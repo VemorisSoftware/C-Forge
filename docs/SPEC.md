@@ -419,6 +419,27 @@ bibliotecas) pasan compiladas a ELF sin libc. Estado de la suite completa:
 7 de 25 pruebas ya compilan nativas; el resto espera los bloques 2 a 4
 (clases, closures, errores, `extern`, más funciones de la biblioteca).
 
+### Bloque 2: clases, estructuras, métodos e inglés en el compilador autoalojado ✅
+
+- `clase X [extiende P] [implementa I] { sea campo = v  funcion metodo(..) {..} }`,
+  `estructura P { x: numero  y: numero }` (constructor posicional),
+  `interfaz`, `abstracto`, `privado`/`publico`/`estatico`.
+- Una instancia es un mapa con `"__clase"` (igual que el intérprete). Los
+  campos se inicializan desde el padre hacia la clase hija; `Nombre(args)`
+  llama a `constructor` propio o heredado.
+- Métodos: despacho dinámico por la tabla de clases que el compilador deja en
+  el ejecutable (`call rax`), subiendo por la cadena de herencia;
+  `super.metodo(..)` se resuelve al compilar. Si el valor no es una instancia,
+  `x.f(a)` equivale a `f(x, a)` (por ejemplo `lista.agregar(v)`).
+- Asignación a campos e índices encadenados: `esto.a["k"].b = v`, también con
+  `+= -= *= /= %=`.
+- Palabras clave en inglés (`class`, `function`/`func`/`fn`, `let`/`var`, `if`,
+  `else`, `for`, `in`, `return`, `true`, `false`, `null`, `this`/`self`, …) y
+  nombres de funciones en inglés (`append`, `length`, `upper`, …). Si el
+  programa está escrito mayormente en inglés, los valores se imprimen en
+  inglés (`true`, `null`).
+- Los errores de compilación indican `archivo.cfv:línea`.
+
 **Alcance honesto:** el compilador autoalojado compila el *dialecto nativo*
 (enteros de 64 bits, funciones, recursión, condiciones, ciclos, textos
 literales e intrínsecos). El lenguaje C-Forge completo (clases, mapas,

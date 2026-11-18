@@ -316,7 +316,7 @@ nativo-check:
 ## Lenguaje completo compilado por cforge_self: runtime nativo + mapas en
 ## dialecto nativo, y runtime/dyn.cfv en modo puente (valores del lenguaje).
 RUNTIME_LENGUAJE := $(RUNTIME_NATIVO) runtime/map.cfv --puente runtime/dyn.cfv
-PRUEBAS_LENGUAJE_NATIVAS := 03_colecciones 06_stdlib_lista 10_stdlib_mapa 16_colecciones_avanzadas
+PRUEBAS_LENGUAJE_NATIVAS := 01_nucleo 03_colecciones 06_stdlib_lista 08_clases 10_stdlib_mapa 14_control_avanzado 16_colecciones_avanzadas 22_funciones_propias 25_idioma_ingles
 FUENTES_AUTOALOJADO := $(RUNTIME_NATIVO) bootstrap/nativo/lexer.cfv bootstrap/nativo/cforge_self.cfv
 autoalojado-check:
 	@set -e; dir=$$(mktemp -d /tmp/cforge-self.XXXXXX); \
@@ -340,13 +340,15 @@ autoalojado-check:
 	"$$dir/mapa" | diff -u tests/nativo/07_mapa.salida -; \
 	env -i "$$dir/stage3" -o "$$dir/colecciones" $(RUNTIME_LENGUAJE) --dinamico tests/nativo/06_colecciones.cfv >/dev/null; \
 	"$$dir/colecciones" | diff -u tests/nativo/06_colecciones.salida -; \
+	env -i "$$dir/stage3" -o "$$dir/clases" $(RUNTIME_LENGUAJE) --dinamico tests/nativo/08_clases.cfv >/dev/null; \
+	"$$dir/clases" | diff -u tests/nativo/08_clases.salida -; \
 	for prueba in $(PRUEBAS_LENGUAJE_NATIVAS); do \
 		env -i "$$dir/stage3" -o "$$dir/$$prueba" --stdlib stdlib $(RUNTIME_LENGUAJE) --dinamico tests/cfv/$$prueba.cfv >/dev/null; \
 		"$$dir/$$prueba" | grep -q '^\[OK\]' || { echo "  ✗ tests/cfv/$$prueba.cfv"; exit 1; }; \
 	done; \
 	sha256sum "$$dir/stage2" "$$dir/stage3" | sed "s#$$dir/##"; \
 	echo "  ✓ C-Forge se compila a sí mismo: Stage 2 = Stage 3, sin libc ni C++"; \
-	echo "  ✓ Listas y mapas nativos: $(PRUEBAS_LENGUAJE_NATIVAS)"
+	echo "  ✓ Suite del lenguaje compilada nativa: $(PRUEBAS_LENGUAJE_NATIVAS)"
 
 ## Verificar los backends Core B6.8 sin toolchain durante la emisión.
 backend-core-check: backend-core-bundle

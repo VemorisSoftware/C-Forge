@@ -18,6 +18,9 @@ Sitio oficial: [c-forge.org](https://c-forge.org)
 - **Listas y mapas nativos** en el compilador autoalojado: valores dinámicos
   etiquetados, `runtime/map.cfv` (tabla hash) y `runtime/dyn.cfv`. Las pruebas
   de colecciones de la suite pasan compiladas a ELF sin libc.
+- **Clases nativas** en el compilador autoalojado: clases, estructuras,
+  herencia, `super`, interfaces, despacho dinámico de métodos, palabras clave
+  en inglés y errores con `archivo.cfv:línea`.
 
 ## 3.7.3 — extern C + idioma del programa
 
