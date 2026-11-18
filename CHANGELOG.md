@@ -2,7 +2,7 @@
 
 Sitio oficial: [c-forge.org](https://c-forge.org)
 
-## Sin publicar (4.1)
+## 4.1.0 — 2026-11-18
 
 - **Biblioteca estándar completa en C-Forge:** los 35 módulos de `stdlib/`
   cargan con el compilador nativo; `stdlib/PENDIENTES` desaparece.
