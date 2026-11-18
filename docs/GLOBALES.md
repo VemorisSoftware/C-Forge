@@ -46,6 +46,7 @@ estado en silencio.
 
 | Casilla | Contenido |
 |---|---|
+| 19 | `build --release`: eliminar el código que no se usa |
 | 36 | tabla de paquetes (`cforge.toml`) |
 | 37 | archivo de diagnósticos (`check --diagnosticos`): `rt_panico` escribe ahí |
 | 38 | contenido alternativo del archivo (`check --contenido`, editor) |
