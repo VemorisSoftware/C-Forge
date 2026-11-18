@@ -213,6 +213,13 @@ stdlib-load-check: build
 	done; \
 	echo "  ✓ $$total módulos de la stdlib cargados ($(words $(STDLIB_PENDIENTES)) pendientes para 4.1)"
 
+## Módulos de la stdlib con salida esperada (SQLite del sistema).
+stdlib-check: build
+	@set -e; dir=$$(mktemp -d /tmp/cforge-db.XXXXXX); \
+	(cd $$dir && CFORGE_STDLIB=$(CURDIR)/stdlib $(CURDIR)/$(TARGET) $(CURDIR)/tests/db/prueba.cfv) | diff -u tests/db/prueba.salida - || { echo "  ✗ tests/db"; exit 1; }; \
+	rm -rf $$dir; \
+	echo "  ✓ db: SQLite (CRUD, parámetros, transacciones, archivo)"
+
 ## Contrato público mínimo del CLI.
 cli-check: build
 	@set -e; \
@@ -253,7 +260,7 @@ smoke-test: build
 
 ## Gate único exigido antes de publicar una versión.
 release-check: build nativo-check autoalojado-check semilla-check check test \
-	stdlib-load-check cli-check malformed-check install-check smoke-test
+	stdlib-load-check stdlib-check cli-check malformed-check install-check smoke-test
 	@echo ""
 	@echo "  ✓ GATE DE ESTABILIDAD C-FORGE COMPLETO (100 % C-Forge)"
 
