@@ -20,7 +20,7 @@ if r.returncode != 0 or salida != esperado:
     import difflib
     print("".join(difflib.unified_diff(esperado.splitlines(True), salida.splitlines(True), "esperado", "obtenido")))
     print("  ✗ tests/red"); sys.exit(1)
-print("  ✓ red: HTTP (chunked, redirección, POST), UDP, Redis, DNS y HTTPS")
+print("  ✓ red: HTTP (chunked, redirección, POST), UDP, Redis, DNS, HTTPS y WebSocket")
 if os.environ.get("CFORGE_TLS_INTERNET"):
     t = subprocess.run([cforge, os.path.join(AQUI, "internet.cfv")], capture_output=True, timeout=120)
     s = t.stdout.decode("utf-8", "replace").strip()
