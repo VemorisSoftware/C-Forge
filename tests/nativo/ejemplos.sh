@@ -46,6 +46,7 @@ for f in ejemplos/*.cfv; do
       if ! hay_sdl; then echo "  · $b: omitido (falta SDL2)"; total=$((total - 1)); continue; fi
       (cd ejemplos && SDL_VIDEODRIVER=${SDL_VIDEODRIVER:-dummy} timeout 3 "$C" "$b.cfv") > "$tmp/out" 2>/dev/null
       rc=$?
+      detener_programas
       if [ $rc = 124 ]; then ok=$((ok + 1)); else falla "$b" "el ciclo de SDL terminó (código $rc)"; fi
       ;;
     plataformas)
