@@ -35,6 +35,21 @@ Sitio oficial: [c-forge.org](https://c-forge.org)
   `cforge check`, `build` y el LSP.
 - **`comptime`:** `comptime(expr)` y `comptime { … }` se ejecutan al compilar
   y quedan como literales; genéricos `comptime T` verificados por llamada.
+- **WebSocket real (RFC 6455)** en `stdlib/red.cfv`: cliente (`ws_conectar`,
+  `ws_conectar_url`) y servidor (`ws_aceptar` sobre `servidor_http_*`),
+  texto, binario, fragmentación, ping/pong y cierre con código. Reemplaza el
+  atajo por UDP.
+- **PostgreSQL nativo** (`stdlib/postgres.cfv`): protocolo v3 sin libpq,
+  SCRAM-SHA-256 (con verificación de la firma del servidor), MD5, consultas
+  con parámetros por el protocolo extendido y tipos convertidos.
+- **MySQL / MariaDB nativo** (`stdlib/mysql.cfv`): protocolo 4.1,
+  mysql_native_password y caching_sha2_password (autenticación rápida),
+  parámetros `?` escapados. La autenticación completa de caching_sha2 sin TLS
+  (RSA) no está soportada.
+- **Runtime:** `cfv_sha1`, `sha1_bytes`, `sha256_bytes`, `hmac_sha256_bytes`,
+  `pbkdf2_sha256`, `bytes_entero`, `bytes_leer_entero`, `bytes_xor`,
+  `bytes_buscar`, `bytes_de_hex`, `hex_de_bytes`, `net_recibir_exacto`,
+  `servidor_http_tomar_conexion`.
 - **`docs/GLOBALES.md`:** mapa de las casillas globales del runtime. Corrige
   dos choques de 4.1: las tablas de AES usaban la caché de `argv` en Windows
   (ahora casilla 15) y el handle de libssl la casilla de `sys_casilla` (16).

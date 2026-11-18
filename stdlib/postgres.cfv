@@ -1,0 +1,242 @@
+// stdlib/postgres.cfv — cliente nativo de PostgreSQL (protocolo v3).
+// Sin libpq: sockets del runtime, SCRAM-SHA-256 (PBKDF2 + HMAC propios), MD5
+// y contraseña en claro. Las consultas con parámetros usan el protocolo
+// extendido (Parse/Bind/Execute): los valores nunca se mezclan con el SQL.
+//
+//   importar "postgres"
+//   sea db = pg_conectar({"host": "127.0.0.1", "usuario": "app", "clave": "…", "base": "tienda"})
+//   pg_ejecutar(db, "INSERT INTO productos (nombre, precio) VALUES ($1, $2)", ["té", 2.5])
+//   para fila en pg_consultar(db, "SELECT * FROM productos WHERE precio > $1", [1])["filas"] {
+//       mostrar(fila["nombre"])
+//   }
+//   pg_cerrar(db)
+//
+// Resultado: {"filas": [mapa], "columnas": [texto], "comando": "SELECT 2",
+// "afectadas": 2}. Tipos: bool → booleano, int2/4/8 → entero,
+// float4/8 y numeric → número, NULL → nulo, el resto → texto.
+
+funcion pg_i32(n) { retornar bytes_entero(n, 4, 0) }
+funcion pg_i16(n) { retornar bytes_entero(n, 2, 0) }
+
+// Mensaje del cliente: tipo + longitud (incluida) + cuerpo.
+funcion pg_mensaje(tipo, cuerpo) { retornar tipo + pg_i32(longitud(cuerpo) + 4) + cuerpo }
+
+// Siguiente mensaje del servidor: {"tipo", "datos"}.
+funcion pg_leer(conn) {
+    sea h = net_recibir_exacto(conn["sock"], 5)
+    si (longitud(h) < 5) { lanzar "postgres: el servidor cerró la conexión" }
+    sea n = bytes_leer_entero(h, 1, 4, 0) - 4
+    sea datos = ""
+    si (n > 0) { datos = net_recibir_exacto(conn["sock"], n) }
+    retornar {"tipo": subtexto(h, 0, 1), "datos": datos}
+}
+
+// Texto terminado en \0 desde pos: [texto, posición siguiente].
+funcion pg_cadena(d, pos) {
+    sea fin = bytes_buscar(d, char_de(0), pos)
+    si (fin < 0) { fin = longitud(d) }
+    retornar [subtexto(d, pos, fin), fin + 1]
+}
+
+// ErrorResponse → "SEVERIDAD CÓDIGO: mensaje".
+funcion pg_error(d) {
+    sea campos = {}
+    sea pos = 0
+    mientras (pos < longitud(d) y byte_en(d, pos) != 0) {
+        sea clave = subtexto(d, pos, pos + 1)
+        sea c = pg_cadena(d, pos + 1)
+        campos[clave] = c[0]
+        pos = c[1]
+    }
+    sea m = "postgres: "
+    si (tiene_clave(campos, "S")) { m = m + campos["S"] + " " }
+    si (tiene_clave(campos, "C")) { m = m + campos["C"] + ": " }
+    si (tiene_clave(campos, "M")) { m = m + campos["M"] }
+    retornar m
+}
+
+funcion pg_enviar(conn, datos) { net_enviar(conn["sock"], datos) }
+
+// Atributos SCRAM "a=v,b=w" → mapa.
+funcion pg_scram_campos(t) {
+    sea r = {}
+    para parte en texto_dividir(t, ",") {
+        si (longitud(parte) >= 2) { r[subtexto(parte, 0, 1)] = subtexto(parte, 2, longitud(parte)) }
+    }
+    retornar r
+}
+
+funcion pg_conectar(opciones) {
+    sea host = "127.0.0.1"
+    sea puerto = 5432
+    sea usuario = "postgres"
+    sea clave = ""
+    sea base = nulo
+    si (tiene_clave(opciones, "host")) { host = opciones["host"] }
+    si (tiene_clave(opciones, "puerto")) { puerto = opciones["puerto"] }
+    si (tiene_clave(opciones, "usuario")) { usuario = opciones["usuario"] }
+    si (tiene_clave(opciones, "clave")) { clave = opciones["clave"] }
+    si (tiene_clave(opciones, "base")) { base = opciones["base"] }
+    si (base == nulo) { base = usuario }
+    sea conn = {"sock": net_conectar(host, puerto), "parametros": {}, "abierta": verdadero}
+    sea cero = char_de(0)
+    sea inicio = pg_i32(196608) + "user" + cero + usuario + cero + "database" + cero + base + cero + "client_encoding" + cero + "UTF8" + cero + cero
+    pg_enviar(conn, pg_i32(longitud(inicio) + 4) + inicio)
+    // Autenticación.
+    sea scram = nulo
+    sea listo = falso
+    mientras (listo == falso) {
+        sea m = pg_leer(conn)
+        sea t = m["tipo"]
+        sea d = m["datos"]
+        si (t == "E") {
+            net_cerrar(conn["sock"])
+            lanzar pg_error(d)
+        }
+        si (t == "R") {
+            sea codigo = bytes_leer_entero(d, 0, 4, 0)
+            si (codigo == 3) { pg_enviar(conn, pg_mensaje("p", clave + cero)) }
+            si (codigo == 5) {
+                sea interno = cfv_md5(clave + usuario)
+                pg_enviar(conn, pg_mensaje("p", "md5" + cfv_md5(interno + subtexto(d, 4, 8)) + cero))
+            }
+            si (codigo == 10) {
+                si (bytes_buscar(d, "SCRAM-SHA-256" + cero, 4) < 0) { lanzar "postgres: el servidor no ofrece SCRAM-SHA-256" }
+                sea nonce = cfv_base64_codificar(bytes_de_hex(crypto_rand_bytes(18)))
+                sea primero = "n=,r=" + nonce
+                scram = {"nonce": nonce, "primero": primero}
+                sea mensaje = "n,," + primero
+                pg_enviar(conn, pg_mensaje("p", "SCRAM-SHA-256" + cero + pg_i32(longitud(mensaje)) + mensaje))
+            }
+            si (codigo == 11) {
+                sea servidor = subtexto(d, 4, longitud(d))
+                sea campos = pg_scram_campos(servidor)
+                si (texto_empieza_con(campos["r"], scram["nonce"]) == falso) { lanzar "postgres: SCRAM: nonce del servidor inválido" }
+                sea salada = pbkdf2_sha256(clave, cfv_base64_decodificar(campos["s"]), a_numero(campos["i"]), 32)
+                sea clave_cliente = hmac_sha256_bytes(salada, "Client Key")
+                sea sin_prueba = "c=biws,r=" + campos["r"]
+                sea autenticacion = scram["primero"] + "," + servidor + "," + sin_prueba
+                sea firma = hmac_sha256_bytes(sha256_bytes(clave_cliente), autenticacion)
+                scram["esperada"] = cfv_base64_codificar(hmac_sha256_bytes(hmac_sha256_bytes(salada, "Server Key"), autenticacion))
+                pg_enviar(conn, pg_mensaje("p", sin_prueba + ",p=" + cfv_base64_codificar(bytes_xor(clave_cliente, firma))))
+            }
+            si (codigo == 12) {
+                // El servidor también prueba que conoce la contraseña.
+                sea final = pg_scram_campos(subtexto(d, 4, longitud(d)))
+                si (scram == nulo o final["v"] != scram["esperada"]) {
+                    net_cerrar(conn["sock"])
+                    lanzar "postgres: SCRAM: la firma del servidor no coincide"
+                }
+            }
+            si (codigo != 0 y codigo != 3 y codigo != 5 y codigo != 10 y codigo != 11 y codigo != 12) {
+                net_cerrar(conn["sock"])
+                lanzar "postgres: método de autenticación no soportado (" + codigo + ")"
+            }
+        }
+        si (t == "S") {
+            sea a = pg_cadena(d, 0)
+            sea b = pg_cadena(d, a[1])
+            conn["parametros"][a[0]] = b[0]
+        }
+        si (t == "Z") { listo = verdadero }
+    }
+    retornar conn
+}
+
+// Valor de una columna según el OID de su tipo.
+funcion pg_valor(texto_crudo, oid) {
+    si (oid == 16) { retornar texto_crudo == "t" }
+    si (oid == 20 o oid == 21 o oid == 23 o oid == 26) { retornar a_numero(texto_crudo) }
+    si (oid == 700 o oid == 701 o oid == 1700) {
+        si (texto_crudo == "NaN") { retornar texto_crudo }
+        retornar a_numero(texto_crudo) * 1.0
+    }
+    retornar texto_crudo
+}
+
+// Lee la respuesta hasta ReadyForQuery.
+funcion pg_respuesta(conn) {
+    sea r = {"filas": [], "columnas": [], "comando": "", "afectadas": 0}
+    sea tipos = []
+    sea error = nulo
+    sea listo = falso
+    mientras (listo == falso) {
+        sea m = pg_leer(conn)
+        sea t = m["tipo"]
+        sea d = m["datos"]
+        si (t == "T") {
+            sea n = bytes_leer_entero(d, 0, 2, 0)
+            sea pos = 2
+            r["columnas"] = []
+            tipos = []
+            para i en rango(n) {
+                sea c = pg_cadena(d, pos)
+                r["columnas"].agregar(c[0])
+                tipos.agregar(bytes_leer_entero(d, c[1] + 6, 4, 0))
+                pos = c[1] + 18
+            }
+        }
+        si (t == "D") {
+            sea n = bytes_leer_entero(d, 0, 2, 0)
+            sea pos = 2
+            sea fila = {}
+            para i en rango(n) {
+                sea largo = bytes_leer_entero(d, pos, 4, 0)
+                pos = pos + 4
+                si (largo == 4294967295) {
+                    fila[r["columnas"][i]] = nulo
+                } sino {
+                    fila[r["columnas"][i]] = pg_valor(subtexto(d, pos, pos + largo), tipos[i])
+                    pos = pos + largo
+                }
+            }
+            r["filas"].agregar(fila)
+        }
+        si (t == "C") {
+            r["comando"] = pg_cadena(d, 0)[0]
+            sea partes = texto_dividir(r["comando"], " ")
+            sea ultimo = partes[longitud(partes) - 1]
+            si (longitud(partes) > 1 y longitud(ultimo) > 0 y byte_en(ultimo, 0) >= 48 y byte_en(ultimo, 0) <= 57) { r["afectadas"] = a_numero(ultimo) }
+        }
+        si (t == "E" y error == nulo) { error = pg_error(d) }
+        si (t == "Z") { listo = verdadero }
+    }
+    si (error != nulo) { lanzar error }
+    retornar r
+}
+
+// Parámetro como texto para Bind (nulo → NULL).
+funcion pg_parametro(v) {
+    si (v == nulo) { retornar pg_i32(4294967295) }
+    sea s = ""
+    si (v == verdadero) { s = "t" } sino {
+        si (v == falso) { s = "f" } sino { s = "" + v }
+    }
+    retornar pg_i32(longitud(s)) + s
+}
+
+funcion pg_consultar(conn, sql, parametros = []) {
+    si (conn["abierta"] == falso) { lanzar "postgres: la conexión está cerrada" }
+    sea cero = char_de(0)
+    si (longitud(parametros) == 0) {
+        pg_enviar(conn, pg_mensaje("Q", sql + cero))
+        retornar pg_respuesta(conn)
+    }
+    sea valores = []
+    para v en parametros { valores.agregar(pg_parametro(v)) }
+    sea bind = cero + cero + pg_i16(0) + pg_i16(longitud(parametros)) + unir(valores, "") + pg_i16(0)
+    sea lote = pg_mensaje("P", cero + sql + cero + pg_i16(0)) + pg_mensaje("B", bind) + pg_mensaje("D", "P" + cero) + pg_mensaje("E", cero + pg_i32(0)) + pg_mensaje("S", "")
+    pg_enviar(conn, lote)
+    retornar pg_respuesta(conn)
+}
+
+// Filas afectadas (INSERT, UPDATE, DELETE…).
+funcion pg_ejecutar(conn, sql, parametros = []) { retornar pg_consultar(conn, sql, parametros)["afectadas"] }
+
+funcion pg_cerrar(conn) {
+    si (conn["abierta"]) {
+        conn["abierta"] = falso
+        intentar { pg_enviar(conn, pg_mensaje("X", "")) } capturar (e) { }
+        net_cerrar(conn["sock"])
+    }
+}
