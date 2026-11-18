@@ -456,3 +456,111 @@ funcion a64_aplicar(codigo, posicion, tipo, pc, destino) {
     retornar 0
 }
 
+
+// ── Envoltura con ABI C de una función exportada (cforge build --lib) ─────
+// La llama código C, Swift u Objective-C (AAPCS64). Usa las globales del
+// programa 40 (cerrojo), 41 (iniciado), 42-49 (x0-x7) y 50-57 (d0-d7), y
+// una pila propia del lenguaje de 8 MiB en "pila" (desplazamiento en las
+// globales). La primera llamada ejecuta el programa principal (variables
+// globales, clases); las llamadas se serializan con el cerrojo.
+// tipos: clases de clase_tipo (0 entero de 64 · 1 double · 2 texto ·
+// 3 booleano · 4 nulo · 5 entero de 32).
+funcion a64_envoltura_c(c, destino, tipos, resultado, principal, pila) {
+    a64(c, 2847898621)                                                 // stp x29, x30, [sp, #-16]!
+    a64(c, 2847896571)                                                 // stp x27, x28, [sp, #-16]!
+    a64(c, 2847888371)                                                 // stp x19, x20, [sp, #-16]!
+    a64(c, 2847890421)                                                 // stp x21, x22, [sp, #-16]!
+    a64(c, 2847892471)                                                 // stp x23, x24, [sp, #-16]!
+    // Cerrojo (global 40): mientras swpal devuelva 1, ceder y reintentar.
+    sea esperar = nueva_etiqueta(c)
+    sea tomado = nueva_etiqueta(c)
+    definir_etiqueta(c, esperar)
+    a64_adr(c, 16, 2, 320)
+    a64(c, 3531604017)                                                 // mov x17, #1
+    a64(c, 4176577041)                                                 // swpal x17, x17, [x16]
+    a64(c, 3019898993)                                                 // cbz x17, +12 (tomado)
+    a64(c, 3573751871)                                                 // yield
+    a64_b(c, esperar)
+    definir_etiqueta(c, tomado)
+    // Argumentos C → globales 42..57.
+    a64_adr(c, 16, 2, 336)
+    a64(c, 2835351040)                                                 // stp x0, x1, [x16]
+    a64(c, 2835418626)                                                 // stp x2, x3, [x16, #16]
+    a64(c, 2835486212)                                                 // stp x4, x5, [x16, #32]
+    a64(c, 2835553798)                                                 // stp x6, x7, [x16, #48]
+    a64(c, 1828980224)                                                 // stp d0, d1, [x16, #64]
+    a64(c, 1829047810)                                                 // stp d2, d3, [x16, #80]
+    a64(c, 1829115396)                                                 // stp d4, d5, [x16, #96]
+    a64(c, 1829182982)                                                 // stp d6, d7, [x16, #112]
+    // Pila del lenguaje: x28 = pila + 8 MiB, x29 = x28.
+    a64_adr(c, 28, 2, pila)
+    a64_sumar_inm(c, 28, 28, 8388608)
+    a64_mov(c, 29, 28)
+    // Primera llamada: ejecutar el programa principal (global 41).
+    sea listo = nueva_etiqueta(c)
+    a64_cargar_absoluto(c, 2, 328)
+    a64_saltar_si(c, 0, listo)
+    a64_constante(c, 0, 1)
+    a64_guardar_absoluto(c, 2, 328)
+    a64_bl(c, principal)
+    definir_etiqueta(c, listo)
+    // Argumentos convertidos a valores del lenguaje, apilados en orden.
+    sea n = vec_largo(tipos)
+    sea enteros = 0
+    sea flotantes = 0
+    sea i = 0
+    mientras (i < n) {
+        sea clase = vec_obtener(tipos, i)
+        si (clase == 1) {
+            si (flotantes > 7) { error_en(c, "--lib: más de 8 argumentos double") }
+            a64_cargar_absoluto(c, 2, 400 + flotantes * 8)
+            flotantes = flotantes + 1
+            a64_empujar_fis(c, 0)
+            llamar_runtime(c, "dyn_desde_f64", 1)
+        } sino {
+            si (enteros > 7) { error_en(c, "--lib: más de 8 argumentos enteros") }
+            a64_cargar_absoluto(c, 2, 336 + enteros * 8)
+            enteros = enteros + 1
+            si (clase == 2) {
+                a64_empujar_fis(c, 0)
+                llamar_runtime(c, "dyn_texto_desde_c", 1)
+            }
+            si (clase == 3) {
+                a64_byte_bajo(c)
+                a64_no_cero(c)
+                a64_etiquetar(c, 2)
+            }
+            si (clase == 5) {
+                a64_extender32(c)
+                a64_etiquetar(c, 1)
+            }
+            si (clase == 0) {
+                a64_empujar_fis(c, 0)
+                llamar_runtime(c, "dyn_entero_desde_c", 1)
+            }
+        }
+        a64_empujar_fis(c, 0)
+        i = i + 1
+    }
+    a64_bl(c, destino)
+    si (n > 0) { a64_liberar_pila(c, n * 8) }
+    // Resultado → C.
+    si (resultado != 4) { a64_empujar_fis(c, 0) }
+    si (resultado == 1) {
+        llamar_runtime(c, "dyn_a_f64", 1)
+        a64(c, 2657550336)                                             // fmov d0, x0
+    }
+    si (resultado == 0 o resultado == 5) { llamar_runtime(c, "dyn_entero_c", 1) }
+    si (resultado == 2) { llamar_runtime(c, "dyn_texto_c", 1) }
+    si (resultado == 3) { llamar_runtime(c, "dyn_verdad", 1) }
+    si (resultado == 4) { a64_constante(c, 0, 0) }
+    // Liberar el cerrojo y volver.
+    a64_adr(c, 16, 2, 320)
+    a64(c, 3365928479)                                                 // stlr xzr, [x16]
+    a64(c, 2831246327)                                                 // ldp x23, x24, [sp], #16
+    a64(c, 2831244277)                                                 // ldp x21, x22, [sp], #16
+    a64(c, 2831242227)                                                 // ldp x19, x20, [sp], #16
+    a64(c, 2831250427)                                                 // ldp x27, x28, [sp], #16
+    a64(c, 2831252477)                                                 // ldp x29, x30, [sp], #16
+    retornar a64(c, 3596551104)                                        // ret
+}
