@@ -1,0 +1,482 @@
+// bootstrap/nativo/biblioteca_c.cfv — cforge build --lib: bibliotecas
+// estáticas para Xcode (Swift, Objective-C) y C en macOS ARM64 e iOS.
+//
+// Las funciones marcadas con #[Exportar] (o #[export]) se publican con ABI
+// C. Sus tipos salen de las anotaciones: entero → int64_t, entero32 / int →
+// int32_t, numero → double, texto → const char*, booleano → bool, sin
+// resultado → void. Se genera:
+//   · un Mach-O objeto (MH_OBJECT) con relocaciones ARM64 (PAGE21,
+//     PAGEOFF12, UNSIGNED) y los símbolos _nombre de cada función;
+//   · un archivo estático .a (ar BSD con __.SYMDEF SORTED);
+//   · la cabecera C (.h) con los prototipos.
+// La biblioteca usa libSystem (enlazada siempre por Xcode) y su propia pila
+// del lenguaje; la primera llamada ejecuta el código de nivel superior.
+
+// Funciones exportadas: [nombre][tipos de parámetros][resultado][etiqueta][nombres]
+funcion exportaciones(c) {
+    sea r = vec_nuevo()
+    sea atributos = __cargar64(c + 288)
+    sea i = 0
+    mientras (i < vec_largo(atributos)) {
+        sea a = vec_obtener(atributos, i)
+        sea nombre_atributo = __cargar64(a)
+        si (str_igual(nombre_atributo, "Exportar") o str_igual(nombre_atributo, "exportar") o str_igual(nombre_atributo, "export") o str_igual(nombre_atributo, "Export")) {
+            sea nombre = __cargar64(a + 16)
+            sea f = buscar_funcion(c, nombre)
+            si (f == 0) { rt_panico(str_concatenar("#[Exportar]: función desconocida ", nombre)) }
+            sea e = mem_reservar(40)
+            __guardar64(e, nombre)
+            __guardar64(e + 24, __cargar64(f + 8))
+            firma_exportada(c, nombre, e)
+            vec_agregar(r, e)
+        }
+        i = i + 1
+    }
+    si (vec_largo(r) == 0) { rt_panico("--lib: marca con #[Exportar] las funciones que publica la biblioteca") }
+    retornar r
+}
+
+funcion clase_exportada(c, tipo, nombre) {
+    si (str_igual(tipo, "entero32") o str_igual(tipo, "int32") o str_igual(tipo, "int")) { retornar 5 }
+    si (str_igual(tipo, "entero") o str_igual(tipo, "largo") o str_igual(tipo, "int64") o str_igual(tipo, "long")) { retornar 0 }
+    si (str_igual(tipo, "numero") o str_igual(tipo, "flotante") o str_igual(tipo, "doble") o str_igual(tipo, "number") o str_igual(tipo, "double") o str_igual(tipo, "float")) { retornar 1 }
+    si (str_igual(tipo, "texto") o str_igual(tipo, "cadena") o str_igual(tipo, "string")) { retornar 2 }
+    si (str_igual(tipo, "booleano") o str_igual(tipo, "bool") o str_igual(tipo, "boolean")) { retornar 3 }
+    si (str_igual(tipo, "nulo") o str_igual(tipo, "vacio") o str_igual(tipo, "void")) { retornar 4 }
+    rt_panico(str_concatenar(str_concatenar(str_concatenar("#[Exportar] ", nombre), ": tipo sin equivalente en C: "), tipo))
+    retornar 0
+}
+
+// Tipos de la firma "funcion nombre(p: tipo, ...): tipo" en los tokens.
+funcion firma_exportada(c, nombre, e) {
+    sea tokens = __cargar64(c)
+    sea i = 0
+    sea hallado = 0 - 1
+    mientras (i + 2 < vec_largo(tokens) y hallado < 0) {
+        si (__cargar64(vec_obtener(tokens, i)) == 1 y (str_igual(lexema_en(tokens, i), "funcion") o str_igual(lexema_en(tokens, i), "function") o str_igual(lexema_en(tokens, i), "fn")) y str_igual(lexema_en(tokens, i + 1), nombre) y es_simbolo(vec_obtener(tokens, i + 2), "(")) { hallado = i + 3 }
+        i = i + 1
+    }
+    sea tipos = vec_nuevo()
+    sea nombres = vec_nuevo()
+    sea j = hallado
+    mientras (es_simbolo(vec_obtener(tokens, j), ")") == 0) {
+        sea p = lexema_en(tokens, j)
+        vec_agregar(nombres, p)
+        j = j + 1
+        si (es_simbolo(vec_obtener(tokens, j), ":") == 0) {
+            rt_panico(str_concatenar(str_concatenar(str_concatenar("#[Exportar] ", nombre), ": falta el tipo del parámetro "), p))
+        }
+        vec_agregar(tipos, clase_exportada(c, lexema_en(tokens, j + 1), nombre))
+        j = j + 2
+        si (es_simbolo(vec_obtener(tokens, j), "=")) { j = fin_valor_defecto(tokens, j + 1) }
+        si (es_simbolo(vec_obtener(tokens, j), ",")) { j = j + 1 }
+    }
+    sea resultado = 4
+    si (es_simbolo(vec_obtener(tokens, j + 1), ":")) { resultado = clase_exportada(c, lexema_en(tokens, j + 2), nombre) }
+    __guardar64(e + 8, tipos)
+    __guardar64(e + 16, resultado)
+    __guardar64(e + 32, nombres)
+    retornar 0
+}
+
+// Desplazamiento (en las globales) de la pila de 8 MiB de la biblioteca.
+funcion pila_biblioteca(c) { retornar alinear(512 + vec_largo(__cargar64(c + 224)) * 8, 16) }
+
+// Emite las envolturas C; devuelve [nombre][posición en el código].
+funcion emitir_envolturas(c, principal) {
+    si (es_arm64(c) == 0 o es_macos(c) == 0) { rt_panico("--lib: destinos macos-arm64, ios-arm64 o ios-sim-arm64") }
+    sea exportadas = exportaciones(c)
+    sea simbolos = vec_nuevo()
+    sea i = 0
+    mientras (i < vec_largo(exportadas)) {
+        sea e = vec_obtener(exportadas, i)
+        mientras (str_largo(ctx_codigo(c)) % 16 != 0) { e32(c, 3573751839) }   // nop
+        sea s = mem_reservar(16)
+        __guardar64(s, str_concatenar("_", __cargar64(e)))
+        __guardar64(s + 8, posicion_codigo(c))
+        vec_agregar(simbolos, s)
+        a64_envoltura_c(c, __cargar64(e + 24), __cargar64(e + 8), __cargar64(e + 16), principal, pila_biblioteca(c))
+        i = i + 1
+    }
+    mem_fijar_global(41, cabecera_c(exportadas))
+    retornar simbolos
+}
+
+funcion tipo_c(clase) {
+    si (clase == 0) { retornar "int64_t" }
+    si (clase == 1) { retornar "double" }
+    si (clase == 2) { retornar "const char *" }
+    si (clase == 3) { retornar "bool" }
+    si (clase == 5) { retornar "int32_t" }
+    retornar "void"
+}
+
+funcion cabecera_c(exportadas) {
+    sea h = str_nuevo(1024)
+    str_agregar(h, "// Generado por cforge build --lib (C-Forge, https://c-forge.org). No editar.\n")
+    str_agregar(h, "// Los textos devueltos pertenecen a C-Forge: cópialos si los guardas.\n")
+    str_agregar(h, "#pragma once\n#include <stdbool.h>\n#include <stdint.h>\n\n#ifdef __cplusplus\nextern \"C\" {\n#endif\n\n")
+    sea i = 0
+    mientras (i < vec_largo(exportadas)) {
+        sea e = vec_obtener(exportadas, i)
+        str_agregar(h, tipo_c(__cargar64(e + 16)))
+        str_agregar(h, " ")
+        str_agregar(h, __cargar64(e))
+        str_agregar(h, "(")
+        sea tipos = __cargar64(e + 8)
+        si (vec_largo(tipos) == 0) { str_agregar(h, "void") }
+        sea k = 0
+        mientras (k < vec_largo(tipos)) {
+            si (k > 0) { str_agregar(h, ", ") }
+            str_agregar(h, tipo_c(vec_obtener(tipos, k)))
+            str_agregar(h, " ")
+            str_agregar(h, vec_obtener(__cargar64(e + 32), k))
+            k = k + 1
+        }
+        str_agregar(h, ");\n")
+        i = i + 1
+    }
+    str_agregar(h, "\n#ifdef __cplusplus\n}\n#endif\n")
+    retornar h
+}
+
+// ── Mach-O objeto (MH_OBJECT, ARM64) ──────────────────────────────────────
+
+// Entrada de relocación: [dirección][símbolo][pcrel][longitud][externo][tipo]
+funcion reloc(s, direccion, simbolo, pcrel, longitud, externo, tipo) {
+    bytes_le(s, direccion, 4)
+    bytes_le(s, __y_bits(simbolo, 16777215) + pcrel * 16777216 + longitud * 33554432 + externo * 134217728 + tipo * 268435456, 4)
+    retornar 0
+}
+
+// Par ADDEND + reloc contra un símbolo local de sección.
+funcion reloc_con_suma(s, direccion, simbolo, pcrel, tipo, suma) {
+    si (suma != 0) {
+        si (suma >= 8388608 o suma < 0 - 8388608) { rt_panico("--lib: sección demasiado grande para ARM64_RELOC_ADDEND") }
+        reloc(s, direccion, suma, 0, 2, 0, 10)
+    }
+    retornar reloc(s, direccion, simbolo, pcrel, 2, 1, tipo)
+}
+
+funcion nlist(s, strx, tipo, seccion, valor) {
+    bytes_le(s, strx, 4)
+    bytes_le(s, tipo, 1)
+    bytes_le(s, seccion, 1)
+    bytes_le(s, 0, 2)
+    bytes_le(s, valor, 8)
+    retornar 0
+}
+
+// Ordena textos (inserción) — devuelve los índices en orden.
+funcion orden_textos(textos) {
+    sea idx = vec_nuevo()
+    sea i = 0
+    mientras (i < vec_largo(textos)) {
+        vec_agregar(idx, i)
+        sea j = vec_largo(idx) - 1
+        mientras (j > 0 y texto_menor(vec_obtener(textos, vec_obtener(idx, j)), vec_obtener(textos, vec_obtener(idx, j - 1)))) {
+            sea t = vec_obtener(idx, j)
+            vec_fijar(idx, j, vec_obtener(idx, j - 1))
+            vec_fijar(idx, j - 1, t)
+            j = j - 1
+        }
+        i = i + 1
+    }
+    retornar idx
+}
+
+funcion texto_menor(a, b) {
+    sea i = 0
+    mientras (i < str_largo(a) y i < str_largo(b)) {
+        si (str_byte(a, i) != str_byte(b, i)) { retornar str_byte(a, i) < str_byte(b, i) }
+        i = i + 1
+    }
+    retornar str_largo(a) < str_largo(b)
+}
+
+funcion empaquetar_objeto(c, simbolos) {
+    sea codigo = ctx_codigo(c)
+    sea datos = ctx_datos(c)
+    mientras (str_largo(datos) % 8 != 0) { str_agregar_byte(datos, 0) }
+    // Casillas de las funciones de libSystem al final de los datos.
+    sea imps = __cargar64(c + 304)
+    sea casillas = vec_nuevo()
+    sea i = 0
+    mientras (i < vec_largo(imps)) {
+        vec_agregar(casillas, str_largo(datos))
+        bytes_le(datos, 0, 8)
+        i = i + 1
+    }
+    sea dir_datos = alinear(str_largo(codigo), 16)
+    sea dir_bss = alinear(dir_datos + str_largo(datos), 16)
+    sea tam_bss = pila_biblioteca(c) + 8388608
+    // Símbolos: 0-2 locales de sección, luego definidos externos, luego indefinidos.
+    sea cadenas = str_nuevo(1024)
+    str_agregar_byte(cadenas, 32)
+    str_agregar_byte(cadenas, 0)
+    sea tabla = str_nuevo(1024)
+    sea k = 0
+    mientras (k < 3) {
+        sea strx = str_largo(cadenas)
+        str_agregar(cadenas, "ltmp")
+        str_agregar(cadenas, str_desde_entero(k))
+        str_agregar_byte(cadenas, 0)
+        sea valor = 0
+        si (k == 1) { valor = dir_datos }
+        si (k == 2) { valor = dir_bss }
+        nlist(tabla, strx, 14, k + 1, valor)                   // N_SECT
+        k = k + 1
+    }
+    sea nombres_def = vec_nuevo()
+    i = 0
+    mientras (i < vec_largo(simbolos)) {
+        vec_agregar(nombres_def, __cargar64(vec_obtener(simbolos, i)))
+        i = i + 1
+    }
+    sea orden_def = orden_textos(nombres_def)
+    i = 0
+    mientras (i < vec_largo(orden_def)) {
+        sea s = vec_obtener(simbolos, vec_obtener(orden_def, i))
+        sea strx = str_largo(cadenas)
+        str_agregar(cadenas, __cargar64(s))
+        str_agregar_byte(cadenas, 0)
+        nlist(tabla, strx, 15, 1, __cargar64(s + 8))           // N_SECT | N_EXT
+        i = i + 1
+    }
+    sea nombres_imp = vec_nuevo()
+    i = 0
+    mientras (i < vec_largo(imps)) {
+        vec_agregar(nombres_imp, str_concatenar("_", __cargar64(vec_obtener(imps, i) + 8)))
+        i = i + 1
+    }
+    sea orden_imp = orden_textos(nombres_imp)
+    sea indice_imp = vec_nuevo()                               // importación → símbolo
+    i = 0
+    mientras (i < vec_largo(imps)) {
+        vec_agregar(indice_imp, 0)
+        i = i + 1
+    }
+    i = 0
+    mientras (i < vec_largo(orden_imp)) {
+        sea o = vec_obtener(orden_imp, i)
+        vec_fijar(indice_imp, o, 3 + vec_largo(simbolos) + i)
+        sea strx = str_largo(cadenas)
+        str_agregar(cadenas, vec_obtener(nombres_imp, o))
+        str_agregar_byte(cadenas, 0)
+        nlist(tabla, strx, 1, 0, 0)                            // N_UNDF | N_EXT
+        i = i + 1
+    }
+    mientras (str_largo(cadenas) % 8 != 0) { str_agregar_byte(cadenas, 0) }
+    // Arreglos del código: saltos resueltos aquí, direcciones como relocaciones.
+    sea etiquetas = __cargar64(c + 40)
+    sea arreglos = __cargar64(c + 32)
+    sea rel_texto = str_nuevo(1024)
+    i = 0
+    mientras (i < vec_largo(arreglos)) {
+        sea a = vec_obtener(arreglos, i)
+        sea posicion = __cargar64(a)
+        sea tipo = __cargar64(a + 8)
+        sea valor = __cargar64(a + 16)
+        si (tipo == 10) {
+            sea destino = vec_obtener(etiquetas, valor)
+            si (destino < 0) { rt_panico("etiqueta sin definir") }
+            a64_aplicar(codigo, posicion, 10, posicion, destino)
+        }
+        si (tipo >= 21) {
+            sea simbolo = 1
+            sea suma = valor
+            si (tipo == 22) { simbolo = 2 }
+            si (tipo == 23) { suma = __cargar64(c + 192) }
+            si (tipo == 24) {
+                simbolo = 0
+                suma = vec_obtener(etiquetas, valor)
+            }
+            si (tipo == 25) { suma = vec_obtener(casillas, valor) }
+            reloc_con_suma(rel_texto, posicion, simbolo, 1, 3, suma)          // ARM64_RELOC_PAGE21
+            reloc_con_suma(rel_texto, posicion + 4, simbolo, 0, 4, suma)      // ARM64_RELOC_PAGEOFF12
+        }
+        i = i + 1
+    }
+    // Punteros de los datos: el contenido es el desplazamiento en la sección.
+    sea rel_datos = str_nuevo(1024)
+    sea reubicaciones = __cargar64(c + 80)
+    i = 0
+    mientras (i < vec_largo(reubicaciones)) {
+        sea campo = vec_obtener(reubicaciones, i)
+        parchear64(datos, campo, campo + 16)
+        reloc(rel_datos, campo, 1, 0, 3, 1, 0)                 // ARM64_RELOC_UNSIGNED → ltmp1
+        i = i + 1
+    }
+    sea a_codigo = __cargar64(c + 176)
+    i = 0
+    mientras (i < vec_largo(a_codigo)) {
+        sea p = vec_obtener(a_codigo, i)
+        parchear64(datos, __cargar64(p), vec_obtener(etiquetas, __cargar64(p + 8)))
+        reloc(rel_datos, __cargar64(p), 0, 0, 3, 1, 0)
+        i = i + 1
+    }
+    sea punteros = __cargar64(c + 112)
+    i = 0
+    mientras (i < vec_largo(punteros)) {
+        sea p = vec_obtener(punteros, i)
+        parchear64(datos, __cargar64(p), __cargar64(p + 8))
+        reloc(rel_datos, __cargar64(p), 1, 0, 3, 1, 0)
+        i = i + 1
+    }
+    i = 0
+    mientras (i < vec_largo(imps)) {
+        reloc(rel_datos, vec_obtener(casillas, i), vec_obtener(indice_imp, i), 0, 3, 1, 0)
+        i = i + 1
+    }
+    // Disposición del archivo.
+    sea tam_comandos = 72 + 3 * 80 + 24 + 24 + 80
+    sea inicio_texto = alinear(32 + tam_comandos, 16)
+    sea inicio_datos = inicio_texto + dir_datos
+    sea inicio_rel = alinear(inicio_datos + str_largo(datos), 8)
+    sea inicio_rel_datos = inicio_rel + str_largo(rel_texto)
+    sea inicio_simbolos = inicio_rel_datos + str_largo(rel_datos)
+    sea inicio_cadenas = inicio_simbolos + str_largo(tabla)
+    sea nsimbolos = str_largo(tabla) / 16
+    sea m = str_nuevo(inicio_cadenas + str_largo(cadenas))
+    bytes_le(m, 4277009103, 4)                                 // MH_MAGIC_64
+    bytes_le(m, 16777228, 4)                                   // CPU_TYPE_ARM64
+    bytes_le(m, 0, 4)
+    bytes_le(m, 1, 4)                                          // MH_OBJECT
+    bytes_le(m, 4, 4)
+    bytes_le(m, tam_comandos, 4)
+    bytes_le(m, 0, 4)
+    bytes_le(m, 0, 4)
+    // LC_SEGMENT_64 sin nombre con __text, __data y __bss.
+    bytes_le(m, 25, 4)
+    bytes_le(m, 72 + 3 * 80, 4)
+    nombre_de_16(m, "")
+    bytes_le(m, 0, 8)
+    bytes_le(m, dir_bss + tam_bss, 8)
+    bytes_le(m, inicio_texto, 8)
+    bytes_le(m, dir_datos + str_largo(datos), 8)
+    bytes_le(m, 7, 4)
+    bytes_le(m, 7, 4)
+    bytes_le(m, 3, 4)
+    bytes_le(m, 0, 4)
+    seccion_objeto(m, "__text", "__TEXT", 0, str_largo(codigo), inicio_texto, 2, inicio_rel, str_largo(rel_texto) / 8, 2147484672)
+    seccion_objeto(m, "__data", "__DATA", dir_datos, str_largo(datos), inicio_datos, 3, inicio_rel_datos, str_largo(rel_datos) / 8, 0)
+    seccion_objeto(m, "__bss", "__DATA", dir_bss, tam_bss, 0, 4, 0, 0, 1)
+    bytes_le(m, 50, 4)                                         // LC_BUILD_VERSION
+    bytes_le(m, 24, 4)
+    bytes_le(m, plataforma_macho(c), 4)
+    si (es_ios(c)) {
+        bytes_le(m, 917504, 4)
+        bytes_le(m, 917504, 4)
+    } sino {
+        bytes_le(m, 720896, 4)
+        bytes_le(m, 720896, 4)
+    }
+    bytes_le(m, 0, 4)
+    bytes_le(m, 2, 4)                                          // LC_SYMTAB
+    bytes_le(m, 24, 4)
+    bytes_le(m, inicio_simbolos, 4)
+    bytes_le(m, nsimbolos, 4)
+    bytes_le(m, inicio_cadenas, 4)
+    bytes_le(m, str_largo(cadenas), 4)
+    bytes_le(m, 11, 4)                                         // LC_DYSYMTAB
+    bytes_le(m, 80, 4)
+    bytes_le(m, 0, 4)                                          // ilocalsym
+    bytes_le(m, 3, 4)
+    bytes_le(m, 3, 4)                                          // iextdefsym
+    bytes_le(m, vec_largo(simbolos), 4)
+    bytes_le(m, 3 + vec_largo(simbolos), 4)                    // iundefsym
+    bytes_le(m, vec_largo(imps), 4)
+    bytes_le(m, 0, 48)
+    mientras (str_largo(m) < inicio_texto) { str_agregar_byte(m, 0) }
+    str_agregar(m, codigo)
+    mientras (str_largo(m) < inicio_datos) { str_agregar_byte(m, 0) }
+    str_agregar(m, datos)
+    mientras (str_largo(m) < inicio_rel) { str_agregar_byte(m, 0) }
+    str_agregar(m, rel_texto)
+    str_agregar(m, rel_datos)
+    str_agregar(m, tabla)
+    str_agregar(m, cadenas)
+    retornar m
+}
+
+funcion seccion_objeto(s, nombre, segmento, direccion, tam, desplazamiento, alineacion, reloff, nreloc, banderas) {
+    nombre_de_16(s, nombre)
+    nombre_de_16(s, segmento)
+    bytes_le(s, direccion, 8)
+    bytes_le(s, tam, 8)
+    bytes_le(s, desplazamiento, 4)
+    bytes_le(s, alineacion, 4)
+    bytes_le(s, reloff, 4)
+    bytes_le(s, nreloc, 4)
+    bytes_le(s, banderas, 4)
+    bytes_le(s, 0, 12)
+    retornar 0
+}
+
+// ── Archivo estático (ar BSD de Apple) ────────────────────────────────────
+
+funcion texto_relleno(s, texto, ancho) {
+    str_agregar(s, texto)
+    sea i = str_largo(texto)
+    mientras (i < ancho) {
+        str_agregar_byte(s, 32)
+        i = i + 1
+    }
+    retornar 0
+}
+
+// Cabecera de miembro con nombre largo BSD (#1/n) de n bytes.
+funcion miembro_ar(a, nombre, n, tam) {
+    texto_relleno(a, str_concatenar("#1/", str_desde_entero(n)), 16)
+    texto_relleno(a, "0", 12)
+    texto_relleno(a, "0", 6)
+    texto_relleno(a, "0", 6)
+    texto_relleno(a, "100644", 8)
+    texto_relleno(a, str_desde_entero(tam + n), 10)
+    str_agregar_byte(a, 96)
+    str_agregar_byte(a, 10)
+    str_agregar(a, nombre)
+    bytes_le(a, 0, n - str_largo(nombre))
+    retornar 0
+}
+
+funcion empaquetar_archivo(objeto, simbolos) {
+    sea nombres = vec_nuevo()
+    sea i = 0
+    mientras (i < vec_largo(simbolos)) {
+        vec_agregar(nombres, __cargar64(vec_obtener(simbolos, i)))
+        i = i + 1
+    }
+    sea orden = orden_textos(nombres)
+    sea cadenas = str_nuevo(256)
+    sea strx = vec_nuevo()
+    i = 0
+    mientras (i < vec_largo(orden)) {
+        vec_agregar(strx, str_largo(cadenas))
+        str_agregar(cadenas, vec_obtener(nombres, vec_obtener(orden, i)))
+        str_agregar_byte(cadenas, 0)
+        i = i + 1
+    }
+    mientras (str_largo(cadenas) % 8 != 4) { str_agregar_byte(cadenas, 0) }
+    // __.SYMDEF SORTED en 8 + 60, nombre de 20 bytes → datos alineados a 8.
+    sea tam_tabla = 4 + vec_largo(orden) * 8 + 4 + str_largo(cadenas)
+    sea inicio_objeto = 8 + 60 + 20 + tam_tabla
+    sea nombre_objeto = 20
+    mientras ((inicio_objeto + 60 + nombre_objeto) % 8 != 0) { nombre_objeto = nombre_objeto + 1 }
+    sea a = str_nuevo(inicio_objeto + 128 + str_largo(objeto))
+    str_agregar(a, "!<arch>\n")
+    miembro_ar(a, "__.SYMDEF SORTED", 20, tam_tabla)
+    bytes_le(a, vec_largo(orden) * 8, 4)
+    i = 0
+    mientras (i < vec_largo(orden)) {
+        bytes_le(a, vec_obtener(strx, i), 4)
+        bytes_le(a, inicio_objeto, 4)
+        i = i + 1
+    }
+    bytes_le(a, str_largo(cadenas), 4)
+    str_agregar(a, cadenas)
+    miembro_ar(a, "cforge.o", nombre_objeto, str_largo(objeto))
+    str_agregar(a, objeto)
+    si (str_largo(a) % 2 != 0) { str_agregar_byte(a, 10) }
+    retornar a
+}

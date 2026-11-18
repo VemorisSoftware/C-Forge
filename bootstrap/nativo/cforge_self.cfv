@@ -39,12 +39,14 @@
 // 280 valores por defecto pendientes [nombre][posición del token]
 // 288 atributos #[...] [atributo][argumentos][función]
 // 296 plataforma objetivo: 0 Linux x86-64 (ELF) · 1 Windows (PE64) ·
-//     2 macOS x86-64 (Mach-O) · 3 macOS ARM64 (Mach-O) · 4 Linux ARM64 (ELF)
+//     2 macOS x86-64 (Mach-O) · 3 macOS ARM64 (Mach-O) · 4 Linux ARM64 (ELF) ·
+//     5 iOS ARM64 (Mach-O) · 6 simulador de iOS en Apple Silicon (Mach-O)
 // 304 importaciones de Windows [dll][función]
 // 312 etiqueta del trampolín de hilos de Windows (o -1)
+// 320 símbolos exportados de una biblioteca (--lib) [nombre][posición]
 
 funcion ctx_nuevo(tokens) {
-    sea c = mem_reservar(320)
+    sea c = mem_reservar(328)
     __guardar64(c, tokens)
     __guardar64(c + 8, 0)
     __guardar64(c + 16, str_nuevo(65536))
@@ -93,8 +95,11 @@ funcion ctx_nuevo(tokens) {
 
 funcion ctx_codigo(c) { retornar __cargar64(c + 16) }
 funcion es_windows(c) { retornar __cargar64(c + 296) == 1 }
-funcion es_macos(c) { retornar __cargar64(c + 296) == 2 o __cargar64(c + 296) == 3 }
-funcion es_arm64(c) { retornar __cargar64(c + 296) == 3 o __cargar64(c + 296) == 4 }
+// Darwin (macOS e iOS): libSystem, dyld y Mach-O.
+funcion es_macos(c) { retornar es_darwin_numero(__cargar64(c + 296)) }
+funcion es_darwin_numero(t) { retornar t == 2 o t == 3 o t == 5 o t == 6 }
+funcion es_ios(c) { retornar __cargar64(c + 296) == 5 o __cargar64(c + 296) == 6 }
+funcion es_arm64(c) { retornar __cargar64(c + 296) >= 3 }                // 3, 4, 5 y 6
 funcion ctx_modo(c) { retornar __cargar64(c + 104) }
 // 2: programa del usuario · 3: biblioteca del lenguaje (también dinámica)
 funcion dinamico(c) { retornar __cargar64(c + 104) >= 2 }
@@ -583,16 +588,20 @@ funcion contar_parametros(tokens, j) {
 // PT_DYNAMIC, símbolos débiles y GOT). Una envoltura convierte los valores
 // del lenguaje a la ABI System V AMD64 y de vuelta.
 
+// extern "lib" funcion nombre(parámetros) [: tipo] [como "símbolo"]
+// Registro: [símbolo][biblioteca][etiqueta][casilla][original][nombre]
 funcion registrar_externa(c, i) {
     sea tokens = __cargar64(c)
-    sea simbolo = lexema_en(tokens, i + 3)
+    sea nombre = lexema_en(tokens, i + 3)
+    sea simbolo = simbolo_externo(tokens, i, nombre)
     // Repetir una declaración (como un prototipo de C) reutiliza la primera.
     sea externas = __cargar64(c + 256)
     sea k = 0
     mientras (k < vec_largo(externas)) {
         sea previa_e = vec_obtener(externas, k)
-        si (__cargar64(previa_e + 32) == 0 y str_igual(__cargar64(previa_e), simbolo)) {
-            sea alias = mem_reservar(40)
+        si (__cargar64(previa_e + 32) == 0 y str_igual(__cargar64(previa_e + 40), nombre)) {
+            sea alias = mem_reservar(48)
+            __guardar64(alias + 40, nombre)
             __guardar64(alias, simbolo)
             __guardar64(alias + 8, __cargar64(previa_e + 8))
             __guardar64(alias + 16, __cargar64(previa_e + 16))
@@ -604,14 +613,15 @@ funcion registrar_externa(c, i) {
         k = k + 1
     }
     // Una externa reemplaza a una función del lenguaje con el mismo nombre.
-    sea previa = indice_funcion(c, simbolo)
+    sea previa = indice_funcion(c, nombre)
     si (previa >= 0) {
         sea modo_previo = __cargar64(vec_obtener(__cargar64(c + 48), previa) + 24)
         si (modo_previo != 1 y modo_previo != 3) {
-            rt_panico(str_concatenar("función externa definida dos veces: ", simbolo))
+            rt_panico(str_concatenar("función externa definida dos veces: ", nombre))
         }
     }
-    sea e = mem_reservar(40)
+    sea e = mem_reservar(48)
+    __guardar64(e + 40, nombre)
     __guardar64(e, simbolo)
     __guardar64(e + 8, decodificar_literal(lexema_en(tokens, i + 1)))
     __guardar64(e + 16, nueva_etiqueta(c))
@@ -621,12 +631,31 @@ funcion registrar_externa(c, i) {
     casillas_dl(c)
     sea f = mem_reservar(40)
     __guardar64(f + 32, 0)
-    __guardar64(f, simbolo)
+    __guardar64(f, nombre)
     __guardar64(f + 8, __cargar64(e + 16))
     __guardar64(f + 16, contar_parametros(tokens, i + 5))
     __guardar64(f + 24, 2)
     si (previa >= 0) { vec_fijar(__cargar64(c + 48), previa, f) } sino { vec_agregar(__cargar64(c + 48), f) }
     retornar 0
+}
+
+// Símbolo C de una declaración externa: el texto tras "como"/"as" después
+// de la firma, o el mismo nombre.
+funcion simbolo_externo(tokens, i, nombre) {
+    sea j = i + 5
+    sea nivel = 1
+    mientras (nivel > 0 y j < vec_largo(tokens)) {
+        sea t = vec_obtener(tokens, j)
+        si (__cargar64(t) == 5) { retornar nombre }
+        si (__cargar64(t) == 4 y str_igual(__cargar64(t + 8), "(")) { nivel = nivel + 1 }
+        si (__cargar64(t) == 4 y str_igual(__cargar64(t + 8), ")")) { nivel = nivel - 1 }
+        j = j + 1
+    }
+    si (j + 1 < vec_largo(tokens) y es_simbolo(vec_obtener(tokens, j), ":")) { j = j + 2 }
+    si (j + 1 < vec_largo(tokens) y __cargar64(vec_obtener(tokens, j)) == 1 y (str_igual(lexema_en(tokens, j), "como") o str_igual(lexema_en(tokens, j), "as")) y __cargar64(vec_obtener(tokens, j + 1)) == 3) {
+        retornar decodificar_literal(lexema_en(tokens, j + 1))
+    }
+    retornar nombre
 }
 
 // Dos casillas en datos que el enlazador dinámico llena con dlopen y dlsym.
@@ -674,7 +703,7 @@ funcion nombre_biblioteca_macos(nombre) {
 
 funcion nombre_biblioteca(nombre) {
     si (mem_global(33) == 1) { retornar nombre_biblioteca_windows(nombre) }
-    si (mem_global(33) == 2 o mem_global(33) == 3) { retornar nombre_biblioteca_macos(nombre) }
+    si (es_darwin_numero(mem_global(33))) { retornar nombre_biblioteca_macos(nombre) }
     si (str_igual(nombre, "libc") o str_igual(nombre, "c")) { retornar "libc.so.6" }
     si (str_igual(nombre, "libm") o str_igual(nombre, "m")) { retornar "libm.so.6" }
     si (str_buscar_en(nombre, ".so") >= 0 o str_buscar_en(nombre, "/") >= 0) { retornar nombre }
@@ -719,6 +748,7 @@ funcion declaracion_externa(c) {
         mientras (ver(c, ")") == 0) { avanzar(c) }
         requerir(c, ")")
         si (tomar(c, ":")) { requerir_ident(c) }
+        si (tomar(c, "como") o tomar(c, "as")) { avanzar(c) }
         tomar(c, ";")
         sea original = __cargar64(e + 32)
         si (__cargar64(original + 24) >= 0) { asegurar_externa(c, original) }
@@ -739,6 +769,7 @@ funcion declaracion_externa(c) {
     requerir(c, ")")
     sea resultado = 4
     si (tomar(c, ":")) { resultado = clase_tipo(c, requerir_ident(c)) }
+    si (tomar(c, "como") o tomar(c, "as")) { avanzar(c) }
     tomar(c, ";")
     // Casilla con la dirección de la función (se llena en el primer uso).
     sea datos = ctx_datos(c)
@@ -777,9 +808,13 @@ funcion declaracion_externa(c) {
         empujar(c)
         llamar_runtime(c, "dyn_desde_f64", 1)
     }
-    si (resultado == 5) { op_extender32(c) }
-    si (resultado == 0 o resultado == 5) {
+    si (resultado == 5) {
+        op_extender32(c)
         op_etiquetar(c, 1)
+    }
+    si (resultado == 0) {
+        empujar(c)
+        llamar_runtime(c, "dyn_entero_desde_c", 1)
     }
     si (resultado == 2) {
         empujar(c)
@@ -3108,7 +3143,10 @@ funcion emitir_tabla_clases(c) {
 funcion compilar(c) {
     registrar_funciones(c)
     sea principal = nueva_etiqueta(c)
-    op_inicio(c, principal)
+    // --lib (global 40 del compilador: 1 archivo .a, 2 objeto .o): sin
+    // punto de entrada; las envolturas C llaman al programa principal.
+    sea biblioteca = mem_global(40)
+    si (biblioteca == 0) { op_inicio(c, principal) }
     definir_etiqueta(c, principal)
     sea marco = prologo(c)
     si (__cargar64(c + 200) y buscar_funcion(c, "dyn_fijar_ingles") != 0) {
@@ -3129,6 +3167,7 @@ funcion compilar(c) {
         definir_etiqueta(c, __cargar64(c + 312))
         op_trampolin_hilo(c)
     }
+    si (biblioteca) { __guardar64(c + 320, emitir_envolturas(c, principal)) }
     emitir_tabla_clases(c)
     retornar 0
 }
@@ -3304,6 +3343,11 @@ funcion aplicar_arreglos(c, va_codigo, va_datos, va_globales, iat) {
 }
 
 funcion empaquetar(c) {
+    si (mem_global(40) != 0) {
+        sea objeto = empaquetar_objeto(c, __cargar64(c + 320))
+        si (mem_global(40) == 2) { retornar objeto }
+        retornar empaquetar_archivo(objeto, __cargar64(c + 320))
+    }
     si (es_windows(c)) { retornar empaquetar_pe(c) }
     si (es_macos(c)) { retornar empaquetar_macho(c) }
     sea base = 4194304
@@ -3701,13 +3745,18 @@ funcion empaquetar_macho(c) {
     bytes_le(m, 0, 6)
     bytes_le(m, 50, 4)                                         // LC_BUILD_VERSION
     bytes_le(m, 24, 4)
-    bytes_le(m, 1, 4)                                          // macOS
+    bytes_le(m, plataforma_macho(c), 4)                        // 1 macOS · 2 iOS · 7 simulador
+    si (es_ios(c)) {
+        bytes_le(m, 917504, 4)                                 // minos 14.0
+        bytes_le(m, 917504, 4)
+    } sino {
     si (arm) {
         bytes_le(m, 720896, 4)                                 // minos 11.0
         bytes_le(m, 720896, 4)
     } sino {
         bytes_le(m, 659200, 4)                                 // minos 10.15
         bytes_le(m, 659200, 4)                                 // sdk 10.15
+    }
     }
     bytes_le(m, 0, 4)
     si (arm) {
@@ -3729,6 +3778,12 @@ funcion empaquetar_macho(c) {
         firma_adhoc(m, inicio_firma, tam_texto)
     }
     retornar m
+}
+
+funcion plataforma_macho(c) {
+    si (__cargar64(c + 296) == 5) { retornar 2 }
+    si (__cargar64(c + 296) == 6) { retornar 7 }
+    retornar 1
 }
 
 // Instrucciones de rebase de dyld para cada puntero absoluto de __DATA
@@ -4186,8 +4241,10 @@ funcion numero_plataforma(nombre) {
     si (str_igual(nombre, "macos") o str_igual(nombre, "macos-x64") o str_igual(nombre, "darwin")) { retornar 2 }
     si (str_igual(nombre, "macos-arm64") o str_igual(nombre, "macos-aarch64")) { retornar 3 }
     si (str_igual(nombre, "linux-arm64") o str_igual(nombre, "linux-aarch64")) { retornar 4 }
+    si (str_igual(nombre, "ios-arm64") o str_igual(nombre, "ios")) { retornar 5 }
+    si (str_igual(nombre, "ios-sim-arm64") o str_igual(nombre, "ios-simulator")) { retornar 6 }
     si (str_igual(nombre, "linux") o str_igual(nombre, "linux-x64")) { retornar 0 }
-    rt_panico(str_concatenar("plataforma desconocida: ", str_concatenar(nombre, " (linux, linux-arm64, windows, macos, macos-arm64)")))
+    rt_panico(str_concatenar("plataforma desconocida: ", str_concatenar(nombre, " (linux, linux-arm64, windows, macos, macos-arm64, ios-arm64, ios-sim-arm64)")))
     retornar 0
 }
 

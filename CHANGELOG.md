@@ -99,6 +99,10 @@ Sitio oficial: [c-forge.org](https://c-forge.org)
 - **`cforge fmt`** (formateador idempotente que conserva los tokens) y
   **`cforge lsp`** (diagnósticos, autocompletado, definición, información y
   formateo), con la extensión de VS Code como cliente del servidor (`.vsix`).
+- **Apple**: `cforge build --lib` (`.a` + `.h` de las funciones `#[Exportar]`),
+  `--target ios-arm64` / `ios-sim-arm64`, `cforge xcode-init` (regla de
+  Xcode, cabecera puente para Swift, `CForge.xclangspec`) y `stdlib/apple.cfv`
+  (puente con Objective-C).
 - **CI**: smoke test con rutas absolutas; se elimina `build-native.yml`
   (duplicado).
 - **Web**: c-forge.org vive en `site/` y se despliega en Cloudflare Pages; se
