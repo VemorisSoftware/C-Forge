@@ -44,9 +44,14 @@
 // 304 importaciones de Windows [dll][función]
 // 312 etiqueta del trampolín de hilos de Windows (o -1)
 // 320 símbolos exportados de una biblioteca (--lib) [nombre][posición]
+// Tipos estáticos (verificación antes de ejecutar, solo en el lenguaje):
+// 328 tipo de la última expresión · 336 variables [nombre][tipo] · 344 tipos
+// de los parámetros pendientes · 352 retorno pendiente · 360 retorno de la
+// función actual · 368 tipo para la próxima variable declarada
 
 funcion ctx_nuevo(tokens) {
-    sea c = mem_reservar(328)
+    sea c = mem_reservar(384)
+    mem_llenar(c, 0, 384)
     __guardar64(c, tokens)
     __guardar64(c + 8, 0)
     __guardar64(c + 16, str_nuevo(65536))
@@ -88,6 +93,8 @@ funcion ctx_nuevo(tokens) {
     __guardar64(c + 280, vec_nuevo())
     __guardar64(c + 288, vec_nuevo())
     __guardar64(c + 296, 0)
+    __guardar64(c + 336, vec_nuevo())
+    __guardar64(c + 344, vec_nuevo())
     __guardar64(c + 304, vec_nuevo())
     __guardar64(c + 312, 0 - 1)
     retornar c
@@ -186,16 +193,220 @@ funcion requerir_ident(c) {
 
 // Anotación de tipo opcional: ": tipo"
 funcion saltar_tipo(c) {
+    sea t = 0
     si (tomar(c, ":")) {
-        requerir_ident(c)
+        t = tipo_por_nombre(requerir_ident(c))
         saltar_genericos(c)
         tomar(c, "?")
         mientras (ver(c, "[") y str_igual(tok_siguiente_lexema(c), "]")) {
             avanzar(c)
             avanzar(c)
+            t = 4
         }
     }
+    retornar t
+}
+
+// ── Tipos estáticos ───────────────────────────────────────────────────────
+// 0 desconocido · 1 entero · 9 numero · 2 texto · 3 booleano · 4 lista ·
+// 5 mapa · 6 nulo · 7 funcion. Lo desconocido (dinámico) es compatible con
+// todo; nulo, con cualquier tipo; entero y numero, entre sí.
+
+funcion tipo_por_nombre(n) {
+    si (str_igual(n, "numero") o str_igual(n, "número") o str_igual(n, "number") o str_igual(n, "flotante") o str_igual(n, "float") o str_igual(n, "doble") o str_igual(n, "double") o str_igual(n, "decimal")) { retornar 9 }
+    si (str_igual(n, "entero") o str_igual(n, "int") o str_igual(n, "integer") o str_igual(n, "largo") o str_igual(n, "long") o str_igual(n, "entero32")) { retornar 1 }
+    si (str_igual(n, "texto") o str_igual(n, "string") o str_igual(n, "cadena") o str_igual(n, "str")) { retornar 2 }
+    si (str_igual(n, "booleano") o str_igual(n, "bool") o str_igual(n, "boolean") o str_igual(n, "logico")) { retornar 3 }
+    si (str_igual(n, "lista") o str_igual(n, "list") o str_igual(n, "arreglo") o str_igual(n, "array")) { retornar 4 }
+    si (str_igual(n, "mapa") o str_igual(n, "map") o str_igual(n, "dict") o str_igual(n, "diccionario")) { retornar 5 }
+    si (str_igual(n, "nulo") o str_igual(n, "null") o str_igual(n, "vacio") o str_igual(n, "void")) { retornar 6 }
+    si (str_igual(n, "funcion") o str_igual(n, "function") o str_igual(n, "fn")) { retornar 7 }
     retornar 0
+}
+
+funcion nombre_de_tipo(t) {
+    si (t == 1) { retornar "entero" }
+    si (t == 9) { retornar "numero" }
+    si (t == 2) { retornar "texto" }
+    si (t == 3) { retornar "booleano" }
+    si (t == 4) { retornar "lista" }
+    si (t == 5) { retornar "mapa" }
+    si (t == 6) { retornar "nulo" }
+    si (t == 7) { retornar "funcion" }
+    retornar "desconocido"
+}
+
+funcion es_numerico(t) { retornar t == 1 o t == 9 }
+funcion tipo_actual(c) { retornar __cargar64(c + 328) }
+funcion fijar_tipo(c, t) {
+    __guardar64(c + 328, t)
+    retornar 0
+}
+
+funcion tipos_compatibles(esperado, real) {
+    si (esperado == 0 o real == 0 o real == 6) { retornar 1 }
+    si (es_numerico(esperado) y es_numerico(real)) { retornar 1 }
+    retornar esperado == real
+}
+
+// Error de tipos en la línea de la expresión recién compilada.
+funcion error_tipos(c, mensaje) {
+    sea m = ubicacion(c, linea_previa(c))
+    str_agregar(m, ": ")
+    str_agregar(m, mensaje)
+    rt_panico(m)
+    retornar 0
+}
+
+funcion exigir_tipo(c, esperado, real, que) {
+    si (dinamico(c) y tipos_compatibles(esperado, real) == 0) {
+        sea m = str_concatenar("error de tipos: ", que)
+        str_agregar(m, " espera ")
+        str_agregar(m, nombre_de_tipo(esperado))
+        str_agregar(m, " y recibe ")
+        str_agregar(m, nombre_de_tipo(real))
+        error_tipos(c, m)
+    }
+    retornar 0
+}
+
+// Tipo conocido de una variable (la declaración más reciente con ese nombre).
+funcion tipo_variable(c, nombre) {
+    sea v = __cargar64(c + 336)
+    si (v == 0) { retornar 0 }
+    sea i = vec_largo(v) - 1
+    mientras (i >= 0) {
+        sea e = vec_obtener(v, i)
+        si (str_igual(__cargar64(e), nombre)) { retornar __cargar64(e + 8) }
+        i = i - 1
+    }
+    retornar 0
+}
+
+funcion anotar_tipo_variable(c, nombre, tipo) {
+    sea v = __cargar64(c + 336)
+    si (v == 0 o dinamico(c) == 0) { retornar 0 }
+    sea e = mem_reservar(16)
+    __guardar64(e, nombre)
+    __guardar64(e + 8, tipo)
+    vec_agregar(v, e)
+    retornar 0
+}
+
+// ¿Se vuelve a asignar "nombre" desde la posición desde hasta el final del
+// bloque (o de todo el programa)? nombre =, nombre += …, para nombre en …
+funcion reasignada(c, nombre, desde, todo) {
+    sea tokens = __cargar64(c)
+    sea i = desde
+    // Una global: todo el código del programa (dialecto 2), no el runtime.
+    sea modo = 2
+    si (todo) {
+        i = 0
+        modo = 0
+    }
+    sea nivel = 0
+    mientras (i + 1 < vec_largo(tokens)) {
+        sea t = vec_obtener(tokens, i)
+        si (__cargar64(t) == 1 y str_igual(__cargar64(t + 8), "__dialecto")) { modo = numero_literal(lexema_en(tokens, i + 1)) }
+        si (__cargar64(t) == 4) {
+            si (str_igual(__cargar64(t + 8), "{")) { nivel = nivel + 1 }
+            si (str_igual(__cargar64(t + 8), "}")) {
+                nivel = nivel - 1
+                si (nivel < 0 y todo == 0) { retornar 0 }
+            }
+        }
+        si (modo == 2 y __cargar64(t) == 1 y str_igual(__cargar64(t + 8), nombre) y i != desde) {
+            sea sig = vec_obtener(tokens, i + 1)
+            sea ls = __cargar64(sig + 8)
+            si (__cargar64(sig) == 4 y str_igual(ls, "=")) { retornar 1 }
+            si (__cargar64(sig) == 4 y (str_igual(ls, "+") o str_igual(ls, "-") o str_igual(ls, "*") o str_igual(ls, "/") o str_igual(ls, "%")) y i + 2 < vec_largo(tokens) y es_simbolo(vec_obtener(tokens, i + 2), "=")) { retornar 1 }
+            si (i > 0 y str_igual(lexema_en(tokens, i - 1), "para")) { retornar 1 }
+        }
+        i = i + 1
+    }
+    retornar 0
+}
+
+// Resultado y comprobación de un operador binario con tipos conocidos.
+funcion tipo_binario(c, lex, tl, tr) {
+    si (dinamico(c) == 0) { retornar 0 }
+    sea conocidos = tl != 0 y tr != 0
+    si (str_igual(lex, "==") o str_igual(lex, "!=")) { retornar fijar_tipo(c, 3) }
+    si (str_igual(lex, "<") o str_igual(lex, "<=") o str_igual(lex, ">") o str_igual(lex, ">=")) {
+        si (conocidos y (es_numerico(tl) y es_numerico(tr)) == 0 y (tl == 2 y tr == 2) == 0) {
+            sea m = str_concatenar("error de tipos: no se puede comparar ", nombre_de_tipo(tl))
+            str_agregar(m, " con ")
+            str_agregar(m, nombre_de_tipo(tr))
+            error_tipos(c, m)
+        }
+        retornar fijar_tipo(c, 3)
+    }
+    si (str_igual(lex, "+")) {
+        si (tl == 2 o tr == 2) { retornar fijar_tipo(c, 2) }
+        si (es_numerico(tl) y es_numerico(tr)) {
+            si (tl == 1 y tr == 1) { retornar fijar_tipo(c, 1) }
+            retornar fijar_tipo(c, 9)
+        }
+        si (tl == 4 y tr == 4) { retornar fijar_tipo(c, 4) }
+        si (conocidos) {
+            sea m = str_concatenar("error de tipos: no se puede sumar ", nombre_de_tipo(tl))
+            str_agregar(m, " y ")
+            str_agregar(m, nombre_de_tipo(tr))
+            error_tipos(c, m)
+        }
+        retornar fijar_tipo(c, 0)
+    }
+    // - * / %: números.
+    si ((tl != 0 y es_numerico(tl) == 0) o (tr != 0 y es_numerico(tr) == 0)) {
+        sea m = str_concatenar("error de tipos: '", lex)
+        str_agregar(m, "' necesita números y recibe ")
+        str_agregar(m, nombre_de_tipo(tl))
+        str_agregar(m, " y ")
+        str_agregar(m, nombre_de_tipo(tr))
+        error_tipos(c, m)
+    }
+    si (conocidos y tl == 1 y tr == 1 y str_igual(lex, "/") == 0) { retornar fijar_tipo(c, 1) }
+    si (conocidos) { retornar fijar_tipo(c, 9) }
+    retornar fijar_tipo(c, 0)
+}
+
+// Tipos de la firma "(a: t, b, ...): r" en tokens desde j (tras el "(").
+// Devuelve [vec de tipos][retorno].
+funcion firma_tipos(tokens, j) {
+    sea r = mem_reservar(16)
+    sea tipos = vec_nuevo()
+    __guardar64(r, tipos)
+    __guardar64(r + 8, 0)
+    sea nivel = 1
+    sea esperando = 1
+    mientras (nivel > 0 y j < vec_largo(tokens)) {
+        sea t = vec_obtener(tokens, j)
+        sea lex = __cargar64(t + 8)
+        si (__cargar64(t) == 4 y (str_igual(lex, "(") o str_igual(lex, "[") o str_igual(lex, "{"))) { nivel = nivel + 1 }
+        si (__cargar64(t) == 4 y (str_igual(lex, ")") o str_igual(lex, "]") o str_igual(lex, "}"))) { nivel = nivel - 1 }
+        si (nivel == 1 y __cargar64(t) == 4 y str_igual(lex, ",")) { esperando = 1 }
+        si (nivel == 1 y esperando y __cargar64(t) == 1) {
+            esperando = 0
+            sea tipo = 0
+            si (j + 2 < vec_largo(tokens) y es_simbolo(vec_obtener(tokens, j + 1), ":")) { tipo = tipo_en_tokens(tokens, j + 2) }
+            vec_agregar(tipos, tipo)
+        }
+        j = j + 1
+    }
+    si (j + 1 < vec_largo(tokens) y es_simbolo(vec_obtener(tokens, j), ":")) { __guardar64(r + 8, tipo_en_tokens(tokens, j + 1)) }
+    retornar r
+}
+
+funcion tipo_en_tokens(tokens, k) {
+    sea t = vec_obtener(tokens, k)
+    si (__cargar64(t) != 1) { retornar 0 }
+    sea tipo = tipo_por_nombre(__cargar64(t + 8))
+    sea fin = fin_genericos(tokens, k + 1)
+    si (fin >= 0) { k = fin }
+    k = k + 1
+    si (k < vec_largo(tokens) y es_simbolo(vec_obtener(tokens, k), "?")) { k = k + 1 }
+    si (k + 1 < vec_largo(tokens) y es_simbolo(vec_obtener(tokens, k), "[") y es_simbolo(vec_obtener(tokens, k + 1), "]")) { tipo = 4 }
+    retornar tipo
 }
 
 // Fin (índice del ">" que cierra) de una lista de tipos genéricos que empieza
@@ -439,8 +650,10 @@ funcion buscar_funcion(c, nombre) {
 // dinámico define una función con el nombre de una del lenguaje (puente),
 // la del programa tiene prioridad, como en el intérprete.
 funcion registrar_funcion(c, nombre, parametros, modo) {
-    sea f = mem_reservar(40)
+    sea f = mem_reservar(56)
     __guardar64(f + 32, 0)
+    __guardar64(f + 40, 0)
+    __guardar64(f + 48, 0)
     __guardar64(f, nombre)
     __guardar64(f + 8, nueva_etiqueta(c))
     __guardar64(f + 16, parametros)
@@ -496,6 +709,11 @@ funcion registrar_funciones(c) {
             si (fin_gen >= 0) { abre = fin_gen + 1 }
             sea f = registrar_funcion(c, nombre, contar_parametros(tokens, abre + 1), modo)
             __guardar64(f + 32, es_variadica(tokens, abre + 1))
+            si (modo >= 2) {
+                sea firma = firma_tipos(tokens, abre + 1)
+                __guardar64(f + 40, __cargar64(firma))
+                __guardar64(f + 48, __cargar64(firma + 8))
+            }
             registrar_atributos(c, tokens, i, nombre)
             i = i + 1
         }
@@ -626,8 +844,10 @@ funcion registrar_externa(c, i) {
     __guardar64(e + 32, 0)
     vec_agregar(__cargar64(c + 256), e)
     casillas_dl(c)
-    sea f = mem_reservar(40)
+    sea f = mem_reservar(56)
     __guardar64(f + 32, 0)
+    __guardar64(f + 40, 0)
+    __guardar64(f + 48, 0)
     __guardar64(f, nombre)
     __guardar64(f + 8, __cargar64(e + 16))
     __guardar64(f + 16, contar_parametros(tokens, i + 5))
@@ -947,8 +1167,10 @@ funcion finalizar_clases(c) {
         si (buscar_funcion(c, __cargar64(k)) != 0) {
             rt_panico(str_concatenar("nombre usado por una clase y una función: ", __cargar64(k)))
         }
-        sea f = mem_reservar(40)
+        sea f = mem_reservar(56)
         __guardar64(f + 32, 0)
+        __guardar64(f + 40, 0)
+        __guardar64(f + 48, 0)
         __guardar64(f, __cargar64(k))
         __guardar64(f + 8, __cargar64(k + 32))
         __guardar64(f + 16, aridad)
@@ -981,6 +1203,8 @@ funcion marco_nuevo(base, celdas, padre, es_cierre) {
 
 // Variable: [nombre][desplazamiento][en celda]
 funcion declarar_variable(c, nombre, desplazamiento) {
+    anotar_tipo_variable(c, nombre, __cargar64(c + 368))
+    __guardar64(c + 368, 0)
     sea v = mem_reservar(24)
     __guardar64(v, nombre)
     __guardar64(v + 8, desplazamiento)
@@ -1515,14 +1739,48 @@ funcion llamar_runtime(c, nombre, n) {
 }
 
 funcion llamada(c, nombre) {
-    si (intrinseco(c, nombre)) { retornar 0 }
+    si (intrinseco(c, nombre)) {
+        fijar_tipo(c, 0)
+        retornar 0
+    }
     sea f = funcion_llamable(c, nombre)
     si (__cargar64(f + 32)) {
         emitir_llamada(c, f, argumentos_variadicos(c, __cargar64(f + 16) - 1))
+        fijar_tipo(c, 0)
+        retornar 0
+    }
+    si (dinamico(c) y __cargar64(f + 40) != 0) {
+        emitir_llamada(c, f, argumentos_tipados(c, f))
+        fijar_tipo(c, __cargar64(f + 48))
         retornar 0
     }
     emitir_llamada(c, f, argumentos(c))
+    fijar_tipo(c, 0)
     retornar 0
+}
+
+// Argumentos comprobados contra los tipos anotados de los parámetros.
+funcion argumentos_tipados(c, f) {
+    sea tipos = __cargar64(f + 40)
+    requerir(c, "(")
+    sea n = 0
+    si (ver(c, ")") == 0) {
+        sea seguir = 1
+        mientras (seguir) {
+            expresion(c)
+            si (n < vec_largo(tipos)) {
+                sea que = str_concatenar("el argumento ", str_desde_entero(n + 1))
+                str_agregar(que, " de ")
+                str_agregar(que, __cargar64(f))
+                exigir_tipo(c, vec_obtener(tipos, n), tipo_actual(c), que)
+            }
+            empujar(c)
+            n = n + 1
+            seguir = tomar(c, ",")
+        }
+    }
+    requerir(c, ")")
+    retornar n
 }
 
 // f(a, b, x, y, z) con f(a, b, ...resto): los argumentos desde el fijo
@@ -1557,6 +1815,7 @@ funcion argumentos_variadicos(c, k) {
 // En modo dinámico convierte rax (valor del lenguaje) en 0/1 para saltos.
 funcion condicion(c) {
     si (dinamico(c)) {
+        exigir_tipo(c, 3, tipo_actual(c), "la condición")
         empujar(c)
         llamar_runtime(c, "dyn_verdad", 1)
     }
@@ -1640,15 +1899,18 @@ funcion numero_dinamico(c) {
         cargar_inmediato(c, bits)
         empujar(c)
         llamar_runtime(c, "dyn_flotante", 1)
+        fijar_tipo(c, 9)
         retornar 0
     }
     si (con_exponente) {
         cargar_inmediato(c, escalar_potencia10(bits, exponente))
         empujar(c)
         llamar_runtime(c, "dyn_flotante", 1)
+        fijar_tipo(c, 9)
         retornar 0
     }
     cargar_inmediato(c, entero * 2 + 1)
+    fijar_tipo(c, 1)
     retornar 0
 }
 
@@ -1960,15 +2222,17 @@ funcion primaria_dinamica(c) {
         sea lexema = __cargar64(avanzar(c) + 8)
         si (tiene_interpolacion(lexema)) {
             texto_interpolado(c, lexema)
+            fijar_tipo(c, 2)
             retornar 0
         }
         sea d = literal_caja(c, lexema)
         op_direccion(c, 1, d)
+        fijar_tipo(c, 2)
         retornar 0
     }
-    si (tomar(c, "verdadero")) { cargar_inmediato(c, 4) retornar 0 }
-    si (tomar(c, "falso")) { cargar_inmediato(c, 2) retornar 0 }
-    si (tomar(c, "nulo")) { cargar_inmediato(c, 0) retornar 0 }
+    si (tomar(c, "verdadero")) { cargar_inmediato(c, 4) fijar_tipo(c, 3) retornar 0 }
+    si (tomar(c, "falso")) { cargar_inmediato(c, 2) fijar_tipo(c, 3) retornar 0 }
+    si (tomar(c, "nulo")) { cargar_inmediato(c, 0) fijar_tipo(c, 6) retornar 0 }
     si (ver(c, "si") y str_igual(tok_siguiente_lexema(c), "(")) {
         // si(condición, a, b): solo se evalúa la rama elegida.
         avanzar(c)
@@ -1986,6 +2250,7 @@ funcion primaria_dinamica(c) {
         expresion(c)
         requerir(c, ")")
         definir_etiqueta(c, fin)
+        fijar_tipo(c, 0)
         retornar 0
     }
     si (ver(c, "super") y str_igual(tok_siguiente_lexema(c), ".")) {
@@ -1993,8 +2258,8 @@ funcion primaria_dinamica(c) {
         llamada_super(c)
         retornar 0
     }
-    si (tomar(c, "[")) { lista_literal(c) retornar 0 }
-    si (tomar(c, "{")) { mapa_literal(c) retornar 0 }
+    si (tomar(c, "[")) { lista_literal(c) fijar_tipo(c, 4) retornar 0 }
+    si (tomar(c, "{")) { mapa_literal(c) fijar_tipo(c, 5) retornar 0 }
     si (tomar(c, "(")) {
         expresion(c)
         requerir(c, ")")
@@ -2003,6 +2268,7 @@ funcion primaria_dinamica(c) {
     si (ver(c, "funcion") y str_igual(tok_siguiente_lexema(c), "(")) {
         avanzar(c)
         funcion_anonima(c)
+        fijar_tipo(c, 7)
         retornar 0
     }
     si (tipo == 1) {
@@ -2025,6 +2291,7 @@ funcion primaria_dinamica(c) {
             si (a != 0) {
                 cargar_var(c, a)
                 llamada_cierre(c)
+                fijar_tipo(c, 0)
             } sino {
                 llamada(c, nombre)
             }
@@ -2032,11 +2299,13 @@ funcion primaria_dinamica(c) {
         }
         si (a != 0) {
             cargar_var(c, a)
+            fijar_tipo(c, tipo_variable(c, nombre))
             retornar 0
         }
         sea f = buscar_funcion(c, nombre)
         si (f != 0) {
             valor_funcion(c, f)
+            fijar_tipo(c, 7)
             retornar 0
         }
         error_en(c, str_concatenar("variable desconocida ", nombre))
@@ -2144,8 +2413,13 @@ funcion funcion_anonima(c) {
 
 funcion primaria(c) {
     si (dinamico(c)) {
+        fijar_tipo(c, 0)
         primaria_dinamica(c)
+        sea antes = __cargar64(c + 8)
+        sea t = tipo_actual(c)
         sufijos(c)
+        si (__cargar64(c + 8) != antes) { t = 0 }
+        fijar_tipo(c, t)
         retornar 0
     }
     sea tipo = tok_tipo(c)
@@ -2182,8 +2456,11 @@ funcion unaria(c) {
     si (tomar(c, "-")) {
         unaria(c)
         si (dinamico(c)) {
+            sea t = tipo_actual(c)
+            si (t != 0 y es_numerico(t) == 0) { exigir_tipo(c, 9, t, "'-'") }
             empujar(c)
             llamar_runtime(c, "dyn_neg", 1)
+            fijar_tipo(c, t)
             retornar 0
         }
         op_negar(c)
@@ -2193,19 +2470,23 @@ funcion unaria(c) {
         unaria(c)
         empujar(c)
         llamar_runtime(c, "dyn_direccion", 1)
+        fijar_tipo(c, 0)
         retornar 0
     }
     si (dinamico(c) y tomar(c, "*")) {
         unaria(c)
         empujar(c)
         llamar_runtime(c, "dyn_leer_puntero", 1)
+        fijar_tipo(c, 0)
         retornar 0
     }
     si (tomar(c, "no")) {
         unaria(c)
         si (dinamico(c)) {
+            exigir_tipo(c, 3, tipo_actual(c), "'no'")
             empujar(c)
             llamar_runtime(c, "dyn_no", 1)
+            fijar_tipo(c, 3)
             retornar 0
         }
         op_es_cero(c)
@@ -2256,9 +2537,12 @@ funcion producto(c) {
     mientras (seguir) {
         si (ver(c, "*") o ver(c, "/") o ver(c, "%")) {
             sea lex = __cargar64(avanzar(c) + 8)
+            sea tl = tipo_actual(c)
             empujar(c)
             unaria(c)
+            sea tr = tipo_actual(c)
             aplicar_operador(c, lex)
+            tipo_binario(c, lex, tl, tr)
         } sino {
             seguir = 0
         }
@@ -2272,9 +2556,12 @@ funcion suma(c) {
     mientras (seguir) {
         si (ver(c, "+") o ver(c, "-")) {
             sea lex = __cargar64(avanzar(c) + 8)
+            sea tl = tipo_actual(c)
             empujar(c)
             producto(c)
+            sea tr = tipo_actual(c)
             aplicar_operador(c, lex)
+            tipo_binario(c, lex, tl, tr)
         } sino {
             seguir = 0
         }
@@ -2288,9 +2575,12 @@ funcion comparacion(c) {
     mientras (seguir) {
         si (ver(c, "<") o ver(c, "<=") o ver(c, ">") o ver(c, ">=")) {
             sea lex = __cargar64(avanzar(c) + 8)
+            sea tl = tipo_actual(c)
             empujar(c)
             suma(c)
+            sea tr = tipo_actual(c)
             aplicar_operador(c, lex)
+            tipo_binario(c, lex, tl, tr)
         } sino {
             seguir = 0
         }
@@ -2304,9 +2594,12 @@ funcion igualdad(c) {
     mientras (seguir) {
         si (ver(c, "==") o ver(c, "!=")) {
             sea lex = __cargar64(avanzar(c) + 8)
+            sea tl = tipo_actual(c)
             empujar(c)
             comparacion(c)
+            sea tr = tipo_actual(c)
             aplicar_operador(c, lex)
+            tipo_binario(c, lex, tl, tr)
         } sino {
             seguir = 0
         }
@@ -2323,7 +2616,10 @@ funcion logica(c, operador, siguiente) {
     condicion(c)
     definir_etiqueta(c, fin)
     op_no_cero(c)
-    si (dinamico(c)) { booleano_dinamico(c) }
+    si (dinamico(c)) {
+        booleano_dinamico(c)
+        fijar_tipo(c, 3)
+    }
     retornar 0
 }
 
@@ -2349,6 +2645,7 @@ funcion expresion(c) {
         op_saltar_si_no_cero(c, fin)
         disyuncion(c)
         definir_etiqueta(c, fin)
+        fijar_tipo(c, 0)
     }
     // condición ? a : b
     si (dinamico(c) y ver(c, "?") y str_igual(tok_siguiente_lexema(c), "?") == 0) {
@@ -2363,6 +2660,7 @@ funcion expresion(c) {
         definir_etiqueta(c, otro)
         expresion(c)
         definir_etiqueta(c, fin_ternario)
+        fijar_tipo(c, 0)
     }
     retornar 0
 }
@@ -2378,6 +2676,8 @@ funcion bloque(c) {
     requerir(c, "{")
     sea locales = __cargar64(c + 56)
     sea marca = vec_largo(locales)
+    sea marca_tipos = 0
+    si (__cargar64(c + 336) != 0) { marca_tipos = vec_largo(__cargar64(c + 336)) }
     __guardar64(c + 232, __cargar64(c + 232) + 1)
     mientras (ver(c, "}") == 0) {
         si (tok_tipo(c) == 5) { error_en(c, "falta '}'") }
@@ -2386,6 +2686,7 @@ funcion bloque(c) {
     requerir(c, "}")
     __guardar64(c + 232, __cargar64(c + 232) - 1)
     __guardar64(locales, marca)
+    si (__cargar64(c + 336) != 0) { __guardar64(__cargar64(c + 336), marca_tipos) }
     retornar 0
 }
 
@@ -2624,8 +2925,9 @@ funcion sentencia(c) {
         retornar 0
     }
     si (tomar(c, "sea")) {
+        sea posicion_nombre = __cargar64(c + 8)
         sea nombre = requerir_ident(c)
-        saltar_tipo(c)
+        sea anotado = saltar_tipo(c)
         requerir(c, "=")
         sea g = indice_global(c, nombre)
         // sea f = funcion(..) { .. f(..) .. }: la celda existe antes del cuerpo,
@@ -2640,9 +2942,18 @@ funcion sentencia(c) {
             retornar 0
         }
         expresion(c)
+        sea tipo_var = anotado
+        si (dinamico(c)) {
+            sea que = str_concatenar("la variable ", nombre)
+            exigir_tipo(c, anotado, tipo_actual(c), que)
+            // Sin anotación: el tipo del valor, si nunca se vuelve a asignar.
+            si (anotado == 0 y tipo_actual(c) != 6 y reasignada(c, nombre, posicion_nombre, es_global) == 0) { tipo_var = tipo_actual(c) }
+        }
         si (dinamico(c) y g >= 0 y __cargar64(c + 232) == 0 y __cargar64(__cargar64(c + 216) + 48) == 1) {
             guardar_var(c, acceso(3, g))
+            anotar_tipo_variable(c, nombre, tipo_var)
         } sino {
+            __guardar64(c + 368, tipo_var)
             si (dinamico(c)) { declarar_usuario(c, nombre) } sino { guardar_local(c, declarar_local(c, nombre)) }
         }
         tomar(c, ";")
@@ -2726,7 +3037,11 @@ funcion sentencia(c) {
     si (tomar(c, "romper")) { saltar_a(c, 128, "romper") retornar 0 }
     si (tomar(c, "continuar")) { saltar_a(c, 136, "continuar") retornar 0 }
     si (tomar(c, "retornar")) {
-        si (ver(c, "}") o ver(c, ";")) { cargar_inmediato(c, 0) } sino { expresion(c) }
+        si (ver(c, "}") o ver(c, ";")) {
+            cargar_inmediato(c, 0)
+            fijar_tipo(c, 6)
+        } sino { expresion(c) }
+        si (__cargar64(c + 360) != 6) { exigir_tipo(c, __cargar64(c + 360), tipo_actual(c), "el valor de retorno") }
         tomar(c, ";")
         si (__cargar64(c + 240) > 0) {
             empujar(c)
@@ -2758,6 +3073,7 @@ funcion sentencia(c) {
         sea nombre = __cargar64(avanzar(c) + 8)
         avanzar(c)
         expresion(c)
+        exigir_tipo(c, tipo_variable(c, nombre), tipo_actual(c), str_concatenar("la variable ", nombre))
         guardar_var(c, variable(c, nombre))
         tomar(c, ";")
         retornar 0
@@ -2770,7 +3086,10 @@ funcion sentencia(c) {
         cargar_var(c, d)
         empujar(c)
         expresion(c)
+        sea tr = tipo_actual(c)
         aplicar_operador(c, lex)
+        tipo_binario(c, lex, tipo_variable(c, nombre), tr)
+        exigir_tipo(c, tipo_variable(c, nombre), tipo_actual(c), str_concatenar("la variable ", nombre))
         guardar_var(c, d)
         tomar(c, ";")
         retornar 0
@@ -2818,7 +3137,13 @@ funcion contiene_cierre(c) {
 // Abre una función: guarda el estado del código que la rodea, define su
 // etiqueta, emite el prólogo y declara los parámetros. Devuelve el estado.
 funcion abrir_marco(c, etiqueta, nombres, es_cierre) {
-    sea estado = mem_reservar(80)
+    sea estado = mem_reservar(96)
+    sea tipos_param = __cargar64(c + 344)
+    __guardar64(c + 344, vec_nuevo())
+    si (__cargar64(c + 336) != 0) { __guardar64(estado + 80, vec_largo(__cargar64(c + 336))) } sino { __guardar64(estado + 80, 0) }
+    __guardar64(estado + 88, __cargar64(c + 360))
+    __guardar64(c + 360, __cargar64(c + 352))
+    __guardar64(c + 352, 0)
     sea locales = __cargar64(c + 56)
     __guardar64(estado, vec_largo(locales))
     __guardar64(estado + 8, __cargar64(c + 64))
@@ -2847,6 +3172,7 @@ funcion abrir_marco(c, etiqueta, nombres, es_cierre) {
     sea n = vec_largo(nombres)
     sea i = 0
     mientras (i < n) {
+        si (i < vec_largo(tipos_param)) { __guardar64(c + 368, vec_obtener(tipos_param, i)) }
         declarar_variable(c, vec_obtener(nombres, i), 16 + (n - 1 - i) * 8)
         i = i + 1
     }
@@ -2859,6 +3185,7 @@ funcion abrir_marco(c, etiqueta, nombres, es_cierre) {
             cargar_local(c, 16 + (n - 1 - i) * 8)
             empujar(c)
             llamar_runtime(c, "dyn_celda_nueva", 1)
+            si (i < vec_largo(tipos_param)) { __guardar64(c + 368, vec_obtener(tipos_param, i)) }
             guardar_local(c, declarar_local(c, vec_obtener(nombres, i)))
             marcar_ultima_celda(c)
             i = i + 1
@@ -2883,19 +3210,22 @@ funcion cerrar_funcion(c, estado) {
     __guardar64(c + 232, __cargar64(estado + 56))
     __guardar64(c + 240, __cargar64(estado + 64))
     __guardar64(c + 248, __cargar64(estado + 72))
+    si (__cargar64(c + 336) != 0) { __guardar64(__cargar64(c + 336), __cargar64(estado + 80)) }
+    __guardar64(c + 360, __cargar64(estado + 88))
     mem_liberar(estado)
     retornar 0
 }
 
 // (p1, p2: tipo, ...): tipo → nombres de los parámetros.
 funcion parametros(c, nombres) {
+    __guardar64(c + 344, vec_nuevo())
     requerir(c, "(")
     si (ver(c, ")") == 0) {
         parametro(c, nombres)
         mientras (tomar(c, ",")) { parametro(c, nombres) }
     }
     requerir(c, ")")
-    saltar_tipo(c)
+    __guardar64(c + 352, saltar_tipo(c))
     retornar nombres
 }
 
@@ -2908,7 +3238,7 @@ funcion parametro(c, nombres) {
     }
     sea nombre = requerir_ident(c)
     vec_agregar(nombres, nombre)
-    saltar_tipo(c)
+    vec_agregar(__cargar64(c + 344), saltar_tipo(c))
     si (tomar(c, "=")) {
         sea d = mem_reservar(16)
         __guardar64(d, nombre)

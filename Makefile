@@ -227,6 +227,14 @@ gc-check: build
 	done; \
 	echo "  ✓ recolector: 2 M iteraciones con arena < 50 MB y suite completa en modo estrés"
 
+## Verificador de tipos: 11 errores detectados al compilar y un programa
+## con tipos anotados e inferidos que se acepta y ejecuta.
+tipos-check: build
+	@set -e; cd tests/tipos; \
+	for f in error_*.cfv; do CFORGE_STDLIB=../../stdlib ../../$(TARGET) check $$f 2>&1 | head -1 | sed 's|^\[C-Forge\] ||'; done | diff -u errores.esperados - || { echo "  ✗ tests/tipos"; exit 1; }; \
+	CFORGE_STDLIB=../../stdlib ../../$(TARGET) valido.cfv | grep -q '^\[OK\]'; \
+	echo "  ✓ tipos: 11 errores detectados antes de ejecutar y un programa válido"
+
 ## cforge repl: sesión guardada (sin la línea de versión).
 repl-check: build
 	@set -e; CFORGE_STDLIB=./stdlib ./$(TARGET) repl < tests/repl/entrada.txt 2>&1 | tail -n +2 | diff -u tests/repl/esperado.txt - || { echo "  ✗ cforge repl"; exit 1; }; \
@@ -272,7 +280,7 @@ smoke-test: build
 
 ## Gate único exigido antes de publicar una versión.
 release-check: build nativo-check autoalojado-check semilla-check check test \
-	stdlib-load-check stdlib-check repl-check gc-check cli-check malformed-check install-check smoke-test
+	stdlib-load-check stdlib-check repl-check gc-check tipos-check cli-check malformed-check install-check smoke-test
 	@echo ""
 	@echo "  ✓ GATE DE ESTABILIDAD C-FORGE COMPLETO (100 % C-Forge)"
 
