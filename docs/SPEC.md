@@ -315,26 +315,40 @@ hilos ocultos.
 
 ---
 
-## 10. Ejecución en tiempo de compilación (`comptime`) 📐
+## 10. Ejecución en tiempo de compilación (`comptime`) ✅
 
-```cfv
-funcion tabla_cuadrados(n: usize): [n]u32 {
-    sea t: [n]u32
-    para i en 0..n { t[i] = i * i }
-    retornar t
-}
+Ver §3.3b: `comptime(expr)` y `comptime { … }` se ejecutan al compilar y
+quedan como literales; los genéricos `comptime T` se verifican en cada
+llamada.
 
-constante CUADRADOS = comptime tabla_cuadrados(256)   // calculado al compilar
+### 10.1 WebAssembly (`--target wasm`) ✅
 
-funcion Pila(comptime T: tipo): tipo {                  // genéricos = funciones
-    retornar estructura { datos: lista<T>, tope: usize }
-}
+```sh
+cforge build app.cfv --target wasm --release -o app   # app.wasm + app.mjs + app.d.ts
+node app.mjs                                          # o en el navegador:
 ```
 
-Cualquier función sin efectos externos puede ejecutarse al compilar. Los
-genéricos son funciones que reciben y devuelven tipos.
+```js
+import { iniciar } from "./app.mjs";
+const cf = await iniciar({ js: { doble: (x) => x * 2 } });   // extern "js"
+cf.llamar("mi_funcion", 3);                                  // C-Forge desde JS
+```
 
----
+- El mismo compilador y la misma capa `gen.cfv`: `gen_wasm.cfv` emula la
+  máquina virtual dentro de una función wasm (registros en locales, pila y
+  marcos en la memoria lineal, un bloque por etiqueta). El recolector de
+  basura, `intentar`/`capturar` y los punteros a funciones funcionan igual.
+- `extern "js" funcion f(x: numero): texto` importa funciones de JavaScript
+  (números, enteros, booleanos y textos se convierten solos).
+- `importar "navegador"`: DOM, eventos, `nav_animar` (requestAnimationFrame),
+  lienzo 2D y `nav_particulas` (miles de partículas con WebGL2).
+- `cociente(a, b)` (división entera) y `bits_y/bits_o/bits_xo` se compilan
+  en línea: con ellos la física en enteros no crea objetos.
+- `tarea()` corre completa al lanzarse (no hay hilos); `extern` de C no
+  existe en el navegador.
+- Rendimiento: el código que se llama muchas veces (animación, eventos)
+  corre a ~2,5× del nativo; un programa que hace todo en `main` corre en el
+  primer nivel de V8 (~7×).
 
 ## 11. Biblioteca estándar
 
