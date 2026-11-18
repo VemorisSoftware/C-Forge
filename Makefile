@@ -316,7 +316,7 @@ nativo-check:
 ## Lenguaje completo compilado por cforge_self: runtime nativo + mapas en
 ## dialecto nativo, y runtime/dyn.cfv en modo puente (valores del lenguaje).
 RUNTIME_LENGUAJE := $(RUNTIME_NATIVO) runtime/map.cfv --puente runtime/dyn.cfv runtime/biblioteca.cfv --lenguaje runtime/lenguaje.cfv
-PRUEBAS_LENGUAJE_NATIVAS := 01_nucleo 02_funciones 03_colecciones 04_errores 05_stdlib_matematica 06_stdlib_lista 07_json_texto 08_clases 09_stdlib_algoritmos 10_stdlib_mapa 11_texto_base64 12_fechas 13_archivos 14_control_avanzado 15_errores_limite 16_colecciones_avanzadas 17_resultados_opciones 18_regex 19_vectores 20_sistema 21_tareas_async 22_funciones_propias 23_bilingue 25_idioma_ingles
+PRUEBAS_LENGUAJE_NATIVAS := 01_nucleo 02_funciones 03_colecciones 04_errores 05_stdlib_matematica 06_stdlib_lista 07_json_texto 08_clases 09_stdlib_algoritmos 10_stdlib_mapa 11_texto_base64 12_fechas 13_archivos 14_control_avanzado 15_errores_limite 16_colecciones_avanzadas 17_resultados_opciones 18_regex 19_vectores 20_sistema 21_tareas_async 22_funciones_propias 23_bilingue 24_extern_c 25_idioma_ingles
 FUENTES_AUTOALOJADO := $(RUNTIME_NATIVO) bootstrap/nativo/lexer.cfv bootstrap/nativo/cforge_self.cfv
 autoalojado-check:
 	@set -e; dir=$$(mktemp -d /tmp/cforge-self.XXXXXX); \
@@ -346,13 +346,15 @@ autoalojado-check:
 	"$$dir/cierres" | diff -u tests/nativo/09_cierres_errores.salida -; \
 	env -i "$$dir/stage3" -o "$$dir/biblioteca" --stdlib stdlib $(RUNTIME_LENGUAJE) --dinamico tests/nativo/10_biblioteca.cfv >/dev/null; \
 	"$$dir/biblioteca" | diff -u tests/nativo/10_biblioteca.salida -; \
+	env -i "$$dir/stage3" -o "$$dir/externo" $(RUNTIME_LENGUAJE) --dinamico tests/nativo/11_extern.cfv >/dev/null; \
+	env -i "$$dir/externo" | diff -u tests/nativo/11_extern.salida -; \
 	for prueba in $(PRUEBAS_LENGUAJE_NATIVAS); do \
 		env -i "$$dir/stage3" -o "$$dir/$$prueba" --stdlib stdlib $(RUNTIME_LENGUAJE) --dinamico tests/cfv/$$prueba.cfv >/dev/null; \
 		"$$dir/$$prueba" | grep -q '^\[OK\]' || { echo "  ✗ tests/cfv/$$prueba.cfv"; exit 1; }; \
 	done; \
 	sha256sum "$$dir/stage2" "$$dir/stage3" | sed "s#$$dir/##"; \
 	echo "  ✓ C-Forge se compila a sí mismo: Stage 2 = Stage 3, sin libc ni C++"; \
-	echo "  ✓ Suite del lenguaje compilada nativa: $(PRUEBAS_LENGUAJE_NATIVAS)"
+	echo "  ✓ Suite del lenguaje compilada nativa ($(words $(PRUEBAS_LENGUAJE_NATIVAS)) pruebas): $(PRUEBAS_LENGUAJE_NATIVAS)"
 
 ## Verificar los backends Core B6.8 sin toolchain durante la emisión.
 backend-core-check: backend-core-bundle

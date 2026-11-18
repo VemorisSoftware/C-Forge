@@ -33,9 +33,11 @@
 // 216 marco de función actual                  224 variables globales [nombre][casilla]
 // 232 profundidad de bloque                    240 bloques intentar abiertos
 // 248 bloques intentar abiertos al entrar al ciclo
+// 256 funciones externas [símbolo][biblioteca][etiqueta][casilla GOT][tipos]
+// 264 siguiente declaración externa
 
 funcion ctx_nuevo(tokens) {
-    sea c = mem_reservar(256)
+    sea c = mem_reservar(272)
     __guardar64(c, tokens)
     __guardar64(c + 8, 0)
     __guardar64(c + 16, str_nuevo(65536))
@@ -69,6 +71,8 @@ funcion ctx_nuevo(tokens) {
     __guardar64(c + 232, 0)
     __guardar64(c + 240, 0)
     __guardar64(c + 248, 0)
+    __guardar64(c + 256, vec_nuevo())
+    __guardar64(c + 264, 0)
     retornar c
 }
 
@@ -393,6 +397,10 @@ funcion registrar_funciones(c) {
             sea global = __cargar64(vec_obtener(tokens, i + 1) + 8)
             si (indice_global(c, global) < 0) { vec_agregar(__cargar64(c + 224), global) }
         }
+        si (modo >= 2 y __cargar64(t) == 1 y str_igual(lex, "extern") y __cargar64(vec_obtener(tokens, i + 1)) == 3) {
+            registrar_externa(c, i)
+            i = i + 2
+        }
         si (profundidad == 0 y __cargar64(t) == 1 y str_igual(lex, "funcion") y __cargar64(vec_obtener(tokens, i + 1)) == 1) {
             sea nombre = __cargar64(vec_obtener(tokens, i + 1) + 8)
             sea j = i + 3
@@ -436,6 +444,196 @@ funcion contar_parametros(tokens, j) {
         j = j + 1
     }
     retornar parametros
+}
+
+// ── Funciones externas (extern "lib" funcion f(x: tipo): tipo) ─────────────
+// El ejecutable se enlaza dinámicamente con la biblioteca (PT_INTERP,
+// PT_DYNAMIC, símbolos débiles y GOT). Una envoltura convierte los valores
+// del lenguaje a la ABI System V AMD64 y de vuelta.
+
+funcion registrar_externa(c, i) {
+    sea tokens = __cargar64(c)
+    sea simbolo = lexema_en(tokens, i + 3)
+    // Una externa reemplaza a una función del lenguaje con el mismo nombre.
+    sea previa = indice_funcion(c, simbolo)
+    si (previa >= 0) {
+        sea modo_previo = __cargar64(vec_obtener(__cargar64(c + 48), previa) + 24)
+        si (modo_previo != 1 y modo_previo != 3) {
+            rt_panico(str_concatenar("función externa definida dos veces: ", simbolo))
+        }
+    }
+    sea e = mem_reservar(40)
+    __guardar64(e, simbolo)
+    __guardar64(e + 8, decodificar_literal(lexema_en(tokens, i + 1)))
+    __guardar64(e + 16, nueva_etiqueta(c))
+    __guardar64(e + 24, 0 - 1)
+    __guardar64(e + 32, 0)
+    vec_agregar(__cargar64(c + 256), e)
+    sea f = mem_reservar(32)
+    __guardar64(f, simbolo)
+    __guardar64(f + 8, __cargar64(e + 16))
+    __guardar64(f + 16, contar_parametros(tokens, i + 5))
+    __guardar64(f + 24, 2)
+    si (previa >= 0) { vec_fijar(__cargar64(c + 48), previa, f) } sino { vec_agregar(__cargar64(c + 48), f) }
+    retornar 0
+}
+
+// Biblioteca compartida: "libc" → libc.so.6, "libm" → libm.so.6,
+// "sqlite3" → libsqlite3.so, o el nombre tal cual si ya es un .so.
+funcion nombre_biblioteca(nombre) {
+    si (str_igual(nombre, "libc") o str_igual(nombre, "c")) { retornar "libc.so.6" }
+    si (str_igual(nombre, "libm") o str_igual(nombre, "m")) { retornar "libm.so.6" }
+    si (str_buscar_en(nombre, ".so") >= 0) { retornar nombre }
+    sea r = str_nuevo(16)
+    si (str_largo(nombre) < 3 o str_igual(str_rebanar(nombre, 0, 3), "lib") == 0) { str_agregar(r, "lib") }
+    str_agregar(r, nombre)
+    str_agregar(r, ".so")
+    retornar r
+}
+
+funcion str_buscar_en(pajar, aguja) {
+    sea i = 0
+    mientras (i + str_largo(aguja) <= str_largo(pajar)) {
+        si (str_igual(str_rebanar(pajar, i, i + str_largo(aguja)), aguja)) { retornar i }
+        i = i + 1
+    }
+    retornar 0 - 1
+}
+
+// Clase de un tipo C: 0 entero de 64 bits (largo, puntero) · 1 flotante
+// (numero) · 2 texto (char*) · 3 booleano · 4 nulo · 5 entero de 32 bits
+funcion clase_tipo(c, tipo) {
+    si (str_igual(tipo, "numero") o str_igual(tipo, "flotante") o str_igual(tipo, "doble")) { retornar 1 }
+    si (str_igual(tipo, "texto") o str_igual(tipo, "cadena")) { retornar 2 }
+    si (str_igual(tipo, "booleano") o str_igual(tipo, "bool")) { retornar 3 }
+    si (str_igual(tipo, "nulo") o str_igual(tipo, "vacio") o str_igual(tipo, "void")) { retornar 4 }
+    si (str_igual(tipo, "entero") o str_igual(tipo, "int")) { retornar 5 }
+    si (str_igual(tipo, "largo") o str_igual(tipo, "puntero") o str_igual(tipo, "long")) { retornar 0 }
+    error_en(c, str_concatenar("tipo C no soportado en extern: ", tipo))
+    retornar 0
+}
+
+funcion declaracion_externa(c) {
+    requerir(c, "extern")
+    avanzar(c)
+    requerir(c, "funcion")
+    requerir_ident(c)
+    sea e = vec_obtener(__cargar64(c + 256), __cargar64(c + 264))
+    __guardar64(c + 264, __cargar64(c + 264) + 1)
+    // Firma: tipos de los parámetros y del resultado.
+    sea tipos = vec_nuevo()
+    requerir(c, "(")
+    si (ver(c, ")") == 0) {
+        sea seguir = 1
+        mientras (seguir) {
+            requerir_ident(c)
+            requerir(c, ":")
+            vec_agregar(tipos, clase_tipo(c, requerir_ident(c)))
+            seguir = tomar(c, ",")
+        }
+    }
+    requerir(c, ")")
+    sea resultado = 4
+    si (tomar(c, ":")) { resultado = clase_tipo(c, requerir_ident(c)) }
+    tomar(c, ";")
+    // Casilla de la GOT (la llena el enlazador dinámico).
+    sea datos = ctx_datos(c)
+    mientras (str_largo(datos) % 8 != 0) { str_agregar_byte(datos, 0) }
+    sea casilla = str_largo(datos)
+    bytes_le(datos, 0, 8)
+    __guardar64(e + 24, casilla)
+    // Envoltura con la convención del lenguaje.
+    sea n = vec_largo(tipos)
+    sea saltar = saltar_por_encima(c)
+    sea ocultos = vec_nuevo()
+    sea i = 0
+    mientras (i < n) {
+        vec_agregar(ocultos, str_nuevo(0))
+        i = i + 1
+    }
+    sea estado = abrir_funcion(c, __cargar64(e + 16), ocultos)
+    sea convertidos = vec_nuevo()
+    i = 0
+    mientras (i < n) {
+        sea clase = vec_obtener(tipos, i)
+        cargar_local(c, 16 + (n - 1 - i) * 8)
+        empujar(c)
+        si (clase == 1) { llamar_runtime(c, "dyn_a_f64", 1) }
+        si (clase == 2) { llamar_runtime(c, "dyn_texto_c", 1) }
+        si (clase == 0 o clase == 3 o clase == 4 o clase == 5) { llamar_runtime(c, "dyn_entero_c", 1) }
+        sea d = declarar_local(c, str_nuevo(0))
+        guardar_local(c, d)
+        vec_agregar(convertidos, d)
+        i = i + 1
+    }
+    // Registros: enteros en rdi, rsi, rdx, rcx, r8, r9; flotantes en xmm0..7.
+    sea enteros = 0
+    sea flotantes = 0
+    i = 0
+    mientras (i < n) {
+        cargar_local(c, vec_obtener(convertidos, i))
+        si (vec_obtener(tipos, i) == 1) {
+            si (flotantes > 7) { error_en(c, "extern: demasiados argumentos flotantes") }
+            e5(c, 102, 72, 15, 110, 192 + flotantes * 8)       // movq xmmN, rax
+            flotantes = flotantes + 1
+        } sino {
+            si (enteros == 0) { e3(c, 72, 137, 199) }          // mov rdi, rax
+            si (enteros == 1) { e3(c, 72, 137, 198) }          // mov rsi, rax
+            si (enteros == 2) { e3(c, 72, 137, 194) }          // mov rdx, rax
+            si (enteros == 3) { e3(c, 72, 137, 193) }          // mov rcx, rax
+            si (enteros == 4) { e3(c, 73, 137, 192) }          // mov r8, rax
+            si (enteros == 5) { e3(c, 73, 137, 193) }          // mov r9, rax
+            si (enteros > 5) { error_en(c, "extern: más de 6 argumentos enteros") }
+            enteros = enteros + 1
+        }
+        i = i + 1
+    }
+    e3(c, 73, 137, 228)                                        // mov r12, rsp
+    e4(c, 72, 131, 228, 240)                                   // and rsp, -16
+    e1(c, 184)                                                 // mov eax, flotantes
+    e32(c, flotantes)
+    e3(c, 255, 20, 37)                                         // call [GOT]
+    ref_dato(c, casilla)
+    e3(c, 76, 137, 228)                                        // mov rsp, r12
+    si (resultado == 1) {
+        e5(c, 102, 72, 15, 126, 192)                           // movq rax, xmm0
+        empujar(c)
+        llamar_runtime(c, "dyn_desde_f64", 1)
+    }
+    si (resultado == 5) { e3(c, 72, 99, 192) }                 // movsxd rax, eax
+    si (resultado == 0 o resultado == 5) {
+        e3(c, 72, 1, 192)                                      // add rax, rax
+        e4(c, 72, 131, 192, 1)                                 // add rax, 1
+    }
+    si (resultado == 2) {
+        empujar(c)
+        llamar_runtime(c, "dyn_texto_desde_c", 1)
+    }
+    si (resultado == 3) {
+        e3(c, 15, 182, 192)                                    // movzx eax, al
+        e3(c, 72, 133, 192)
+        e3(c, 15, 149, 192)
+        e3(c, 15, 182, 192)
+        booleano_dinamico(c)
+    }
+    si (resultado == 4) { cargar_inmediato(c, 0) }
+    epilogo(c)
+    cerrar_funcion(c, estado)
+    vec_liberar(ocultos)
+    definir_etiqueta(c, saltar)
+    // Al ejecutarse la declaración: error capturable si el símbolo no existe.
+    sea listo = nueva_etiqueta(c)
+    e4(c, 72, 139, 4, 37)                                      // mov rax, [GOT]
+    ref_dato(c, casilla)
+    e5(c, 72, 133, 192, 15, 133)                               // test rax, rax; jne listo
+    ref_etiqueta(c, listo)
+    cargar_texto_crudo(c, __cargar64(e))
+    empujar(c)
+    cargar_texto_crudo(c, nombre_biblioteca(__cargar64(e + 8)))
+    empujar(c)
+    llamar_runtime(c, "dyn_simbolo_faltante", 2)
+    definir_etiqueta(c, listo)
+    retornar 0
 }
 
 // ── Clases ────────────────────────────────────────────────────────────────
@@ -1994,6 +2192,10 @@ funcion sentencia(c) {
         definir_etiqueta(c, fin)
         retornar 0
     }
+    si (dinamico(c) y ver(c, "extern") y tok_tipo_en(c, 1) == 3) {
+        declaracion_externa(c)
+        retornar 0
+    }
     si (dinamico(c) y (ver(c, "clase") o ver(c, "estructura") o ver(c, "interfaz") o ver(c, "abstracto")) y tok_tipo_en(c, 1) == 1) {
         definicion_clase(c)
         retornar 0
@@ -2502,12 +2704,121 @@ funcion compilar(c) {
 
 // ── Enlazado y ELF ────────────────────────────────────────────────────────
 
+// Tablas de enlace dinámico al final de los datos. Devuelve un registro
+// [interp][largo interp][dynamic][entradas dynamic] (desplazamientos en datos).
+funcion tablas_dinamicas(c, base, inicio_datos) {
+    sea datos = ctx_datos(c)
+    sea externas = __cargar64(c + 256)
+    sea r = mem_reservar(32)
+    // Intérprete.
+    __guardar64(r, str_largo(datos))
+    str_agregar(datos, "/lib64/ld-linux-x86-64.so.2")
+    str_agregar_byte(datos, 0)
+    __guardar64(r + 8, 28)
+    // Cadenas: bibliotecas y símbolos.
+    sea cadenas = str_nuevo(256)
+    str_agregar_byte(cadenas, 0)
+    sea bibliotecas = vec_nuevo()
+    sea nombres_bib = vec_nuevo()
+    sea nombres_sim = vec_nuevo()
+    sea i = 0
+    mientras (i < vec_largo(externas)) {
+        sea e = vec_obtener(externas, i)
+        sea bib = nombre_biblioteca(__cargar64(e + 8))
+        si (contiene_texto(bibliotecas, bib) == 0) {
+            vec_agregar(bibliotecas, bib)
+            vec_agregar(nombres_bib, str_largo(cadenas))
+            str_agregar(cadenas, bib)
+            str_agregar_byte(cadenas, 0)
+        }
+        vec_agregar(nombres_sim, str_largo(cadenas))
+        str_agregar(cadenas, __cargar64(e))
+        str_agregar_byte(cadenas, 0)
+        i = i + 1
+    }
+    sea dir = base + inicio_datos
+    sea strtab = str_largo(datos)
+    str_agregar(datos, cadenas)
+    mientras (str_largo(datos) % 8 != 0) { str_agregar_byte(datos, 0) }
+    // Símbolos: el nulo y uno débil por función externa.
+    sea symtab = str_largo(datos)
+    bytes_le(datos, 0, 24)
+    i = 0
+    mientras (i < vec_largo(externas)) {
+        bytes_le(datos, vec_obtener(nombres_sim, i), 4)
+        bytes_le(datos, 34, 1)                                 // STB_WEAK | STT_FUNC
+        bytes_le(datos, 0, 1)
+        bytes_le(datos, 0, 2)
+        bytes_le(datos, 0, 8)
+        bytes_le(datos, 0, 8)
+        i = i + 1
+    }
+    // Tabla hash mínima: un balde, cadena vacía.
+    sea hash = str_largo(datos)
+    sea nsimbolos = vec_largo(externas) + 1
+    bytes_le(datos, 1, 4)
+    bytes_le(datos, nsimbolos, 4)
+    bytes_le(datos, 0, 4)
+    bytes_le(datos, 0, 4 * nsimbolos)
+    mientras (str_largo(datos) % 8 != 0) { str_agregar_byte(datos, 0) }
+    // Relocaciones R_X86_64_GLOB_DAT hacia cada casilla de la GOT.
+    sea rela = str_largo(datos)
+    i = 0
+    mientras (i < vec_largo(externas)) {
+        sea e = vec_obtener(externas, i)
+        bytes_le(datos, dir + __cargar64(e + 24), 8)
+        bytes_le(datos, __o_bits(__desplazar_izq(i + 1, 32), 6), 8)
+        bytes_le(datos, 0, 8)
+        i = i + 1
+    }
+    sea relasz = str_largo(datos) - rela
+    // Sección dinámica.
+    sea dinamica = str_largo(datos)
+    i = 0
+    mientras (i < vec_largo(nombres_bib)) {
+        bytes_le(datos, 1, 8)                                  // DT_NEEDED
+        bytes_le(datos, vec_obtener(nombres_bib, i), 8)
+        i = i + 1
+    }
+    bytes_le(datos, 4, 8)  bytes_le(datos, dir + hash, 8)      // DT_HASH
+    bytes_le(datos, 5, 8)  bytes_le(datos, dir + strtab, 8)    // DT_STRTAB
+    bytes_le(datos, 6, 8)  bytes_le(datos, dir + symtab, 8)    // DT_SYMTAB
+    bytes_le(datos, 7, 8)  bytes_le(datos, dir + rela, 8)      // DT_RELA
+    bytes_le(datos, 8, 8)  bytes_le(datos, relasz, 8)          // DT_RELASZ
+    bytes_le(datos, 9, 8)  bytes_le(datos, 24, 8)              // DT_RELAENT
+    bytes_le(datos, 10, 8) bytes_le(datos, str_largo(cadenas), 8)  // DT_STRSZ
+    bytes_le(datos, 11, 8) bytes_le(datos, 24, 8)              // DT_SYMENT
+    bytes_le(datos, 24, 8) bytes_le(datos, 0, 8)               // DT_BIND_NOW
+    bytes_le(datos, 0, 8)  bytes_le(datos, 0, 8)               // DT_NULL
+    __guardar64(r + 16, dinamica)
+    __guardar64(r + 24, (str_largo(datos) - dinamica) / 16)
+    retornar r
+}
+
+funcion encabezado_programa(elf, tipo, banderas, desplazamiento, direccion, tam_archivo, tam_memoria, alineacion) {
+    bytes_le(elf, tipo, 4)
+    bytes_le(elf, banderas, 4)
+    bytes_le(elf, desplazamiento, 8)
+    bytes_le(elf, direccion, 8)
+    bytes_le(elf, direccion, 8)
+    bytes_le(elf, tam_archivo, 8)
+    bytes_le(elf, tam_memoria, 8)
+    bytes_le(elf, alineacion, 8)
+    retornar 0
+}
+
 funcion empaquetar(c) {
     sea base = 4194304
     sea codigo = ctx_codigo(c)
     sea datos = ctx_datos(c)
-    sea inicio_datos = 120 + str_largo(codigo)
+    sea dinamico_elf = vec_largo(__cargar64(c + 256)) > 0
+    // Encabezado ELF + encabezados de programa (1 estático, 3 dinámico).
+    sea cabecera = 120
+    si (dinamico_elf) { cabecera = 232 }
+    sea inicio_datos = cabecera + str_largo(codigo)
     mientras (inicio_datos % 16 != 0) { inicio_datos = inicio_datos + 1 }
+    sea tablas = 0
+    si (dinamico_elf) { tablas = tablas_dinamicas(c, base, inicio_datos) }
     sea fin_datos = inicio_datos + str_largo(datos)
     sea inicio_globales = fin_datos
     mientras (inicio_globales % 16 != 0) { inicio_globales = inicio_globales + 1 }
@@ -2531,7 +2842,7 @@ funcion empaquetar(c) {
         si (tipo == 4) {
             sea direccion = vec_obtener(etiquetas, valor)
             si (direccion < 0) { rt_panico("etiqueta sin definir") }
-            parchear32(codigo, posicion, base + 120 + direccion)
+            parchear32(codigo, posicion, base + cabecera + direccion)
         }
         i = i + 1
     }
@@ -2548,10 +2859,10 @@ funcion empaquetar(c) {
     i = 0
     mientras (i < vec_largo(a_codigo)) {
         sea p = vec_obtener(a_codigo, i)
-        parchear64(datos, __cargar64(p), base + 120 + vec_obtener(etiquetas, __cargar64(p + 8)))
+        parchear64(datos, __cargar64(p), base + cabecera + vec_obtener(etiquetas, __cargar64(p + 8)))
         i = i + 1
     }
-    // Cajas de texto del lenguaje: [1][puntero al texto literal].
+    // Punteros entre datos (cajas de texto, registros de clase).
     sea punteros = __cargar64(c + 112)
     i = 0
     mientras (i < vec_largo(punteros)) {
@@ -2559,6 +2870,7 @@ funcion empaquetar(c) {
         parchear64(datos, __cargar64(p), base + inicio_datos + __cargar64(p + 8))
         i = i + 1
     }
+    sea memoria = inicio_globales + 512 + vec_largo(__cargar64(c + 224)) * 8
     sea elf = str_nuevo(fin_datos + 16)
     bytes_le(elf, 1179403647, 4)                               // \x7fELF
     bytes_le(elf, 2, 1)
@@ -2568,22 +2880,24 @@ funcion empaquetar(c) {
     bytes_le(elf, 2, 2)                                        // ET_EXEC
     bytes_le(elf, 62, 2)                                       // x86-64
     bytes_le(elf, 1, 4)
-    bytes_le(elf, base + 120, 8)                               // entrada
+    bytes_le(elf, base + cabecera, 8)                          // entrada
     bytes_le(elf, 64, 8)
     bytes_le(elf, 0, 8)
     bytes_le(elf, 0, 4)
     bytes_le(elf, 64, 2)
     bytes_le(elf, 56, 2)
-    bytes_le(elf, 1, 2)
+    si (dinamico_elf) { bytes_le(elf, 3, 2) } sino { bytes_le(elf, 1, 2) }
     bytes_le(elf, 0, 6)
-    bytes_le(elf, 1, 4)                                        // PT_LOAD
-    bytes_le(elf, 7, 4)                                        // RWX
-    bytes_le(elf, 0, 8)
-    bytes_le(elf, base, 8)
-    bytes_le(elf, base, 8)
-    bytes_le(elf, fin_datos, 8)
-    bytes_le(elf, inicio_globales + 512 + vec_largo(__cargar64(c + 224)) * 8, 8)
-    bytes_le(elf, 4096, 8)
+    si (dinamico_elf) {
+        sea interp = inicio_datos + __cargar64(tablas)
+        encabezado_programa(elf, 3, 4, interp, base + interp, __cargar64(tablas + 8), __cargar64(tablas + 8), 1)
+    }
+    encabezado_programa(elf, 1, 7, 0, base, fin_datos, memoria, 4096)       // PT_LOAD RWX
+    si (dinamico_elf) {
+        sea dinamica = inicio_datos + __cargar64(tablas + 16)
+        sea tam = __cargar64(tablas + 24) * 16
+        encabezado_programa(elf, 2, 6, dinamica, base + dinamica, tam, tam, 8)
+    }
     str_agregar(elf, codigo)
     mientras (str_largo(elf) < inicio_datos) { str_agregar_byte(elf, 0) }
     str_agregar(elf, datos)
