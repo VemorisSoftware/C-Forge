@@ -152,35 +152,177 @@ funcion udp_terminar(sock: numero): nulo {
     udp_cerrar(sock)
 }
 
-// ── WebSocket (sobre TCP) ─────────────────────────────────────────────────
-// Implementación simplificada para conexiones de tiempo real.
-// Para WebSocket completo usa el servidor HTTP integrado con Upgrade.
+// ── WebSocket (RFC 6455) ──────────────────────────────────────────────────
+// Cliente:   sea ws = ws_conectar_url("ws://127.0.0.1:8080/chat")
+//            ws_enviar(ws, "hola")  ·  sea m = ws_recibir(ws)  ·  ws_cerrar(ws)
+// Servidor:  sea srv = servidor_http_escuchar(8080)
+//            sea req = servidor_http_solicitud(srv)
+//            si (ws_es_solicitud(req)) { sea c = ws_aceptar(srv, req) … }
+// Tramas de texto (1), binarias (2), cierre (8), ping (9) y pong (10), con
+// fragmentación y máscara obligatoria del cliente. ws_recibir responde solo
+// a ping y cierre; devuelve nulo cuando la conexión termina.
 
-funcion ws_conectar(host: texto, puerto: numero): mapa {
-    // Crear socket UDP como canal de mensajes rápido (para juegos)
-    // Para WebSocket real, usar el servidor HTTP con cabecera Upgrade
-    sea sock = udp_crear(0)
-    retornar {
-        "sock": sock,
-        "host": host,
-        "puerto": puerto,
-        "conectado": verdadero
+funcion ws_guid(): texto { retornar "258EAFA5-E914-47DA-95CA-C5AB0DC85B11" }
+
+funcion ws_aceptacion(clave: texto): texto {
+    retornar cfv_base64_codificar(sha1_bytes(clave + ws_guid()))
+}
+
+// "ws://host:puerto/ruta" (puerto 80 por defecto).
+funcion ws_conectar_url(url: texto): mapa {
+    sea resto = url
+    si (texto_empieza_con(resto, "ws://")) { resto = subtexto(resto, 5, longitud(resto)) }
+    sea ruta = "/"
+    sea barra = texto_indice(resto, "/")
+    si (barra >= 0) {
+        ruta = subtexto(resto, barra, longitud(resto))
+        resto = subtexto(resto, 0, barra)
     }
+    sea puerto = 80
+    sea dos = texto_indice(resto, ":")
+    si (dos >= 0) {
+        puerto = a_numero(subtexto(resto, dos + 1, longitud(resto)))
+        resto = subtexto(resto, 0, dos)
+    }
+    retornar ws_conectar(resto, puerto, ruta)
 }
 
-funcion ws_enviar(conn: mapa, mensaje: texto): nulo {
-    udp_enviar(conn["sock"], conn["host"], conn["puerto"], mensaje)
+funcion ws_conectar(host: texto, puerto: numero, ruta = "/"): mapa {
+    sea sock = net_conectar(host, puerto)
+    sea clave = cfv_base64_codificar(bytes_de_hex(crypto_rand_bytes(16)))
+    sea pedido = "GET " + ruta + " HTTP/1.1\r\nHost: " + host + ":" + puerto + "\r\nUpgrade: websocket\r\nConnection: Upgrade\r\nSec-WebSocket-Key: " + clave + "\r\nSec-WebSocket-Version: 13\r\n\r\n"
+    net_enviar(sock, pedido)
+    // Cabeceras de la respuesta, byte a byte hasta la línea vacía.
+    sea partes = []
+    sea fin = ""
+    mientras (fin != "\r\n\r\n") {
+        sea b = net_recibir_exacto(sock, 1)
+        si (longitud(b) == 0) {
+            net_cerrar(sock)
+            lanzar "ws_conectar: el servidor cerró la conexión durante el saludo"
+        }
+        partes.agregar(b)
+        fin = fin + b
+        si (longitud(fin) > 4) { fin = subtexto(fin, 1, 5) }
+    }
+    sea cabeceras = unir(partes, "")
+    sea primera = subtexto(cabeceras, 0, texto_indice(cabeceras, "\r\n"))
+    si (texto_indice(primera, " 101") < 0) {
+        net_cerrar(sock)
+        lanzar "ws_conectar: el servidor no aceptó WebSocket (" + primera + ")"
+    }
+    si (texto_indice(cabeceras, ws_aceptacion(clave)) < 0) {
+        net_cerrar(sock)
+        lanzar "ws_conectar: Sec-WebSocket-Accept no coincide"
+    }
+    retornar {"sock": sock, "cliente": verdadero, "abierto": verdadero}
 }
 
-funcion ws_recibir(conn: mapa): texto {
-    sea msg = udp_recibir(conn["sock"])
-    si (msg == nulo) { retornar nulo }
-    retornar msg["datos"]
+// ¿La petición del servidor HTTP pide pasar a WebSocket?
+funcion ws_es_solicitud(req: mapa): booleano {
+    sea c = req["cabeceras"]
+    si (tiene_clave(c, "upgrade") == falso o tiene_clave(c, "sec-websocket-key") == falso) { retornar falso }
+    retornar texto_minusculas(c["upgrade"]) == "websocket"
 }
 
-funcion ws_cerrar(conn: mapa): nulo {
-    udp_cerrar(conn["sock"])
-    conn["conectado"] = falso
+// Completa el saludo y devuelve la conexión (el servidor sigue aceptando).
+funcion ws_aceptar(srv: numero, req: mapa): mapa {
+    si (ws_es_solicitud(req) == falso) { lanzar "ws_aceptar: la petición no es un saludo WebSocket" }
+    sea sock = servidor_http_tomar_conexion(srv)
+    net_enviar(sock, "HTTP/1.1 101 Switching Protocols\r\nUpgrade: websocket\r\nConnection: Upgrade\r\nSec-WebSocket-Accept: " + ws_aceptacion(req["cabeceras"]["sec-websocket-key"]) + "\r\n\r\n")
+    retornar {"sock": sock, "cliente": falso, "abierto": verdadero}
+}
+
+// Trama completa (FIN) con el código de operación dado.
+funcion ws_trama(conn: mapa, opcode: numero, datos: texto): texto {
+    sea n = longitud(datos)
+    sea mascara = 0
+    si (conn["cliente"]) { mascara = 128 }
+    sea cabecera = char_de(128 + opcode)
+    si (n < 126) {
+        cabecera = cabecera + char_de(mascara + n)
+    } sino {
+        si (n < 65536) {
+            cabecera = cabecera + char_de(mascara + 126) + bytes_entero(n, 2, 0)
+        } sino {
+            cabecera = cabecera + char_de(mascara + 127) + bytes_entero(n, 8, 0)
+        }
+    }
+    si (conn["cliente"]) {
+        sea clave = bytes_de_hex(crypto_rand_bytes(4))
+        si (n == 0) { retornar cabecera + clave }
+        retornar cabecera + clave + bytes_xor(datos, clave)
+    }
+    retornar cabecera + datos
+}
+
+funcion ws_enviar_trama(conn: mapa, opcode: numero, datos: texto) {
+    si (conn["abierto"] == falso) { lanzar "ws: la conexión está cerrada" }
+    net_enviar(conn["sock"], ws_trama(conn, opcode, datos))
+}
+
+funcion ws_enviar(conn: mapa, mensaje: texto) { ws_enviar_trama(conn, 1, mensaje) }
+funcion ws_enviar_binario(conn: mapa, datos: texto) { ws_enviar_trama(conn, 2, datos) }
+funcion ws_ping(conn: mapa, datos = "") { ws_enviar_trama(conn, 9, datos) }
+
+// Siguiente mensaje (texto o binario) o nulo si la conexión terminó.
+funcion ws_recibir(conn: mapa) {
+    sea partes = []
+    mientras (conn["abierto"]) {
+        sea h = net_recibir_exacto(conn["sock"], 2)
+        si (longitud(h) < 2) {
+            conn["abierto"] = falso
+            retornar nulo
+        }
+        sea b0 = byte_en(h, 0)
+        sea b1 = byte_en(h, 1)
+        sea fin = b0 >= 128
+        sea opcode = b0 % 16
+        sea enmascarada = b1 >= 128
+        sea n = b1 % 128
+        si (n == 126) { n = bytes_leer_entero(net_recibir_exacto(conn["sock"], 2), 0, 2, 0) }
+        si (n == 127) { n = bytes_leer_entero(net_recibir_exacto(conn["sock"], 8), 0, 8, 0) }
+        si (conn["cliente"] == falso y enmascarada == falso) {
+            ws_cerrar(conn, 1002)
+            lanzar "ws: el cliente envió una trama sin máscara"
+        }
+        sea clave = ""
+        si (enmascarada) { clave = net_recibir_exacto(conn["sock"], 4) }
+        sea datos = ""
+        si (n > 0) { datos = net_recibir_exacto(conn["sock"], n) }
+        si (longitud(datos) < n) {
+            conn["abierto"] = falso
+            retornar nulo
+        }
+        si (enmascarada y n > 0) { datos = bytes_xor(datos, clave) }
+        si (opcode == 8) {
+            // Cierre: se responde con el mismo código y se termina.
+            sea codigo = 1000
+            si (n >= 2) { codigo = bytes_leer_entero(datos, 0, 2, 0) }
+            conn["codigo_cierre"] = codigo
+            ws_cerrar(conn, codigo)
+            retornar nulo
+        }
+        si (opcode == 9) {
+            net_enviar(conn["sock"], ws_trama(conn, 10, datos))
+        } sino {
+            si (opcode != 10) {
+                partes.agregar(datos)
+                si (fin) { retornar unir(partes, "") }
+            }
+        }
+    }
+    retornar nulo
+}
+
+funcion ws_cerrar(conn: mapa, codigo = 1000) {
+    si (conn["abierto"]) {
+        conn["abierto"] = falso
+        intentar {
+            net_enviar(conn["sock"], ws_trama(conn, 8, bytes_entero(codigo, 2, 0)))
+        } capturar (e) { }
+        net_cerrar(conn["sock"])
+    }
 }
 
 // ── Servidor web rápido ────────────────────────────────────────────────────

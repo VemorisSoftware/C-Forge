@@ -1,0 +1,270 @@
+// stdlib/mysql.cfv — cliente nativo de MySQL / MariaDB (protocolo 4.1).
+// Sin libmysqlclient: sockets del runtime, mysql_native_password (SHA-1) y
+// caching_sha2_password con autenticación rápida (SHA-256). La autenticación
+// completa de caching_sha2_password sin TLS necesita RSA y no está soportada:
+// se informa con un error claro (usa mysql_native_password o entra una vez
+// por TLS para que el servidor guarde la clave en su caché).
+//
+//   importar "mysql"
+//   sea db = mysql_conectar({"host": "127.0.0.1", "usuario": "app", "clave": "…", "base": "tienda"})
+//   mysql_ejecutar(db, "INSERT INTO productos (nombre, precio) VALUES (?, ?)", ["té", 2.5])
+//   para fila en mysql_consultar(db, "SELECT * FROM productos")["filas"] { mostrar(fila["nombre"]) }
+//   mysql_cerrar(db)
+//
+// Los "?" se reemplazan por los valores escapados (textos entre comillas con
+// \ ' " \0 \n \r \x1a escapados; nulo → NULL). Resultado: {"filas",
+// "columnas", "afectadas", "ultimo_id"}. Enteros → entero, FLOAT/DOUBLE/
+// DECIMAL → número, BOOLEAN (TINYINT(1)) → booleano, NULL → nulo, el resto →
+// texto.
+
+funcion mysql_entero_lenenc(d, pos) {
+    sea b = byte_en(d, pos)
+    si (b < 251) { retornar [b, pos + 1] }
+    si (b == 252) { retornar [bytes_leer_entero(d, pos + 1, 2, 1), pos + 3] }
+    si (b == 253) { retornar [bytes_leer_entero(d, pos + 1, 3, 1), pos + 4] }
+    retornar [bytes_leer_entero(d, pos + 1, 8, 1), pos + 9]
+}
+
+// Texto con longitud codificada: [texto o nulo, posición siguiente].
+funcion mysql_texto_lenenc(d, pos) {
+    si (byte_en(d, pos) == 251) { retornar [nulo, pos + 1] }
+    sea n = mysql_entero_lenenc(d, pos)
+    retornar [subtexto(d, n[1], n[1] + n[0]), n[1] + n[0]]
+}
+
+// Paquete: 3 bytes de longitud (little endian) + número de secuencia.
+funcion mysql_leer(conn) {
+    sea datos = ""
+    sea seguir = verdadero
+    mientras (seguir) {
+        sea h = net_recibir_exacto(conn["sock"], 4)
+        si (longitud(h) < 4) { lanzar "mysql: el servidor cerró la conexión" }
+        sea n = bytes_leer_entero(h, 0, 3, 1)
+        conn["secuencia"] = (byte_en(h, 3) + 1) % 256
+        si (n > 0) { datos = datos + net_recibir_exacto(conn["sock"], n) }
+        // Un paquete de 16 MiB - 1 continúa en el siguiente.
+        seguir = n == 16777215
+    }
+    retornar datos
+}
+
+funcion mysql_enviar(conn, datos) {
+    net_enviar(conn["sock"], bytes_entero(longitud(datos), 3, 1) + char_de(conn["secuencia"]) + datos)
+    conn["secuencia"] = (conn["secuencia"] + 1) % 256
+}
+
+funcion mysql_error(d) {
+    sea codigo = bytes_leer_entero(d, 1, 2, 1)
+    sea mensaje = subtexto(d, 3, longitud(d))
+    si (longitud(mensaje) > 6 y subtexto(mensaje, 0, 1) == "#") { mensaje = subtexto(mensaje, 6, longitud(mensaje)) + " (" + subtexto(d, 4, 9) + ")" }
+    retornar "mysql: error " + codigo + ": " + mensaje
+}
+
+// Respuesta de autenticación para el plugin y el nonce dados.
+funcion mysql_auth(plugin, clave, nonce) {
+    si (clave == "") { retornar "" }
+    si (plugin == "caching_sha2_password") {
+        sea a = sha256_bytes(clave)
+        retornar bytes_xor(a, sha256_bytes(sha256_bytes(a) + nonce))
+    }
+    si (plugin == "mysql_native_password") {
+        sea a = sha1_bytes(clave)
+        retornar bytes_xor(a, sha1_bytes(nonce + sha1_bytes(a)))
+    }
+    lanzar "mysql: plugin de autenticación no soportado: " + plugin
+}
+
+funcion mysql_conectar(opciones) {
+    sea host = "127.0.0.1"
+    sea puerto = 3306
+    sea usuario = "root"
+    sea clave = ""
+    sea base = nulo
+    si (tiene_clave(opciones, "host")) { host = opciones["host"] }
+    si (tiene_clave(opciones, "puerto")) { puerto = opciones["puerto"] }
+    si (tiene_clave(opciones, "usuario")) { usuario = opciones["usuario"] }
+    si (tiene_clave(opciones, "clave")) { clave = opciones["clave"] }
+    si (tiene_clave(opciones, "base")) { base = opciones["base"] }
+    sea conn = {"sock": net_conectar(host, puerto), "secuencia": 0, "abierta": verdadero}
+    sea cero = char_de(0)
+    // Saludo del servidor (protocolo 10).
+    sea d = mysql_leer(conn)
+    si (byte_en(d, 0) == 255) {
+        net_cerrar(conn["sock"])
+        lanzar mysql_error(d)
+    }
+    sea fin_version = bytes_buscar(d, cero, 1)
+    conn["version"] = subtexto(d, 1, fin_version)
+    sea pos = fin_version + 1 + 4
+    sea nonce = subtexto(d, pos, pos + 8)
+    pos = pos + 8 + 1 + 2 + 1 + 2 + 2
+    sea largo_auth = byte_en(d, pos)
+    pos = pos + 1 + 10
+    sea resto = 13
+    si (largo_auth - 8 > resto) { resto = largo_auth - 8 }
+    nonce = nonce + subtexto(d, pos, pos + resto - 1)
+    pos = pos + resto
+    sea plugin = "mysql_native_password"
+    si (pos < longitud(d)) {
+        sea fin_plugin = bytes_buscar(d, cero, pos)
+        si (fin_plugin < 0) { fin_plugin = longitud(d) }
+        plugin = subtexto(d, pos, fin_plugin)
+    }
+    // Respuesta: PROTOCOL_41 | SECURE_CONNECTION | PLUGIN_AUTH | LONG_PASSWORD
+    // | TRANSACTIONS | MULTI_RESULTS [| CONNECT_WITH_DB].
+    sea capacidades = 1 + 512 + 8192 + 32768 + 131072 + 524288
+    si (base != nulo) { capacidades = capacidades + 8 }
+    sea auth = mysql_auth(plugin, clave, nonce)
+    sea respuesta = bytes_entero(capacidades, 4, 1) + bytes_entero(16777215, 4, 1) + char_de(45) + texto_repetir(cero, 23) + usuario + cero + char_de(longitud(auth)) + auth
+    si (base != nulo) { respuesta = respuesta + base + cero }
+    respuesta = respuesta + plugin + cero
+    mysql_enviar(conn, respuesta)
+    sea listo = falso
+    mientras (listo == falso) {
+        sea r = mysql_leer(conn)
+        sea b = byte_en(r, 0)
+        si (b == 0) { listo = verdadero } sino {
+            si (b == 255) {
+                net_cerrar(conn["sock"])
+                lanzar mysql_error(r)
+            }
+            si (b == 254) {
+                // Cambio de plugin: nuevo nombre y nonce.
+                sea fin_nombre = bytes_buscar(r, cero, 1)
+                plugin = subtexto(r, 1, fin_nombre)
+                nonce = subtexto(r, fin_nombre + 1, longitud(r))
+                si (longitud(nonce) > 0 y byte_en(nonce, longitud(nonce) - 1) == 0) { nonce = subtexto(nonce, 0, longitud(nonce) - 1) }
+                mysql_enviar(conn, mysql_auth(plugin, clave, nonce))
+            } sino {
+                si (b == 1 y longitud(r) >= 2 y byte_en(r, 1) == 4) {
+                    net_cerrar(conn["sock"])
+                    lanzar "mysql: caching_sha2_password pide la autenticación completa (RSA o TLS), que este cliente no soporta; usa mysql_native_password"
+                }
+                // 0x01 0x03: autenticación rápida aceptada; sigue el OK.
+            }
+        }
+    }
+    conn["secuencia"] = 0
+    retornar conn
+}
+
+// Valor SQL literal con escapes.
+funcion mysql_literal(v) {
+    si (v == nulo) { retornar "NULL" }
+    si (v == verdadero) { retornar "1" }
+    si (v == falso) { retornar "0" }
+    si (tipo(v) == "numero") { retornar "" + v }
+    sea s = "" + v
+    sea partes = []
+    sea inicio = 0
+    para i en rango(longitud(s)) {
+        sea b = byte_en(s, i)
+        sea escape = nulo
+        si (b == 0) { escape = "\\0" }
+        si (b == 10) { escape = "\\n" }
+        si (b == 13) { escape = "\\r" }
+        si (b == 26) { escape = "\\Z" }
+        si (b == 39) { escape = "\\'" }
+        si (b == 34) { escape = "\\\"" }
+        si (b == 92) { escape = "\\\\" }
+        si (escape != nulo) {
+            partes.agregar(subtexto(s, inicio, i))
+            partes.agregar(escape)
+            inicio = i + 1
+        }
+    }
+    partes.agregar(subtexto(s, inicio, longitud(s)))
+    retornar "'" + unir(partes, "") + "'"
+}
+
+// Reemplaza cada "?" fuera de comillas por el parámetro siguiente.
+funcion mysql_sql(sql, parametros) {
+    si (longitud(parametros) == 0) { retornar sql }
+    sea partes = []
+    sea k = 0
+    sea comilla = 0
+    sea inicio = 0
+    para i en rango(longitud(sql)) {
+        sea b = byte_en(sql, i)
+        si (comilla == 0 y (b == 39 o b == 34 o b == 96)) { comilla = b } sino {
+            si (comilla != 0 y b == comilla) { comilla = 0 }
+        }
+        si (comilla == 0 y b == 63) {
+            si (k >= longitud(parametros)) { lanzar "mysql: faltan parámetros para los '?' de la consulta" }
+            partes.agregar(subtexto(sql, inicio, i))
+            partes.agregar(mysql_literal(parametros[k]))
+            k = k + 1
+            inicio = i + 1
+        }
+    }
+    si (k != longitud(parametros)) { lanzar "mysql: sobran parámetros para la consulta" }
+    partes.agregar(subtexto(sql, inicio, longitud(sql)))
+    retornar unir(partes, "")
+}
+
+funcion mysql_valor(t, tipo_columna) {
+    si (t == nulo) { retornar nulo }
+    si (tipo_columna == 1001) { retornar t != "0" }
+    si (tipo_columna == 1 o tipo_columna == 2 o tipo_columna == 3 o tipo_columna == 8 o tipo_columna == 9 o tipo_columna == 13) { retornar a_numero(t) }
+    si (tipo_columna == 4 o tipo_columna == 5 o tipo_columna == 0 o tipo_columna == 246) { retornar a_numero(t) * 1.0 }
+    retornar t
+}
+
+funcion mysql_consultar(conn, sql, parametros = []) {
+    si (conn["abierta"] == falso) { lanzar "mysql: la conexión está cerrada" }
+    conn["secuencia"] = 0
+    mysql_enviar(conn, char_de(3) + mysql_sql(sql, parametros))
+    sea r = {"filas": [], "columnas": [], "afectadas": 0, "ultimo_id": 0}
+    sea d = mysql_leer(conn)
+    sea b = byte_en(d, 0)
+    si (b == 255) { lanzar mysql_error(d) }
+    si (b == 0) {
+        sea a = mysql_entero_lenenc(d, 1)
+        r["afectadas"] = a[0]
+        r["ultimo_id"] = mysql_entero_lenenc(d, a[1])[0]
+        retornar r
+    }
+    // Conjunto de resultados: columnas, EOF, filas, EOF.
+    sea n = mysql_entero_lenenc(d, 0)[0]
+    sea tipos = []
+    para i en rango(n) {
+        sea c = mysql_leer(conn)
+        sea pos = 0
+        para k en rango(4) { pos = mysql_texto_lenenc(c, pos)[1] }
+        sea nombre = mysql_texto_lenenc(c, pos)
+        pos = mysql_texto_lenenc(c, nombre[1])[1]
+        r["columnas"].agregar(nombre[0])
+        sea tipo_columna = byte_en(c, pos + 1 + 2 + 4)
+        // TINYINT(1) es el BOOLEAN de MySQL.
+        si (tipo_columna == 1 y bytes_leer_entero(c, pos + 3, 4, 1) == 1) { tipo_columna = 1001 }
+        tipos.agregar(tipo_columna)
+    }
+    mysql_leer(conn)
+    sea seguir = verdadero
+    mientras (seguir) {
+        sea f = mysql_leer(conn)
+        si (byte_en(f, 0) == 254 y longitud(f) < 9) { seguir = falso } sino {
+            si (byte_en(f, 0) == 255) { lanzar mysql_error(f) }
+            sea fila = {}
+            sea pos = 0
+            para i en rango(n) {
+                sea v = mysql_texto_lenenc(f, pos)
+                fila[r["columnas"][i]] = mysql_valor(v[0], tipos[i])
+                pos = v[1]
+            }
+            r["filas"].agregar(fila)
+        }
+    }
+    retornar r
+}
+
+funcion mysql_ejecutar(conn, sql, parametros = []) { retornar mysql_consultar(conn, sql, parametros)["afectadas"] }
+
+funcion mysql_cerrar(conn) {
+    si (conn["abierta"]) {
+        conn["abierta"] = falso
+        conn["secuencia"] = 0
+        intentar { mysql_enviar(conn, char_de(1)) } capturar (e) { }
+        net_cerrar(conn["sock"])
+    }
+}
