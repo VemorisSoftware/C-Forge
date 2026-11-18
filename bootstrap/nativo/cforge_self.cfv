@@ -1569,11 +1569,64 @@ funcion booleano_dinamico(c) {
     retornar 0
 }
 
+// Posición de la "e" del exponente en un literal numérico, o -1.
+funcion posicion_exponente(lexema) {
+    sea i = 0
+    mientras (i < str_largo(lexema)) {
+        si (str_byte(lexema, i) == 101 o str_byte(lexema, i) == 69) { retornar i }
+        i = i + 1
+    }
+    retornar 0 - 1
+}
+
+// Exponente decimal ("-3", "+2", "5") → entero.
+funcion valor_exponente(t) {
+    si (str_largo(t) > 0 y str_byte(t, 0) == 45) { retornar 0 - numero_literal(str_rebanar(t, 1, str_largo(t))) }
+    si (str_largo(t) > 0 y str_byte(t, 0) == 43) { retornar numero_literal(str_rebanar(t, 1, str_largo(t))) }
+    retornar numero_literal(t)
+}
+
+// bits · 10^e en f64 (potencias exactas de 10 hasta 10^22 por tramo).
+funcion escalar_potencia10(bits, e) {
+    mientras (e != 0) {
+        sea paso = e
+        si (paso > 22) { paso = 22 }
+        si (paso < 0 - 22) { paso = 0 - 22 }
+        sea p = __f64_desde_entero(1)
+        sea k = 0
+        sea m = paso
+        si (m < 0) { m = 0 - m }
+        mientras (k < m) {
+            p = __f64_mul(p, __f64_desde_entero(10))
+            k = k + 1
+        }
+        si (paso > 0) { bits = __f64_mul(bits, p) } sino { bits = __f64_div(bits, p) }
+        e = e - paso
+    }
+    retornar bits
+}
+
 funcion numero_dinamico(c) {
-    sea entero = numero_literal(__cargar64(avanzar(c) + 8))
-    si (ver(c, ".") y __cargar64(vec_obtener(__cargar64(c), __cargar64(c + 8) + 1)) == 2) {
+    sea lexema = __cargar64(avanzar(c) + 8)
+    sea exponente = 0
+    sea con_exponente = 0
+    sea pe = posicion_exponente(lexema)
+    si (pe >= 0) {
+        exponente = valor_exponente(str_rebanar(lexema, pe + 1, str_largo(lexema)))
+        lexema = str_rebanar(lexema, 0, pe)
+        con_exponente = 1
+    }
+    sea entero = numero_literal(lexema)
+    sea bits = __f64_desde_entero(entero)
+    si (con_exponente == 0 y ver(c, ".") y __cargar64(vec_obtener(__cargar64(c), __cargar64(c + 8) + 1)) == 2) {
         avanzar(c)
         sea fraccion = __cargar64(avanzar(c) + 8)
+        sea pf = posicion_exponente(fraccion)
+        si (pf >= 0) {
+            exponente = valor_exponente(str_rebanar(fraccion, pf + 1, str_largo(fraccion)))
+            fraccion = str_rebanar(fraccion, 0, pf)
+            con_exponente = 1
+        }
         // Más de 17 cifras no cambian un double y desbordarían el entero.
         si (str_largo(fraccion) > 17) { fraccion = str_rebanar(fraccion, 0, 17) }
         sea escala = 1
@@ -1583,8 +1636,14 @@ funcion numero_dinamico(c) {
             i = i + 1
         }
         sea parte = __f64_div(__f64_desde_entero(numero_literal(fraccion)), __f64_desde_entero(escala))
-        sea bits = __f64_suma(__f64_desde_entero(entero), parte)
+        bits = escalar_potencia10(__f64_suma(bits, parte), exponente)
         cargar_inmediato(c, bits)
+        empujar(c)
+        llamar_runtime(c, "dyn_flotante", 1)
+        retornar 0
+    }
+    si (con_exponente) {
+        cargar_inmediato(c, escalar_potencia10(bits, exponente))
         empujar(c)
         llamar_runtime(c, "dyn_flotante", 1)
         retornar 0
@@ -1780,7 +1839,29 @@ funcion tok_tipo_en(c, salto) {
     retornar __cargar64(vec_obtener(__cargar64(c), i))
 }
 
-// ¿Tiene el literal una "{" sin escapar? (interpolación)
+// ¿Empieza una interpolación en la posición i del literal? "{" seguida de
+// una letra, "_" o "(", con su "}" antes del final. Así "{\"a\":1}" (JSON) o
+// "main() {" (GLSL) quedan como texto literal.
+funcion abre_interpolacion(lexema, i) {
+    si (str_byte(lexema, i) != 123 o i + 1 >= str_largo(lexema) - 1) { retornar 0 }
+    sea s = str_byte(lexema, i + 1)
+    si (es_letra(s) == 0 y s != 40) { retornar 0 }
+    sea nivel = 1
+    sea k = i + 1
+    mientras (k < str_largo(lexema) - 1) {
+        sea b = str_byte(lexema, k)
+        si (b == 34 o b == 92 o b == 10) { retornar 0 }
+        si (b == 123) { nivel = nivel + 1 }
+        si (b == 125) {
+            nivel = nivel - 1
+            si (nivel == 0) { retornar 1 }
+        }
+        k = k + 1
+    }
+    retornar 0
+}
+
+// ¿Tiene el literal alguna interpolación?
 funcion tiene_interpolacion(lexema) {
     sea i = 1
     mientras (i < str_largo(lexema) - 1) {
@@ -1788,7 +1869,7 @@ funcion tiene_interpolacion(lexema) {
         si (b == 92) {
             i = i + 2
         } sino {
-            si (b == 123) { retornar 1 }
+            si (abre_interpolacion(lexema, i)) { retornar 1 }
             i = i + 1
         }
     }
@@ -1829,7 +1910,7 @@ funcion texto_interpolado(c, lexema) {
             str_agregar_byte(parte, str_byte(lexema, i + 1))
             i = i + 2
         } sino {
-            si (b == 123) {
+            si (abre_interpolacion(lexema, i)) {
                 si (str_largo(parte) > 1) {
                     str_agregar_byte(parte, 34)
                     empujar(c)
