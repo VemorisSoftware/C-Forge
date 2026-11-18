@@ -456,6 +456,26 @@ bibliotecas) pasan compiladas a ELF sin libc. Estado de la suite completa:
 - `a ?? b`, argumentos faltantes = `nulo`, `runtime/lenguaje.cfv` (biblioteca
   del lenguaje en C-Forge: `mapear`, `filtrar`, `reducir`, `tarea`, `esperar`).
 
+### Bloque 4A: biblioteca estándar nativa ✅ (24 de 25 pruebas)
+
+- `runtime/biblioteca.cfv` (modo puente, sin libc): matemática con series
+  propias (`seno`, `coseno`, `tangente`, `arcoseno`, `arccoseno`,
+  `arcotangente`, `exponencial`, `logaritmo`, `potencia`, `raiz` con `sqrtsd`,
+  `redondear`, `absoluto`, `minimo`, `maximo`, `aleatorio`), texto
+  (`texto_reemplazar`, `texto_dividir`, `texto_unir`, `texto_recortar`,
+  `subtexto`, `contiene`, `caracter`, UTF-8), Base64, URL, SHA-256 y MD5,
+  archivos, tiempo con `clock_gettime` (UTC), `sys_info` con
+  `sched_getaffinity`, rutas, `insertar`/`eliminar`.
+- `runtime/lenguaje.cfv` (C-Forge completo): JSON (`json_serializar`,
+  `json_bonito`, `json_parsear` con escapes `\u`, exponentes) y un motor de
+  expresiones regulares con retroceso (clases, grupos, alternativas,
+  cuantificadores `* + ? {m,n}`, anclas).
+- Interpolación de textos `"Hola {nombre}"`, `si(c, a, b)` perezoso y números
+  impresos como el intérprete (6 cifras significativas, `%g`).
+- Los módulos importados se ejecutan antes que el archivo que los importa.
+- Diferencias con el intérprete: `md5` da el MD5 real (el intérprete devolvía
+  SHA-256) y `fecha_ahora` usa UTC.
+
 **Alcance honesto:** el compilador autoalojado compila el *dialecto nativo*
 (enteros de 64 bits, funciones, recursión, condiciones, ciclos, textos
 literales e intrínsecos). El lenguaje C-Forge completo (clases, mapas,
