@@ -89,8 +89,8 @@ fi
 # 8. cforge new (crear proyecto)
 TMPDIR_PROJ=$(mktemp -d)
 cd "$TMPDIR_PROJ"
-if "$CFORGE" new smoke-proj > /dev/null 2>&1 && [ -f "smoke-proj/main.cfv" ] && [ -f "smoke-proj/cforge.json" ]; then
-  ok "cforge new smoke-proj → main.cfv y cforge.json creados"
+if "$CFORGE" new smoke-proj > /dev/null 2>&1 && [ -f "smoke-proj/principal.cfv" ] && [ -f "smoke-proj/cforge.toml" ]; then
+  ok "cforge new smoke-proj → principal.cfv y cforge.toml creados"
 else
   fail "cforge new smoke-proj no creó los archivos esperados"
 fi

@@ -1,66 +1,46 @@
-# C-Forge Core Bootstrap
+# Arranque (bootstrap) de C-Forge
 
-## Objetivo
+C-Forge es 100 % C-Forge: el compilador (`bootstrap/nativo/cforge_self.cfv`
+y la capa de generación `gen*.cfv`), el runtime (`runtime/*.cfv`) y las
+herramientas (CLI, paquetes, `fmt`, LSP, Xcode) están escritos en C-Forge.
+No hay C++, libc ni enlazador externo en ninguna etapa.
 
-El objetivo del bootstrap es que el compilador de C-Forge llegue a compilar sus
-propias fuentes. C++20 se acepta únicamente como Stage 0: el punto de arranque
-para construir el primer motor.
+## Raíz de confianza: la semilla
 
-## Fuentes verificadas
+`bootstrap/semilla/cforge-linux-x64` es un `cforge` para Linux x64 generado
+por el propio compilador. Con él:
 
-El árbol activo conserva Stage 0 y el frontend de C-Forge Core escrito en
-`.cfv`: lexer, AST, parser, análisis semántico, verificación básica de
-movimientos, emisor, runtime y controlador Stage 1. El gate `bootstrap-check`
-construye y ejecuta esas fuentes; no basta con analizarlas como texto.
+| Etapa | Cómo | Resultado |
+|---|---|---|
+| s1 | semilla compila las fuentes | `cforge` nuevo (compilado por el anterior) |
+| s2 | s1 compila las fuentes | `cforge` compilado por sí mismo |
+| s3 | s2 compila las fuentes | idéntico a s2 byte por byte |
 
-## Estado por etapa
+`make cforge-nativo` hace la cadena y comprueba `s2 = s3`. `make semilla`
+actualiza la semilla tras cambiar el compilador y `make semilla-check`
+comprueba que la semilla reproduce exactamente al compilador actual (y por
+tanto a sí misma). La suma SHA-256 está en `cforge-linux-x64.sha256`.
 
-| Etapa | Estado verificable |
-|---|---|
-| Stage 0 | Bootstrap C++20 disponible en `bootstrap/stage0/` |
-| Stage 1 | Frontend Core escrito en `.cfv` y construido por Stage 0 |
-| Stage 2/3 | Reconstrucción reproducible y comparación byte por byte |
-| Runtime autónomo | El binario ejecuta `.cfv` sin Python/JVM/.NET/Node |
-| Toolchain autónoma | Parcial: el frontend se autoaloja; el enlazado final todavía usa `clang++` |
-| Backends directos | Mach-O ARM64, ELF x64 y PE x64 Core B6.21 parciales; consulta `RUNTIME-AUTONOMY.md` |
-| Objetos nativos | Core IR 1 y Object Lowering 1 alimentan Mach-O, ELF y PE con constructores de valor, lectura y escritura de campos | verificado B6.11 |
-| Métodos nativos | Métodos de instancia de solo lectura y `este` se reducen a funciones nativas explícitas en los tres formatos | verificado B6.12 |
-| Métodos mutables | Las llamadas de efecto expanden parámetros y escrituras de `este.campo` sobre la instancia receptora | verificado B6.13 |
-| Ciclo de vida | `crear` inicializa todos los campos y `destruir` se ejecuta automáticamente en orden inverso para instancias superiores | verificado B6.14 |
-| Interfaces | `interfaz`/`implementa` validan métodos, retornos y parámetros antes de emitir los tres formatos | verificado B6.15 |
-| Módulos fuente | `importar "ruta.cfv"` resuelve dependencias relativas, evita cargas duplicadas y rechaza ciclos antes de emitir | verificado B6.16 |
-| Excepciones directas | `intentar`/`capturar`/`lanzar` se reducen a control de flujo común sin excepciones C++ | verificado B6.19 local |
-| ABI de excepciones | Las llamadas directas propagan indicador, mensaje y longitud hasta el bloque capturador | verificado B6.20 |
-| Ownership y RAII | `mover`, préstamos compartidos/mutables y destrucción LIFO por ámbitos se verifican antes de los tres formatos | verificado B6.21 Core |
+## Todas las plataformas desde Linux
 
-El término **frontend Core autoalojado** solo describe el alcance probado por
-`make bootstrap-check`. No significa que toda la toolchain sea autónoma: el
-emisor produce C++17 y el runtime Stage 1 llama a `clang++` para crear el
-ejecutable final.
+El mismo compilador genera, de forma cruzada y reproducible:
 
-## Gate actual
+| Destino | Formato | Orden |
+|---|---|---|
+| `linux` | ELF x86-64 estático | `make build` |
+| `linux-arm64` | ELF AArch64 estático | `make linux-arm64-cruzado` |
+| `windows` | PE32+ x86-64 | `make windows-cruzado` |
+| `macos` | Mach-O x86-64 | `make macos-cruzado` |
+| `macos-arm64` | Mach-O ARM64 PIE con firma ad-hoc | `make macos-arm64-cruzado` |
+| `ios-arm64`, `ios-sim-arm64` | biblioteca `.a` (Mach-O objeto) | `cforge build --lib` |
 
-```sh
-make clean
-make build
-make check
-make test
-make stdlib-load-check
-make malformed-check
-make sanitize-check
-make backend-check
-make install-check
-make bootstrap-check
-```
+El CI compila `cforge` en Windows, macOS Intel y Apple Silicon reales y
+comprueba que el resultado es idéntico byte por byte al compilado desde
+Linux.
 
-Este gate no utiliza Python. Comprueba el motor activo, los módulos `.cfv`, las
-pruebas nativas, los backends mínimos, los tres backends Core B6.8 y una instalación
-aislada. Sus límites forman parte de la evidencia: pasar el gate no convierte
-los backends parciales en backends generales.
+## Historia
 
-## Siguiente criterio de avance
-
-La siguiente etapa debe sustituir la llamada a `clang++` por los emisores
-Mach-O, ELF y PE propios, y ampliar esos emisores hasta cubrir todo Core. Solo
-entonces podrá declararse autónoma la toolchain completa. El runtime y el
-lenguaje 2.6 mantienen un contrato estable independiente de este avance.
+Hasta la versión 3.7 el ejecutable distribuido era un intérprete en C++
+(`cforgev.cpp`) y el compilador se arrancaba desde un Stage 0 en C++20. Ese
+código se retiró del repositorio (sigue en el historial de git); la semilla
+lo reemplaza como punto de partida.

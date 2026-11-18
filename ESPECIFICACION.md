@@ -122,9 +122,9 @@ prueba se ejecutan con `cforge test archivo.cfv`.
 
 ## Implementación y límites
 
-El motor activo está arrancado desde C++20, pero los programas y la biblioteca
-estándar se escriben en C-Forge. No existen en esta especificación puentes a
-Python, Java, JavaScript, TypeScript o C#. Los backends directos Mach-O, ELF y
-PE son prototipos literales y no implementan todavía toda esta especificación.
+El compilador, el runtime y la biblioteca estándar están escritos en C-Forge
+(sin C++). No existen en esta especificación puentes a Python, Java,
+JavaScript, TypeScript o C#. Los backends ELF, PE y Mach-O (x86-64 y ARM64)
+compilan el lenguaje completo; los módulos de `stdlib/PENDIENTES` aún no.
 
 La lista exacta de capacidades y su estado está en `capabilities.json`.
