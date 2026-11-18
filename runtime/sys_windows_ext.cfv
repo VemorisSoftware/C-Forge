@@ -52,20 +52,62 @@ funcion sys_futex_esperar(direccion, valor, ms, op) {
 
 funcion sys_futex_despertar(direccion) { retornar 0 }
 
+// Hilo con CreateThread: el trampolín del compilador cambia a la pila
+// [base, base + tam) y llama a dyn_hilo_inicio(t); al terminar pone en 0
+// [base + 16] (esperar() lo observa).
 funcion sys_hilo_crear(base, tam, t) {
-    rt_panico("tarea/hilo: los hilos nativos en Windows llegan en la fase B del backend")
-    retornar 0 - 1
+    __guardar64(base + 24, t)
+    __guardar64(base + 32, __dir("dyn_hilo_inicio"))
+    sea h = __winapi("kernel32.dll", "CreateThread", 0, 65536, __trampolin_hilo(), base, 0, 0)
+    si (h == 0) { retornar 0 - 1 }
+    __winapi("kernel32.dll", "CloseHandle", h)
+    retornar 0
 }
 
 funcion sys_dl_disponible() { retornar 1 }
 funcion sys_cargar_biblioteca(nombre) { retornar __winapi("kernel32.dll", "LoadLibraryA", str_c(nombre)) }
 funcion sys_simbolo(h, nombre) { retornar __winapi("kernel32.dll", "GetProcAddress", h, str_c(nombre)) }
 
-funcion sys_red_escuchar(puerto) {
-    rt_panico("servidor_http: Winsock llega en la fase B del backend de Windows")
-    retornar 0 - 1
+// ── Red con Winsock (ws2_32.dll) ──────────────────────────────────────────
+
+funcion sys_i32(x) {
+    sea v = __y_bits(x, 4294967295)
+    si (v >= 2147483648) { retornar v - 4294967296 }
+    retornar v
 }
-funcion sys_red_aceptar(fd, dir, largo_dir) { retornar 0 - 1 }
-funcion sys_red_leer(fd, buf, n) { retornar 0 - 1 }
-funcion sys_red_escribir(fd, buf, n) { retornar 0 - 1 }
-funcion sys_red_cerrar(fd) { retornar 0 }
+
+funcion sys_winsock() {
+    si (__cargar64(__globales() + 224) == 0) {
+        sea datos = mem_reservar(512)
+        __winapi("ws2_32.dll", "WSAStartup", 514, datos)      // versión 2.2
+        mem_liberar(datos)
+        __guardar64(__globales() + 224, 1)
+    }
+    retornar 0
+}
+
+funcion sys_red_escuchar(puerto) {
+    sys_winsock()
+    sea fd = __winapi("ws2_32.dll", "socket", 2, 1, 6)        // AF_INET, SOCK_STREAM, TCP
+    si (fd == 0 - 1 o fd == 0) { retornar 0 - 1 }
+    sea dir = mem_reservar(16)
+    mem_llenar(dir, 0, 16)
+    __guardar8(dir, 2)
+    __guardar8(dir + 2, __desplazar_der(puerto, 8))
+    __guardar8(dir + 3, __y_bits(puerto, 255))
+    sea r = sys_i32(__winapi("ws2_32.dll", "bind", fd, dir, 16))
+    mem_liberar(dir)
+    si (r != 0) { retornar 0 - 2 }
+    si (sys_i32(__winapi("ws2_32.dll", "listen", fd, 64)) != 0) { retornar 0 - 3 }
+    retornar fd
+}
+
+funcion sys_red_aceptar(fd, dir, largo_dir) {
+    sea c = __winapi("ws2_32.dll", "accept", fd, dir, largo_dir)
+    si (c == 0 - 1) { retornar 0 - 1 }
+    retornar c
+}
+
+funcion sys_red_leer(fd, buf, n) { retornar sys_i32(__winapi("ws2_32.dll", "recv", fd, buf, n, 0)) }
+funcion sys_red_escribir(fd, buf, n) { retornar sys_i32(__winapi("ws2_32.dll", "send", fd, buf, n, 0)) }
+funcion sys_red_cerrar(fd) { __winapi("ws2_32.dll", "closesocket", fd) retornar 0 }
