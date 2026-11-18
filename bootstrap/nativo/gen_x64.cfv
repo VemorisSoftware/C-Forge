@@ -1,0 +1,438 @@
+// bootstrap/nativo/gen_x64.cfv — backend x86-64 del compilador autoalojado.
+//
+// Implementa las operaciones de la máquina virtual de bootstrap/nativo/gen.cfv
+// con código x86-64. Registros virtuales con la numeración de x86-64:
+//   0 rax · 1 rcx · 2 rdx · 3 rbx · 4 rsp · 5 rbp · 6 rsi · 7 rdi · 8-15 r8-r15
+// Modelo: resultado en rax, valores intermedios en la pila (8 bytes),
+// locales en [rbp - 8k] y argumentos en [rbp + 16 + 8i].
+
+// REX.W con las extensiones R (registro) y B (base).
+funcion x64_rex(c, registro, base) {
+    sea r = 72
+    si (registro >= 8) { r = r + 4 }
+    si (base >= 8) { r = r + 1 }
+    e1(c, r)
+    retornar 0
+}
+
+funcion x64_modrm(c, modo, registro, base) {
+    e1(c, modo * 64 + __y_bits(registro, 7) * 8 + __y_bits(base, 7))
+    si (__y_bits(base, 7) == 4) { e1(c, 36) }                  // SIB [rsp]/[r12]
+    retornar 0
+}
+
+funcion x64_empujar_reg(c, r) {
+    si (r >= 8) { e1(c, 65) }
+    e1(c, 80 + __y_bits(r, 7))
+    retornar 0
+}
+
+funcion x64_sacar(c, r) {
+    si (r >= 8) { e1(c, 65) }
+    e1(c, 88 + __y_bits(r, 7))
+    retornar 0
+}
+
+// mov destino, origen
+funcion x64_mov(c, destino, origen) {
+    x64_rex(c, origen, destino)
+    e2(c, 137, 192 + __y_bits(origen, 7) * 8 + __y_bits(destino, 7))
+    retornar 0
+}
+
+funcion x64_inmediato(c, valor) {
+    si (valor >= 0 - 2147483648 y valor <= 2147483647) {
+        e3(c, 72, 199, 192)                                    // mov rax, imm32
+        e32(c, valor)
+        retornar 0
+    }
+    e2(c, 72, 184)                                             // movabs rax, imm64
+    e32(c, valor)
+    e32(c, __desplazar_der(valor, 32))
+    retornar 0
+}
+
+// mov destino, [base + d] con la forma más corta (sin desplazamiento o disp8).
+funcion x64_cargar(c, destino, base, d) {
+    x64_rex(c, destino, base)
+    e1(c, 139)
+    si (d == 0 y __y_bits(base, 7) != 5) {
+        x64_modrm(c, 0, destino, base)
+    } sino {
+        x64_modrm(c, 1, destino, base)
+        e1(c, __y_bits(d, 255))
+    }
+    retornar 0
+}
+
+// mov destino, [base + disp32]
+funcion x64_cargar32(c, destino, base, d) {
+    x64_rex(c, destino, base)
+    e1(c, 139)
+    x64_modrm(c, 2, destino, base)
+    e32(c, d)
+    retornar 0
+}
+
+// mov [base + d], origen (forma corta)
+funcion x64_guardar(c, base, d, origen) {
+    x64_rex(c, origen, base)
+    e1(c, 137)
+    si (d == 0 y __y_bits(base, 7) != 5) {
+        x64_modrm(c, 0, origen, base)
+    } sino {
+        x64_modrm(c, 1, origen, base)
+        e1(c, __y_bits(d, 255))
+    }
+    retornar 0
+}
+
+// mov [base + disp32], origen
+funcion x64_guardar32(c, base, d, origen) {
+    x64_rex(c, origen, base)
+    e1(c, 137)
+    x64_modrm(c, 2, origen, base)
+    e32(c, d)
+    retornar 0
+}
+
+// rax ← dirección (tipo 1 dato, 2 global, 3 tabla de clases, 4 etiqueta)
+funcion x64_direccion(c, tipo, valor) {
+    e1(c, 184)                                                 // mov eax, imm32
+    nuevo_arreglo(c, tipo, valor)
+    retornar 0
+}
+
+funcion x64_cargar_absoluto(c, tipo, valor) {
+    e4(c, 72, 139, 4, 37)                                      // mov rax, [abs32]
+    nuevo_arreglo(c, tipo, valor)
+    retornar 0
+}
+
+funcion x64_guardar_absoluto(c, tipo, valor) {
+    e4(c, 72, 137, 4, 37)                                      // mov [abs32], rax
+    nuevo_arreglo(c, tipo, valor)
+    retornar 0
+}
+
+// rax ← [rax + rcx·8 + d]
+funcion x64_cargar_indexado(c, d) {
+    si (d == 0) { e4(c, 72, 139, 4, 200) } sino { e5(c, 72, 139, 68, 200, d) }
+    retornar 0
+}
+
+// push qword [rsp + d]
+funcion x64_empujar_pila(c, d) {
+    si (d == 0) { e3(c, 255, 52, 36) } sino { e4(c, 255, 116, 36, d) }
+    retornar 0
+}
+
+// rax ← rax (op) rcx: 1 suma · 2 resta · 3 producto · 4 división ·
+// 5 resto · 6 y · 7 o · 8 o exclusivo · 9 desplazar izq · 10 desplazar der
+funcion x64_aritmetica(c, op) {
+    si (op == 1) { e3(c, 72, 1, 200) }
+    si (op == 2) { e3(c, 72, 41, 200) }
+    si (op == 3) { e4(c, 72, 15, 175, 193) }
+    si (op == 4) { e5(c, 72, 153, 72, 247, 249) }              // cqo; idiv rcx
+    si (op == 5) {
+        e5(c, 72, 153, 72, 247, 249)
+        e3(c, 72, 137, 208)                                    // mov rax, rdx
+    }
+    si (op == 6) { e3(c, 72, 33, 200) }
+    si (op == 7) { e3(c, 72, 9, 200) }
+    si (op == 8) { e3(c, 72, 49, 200) }
+    si (op == 9) { e3(c, 72, 211, 224) }                       // shl rax, cl
+    si (op == 10) { e3(c, 72, 211, 232) }                      // shr rax, cl
+    retornar 0
+}
+
+// rax ← rax + rax + k (entero etiquetado: k = 1; booleano: k = 2)
+funcion x64_etiquetar(c, k) {
+    e3(c, 72, 1, 192)
+    e4(c, 72, 131, 192, k)
+    retornar 0
+}
+
+// Comparación rax ? rcx → 0/1. codigo: byte de setcc de x86 (156 <, 158 <=,
+// 159 >, 157 >=, 148 ==, 149 !=).
+funcion x64_comparar(c, codigo) {
+    e3(c, 72, 57, 200)
+    e3(c, 15, codigo, 192)
+    e3(c, 15, 182, 192)
+    retornar 0
+}
+
+funcion x64_saltar_si(c, cero, etiqueta) {
+    e3(c, 72, 133, 192)                                        // test rax, rax
+    si (cero) { e2(c, 15, 132) } sino { e2(c, 15, 133) }       // je / jne
+    nuevo_arreglo(c, 0, etiqueta)
+    retornar 0
+}
+
+funcion x64_prologo(c) {
+    e4(c, 85, 72, 137, 229)                                    // push rbp; mov rbp, rsp
+    e3(c, 72, 129, 236)                                        // sub rsp, imm32
+    sea posicion = posicion_codigo(c)
+    e32(c, 0)
+    retornar posicion
+}
+
+funcion x64_f64(c, operacion) {
+    e5(c, 102, 72, 15, 110, 192)                               // movq xmm0, rax
+    e5(c, 102, 72, 15, 110, 201)                               // movq xmm1, rcx
+    e4(c, 242, 15, operacion, 193)                             // op sd xmm0, xmm1
+    e5(c, 102, 72, 15, 126, 192)                               // movq rax, xmm0
+    retornar 0
+}
+
+// __syscall(n, a1..a6) con los argumentos apilados.
+funcion x64_syscall(c, n) {
+    sea i = n - 1
+    mientras (i >= 0) {
+        si (i == 0) { x64_sacar(c, 0) }
+        si (i == 1) { x64_sacar(c, 7) }
+        si (i == 2) { x64_sacar(c, 6) }
+        si (i == 3) { x64_sacar(c, 2) }
+        si (i == 4) { x64_sacar(c, 10) }
+        si (i == 5) { x64_sacar(c, 8) }
+        si (i == 6) { x64_sacar(c, 9) }
+        i = i - 1
+    }
+    e2(c, 15, 5)
+    retornar 0
+}
+
+// __hilo(tope_pila, funcion, arg, tid): clone (Linux) con hilo nuevo que
+// ejecuta funcion(arg) en su pila y termina; devuelve el tid.
+funcion x64_hilo(c) {
+    x64_sacar(c, 10)                                           // pop r10 (tid)
+    x64_sacar(c, 0)                                            // pop rax (arg)
+    x64_sacar(c, 1)                                            // pop rcx (funcion)
+    x64_sacar(c, 6)                                            // pop rsi (pila)
+    e3(c, 76, 137, 210)                                        // mov rdx, r10
+    e4(c, 72, 131, 238, 16)                                    // sub rsi, 16
+    e3(c, 72, 137, 14)                                         // mov [rsi], rcx
+    e4(c, 72, 137, 70, 8)                                      // mov [rsi + 8], rax
+    e1(c, 191)                                                 // mov edi, banderas
+    e32(c, 3477248)                                            // VM|FS|FILES|SIGHAND|THREAD|SYSVSEM|PARENT_SETTID|CHILD_CLEARTID
+    e3(c, 69, 49, 192)                                         // xor r8d, r8d
+    e1(c, 184)
+    e32(c, 56)                                                 // clone
+    e2(c, 15, 5)
+    sea padre = nueva_etiqueta(c)
+    x64_saltar_si(c, 0, padre)
+    x64_sacar(c, 0)                                            // hijo: pop rax (funcion)
+    x64_sacar(c, 1)                                            // pop rcx (arg)
+    e2(c, 49, 237)                                             // xor ebp, ebp
+    x64_empujar_reg(c, 1)
+    e2(c, 255, 208)                                            // call rax
+    e1(c, 191)
+    e32(c, 0)
+    e1(c, 184)
+    e32(c, 60)                                                 // exit (solo este hilo)
+    e2(c, 15, 5)
+    definir_etiqueta(c, padre)
+    retornar 0
+}
+
+// Saca n argumentos apilados (el primero, el más profundo) a los registros
+// de la ABI System V: rdi, rsi, rdx, rcx, r8, r9.
+funcion x64_sacar_sysv(c, n) {
+    sea i = n
+    mientras (i >= 1) {
+        si (i == 1) { x64_sacar(c, 7) }
+        si (i == 2) { x64_sacar(c, 6) }
+        si (i == 3) { x64_sacar(c, 2) }
+        si (i == 4) { x64_sacar(c, 1) }
+        si (i == 5) { x64_sacar(c, 8) }
+        si (i == 6) { x64_sacar(c, 9) }
+        i = i - 1
+    }
+    retornar 0
+}
+
+// __ccall(funcion, a1..a6): llamada C con enteros (System V).
+funcion x64_ccall(c, n) {
+    x64_sacar_sysv(c, n - 1)
+    x64_sacar(c, 11)                                           // pop r11
+    e3(c, 73, 137, 228)                                        // mov r12, rsp
+    e4(c, 72, 131, 228, 240)                                   // and rsp, -16
+    e2(c, 49, 192)                                             // xor eax, eax
+    e3(c, 65, 255, 211)                                        // call r11
+    e3(c, 76, 137, 228)                                        // mov rsp, r12
+    retornar 0
+}
+
+// call [GOT] de la importación i (macOS: puntero que llena dyld), System V.
+funcion x64_llamar_importada(c, indice, n) {
+    x64_sacar_sysv(c, n)
+    e3(c, 73, 137, 228)                                        // mov r12, rsp
+    e4(c, 72, 131, 228, 240)                                   // and rsp, -16
+    e2(c, 49, 192)                                             // xor eax, eax
+    e3(c, 255, 20, 37)                                         // call [GOT]
+    nuevo_arreglo(c, 5, indice)
+    e3(c, 76, 137, 228)                                        // mov rsp, r12
+    retornar 0
+}
+
+// call [IAT] de la importación i, con la ABI x64 de Windows: los n
+// argumentos ya están apilados (el primero, el más profundo); van a rcx,
+// rdx, r8, r9 y el resto a la pila tras 32 bytes de sombra, con rsp
+// alineado a 16. El resultado queda en rax.
+funcion x64_llamar_iat(c, indice, n) {
+    e3(c, 73, 137, 228)                                        // mov r12, rsp
+    sea extra = 0
+    si (n > 4) { extra = n - 4 }
+    e3(c, 72, 129, 236)                                        // sub rsp, 32 + 8·extra
+    e32(c, 32 + 8 * extra + 8)
+    e4(c, 72, 131, 228, 240)                                   // and rsp, -16
+    sea i = 4
+    mientras (i < n) {
+        x64_cargar32(c, 0, 12, 8 * (n - 1 - i))                // mov rax, [r12 + 8(n-1-i)]
+        x64_guardar32(c, 4, 32 + 8 * (i - 4), 0)               // mov [rsp + 32 + 8(i-4)], rax
+        i = i + 1
+    }
+    si (n > 0) { x64_cargar32(c, 1, 12, 8 * (n - 1)) }
+    si (n > 1) { x64_cargar32(c, 2, 12, 8 * (n - 2)) }
+    si (n > 2) { x64_cargar32(c, 8, 12, 8 * (n - 3)) }
+    si (n > 3) { x64_cargar32(c, 9, 12, 8 * (n - 4)) }
+    e3(c, 255, 20, 37)                                         // call [IAT]
+    nuevo_arreglo(c, 5, indice)
+    e3(c, 76, 137, 228)                                        // mov rsp, r12
+    si (n > 0) {
+        e3(c, 72, 129, 196)
+        e32(c, 8 * n)
+    }
+    retornar 0
+}
+
+// Llamada externa (extern) con la ABI System V: los argumentos ya
+// convertidos (en locales) van a rdi..r9 o xmm0..7; resultado en rax/xmm0.
+funcion x64_llamada_externa(c, casilla, tipos, convertidos) {
+    sea n = vec_largo(tipos)
+    sea enteros = 0
+    sea flotantes = 0
+    sea i = 0
+    mientras (i < n) {
+        cargar_local(c, vec_obtener(convertidos, i))
+        si (vec_obtener(tipos, i) == 1) {
+            si (flotantes > 7) { error_en(c, "extern: demasiados argumentos flotantes") }
+            e5(c, 102, 72, 15, 110, 192 + flotantes * 8)       // movq xmmN, rax
+            flotantes = flotantes + 1
+        } sino {
+            si (enteros == 0) { x64_mov(c, 7, 0) }
+            si (enteros == 1) { x64_mov(c, 6, 0) }
+            si (enteros == 2) { x64_mov(c, 2, 0) }
+            si (enteros == 3) { x64_mov(c, 1, 0) }
+            si (enteros == 4) { x64_mov(c, 8, 0) }
+            si (enteros == 5) { x64_mov(c, 9, 0) }
+            si (enteros > 5) { error_en(c, "extern: más de 6 argumentos enteros") }
+            enteros = enteros + 1
+        }
+        i = i + 1
+    }
+    e3(c, 73, 137, 228)                                        // mov r12, rsp
+    e4(c, 72, 131, 228, 240)                                   // and rsp, -16
+    e1(c, 184)                                                 // mov eax, flotantes
+    e32(c, flotantes)
+    e3(c, 255, 20, 37)                                         // call [GOT]
+    nuevo_arreglo(c, 1, casilla)
+    e3(c, 76, 137, 228)                                        // mov rsp, r12
+    retornar 0
+}
+
+// Llamada externa con la ABI x64 de Windows: los argumentos ya convertidos
+// (en locales) van por posición a rcx/rdx/r8/r9 o xmm0-3, el resto a la pila
+// tras 32 bytes de sombra; rsp alineado a 16.
+funcion x64_llamada_externa_windows(c, casilla, tipos, convertidos) {
+    sea n = vec_largo(tipos)
+    sea extra = 0
+    si (n > 4) { extra = n - 4 }
+    e3(c, 73, 137, 228)                                        // mov r12, rsp
+    e3(c, 72, 129, 236)                                        // sub rsp, 32 + 8·extra + 8
+    e32(c, 40 + 8 * extra)
+    e4(c, 72, 131, 228, 240)                                   // and rsp, -16
+    sea i = 4
+    mientras (i < n) {
+        cargar_local(c, vec_obtener(convertidos, i))
+        x64_guardar32(c, 4, 32 + 8 * (i - 4), 0)
+        i = i + 1
+    }
+    i = 0
+    mientras (i < n y i < 4) {
+        cargar_local(c, vec_obtener(convertidos, i))
+        si (vec_obtener(tipos, i) == 1) {
+            e5(c, 102, 72, 15, 110, 192 + i * 8)               // movq xmm_i, rax
+        } sino {
+            si (i == 0) { x64_mov(c, 1, 0) }
+            si (i == 1) { x64_mov(c, 2, 0) }
+            si (i == 2) { x64_mov(c, 8, 0) }
+            si (i == 3) { x64_mov(c, 9, 0) }
+        }
+        i = i + 1
+    }
+    e3(c, 255, 20, 37)                                         // call [casilla]
+    nuevo_arreglo(c, 1, casilla)
+    e3(c, 76, 137, 228)                                        // mov rsp, r12
+    retornar 0
+}
+
+// Entrada del ejecutable: guarda rsp (argc/argv), llama al programa y termina.
+funcion x64_inicio(c, principal) {
+    x64_mov(c, 0, 4)
+    x64_guardar_absoluto(c, 2, 504)
+    si (es_macos(c)) {
+        // dyld llama a main(argc, argv, envp): globales 60, 61 y 62.
+        x64_mov(c, 0, 7)
+        x64_guardar_absoluto(c, 2, 480)
+        x64_mov(c, 0, 6)
+        x64_guardar_absoluto(c, 2, 488)
+        x64_mov(c, 0, 2)
+        x64_guardar_absoluto(c, 2, 496)
+    }
+    e1(c, 232)
+    nuevo_arreglo(c, 0, principal)
+    si (es_windows(c)) {
+        x64_empujar_reg(c, 0)                                  // ExitProcess(código)
+        x64_llamar_iat(c, importacion_windows(c, "kernel32.dll", "ExitProcess"), 1)
+        retornar 0
+    }
+    si (es_macos(c)) {
+        x64_empujar_reg(c, 0)                                  // exit(código)
+        x64_llamar_importada(c, importacion_windows(c, "libSystem", "exit"), 1)
+        retornar 0
+    }
+    x64_mov(c, 7, 0)                                           // mov rdi, rax
+    x64_inmediato(c, 231)                                      // exit_group
+    e2(c, 15, 5)
+    retornar 0
+}
+
+// Trampolín de hilos (CreateThread: registro en rcx; pthread: en rdi; el
+// registro está en la base de una pila de 8 MiB alineada): cambia a esa
+// pila, llama a [registro + 32](t = [registro + 24]) con la convención del
+// lenguaje, marca el hilo como terminado ([registro + 16] = 0) y vuelve a
+// la pila del sistema. El registro se guarda en r13 y la pila del sistema
+// en rbx: el código generado no usa esos registros.
+funcion x64_trampolin_hilo(c) {
+    x64_empujar_reg(c, 3)
+    x64_empujar_reg(c, 13)
+    x64_empujar_reg(c, 12)
+    si (es_macos(c)) { x64_mov(c, 13, 7) } sino { x64_mov(c, 13, 1) }
+    x64_mov(c, 3, 4)                                           // mov rbx, rsp
+    x64_mov(c, 0, 13)                                          // mov rax, r13
+    e2(c, 72, 5)                                               // add rax, 8 MiB
+    e32(c, 8388608)
+    x64_mov(c, 4, 0)                                           // mov rsp, rax
+    e4(c, 65, 255, 117, 24)                                    // push qword [r13 + 24]
+    e4(c, 65, 255, 85, 32)                                     // call qword [r13 + 32]
+    x64_mov(c, 4, 3)                                           // mov rsp, rbx
+    e4(c, 73, 199, 69, 16)                                     // mov qword [r13 + 16], 0
+    e32(c, 0)
+    x64_sacar(c, 12)
+    x64_sacar(c, 13)
+    x64_sacar(c, 3)
+    e2(c, 49, 192)                                             // xor eax, eax
+    e1(c, 195)                                                 // ret
+    retornar 0
+}
