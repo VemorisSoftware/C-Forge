@@ -11,10 +11,10 @@ export CFORGE_STDLIB="$SITIO/../stdlib"
 fallos=0
 tmp=$(mktemp -d)
 trap 'rm -rf "$tmp"' EXIT
-for ejemplo in "$SITIO"/ejemplos/*.cfv; do
-  nombre=$(basename "$ejemplo" .cfv)
+for ejemplo in "$SITIO"/ejemplos/*.cfv "$SITIO"/ejemplos/en/*.cfv; do
+  nombre=$(basename "$ejemplo" .cfv); dir=$(dirname "$ejemplo")
   (cd "$tmp" && "$CFORGE" "$ejemplo") > "$tmp/$nombre.real" 2>&1 || true
-  if diff -u "$SITIO/ejemplos/$nombre.salida" "$tmp/$nombre.real" > "$tmp/$nombre.diff"; then
+  if diff -u "$dir/$nombre.salida" "$tmp/$nombre.real" > "$tmp/$nombre.diff"; then
     echo "  OK   ejemplo $nombre"
   else
     echo "  FALLA ejemplo $nombre"; cat "$tmp/$nombre.diff"; fallos=$((fallos + 1))

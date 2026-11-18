@@ -1416,6 +1416,31 @@ Value cfv_eval_builtin(Value cfv_nombre, Value cfv_args, Value cfv_env, Value cf
 Value cfv_eval_expr(Value cfv_nodo_e, Value cfv_env, Value cfv_fns);
 Value cfv_exec_bloque(Value cfv_sentencias, Value cfv_env, Value cfv_fns);
 Value cfv_exec_stmt(Value cfv_stmt, Value cfv_env, Value cfv_fns);
+// Sintaxis bilingüe: las palabras clave en inglés son alias exactos de las
+// palabras clave en español. Tras un '.' no se traduce (campos y métodos).
+static Value cfv_palabra_clave_ingles(const Value& lexema, const Value& tokens) {
+    static const std::map<std::string, std::string> alias = {
+        {"let", "sea"}, {"function", "funcion"}, {"return", "retornar"},
+        {"if", "si"}, {"else", "sino"}, {"while", "mientras"}, {"for", "para"},
+        {"in", "en"}, {"try", "intentar"}, {"catch", "capturar"},
+        {"throw", "lanzar"}, {"class", "clase"}, {"this", "esto"},
+        {"import", "importar"}, {"break", "romper"}, {"continue", "continuar"},
+        {"and", "y"}, {"or", "o"}, {"not", "no"}, {"true", "verdadero"},
+        {"false", "falso"}, {"null", "nulo"}, {"print", "mostrar"},
+        {"assert", "afirmar"},
+    };
+    const auto* texto_lex = std::get_if<std::string>(&lexema.data);
+    if (!texto_lex) return lexema;
+    const auto encontrado = alias.find(*texto_lex);
+    if (encontrado == alias.end()) return lexema;
+    if (const auto* lista = std::get_if<Lista>(&tokens.data)) {
+        if (!(*lista)->empty()) {
+            Value previo = indice((*lista)->back(), Value{std::string("lexema")});
+            if (const auto* p = std::get_if<std::string>(&previo.data); p && *p == ".") return lexema;
+        }
+    }
+    return Value{encontrado->second};
+}
 Value cfv_Token(Value cfv_tipo, Value cfv_lexema, Value cfv_linea) {
   cfv_jit_hit("Token");
  [[maybe_unused]] size_t cfv_tipo_tipo = cfv_tipo.index();
@@ -1554,6 +1579,7 @@ Value cfv_tokenizar(Value cfv_fuente) {
       Value cfv_lex = cfv_subcadena(cfv_fuente, cfv_inicio, cfv_pos);
       if (cfv_lex.index() != 2) throw std::runtime_error("tipo incompatible para lex");
  [[maybe_unused]] size_t cfv_lex_tipo = 2;
+      cfv_lex = cfv_palabra_clave_ingles(cfv_lex, cfv_tokens);
       (void)(cfv_agregar(cfv_tokens, cfv_Token(Value{std::string("IDENT", 5)}, cfv_lex, cfv_linea)));
     }     else if (verdad(compara(cfv_c, Value{std::string("\"", 1)}, "=="))) {
       Value cfv_linea_str = cfv_linea;
@@ -5905,6 +5931,25 @@ Value cfv_eval_builtin(Value cfv_nombre, Value cfv_args, Value cfv_env, Value cf
   return Value{std::string("__no_builtin__", 14)};
   return Value{};
 }
+// Nombres en inglés para las funciones integradas más usadas. Solo se aplican
+// si el programa no definió una función o variable con ese nombre.
+static Value cfv_funcion_ingles(const Value& nombre, const Value& env, const Value& fns) {
+    static const std::map<std::string, std::string> alias = {
+        {"length", "longitud"}, {"append", "agregar"}, {"to_text", "a_texto"},
+        {"to_number", "a_numero"}, {"upper", "texto_mayusculas"},
+        {"lower", "texto_minusculas"}, {"replace", "texto_reemplazar"},
+        {"json_parse", "json_parsear"}, {"json_stringify", "json_serializar"},
+        {"json_pretty", "json_bonito"}, {"json_valid", "json_valido"},
+        {"sort", "lista_ordenar"},
+    };
+    const auto* texto_nombre = std::get_if<std::string>(&nombre.data);
+    if (!texto_nombre) return nombre;
+    const auto encontrado = alias.find(*texto_nombre);
+    if (encontrado == alias.end()) return nombre;
+    if (verdad(cfv_tiene_clave(fns, nombre))) return nombre;
+    try { (void)cfv_env_buscar(env, nombre); return nombre; } catch (...) {}
+    return Value{encontrado->second};
+}
 Value cfv_eval_expr(Value cfv_nodo_e, Value cfv_env, Value cfv_fns) {
   cfv_jit_hit("eval_expr");
  [[maybe_unused]] size_t cfv_nodo_e_tipo = cfv_nodo_e.index();
@@ -6152,6 +6197,7 @@ Value cfv_eval_expr(Value cfv_nodo_e, Value cfv_env, Value cfv_fns) {
   if (verdad(compara(cfv_t, Value{std::string("Llamada", 7)}, "=="))) {
     Value cfv_nombre_fn = indice(cfv_nodo_e, Value{std::string("valor", 5)});
     if (cfv_nombre_fn.index() != 2) throw std::runtime_error("tipo incompatible para nombre_fn");
+    cfv_nombre_fn = cfv_funcion_ingles(cfv_nombre_fn, cfv_env, cfv_fns);
  [[maybe_unused]] size_t cfv_nombre_fn_tipo = 2;
     Value cfv_args_eval = crear_lista({});
     if (cfv_args_eval.index() != 4) throw std::runtime_error("tipo incompatible para args_eval");
@@ -7226,9 +7272,9 @@ const char* cfv_eval_json(const char* code) {
 }
 
 // Obtener version del interprete
-// FUENTE DE VERDAD: Makefile VERSION := 3.7.1
+// FUENTE DE VERDAD: Makefile VERSION := 3.7.2
 // Actualizar ambos a la vez con: sed -i 's/3\.7\.0/NUEVA/g' Makefile cforgev.cpp
-const char* cfv_version() { return "3.7.1"; }
+const char* cfv_version() { return "3.7.2"; }
 
 // Verificar disponibilidad de SDL2
 int cfv_has_sdl2() {
