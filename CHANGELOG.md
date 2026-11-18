@@ -17,6 +17,13 @@ Sitio oficial: [c-forge.org](https://c-forge.org)
   con 10 000 solicitudes: de 231 MB a 8,6 MB. `memoria_estadisticas()`,
   `CFORGE_GC=0` (desactivar) y `CFORGE_GC_ESTRES=1` (pruebas). No recolecta
   mientras haya hilos de `tarea()` vivos.
+- **Verificador de tipos estáticos:** `cforge check`, `build` y el LSP
+  detectan antes de ejecutar los errores de tipo con anotaciones (`sea x:
+  numero`, parámetros y retorno) e inferencia local (`sea n = 5`, si la
+  variable no se vuelve a asignar): asignaciones, argumentos, valores de
+  retorno, operadores (`texto - numero`, comparar lista con número),
+  condiciones y `no` que no son booleanas. Lo que no se conoce sigue siendo
+  dinámico (tipado gradual): ningún programa válido deja de compilar.
 - **`docs/GLOBALES.md`:** mapa de las casillas globales del runtime. Corrige
   dos choques de 4.1: las tablas de AES usaban la caché de `argv` en Windows
   (ahora casilla 15) y el handle de libssl la casilla de `sys_casilla` (16).

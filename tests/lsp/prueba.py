@@ -53,6 +53,10 @@ assert leer()["params"]["diagnostics"] == []
 diag = cambiar(texto.replace("x * 2", "x * )"), 2)
 assert len(diag) == 1 and diag[0]["range"]["start"]["line"] == 1, diag
 assert cambiar(texto, 3) == []
+# Error de tipos detectado antes de ejecutar (verificador estático).
+diag = cambiar(texto.replace("doble(4)", 'doble("cuatro")'), 4)
+assert len(diag) == 1 and "error de tipos" in diag[0]["message"] and diag[0]["range"]["start"]["line"] == 4, diag
+assert cambiar(texto, 5) == []
 defi = peticion(2, "textDocument/definition", {"textDocument": {"uri": uri}, "position": {"line": 4, "character": 14}})
 assert defi["range"]["start"] == {"line": 0, "character": 8}, defi
 hover = peticion(3, "textDocument/hover", {"textDocument": {"uri": uri}, "position": {"line": 4, "character": 14}})
