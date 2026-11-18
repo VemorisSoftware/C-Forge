@@ -86,6 +86,9 @@ Sitio oficial: [c-forge.org](https://c-forge.org)
   necesita `CFORGE_STDLIB`.
 - **Windows**: el fallo de la suite con MSVC era la pila de 1 MB; se enlaza con
   64 MB y la suite completa vuelve a ser obligatoria en CI y release.
+- **macOS x86-64 nativo (Mach-O)**: `--target macos`, escritor Mach-O propio
+  enlazado a `libSystem.B.dylib`, `runtime/sys_macos*.cfv` y CI en macOS real
+  (Stage 2 = Stage 3 = compilación cruzada; 25/25, 32/32, 22/22).
 - **CI**: smoke test con rutas absolutas; se elimina `build-native.yml`
   (duplicado).
 - **Web**: c-forge.org vive en `site/` y se despliega en Cloudflare Pages; se

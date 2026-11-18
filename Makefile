@@ -48,7 +48,7 @@ endif
 
 # ── Targets ────────────────────────────────────────────────────────────────────
 
-.PHONY: windows-cruzado cforge-nativo embebido semilla semilla-check cforge-desde-semilla autoalojado-check
+.PHONY: macos-cruzado windows-cruzado cforge-nativo embebido semilla semilla-check cforge-desde-semilla autoalojado-check
 .PHONY: all build debug release install uninstall test check stdlib-load-check \
 	cli-check malformed-check sanitize-check backend-check install-check \
 	bootstrap-bundle backend-core-bundle bootstrap-check backend-core-check ir-core-check object-lowering-check release-check clean help
@@ -323,7 +323,7 @@ RUNTIME_LENGUAJE := $(RUNTIME_NATIVO) runtime/sys_linux_ext.cfv runtime/map.cfv 
 PRUEBAS_LENGUAJE_NATIVAS := $(basename $(notdir $(wildcard tests/cfv/*.cfv)))
 FUENTES_COMPILADOR := $(RUNTIME_NATIVO) bootstrap/nativo/lexer.cfv bootstrap/nativo/cforge_self.cfv
 FUENTES_CFORGE := $(FUENTES_COMPILADOR) bootstrap/nativo/embebido.cfv bootstrap/nativo/cforge_cli.cfv
-EMBEBIDO_ARGS := --nativo $(RUNTIME_NATIVO) runtime/sys_linux_ext.cfv runtime/sys_windows.cfv runtime/sys_windows_ext.cfv runtime/map.cfv --puente runtime/dyn.cfv runtime/biblioteca.cfv --lenguaje runtime/lenguaje.cfv --opcional runtime/sdl.cfv
+EMBEBIDO_ARGS := --nativo $(RUNTIME_NATIVO) runtime/sys_linux_ext.cfv runtime/sys_windows.cfv runtime/sys_windows_ext.cfv runtime/sys_macos.cfv runtime/sys_macos_ext.cfv runtime/map.cfv --puente runtime/dyn.cfv runtime/biblioteca.cfv --lenguaje runtime/lenguaje.cfv --opcional runtime/sdl.cfv
 SEMILLA := bootstrap/semilla/cforge-linux-x64
 
 ## Construye ./cforge-nativo desde C++ (Stage 0) y verifica Stage 2 = Stage 3.
@@ -357,6 +357,18 @@ windows-cruzado: cforge-nativo
 	done; \
 	sha256sum dist-windows/cforge.exe; \
 	echo "  ✓ cforge.exe (PE64) y pruebas compiladas para Windows desde Linux"
+
+## ── macOS x86-64 (Mach-O), compilado de forma cruzada ───────────────────
+RUNTIME_MACOS := runtime/sys_macos.cfv runtime/mem.cfv runtime/str.cfv runtime/vec.cfv runtime/io.cfv runtime/f64.cfv
+FUENTES_CFORGE_MACOS := $(RUNTIME_MACOS) bootstrap/nativo/lexer.cfv bootstrap/nativo/cforge_self.cfv bootstrap/nativo/embebido.cfv bootstrap/nativo/cforge_cli.cfv
+macos-cruzado: cforge-nativo
+	@set -e; rm -rf dist-macos; mkdir -p dist-macos/pruebas; \
+	./cforge-nativo -o dist-macos/cforge --target macos $(FUENTES_CFORGE_MACOS) >/dev/null; \
+	for prueba in 01_memoria 02_textos 03_listas 04_prueba_de_fuego; do \
+		./cforge-nativo -o dist-macos/pruebas/$$prueba --target macos $(RUNTIME_MACOS) tests/nativo/$$prueba.cfv >/dev/null; \
+	done; \
+	sha256sum dist-macos/cforge; \
+	echo "  ✓ cforge (Mach-O x86-64) y pruebas compiladas para macOS desde Linux"
 
 ## Regenera el runtime incrustado (tras cambiar runtime/*.cfv o VERSION).
 embebido:
