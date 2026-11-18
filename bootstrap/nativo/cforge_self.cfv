@@ -30,9 +30,12 @@
 // 176 punteros de datos a etiquetas [campo][etiqueta]
 // 184 registros de clase en datos             192 tabla de clases en datos
 // 200 programa en inglés (0/1)                208 archivos [línea inicial][nombre]
+// 216 marco de función actual                  224 variables globales [nombre][casilla]
+// 232 profundidad de bloque                    240 bloques intentar abiertos
+// 248 bloques intentar abiertos al entrar al ciclo
 
 funcion ctx_nuevo(tokens) {
-    sea c = mem_reservar(216)
+    sea c = mem_reservar(256)
     __guardar64(c, tokens)
     __guardar64(c + 8, 0)
     __guardar64(c + 16, str_nuevo(65536))
@@ -60,12 +63,19 @@ funcion ctx_nuevo(tokens) {
     __guardar64(c + 192, 0)
     __guardar64(c + 200, 0)
     __guardar64(c + 208, vec_nuevo())
+    __guardar64(c + 216, marco_nuevo(0, 0, 0, 0))
+    __guardar64(__cargar64(c + 216) + 48, 1)
+    __guardar64(c + 224, vec_nuevo())
+    __guardar64(c + 232, 0)
+    __guardar64(c + 240, 0)
+    __guardar64(c + 248, 0)
     retornar c
 }
 
 funcion ctx_codigo(c) { retornar __cargar64(c + 16) }
 funcion ctx_modo(c) { retornar __cargar64(c + 104) }
-funcion dinamico(c) { retornar __cargar64(c + 104) == 2 }
+// 2: programa del usuario · 3: biblioteca del lenguaje (también dinámica)
+funcion dinamico(c) { retornar __cargar64(c + 104) >= 2 }
 funcion ctx_datos(c) { retornar __cargar64(c + 24) }
 
 // ── Tokens ────────────────────────────────────────────────────────────────
@@ -351,11 +361,12 @@ funcion registrar_funcion(c, nombre, parametros, modo) {
         retornar f
     }
     sea previa = __cargar64(vec_obtener(funciones, i) + 24)
-    si (previa == 1 y modo == 2) {
+    // El programa (2) tiene prioridad sobre el lenguaje (1 puente, 3 biblioteca).
+    si ((previa == 1 o previa == 3) y modo == 2) {
         vec_fijar(funciones, i, f)
         retornar f
     }
-    si (previa == 2 y modo == 1) { retornar f }
+    si (previa == 2 y (modo == 1 o modo == 3)) { retornar f }
     rt_panico(str_concatenar("función definida dos veces: ", nombre))
     retornar f
 }
@@ -375,10 +386,14 @@ funcion registrar_funciones(c) {
         si (profundidad == 0 y __cargar64(t) == 1 y str_igual(lex, "__dialecto")) {
             modo = numero_literal(__cargar64(vec_obtener(tokens, i + 1) + 8))
         }
-        si (profundidad == 0 y modo == 2 y __cargar64(t) == 1 y (str_igual(lex, "clase") o str_igual(lex, "estructura")) y __cargar64(vec_obtener(tokens, i + 1)) == 1) {
+        si (profundidad == 0 y modo >= 2 y __cargar64(t) == 1 y (str_igual(lex, "clase") o str_igual(lex, "estructura")) y __cargar64(vec_obtener(tokens, i + 1)) == 1) {
             i = registrar_clase(c, i)
         }
-        si (profundidad == 0 y __cargar64(t) == 1 y str_igual(lex, "funcion")) {
+        si (profundidad == 0 y modo >= 2 y __cargar64(t) == 1 y str_igual(lex, "sea") y __cargar64(vec_obtener(tokens, i + 1)) == 1) {
+            sea global = __cargar64(vec_obtener(tokens, i + 1) + 8)
+            si (indice_global(c, global) < 0) { vec_agregar(__cargar64(c + 224), global) }
+        }
+        si (profundidad == 0 y __cargar64(t) == 1 y str_igual(lex, "funcion") y __cargar64(vec_obtener(tokens, i + 1)) == 1) {
             sea nombre = __cargar64(vec_obtener(tokens, i + 1) + 8)
             sea j = i + 3
             sea parametros = 0
@@ -549,10 +564,31 @@ funcion finalizar_clases(c) {
 }
 
 // Variable: [nombre][desplazamiento]
+// ── Variables ─────────────────────────────────────────────────────────────
+// Marco de función: [base de locales][celdas][capturas][padre][es cierre]
+//                   [desplazamiento del entorno]
+// En un marco con celdas (funciones que contienen funciones anónimas) cada
+// variable vive en una celda del heap, así los cierres la comparten por
+// referencia. Un cierre recibe su entorno como primer parámetro oculto.
+
+funcion marco_nuevo(base, celdas, padre, es_cierre) {
+    sea m = mem_reservar(56)
+    __guardar64(m + 48, 0)
+    __guardar64(m, base)
+    __guardar64(m + 8, celdas)
+    __guardar64(m + 16, vec_nuevo())
+    __guardar64(m + 24, padre)
+    __guardar64(m + 32, es_cierre)
+    __guardar64(m + 40, 0)
+    retornar m
+}
+
+// Variable: [nombre][desplazamiento][en celda]
 funcion declarar_variable(c, nombre, desplazamiento) {
-    sea v = mem_reservar(16)
+    sea v = mem_reservar(24)
     __guardar64(v, nombre)
     __guardar64(v + 8, desplazamiento)
+    __guardar64(v + 16, 0)
     vec_agregar(__cargar64(c + 56), v)
     retornar desplazamiento
 }
@@ -562,15 +598,141 @@ funcion declarar_local(c, nombre) {
     retornar declarar_variable(c, nombre, 0 - __cargar64(c + 64) * 8)
 }
 
-funcion buscar_variable(c, nombre) {
+funcion marcar_ultima_celda(c) {
     sea locales = __cargar64(c + 56)
-    sea i = vec_largo(locales) - 1
-    mientras (i >= __cargar64(c + 88)) {
+    __guardar64(vec_obtener(locales, vec_largo(locales) - 1) + 16, 1)
+    retornar 0
+}
+
+// Declara una variable del programa con el valor de rax.
+funcion declarar_usuario(c, nombre) {
+    si (__cargar64(__cargar64(c + 216) + 8)) {
+        empujar(c)
+        llamar_runtime(c, "dyn_celda_nueva", 1)
+        guardar_local(c, declarar_local(c, nombre))
+        marcar_ultima_celda(c)
+        retornar 0
+    }
+    guardar_local(c, declarar_local(c, nombre))
+    retornar 0
+}
+
+funcion indice_global(c, nombre) {
+    sea globales = __cargar64(c + 224)
+    sea i = 0
+    mientras (i < vec_largo(globales)) {
+        si (str_igual(vec_obtener(globales, i), nombre)) { retornar i }
+        i = i + 1
+    }
+    retornar 0 - 1
+}
+
+funcion acceso(tipo, valor) {
+    sea a = mem_reservar(16)
+    __guardar64(a, tipo)
+    __guardar64(a + 8, valor)
+    retornar a
+}
+
+// Busca en los locales [base, tope) del marco; si es un cierre, en sus
+// capturas y luego en los marcos que lo rodean.
+// Acceso: 0 local · 1 local en celda · 2 captura i · 3 global i
+funcion resolver_en(c, marco, tope, nombre) {
+    sea locales = __cargar64(c + 56)
+    sea i = tope - 1
+    mientras (i >= __cargar64(marco)) {
         sea v = vec_obtener(locales, i)
-        si (str_igual(__cargar64(v), nombre)) { retornar __cargar64(v + 8) }
+        si (str_igual(__cargar64(v), nombre)) { retornar acceso(__cargar64(v + 16), __cargar64(v + 8)) }
         i = i - 1
     }
-    error_en(c, str_concatenar("variable desconocida ", nombre))
+    si (__cargar64(marco + 32) == 0) { retornar 0 }
+    sea capturas = __cargar64(marco + 16)
+    i = 0
+    mientras (i < vec_largo(capturas)) {
+        si (str_igual(vec_obtener(capturas, i), nombre)) { retornar acceso(2, i) }
+        i = i + 1
+    }
+    sea externo = resolver_en(c, __cargar64(marco + 24), __cargar64(marco), nombre)
+    si (externo == 0) { retornar 0 }
+    si (__cargar64(externo) == 0) {
+        error_en(c, str_concatenar("una función anónima no puede capturar esta variable: ", nombre))
+    }
+    vec_agregar(capturas, nombre)
+    retornar acceso(2, vec_largo(capturas) - 1)
+}
+
+funcion resolver(c, nombre) {
+    sea r = resolver_en(c, __cargar64(c + 216), vec_largo(__cargar64(c + 56)), nombre)
+    si (r != 0) { retornar r }
+    si (dinamico(c)) {
+        sea g = indice_global(c, nombre)
+        si (g >= 0) { retornar acceso(3, g) }
+    }
+    retornar 0
+}
+
+funcion variable(c, nombre) {
+    sea r = resolver(c, nombre)
+    si (r == 0) { error_en(c, str_concatenar("variable desconocida ", nombre)) }
+    retornar r
+}
+
+// rax ← puntero a la celda de una captura del cierre actual.
+funcion cargar_celda_captura(c, i) {
+    cargar_local(c, __cargar64(__cargar64(c + 216) + 40))
+    e4(c, 72, 139, 64, 8)                                      // mov rax, [rax + 8]
+    e3(c, 72, 139, 128)                                        // mov rax, [rax + 24 + 8i]
+    e32(c, 24 + i * 8)
+    retornar 0
+}
+
+funcion cargar_var(c, a) {
+    sea tipo = __cargar64(a)
+    sea valor = __cargar64(a + 8)
+    si (tipo == 0) { cargar_local(c, valor) retornar 0 }
+    si (tipo == 1) {
+        cargar_local(c, valor)
+        e3(c, 72, 139, 0)                                      // mov rax, [rax]
+        retornar 0
+    }
+    si (tipo == 2) {
+        cargar_celda_captura(c, valor)
+        e3(c, 72, 139, 0)
+        retornar 0
+    }
+    e4(c, 72, 139, 4, 37)                                      // mov rax, [global]
+    ref_global(c, 512 + valor * 8)
+    retornar 0
+}
+
+funcion guardar_var(c, a) {
+    sea tipo = __cargar64(a)
+    sea valor = __cargar64(a + 8)
+    si (tipo == 0) { guardar_local(c, valor) retornar 0 }
+    si (tipo == 1) {
+        e3(c, 72, 139, 141)                                    // mov rcx, [rbp + d]
+        e32(c, valor)
+        e3(c, 72, 137, 1)                                      // mov [rcx], rax
+        retornar 0
+    }
+    si (tipo == 2) {
+        empujar(c)
+        cargar_celda_captura(c, valor)
+        e3(c, 72, 137, 193)                                    // mov rcx, rax
+        e1(c, 88)                                              // pop rax
+        e3(c, 72, 137, 1)
+        retornar 0
+    }
+    e4(c, 72, 137, 4, 37)                                      // mov [global], rax
+    ref_global(c, 512 + valor * 8)
+    retornar 0
+}
+
+// rax ← celda (no su valor) de una variable, para entregarla a un cierre.
+funcion cargar_celda(c, a) {
+    si (__cargar64(a) == 1) { cargar_local(c, __cargar64(a + 8)) retornar 0 }
+    si (__cargar64(a) == 2) { cargar_celda_captura(c, __cargar64(a + 8)) retornar 0 }
+    error_en(c, "variable no capturable")
     retornar 0
 }
 
@@ -764,6 +926,18 @@ funcion intrinseco(c, nombre) {
         ref_global(c, 0)
         retornar 1
     }
+    si (str_igual(nombre, "__saltar")) {
+        // __saltar(rbp, rsp, destino, valor): restaura el marco y salta.
+        si (argumentos(c) != 4) { error_en(c, "__saltar recibe 4 argumentos") }
+        e1(c, 88)                                              // pop rax (valor)
+        e1(c, 90)                                              // pop rdx (destino)
+        e1(c, 89)                                              // pop rcx (rsp)
+        e1(c, 94)                                              // pop rsi (rbp)
+        e3(c, 72, 137, 245)                                    // mov rbp, rsi
+        e3(c, 72, 137, 204)                                    // mov rsp, rcx
+        e2(c, 255, 226)                                        // jmp rdx
+        retornar 1
+    }
     si (str_igual(nombre, "__clases")) {
         argumentos(c)
         e1(c, 184)
@@ -825,6 +999,14 @@ funcion funcion_llamable(c, nombre) {
 
 // Llama a f con n argumentos ya apilados y los retira.
 funcion emitir_llamada(c, f, n) {
+    // En el lenguaje dinámico los argumentos que faltan valen nulo.
+    si (dinamico(c) y n < __cargar64(f + 16)) {
+        mientras (n < __cargar64(f + 16)) {
+            cargar_inmediato(c, 0)
+            empujar(c)
+            n = n + 1
+        }
+    }
     si (n != __cargar64(f + 16)) {
         error_en(c, str_concatenar("cantidad de argumentos incorrecta en ", __cargar64(f)))
     }
@@ -1014,7 +1196,7 @@ funcion llamada_super(c) {
     sea nombre = requerir_ident(c)
     sea m = metodo_en_cadena(c, buscar_clase(c, __cargar64(k + 8)), nombre)
     si (m == 0) { error_en(c, str_concatenar("la clase padre no tiene el método ", nombre)) }
-    cargar_local(c, buscar_variable(c, "esto"))
+    cargar_var(c, variable(c, "esto"))
     empujar(c)
     sea n = argumentos(c)
     si (n + 1 != __cargar64(m + 16)) { error_en(c, str_concatenar("cantidad de argumentos incorrecta en ", nombre)) }
@@ -1052,16 +1234,100 @@ funcion primaria_dinamica(c) {
         requerir(c, ")")
         retornar 0
     }
+    si (ver(c, "funcion") y str_igual(tok_siguiente_lexema(c), "(")) {
+        avanzar(c)
+        funcion_anonima(c)
+        retornar 0
+    }
     si (tipo == 1) {
         sea nombre = __cargar64(avanzar(c) + 8)
+        sea a = resolver(c, nombre)
         si (ver(c, "(")) {
-            llamada(c, nombre)
+            si (a != 0) {
+                cargar_var(c, a)
+                llamada_cierre(c)
+            } sino {
+                llamada(c, nombre)
+            }
             retornar 0
         }
-        cargar_local(c, buscar_variable(c, nombre))
+        si (a != 0) {
+            cargar_var(c, a)
+            retornar 0
+        }
+        sea f = buscar_funcion(c, nombre)
+        si (f != 0) {
+            valor_funcion(c, f)
+            retornar 0
+        }
+        error_en(c, str_concatenar("variable desconocida ", nombre))
         retornar 0
     }
     error_en(c, "expresión inválida")
+    retornar 0
+}
+
+// Valor de función con nombre: un cierre sin capturas (la función ignora
+// el entorno, que llega por debajo de sus parámetros).
+funcion valor_funcion(c, f) {
+    e1(c, 184)
+    nuevo_arreglo(c, 4, __cargar64(f + 8))
+    empujar(c)
+    cargar_inmediato(c, __cargar64(f + 16))
+    empujar(c)
+    cargar_inmediato(c, 0)
+    empujar(c)
+    llamar_runtime(c, "dyn_cierre_nuevo", 3)
+    retornar 0
+}
+
+// Llamada a un cierre que está en rax: f(args).
+funcion llamada_cierre(c) {
+    empujar(c)
+    sea n = argumentos(c)
+    e4(c, 72, 139, 132, 36)                                    // mov rax, [rsp + 8n]
+    e32(c, n * 8)
+    empujar(c)
+    cargar_inmediato(c, n)
+    empujar(c)
+    llamar_runtime(c, "dyn_codigo_cierre", 2)
+    e2(c, 255, 208)                                            // call rax
+    e3(c, 72, 129, 196)
+    e32(c, (n + 1) * 8)
+    retornar 0
+}
+
+// funcion(p1, p2) { ... } como expresión.
+funcion funcion_anonima(c) {
+    sea saltar = saltar_por_encima(c)
+    sea etiqueta = nueva_etiqueta(c)
+    sea nombres = parametros(c, un_nombre(str_nuevo(0)))
+    sea n = vec_largo(nombres) - 1
+    sea estado = abrir_cierre(c, etiqueta, nombres)
+    vec_liberar(nombres)
+    sea marco = __cargar64(c + 216)
+    bloque(c)
+    sea capturas = __cargar64(marco + 16)
+    cerrar_funcion(c, estado)
+    definir_etiqueta(c, saltar)
+    e1(c, 184)
+    nuevo_arreglo(c, 4, etiqueta)
+    empujar(c)
+    cargar_inmediato(c, n)
+    empujar(c)
+    cargar_inmediato(c, vec_largo(capturas))
+    empujar(c)
+    llamar_runtime(c, "dyn_cierre_nuevo", 3)
+    sea i = 0
+    mientras (i < vec_largo(capturas)) {
+        empujar(c)
+        cargar_inmediato(c, i)
+        empujar(c)
+        cargar_celda(c, variable(c, vec_obtener(capturas, i)))
+        empujar(c)
+        llamar_runtime(c, "dyn_cierre_fijar", 3)
+        i = i + 1
+    }
     retornar 0
 }
 
@@ -1095,7 +1361,7 @@ funcion primaria(c) {
             llamada(c, nombre)
             retornar 0
         }
-        cargar_local(c, buscar_variable(c, nombre))
+        cargar_var(c, variable(c, nombre))
         retornar 0
     }
     error_en(c, "expresión inválida")
@@ -1257,9 +1523,24 @@ funcion conjuncion(c) {
     retornar 0
 }
 
-funcion expresion(c) {
+funcion disyuncion(c) {
     conjuncion(c)
     mientras (tomar(c, "o")) { logica(c, 2, 2) }
+    retornar 0
+}
+
+// a ?? b: a si no es nulo; si no, b (b solo se evalúa si hace falta).
+funcion expresion(c) {
+    disyuncion(c)
+    mientras (dinamico(c) y ver(c, "?") y str_igual(tok_siguiente_lexema(c), "?")) {
+        avanzar(c)
+        avanzar(c)
+        sea fin = nueva_etiqueta(c)
+        e5(c, 72, 133, 192, 15, 133)                           // test rax, rax; jne fin
+        ref_etiqueta(c, fin)
+        disyuncion(c)
+        definir_etiqueta(c, fin)
+    }
     retornar 0
 }
 
@@ -1275,11 +1556,13 @@ funcion bloque(c) {
     requerir(c, "{")
     sea locales = __cargar64(c + 56)
     sea marca = vec_largo(locales)
+    __guardar64(c + 232, __cargar64(c + 232) + 1)
     mientras (ver(c, "}") == 0) {
         si (tok_tipo(c) == 5) { error_en(c, "falta '}'") }
         sentencia(c)
     }
     requerir(c, "}")
+    __guardar64(c + 232, __cargar64(c + 232) - 1)
     __guardar64(locales, marca)
     retornar 0
 }
@@ -1288,9 +1571,73 @@ funcion bloque(c) {
 funcion saltar_a(c, campo, palabra) {
     sea etiqueta = __cargar64(c + campo)
     si (etiqueta < 0) { error_en(c, str_concatenar(palabra, " fuera de un ciclo")) }
+    salir_de_intentar(c, __cargar64(c + 240) - __cargar64(c + 248))
     e1(c, 233)
     ref_etiqueta(c, etiqueta)
     tomar(c, ";")
+    retornar 0
+}
+
+// Cierra n bloques intentar abiertos (al salir con retornar/romper/continuar).
+funcion salir_de_intentar(c, n) {
+    sea i = 0
+    mientras (i < n) {
+        llamar_runtime(c, "dyn_intentar_salir", 0)
+        i = i + 1
+    }
+    retornar 0
+}
+
+// intentar { A } [capturar (e) { B }] [finalmente { C }]
+// El runtime guarda rsp, rbp y la dirección de captura; lanzar (o un error
+// del runtime) restaura ese marco y salta a la captura con el valor en rax.
+funcion bloque_intentar(c) {
+    sea captura = nueva_etiqueta(c)
+    sea despues = nueva_etiqueta(c)
+    sea pendiente = declarar_local(c, str_nuevo(0))
+    sea valor = declarar_local(c, str_nuevo(0))
+    cargar_inmediato(c, 0)
+    guardar_local(c, pendiente)
+    e3(c, 72, 137, 224)                                        // mov rax, rsp
+    empujar(c)
+    e3(c, 72, 137, 232)                                        // mov rax, rbp
+    empujar(c)
+    e1(c, 184)
+    nuevo_arreglo(c, 4, captura)
+    empujar(c)
+    llamar_runtime(c, "dyn_intentar_entrar", 3)
+    __guardar64(c + 240, __cargar64(c + 240) + 1)
+    bloque(c)
+    __guardar64(c + 240, __cargar64(c + 240) - 1)
+    llamar_runtime(c, "dyn_intentar_salir", 0)
+    e1(c, 233)
+    ref_etiqueta(c, despues)
+    definir_etiqueta(c, captura)
+    si (tomar(c, "capturar")) {
+        sea parentesis = tomar(c, "(")
+        sea nombre = requerir_ident(c)
+        si (parentesis) { requerir(c, ")") }
+        sea locales = __cargar64(c + 56)
+        sea marca = vec_largo(locales)
+        declarar_usuario(c, nombre)
+        bloque(c)
+        __guardar64(locales, marca)
+    } sino {
+        guardar_local(c, valor)
+        cargar_inmediato(c, 1)
+        guardar_local(c, pendiente)
+    }
+    definir_etiqueta(c, despues)
+    si (tomar(c, "finalmente")) { bloque(c) }
+    // Sin capturar: el error sigue su camino después de finalmente.
+    sea fin = nueva_etiqueta(c)
+    cargar_local(c, pendiente)
+    e5(c, 72, 133, 192, 15, 132)
+    ref_etiqueta(c, fin)
+    cargar_local(c, valor)
+    empujar(c)
+    llamar_runtime(c, "dyn_lanzar", 1)
+    definir_etiqueta(c, fin)
     retornar 0
 }
 
@@ -1298,11 +1645,14 @@ funcion saltar_a(c, campo, palabra) {
 funcion cuerpo_ciclo(c, fin, continuar) {
     sea romper_previo = __cargar64(c + 128)
     sea continuar_previo = __cargar64(c + 136)
+    sea intentar_previo = __cargar64(c + 248)
     __guardar64(c + 128, fin)
     __guardar64(c + 136, continuar)
+    __guardar64(c + 248, __cargar64(c + 240))
     bloque(c)
     __guardar64(c + 128, romper_previo)
     __guardar64(c + 136, continuar_previo)
+    __guardar64(c + 248, intentar_previo)
     retornar 0
 }
 
@@ -1316,7 +1666,9 @@ funcion ciclo_para(c) {
     cargar_inmediato(c, 0)
     sea indice = declarar_local(c, str_nuevo(0))
     guardar_local(c, indice)
+    sea celdas = __cargar64(__cargar64(c + 216) + 8)
     sea variable = declarar_local(c, nombre)
+    si (celdas) { marcar_ultima_celda(c) }
     sea inicio = nueva_etiqueta(c)
     sea siguiente = nueva_etiqueta(c)
     sea fin = nueva_etiqueta(c)
@@ -1334,6 +1686,10 @@ funcion ciclo_para(c) {
     cargar_local(c, indice)
     empujar(c)
     llamar_runtime(c, "dyn_iter_obtener", 2)
+    si (celdas) {
+        empujar(c)
+        llamar_runtime(c, "dyn_celda_nueva", 1)
+    }
     guardar_local(c, variable)
     cuerpo_ciclo(c, fin, siguiente)
     definir_etiqueta(c, siguiente)
@@ -1391,7 +1747,7 @@ funcion es_asignacion_indice(c) {
 // nombre[i].campo...[k] = valor  (o += -= *= /= %=)
 funcion asignacion_indice(c) {
     sea nombre = __cargar64(avanzar(c) + 8)
-    cargar_local(c, buscar_variable(c, nombre))
+    cargar_var(c, variable(c, nombre))
     sea seguir = 1
     mientras (seguir) {
         empujar(c)
@@ -1456,8 +1812,23 @@ funcion sentencia(c) {
         sea nombre = requerir_ident(c)
         saltar_tipo(c)
         requerir(c, "=")
+        sea g = indice_global(c, nombre)
+        // sea f = funcion(..) { .. f(..) .. }: la celda existe antes del cuerpo,
+        // así la función anónima puede llamarse a sí misma.
+        si (dinamico(c) y __cargar64(__cargar64(c + 216) + 8) y ver(c, "funcion") y str_igual(tok_siguiente_lexema(c), "(")) {
+            cargar_inmediato(c, 0)
+            declarar_usuario(c, nombre)
+            expresion(c)
+            guardar_var(c, variable(c, nombre))
+            tomar(c, ";")
+            retornar 0
+        }
         expresion(c)
-        guardar_local(c, declarar_local(c, nombre))
+        si (dinamico(c) y g >= 0 y __cargar64(c + 232) == 0 y __cargar64(__cargar64(c + 216) + 48) == 1) {
+            guardar_var(c, acceso(3, g))
+        } sino {
+            si (dinamico(c)) { declarar_usuario(c, nombre) } sino { guardar_local(c, declarar_local(c, nombre)) }
+        }
         tomar(c, ";")
         retornar 0
     }
@@ -1510,7 +1881,24 @@ funcion sentencia(c) {
     si (tomar(c, "retornar")) {
         si (ver(c, "}") o ver(c, ";")) { cargar_inmediato(c, 0) } sino { expresion(c) }
         tomar(c, ";")
+        si (__cargar64(c + 240) > 0) {
+            empujar(c)
+            salir_de_intentar(c, __cargar64(c + 240))
+            e1(c, 88)
+        }
         epilogo(c)
+        retornar 0
+    }
+    si (dinamico(c) y ver(c, "intentar") y str_igual(tok_siguiente_lexema(c), "{")) {
+        avanzar(c)
+        bloque_intentar(c)
+        retornar 0
+    }
+    si (dinamico(c) y tomar(c, "lanzar")) {
+        expresion(c)
+        empujar(c)
+        llamar_runtime(c, "dyn_lanzar", 1)
+        tomar(c, ";")
         retornar 0
     }
     si (dinamico(c) == 0 y ver(c, "mostrar") y str_igual(tok_siguiente_lexema(c), "(")) {
@@ -1523,7 +1911,7 @@ funcion sentencia(c) {
         sea nombre = __cargar64(avanzar(c) + 8)
         avanzar(c)
         expresion(c)
-        guardar_local(c, buscar_variable(c, nombre))
+        guardar_var(c, variable(c, nombre))
         tomar(c, ";")
         retornar 0
     }
@@ -1531,12 +1919,12 @@ funcion sentencia(c) {
         sea nombre = __cargar64(avanzar(c) + 8)
         sea lex = __cargar64(avanzar(c) + 8)
         avanzar(c)
-        sea d = buscar_variable(c, nombre)
-        cargar_local(c, d)
+        sea d = variable(c, nombre)
+        cargar_var(c, d)
         empujar(c)
         expresion(c)
         aplicar_operador(c, lex)
-        guardar_local(c, d)
+        guardar_var(c, d)
         tomar(c, ";")
         retornar 0
     }
@@ -1565,20 +1953,54 @@ funcion cerrar_marco(c, posicion) {
     retornar 0
 }
 
+// ¿El bloque que empieza en el token actual contiene una función anónima?
+funcion contiene_cierre(c) {
+    si (ver(c, "{") == 0) { retornar 0 }
+    sea tokens = __cargar64(c)
+    sea j = __cargar64(c + 8)
+    sea nivel = 0
+    sea seguir = 1
+    mientras (seguir) {
+        sea t = vec_obtener(tokens, j)
+        si (__cargar64(t) == 5) { retornar 0 }
+        si (es_simbolo(t, "{")) { nivel = nivel + 1 }
+        si (es_simbolo(t, "}")) {
+            nivel = nivel - 1
+            si (nivel == 0) { seguir = 0 }
+        }
+        si (__cargar64(t) == 1 y str_igual(__cargar64(t + 8), "funcion") y es_simbolo(vec_obtener(tokens, j + 1), "(")) { retornar 1 }
+        j = j + 1
+    }
+    retornar 0
+}
+
 // Abre una función: guarda el estado del código que la rodea, define su
 // etiqueta, emite el prólogo y declara los parámetros. Devuelve el estado.
-funcion abrir_funcion(c, etiqueta, nombres) {
-    sea estado = mem_reservar(48)
+funcion abrir_marco(c, etiqueta, nombres, es_cierre) {
+    sea estado = mem_reservar(80)
     sea locales = __cargar64(c + 56)
     __guardar64(estado, vec_largo(locales))
     __guardar64(estado + 8, __cargar64(c + 64))
     __guardar64(estado + 16, __cargar64(c + 88))
     __guardar64(estado + 32, __cargar64(c + 128))
     __guardar64(estado + 40, __cargar64(c + 136))
+    __guardar64(estado + 48, __cargar64(c + 216))
+    __guardar64(estado + 56, __cargar64(c + 232))
+    __guardar64(estado + 64, __cargar64(c + 240))
+    __guardar64(estado + 72, __cargar64(c + 248))
+    sea celdas = 0
+    si (dinamico(c)) { celdas = contiene_cierre(c) }
+    sea padre = 0
+    si (es_cierre) { padre = __cargar64(c + 216) }
+    sea marco = marco_nuevo(vec_largo(locales), celdas, padre, es_cierre)
+    __guardar64(c + 216, marco)
     __guardar64(c + 88, vec_largo(locales))
     __guardar64(c + 64, 0)
     __guardar64(c + 128, 0 - 1)
     __guardar64(c + 136, 0 - 1)
+    __guardar64(c + 232, 0)
+    __guardar64(c + 240, 0)
+    __guardar64(c + 248, 0)
     definir_etiqueta(c, etiqueta)
     __guardar64(estado + 24, prologo(c))
     sea n = vec_largo(nombres)
@@ -1587,8 +2009,25 @@ funcion abrir_funcion(c, etiqueta, nombres) {
         declarar_variable(c, vec_obtener(nombres, i), 16 + (n - 1 - i) * 8)
         i = i + 1
     }
+    si (es_cierre) { __guardar64(marco + 40, 16 + (n - 1) * 8) }
+    si (celdas) {
+        // Cada parámetro pasa a una celda propia.
+        i = 0
+        si (es_cierre) { i = 1 }
+        mientras (i < n) {
+            cargar_local(c, 16 + (n - 1 - i) * 8)
+            empujar(c)
+            llamar_runtime(c, "dyn_celda_nueva", 1)
+            guardar_local(c, declarar_local(c, vec_obtener(nombres, i)))
+            marcar_ultima_celda(c)
+            i = i + 1
+        }
+    }
     retornar estado
 }
+
+funcion abrir_funcion(c, etiqueta, nombres) { retornar abrir_marco(c, etiqueta, nombres, 0) }
+funcion abrir_cierre(c, etiqueta, nombres) { retornar abrir_marco(c, etiqueta, nombres, 1) }
 
 funcion cerrar_funcion(c, estado) {
     cargar_inmediato(c, 0)
@@ -1599,6 +2038,10 @@ funcion cerrar_funcion(c, estado) {
     __guardar64(c + 88, __cargar64(estado + 16))
     __guardar64(c + 128, __cargar64(estado + 32))
     __guardar64(c + 136, __cargar64(estado + 40))
+    __guardar64(c + 216, __cargar64(estado + 48))
+    __guardar64(c + 232, __cargar64(estado + 56))
+    __guardar64(c + 240, __cargar64(estado + 64))
+    __guardar64(c + 248, __cargar64(estado + 72))
     mem_liberar(estado)
     retornar 0
 }
@@ -1736,7 +2179,7 @@ funcion inicializador_campo(c, k, nombre, con_valor) {
     sea etiqueta = nueva_etiqueta(c)
     vec_agregar(__cargar64(k + 56), etiqueta)
     sea estado = abrir_funcion(c, etiqueta, un_nombre("esto"))
-    cargar_local(c, buscar_variable(c, "esto"))
+    cargar_var(c, variable(c, "esto"))
     empujar(c)
     cargar_caja(c, nombre)
     empujar(c)
@@ -1807,7 +2250,7 @@ funcion definicion_clase(c) {
     requerir(c, "}")
     // Inicialización de campos: primero los del padre.
     sea estado = abrir_funcion(c, __cargar64(k + 40), un_nombre("esto"))
-    sea esto = buscar_variable(c, "esto")
+    sea esto = __cargar64(variable(c, "esto") + 8)
     si (__cargar64(k + 8) != 0) {
         sea padre = buscar_clase(c, __cargar64(k + 8))
         si (padre == 0) { error_en(c, str_concatenar("clase padre desconocida: ", __cargar64(k + 8))) }
@@ -1916,7 +2359,12 @@ funcion compilar(c) {
         llamar_runtime(c, "dyn_fijar_ingles", 0)
     }
     mientras (tok_tipo(c) != 5) {
-        si (tomar(c, "funcion")) { definicion_funcion(c) } sino { sentencia(c) }
+        si (ver(c, "funcion") y tok_tipo_en(c, 1) == 1) {
+            avanzar(c)
+            definicion_funcion(c)
+        } sino {
+            sentencia(c)
+        }
     }
     cargar_inmediato(c, 0)
     epilogo(c)
@@ -1953,6 +2401,11 @@ funcion empaquetar(c) {
         si (tipo == 1) { parchear32(codigo, posicion, base + inicio_datos + valor) }
         si (tipo == 2) { parchear32(codigo, posicion, base + inicio_globales + valor) }
         si (tipo == 3) { parchear32(codigo, posicion, base + inicio_datos + __cargar64(c + 192)) }
+        si (tipo == 4) {
+            sea direccion = vec_obtener(etiquetas, valor)
+            si (direccion < 0) { rt_panico("etiqueta sin definir") }
+            parchear32(codigo, posicion, base + 120 + direccion)
+        }
         i = i + 1
     }
     // Punteros internos de los textos literales.
@@ -2002,7 +2455,7 @@ funcion empaquetar(c) {
     bytes_le(elf, base, 8)
     bytes_le(elf, base, 8)
     bytes_le(elf, fin_datos, 8)
-    bytes_le(elf, inicio_globales + 512, 8)
+    bytes_le(elf, inicio_globales + 512 + vec_largo(__cargar64(c + 224)) * 8, 8)
     bytes_le(elf, 4096, 8)
     str_agregar(elf, codigo)
     mientras (str_largo(elf) < inicio_datos) { str_agregar_byte(elf, 0) }
@@ -2119,12 +2572,16 @@ mientras (indice < rt_argc()) {
                 si (str_igual(argumento, "--dinamico")) {
                     modo = 2
                 } sino {
+                si (str_igual(argumento, "--lenguaje")) {
+                    modo = 3
+                } sino {
                     sea texto = archivo_leer(argumento)
                     agregar_fuente(fuente, modo, texto, argumento, archivos)
                     si (modo == 2) {
                         puntaje = puntaje + puntaje_ingles(tokenizar(texto))
                         resolver_importaciones(fuente, stdlib, texto, vistas, archivos)
                     }
+                }
                 }
             }
         }
