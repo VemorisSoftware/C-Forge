@@ -22,11 +22,9 @@ RUNTIME_LENGUAJE := $(RUNTIME_NATIVO) runtime/sys_linux_ext.cfv runtime/map.cfv 
 PRUEBAS_LENGUAJE_NATIVAS := $(basename $(notdir $(wildcard tests/cfv/*.cfv)))
 FUENTES_COMPILADOR := $(RUNTIME_NATIVO) bootstrap/nativo/lexer.cfv bootstrap/nativo/cforge_self.cfv bootstrap/nativo/gen.cfv bootstrap/nativo/gen_x64.cfv bootstrap/nativo/gen_a64.cfv bootstrap/nativo/biblioteca_c.cfv
 FUENTES_CFORGE := $(FUENTES_COMPILADOR) bootstrap/nativo/embebido.cfv bootstrap/nativo/paquetes.cfv bootstrap/nativo/formato.cfv bootstrap/nativo/lsp.cfv bootstrap/nativo/xcode.cfv bootstrap/nativo/cforge_cli.cfv
-EMBEBIDO_ARGS := --nativo $(RUNTIME_NATIVO) runtime/sys_linux_ext.cfv runtime/sys_linux_arm64.cfv runtime/sys_linux_arm64_ext.cfv runtime/sys_windows.cfv runtime/sys_windows_ext.cfv runtime/sys_macos.cfv runtime/sys_macos_ext.cfv runtime/map.cfv --puente runtime/dyn.cfv runtime/biblioteca.cfv --lenguaje runtime/lenguaje.cfv --opcional runtime/sdl.cfv
+EMBEBIDO_ARGS := --nativo $(RUNTIME_NATIVO) runtime/sys_linux_ext.cfv runtime/sys_linux_arm64.cfv runtime/sys_linux_arm64_ext.cfv runtime/sys_windows.cfv runtime/sys_windows_ext.cfv runtime/sys_macos.cfv runtime/sys_macos_ext.cfv runtime/map.cfv --puente runtime/dyn.cfv runtime/biblioteca.cfv --lenguaje runtime/lenguaje.cfv --opcional runtime/sdl.cfv runtime/gl3d.cfv
 SEMILLA := bootstrap/semilla/cforge-linux-x64
 
-# Módulos de la stdlib que el runtime nativo aún no cubre (llegan en 4.1).
-STDLIB_PENDIENTES := $(shell grep -v '^\#' stdlib/PENDIENTES 2>/dev/null)
 
 .PHONY: all build install uninstall check test stdlib-load-check cli-check \
 	malformed-check install-check smoke-test release-check bench clean help \
@@ -205,13 +203,19 @@ stdlib-load-check: build
 	@set -e; total=0; \
 	for file in stdlib/*.cfv; do \
 		module=$$(basename "$$file" .cfv); \
-		case " $(STDLIB_PENDIENTES) " in *" $$module "*) continue ;; esac; \
 		if [ "$$module" = apple ] && [ "$(UNAME)" != Darwin ]; then continue; fi; \
 		printf 'importar "%s"\n' "$$module" > /tmp/cforge-load-$$module.cfv; \
 		CFORGE_STDLIB=./stdlib ./$(TARGET) /tmp/cforge-load-$$module.cfv >/dev/null || { echo "  ✗ stdlib/$$module.cfv"; exit 1; }; \
 		total=$$((total + 1)); \
 	done; \
-	echo "  ✓ $$total módulos de la stdlib cargados ($(words $(STDLIB_PENDIENTES)) pendientes para 4.1)"
+	echo "  ✓ $$total módulos de la stdlib cargados (todos)"
+
+## Módulos de la stdlib con salida esperada (SQLite del sistema).
+stdlib-check: build
+	@set -e; dir=$$(mktemp -d /tmp/cforge-db.XXXXXX); \
+	(cd $$dir && CFORGE_STDLIB=$(CURDIR)/stdlib $(CURDIR)/$(TARGET) $(CURDIR)/tests/db/prueba.cfv) | diff -u tests/db/prueba.salida - || { echo "  ✗ tests/db"; exit 1; }; \
+	rm -rf $$dir; \
+	echo "  ✓ db: SQLite (CRUD, parámetros, transacciones, archivo)"
 
 ## Contrato público mínimo del CLI.
 cli-check: build
@@ -253,7 +257,7 @@ smoke-test: build
 
 ## Gate único exigido antes de publicar una versión.
 release-check: build nativo-check autoalojado-check semilla-check check test \
-	stdlib-load-check cli-check malformed-check install-check smoke-test
+	stdlib-load-check stdlib-check cli-check malformed-check install-check smoke-test
 	@echo ""
 	@echo "  ✓ GATE DE ESTABILIDAD C-FORGE COMPLETO (100 % C-Forge)"
 

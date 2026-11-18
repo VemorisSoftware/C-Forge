@@ -1,0 +1,167 @@
+// stdlib/sqlite.cfv — SQLite en C-Forge con la biblioteca del sistema.
+//
+// Linux: libsqlite3.so.0 · macOS: /usr/lib/libsqlite3.dylib (viene con el
+// sistema) · Windows: winsqlite3.dll (Windows 10 y posteriores) o
+// sqlite3.dll. stdlib/db.cfv construye su API encima de estas funciones.
+//
+//   sea db = db_abrir("datos.db")             // ":memory:" para memoria
+//   db_ejecutar(db, "CREATE TABLE t (id INTEGER PRIMARY KEY, nombre TEXT)")
+//   db_consulta_p(db, "INSERT INTO t (nombre) VALUES (?)", ["Ana"])
+//   mostrar(db_consulta(db, "SELECT * FROM t"))  // [{"id": 1, "nombre": "Ana"}]
+//   db_cerrar(db)
+
+// Cada función se resuelve (dlopen + dlsym) la primera vez que se llama.
+funcion __sqlite_declaraciones() {
+    extern "libsqlite3" funcion sqlite3_open(ruta: texto, salida: puntero): entero
+    extern "libsqlite3" funcion sqlite3_close(db: puntero): entero
+    extern "libsqlite3" funcion sqlite3_errmsg(db: puntero): puntero
+    extern "libsqlite3" funcion sqlite3_exec(db: puntero, sql: texto, retorno: puntero, dato: puntero, error: puntero): entero
+    extern "libsqlite3" funcion sqlite3_changes(db: puntero): entero
+    extern "libsqlite3" funcion sqlite3_last_insert_rowid(db: puntero): largo
+    extern "libsqlite3" funcion sqlite3_prepare_v2(db: puntero, sql: texto, largo_sql: entero, salida: puntero, resto: puntero): entero
+    extern "libsqlite3" funcion sqlite3_step(stmt: puntero): entero
+    extern "libsqlite3" funcion sqlite3_finalize(stmt: puntero): entero
+    extern "libsqlite3" funcion sqlite3_column_count(stmt: puntero): entero
+    extern "libsqlite3" funcion sqlite3_column_name(stmt: puntero, i: entero): puntero
+    extern "libsqlite3" funcion sqlite3_column_type(stmt: puntero, i: entero): entero
+    extern "libsqlite3" funcion sqlite3_column_int64(stmt: puntero, i: entero): largo
+    extern "libsqlite3" funcion sqlite3_column_double(stmt: puntero, i: entero): numero
+    extern "libsqlite3" funcion sqlite3_column_text(stmt: puntero, i: entero): puntero
+    extern "libsqlite3" funcion sqlite3_bind_null(stmt: puntero, i: entero): entero
+    extern "libsqlite3" funcion sqlite3_bind_int64(stmt: puntero, i: entero, v: largo): entero
+    extern "libsqlite3" funcion sqlite3_bind_double(stmt: puntero, i: entero, v: numero): entero
+    extern "libsqlite3" funcion sqlite3_bind_text(stmt: puntero, i: entero, t: texto, n: entero, destructor: largo): entero
+    extern "libsqlite3" funcion sqlite3_free(p: puntero): nulo
+}
+
+funcion _sqlite_error(db, operacion) {
+    lanzar operacion + ": " + c_texto(sqlite3_errmsg(db))
+}
+
+/// @doc Abrir (o crear) una base de datos; ":memory:" la deja en memoria.
+funcion db_abrir(ruta) {
+    sea salida = c_reservar(8)
+    sea rc = sqlite3_open(ruta, salida)
+    sea db = c_leer64(salida, 0)
+    c_liberar(salida)
+    si (rc != 0) {
+        sea mensaje = "no se pudo abrir " + ruta
+        si (db != 0) {
+            mensaje = c_texto(sqlite3_errmsg(db))
+            sqlite3_close(db)
+        }
+        lanzar "db_abrir: " + mensaje
+    }
+    retornar db
+}
+
+funcion db_cerrar(db) {
+    sqlite3_close(db)
+    retornar nulo
+}
+
+/// @doc Ejecutar SQL sin resultados (varias sentencias permitidas); devuelve las filas afectadas.
+funcion db_ejecutar(db, sql) {
+    sea error = c_reservar(8)
+    sea rc = sqlite3_exec(db, sql, 0, 0, error)
+    si (rc != 0) {
+        sea p = c_leer64(error, 0)
+        sea mensaje = "error SQL"
+        si (p != 0) {
+            mensaje = c_texto(p)
+            sqlite3_free(p)
+        }
+        c_liberar(error)
+        lanzar "db_ejecutar: " + mensaje
+    }
+    c_liberar(error)
+    retornar sqlite3_changes(db)
+}
+
+funcion _sqlite_vincular(db, stmt, parametros) {
+    si (parametros == nulo) { retornar nulo }
+    sea i = 0
+    mientras (i < longitud(parametros)) {
+        sea v = parametros[i]
+        sea t = tipo_de(v)
+        sea rc = 0
+        si (v == nulo) {
+            rc = sqlite3_bind_null(stmt, i + 1)
+        } sino si (t == "booleano") {
+            sea b = 0
+            si (v) { b = 1 }
+            rc = sqlite3_bind_int64(stmt, i + 1, b)
+        } sino si (t == "numero") {
+            si (piso(v) == v y absoluto(v) < 4611686018427387904) {
+                rc = sqlite3_bind_int64(stmt, i + 1, v)
+            } sino {
+                rc = sqlite3_bind_double(stmt, i + 1, v)
+            }
+        } sino {
+            sea s = a_texto(v)
+            rc = sqlite3_bind_text(stmt, i + 1, s, longitud(s), 0 - 1)   // SQLITE_TRANSIENT
+        }
+        si (rc != 0) { _sqlite_error(db, "db: parámetro " + (i + 1)) }
+        i += 1
+    }
+    retornar nulo
+}
+
+funcion _sqlite_filas(db, stmt) {
+    sea filas = []
+    sea columnas = sqlite3_column_count(stmt)
+    sea nombres = []
+    sea c = 0
+    mientras (c < columnas) {
+        nombres.agregar(c_texto(sqlite3_column_name(stmt, c)))
+        c += 1
+    }
+    sea rc = sqlite3_step(stmt)
+    mientras (rc == 100) {                                     // SQLITE_ROW
+        sea fila = {}
+        c = 0
+        mientras (c < columnas) {
+            sea tipo = sqlite3_column_type(stmt, c)
+            si (tipo == 1) {
+                fila[nombres[c]] = sqlite3_column_int64(stmt, c)
+            } sino si (tipo == 2) {
+                fila[nombres[c]] = sqlite3_column_double(stmt, c)
+            } sino si (tipo == 5) {
+                fila[nombres[c]] = nulo
+            } sino {
+                sea p = sqlite3_column_text(stmt, c)
+                si (p == 0) { fila[nombres[c]] = "" } sino { fila[nombres[c]] = c_texto(p) }
+            }
+            c += 1
+        }
+        filas.agregar(fila)
+        rc = sqlite3_step(stmt)
+    }
+    si (rc != 101) {                                           // SQLITE_DONE
+        sqlite3_finalize(stmt)
+        _sqlite_error(db, "db_consulta")
+    }
+    retornar filas
+}
+
+/// @doc Consulta con parámetros "?" (lista); devuelve una lista de mapas columna → valor.
+funcion db_consulta_p(db, sql, parametros) {
+    sea salida = c_reservar(8)
+    sea rc = sqlite3_prepare_v2(db, sql, 0 - 1, salida, 0)
+    sea stmt = c_leer64(salida, 0)
+    c_liberar(salida)
+    si (rc != 0) { _sqlite_error(db, "db_consulta") }
+    _sqlite_vincular(db, stmt, parametros)
+    sea filas = _sqlite_filas(db, stmt)
+    sqlite3_finalize(stmt)
+    retornar filas
+}
+
+funcion db_consulta(db, sql) { retornar db_consulta_p(db, sql, nulo) }
+
+/// @doc Filas cambiadas por la última sentencia.
+funcion db_cambios(db) { retornar sqlite3_changes(db) }
+funcion db_ultimo_id(db) { retornar sqlite3_last_insert_rowid(db) }
+funcion db_transaccion(db) { db_ejecutar(db, "BEGIN TRANSACTION") }
+funcion db_confirmar(db) { db_ejecutar(db, "COMMIT") }
+funcion db_revertir(db) { db_ejecutar(db, "ROLLBACK") }

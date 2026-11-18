@@ -1024,6 +1024,8 @@ funcion buscar_biblioteca(base) {
     sea dirs = vec_nuevo()
     vec_agregar(dirs, "/lib/x86_64-linux-gnu")
     vec_agregar(dirs, "/usr/lib/x86_64-linux-gnu")
+    vec_agregar(dirs, "/lib/aarch64-linux-gnu")
+    vec_agregar(dirs, "/usr/lib/aarch64-linux-gnu")
     vec_agregar(dirs, "/usr/local/lib")
     vec_agregar(dirs, "/usr/lib64")
     vec_agregar(dirs, "/lib64")
@@ -1063,11 +1065,30 @@ funcion dyn_abrir_biblioteca(nombre) {
     sea h = map_obtener_o(cache, nombre, 0)
     si (h != 0) { retornar h }
     h = sys_cargar_biblioteca(nombre)
-    si (h == 0 y str_buscar(nombre, "/", 0) < 0) {
+    si (h == 0 y str_buscar(nombre, "/", 0) < 0 y str_buscar(nombre, "\\", 0) < 0) {
         sea base = nombre
         si (str_buscar(nombre, ".so", 0) >= 0) { base = str_rebanar(nombre, 0, str_buscar(nombre, ".so", 0)) }
-        sea encontrada = buscar_biblioteca(base)
-        si (encontrada != 0) { h = sys_cargar_biblioteca(encontrada) }
+        si (str_buscar(nombre, ".dylib", 0) >= 0) { base = str_rebanar(nombre, 0, str_buscar(nombre, ".dylib", 0)) }
+        si (str_buscar(nombre, ".dll", 0) >= 0) { base = str_rebanar(nombre, 0, str_buscar(nombre, ".dll", 0)) }
+        si (sys_es_windows()) {
+            // "libsqlite3" → sqlite3.dll, winsqlite3.dll (la del sistema), libsqlite3.dll
+            sea sin_lib = base
+            si (dyn_empieza(base, "lib")) { sin_lib = str_rebanar(base, 3, str_largo(base)) }
+            h = sys_cargar_biblioteca(str_concatenar(sin_lib, ".dll"))
+            si (h == 0) { h = sys_cargar_biblioteca(str_concatenar(str_concatenar("win", sin_lib), ".dll")) }
+            si (h == 0) { h = sys_cargar_biblioteca(str_concatenar(base, ".dll")) }
+        } sino {
+            si (__plataforma() == 2 o __plataforma() == 3) {
+                sea con_dylib = str_concatenar(base, ".dylib")
+                h = sys_cargar_biblioteca(con_dylib)
+                si (h == 0) { h = sys_cargar_biblioteca(str_concatenar("/usr/lib/", con_dylib)) }
+                si (h == 0) { h = sys_cargar_biblioteca(str_concatenar("/opt/homebrew/lib/", con_dylib)) }
+                si (h == 0) { h = sys_cargar_biblioteca(str_concatenar("/usr/local/lib/", con_dylib)) }
+            } sino {
+                sea encontrada = buscar_biblioteca(base)
+                si (encontrada != 0) { h = sys_cargar_biblioteca(encontrada) }
+            }
+        }
     }
     si (h != 0) { map_fijar(cache, nombre, h) }
     retornar h
@@ -1183,6 +1204,851 @@ funcion texto_a_numero(t) { retornar a_numero(t) }
 // ── Tiempo ────────────────────────────────────────────────────────────────
 
 funcion tiempo_ms() { retornar dyn_entero(sys_reloj_ns() / 1000000) }
+
+// ── HMAC-SHA256 y bytes aleatorios del sistema ────────────────────────────
+
+// Texto hexadecimal → bytes crudos.
+funcion hex_a_bytes(h) {
+    sea r = str_nuevo(str_largo(h) / 2)
+    sea i = 0
+    mientras (i + 1 < str_largo(h)) {
+        str_agregar_byte(r, valor_hex(str_byte(h, i)) * 16 + valor_hex(str_byte(h, i + 1)))
+        i = i + 2
+    }
+    retornar r
+}
+
+// HMAC-SHA256 (RFC 2104) en hexadecimal, igual que en 3.x.
+funcion hmac_sha256(clave, mensaje) {
+    sea k = dyn_a_str(clave)
+    si (str_largo(k) > 64) { k = hex_a_bytes(dyn_texto_de(cfv_sha256(dyn_texto(k)), "hmac_sha256")) }
+    sea interno = str_nuevo(64 + str_largo(dyn_a_str(mensaje)))
+    sea externo = str_nuevo(96)
+    sea i = 0
+    mientras (i < 64) {
+        sea b = 0
+        si (i < str_largo(k)) { b = str_byte(k, i) }
+        str_agregar_byte(interno, __xo_bits(b, 54))
+        str_agregar_byte(externo, __xo_bits(b, 92))
+        i = i + 1
+    }
+    str_agregar(interno, dyn_a_str(mensaje))
+    str_agregar(externo, hex_a_bytes(dyn_texto_de(cfv_sha256(dyn_texto(interno)), "hmac_sha256")))
+    retornar cfv_sha256(dyn_texto(externo))
+}
+
+// n bytes aleatorios criptográficos del sistema, en hexadecimal.
+funcion crypto_rand_bytes(n) {
+    sea k = dyn_valor_entero(n)
+    si (k < 1 o k > 65536) { dyn_error("crypto_rand_bytes: n debe ser 1..65536") }
+    sea buf = mem_reservar(k)
+    si (sys_aleatorio(buf, k) != 0) { dyn_error("crypto_rand_bytes: el sistema no entregó bytes aleatorios") }
+    sea r = str_nuevo(k * 2)
+    sea i = 0
+    mientras (i < k) {
+        sea b = __cargar8(buf + i)
+        str_agregar_byte(r, __o_bits(hex_digito(b / 16), 32))
+        str_agregar_byte(r, __o_bits(hex_digito(b % 16), 32))
+        i = i + 1
+    }
+    mem_liberar(buf)
+    retornar dyn_texto(r)
+}
+
+// ── AES-256-CBC con PKCS#7 (FIPS 197), en C-Forge puro ────────────────────
+// Formato compatible con 3.x: hex(iv) + ":" + hex(cifrado); la clave es el
+// SHA-256 del texto que pasa el programa.
+
+funcion aes_xtime(b) {
+    sea r = b * 2
+    si (r >= 256) { r = __xo_bits(r, 283) }
+    retornar r
+}
+
+funcion aes_mul(a, b) {
+    sea r = 0
+    mientras (b > 0) {
+        si (__y_bits(b, 1)) { r = __xo_bits(r, a) }
+        a = aes_xtime(a)
+        b = __desplazar_der(b, 1)
+    }
+    retornar r
+}
+
+// S-box (0..255) y su inversa (256..511), una sola vez (global 26; la 25
+// es el cerrojo del asignador de memoria).
+funcion aes_tablas() {
+    sea t = mem_global(26)
+    si (t != 0) { retornar t }
+    t = mem_reservar(512)
+    sea p = 1
+    sea q = 1
+    __guardar8(t, 99)
+    __guardar8(t + 256 + 99, 0)
+    sea vuelta = 0
+    sea x = 0
+    sea k = 0
+    mientras (vuelta < 255) {
+        // p · 3, q / 3 en GF(2^8)
+        p = __xo_bits(p, aes_xtime(p))
+        q = __xo_bits(q, q * 2)
+        q = __xo_bits(q, q * 4)
+        q = __xo_bits(q, q * 16)
+        q = __y_bits(q, 255)
+        si (__y_bits(q, 128)) { q = __xo_bits(q, 9) }
+        x = __xo_bits(q, 99)
+        k = 1
+        mientras (k <= 4) {
+            x = __xo_bits(x, __y_bits(__o_bits(__desplazar_izq(q, k), __desplazar_der(q, 8 - k)), 255))
+            k = k + 1
+        }
+        __guardar8(t + p, x)
+        __guardar8(t + 256 + x, p)
+        vuelta = vuelta + 1
+    }
+    mem_fijar_global(26, t)
+    retornar t
+}
+
+// Expansión de la clave de 32 bytes → 240 bytes (15 claves de ronda).
+funcion aes_expandir(clave) {
+    sea s = aes_tablas()
+    sea w = mem_reservar(240)
+    sea i = 0
+    mientras (i < 32) {
+        __guardar8(w + i, __cargar8(clave + i))
+        i = i + 1
+    }
+    sea rcon = 1
+    mientras (i < 240) {
+        sea a = __cargar8(w + i - 4)
+        sea b = __cargar8(w + i - 3)
+        sea c = __cargar8(w + i - 2)
+        sea d = __cargar8(w + i - 1)
+        si (i % 32 == 0) {
+            sea tmp = a
+            a = __xo_bits(__cargar8(s + b), rcon)
+            b = __cargar8(s + c)
+            c = __cargar8(s + d)
+            d = __cargar8(s + tmp)
+            rcon = aes_xtime(rcon)
+        } sino {
+            si (i % 32 == 16) {
+                a = __cargar8(s + a)
+                b = __cargar8(s + b)
+                c = __cargar8(s + c)
+                d = __cargar8(s + d)
+            }
+        }
+        __guardar8(w + i, __xo_bits(__cargar8(w + i - 32), a))
+        __guardar8(w + i + 1, __xo_bits(__cargar8(w + i - 31), b))
+        __guardar8(w + i + 2, __xo_bits(__cargar8(w + i - 30), c))
+        __guardar8(w + i + 3, __xo_bits(__cargar8(w + i - 29), d))
+        i = i + 4
+    }
+    retornar w
+}
+
+funcion aes_sumar_clave(e, w, ronda) {
+    sea i = 0
+    mientras (i < 16) {
+        __guardar8(e + i, __xo_bits(__cargar8(e + i), __cargar8(w + ronda * 16 + i)))
+        i = i + 1
+    }
+    retornar 0
+}
+
+// SubBytes + ShiftRows (directo o inverso) sobre el estado e (16 bytes).
+funcion aes_sustituir_desplazar(e, tabla, inverso) {
+    sea tmp = mem_reservar(16)
+    sea i = 0
+    mientras (i < 16) {
+        sea fila = i % 4
+        sea col = i / 4
+        sea origen = ((col + fila) % 4) * 4 + fila
+        si (inverso) { origen = ((col + 4 - fila) % 4) * 4 + fila }
+        __guardar8(tmp + i, __cargar8(tabla + __cargar8(e + origen)))
+        i = i + 1
+    }
+    i = 0
+    mientras (i < 16) {
+        __guardar8(e + i, __cargar8(tmp + i))
+        i = i + 1
+    }
+    mem_liberar(tmp)
+    retornar 0
+}
+
+funcion aes_mezclar(e, inverso) {
+    sea c = 0
+    mientras (c < 4) {
+        sea p = e + c * 4
+        sea a0 = __cargar8(p)
+        sea a1 = __cargar8(p + 1)
+        sea a2 = __cargar8(p + 2)
+        sea a3 = __cargar8(p + 3)
+        si (inverso) {
+            __guardar8(p, __xo_bits(__xo_bits(aes_mul(a0, 14), aes_mul(a1, 11)), __xo_bits(aes_mul(a2, 13), aes_mul(a3, 9))))
+            __guardar8(p + 1, __xo_bits(__xo_bits(aes_mul(a0, 9), aes_mul(a1, 14)), __xo_bits(aes_mul(a2, 11), aes_mul(a3, 13))))
+            __guardar8(p + 2, __xo_bits(__xo_bits(aes_mul(a0, 13), aes_mul(a1, 9)), __xo_bits(aes_mul(a2, 14), aes_mul(a3, 11))))
+            __guardar8(p + 3, __xo_bits(__xo_bits(aes_mul(a0, 11), aes_mul(a1, 13)), __xo_bits(aes_mul(a2, 9), aes_mul(a3, 14))))
+        } sino {
+            __guardar8(p, __xo_bits(__xo_bits(aes_xtime(a0), __xo_bits(aes_xtime(a1), a1)), __xo_bits(a2, a3)))
+            __guardar8(p + 1, __xo_bits(__xo_bits(a0, aes_xtime(a1)), __xo_bits(__xo_bits(aes_xtime(a2), a2), a3)))
+            __guardar8(p + 2, __xo_bits(__xo_bits(a0, a1), __xo_bits(aes_xtime(a2), __xo_bits(aes_xtime(a3), a3))))
+            __guardar8(p + 3, __xo_bits(__xo_bits(__xo_bits(aes_xtime(a0), a0), a1), __xo_bits(a2, aes_xtime(a3))))
+        }
+        c = c + 1
+    }
+    retornar 0
+}
+
+funcion aes_bloque_cifrar(e, w) {
+    sea s = aes_tablas()
+    aes_sumar_clave(e, w, 0)
+    sea r = 1
+    mientras (r < 14) {
+        aes_sustituir_desplazar(e, s, 0)
+        aes_mezclar(e, 0)
+        aes_sumar_clave(e, w, r)
+        r = r + 1
+    }
+    aes_sustituir_desplazar(e, s, 0)
+    aes_sumar_clave(e, w, 14)
+    retornar 0
+}
+
+funcion aes_bloque_descifrar(e, w) {
+    sea s = aes_tablas() + 256
+    aes_sumar_clave(e, w, 14)
+    sea r = 13
+    mientras (r > 0) {
+        aes_sustituir_desplazar(e, s, 1)
+        aes_sumar_clave(e, w, r)
+        aes_mezclar(e, 1)
+        r = r - 1
+    }
+    aes_sustituir_desplazar(e, s, 1)
+    aes_sumar_clave(e, w, 0)
+    retornar 0
+}
+
+funcion aes_clave_de(clave) {
+    sea k = hex_a_bytes(dyn_texto_de(cfv_sha256(dyn_texto(dyn_a_str(clave))), "aes"))
+    retornar aes_expandir(str_datos(k))
+}
+
+funcion hex_de_memoria(r, p, n) {
+    sea i = 0
+    mientras (i < n) {
+        sea b = __cargar8(p + i)
+        str_agregar_byte(r, __o_bits(hex_digito(b / 16), 32))
+        str_agregar_byte(r, __o_bits(hex_digito(b % 16), 32))
+        i = i + 1
+    }
+    retornar 0
+}
+
+funcion aes_cifrar(clave, texto) {
+    sea w = aes_clave_de(clave)
+    sea m = dyn_a_str(texto)
+    sea n = str_largo(m)
+    sea relleno = 16 - n % 16
+    sea total = n + relleno
+    sea datos = mem_reservar(total)
+    sea i = 0
+    mientras (i < n) {
+        __guardar8(datos + i, str_byte(m, i))
+        i = i + 1
+    }
+    mientras (i < total) {
+        __guardar8(datos + i, relleno)
+        i = i + 1
+    }
+    sea iv = mem_reservar(16)
+    si (sys_aleatorio(iv, 16) != 0) { dyn_error("aes_cifrar: el sistema no entregó bytes aleatorios") }
+    sea previo = iv
+    sea b = 0
+    mientras (b < total) {
+        sea j = 0
+        mientras (j < 16) {
+            __guardar8(datos + b + j, __xo_bits(__cargar8(datos + b + j), __cargar8(previo + j)))
+            j = j + 1
+        }
+        aes_bloque_cifrar(datos + b, w)
+        previo = datos + b
+        b = b + 16
+    }
+    sea r = str_nuevo(33 + total * 2)
+    hex_de_memoria(r, iv, 16)
+    str_agregar_byte(r, 58)
+    hex_de_memoria(r, datos, total)
+    mem_liberar(datos)
+    mem_liberar(iv)
+    mem_liberar(w)
+    retornar dyn_texto(r)
+}
+
+funcion aes_descifrar(clave, cifrado) {
+    sea c = dyn_texto_de(cifrado, "aes_descifrar")
+    si (str_largo(c) < 33 o str_byte(c, 32) != 58) { dyn_error("aes_descifrar: formato invalido (usar salida de aes_cifrar)") }
+    sea iv = hex_a_bytes(str_rebanar(c, 0, 32))
+    sea ct = hex_a_bytes(str_rebanar(c, 33, str_largo(c)))
+    sea total = str_largo(ct)
+    si (total == 0 o total % 16 != 0) { dyn_error("aes_descifrar: clave incorrecta o datos corruptos") }
+    sea w = aes_clave_de(clave)
+    sea datos = mem_reservar(total)
+    sea i = 0
+    mientras (i < total) {
+        __guardar8(datos + i, str_byte(ct, i))
+        i = i + 1
+    }
+    sea b = total - 16
+    mientras (b >= 0) {
+        aes_bloque_descifrar(datos + b, w)
+        sea j = 0
+        mientras (j < 16) {
+            sea anterior = 0
+            si (b == 0) { anterior = str_byte(iv, j) } sino { anterior = str_byte(ct, b - 16 + j) }
+            __guardar8(datos + b + j, __xo_bits(__cargar8(datos + b + j), anterior))
+            j = j + 1
+        }
+        b = b - 16
+    }
+    sea relleno = __cargar8(datos + total - 1)
+    sea valido = relleno >= 1 y relleno <= 16
+    i = 0
+    mientras (valido y i < relleno) {
+        si (__cargar8(datos + total - 1 - i) != relleno) { valido = 0 }
+        i = i + 1
+    }
+    mem_liberar(w)
+    si (valido == 0) {
+        mem_liberar(datos)
+        dyn_error("aes_descifrar: clave incorrecta o datos corruptos")
+    }
+    sea r = str_nuevo(total)
+    i = 0
+    mientras (i < total - relleno) {
+        str_agregar_byte(r, __cargar8(datos + i))
+        i = i + 1
+    }
+    mem_liberar(datos)
+    retornar dyn_texto(r)
+}
+
+// ── Red: nombres, TCP y UDP (IPv4) ────────────────────────────────────────
+
+// "a.b.c.d" → ip (entero de 32 bits) o -1.
+funcion red_ip_de_texto(s) {
+    sea ip = 0
+    sea parte = 0
+    sea digitos = 0
+    sea puntos = 0
+    sea i = 0
+    mientras (i < str_largo(s)) {
+        sea b = str_byte(s, i)
+        si (b >= 48 y b <= 57) {
+            parte = parte * 10 + b - 48
+            digitos = digitos + 1
+            si (parte > 255 o digitos > 3) { retornar 0 - 1 }
+        } sino {
+            si (b != 46 o digitos == 0) { retornar 0 - 1 }
+            ip = ip * 256 + parte
+            parte = 0
+            digitos = 0
+            puntos = puntos + 1
+        }
+        i = i + 1
+    }
+    si (puntos != 3 o digitos == 0) { retornar 0 - 1 }
+    retornar ip * 256 + parte
+}
+
+funcion red_texto_de_ip(ip) {
+    sea r = str_nuevo(16)
+    sea k = 3
+    mientras (k >= 0) {
+        str_agregar(r, str_desde_entero(__y_bits(__desplazar_der(ip, k * 8), 255)))
+        si (k > 0) { str_agregar_byte(r, 46) }
+        k = k - 1
+    }
+    retornar r
+}
+
+// Contenido de un archivo, o 0 si no existe.
+funcion red_leer_si_existe(ruta) {
+    sea fd = sys_abrir(str_c(ruta), sys_abrir_lectura(), 0)
+    si (fd < 0) { retornar 0 }
+    sys_cerrar(fd)
+    retornar archivo_leer(ruta)
+}
+
+// Siguiente palabra (separada por espacios o tabs) desde *pos; avanza pos.
+funcion red_palabra(linea, pos) {
+    sea i = __cargar64(pos)
+    mientras (i < str_largo(linea) y (str_byte(linea, i) == 32 o str_byte(linea, i) == 9)) { i = i + 1 }
+    sea inicio = i
+    mientras (i < str_largo(linea) y str_byte(linea, i) != 32 y str_byte(linea, i) != 9) { i = i + 1 }
+    __guardar64(pos, i)
+    retornar str_rebanar(linea, inicio, i)
+}
+
+funcion red_igual_sin_mayusculas(a, b) {
+    si (str_largo(a) != str_largo(b)) { retornar 0 }
+    sea i = 0
+    mientras (i < str_largo(a)) {
+        sea x = str_byte(a, i)
+        sea y = str_byte(b, i)
+        si (x >= 65 y x <= 90) { x = x + 32 }
+        si (y >= 65 y y <= 90) { y = y + 32 }
+        si (x != y) { retornar 0 }
+        i = i + 1
+    }
+    retornar 1
+}
+
+// Busca nombre en un archivo con el formato de /etc/hosts o resolv.conf:
+// en hosts devuelve la ip de la línea que lo nombra; con nombre == 0
+// devuelve la ip del primer "nameserver".
+funcion red_buscar_en_archivo(ruta, nombre) {
+    sea texto = red_leer_si_existe(ruta)
+    si (texto == 0) { retornar 0 - 1 }
+    sea pos = mem_reservar(8)
+    sea inicio = 0
+    sea i = 0
+    sea resultado = 0 - 1
+    mientras (i <= str_largo(texto) y resultado < 0) {
+        si (i == str_largo(texto) o str_byte(texto, i) == 10) {
+            sea linea = str_rebanar(texto, inicio, i)
+            sea comentario = str_buscar(linea, "#", 0)
+            si (comentario >= 0) { linea = str_rebanar(linea, 0, comentario) }
+            __guardar64(pos, 0)
+            sea primera = red_palabra(linea, pos)
+            si (nombre == 0) {
+                si (str_igual(primera, "nameserver")) { resultado = red_ip_de_texto(red_palabra(linea, pos)) }
+            } sino {
+                sea ip = red_ip_de_texto(primera)
+                si (ip >= 0) {
+                    sea otra = red_palabra(linea, pos)
+                    mientras (str_largo(otra) > 0 y resultado < 0) {
+                        si (red_igual_sin_mayusculas(otra, nombre)) { resultado = ip }
+                        otra = red_palabra(linea, pos)
+                    }
+                }
+            }
+            inicio = i + 1
+        }
+        i = i + 1
+    }
+    mem_liberar(pos)
+    retornar resultado
+}
+
+// Salta un nombre DNS (etiquetas o puntero comprimido) desde p.
+funcion red_dns_saltar_nombre(m, p) {
+    mientras (p < str_largo(m)) {
+        sea n = str_byte(m, p)
+        si (n == 0) { retornar p + 1 }
+        si (n >= 192) { retornar p + 2 }
+        p = p + 1 + n
+    }
+    retornar p
+}
+
+// Consulta A al servidor DNS (UDP 53). Devuelve la ip o -1.
+funcion red_dns_consultar(nombre, servidor) {
+    sea q = str_nuevo(32 + str_largo(nombre))
+    sea id_buf = mem_reservar(8)
+    sys_aleatorio(id_buf, 2)
+    sea id = __y_bits(__cargar64(id_buf), 65535)
+    mem_liberar(id_buf)
+    str_agregar_byte(q, __desplazar_der(id, 8))
+    str_agregar_byte(q, __y_bits(id, 255))
+    str_agregar_byte(q, 1)                                     // RD
+    str_agregar_byte(q, 0)
+    str_agregar_byte(q, 0)
+    str_agregar_byte(q, 1)                                     // QDCOUNT = 1
+    sea k = 0
+    mientras (k < 6) {
+        str_agregar_byte(q, 0)
+        k = k + 1
+    }
+    sea inicio = 0
+    sea i = 0
+    mientras (i <= str_largo(nombre)) {
+        si (i == str_largo(nombre) o str_byte(nombre, i) == 46) {
+            si (i > inicio) {
+                str_agregar_byte(q, i - inicio)
+                str_agregar(q, str_rebanar(nombre, inicio, i))
+            }
+            inicio = i + 1
+        }
+        i = i + 1
+    }
+    str_agregar_byte(q, 0)
+    str_agregar_byte(q, 0)
+    str_agregar_byte(q, 1)                                     // QTYPE A
+    str_agregar_byte(q, 0)
+    str_agregar_byte(q, 1)                                     // QCLASS IN
+    sea fd = sys_udp_crear(0)
+    si (fd < 0) { retornar 0 - 1 }
+    sys_red_espera(fd, 2500)
+    sea buf = mem_reservar(1500)
+    sea dir = mem_reservar(16)
+    sea resultado = 0 - 1
+    sea intento = 0
+    mientras (intento < 2 y resultado < 0) {
+        sys_udp_enviar(fd, servidor, 53, str_datos(q), str_largo(q))
+        sea n = sys_udp_recibir(fd, buf, 1500, dir, 1)
+        si (n >= 12 y __cargar8(buf) * 256 + __cargar8(buf + 1) == id) {
+            sea m = str_nuevo(n)
+            sea j = 0
+            mientras (j < n) {
+                str_agregar_byte(m, __cargar8(buf + j))
+                j = j + 1
+            }
+            sea respuestas = str_byte(m, 6) * 256 + str_byte(m, 7)
+            sea p = red_dns_saltar_nombre(m, 12) + 4
+            sea r = 0
+            mientras (r < respuestas y resultado < 0 y p + 10 <= n) {
+                p = red_dns_saltar_nombre(m, p)
+                sea tipo = str_byte(m, p) * 256 + str_byte(m, p + 1)
+                sea largo = str_byte(m, p + 8) * 256 + str_byte(m, p + 9)
+                p = p + 10
+                si (tipo == 1 y largo == 4 y p + 4 <= n) {
+                    resultado = str_byte(m, p) * 16777216 + str_byte(m, p + 1) * 65536 + str_byte(m, p + 2) * 256 + str_byte(m, p + 3)
+                }
+                p = p + largo
+                r = r + 1
+            }
+            intento = 2
+        }
+        intento = intento + 1
+    }
+    mem_liberar(dir)
+    mem_liberar(buf)
+    sys_red_cerrar(fd)
+    retornar resultado
+}
+
+// Nombre de máquina → ip: dirección literal, localhost, el resolvedor del
+// sistema (macOS, Windows) o /etc/hosts y DNS propio (Linux). -1 si falla.
+funcion red_resolver_crudo(nombre) {
+    sea ip = red_ip_de_texto(nombre)
+    si (ip >= 0) { retornar ip }
+    si (red_igual_sin_mayusculas(nombre, "localhost")) { retornar 2130706433 }
+    ip = sys_resolver(str_c(nombre))
+    si (ip != 0) { retornar ip }
+    ip = red_buscar_en_archivo("/etc/hosts", nombre)
+    si (ip >= 0) { retornar ip }
+    sea servidor = red_buscar_en_archivo("/etc/resolv.conf", 0)
+    si (servidor < 0) { servidor = 16843009 }                  // 1.1.1.1
+    retornar red_dns_consultar(nombre, servidor)
+}
+
+funcion red_resolver(nombre) {
+    sea ip = red_resolver_crudo(dyn_texto_de(nombre, "red_resolver"))
+    si (ip < 0) { retornar 0 }
+    retornar dyn_texto(red_texto_de_ip(ip))
+}
+
+// ── TCP ──
+
+funcion net_conectar(host, puerto) {
+    sea nombre = dyn_texto_de(host, "net_conectar")
+    sea ip = red_resolver_crudo(nombre)
+    si (ip < 0) { dyn_error(str_concatenar("net_conectar: no se pudo resolver ", nombre)) }
+    sea fd = sys_red_conectar(ip, dyn_valor_entero(puerto))
+    si (fd < 0) { dyn_error(str_concatenar("net_conectar: no se pudo conectar a ", nombre)) }
+    sys_red_espera(fd, 15000)
+    retornar dyn_entero(fd)
+}
+
+funcion net_espera(sock, ms) {
+    sys_red_espera(dyn_valor_entero(sock), dyn_valor_entero(ms))
+    retornar 0
+}
+
+funcion net_enviar(sock, datos) {
+    sea fd = dyn_valor_entero(sock)
+    sea s = dyn_a_str(datos)
+    sea hecho = 0
+    mientras (hecho < str_largo(s)) {
+        sea n = sys_red_escribir(fd, str_datos(s) + hecho, str_largo(s) - hecho)
+        si (n <= 0) { dyn_error("net_enviar: la conexión se cerró") }
+        hecho = hecho + n
+    }
+    retornar dyn_entero(hecho)
+}
+
+// Lee hasta max bytes (por defecto 65536). "" si la conexión terminó o se
+// agotó la espera.
+funcion net_recibir(sock, max) {
+    sea limite = 65536
+    si (max != 0) { limite = dyn_valor_entero(max) }
+    sea r = str_nuevo(limite)
+    sea n = sys_red_leer(dyn_valor_entero(sock), str_datos(r), limite)
+    si (n > 0) { __guardar64(r, n) }
+    retornar dyn_texto(r)
+}
+
+// Todo lo que llegue hasta que la otra parte cierre.
+funcion net_recibir_todo(sock) {
+    sea fd = dyn_valor_entero(sock)
+    sea r = str_nuevo(4096)
+    sea seguir = 1
+    mientras (seguir) {
+        str_asegurar(r, str_largo(r) + 65536)
+        sea n = sys_red_leer(fd, str_datos(r) + str_largo(r), 65536)
+        si (n <= 0) { seguir = 0 } sino { __guardar64(r, str_largo(r) + n) }
+    }
+    retornar dyn_texto(r)
+}
+
+// Envía y devuelve la respuesta: espera el primer bloque y sigue leyendo
+// mientras lleguen datos (pausa de 100 ms).
+funcion net_enviar_recibir(sock, datos) {
+    sea fd = dyn_valor_entero(sock)
+    net_enviar(sock, datos)
+    sea r = str_nuevo(4096)
+    sea seguir = 1
+    sea primero = 1
+    mientras (seguir) {
+        str_asegurar(r, str_largo(r) + 65536)
+        sea n = sys_red_leer(fd, str_datos(r) + str_largo(r), 65536)
+        si (n <= 0) {
+            seguir = 0
+        } sino {
+            __guardar64(r, str_largo(r) + n)
+            si (primero) {
+                sys_red_espera(fd, 100)
+                primero = 0
+            }
+        }
+    }
+    sys_red_espera(fd, 15000)
+    retornar dyn_texto(r)
+}
+
+funcion net_cerrar(sock) {
+    sys_red_cerrar(dyn_valor_entero(sock))
+    retornar 0
+}
+
+// ── UDP ──
+
+funcion udp_crear(puerto) {
+    sea p = 0
+    si (puerto != 0) { p = dyn_valor_entero(puerto) }
+    sea fd = sys_udp_crear(p)
+    si (fd < 0) { dyn_error(str_concatenar("udp_crear: no se pudo abrir el puerto ", str_desde_entero(p))) }
+    retornar dyn_entero(fd)
+}
+
+funcion udp_enviar(sock, host, puerto, datos) {
+    sea nombre = dyn_texto_de(host, "udp_enviar")
+    sea ip = red_resolver_crudo(nombre)
+    si (ip < 0) { dyn_error(str_concatenar("udp_enviar: dirección inválida ", nombre)) }
+    sea s = dyn_a_str(datos)
+    sys_udp_enviar(dyn_valor_entero(sock), ip, dyn_valor_entero(puerto), str_datos(s), str_largo(s))
+    retornar 0
+}
+
+// {"datos", "origen", "puerto"} o nulo si no hay datagramas (no bloquea).
+funcion udp_recibir(sock) {
+    sea buf = mem_reservar(65536)
+    sea dir = mem_reservar(16)
+    sea n = sys_udp_recibir(dyn_valor_entero(sock), buf, 65536, dir, 0)
+    si (n <= 0) {
+        mem_liberar(buf)
+        mem_liberar(dir)
+        retornar 0
+    }
+    sea datos = str_nuevo(n)
+    sea i = 0
+    mientras (i < n) {
+        str_agregar_byte(datos, __cargar8(buf + i))
+        i = i + 1
+    }
+    sea ip = __cargar8(dir + 4) * 16777216 + __cargar8(dir + 5) * 65536 + __cargar8(dir + 6) * 256 + __cargar8(dir + 7)
+    sea m = map_nuevo()
+    map_fijar(m, "datos", dyn_texto(datos))
+    map_fijar(m, "origen", dyn_texto(red_texto_de_ip(ip)))
+    map_fijar(m, "puerto", dyn_entero(__cargar8(dir + 2) * 256 + __cargar8(dir + 3)))
+    mem_liberar(buf)
+    mem_liberar(dir)
+    retornar dyn_caja(3, m)
+}
+
+funcion udp_cerrar(sock) {
+    sys_red_cerrar(dyn_valor_entero(sock))
+    retornar 0
+}
+
+// ── TLS (HTTPS) con la biblioteca del sistema ─────────────────────────────
+// Linux y macOS: OpenSSL 3 (o 1.1) cargado en tiempo de ejecución, con
+// verificación de certificados contra el almacén del sistema y SNI.
+// Windows: Schannel (SSPI). El estado de una conexión es un bloque de
+// 64 bytes: [ssl][ctx][fd][tipo][...].
+
+funcion tls_i32(x) {
+    sea v = __y_bits(x, 4294967295)
+    si (v >= 2147483648) { retornar v - 4294967296 }
+    retornar v
+}
+
+// Handle de libssl (global 27), o 0 si no está disponible.
+funcion tls_libssl() {
+    sea h = mem_global(27)
+    si (h != 0) { retornar h }
+    si (sys_dl_disponible() == 0) { retornar 0 }
+    sea candidatos = vec_nuevo()
+    si (__plataforma() == 2 o __plataforma() == 3) {
+        vec_agregar(candidatos, "/opt/homebrew/opt/openssl@3/lib/libssl.3.dylib")
+        vec_agregar(candidatos, "/usr/local/opt/openssl@3/lib/libssl.3.dylib")
+        vec_agregar(candidatos, "/opt/homebrew/lib/libssl.3.dylib")
+        vec_agregar(candidatos, "/usr/local/lib/libssl.3.dylib")
+    } sino {
+        vec_agregar(candidatos, "libssl.so.3")
+        vec_agregar(candidatos, "libssl.so.1.1")
+    }
+    sea i = 0
+    mientras (i < vec_largo(candidatos) y h == 0) {
+        h = dyn_abrir_biblioteca(vec_obtener(candidatos, i))
+        i = i + 1
+    }
+    si (h != 0) {
+        mem_fijar_global(27, h)
+        __ccall(sys_simbolo(h, "OPENSSL_init_ssl"), 0, 0)
+    }
+    retornar h
+}
+
+funcion tls_f(nombre) {
+    sea p = sys_simbolo(tls_libssl(), nombre)
+    si (p == 0) { dyn_error(str_concatenar("tls: falta el símbolo de OpenSSL ", nombre)) }
+    retornar p
+}
+
+funcion tls_error(estado, mensaje) {
+    sys_red_cerrar(__cargar64(estado + 16))
+    dyn_error(mensaje)
+    retornar 0
+}
+
+funcion tls_abrir(sock, anfitrion) {
+    sea fd = dyn_valor_entero(sock)
+    sea host = dyn_texto_de(anfitrion, "tls_abrir")
+    sea estado = mem_reservar(64)
+    mem_llenar(estado, 0, 64)
+    __guardar64(estado + 16, fd)
+    si (sys_es_windows()) { retornar tls_abrir_schannel(estado, host) }
+    si (tls_libssl() == 0) {
+        si (sys_dl_disponible() == 0) { tls_error(estado, "https: agrega importar \"tls\" (o \"red\") al programa para usar TLS") }
+        tls_error(estado, "https: no se encontró OpenSSL (libssl 3 o 1.1); en macOS: brew install openssl@3")
+    }
+    sea ctx = __ccall(tls_f("SSL_CTX_new"), __ccall(tls_f("TLS_client_method")))
+    si (ctx == 0) { tls_error(estado, "tls: SSL_CTX_new falló") }
+    __ccall(tls_f("SSL_CTX_set_default_verify_paths"), ctx)
+    __ccall(tls_f("SSL_CTX_set_verify"), ctx, 1, 0)             // SSL_VERIFY_PEER
+    sea ssl = __ccall(tls_f("SSL_new"), ctx)
+    __guardar64(estado, ssl)
+    __guardar64(estado + 8, ctx)
+    __guardar64(estado + 24, 1)
+    __ccall(tls_f("SSL_set_fd"), ssl, fd)
+    sea host_c = str_c(host)
+    __ccall(tls_f("SSL_ctrl"), ssl, 55, 0, host_c)              // SNI
+    __ccall(tls_f("SSL_set1_host"), ssl, host_c)                // nombre del certificado
+    si (tls_i32(__ccall(tls_f("SSL_connect"), ssl)) != 1) {
+        sea v = __ccall(tls_f("SSL_get_verify_result"), ssl)
+        __ccall(tls_f("SSL_free"), ssl)
+        __ccall(tls_f("SSL_CTX_free"), ctx)
+        si (v != 0) { tls_error(estado, str_concatenar(str_concatenar("tls: certificado no válido para ", host), str_concatenar(" (código ", str_concatenar(str_desde_entero(v), ")")))) }
+        tls_error(estado, str_concatenar("tls: no se pudo establecer la sesión con ", host))
+    }
+    retornar dyn_entero(estado)
+}
+
+funcion tls_enviar(t, datos) {
+    sea estado = dyn_valor_entero(t)
+    si (__cargar64(estado + 24) == 2) { retornar tls_enviar_schannel(estado, datos) }
+    sea s = dyn_a_str(datos)
+    sea hecho = 0
+    mientras (hecho < str_largo(s)) {
+        sea n = tls_i32(__ccall(tls_f("SSL_write"), __cargar64(estado), str_datos(s) + hecho, str_largo(s) - hecho))
+        si (n <= 0) { dyn_error("tls: la conexión se cerró al enviar") }
+        hecho = hecho + n
+    }
+    retornar dyn_entero(hecho)
+}
+
+funcion tls_recibir_todo(t) {
+    sea estado = dyn_valor_entero(t)
+    si (__cargar64(estado + 24) == 2) { retornar tls_recibir_todo_schannel(estado) }
+    sea r = str_nuevo(4096)
+    sea leer = tls_f("SSL_read")
+    sea seguir = 1
+    mientras (seguir) {
+        str_asegurar(r, str_largo(r) + 16384)
+        sea n = tls_i32(__ccall(leer, __cargar64(estado), str_datos(r) + str_largo(r), 16384))
+        si (n <= 0) { seguir = 0 } sino { __guardar64(r, str_largo(r) + n) }
+    }
+    retornar dyn_texto(r)
+}
+
+funcion tls_cerrar(t) {
+    sea estado = dyn_valor_entero(t)
+    si (__cargar64(estado + 24) == 2) { retornar tls_cerrar_schannel(estado) }
+    si (__cargar64(estado) != 0) {
+        __ccall(tls_f("SSL_shutdown"), __cargar64(estado))
+        __ccall(tls_f("SSL_free"), __cargar64(estado))
+        __ccall(tls_f("SSL_CTX_free"), __cargar64(estado + 8))
+    }
+    sys_red_cerrar(__cargar64(estado + 16))
+    mem_liberar(estado)
+    retornar 0
+}
+
+// Schannel (Windows): el trabajo está en sys_windows_ext.cfv.
+funcion tls_abrir_schannel(estado, host) {
+    __guardar64(estado + 24, 2)
+    sea r = sys_tls_abrir(estado, host)
+    si (r != 0) {
+        sea m = str_concatenar("tls: no se pudo establecer la sesión con ", host)
+        str_agregar(m, " (SSPI 0x")
+        sea k = 7
+        mientras (k >= 0) {
+            str_agregar_byte(m, __o_bits(hex_digito(__y_bits(__desplazar_der(r, k * 4), 15)), 32))
+            k = k - 1
+        }
+        str_agregar(m, ")")
+        tls_error(estado, m)
+    }
+    retornar dyn_entero(estado)
+}
+
+funcion tls_enviar_schannel(estado, datos) {
+    sea s = dyn_a_str(datos)
+    si (sys_tls_enviar(estado, str_datos(s), str_largo(s)) != 0) { dyn_error("tls: la conexión se cerró al enviar") }
+    retornar dyn_entero(str_largo(s))
+}
+
+funcion tls_recibir_todo_schannel(estado) { retornar dyn_texto(sys_tls_recibir_todo(estado)) }
+
+funcion tls_cerrar_schannel(estado) {
+    sys_tls_cerrar(estado)
+    sys_red_cerrar(__cargar64(estado + 16))
+    mem_liberar(estado)
+    retornar 0
+}
+
+// Un byte como texto de un carácter (sin codificar UTF-8).
+funcion char_de(n) {
+    sea r = str_nuevo(1)
+    str_agregar_byte(r, __y_bits(dyn_valor_entero(n), 255))
+    retornar dyn_texto(r)
+}
 // Segundos desde la época (Unix) con decimales.
 funcion tiempo_actual() { retornar dyn_desde_f64(__f64_div(__f64_desde_entero(sys_reloj_ns()), __f64_desde_entero(1000000000))) }
 
@@ -1600,6 +2466,86 @@ funcion c_leer32(p, desplazamiento) {
 }
 // Texto del lenguaje a partir de una cadena C (terminada en 0) en p.
 funcion c_texto(p) { retornar dyn_texto(str_desde_c(dyn_entero_c(p))) }
+// Llama a la función C en f (puntero, p. ej. de SDL_GL_GetProcAddress) con
+// hasta 8 argumentos enteros o punteros; los que faltan valen 0.
+funcion c_llamar(f, a1, a2, a3, a4, a5, a6, a7, a8) {
+    sea r = __ccall(dyn_entero_c(f), dyn_entero_c(a1), dyn_entero_c(a2), dyn_entero_c(a3), dyn_entero_c(a4), dyn_entero_c(a5), dyn_entero_c(a6), dyn_entero_c(a7), dyn_entero_c(a8))
+    retornar dyn_entero_desde_c(r)
+}
+
+// Resultado int de C (32 bits con signo) a partir de un valor de 64 bits.
+funcion c_i32(v) {
+    sea x = __y_bits(dyn_entero_c(v), 4294967295)
+    si (x >= 2147483648) { x = x - 4294967296 }
+    retornar dyn_entero(x)
+}
+
+// Bits IEEE-754 de 32 bits (float) del número, redondeando al par.
+funcion f32_bits(d) {
+    sea signo = __y_bits(__desplazar_der(d, 63), 1) * 2147483648
+    sea e = __y_bits(__desplazar_der(d, 52), 2047)
+    sea m = __y_bits(d, 4503599627370495)
+    si (e == 2047) {
+        si (m != 0) { retornar 2143289344 }                    // NaN
+        retornar signo + 2139095040                            // ±inf
+    }
+    sea e8 = e - 1023 + 127
+    si (e8 >= 255) { retornar signo + 2139095040 }
+    si (e8 <= 0) {
+        // Subnormal de float (o cero).
+        si (e8 < 0 - 23) { retornar signo }
+        sea completa = __o_bits(m, 4503599627370496)          // con el 1 implícito
+        sea corrimiento = 29 + 1 - e8
+        sea r = __desplazar_der(completa, corrimiento)
+        sea resto = __y_bits(completa, __desplazar_izq(1, corrimiento) - 1)
+        sea mitad = __desplazar_izq(1, corrimiento - 1)
+        si (resto > mitad o (resto == mitad y __y_bits(r, 1) == 1)) { r = r + 1 }
+        retornar signo + r
+    }
+    sea r = __desplazar_der(m, 29)
+    sea resto = __y_bits(m, 536870911)
+    si (resto > 268435456 o (resto == 268435456 y __y_bits(r, 1) == 1)) { r = r + 1 }
+    si (r == 8388608) {
+        r = 0
+        e8 = e8 + 1
+        si (e8 >= 255) { retornar signo + 2139095040 }
+    }
+    retornar signo + e8 * 8388608 + r
+}
+
+funcion c_f32(v) { retornar dyn_entero(f32_bits(dyn_a_f64(v))) }
+
+funcion c_escribir_f32(p, desplazamiento, v) {
+    sea d = dyn_entero_c(p) + dyn_valor_entero(desplazamiento)
+    sea x = f32_bits(dyn_a_f64(v))
+    __guardar8(d, __y_bits(x, 255))
+    __guardar8(d + 1, __y_bits(__desplazar_der(x, 8), 255))
+    __guardar8(d + 2, __y_bits(__desplazar_der(x, 16), 255))
+    __guardar8(d + 3, __y_bits(__desplazar_der(x, 24), 255))
+    retornar 0
+}
+
+// Copia del texto como cadena C terminada en 0 (liberar con c_liberar).
+funcion c_cadena(t) {
+    sea s = dyn_a_str(t)
+    sea p = mem_reservar(str_largo(s) + 1)
+    sea i = 0
+    mientras (i < str_largo(s)) {
+        __guardar8(p + i, str_byte(s, i))
+        i = i + 1
+    }
+    __guardar8(p + str_largo(s), 0)
+    retornar dyn_entero(p)
+}
+
+// Entero de 64 bits (o puntero) en p + desplazamiento.
+funcion c_leer64(p, desplazamiento) {
+    retornar dyn_entero_desde_c(__cargar64(dyn_entero_c(p) + dyn_valor_entero(desplazamiento)))
+}
+funcion c_escribir64(p, desplazamiento, v) {
+    __guardar64(dyn_entero_c(p) + dyn_valor_entero(desplazamiento), dyn_entero_c(v))
+    retornar 0
+}
 funcion c_leer8(p, desplazamiento) {
     retornar dyn_entero(__cargar8(dyn_valor_entero(p) + dyn_valor_entero(desplazamiento)))
 }

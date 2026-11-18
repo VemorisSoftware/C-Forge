@@ -1,0 +1,240 @@
+// runtime/gl3d.cfv — OpenGL 3.3 core sobre SDL2, escrito en C-Forge.
+//
+// Mismas funciones que el intérprete de 3.x (gl3d_iniciar, gl3d_vbo,
+// gl3d_shader, …). cforge incluye este módulo solo si el programa usa
+// funciones gl3d_. Las funciones de OpenGL se obtienen con
+// SDL_GL_GetProcAddress (Linux, macOS y Windows, donde opengl32.dll solo
+// exporta GL 1.1) y se llaman con c_llamar; los float van por puntero
+// (glClearBufferfv, glUniform*fv) porque las llamadas C son enteras.
+
+funcion __gl3d_declaraciones() {
+    extern "SDL2" funcion SDL_GL_SetAttribute(atributo: entero, valor: entero): entero
+    extern "SDL2" funcion SDL_GL_CreateContext(ventana: puntero): puntero
+    extern "SDL2" funcion SDL_GL_DeleteContext(contexto: puntero): nulo
+    extern "SDL2" funcion SDL_GL_GetProcAddress(nombre: texto): puntero
+    extern "SDL2" funcion SDL_GL_SetSwapInterval(intervalo: entero): entero
+    extern "SDL2" funcion SDL_GL_SwapWindow(ventana: puntero): nulo
+    extern "SDL2" funcion SDL_GL_GetDrawableSize(ventana: puntero, ancho: puntero, alto: puntero): nulo
+    extern "SDL2" funcion SDL_GetWindowSize(ventana: puntero, ancho: puntero, alto: puntero): nulo
+    extern "SDL2" funcion SDL_GetError(): puntero
+    extern "SDL2" funcion SDL_InitSubSystem(banderas: entero): entero
+    extern "SDL2" funcion SDL_CreateWindow(titulo: texto, x: entero, y: entero, ancho: entero, alto: entero, banderas: entero): puntero
+}
+
+sea __gl3d = nulo
+
+funcion __gl3d_estado() {
+    si (__gl3d == nulo) { __gl3d = {"funciones": {}, "tmp": c_reservar(64)} }
+    retornar __gl3d
+}
+
+// Puntero a la función de OpenGL (con caché).
+funcion __gl(nombre) {
+    sea f = __gl3d_estado()["funciones"]
+    si (tiene_clave(f, nombre)) { retornar f[nombre] }
+    sea p = SDL_GL_GetProcAddress(nombre)
+    si (p == 0) { lanzar "gl3d: OpenGL no ofrece " + nombre + " (¿contexto 3.3 creado con gl3d_iniciar?)" }
+    f[nombre] = p
+    retornar p
+}
+
+// Ventana SDL lista para OpenGL 3.3 core (atributos antes de crearla).
+funcion gl3d_ventana(titulo, ancho, alto) {
+    si (SDL_InitSubSystem(32) != 0) { lanzar "gl3d_ventana: " + c_texto(SDL_GetError()) }   // VIDEO
+    SDL_GL_SetAttribute(17, 3)                                 // CONTEXT_MAJOR_VERSION
+    SDL_GL_SetAttribute(18, 3)                                 // CONTEXT_MINOR_VERSION
+    SDL_GL_SetAttribute(21, 1)                                 // PROFILE_MASK: CORE
+    SDL_GL_SetAttribute(20, 2)                                 // CONTEXT_FLAGS: FORWARD_COMPATIBLE (macOS)
+    SDL_GL_SetAttribute(5, 1)                                  // DOUBLEBUFFER
+    SDL_GL_SetAttribute(6, 24)                                 // DEPTH_SIZE
+    si (tipo_de(titulo) != "texto") { titulo = "C-Forge 3D" }
+    sea v = SDL_CreateWindow(titulo, 536805376, 536805376, piso(ancho ?? 800), piso(alto ?? 600), 8198)   // OPENGL | SHOWN | ALLOW_HIGHDPI
+    si (v == 0) { lanzar "gl3d_ventana: " + c_texto(SDL_GetError()) }
+    retornar v
+}
+
+funcion gl3d_iniciar(ventana) {
+    sea ctx = SDL_GL_CreateContext(ventana)
+    si (ctx == 0) { lanzar "gl3d_iniciar: " + c_texto(SDL_GetError()) }
+    SDL_GL_SetSwapInterval(1)
+    retornar ctx
+}
+
+funcion gl3d_cerrar(ctx) { SDL_GL_DeleteContext(ctx) }
+funcion gl3d_intercambiar(ventana) { SDL_GL_SwapWindow(ventana) }
+
+funcion __gl3d_tamano(ventana, dibujable) {
+    sea t = __gl3d_estado()["tmp"]
+    si (dibujable) { SDL_GL_GetDrawableSize(ventana, t, t + 4) } sino { SDL_GetWindowSize(ventana, t, t + 4) }
+    retornar {"ancho": c_leer32(t, 0), "alto": c_leer32(t, 4)}
+}
+
+funcion sdl_tamanio_ventana(ventana) { retornar __gl3d_tamano(ventana, falso) }
+funcion gl3d_tamanio_dibujable(ventana) { retornar __gl3d_tamano(ventana, verdadero) }
+
+funcion gl3d_viewport(x, y, ancho, alto) { c_llamar(__gl("glViewport"), piso(x), piso(y), piso(ancho), piso(alto)) }
+
+funcion gl3d_profundidad(activa) {
+    si (activa) {
+        c_llamar(__gl("glEnable"), 2929)                       // GL_DEPTH_TEST
+        c_llamar(__gl("glDepthFunc"), 513)                     // GL_LESS
+    } sino {
+        c_llamar(__gl("glDisable"), 2929)
+    }
+}
+
+// Color 0..255 (como en 3.x) y profundidad a 1.
+funcion gl3d_limpiar(r, g, b, a) {
+    sea t = __gl3d_estado()["tmp"]
+    c_escribir_f32(t, 0, (r ?? 0) / 255)
+    c_escribir_f32(t, 4, (g ?? 0) / 255)
+    c_escribir_f32(t, 8, (b ?? 0) / 255)
+    c_escribir_f32(t, 12, (a ?? 255) / 255)
+    c_escribir_f32(t, 16, 1)
+    c_llamar(__gl("glClearBufferfv"), 6144, 0, t)              // GL_COLOR
+    c_llamar(__gl("glClearBufferfv"), 6145, 0, t + 16)         // GL_DEPTH
+}
+
+// VAO + VBO con los vértices (float); devuelve vao·2^32 + vbo.
+funcion gl3d_vbo(datos) {
+    sea n = longitud(datos)
+    sea buf = c_reservar(n * 4 + 4)
+    sea i = 0
+    mientras (i < n) {
+        c_escribir_f32(buf, i * 4, datos[i])
+        i += 1
+    }
+    sea t = __gl3d_estado()["tmp"]
+    c_llamar(__gl("glGenVertexArrays"), 1, t)
+    c_llamar(__gl("glGenBuffers"), 1, t + 4)
+    sea vao = c_leer32(t, 0)
+    sea vbo = c_leer32(t, 4)
+    c_llamar(__gl("glBindVertexArray"), vao)
+    c_llamar(__gl("glBindBuffer"), 34962, vbo)                 // GL_ARRAY_BUFFER
+    c_llamar(__gl("glBufferData"), 34962, n * 4, buf, 35044)   // GL_STATIC_DRAW
+    c_liberar(buf)
+    retornar vao * 4294967296 + vbo
+}
+
+funcion __gl3d_vao(id) { retornar piso(id / 4294967296) }
+funcion __gl3d_vbo_de(id) { retornar id - __gl3d_vao(id) * 4294967296 }
+
+// Atributo idx: tam floats por vértice, stride y desplazamiento en floats.
+funcion gl3d_atributo(id, idx, tam, stride, desplazamiento) {
+    c_llamar(__gl("glBindVertexArray"), __gl3d_vao(id))
+    c_llamar(__gl("glBindBuffer"), 34962, __gl3d_vbo_de(id))
+    c_llamar(__gl("glVertexAttribPointer"), idx, tam, 5126, 0, stride * 4, desplazamiento * 4)   // GL_FLOAT
+    c_llamar(__gl("glEnableVertexAttribArray"), idx)
+}
+
+funcion gl3d_dibujar(id, vertices, modo) {
+    sea m = 4                                                  // GL_TRIANGLES
+    si (modo == "lineas") { m = 1 }
+    si (modo == "puntos") { m = 0 }
+    si (modo == "tiras") { m = 5 }
+    si (modo == "abanico") { m = 6 }
+    c_llamar(__gl("glBindVertexArray"), __gl3d_vao(id))
+    c_llamar(__gl("glDrawArrays"), m, 0, piso(vertices))
+}
+
+funcion __gl3d_registro(objeto, es_programa) {
+    sea buf = c_reservar(1024)
+    si (es_programa) {
+        c_llamar(__gl("glGetProgramInfoLog"), objeto, 1024, 0, buf)
+    } sino {
+        c_llamar(__gl("glGetShaderInfoLog"), objeto, 1024, 0, buf)
+    }
+    sea t = c_texto(buf)
+    c_liberar(buf)
+    retornar t
+}
+
+funcion gl3d_shader(tipo, codigo) {
+    sea gl_tipo = 35632                                        // GL_FRAGMENT_SHADER
+    si (tipo == "vertex" o tipo == "vertice" o tipo == "vértice") { gl_tipo = 35633 }
+    sea s = c_i32(c_llamar(__gl("glCreateShader"), gl_tipo))
+    sea fuente = c_cadena(codigo)
+    sea t = __gl3d_estado()["tmp"]
+    c_escribir64(t, 0, fuente)
+    c_llamar(__gl("glShaderSource"), s, 1, t, 0)
+    c_llamar(__gl("glCompileShader"), s)
+    c_liberar(fuente)
+    c_llamar(__gl("glGetShaderiv"), s, 35713, t + 8)           // GL_COMPILE_STATUS
+    si (c_leer32(t, 8) == 0) {
+        sea registro = __gl3d_registro(s, falso)
+        c_llamar(__gl("glDeleteShader"), s)
+        lanzar "gl3d_shader error: " + registro
+    }
+    retornar s
+}
+
+funcion gl3d_programa(vertice, fragmento) {
+    sea p = c_i32(c_llamar(__gl("glCreateProgram")))
+    c_llamar(__gl("glAttachShader"), p, vertice)
+    c_llamar(__gl("glAttachShader"), p, fragmento)
+    c_llamar(__gl("glLinkProgram"), p)
+    sea t = __gl3d_estado()["tmp"]
+    c_llamar(__gl("glGetProgramiv"), p, 35714, t)              // GL_LINK_STATUS
+    si (c_leer32(t, 0) == 0) {
+        sea registro = __gl3d_registro(p, verdadero)
+        c_llamar(__gl("glDeleteProgram"), p)
+        lanzar "gl3d_programa error: " + registro
+    }
+    c_llamar(__gl("glDeleteShader"), vertice)
+    c_llamar(__gl("glDeleteShader"), fragmento)
+    retornar p
+}
+
+funcion gl3d_usar_programa(p) { c_llamar(__gl("glUseProgram"), p) }
+
+funcion __gl3d_ubicacion(p, nombre) {
+    sea c = c_cadena(nombre)
+    sea u = c_i32(c_llamar(__gl("glGetUniformLocation"), p, c))
+    c_liberar(c)
+    retornar u
+}
+
+funcion gl3d_uniforme_mat4(p, nombre, m) {
+    si (longitud(m) < 16) { lanzar "gl3d_uniforme_mat4: requiere lista de 16 numeros" }
+    sea u = __gl3d_ubicacion(p, nombre)
+    si (u < 0) { retornar nulo }
+    sea buf = c_reservar(64)
+    sea i = 0
+    mientras (i < 16) {
+        c_escribir_f32(buf, i * 4, m[i])
+        i += 1
+    }
+    c_llamar(__gl("glUseProgram"), p)
+    c_llamar(__gl("glUniformMatrix4fv"), u, 1, 0, buf)
+    c_liberar(buf)
+}
+
+funcion gl3d_uniforme_f(p, nombre, valor) {
+    sea u = __gl3d_ubicacion(p, nombre)
+    si (u < 0) { retornar nulo }
+    sea t = __gl3d_estado()["tmp"]
+    c_escribir_f32(t, 0, valor)
+    c_llamar(__gl("glUseProgram"), p)
+    c_llamar(__gl("glUniform1fv"), u, 1, t)
+}
+
+funcion gl3d_uniforme_vec3(p, nombre, x, y, z) {
+    sea u = __gl3d_ubicacion(p, nombre)
+    si (u < 0) { retornar nulo }
+    sea t = __gl3d_estado()["tmp"]
+    c_escribir_f32(t, 0, x)
+    c_escribir_f32(t, 4, y)
+    c_escribir_f32(t, 8, z)
+    c_llamar(__gl("glUseProgram"), p)
+    c_llamar(__gl("glUniform3fv"), u, 1, t)
+}
+
+// Color RGBA (0..255) del píxel x, y (origen abajo a la izquierda).
+funcion gl3d_leer_pixel(x, y) {
+    sea t = __gl3d_estado()["tmp"]
+    c_escribir32(t, 32, 0)
+    c_llamar(__gl("glReadPixels"), piso(x), piso(y), 1, 1, 6408, 5121, t + 32)   // GL_RGBA, GL_UNSIGNED_BYTE
+    retornar [c_leer8(t, 32), c_leer8(t, 33), c_leer8(t, 34), c_leer8(t, 35)]
+}
+
+funcion gl3d_error() { retornar c_i32(c_llamar(__gl("glGetError"))) }
