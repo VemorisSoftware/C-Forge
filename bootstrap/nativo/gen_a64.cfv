@@ -1,0 +1,458 @@
+// bootstrap/nativo/gen_a64.cfv — backend AArch64 del compilador autoalojado.
+//
+// Implementa las operaciones de bootstrap/nativo/gen.cfv con instrucciones
+// AArch64 de 32 bits. Asignación de registros virtuales:
+//   a → x0 · b → x1 · c → x2 · d → x19 · pila → x28 · marco → x29 ·
+//   e → x6 · f → x7 · r8-r11 → x8-x11 · r12-r15 → x20-x23
+// x16 y x17 son auxiliares de las secuencias; x18 (reservado en macOS) no se
+// usa. La pila del lenguaje vive en x28 (palabras de 8 bytes, mismo marco
+// que en x86-64); sp queda alineado a 16 para las llamadas a C.
+// Los saltos condicionales se emiten como "condición inversa + b" para
+// alcanzar ±128 MiB. Arreglos: 10 b/bl (imm26) · 20 + tipo adrp + add
+// (tipo 1 dato, 2 global, 3 tabla de clases, 4 etiqueta, 5 importación).
+
+funcion a64_r(r) {
+    si (r <= 2) { retornar r }
+    si (r == 3) { retornar 19 }
+    si (r == 4) { retornar 28 }
+    si (r == 5) { retornar 29 }
+    si (r <= 11) { retornar r }
+    retornar r + 8
+}
+
+funcion a64(c, palabra) { retornar e32(c, palabra) }
+
+// Registra un arreglo en la posición actual (sin emitir bytes).
+funcion a64_arreglo(c, tipo, valor) {
+    sea a = mem_reservar(24)
+    __guardar64(a, posicion_codigo(c))
+    __guardar64(a + 8, tipo)
+    __guardar64(a + 16, valor)
+    vec_agregar(__cargar64(c + 32), a)
+    retornar 0
+}
+
+// x[d] ← valor (movz/movn + movk)
+funcion a64_constante(c, d, valor) {
+    sea ceros = 0
+    sea unos = 0
+    sea i = 0
+    mientras (i < 4) {
+        sea h = __y_bits(__desplazar_der(valor, i * 16), 65535)
+        si (h == 0) { ceros = ceros + 1 }
+        si (h == 65535) { unos = unos + 1 }
+        i = i + 1
+    }
+    sea relleno = 0
+    si (unos > ceros) { relleno = 65535 }
+    sea primero = 1
+    i = 0
+    mientras (i < 4) {
+        sea h = __y_bits(__desplazar_der(valor, i * 16), 65535)
+        si (h != relleno) {
+            si (primero) {
+                si (relleno == 0) {
+                    a64(c, 3531603968 + i * 2097152 + h * 32 + d)          // movz
+                } sino {
+                    a64(c, 2457862144 + i * 2097152 + (65535 - h) * 32 + d) // movn
+                }
+                primero = 0
+            } sino {
+                a64(c, 4068474880 + i * 2097152 + h * 32 + d)              // movk
+            }
+        }
+        i = i + 1
+    }
+    si (primero) {
+        si (relleno == 0) { a64(c, 3531603968 + d) } sino { a64(c, 2457862144 + d) }
+    }
+    retornar 0
+}
+
+// x[d] ← x[n] + imm (imm >= 0; usa x17 si no cabe)
+funcion a64_sumar_inm(c, d, n, imm) {
+    si (imm < 4096) { retornar a64(c, 2432696320 + imm * 1024 + n * 32 + d) }
+    si (imm % 4096 == 0 y imm < 16777216) { retornar a64(c, 2436890624 + (imm / 4096) * 1024 + n * 32 + d) }
+    a64_constante(c, 17, imm)
+    retornar a64(c, 2332033024 + 17 * 65536 + n * 32 + d)             // add d, n, x17
+}
+
+funcion a64_restar_inm(c, d, n, imm) {
+    si (imm < 4096) { retornar a64(c, 3506438144 + imm * 1024 + n * 32 + d) }
+    si (imm % 4096 == 0 y imm < 16777216) { retornar a64(c, 3510632448 + (imm / 4096) * 1024 + n * 32 + d) }
+    a64_constante(c, 17, imm)
+    retornar a64(c, 3405774848 + 17 * 65536 + n * 32 + d)             // sub d, n, x17
+}
+
+// ldr/str de 64 bits con desplazamiento d (registros físicos).
+funcion a64_memoria(c, guardar, t, n, d) {
+    si (d >= 0 - 256 y d <= 255) {
+        sea base = 4164943872                                          // ldur
+        si (guardar) { base = 4160749568 }                             // stur
+        retornar a64(c, base + __y_bits(d, 511) * 4096 + n * 32 + t)
+    }
+    si (d >= 0 y d % 8 == 0 y d <= 32760) {
+        sea base = 4181721088                                          // ldr [n, #d]
+        si (guardar) { base = 4177526784 }
+        retornar a64(c, base + (d / 8) * 1024 + n * 32 + t)
+    }
+    a64_constante(c, 17, d)
+    sea base = 4168181760                                              // ldr t, [n, x17]
+    si (guardar) { base = 4163987456 }
+    retornar a64(c, base + n * 32 + t)
+}
+
+funcion a64_mov(c, d, m) { retornar a64(c, 2852127712 + m * 65536 + d) }   // orr d, xzr, m
+
+// Apila / desapila sobre x28 (str t, [x28, #-8]! · ldr t, [x28], #8).
+funcion a64_empujar_fis(c, t) { retornar a64(c, 4162817920 + t) }
+funcion a64_sacar_fis(c, t) { retornar a64(c, 4164978560 + t) }
+
+// x[d] ← dirección (adrp + add) con un arreglo de tipo 20 + tipo.
+funcion a64_adr(c, d, tipo, valor) {
+    a64_arreglo(c, 20 + tipo, valor)
+    a64(c, 2415919104 + d)
+    a64(c, 2432696320 + d * 32 + d)
+    retornar 0
+}
+
+funcion a64_b(c, etiqueta) {
+    a64_arreglo(c, 10, etiqueta)
+    retornar a64(c, 335544320)
+}
+
+funcion a64_bl(c, etiqueta) {
+    a64_arreglo(c, 10, etiqueta)
+    retornar a64(c, 2483027968)
+}
+
+// ── Operaciones ───────────────────────────────────────────────────────────
+
+funcion a64_empujar_reg(c, r) { retornar a64_empujar_fis(c, a64_r(r)) }
+funcion a64_sacar(c, r) { retornar a64_sacar_fis(c, a64_r(r)) }
+funcion a64_mov_op(c, destino, origen) { retornar a64_mov(c, a64_r(destino), a64_r(origen)) }
+funcion a64_inmediato(c, valor) { retornar a64_constante(c, 0, valor) }
+funcion a64_cargar(c, destino, base, d) { retornar a64_memoria(c, 0, a64_r(destino), a64_r(base), d) }
+funcion a64_guardar(c, base, d, origen) { retornar a64_memoria(c, 1, a64_r(origen), a64_r(base), d) }
+funcion a64_cargar8(c) { retornar a64(c, 960495616) }                    // ldrb w0, [x0]
+funcion a64_guardar8(c) { retornar a64(c, 956301313) }                   // strb w1, [x0]
+
+funcion a64_direccion(c, tipo, valor) { retornar a64_adr(c, 0, tipo, valor) }
+funcion a64_cargar_absoluto(c, tipo, valor) {
+    a64_adr(c, 16, tipo, valor)
+    retornar a64(c, 4181721600)                                        // ldr x0, [x16]
+}
+funcion a64_guardar_absoluto(c, tipo, valor) {
+    a64_adr(c, 16, tipo, valor)
+    retornar a64(c, 4177527296)                                        // str x0, [x16]
+}
+
+funcion a64_cargar_indexado(c, d) {
+    a64(c, 2332101648)                                                 // add x16, x0, x1, lsl #3
+    retornar a64_memoria(c, 0, 0, 16, d)
+}
+
+funcion a64_empujar_pila(c, d) {
+    a64_memoria(c, 0, 16, 28, d)
+    retornar a64_empujar_fis(c, 16)
+}
+
+funcion a64_liberar_pila(c, n) { retornar a64_sumar_inm(c, 28, 28, n) }
+
+funcion a64_aritmetica(c, op) {
+    si (op == 1) { a64(c, 2332098560) }                                // add x0, x0, x1
+    si (op == 2) { a64(c, 3405840384) }                                // sub
+    si (op == 3) { a64(c, 2600565760) }                                // mul
+    si (op == 4) { a64(c, 2596342784) }                                // sdiv
+    si (op == 5) {
+        a64(c, 2596342800)                                             // sdiv x16, x0, x1
+        a64(c, 2600567296)                                             // msub x0, x16, x1, x0
+    }
+    si (op == 6) { a64(c, 2315321344) }                                // and
+    si (op == 7) { a64(c, 2852192256) }                                // orr
+    si (op == 8) { a64(c, 3389063168) }                                // eor
+    si (op == 9) { a64(c, 2596347904) }                                // lslv
+    si (op == 10) { a64(c, 2596348928) }                               // lsrv
+    retornar 0
+}
+
+funcion a64_negar(c) { retornar a64(c, 3405775840) }                     // neg x0, x0
+funcion a64_sumar_inmediato(c, k) { retornar a64_sumar_inm(c, 0, 0, k) }
+funcion a64_etiquetar(c, k) {
+    a64(c, 2332033024)                                                 // add x0, x0, x0
+    retornar a64_sumar_inm(c, 0, 0, k)
+}
+funcion a64_extender32(c) { retornar a64(c, 2470476800) }               // sxtw x0, w0
+funcion a64_byte_bajo(c) { retornar a64(c, 2453675008) }                // and x0, x0, #0xff
+funcion a64_intercambiar(c) {
+    a64(c, 4175527952)                                                 // swpal x1, x16, [x0]
+    retornar a64_mov(c, 0, 16)
+}
+
+// cset x0, cond (con la condición invertida en el campo).
+funcion a64_cset(c, cond) { retornar a64(c, 2594113504 + __xo_bits(cond, 1) * 4096) }
+
+// setcc de x86 → condición de AArch64
+funcion a64_condicion(codigo) {
+    si (codigo == 156) { retornar 11 }                                 // lt
+    si (codigo == 158) { retornar 13 }                                 // le
+    si (codigo == 159) { retornar 12 }                                 // gt
+    si (codigo == 157) { retornar 10 }                                 // ge
+    si (codigo == 148) { retornar 0 }                                  // eq
+    retornar 1                                                         // ne
+}
+
+funcion a64_comparar(c, codigo) {
+    a64(c, 3942711327)                                                 // cmp x0, x1
+    retornar a64_cset(c, a64_condicion(codigo))
+}
+funcion a64_es_cero(c) {
+    a64(c, 4043309087)                                                 // cmp x0, #0
+    retornar a64_cset(c, 0)
+}
+funcion a64_no_cero(c) {
+    a64(c, 4043309087)
+    retornar a64_cset(c, 1)
+}
+
+funcion a64_saltar_si(c, cero, etiqueta) {
+    si (cero) { a64(c, 3036676160) } sino { a64(c, 3019898944) }      // cbnz/cbz x0, +8
+    retornar a64_b(c, etiqueta)
+}
+funcion a64_saltar_si_mayor_igual(c, etiqueta) {
+    a64(c, 3942711327)                                                 // cmp x0, x1
+    a64(c, 1409286219)                                                 // b.lt +8
+    retornar a64_b(c, etiqueta)
+}
+funcion a64_saltar_reg(c, r) { retornar a64(c, 3592355840 + a64_r(r) * 32) }    // br
+funcion a64_llamar_reg(c, r) { retornar a64(c, 3594452992 + a64_r(r) * 32) }    // blr
+
+// Prólogo: apila el retorno (x30) y el marco (x29), x29 ← x28 y reserva
+// el marco con x16 (movz + movk, parcheados al cerrar la función).
+funcion a64_prologo(c) {
+    a64_empujar_fis(c, 30)
+    a64_empujar_fis(c, 29)
+    a64_mov(c, 29, 28)
+    sea posicion = posicion_codigo(c)
+    a64(c, 3531603984)                                                 // movz x16, #0
+    a64(c, 4070572048)                                                 // movk x16, #0, lsl #16
+    a64(c, 3406824348)                                                 // sub x28, x28, x16
+    retornar posicion
+}
+
+funcion a64_fijar_marco(c, posicion, tamano) {
+    sea codigo = ctx_codigo(c)
+    parchear32(codigo, posicion, 3531603984 + __y_bits(tamano, 65535) * 32)
+    parchear32(codigo, posicion + 4, 4070572048 + __y_bits(__desplazar_der(tamano, 16), 65535) * 32)
+    retornar 0
+}
+
+funcion a64_epilogo(c) {
+    a64_mov(c, 28, 29)
+    a64_sacar_fis(c, 29)
+    a64_sacar_fis(c, 30)
+    retornar a64(c, 3596551104)                                        // ret
+}
+
+// Flotantes: x0/x1 ↔ d0/d1.
+funcion a64_f64(c, operacion) {
+    a64(c, 2657550336)                                                 // fmov d0, x0
+    a64(c, 2657550369)                                                 // fmov d1, x1
+    si (operacion == 88) { a64(c, 509683712) }                        // fadd d0, d0, d1
+    si (operacion == 92) { a64(c, 509687808) }                        // fsub
+    si (operacion == 89) { a64(c, 509675520) }                        // fmul
+    si (operacion == 94) { a64(c, 509679616) }                        // fdiv
+    retornar a64(c, 2657484800)                                        // fmov x0, d0
+}
+funcion a64_f64_desde_entero(c) {
+    a64(c, 2657222656)                                                 // scvtf d0, x0
+    retornar a64(c, 2657484800)
+}
+funcion a64_f64_a_entero(c) {
+    a64(c, 2657550336)
+    retornar a64(c, 2658664448)                                        // fcvtzs x0, d0
+}
+funcion a64_f64_raiz(c) {
+    a64(c, 2657550336)
+    a64(c, 509722624)                                                 // fsqrt d0, d0
+    retornar a64(c, 2657484800)
+}
+funcion a64_f64_menor(c) {
+    a64(c, 2657550336)
+    a64(c, 2657550369)
+    a64(c, 509681664)                                                 // fcmp d0, d1
+    retornar a64_cset(c, 11)                                           // lt (o sin orden)
+}
+funcion a64_resultado_flotante(c) { retornar a64(c, 2657484800) }
+
+// __syscall(n, a1..a6) en Linux: número en x8, argumentos en x0..x5.
+funcion a64_syscall(c, n) {
+    sea i = n - 1
+    mientras (i >= 0) {
+        si (i == 0) { a64_sacar_fis(c, 8) } sino { a64_sacar_fis(c, i - 1) }
+        i = i - 1
+    }
+    retornar a64(c, 3556769793)                                        // svc #0
+}
+
+// __hilo(tope_pila, funcion, arg, tid) en Linux: clone(banderas, pila,
+// ptid, tls, ctid) con el orden de argumentos de ARM64. El hijo corre
+// funcion(arg) sobre su pila (x28 = sp) y termina con exit.
+funcion a64_hilo(c) {
+    a64_sacar_fis(c, 4)                                                // tid
+    a64_sacar_fis(c, 16)                                               // arg
+    a64_sacar_fis(c, 17)                                               // funcion
+    a64_sacar_fis(c, 1)                                                // tope
+    a64(c, 3506454561)                                                  // sub x1, x1, #16
+    a64(c, 4177526833)                                                  // str x17, [x1]
+    a64(c, 4177527856)                                                  // str x16, [x1, #8]
+    a64_mov(c, 2, 4)
+    a64_constante(c, 3, 0)
+    a64_constante(c, 0, 3477248)
+    a64_constante(c, 8, 220)                                           // clone
+    a64(c, 3556769793)                                                 // svc #0
+    sea padre = nueva_etiqueta(c)
+    a64_saltar_si(c, 0, padre)
+    a64(c, 4181722097)                                                  // ldr x17, [sp]
+    a64(c, 4181723120)                                                  // ldr x16, [sp, #8]
+    a64(c, 2432697340)                                                  // mov x28, sp
+    a64_constante(c, 29, 0)
+    a64_empujar_fis(c, 16)
+    a64(c, 3594453536)                                                  // blr x17
+    a64_constante(c, 0, 0)
+    a64_constante(c, 8, 93)                                            // exit (solo este hilo)
+    a64(c, 3556769793)
+    definir_etiqueta(c, padre)
+    retornar 0
+}
+
+// call [casilla de importación] (dyld la llena) con la ABI AAPCS64.
+// Funciones variádicas de Apple (open, fcntl, ioctl): los argumentos
+// variables van en la pila (sp).
+funcion a64_llamar_importada(c, indice, n) {
+    sea i = n
+    mientras (i >= 1) {
+        a64_sacar_fis(c, i - 1)
+        i = i - 1
+    }
+    sea simbolo = __cargar64(vec_obtener(__cargar64(c + 304), indice) + 8)
+    sea variadica = (str_igual(simbolo, "open") o str_igual(simbolo, "fcntl") o str_igual(simbolo, "ioctl")) y n > 2
+    si (variadica) {
+        a64(c, 3506455551)                                             // sub sp, sp, #16
+        a64(c, 4177527778)                                             // str x2, [sp]
+    }
+    a64_adr(c, 16, 5, indice)
+    a64(c, 4181721616)                                                 // ldr x16, [x16]
+    a64(c, 3594453504)                                                 // blr x16
+    si (variadica) { a64(c, 2432713727) }                              // add sp, sp, #16
+    retornar 0
+}
+
+funcion a64_ccall(c, n) {
+    sea i = n - 1
+    mientras (i >= 1) {
+        a64_sacar_fis(c, i - 1)
+        i = i - 1
+    }
+    a64_sacar_fis(c, 16)
+    retornar a64(c, 3594453504)                                        // blr x16
+}
+
+// extern: argumentos convertidos (locales) a x0..x7 / d0..d7.
+funcion a64_llamada_externa(c, casilla, tipos, convertidos) {
+    sea n = vec_largo(tipos)
+    sea enteros = 0
+    sea flotantes = 0
+    sea i = 0
+    mientras (i < n) {
+        sea d = vec_obtener(convertidos, i)
+        si (vec_obtener(tipos, i) == 1) {
+            si (flotantes > 7) { error_en(c, "extern: demasiados argumentos flotantes") }
+            a64_memoria(c, 0, 16, 29, d)
+            a64(c, 2657550848 + flotantes)                             // fmov dN, x16
+            flotantes = flotantes + 1
+        } sino {
+            si (enteros > 7) { error_en(c, "extern: más de 8 argumentos enteros") }
+            a64_memoria(c, 0, enteros, 29, d)
+            enteros = enteros + 1
+        }
+        i = i + 1
+    }
+    a64_adr(c, 16, 1, casilla)
+    a64(c, 4181721616)                                                 // ldr x16, [x16]
+    retornar a64(c, 3594453504)                                        // blr x16
+}
+
+// Entrada. macOS (LC_MAIN): dyld llama con x0 argc, x1 argv, x2 envp; la
+// pila del lenguaje empieza 8 MiB bajo sp (sp queda para C). Linux: sp
+// apunta a argc; la pila del lenguaje empieza ahí.
+funcion a64_inicio(c, principal) {
+    si (es_macos(c)) {
+        a64(c, 3512730620)                                             // sub x28, sp, #8 MiB
+        a64_guardar_absoluto(c, 2, 480)
+        a64_mov(c, 0, 1)
+        a64_guardar_absoluto(c, 2, 488)
+        a64_mov(c, 0, 2)
+        a64_guardar_absoluto(c, 2, 496)
+    } sino {
+        a64(c, 2432697340)                                             // mov x28, sp
+    }
+    a64_mov(c, 0, 28)
+    a64_guardar_absoluto(c, 2, 504)
+    a64_bl(c, principal)
+    si (es_macos(c)) {
+        a64_empujar_fis(c, 0)
+        retornar a64_llamar_importada(c, importacion_windows(c, "libSystem", "exit"), 1)
+    }
+    a64_constante(c, 8, 94)                                            // exit_group
+    retornar a64(c, 3556769793)
+}
+
+// Trampolín de pthread_create (x0 = registro del hilo en la base de su
+// pila de 8 MiB): guarda los registros que preserva la ABI, cambia la pila
+// del lenguaje (x28) a la del hilo, llama a [registro + 32](t) y marca el
+// hilo como terminado ([registro + 16] = 0).
+funcion a64_trampolin_hilo(c) {
+    a64(c, 2847898621)                                                 // stp x29, x30, [sp, #-16]!
+    a64(c, 2847896571)                                                 // stp x27, x28, [sp, #-16]!
+    a64(c, 2847888371)                                                 // stp x19, x20, [sp, #-16]!
+    a64(c, 2847890421)                                                 // stp x21, x22, [sp, #-16]!
+    a64_mov(c, 21, 0)
+    a64_sumar_inm(c, 28, 0, 8388608)                                   // x28 ← base + 8 MiB
+    a64_memoria(c, 0, 16, 21, 24)
+    a64_empujar_fis(c, 16)                                             // apila t
+    a64_memoria(c, 0, 16, 21, 32)
+    a64(c, 3594453504)                                                 // blr x16
+    a64(c, 4177529535)                                                 // str xzr, [x21, #16]
+    a64(c, 2831244277)                                                 // ldp x21, x22, [sp], #16
+    a64(c, 2831242227)                                                 // ldp x19, x20, [sp], #16
+    a64(c, 2831250427)                                                 // ldp x27, x28, [sp], #16
+    a64(c, 2831252477)                                                 // ldp x29, x30, [sp], #16
+    a64(c, 3531603968)                                                 // mov x0, #0
+    retornar a64(c, 3596551104)                                        // ret
+}
+
+// ── Arreglos ──────────────────────────────────────────────────────────────
+
+funcion a64_leer32(s, posicion) {
+    sea d = str_datos(s) + posicion
+    retornar __cargar8(d) + __cargar8(d + 1) * 256 + __cargar8(d + 2) * 65536 + __cargar8(d + 3) * 16777216
+}
+
+// Aplica un arreglo de AArch64 en la posición dada; pc y destino son
+// direcciones virtuales.
+funcion a64_aplicar(codigo, posicion, tipo, pc, destino) {
+    sea palabra = a64_leer32(codigo, posicion)
+    si (tipo == 10) {
+        sea delta = (destino - pc) / 4
+        parchear32(codigo, posicion, palabra + __y_bits(delta, 67108863))
+        retornar 0
+    }
+    sea paginas = __desplazar_der(destino, 12) - __desplazar_der(pc, 12)
+    sea imm = __y_bits(paginas, 2097151)
+    parchear32(codigo, posicion, palabra + __y_bits(imm, 3) * 536870912 + __desplazar_der(imm, 2) * 32)
+    sea suma = a64_leer32(codigo, posicion + 4)
+    parchear32(codigo, posicion + 4, suma + __y_bits(destino, 4095) * 1024)
+    retornar 0
+}
+
