@@ -227,13 +227,13 @@ gc-check: build
 	done; \
 	echo "  ✓ recolector: 2 M iteraciones con arena < 50 MB y suite completa en modo estrés"
 
-## Verificador de tipos: 11 errores detectados al compilar y un programa
+## Verificador de tipos: 19 errores detectados al compilar y un programa
 ## con tipos anotados e inferidos que se acepta y ejecuta.
 tipos-check: build
 	@set -e; cd tests/tipos; \
 	for f in error_*.cfv; do CFORGE_STDLIB=../../stdlib ../../$(TARGET) check $$f 2>&1 | head -1 | sed 's|^\[C-Forge\] ||'; done | diff -u errores.esperados - || { echo "  ✗ tests/tipos"; exit 1; }; \
 	CFORGE_STDLIB=../../stdlib ../../$(TARGET) valido.cfv | grep -q '^\[OK\]'; \
-	echo "  ✓ tipos: 11 errores detectados antes de ejecutar y un programa válido"
+	echo "  ✓ tipos: 19 errores detectados antes de ejecutar y un programa válido"
 
 ## --release: "hola" < 60 KB, la suite completa sin el código muerto y el
 ## benchmark de enteros (holgura para máquinas lentas del CI).
