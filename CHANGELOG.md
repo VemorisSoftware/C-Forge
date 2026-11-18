@@ -2,8 +2,17 @@
 
 Sitio oficial: [c-forge.org](https://c-forge.org)
 
-## Sin publicar
+## 3.7.2 — sintaxis bilingüe + nuevo c-forge.org
 
+- **Sintaxis bilingüe**: las palabras clave en inglés (`let`, `function`,
+  `return`, `if`, `else`, `while`, `for`, `in`, `try`, `catch`, `throw`,
+  `class`, `this`, `import`, `break`, `continue`, `and`, `or`, `not`, `true`,
+  `false`, `null`, `print`, `assert`) son alias exactos del español y se pueden
+  mezclar en un mismo archivo. Tras un `.` no se traducen.
+- **Funciones integradas en inglés**: `length`, `append`, `sort`, `upper`,
+  `lower`, `replace`, `to_text`, `to_number`, `json_parse`, `json_stringify`,
+  `json_pretty`, `json_valid`. Si el programa define una función o variable con
+  ese nombre, se usa la suya.
 - **c-forge.org rehecho**: sin inicio de sesión ni panel; páginas Inicio y
   Aprende generadas desde el repo. Ejemplos, versión, estado y novedades salen
   de fuentes verificables y `site/verificar.sh` los comprueba en CI.

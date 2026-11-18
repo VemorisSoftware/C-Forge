@@ -20,26 +20,37 @@ from pathlib import Path
 
 SITIO = Path(__file__).resolve().parent
 RAIZ = SITIO.parent
-PAGINAS = ["index.html", "aprende.html", "404.html"]
+# (plantilla, destino, idioma)
+PAGINAS = [
+    ("es/index.html", "index.html", "es"),
+    ("es/aprende.html", "aprende.html", "es"),
+    ("es/404.html", "404.html", "es"),
+    ("en/index.html", "en/index.html", "en"),
+    ("en/learn.html", "en/learn.html", "en"),
+]
 
 PALABRAS = {
     "sea", "funcion", "retornar", "si", "sino", "mientras", "para", "en",
     "intentar", "capturar", "lanzar", "clase", "esto", "importar", "romper",
     "continuar", "y", "o", "no",
+    "let", "function", "return", "if", "else", "while", "for", "in", "try",
+    "catch", "throw", "class", "this", "import", "break", "continue", "and",
+    "or", "not",
 }
-LITERALES = {"verdadero", "falso", "nulo"}
+LITERALES = {"verdadero", "falso", "nulo", "true", "false", "null"}
 TOKEN = re.compile(
     r'(?P<c>//[^\n]*)|(?P<s>"(?:\\.|[^"\\])*")|(?P<n>\b\d+(?:\.\d+)?\b)'
     r'|(?P<id>[A-Za-z_áéíóúñÁÉÍÓÚÑ][\wáéíóúñÁÉÍÓÚÑ]*)(?P<llamada>\s*\()?'
 )
 
 ESTADOS = {
-    "verified-stable": ("estable", "Estable"),
-    "experimental": ("experimental", "Experimental"),
-    "partial": ("parcial", "En desarrollo"),
-    "planned": ("planificado", "Planificado"),
-    "not-certified": ("no-certificado", "No certificado"),
+    "verified-stable": ("estable", {"es": "Estable", "en": "Stable"}),
+    "experimental": ("experimental", {"es": "Experimental", "en": "Experimental"}),
+    "partial": ("parcial", {"es": "En desarrollo", "en": "In progress"}),
+    "planned": ("planificado", {"es": "Planificado", "en": "Planned"}),
+    "not-certified": ("no-certificado", {"es": "No certificado", "en": "Not certified"}),
 }
+SALIDA = {"es": "Salida", "en": "Output"}
 
 
 def resaltar(codigo: str) -> str:
@@ -70,17 +81,18 @@ def resaltar(codigo: str) -> str:
     return "".join(salida)
 
 
-def ejemplo(nombre: str, con_salida: bool = True) -> str:
+def ejemplo(nombre: str, idioma: str, con_salida: bool = True) -> str:
     fuente = (SITIO / "ejemplos" / f"{nombre}.cfv").read_text(encoding="utf-8").rstrip()
+    archivo = nombre.split("/")[-1]
     partes = [
         '<figure class="codigo">',
-        f'<figcaption class="codigo-barra"><span class="puntos"><i></i><i></i><i></i></span>{nombre}.cfv</figcaption>',
+        f'<figcaption class="codigo-barra"><span class="puntos"><i></i><i></i><i></i></span>{archivo}.cfv</figcaption>',
         f"<pre><code>{resaltar(fuente)}</code></pre>",
     ]
     if con_salida:
         salida = (SITIO / "ejemplos" / f"{nombre}.salida").read_text(encoding="utf-8").rstrip()
         partes += [
-            '<div class="salida"><div class="salida-titulo">Salida</div>',
+            f'<div class="salida"><div class="salida-titulo">{SALIDA[idioma]}</div>',
             f"<pre><samp>{html.escape(salida)}</samp></pre></div>",
         ]
     partes.append("</figure>")
@@ -92,28 +104,33 @@ def version() -> str:
     return m.group(1)
 
 
-def tabla_estado() -> str:
+def tabla_estado(idioma: str) -> str:
     datos = json.loads((RAIZ / "capabilities.json").read_text(encoding="utf-8"))
+    sufijo = "" if idioma == "es" else "_" + idioma
     filas = []
     for cap in datos["capabilities"]:
-        clase, etiqueta = ESTADOS[cap["status"]]
+        clase, etiquetas = ESTADOS[cap["status"]]
         filas.append(
-            f'<tr><td>{html.escape(cap["name"])}</td>'
-            f'<td><span class="estado estado-{clase}">{etiqueta}</span></td>'
-            f'<td>{html.escape(cap["scope"])}</td></tr>'
+            f'<tr><td>{html.escape(cap["name" + sufijo])}</td>'
+            f'<td><span class="estado estado-{clase}">{etiquetas[idioma]}</span></td>'
+            f'<td>{html.escape(cap["scope" + sufijo])}</td></tr>'
         )
     return "\n".join(filas)
 
 
-def novedades() -> str:
+def novedades(idioma: str) -> str:
     datos = json.loads((SITIO / "data" / "releases.json").read_text(encoding="utf-8"))
     rel = next(r for r in datos["releases"] if r["version"] == datos["latest"])
-    tipos = {"new": "Nuevo", "fix": "Arreglo", "change": "Cambio"}
+    tipos = {
+        "es": {"new": "Nuevo", "fix": "Arreglo", "change": "Cambio"},
+        "en": {"new": "New", "fix": "Fix", "change": "Change"},
+    }[idioma]
+    sufijo = "" if idioma == "es" else "_" + idioma
     items = []
     for c in rel["changelog"]:
         items.append(
-            f'<article class="novedad"><div class="novedad-tipo">{tipos.get(c["type"], c["type"])}</div>'
-            f'<div><h3>{html.escape(c["title"])}</h3><p>{html.escape(c["desc"])}</p></div></article>'
+            f'<article class="novedad r"><div class="novedad-tipo">{tipos.get(c["type"], c["type"])}</div>'
+            f'<div><h3>{html.escape(c["title" + sufijo])}</h3><p>{html.escape(c["desc" + sufijo])}</p></div></article>'
         )
     return "\n".join(items)
 
@@ -126,37 +143,41 @@ def pruebas() -> int:
     return len(list((RAIZ / "tests" / "cfv").glob("*.cfv")))
 
 
-def renderizar(plantilla: str) -> str:
+def renderizar(plantilla: str, idioma: str) -> str:
     v = version()
+    datos = json.loads((SITIO / "data" / "releases.json").read_text(encoding="utf-8"))
+    actual = next(r for r in datos["releases"] if r["version"] == datos["latest"])
     reemplazos = {
         "version": v,
-        "estado": tabla_estado(),
-        "novedades": novedades(),
+        "estado": tabla_estado(idioma),
+        "novedades": novedades(idioma),
         "modulos": str(modulos_stdlib()),
         "pruebas": str(pruebas()),
-        "fecha": json.loads((SITIO / "data" / "releases.json").read_text(encoding="utf-8"))["releases"][0]["date_display"],
+        "fecha": actual["date_display" if idioma == "es" else "date_display_" + idioma],
+        "mascota": (SITIO / "plantillas" / "mascota.svg").read_text(encoding="utf-8").strip(),
     }
 
     def sustituir(m):
         clave = m.group(1)
         if clave.startswith("ejemplo:"):
-            return ejemplo(clave.split(":", 1)[1])
+            return ejemplo(clave.split(":", 1)[1], idioma)
         if clave.startswith("codigo:"):
-            return ejemplo(clave.split(":", 1)[1], con_salida=False)
+            return ejemplo(clave.split(":", 1)[1], idioma, con_salida=False)
         if clave not in reemplazos:
             raise KeyError(f"marcador desconocido: {{{{{clave}}}}}")
         return reemplazos[clave]
 
-    return re.sub(r"\{\{([a-z:_-]+)\}\}", sustituir, plantilla)
+    return re.sub(r"\{\{([a-z:_/-]+)\}\}", sustituir, plantilla)
 
 
 def main() -> int:
     comprobar = "--check" in sys.argv
     desactualizadas = []
-    for nombre in PAGINAS:
-        plantilla = (SITIO / "plantillas" / nombre).read_text(encoding="utf-8")
-        resultado = renderizar(plantilla)
+    for origen, nombre, idioma in PAGINAS:
+        plantilla = (SITIO / "plantillas" / origen).read_text(encoding="utf-8")
+        resultado = renderizar(plantilla, idioma)
         destino = SITIO / nombre
+        destino.parent.mkdir(parents=True, exist_ok=True)
         if comprobar:
             if not destino.exists() or destino.read_text(encoding="utf-8") != resultado:
                 desactualizadas.append(nombre)
