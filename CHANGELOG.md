@@ -2,6 +2,22 @@
 
 Sitio oficial: [c-forge.org](https://c-forge.org)
 
+## 3.7.1 — instalación en un comando + Windows estable
+
+- **install.sh único** (repo y c-forge.org): descarga el binario de GitHub
+  Releases, verifica SHA-256 y compila desde fuente si no hay binario para la
+  plataforma. Instala en `~/.local` si no hay `sudo`.
+- **install.ps1** nuevo para Windows: `irm https://c-forge.org/install.ps1 | iex`.
+- **Stdlib automática**: `cforge` busca la stdlib junto al ejecutable; ya no se
+  necesita `CFORGE_STDLIB`.
+- **Windows**: el fallo de la suite con MSVC era la pila de 1 MB; se enlaza con
+  64 MB y la suite completa vuelve a ser obligatoria en CI y release.
+- **CI**: smoke test con rutas absolutas; se elimina `build-native.yml`
+  (duplicado).
+- **Web**: c-forge.org vive en `site/` y se despliega en Cloudflare Pages; se
+  quitan comandos de brew/winget/scoop que no existían.
+- Repositorio oficial: `VemorisSoftware/C-Forge`.
+
 ## 3.7.0 — CLI completo + versión centralizada + SDL2 estable + release automatizado
 
 - **Versión centralizada**: Makefile es la única fuente de verdad para VERSION.

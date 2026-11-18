@@ -2,90 +2,63 @@
 
 ![C-Forge](assets/cforgev-logo.svg)
 
-**[c-forge.org](https://c-forge.org)** · [GitHub](https://github.com/VemorisGroup/C-Forge) · [Releases](https://github.com/VemorisGroup/C-Forge/releases)
+**[c-forge.org](https://c-forge.org)** · [GitHub](https://github.com/VemorisSoftware/C-Forge) · [Releases](https://github.com/VemorisSoftware/C-Forge/releases)
 
 C-Forge es un lenguaje de programación creado por Vemoris Group. Su objetivo es ofrecer una sintaxis clara, ejecución nativa y una biblioteca estándar escrita en el propio lenguaje.
 
-> **C-Forge 3.7.0** — El núcleo, CLI y biblioteca estándar superan el gate reproducible `make release-check` en macOS ARM64, Linux x64 y Windows x64. Las capacidades marcadas como experimentales no forman parte del contrato estable.
+> **C-Forge 3.7.1** — El núcleo, CLI y biblioteca estándar superan el gate reproducible `make release-check` en macOS ARM64, Linux x64 y Windows x64. Las capacidades marcadas como experimentales no forman parte del contrato estable.
 
 ---
 
 ## Instalación rápida
 
-### macOS y Linux (desde fuente, recomendado)
+### macOS (Apple Silicon) y Linux x64
 
 ```sh
-curl -fsSL https://raw.githubusercontent.com/VemorisGroup/C-Forge/main/install.sh | bash
+curl -fsSL https://c-forge.org/install.sh | sh
 ```
 
-El script detecta la versión más reciente, descarga las fuentes, compila con el compilador C++20 disponible e instala el binario en `/usr/local/bin/cforge`.
+El instalador descarga el binario oficial desde GitHub Releases, verifica su
+SHA-256 e instala `cforge` en `/usr/local/bin` (o en `~/.local/bin` si no hay
+`sudo`). La biblioteca estándar queda en `<prefijo>/lib/cforge/stdlib` y
+`cforge` la encuentra solo: **no hace falta configurar `CFORGE_STDLIB`**.
 
-Después de instalar, agrega al `.bashrc` / `.zshrc`:
+En otras arquitecturas (Mac Intel, Linux ARM) el mismo comando compila desde
+el código fuente; necesitas `make` y un compilador C++20
+(`xcode-select --install` o `sudo apt install g++ make`).
+
+Opciones:
 
 ```sh
-export CFORGE_STDLIB="/usr/local/lib/cforge/stdlib"
+curl -fsSL https://c-forge.org/install.sh | CFORGE_VERSION=3.7.1 sh   # versión fija
+curl -fsSL https://c-forge.org/install.sh | CFORGE_PREFIX=$HOME/.local sh   # sin sudo
 ```
 
-### macOS (desde archivo)
+> **macOS:** el binario no está firmado con Apple Developer ID; el instalador
+> quita la marca de cuarentena para que Gatekeeper no lo bloquee.
 
-1. Descarga `cforge-3.7.0-macos-arm64.tar.gz` desde [Releases](https://github.com/VemorisGroup/C-Forge/releases/tag/v3.7.0).
-2. Extrae e instala:
-
-```sh
-tar xzf cforge-3.7.0-macos-arm64.tar.gz
-sudo cp cforge-3.7.0-macos-arm64/cforge /usr/local/bin/
-sudo mkdir -p /usr/local/lib/cforge
-sudo cp -r cforge-3.7.0-macos-arm64/stdlib /usr/local/lib/cforge/
-echo 'export CFORGE_STDLIB="/usr/local/lib/cforge/stdlib"' >> ~/.zshrc
-source ~/.zshrc
-```
-
-> **Nota:** El binario no está firmado con Apple Developer ID. Si macOS bloquea la ejecución, ve a *Ajustes del sistema → Privacidad y Seguridad → Permitir de todos modos*.
-
-### Linux x64 (desde .deb)
+### Linux x64 (.deb)
 
 ```sh
-wget https://github.com/VemorisGroup/C-Forge/releases/download/v3.7.0/cforge_3.7.0_amd64.deb
-sudo dpkg -i cforge_3.7.0_amd64.deb
-echo 'export CFORGE_STDLIB="/usr/lib/cforge/stdlib"' >> ~/.bashrc
-source ~/.bashrc
-```
-
-### Linux x64 (desde .tar.gz)
-
-```sh
-tar xzf cforge-3.7.0-linux-x64.tar.gz
-sudo cp cforge-3.7.0-linux-x64/cforge /usr/local/bin/
-sudo mkdir -p /usr/local/lib/cforge
-sudo cp -r cforge-3.7.0-linux-x64/stdlib /usr/local/lib/cforge/
-echo 'export CFORGE_STDLIB="/usr/local/lib/cforge/stdlib"' >> ~/.bashrc
-source ~/.bashrc
+wget https://github.com/VemorisSoftware/C-Forge/releases/download/v3.7.1/cforge_3.7.1_amd64.deb
+sudo dpkg -i cforge_3.7.1_amd64.deb
 ```
 
 ### Windows x64
 
-1. Descarga `cforge-3.7.0-windows-x64.zip` desde [Releases](https://github.com/VemorisGroup/C-Forge/releases/tag/v3.7.0).
-2. Extrae el archivo ZIP.
-3. Añade la carpeta extraída al `PATH` del sistema (Panel de control → Variables de entorno).
-4. Define la variable de entorno `CFORGE_STDLIB` apuntando a la carpeta `stdlib` dentro del ZIP extraído.
-5. Abre una nueva PowerShell o CMD y verifica:
-
-```powershell
-cforge --version
-```
+1. Descarga `cforge-3.7.1-windows-x64.zip` desde [Releases](https://github.com/VemorisSoftware/C-Forge/releases/latest).
+2. Extrae el ZIP en una carpeta fija, por ejemplo `C:\cforge`.
+3. Añade esa carpeta al `PATH`. La `stdlib` incluida junto a `cforge.exe` se detecta sola.
+4. Abre una nueva terminal y ejecuta `cforge --version`.
 
 ### Desinstalar
 
-**macOS / Linux:**
 ```sh
-sudo rm /usr/local/bin/cforge /usr/local/bin/cforgev
+sudo rm -f /usr/local/bin/cforge /usr/local/bin/c-forge
 sudo rm -rf /usr/local/lib/cforge
 ```
 
-**Debian:**
-```sh
-sudo dpkg -r cforge
-```
+Con `.deb`: `sudo dpkg -r cforge`.
 
 ---
 
@@ -93,7 +66,7 @@ sudo dpkg -r cforge
 
 ```sh
 cforge --version
-# → C-Forge 3.7.0
+# → C-Forge 3.7.1
 
 cforge --help
 # → muestra todos los comandos disponibles
@@ -172,7 +145,7 @@ s.decir()                     // Hola desde C-Forge
 
 ## Extensión de Visual Studio Code
 
-1. Descarga `c-forge-3.7.0.vsix` desde [Releases](https://github.com/VemorisGroup/C-Forge/releases/tag/v3.7.0).
+1. Descarga `c-forge-3.7.1.vsix` desde [Releases](https://github.com/VemorisSoftware/C-Forge/releases/tag/v3.7.1).
 2. En VS Code: **Extensions** (⇧⌘X) → **···** → **Install from VSIX…** → selecciona el archivo.
 3. Los archivos `.cfv` tendrán resaltado de sintaxis, snippets y diagnósticos automáticos al guardar.
 
@@ -218,7 +191,7 @@ Módulos experimentales (presentes, sin garantías de producción): `web`, `db`,
 Requiere un compilador C++20 (g++ ≥ 12 o clang++ ≥ 14):
 
 ```sh
-git clone https://github.com/VemorisGroup/C-Forge.git
+git clone https://github.com/VemorisSoftware/C-Forge.git
 cd C-Forge
 make build
 ./cforge --version
@@ -227,7 +200,7 @@ make release-check   # gate completo
 
 ---
 
-## Plataformas verificadas en 3.7.0
+## Plataformas verificadas en 3.7.1
 
 | Plataforma | Build CI | Tests | Distribuible |
 |-----------|----------|-------|-------------|

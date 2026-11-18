@@ -8,6 +8,14 @@
 set -euo pipefail
 
 CFORGE="${1:-cforge}"
+# Ruta absoluta: algunas pruebas cambian de directorio (cforge new).
+if [[ "$CFORGE" == */* ]]; then
+  CFORGE="$(cd "$(dirname "$CFORGE")" && pwd)/$(basename "$CFORGE")"
+fi
+# La stdlib relativa también debe sobrevivir al cambio de directorio.
+if [[ -n "${CFORGE_STDLIB:-}" && -d "$CFORGE_STDLIB" ]]; then
+  export CFORGE_STDLIB="$(cd "$CFORGE_STDLIB" && pwd)"
+fi
 DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 PASS=0
 FAIL=0

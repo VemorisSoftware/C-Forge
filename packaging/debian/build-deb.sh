@@ -21,7 +21,7 @@ Section: devel
 Priority: optional
 Architecture: $ARCH
 Maintainer: Vemoris Group <hola@vemorisgroup.com>
-Homepage: https://github.com/VemorisGroup/C-Forge
+Homepage: https://github.com/VemorisSoftware/C-Forge
 Description: Runtime estable del lenguaje C-Forge
  Ejecuta programas y pruebas .cfv sin Python, JVM, .NET ni Node.
 EOF

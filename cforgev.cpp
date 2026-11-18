@@ -38,6 +38,7 @@
 #include <unistd.h>
 #ifdef __APPLE__
 #include <sys/sysctl.h>
+#include <mach-o/dyld.h>
 #endif
 #endif
 // OpenSSL opcional para primitivas criptográficas nativas.
@@ -236,6 +237,43 @@ auto result=std::make_shared<std::map<std::string,Value>>();(*result)["nucleos"]
 #endif
 return result;}
 static std::filesystem::path cfv_base_archivos;
+// Directorio real del ejecutable cforge (para hallar la stdlib instalada).
+[[maybe_unused]] static std::filesystem::path cfv_directorio_ejecutable() {
+    std::error_code ec;
+#if defined(_WIN32)
+    char buffer[MAX_PATH];
+    DWORD n = GetModuleFileNameA(nullptr, buffer, MAX_PATH);
+    if (n > 0 && n < MAX_PATH) return std::filesystem::path(buffer).parent_path();
+#elif defined(__APPLE__)
+    char buffer[4096]; uint32_t size = sizeof(buffer);
+    if (_NSGetExecutablePath(buffer, &size) == 0) {
+        auto real = std::filesystem::weakly_canonical(buffer, ec);
+        return (ec ? std::filesystem::path(buffer) : real).parent_path();
+    }
+#else
+    auto real = std::filesystem::read_symlink("/proc/self/exe", ec);
+    if (!ec) return real.parent_path();
+#endif
+    return {};
+}
+// Rutas estándar de la stdlib, en orden de prioridad (sin CFORGE_STDLIB).
+[[maybe_unused]] static std::vector<std::filesystem::path> cfv_rutas_stdlib() {
+    std::vector<std::filesystem::path> rutas;
+    const auto exe = cfv_directorio_ejecutable();
+    if (!exe.empty()) {
+        rutas.push_back(exe / "stdlib");
+        rutas.push_back(exe.parent_path() / "lib" / "cforge" / "stdlib");
+        rutas.push_back(exe.parent_path() / "share" / "cforge" / "stdlib");
+    }
+    rutas.emplace_back("/usr/local/lib/cforge/stdlib");
+    rutas.emplace_back("/opt/homebrew/lib/cforge/stdlib");
+    rutas.emplace_back("/usr/lib/cforge/stdlib");
+    if (const char* home = std::getenv("HOME")) {
+        rutas.push_back(std::filesystem::path(home) / ".local" / "lib" / "cforge" / "stdlib");
+        rutas.push_back(std::filesystem::path(home) / ".cforge" / "stdlib");
+    }
+    return rutas;
+}
 // ── Module resolution cache (prevents double-import) ─────────────────────────
 static std::unordered_set<std::string> cfv_imported_set;
 // ── Module search paths ───────────────────────────────────────────────────────
@@ -250,13 +288,9 @@ static std::unordered_set<std::string> cfv_imported_set;
         cfv_base_archivos / "cforge_modules" / std::filesystem::path(name).filename(),
         std::filesystem::current_path() / "stdlib" / std::filesystem::path(name).filename(),
         std::filesystem::current_path() / "cforge_modules" / std::filesystem::path(name).filename(),
-        std::filesystem::path("/usr/local/lib/cforge/stdlib") / std::filesystem::path(name).filename(),
     };
-    // ~/.cforge/stdlib
-    if (const char* home = std::getenv("HOME")) {
-        search.emplace_back(std::filesystem::path(home) / ".cforge" / "stdlib" /
-                            std::filesystem::path(name).filename());
-    }
+    for (const auto& base : cfv_rutas_stdlib())
+        search.push_back(base / std::filesystem::path(name).filename());
     // CFORGE_STDLIB env override
     if (const char* stdlib_env = std::getenv("CFORGE_STDLIB")) {
         search.insert(search.begin(),
@@ -7188,9 +7222,9 @@ const char* cfv_eval_json(const char* code) {
 }
 
 // Obtener version del interprete
-// FUENTE DE VERDAD: Makefile VERSION := 3.7.0
+// FUENTE DE VERDAD: Makefile VERSION := 3.7.1
 // Actualizar ambos a la vez con: sed -i 's/3\.7\.0/NUEVA/g' Makefile cforgev.cpp
-const char* cfv_version() { return "3.7.0"; }
+const char* cfv_version() { return "3.7.1"; }
 
 // Verificar disponibilidad de SDL2
 int cfv_has_sdl2() {
@@ -8211,14 +8245,16 @@ int main(int argc, char** argv){
         } else {
           // buscar stdlib en rutas estándar
           bool found_stdlib = false;
-          for (const auto& p : {"/usr/local/lib/cforge/stdlib", "/usr/lib/cforge/stdlib", "./stdlib"}) {
-            if (std::filesystem::exists(p)) {
-              std::cout << "  [OK] stdlib encontrada en " << p << " (define CFORGE_STDLIB para fijarla)\n";
+          auto rutas = cfv_rutas_stdlib();
+          rutas.emplace_back("./stdlib");
+          for (const auto& p : rutas) {
+            if (std::filesystem::exists(p / "lista.cfv")) {
+              std::cout << "  [OK] stdlib encontrada en " << p.string() << "\n";
               found_stdlib = true;
               break;
             }
           }
-          if (!found_stdlib) std::cout << "  [WARN] CFORGE_STDLIB no definida y no se encontró stdlib en rutas estándar\n";
+          if (!found_stdlib) std::cout << "  [WARN] no se encontró la stdlib; reinstala o define CFORGE_STDLIB\n";
         }
         // Compilador C++ (para cforge build/compile)
         for (const auto& cxx : {"clang++", "g++"}) {
@@ -8240,7 +8276,7 @@ int main(int argc, char** argv){
         std::cout << "  [INFO] SQLite no compilado — stdlib/db.cfv en modo experimental\n";
 #endif
         std::cout << "\nDocumentación: https://c-forge.org\n";
-        std::cout << "Problemas:     https://github.com/VemorisGroup/C-Forge/issues\n";
+        std::cout << "Problemas:     https://github.com/VemorisSoftware/C-Forge/issues\n";
         return 0;
       } else if (!command.empty() && command.front() == '-') {
         throw std::runtime_error("opción desconocida '" + command + "'");

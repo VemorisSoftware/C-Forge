@@ -11,7 +11,7 @@ actualizada de forma automática.
 ### Opción A — GitHub Releases API (recomendada)
 
 ```
-GET https://api.github.com/repos/VemorisGroup/C-Forge/releases/latest
+GET https://api.github.com/repos/VemorisSoftware/C-Forge/releases/latest
 ```
 
 Respuesta relevante:
@@ -32,7 +32,7 @@ para repositorios públicos (límite de 60 req/hora sin token, 5000 con token).
 Cada release incluye un archivo `latest.json`:
 
 ```
-https://github.com/VemorisGroup/C-Forge/releases/download/v{VERSION}/latest.json
+https://github.com/VemorisSoftware/C-Forge/releases/download/v{VERSION}/latest.json
 ```
 
 Contenido:
@@ -41,7 +41,7 @@ Contenido:
 {
   "version": "3.7.0",
   "released_at": "2026-08-06T00:00:00Z",
-  "manifest": "https://github.com/VemorisGroup/C-Forge/releases/download/v3.7.0/release-manifest.json"
+  "manifest": "https://github.com/VemorisSoftware/C-Forge/releases/download/v3.7.0/release-manifest.json"
 }
 ```
 
@@ -51,7 +51,7 @@ Usar la GitHub API (Opción A) para obtener primero el tag, luego construir la U
 ### Flujo recomendado para c-forge.org/download
 
 ```
-1. GET /repos/VemorisGroup/C-Forge/releases/latest
+1. GET /repos/VemorisSoftware/C-Forge/releases/latest
    → extrae tag_name (ej: "v3.7.0")
 2. version = tag_name.replace("v", "")
 3. GET /releases/download/v{version}/release-manifest.json
@@ -74,15 +74,15 @@ Versión del schema: `1`.
   "channel": "stable",
   "released_at": "2026-08-06T00:00:00Z",
   "minimum_supported_version": null,
-  "install_script": "https://raw.githubusercontent.com/VemorisGroup/C-Forge/main/install.sh",
-  "changelog": "https://github.com/VemorisGroup/C-Forge/blob/main/CHANGELOG.md",
+  "install_script": "https://raw.githubusercontent.com/VemorisSoftware/C-Forge/main/install.sh",
+  "changelog": "https://github.com/VemorisSoftware/C-Forge/blob/main/CHANGELOG.md",
   "downloads": {
     "macos": {
       "arm64": {
         "archive": {
           "type": "tar.gz",
           "filename": "cforge-3.7.0-macos-arm64.tar.gz",
-          "url": "https://github.com/VemorisGroup/C-Forge/releases/download/v3.7.0/cforge-3.7.0-macos-arm64.tar.gz",
+          "url": "https://github.com/VemorisSoftware/C-Forge/releases/download/v3.7.0/cforge-3.7.0-macos-arm64.tar.gz",
           "sha256": "<hash>"
         }
       }
@@ -124,7 +124,7 @@ Versión del schema: `1`.
       "marketplace": null
     }
   },
-  "sha256sums": "https://github.com/VemorisGroup/C-Forge/releases/download/v3.7.0/SHA256SUMS"
+  "sha256sums": "https://github.com/VemorisSoftware/C-Forge/releases/download/v3.7.0/SHA256SUMS"
 }
 ```
 
@@ -188,8 +188,8 @@ Ejemplo de verificación:
 
 ```sh
 # Descargar artifact y checksums
-wget https://github.com/VemorisGroup/C-Forge/releases/download/v3.7.0/cforge-3.7.0-linux-x64.tar.gz
-wget https://github.com/VemorisGroup/C-Forge/releases/download/v3.7.0/SHA256SUMS
+wget https://github.com/VemorisSoftware/C-Forge/releases/download/v3.7.0/cforge-3.7.0-linux-x64.tar.gz
+wget https://github.com/VemorisSoftware/C-Forge/releases/download/v3.7.0/SHA256SUMS
 
 # Verificar (el hash debe coincidir)
 sha256sum -c SHA256SUMS --ignore-missing
@@ -201,7 +201,7 @@ sha256sum -c SHA256SUMS --ignore-missing
 
 Las versiones anteriores permanecen disponibles en GitHub Releases:
 ```
-https://github.com/VemorisGroup/C-Forge/releases
+https://github.com/VemorisSoftware/C-Forge/releases
 ```
 
 No se eliminan releases publicadas. El `release-manifest.json` de cada versión
@@ -249,13 +249,13 @@ VSCE_TOKEN                   # Personal Access Token de Azure DevOps
 ```js
 async function loadDownloadPage() {
   // 1. Obtener versión latest
-  const rel = await fetch('https://api.github.com/repos/VemorisGroup/C-Forge/releases/latest');
+  const rel = await fetch('https://api.github.com/repos/VemorisSoftware/C-Forge/releases/latest');
   const { tag_name } = await rel.json();
   const version = tag_name.replace('v', '');
 
   // 2. Obtener manifest
   const mf = await fetch(
-    `https://github.com/VemorisGroup/C-Forge/releases/download/${tag_name}/release-manifest.json`
+    `https://github.com/VemorisSoftware/C-Forge/releases/download/${tag_name}/release-manifest.json`
   );
   const manifest = await mf.json();
 
