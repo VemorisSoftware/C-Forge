@@ -1865,15 +1865,162 @@ funcion udp_cerrar(sock) {
     retornar 0
 }
 
-// TLS: se reemplaza por la capa del sistema (fase 3 de 4.1).
-funcion tls_abrir(sock, anfitrion) {
-    sys_red_cerrar(dyn_valor_entero(sock))
-    dyn_error("https: TLS todavía no está disponible en este runtime")
+// ── TLS (HTTPS) con la biblioteca del sistema ─────────────────────────────
+// Linux y macOS: OpenSSL 3 (o 1.1) cargado en tiempo de ejecución, con
+// verificación de certificados contra el almacén del sistema y SNI.
+// Windows: Schannel (SSPI). El estado de una conexión es un bloque de
+// 64 bytes: [ssl][ctx][fd][tipo][...].
+
+funcion tls_i32(x) {
+    sea v = __y_bits(x, 4294967295)
+    si (v >= 2147483648) { retornar v - 4294967296 }
+    retornar v
+}
+
+// Handle de libssl (global 27), o 0 si no está disponible.
+funcion tls_libssl() {
+    sea h = mem_global(27)
+    si (h != 0) { retornar h }
+    si (sys_dl_disponible() == 0) { retornar 0 }
+    sea candidatos = vec_nuevo()
+    si (__plataforma() == 2 o __plataforma() == 3) {
+        vec_agregar(candidatos, "/opt/homebrew/opt/openssl@3/lib/libssl.3.dylib")
+        vec_agregar(candidatos, "/usr/local/opt/openssl@3/lib/libssl.3.dylib")
+        vec_agregar(candidatos, "/opt/homebrew/lib/libssl.3.dylib")
+        vec_agregar(candidatos, "/usr/local/lib/libssl.3.dylib")
+    } sino {
+        vec_agregar(candidatos, "libssl.so.3")
+        vec_agregar(candidatos, "libssl.so.1.1")
+    }
+    sea i = 0
+    mientras (i < vec_largo(candidatos) y h == 0) {
+        h = dyn_abrir_biblioteca(vec_obtener(candidatos, i))
+        i = i + 1
+    }
+    si (h != 0) {
+        mem_fijar_global(27, h)
+        __ccall(sys_simbolo(h, "OPENSSL_init_ssl"), 0, 0)
+    }
+    retornar h
+}
+
+funcion tls_f(nombre) {
+    sea p = sys_simbolo(tls_libssl(), nombre)
+    si (p == 0) { dyn_error(str_concatenar("tls: falta el símbolo de OpenSSL ", nombre)) }
+    retornar p
+}
+
+funcion tls_error(estado, mensaje) {
+    sys_red_cerrar(__cargar64(estado + 16))
+    dyn_error(mensaje)
     retornar 0
 }
-funcion tls_enviar(t, datos) { retornar 0 }
-funcion tls_recibir_todo(t) { retornar dyn_texto(str_nuevo(1)) }
-funcion tls_cerrar(t) { retornar 0 }
+
+funcion tls_abrir(sock, anfitrion) {
+    sea fd = dyn_valor_entero(sock)
+    sea host = dyn_texto_de(anfitrion, "tls_abrir")
+    sea estado = mem_reservar(64)
+    mem_llenar(estado, 0, 64)
+    __guardar64(estado + 16, fd)
+    si (sys_es_windows()) { retornar tls_abrir_schannel(estado, host) }
+    si (tls_libssl() == 0) {
+        si (sys_dl_disponible() == 0) { tls_error(estado, "https: agrega importar \"tls\" (o \"red\") al programa para usar TLS") }
+        tls_error(estado, "https: no se encontró OpenSSL (libssl 3 o 1.1); en macOS: brew install openssl@3")
+    }
+    sea ctx = __ccall(tls_f("SSL_CTX_new"), __ccall(tls_f("TLS_client_method")))
+    si (ctx == 0) { tls_error(estado, "tls: SSL_CTX_new falló") }
+    __ccall(tls_f("SSL_CTX_set_default_verify_paths"), ctx)
+    __ccall(tls_f("SSL_CTX_set_verify"), ctx, 1, 0)             // SSL_VERIFY_PEER
+    sea ssl = __ccall(tls_f("SSL_new"), ctx)
+    __guardar64(estado, ssl)
+    __guardar64(estado + 8, ctx)
+    __guardar64(estado + 24, 1)
+    __ccall(tls_f("SSL_set_fd"), ssl, fd)
+    sea host_c = str_c(host)
+    __ccall(tls_f("SSL_ctrl"), ssl, 55, 0, host_c)              // SNI
+    __ccall(tls_f("SSL_set1_host"), ssl, host_c)                // nombre del certificado
+    si (tls_i32(__ccall(tls_f("SSL_connect"), ssl)) != 1) {
+        sea v = __ccall(tls_f("SSL_get_verify_result"), ssl)
+        __ccall(tls_f("SSL_free"), ssl)
+        __ccall(tls_f("SSL_CTX_free"), ctx)
+        si (v != 0) { tls_error(estado, str_concatenar(str_concatenar("tls: certificado no válido para ", host), str_concatenar(" (código ", str_concatenar(str_desde_entero(v), ")")))) }
+        tls_error(estado, str_concatenar("tls: no se pudo establecer la sesión con ", host))
+    }
+    retornar dyn_entero(estado)
+}
+
+funcion tls_enviar(t, datos) {
+    sea estado = dyn_valor_entero(t)
+    si (__cargar64(estado + 24) == 2) { retornar tls_enviar_schannel(estado, datos) }
+    sea s = dyn_a_str(datos)
+    sea hecho = 0
+    mientras (hecho < str_largo(s)) {
+        sea n = tls_i32(__ccall(tls_f("SSL_write"), __cargar64(estado), str_datos(s) + hecho, str_largo(s) - hecho))
+        si (n <= 0) { dyn_error("tls: la conexión se cerró al enviar") }
+        hecho = hecho + n
+    }
+    retornar dyn_entero(hecho)
+}
+
+funcion tls_recibir_todo(t) {
+    sea estado = dyn_valor_entero(t)
+    si (__cargar64(estado + 24) == 2) { retornar tls_recibir_todo_schannel(estado) }
+    sea r = str_nuevo(4096)
+    sea leer = tls_f("SSL_read")
+    sea seguir = 1
+    mientras (seguir) {
+        str_asegurar(r, str_largo(r) + 16384)
+        sea n = tls_i32(__ccall(leer, __cargar64(estado), str_datos(r) + str_largo(r), 16384))
+        si (n <= 0) { seguir = 0 } sino { __guardar64(r, str_largo(r) + n) }
+    }
+    retornar dyn_texto(r)
+}
+
+funcion tls_cerrar(t) {
+    sea estado = dyn_valor_entero(t)
+    si (__cargar64(estado + 24) == 2) { retornar tls_cerrar_schannel(estado) }
+    si (__cargar64(estado) != 0) {
+        __ccall(tls_f("SSL_shutdown"), __cargar64(estado))
+        __ccall(tls_f("SSL_free"), __cargar64(estado))
+        __ccall(tls_f("SSL_CTX_free"), __cargar64(estado + 8))
+    }
+    sys_red_cerrar(__cargar64(estado + 16))
+    mem_liberar(estado)
+    retornar 0
+}
+
+// Schannel (Windows): el trabajo está en sys_windows_ext.cfv.
+funcion tls_abrir_schannel(estado, host) {
+    __guardar64(estado + 24, 2)
+    sea r = sys_tls_abrir(estado, host)
+    si (r != 0) {
+        sea m = str_concatenar("tls: no se pudo establecer la sesión con ", host)
+        str_agregar(m, " (SSPI 0x")
+        sea k = 7
+        mientras (k >= 0) {
+            str_agregar_byte(m, __o_bits(hex_digito(__y_bits(__desplazar_der(r, k * 4), 15)), 32))
+            k = k - 1
+        }
+        str_agregar(m, ")")
+        tls_error(estado, m)
+    }
+    retornar dyn_entero(estado)
+}
+
+funcion tls_enviar_schannel(estado, datos) {
+    sea s = dyn_a_str(datos)
+    si (sys_tls_enviar(estado, str_datos(s), str_largo(s)) != 0) { dyn_error("tls: la conexión se cerró al enviar") }
+    retornar dyn_entero(str_largo(s))
+}
+
+funcion tls_recibir_todo_schannel(estado) { retornar dyn_texto(sys_tls_recibir_todo(estado)) }
+
+funcion tls_cerrar_schannel(estado) {
+    sys_tls_cerrar(estado)
+    sys_red_cerrar(__cargar64(estado + 16))
+    mem_liberar(estado)
+    retornar 0
+}
 
 // Un byte como texto de un carácter (sin codificar UTF-8).
 funcion char_de(n) {
