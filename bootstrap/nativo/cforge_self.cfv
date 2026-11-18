@@ -54,8 +54,8 @@
 // funciones alcanzables (segunda pasada; 0 = compilar todo)
 
 funcion ctx_nuevo(tokens) {
-    sea c = mem_reservar(424)
-    mem_llenar(c, 0, 424)
+    sea c = mem_reservar(432)
+    mem_llenar(c, 0, 432)
     __guardar64(c + 400, 0 - 1)
     __guardar64(c, tokens)
     __guardar64(c + 8, 0)
@@ -200,7 +200,12 @@ funcion requerir_ident(c) {
 funcion saltar_tipo(c) {
     sea t = 0
     si (tomar(c, ":")) {
+        // ?T / ?*T: opcional (13), hay que comprobarlo antes de usarlo.
+        // *T: puntero que nunca es nulo (12).
+        sea opcional = tomar(c, "?")
+        sea puntero = tomar(c, "*")
         t = tipo_por_nombre(requerir_ident(c))
+        si (opcional) { t = 13 } sino { si (puntero) { t = 12 } }
         saltar_genericos(c)
         tomar(c, "?")
         mientras (ver(c, "[") y str_igual(tok_siguiente_lexema(c), "]")) {
@@ -238,6 +243,9 @@ funcion nombre_de_tipo(t) {
     si (t == 5) { retornar "mapa" }
     si (t == 6) { retornar "nulo" }
     si (t == 7) { retornar "funcion" }
+    si (t == 12) { retornar "puntero *T" }
+    si (t == 13) { retornar "opcional ?T" }
+    si (t == 20) { retornar "tipo (comptime)" }
     retornar "desconocido"
 }
 
@@ -252,7 +260,14 @@ funcion fijar_tipo(c, t) {
 }
 
 funcion tipos_compatibles(esperado, real) {
+    // *T nunca recibe nulo ni un opcional sin comprobar; un opcional solo
+    // se usa donde se acepta cualquier cosa o otro opcional.
+    si (esperado == 12 y (real == 6 o real == 13)) { retornar 0 }
+    si (real == 13 y esperado != 0 y esperado != 13) { retornar 0 }
     si (esperado == 0 o real == 0 o real == 6) { retornar 1 }
+    // Punteros y opcionales: referencias (objetos, listas, mapas, funciones).
+    si (esperado == 12 o esperado == 13) { retornar real == 12 o real == 13 o real == 4 o real == 5 o real == 7 }
+    si (real == 12) { retornar 0 }
     si (es_numerico(esperado) y es_numerico(real)) { retornar 1 }
     retornar esperado == real
 }
@@ -453,6 +468,7 @@ funcion firma_tipos(tokens, j) {
     sea tipos = vec_nuevo()
     __guardar64(r, tipos)
     __guardar64(r + 8, 0)
+    sea genericos = vec_nuevo()
     sea nivel = 1
     sea esperando = 1
     mientras (nivel > 0 y j < vec_largo(tokens)) {
@@ -464,19 +480,49 @@ funcion firma_tipos(tokens, j) {
         si (nivel == 1 y esperando y __cargar64(t) == 1) {
             esperando = 0
             sea tipo = 0
-            si (j + 2 < vec_largo(tokens) y es_simbolo(vec_obtener(tokens, j + 1), ":")) { tipo = tipo_en_tokens(tokens, j + 2) }
+            si (str_igual(lex, "comptime") y j + 1 < vec_largo(tokens) y __cargar64(vec_obtener(tokens, j + 1)) == 1) {
+                // comptime T: el argumento es un tipo conocido al compilar (20).
+                vec_agregar(genericos, lexema_en(tokens, j + 1))
+                vec_agregar(genericos, vec_largo(tipos))
+                tipo = 20
+            } sino {
+                si (j + 2 < vec_largo(tokens) y es_simbolo(vec_obtener(tokens, j + 1), ":")) { tipo = tipo_generico(tokens, j + 2, genericos) }
+            }
             vec_agregar(tipos, tipo)
         }
         j = j + 1
     }
-    si (j + 1 < vec_largo(tokens) y es_simbolo(vec_obtener(tokens, j), ":")) { __guardar64(r + 8, tipo_en_tokens(tokens, j + 1)) }
+    si (j + 1 < vec_largo(tokens) y es_simbolo(vec_obtener(tokens, j), ":")) { __guardar64(r + 8, tipo_generico(tokens, j + 1, genericos)) }
     retornar r
 }
 
+// ": T" con T un parámetro comptime número k → 100 + k (se resuelve en
+// cada llamada con el tipo que recibe T).
+funcion tipo_generico(tokens, k, genericos) {
+    si (__cargar64(vec_obtener(tokens, k)) == 1) {
+        sea i = 0
+        mientras (i < vec_largo(genericos)) {
+            si (str_igual(vec_obtener(genericos, i), lexema_en(tokens, k))) { retornar 100 + vec_obtener(genericos, i + 1) }
+            i = i + 2
+        }
+    }
+    retornar tipo_en_tokens(tokens, k)
+}
+
 funcion tipo_en_tokens(tokens, k) {
+    sea marca = 0
+    si (es_simbolo(vec_obtener(tokens, k), "?")) {
+        marca = 13
+        k = k + 1
+    }
+    si (es_simbolo(vec_obtener(tokens, k), "*")) {
+        si (marca == 0) { marca = 12 }
+        k = k + 1
+    }
     sea t = vec_obtener(tokens, k)
     si (__cargar64(t) != 1) { retornar 0 }
     sea tipo = tipo_por_nombre(__cargar64(t + 8))
+    si (marca != 0) { tipo = marca }
     sea fin = fin_genericos(tokens, k + 1)
     si (fin >= 0) { k = fin }
     k = k + 1
@@ -499,7 +545,7 @@ funcion fin_genericos(tokens, j) {
                 nivel = nivel - 1
                 si (nivel == 0) { retornar j }
             } sino {
-                si (__cargar64(t) != 1 y es_simbolo(t, ",") == 0 y es_simbolo(t, "?") == 0 y es_simbolo(t, "[") == 0 y es_simbolo(t, "]") == 0) { retornar 0 - 1 }
+                si (__cargar64(t) != 1 y es_simbolo(t, ",") == 0 y es_simbolo(t, "?") == 0 y es_simbolo(t, "*") == 0 y es_simbolo(t, "[") == 0 y es_simbolo(t, "]") == 0) { retornar 0 - 1 }
             }
         }
         j = j + 1
@@ -861,14 +907,19 @@ funcion fin_valor_defecto(tokens, j) {
 // Parámetros de una firma; j apunta al token siguiente a '('.
 funcion contar_parametros(tokens, j) {
     sea parametros = 0
+    sea angulos = 0
     sea nivel = 1
     mientras (nivel > 0) {
         sea u = vec_obtener(tokens, j)
         sea ul = __cargar64(u + 8)
         si (__cargar64(u) == 4 y str_igual(ul, "(")) { nivel = nivel + 1 }
         si (__cargar64(u) == 4 y str_igual(ul, ")")) { nivel = nivel - 1 }
-        si (nivel == 1 y __cargar64(u) == 1) {
-            si (str_igual(lexema_en(tokens, j - 1), ":") == 0) { parametros = parametros + 1 }
+        si (nivel == 1 y es_simbolo(u, "<")) { angulos = angulos + 1 }
+        si (nivel == 1 y es_simbolo(u, ">")) { angulos = angulos - 1 }
+        // Un nombre de parámetro va tras "(", "," o "..." (no en el tipo).
+        si (nivel == 1 y angulos == 0 y __cargar64(u) == 1) {
+            sea previo = lexema_en(tokens, j - 1)
+            si (str_igual(previo, "(") o str_igual(previo, ",") o str_igual(previo, ".")) { parametros = parametros + 1 }
         }
         si (nivel == 1 y es_simbolo(u, "=")) { j = fin_valor_defecto(tokens, j + 1) - 1 }
         j = j + 1
@@ -1847,7 +1898,7 @@ funcion llamada(c, nombre) {
     }
     si (dinamico(c) y __cargar64(f + 40) != 0) {
         emitir_llamada(c, f, argumentos_tipados(c, f))
-        fijar_tipo(c, __cargar64(f + 48))
+        fijar_tipo(c, __cargar64(c + 424))
         retornar 0
     }
     emitir_llamada(c, f, argumentos(c))
@@ -1860,15 +1911,37 @@ funcion argumentos_tipados(c, f) {
     sea tipos = __cargar64(f + 40)
     requerir(c, "(")
     sea n = 0
+    // Tipos que recibió cada parámetro comptime (por posición).
+    sea vinculos = vec_nuevo()
+    sea k = 0
+    mientras (k < vec_largo(tipos)) {
+        vec_agregar(vinculos, 0)
+        k = k + 1
+    }
     si (ver(c, ")") == 0) {
         sea seguir = 1
         mientras (seguir) {
-            expresion(c)
+            sea esperado = 0
+            si (n < vec_largo(tipos)) { esperado = vec_obtener(tipos, n) }
+            si (esperado == 20) {
+                // El argumento de un parámetro comptime es un nombre de tipo.
+                si (tok_tipo(c) != 1 o (ver_en(c, 1, ",") == 0 y ver_en(c, 1, ")") == 0)) { error_en(c, str_concatenar("comptime: se esperaba un tipo como argumento de ", __cargar64(f))) }
+                sea nombre_tipo = __cargar64(avanzar(c) + 8)
+                sea codigo = tipo_por_nombre(nombre_tipo)
+                si (codigo == 0 y buscar_clase(c, nombre_tipo) == 0 y str_igual(nombre_tipo, "dinamico") == 0) { error_en(c, str_concatenar("comptime: tipo desconocido ", nombre_tipo)) }
+                vec_fijar(vinculos, n, codigo)
+                cargar_caja(c, nombre_tipo)
+                fijar_tipo(c, 0)
+            } sino {
+                expresion(c)
+            }
+            si (esperado >= 100 y esperado - 100 < vec_largo(vinculos)) { esperado = vec_obtener(vinculos, esperado - 100) }
+            si (esperado == 20) { esperado = 0 }
             si (n < vec_largo(tipos)) {
                 sea que = str_concatenar("el argumento ", str_desde_entero(n + 1))
                 str_agregar(que, " de ")
                 str_agregar(que, __cargar64(f))
-                exigir_tipo(c, vec_obtener(tipos, n), tipo_actual(c), que)
+                exigir_tipo(c, esperado, tipo_actual(c), que)
             }
             empujar(c)
             n = n + 1
@@ -1876,6 +1949,12 @@ funcion argumentos_tipados(c, f) {
         }
     }
     requerir(c, ")")
+    // Tipo del resultado (": T" se resuelve con lo que recibió T).
+    sea resultado = __cargar64(f + 48)
+    si (resultado >= 100) {
+        si (resultado - 100 < vec_largo(vinculos)) { resultado = vec_obtener(vinculos, resultado - 100) } sino { resultado = 0 }
+    }
+    __guardar64(c + 424, resultado)
     retornar n
 }
 
@@ -1910,6 +1989,14 @@ funcion argumentos_variadicos(c, k) {
 
 // En modo dinámico convierte rax (valor del lenguaje) en 0/1 para saltos.
 funcion condicion(c) {
+    si (dinamico(c) y (tipo_actual(c) == 12 o tipo_actual(c) == 13)) {
+        // si (p): verdadero si el puntero no es nulo.
+        sea nulo_ = nueva_etiqueta(c)
+        op_saltar_si_cero(c, nulo_)
+        op_inmediato(c, 1)
+        definir_etiqueta(c, nulo_)
+        retornar 0
+    }
     si (dinamico(c)) {
         exigir_tipo(c, 3, tipo_actual(c), "la condición")
         // Booleano seguro (comparación, y/o, no, literal): verdadero (4) → 2,
@@ -2213,6 +2300,12 @@ funcion llamada_super(c) {
     retornar 0
 }
 
+funcion ver_en(c, salto, lexema) {
+    sea i = __cargar64(c + 8) + salto
+    si (i >= vec_largo(__cargar64(c))) { retornar 0 }
+    retornar es_simbolo(vec_obtener(__cargar64(c), i), lexema)
+}
+
 funcion tok_tipo_en(c, salto) {
     sea i = __cargar64(c + 8) + salto
     si (i >= vec_largo(__cargar64(c))) { retornar 5 }
@@ -2407,6 +2500,7 @@ funcion primaria_dinamica(c) {
         }
         si (ver(c, "(")) {
             si (a != 0) {
+                si (tipo_variable(c, nombre) == 13) { error_en(c, str_concatenar("error de tipos: no se puede llamar a un opcional sin comprobarlo: ", nombre)) }
                 cargar_var(c, a)
                 llamada_cierre(c)
                 fijar_tipo(c, 0)
@@ -2418,6 +2512,13 @@ funcion primaria_dinamica(c) {
         si (a != 0) {
             cargar_var(c, a)
             fijar_tipo(c, tipo_variable(c, nombre))
+            si (tipo_actual(c) == 13 y (ver(c, ".") o ver(c, "[") o ver(c, "("))) {
+                sea m = str_concatenar("error de tipos: ", nombre)
+                str_agregar(m, " puede ser nulo; compruébalo antes de usarlo: si (")
+                str_agregar(m, nombre)
+                str_agregar(m, ") |valor| { … }")
+                error_en(c, m)
+            }
             retornar 0
         }
         sea f = buscar_funcion(c, nombre)
@@ -3333,13 +3434,40 @@ funcion sentencia(c) {
     }
     si (tomar(c, "si")) {
         requerir(c, "(")
+        // si (p) / si (p != nulo): dentro del bloque p es un puntero *T.
+        sea estrechada = 0
+        si (dinamico(c) y tok_tipo(c) == 1) {
+            sea cand = tok_lexema(c)
+            sea sig = tok_siguiente_lexema(c)
+            si (str_igual(sig, ")") o (str_igual(sig, "!=") y str_igual(lexema_en(__cargar64(c), __cargar64(c + 8) + 2), "nulo") y str_igual(lexema_en(__cargar64(c), __cargar64(c + 8) + 3), ")"))) {
+                si (tipo_variable(c, cand) == 13) { estrechada = cand }
+            }
+        }
         expresion(c)
         requerir(c, ")")
+        // si (opcional) |v| { … }: v es el valor ya comprobado (*T).
+        sea desempaque = 0
+        si (dinamico(c) y ver(c, "|")) {
+            avanzar(c)
+            desempaque = requerir_ident(c)
+            requerir(c, "|")
+            __guardar64(c + 368, 12)
+            declarar_usuario(c, desempaque)
+            cargar_var(c, variable(c, desempaque))
+            si (tipo_actual(c) != 12 y tipo_actual(c) != 13) { fijar_tipo(c, 13) }
+        }
         condicion(c)
         sea otro = nueva_etiqueta(c)
         sea fin = nueva_etiqueta(c)
         op_saltar_si_cero(c, otro)
+        sea marca_tipos = 0 - 1
+        si (estrechada != 0 y __cargar64(c + 336) != 0) {
+            marca_tipos = vec_largo(__cargar64(c + 336))
+            anotar_tipo_variable(c, estrechada, 12)
+        }
         bloque(c)
+        si (marca_tipos >= 0) { __guardar64(__cargar64(c + 336), marca_tipos) }
+        si (desempaque != 0) { anotar_tipo_variable(c, desempaque, 0) }
         op_saltar(c, fin)
         definir_etiqueta(c, otro)
         si (tomar(c, "sino")) {
@@ -3608,6 +3736,8 @@ funcion parametro(c, nombres) {
         requerir(c, ".")
         requerir(c, ".")
     }
+    // comptime T: T llega como el nombre del tipo (texto).
+    si (ver(c, "comptime") y tok_tipo_en(c, 1) == 1) { avanzar(c) }
     sea nombre = requerir_ident(c)
     vec_agregar(nombres, nombre)
     vec_agregar(__cargar64(c + 344), saltar_tipo(c))
@@ -5000,7 +5130,7 @@ funcion agregar_con_importaciones(fuente, stdlib, texto, nombre, vistas, archivo
 
 // Compila la fuente concatenada y devuelve el ejecutable ELF.
 funcion compilar_programa(fuente, archivos, puntaje) {
-    sea tokens = traducir_ingles(tokenizar(fuente))
+    sea tokens = expandir_comptime(traducir_ingles(tokenizar(fuente)), archivos)
     sea alcanzables = 0
     // --release (global 19): primera pasada para saber qué funciones se usan.
     si (mem_global(19) != 0 y mem_global(40) == 0) {
@@ -5031,6 +5161,198 @@ funcion compilar_programa(fuente, archivos, puntaje) {
     __guardar64(contexto + 416, alcanzables)
     compilar(contexto)
     retornar empaquetar(contexto)
+}
+
+// ── comptime ──────────────────────────────────────────────────────────────
+// comptime(expr) y comptime { … retornar v } se ejecutan al compilar: el
+// compilador escribe un programa con las funciones, clases y constantes del
+// usuario más la expresión, lo ejecuta (cforge run, en la máquina que compila)
+// y pone en su lugar el literal que devuelve (nulo, booleano, número, texto,
+// lista o mapa). Funciona igual al compilar para otra plataforma.
+
+funcion es_comptime(tokens, i) {
+    sea t = vec_obtener(tokens, i)
+    si (__cargar64(t) != 1 o str_igual(__cargar64(t + 8), "comptime") == 0) { retornar 0 }
+    si (i + 1 >= vec_largo(tokens)) { retornar 0 }
+    sea sig = vec_obtener(tokens, i + 1)
+    retornar es_simbolo(sig, "(") o es_simbolo(sig, "{")
+}
+
+funcion expandir_comptime(tokens, archivos) {
+    sea modo = 0
+    sea i = 0
+    mientras (i < vec_largo(tokens)) {
+        sea t = vec_obtener(tokens, i)
+        si (__cargar64(t) == 1 y str_igual(__cargar64(t + 8), "__dialecto")) { modo = numero_literal(lexema_en(tokens, i + 1)) }
+        si (modo == 2 y es_comptime(tokens, i)) { tokens = evaluar_comptime(tokens, i, archivos) }
+        i = i + 1
+    }
+    retornar tokens
+}
+
+// Índice del cierre que corresponde a la apertura en j.
+funcion cierre_de(tokens, j) {
+    sea nivel = 0
+    mientras (j < vec_largo(tokens)) {
+        sea t = vec_obtener(tokens, j)
+        si (__cargar64(t) == 4) {
+            sea l = __cargar64(t + 8)
+            si (str_igual(l, "(") o str_igual(l, "[") o str_igual(l, "{")) { nivel = nivel + 1 }
+            si (str_igual(l, ")") o str_igual(l, "]") o str_igual(l, "}")) {
+                nivel = nivel - 1
+                si (nivel == 0) { retornar j }
+            }
+        }
+        si (__cargar64(t) == 5) { retornar j }
+        j = j + 1
+    }
+    retornar j
+}
+
+// Fin (exclusivo) de la sentencia de nivel superior que empieza en a: el
+// primer token fuera de paréntesis y llaves en una línea nueva.
+funcion fin_sentencia_superior(tokens, a) {
+    sea nivel = 0
+    sea j = a
+    mientras (j < vec_largo(tokens)) {
+        sea t = vec_obtener(tokens, j)
+        si (__cargar64(t) == 5) { retornar j }
+        si (j > a y nivel == 0 y __cargar64(t + 16) != __cargar64(vec_obtener(tokens, j - 1) + 16)) { retornar j }
+        si (__cargar64(t) == 1 y str_igual(__cargar64(t + 8), "__dialecto")) { si (j > a) { retornar j } }
+        si (__cargar64(t) == 4) {
+            sea l = __cargar64(t + 8)
+            si (str_igual(l, "(") o str_igual(l, "[") o str_igual(l, "{")) { nivel = nivel + 1 }
+            si (str_igual(l, ")") o str_igual(l, "]") o str_igual(l, "}")) { nivel = nivel - 1 }
+        }
+        j = j + 1
+    }
+    retornar j
+}
+
+// Copia los tokens [a, b) como texto; un comptime pendiente se ejecuta ahí
+// mismo (el programa auxiliar ya corre al compilar).
+funcion comptime_texto(s, tokens, a, b) {
+    sea j = a
+    mientras (j < b) {
+        sea t = vec_obtener(tokens, j)
+        si (j > a y __cargar64(t + 16) != __cargar64(vec_obtener(tokens, j - 1) + 16)) { str_agregar_byte(s, 10) } sino { str_agregar_byte(s, 32) }
+        si (es_comptime(tokens, j)) {
+            si (es_simbolo(vec_obtener(tokens, j + 1), "{")) {
+                sea m = cierre_de(tokens, j + 1)
+                str_agregar(s, "comptime_ejecutar(funcion() ")
+                comptime_texto(s, tokens, j + 1, m + 1)
+                str_agregar(s, ")")
+                j = m + 1
+            } sino {
+                j = j + 1
+            }
+        } sino {
+            si (__cargar64(t) != 5) { str_agregar(s, __cargar64(t + 8)) }
+            j = j + 1
+        }
+    }
+    retornar 0
+}
+
+funcion evaluar_comptime(tokens, i, archivos) {
+    sea abre = i + 1
+    sea cierra = cierre_de(tokens, abre)
+    sea es_bloque = es_simbolo(vec_obtener(tokens, abre), "{")
+    sea linea = __cargar64(vec_obtener(tokens, i) + 16)
+    sea s = str_nuevo(65536)
+    // Definiciones del programa (dialecto 2): funciones, clases, extern,
+    // atributos y las constantes "sea" anteriores al comptime.
+    sea modo = 0
+    sea a = 0
+    mientras (a < vec_largo(tokens)) {
+        sea t = vec_obtener(tokens, a)
+        si (__cargar64(t) == 5) { a = vec_largo(tokens) } sino {
+            si (__cargar64(t) == 1 y str_igual(__cargar64(t + 8), "__dialecto")) {
+                modo = numero_literal(lexema_en(tokens, a + 1))
+                a = a + 2
+            } sino {
+                sea b = fin_sentencia_superior(tokens, a)
+                si (b <= a) { b = a + 1 }
+                si (modo == 2) {
+                    sea l = __cargar64(t + 8)
+                    sea definicion = str_igual(l, "funcion") o str_igual(l, "clase") o str_igual(l, "extern") o str_igual(l, "#")
+                    si (str_igual(l, "sea") y b <= i) { definicion = 1 }
+                    si (definicion) {
+                        comptime_texto(s, tokens, a, b)
+                        str_agregar_byte(s, 10)
+                    }
+                }
+                a = b
+            }
+        }
+    }
+    sea base = str_concatenar(sys_ruta_temporal(), "cforge-comptime-")
+    str_agregar(base, str_desde_entero(sys_proceso_id()))
+    str_agregar(base, "-")
+    str_agregar(base, str_desde_entero(i))
+    sea programa = str_concatenar(base, ".cfv")
+    sea resultado = str_concatenar(base, ".txt")
+    // En el literal del programa auxiliar, "/" también vale en Windows.
+    sea ruta_literal = str_nuevo(str_largo(resultado))
+    sea q = 0
+    mientras (q < str_largo(resultado)) {
+        si (str_byte(resultado, q) == 92) { str_agregar_byte(ruta_literal, 47) } sino { str_agregar_byte(ruta_literal, str_byte(resultado, q)) }
+        q = q + 1
+    }
+    si (es_bloque) {
+        str_agregar(s, "\nfuncion comptime_valor__() ")
+        comptime_texto(s, tokens, abre, cierra + 1)
+        str_agregar(s, "\nescribir_archivo(")
+        str_agregar(s, comillas(ruta_literal))
+        str_agregar(s, ", comptime_literal(comptime_valor__()))\n")
+    } sino {
+        str_agregar(s, "\nescribir_archivo(")
+        str_agregar(s, comillas(ruta_literal))
+        str_agregar(s, ", comptime_literal(")
+        comptime_texto(s, tokens, abre + 1, cierra)
+        str_agregar(s, "))\n")
+    }
+    archivo_escribir(programa, s)
+    archivo_escribir(resultado, "")
+    sea args = vec_nuevo()
+    vec_agregar(args, "run")
+    vec_agregar(args, programa)
+    sea codigo = sys_ejecutar_programa(sys_ruta_ejecutable(), args)
+    sea literal = archivo_leer(resultado)
+    sys_borrar(str_c(programa))
+    sys_borrar(str_c(resultado))
+    si (codigo != 0 o str_largo(literal) == 0) {
+        sea donde = ctx_nuevo(tokens)
+        __guardar64(donde + 208, archivos)
+        sea m = ubicacion(donde, linea)
+        str_agregar(m, ": comptime: la evaluación al compilar falló")
+        rt_panico(m)
+    }
+    // Reemplazo: tokens[0, i) + literal + tokens(cierra, fin].
+    sea nuevos = vec_nuevo()
+    sea k = 0
+    mientras (k < i) {
+        vec_agregar(nuevos, vec_obtener(tokens, k))
+        k = k + 1
+    }
+    sea lit = tokenizar(literal)
+    k = 0
+    vec_agregar(nuevos, token_nuevo(4, "(", linea))
+    mientras (k < vec_largo(lit)) {
+        sea u = vec_obtener(lit, k)
+        si (__cargar64(u) != 5) {
+            __guardar64(u + 16, linea)
+            vec_agregar(nuevos, u)
+        }
+        k = k + 1
+    }
+    vec_agregar(nuevos, token_nuevo(4, ")", linea))
+    k = cierra + 1
+    mientras (k < vec_largo(tokens)) {
+        vec_agregar(nuevos, vec_obtener(tokens, k))
+        k = k + 1
+    }
+    retornar nuevos
 }
 
 // Funciones alcanzables desde el programa principal (1 byte por función).

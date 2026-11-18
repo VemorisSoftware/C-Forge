@@ -30,6 +30,11 @@ Sitio oficial: [c-forge.org](https://c-forge.org)
   de 460 ms a 73 ms (Java 21: 67 ms, gcc -O2: 25 ms).
 - **`cforge build --release`:** elimina las funciones que el programa no usa
   (dos pasadas). "hola": de 231 KB a 34 KB en Linux.
+- **Punteros seguros:** `*T` nunca es nulo y `?T` / `?*T` se comprueba antes
+  de usarse (`si (q) |nodo| { … }` o `si (q != nulo)`); los errores salen en
+  `cforge check`, `build` y el LSP.
+- **`comptime`:** `comptime(expr)` y `comptime { … }` se ejecutan al compilar
+  y quedan como literales; genéricos `comptime T` verificados por llamada.
 - **`docs/GLOBALES.md`:** mapa de las casillas globales del runtime. Corrige
   dos choques de 4.1: las tablas de AES usaban la caché de `argv` en Windows
   (ahora casilla 15) y el handle de libssl la casilla de `sys_casilla` (16).
