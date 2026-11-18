@@ -21,7 +21,8 @@ estado en silencio.
 | 15 | 120 | `biblioteca.cfv` | tablas de AES (S-box e inversa) |
 | 16 | 128 | `biblioteca.cfv` | handle de libssl (TLS con OpenSSL) |
 | 17 | 136 | `io.cfv` | `cforge repl`: estado para omitir la salida ya mostrada |
-| 18–19 | 144–152 | — | **libres** |
+| 18 | 144 | `mem.cfv` | estado del recolector de basura (ver `gc_activar`) |
+| 19 | 152 | — | **libre** |
 | 20 | 160 | `dyn.cfv` | programa escrito en inglés (1) |
 | 21 | 168 | `dyn.cfv` | pila de manejadores de `intentar` del hilo principal |
 | 22 | 176 | `biblioteca.cfv` | estado del generador `aleatorio` (xorshift64*) |

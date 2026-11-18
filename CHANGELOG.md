@@ -10,6 +10,13 @@ Sitio oficial: [c-forge.org](https://c-forge.org)
 - **Interpolación estricta:** `{` interpola solo si la sigue una letra, `_` o
   `(` y cierra en la línea; JSON y GLSL ya no necesitan `\{`.
 - **Notación científica:** `1e5`, `2.5e-3`, `6.02E+23`.
+- **Recolector de basura:** marcado y barrido conservador sobre el asignador
+  propio (raíces: globales, variables de nivel superior y pila del
+  lenguaje), con bloques reciclados en cero y división de bloques libres.
+  2 M iteraciones creando textos: de 1,7 GB a 9 MB de pico; un servidor HTTP
+  con 10 000 solicitudes: de 231 MB a 8,6 MB. `memoria_estadisticas()`,
+  `CFORGE_GC=0` (desactivar) y `CFORGE_GC_ESTRES=1` (pruebas). No recolecta
+  mientras haya hilos de `tarea()` vivos.
 - **`docs/GLOBALES.md`:** mapa de las casillas globales del runtime. Corrige
   dos choques de 4.1: las tablas de AES usaban la caché de `argv` en Windows
   (ahora casilla 15) y el handle de libssl la casilla de `sys_casilla` (16).
