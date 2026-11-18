@@ -4,6 +4,21 @@ Sitio oficial: [c-forge.org](https://c-forge.org)
 
 ## Sin publicar
 
+- **100 % C-Forge: se retiró el C++.** El intérprete `cforgev.cpp`
+  (`cforge-clasico`), el Stage 0 en C++20, `include/` y la cadena de
+  arranque antigua (compilador Core, backends `bootstrap/direct`) salen del
+  repositorio. La semilla `bootstrap/semilla/cforge-linux-x64` compila
+  `cforge` (Stage 2 = Stage 3); Makefile, CI, release, Docker, `.deb`,
+  Homebrew e instaladores usan solo C-Forge. Releases nuevas: Linux ARM64
+  (`.tar.gz` y `.deb`) y macOS Intel.
+- `cforge test`, `cforge new` (alias de `init`), `cforge doctor`,
+  `paralelo(f, lista)`, `tiempo_actual()` y los
+  alias `file_write` / `file_read`.
+- **Pendiente para 4.1:** 14 módulos de la stdlib que usaban funciones del
+  intérprete C++ (`stdlib/PENDIENTES`: cripto, bases de datos, cliente
+  HTTP/TLS, WebSocket, UDP, OpenGL, audio…), un recolector de basura para
+  cadenas temporales y `cforge repl`.
+
 - **Backend nativo ELF sin libc** (`bootstrap/nativo/`): código máquina x86-64
   directo con marcos de pila y recursión; ejecutables estáticos de pocos KB.
 - **Runtime 100 % C-Forge** (`runtime/`): syscalls de Linux aisladas en

@@ -7,7 +7,7 @@ compromisos distintos.
 
 ## Verificado en el repositorio
 
-- El motor C++20 se construye sin avisos con el gate oficial en macOS ARM64.
+- El compilador se construye desde la semilla, sin C++ (Stage 2 = Stage 3).
 - El ejecutable interpreta `.cfv` sin Python, JVM, .NET ni Node.
 - 30 módulos `.cfv` pasan análisis sintáctico y carga real.
 - 20 archivos de prueba nativos pasan localmente y bajo ASan/UBSan.
@@ -23,8 +23,8 @@ compromisos distintos.
 ## No verificado o no terminado
 
 - Cobertura funcional exhaustiva de los módulos experimentales.
-- Toolchain completamente autónoma: Stage 2/3 ya es reproducible para el
-  frontend Core, pero la generación final todavía depende de `clang++`.
+- Paridad con el antiguo intérprete C++ en 14 módulos de la stdlib
+  (`stdlib/PENDIENTES`), previstos para 4.1.
 - Backends directos para el lenguaje completo.
 - Sandboxing fuerte de archivos, procesos y red.
 - Modelo formal y comprobado de ownership para toda la sintaxis.

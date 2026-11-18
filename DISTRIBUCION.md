@@ -16,9 +16,10 @@ make install-check
 
 ## Homebrew
 
-La plantilla `packaging/homebrew/Formula/cforge.rb.template` compila
-`cforgev.cpp`, instala `cforge` y copia `stdlib/*.cfv`. La fórmula publicada
-debe reemplazar `VERSION` y `SHA256` con los valores del tag.
+La plantilla `packaging/homebrew/Formula/cforge.rb.template` instala el
+binario oficial de cada plataforma (macOS ARM64 e Intel, Linux x64 y ARM64)
+y copia `stdlib/*.cfv`. La fórmula publicada reemplaza `VERSION` y cada
+`SHA256_*` con los valores de `SHA256SUMS` del release.
 
 ## Debian/Ubuntu
 

@@ -3,8 +3,9 @@
 ## Estado verificable en 2.6.0 estable
 
 El ejecutable `cforge` puede interpretar programas `.cfv` sin Python, JVM,
-.NET ni Node. El motor distribuido se construye desde `cforgev.cpp` con un
-compilador C++20; por ello la *toolchain* completa todavía no es autónoma.
+.NET ni Node, y la *toolchain* es completamente autónoma: el compilador,
+escrito en C-Forge, se compila a sí mismo desde la semilla y genera los
+ejecutables de todas las plataformas sin C++, libc ni enlazador externo.
 
 La biblioteca estándar activa contiene únicamente fuentes `.cfv`. El gate
 local carga realmente los 30 módulos y ejecuta veinte archivos de prueba nativos:

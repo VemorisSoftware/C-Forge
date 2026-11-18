@@ -307,18 +307,19 @@ implementación auditada, en vez de envoltorios propios.
 |---|---|
 | `cforge archivo.cfv`, `run`, `repl`, `check`, `test`, `fmt`, `new`, `init`, `doctor` | ✅ |
 | `cforge build archivo.cfv -o app` (requiere hoy gcc o clang) | ✅ |
-| `cforge build` con compilador 100 % C-Forge | 🛠️ |
-| `cforge add usuario/repo`, `cforge.json` con dependencias | 📐 |
-| LSP completo (diagnósticos, autocompletado, ir a definición) | 🛠️ |
+| `cforge build` con compilador 100 % C-Forge | ✅ |
+| `cforge add usuario/repo`, `cforge.toml` y `cforge.lock` | ✅ |
+| LSP completo (diagnósticos, autocompletado, ir a definición) | ✅ |
 
 ---
 
 ## 13. Camino al compilador 100 % C-Forge
 
-El ejecutable `cforge` publicado hoy está escrito en C++ (`cforgev.cpp`). El
-objetivo es reemplazarlo por un compilador escrito en C-Forge que emita código
-máquina directo. C++ queda solo como **Stage 0**: se usa una vez para arrancar,
-como hicieron Go (desde C) y Rust (desde OCaml).
+✅ **Cumplido.** `cforge` es un compilador escrito en C-Forge que emite código
+máquina directo (x86-64 y AArch64) y se compila a sí mismo. El intérprete en
+C++ (`cforgev.cpp`) y el Stage 0 en C++ se retiraron del repositorio: la
+semilla `bootstrap/semilla/cforge-linux-x64` es el punto de partida (ver
+`docs/BOOTSTRAP.md`), como Go se compila con Go.
 
 Estado del núcleo nativo (`bootstrap/`):
 
@@ -503,13 +504,13 @@ Los programas sin `extern` siguen siendo estáticos y sin libc.
   runtime va incrustado (`embebido.cfv`, generado por `embeber.cfv`), así el
   binario (~236 KB, estático, sin libc) no depende de archivos externos; la
   biblioteca estándar se busca en `$CFORGE_STDLIB` o junto al ejecutable.
-- Cadena: Stage 0 (C++) → x64_nativo → Stage 1 → **Stage 2 = Stage 3**.
+- Cadena: semilla → s1 → s2 → **s2 = s3** (`make cforge-nativo`).
 - **Semilla** `bootstrap/semilla/cforge-linux-x64` (+ SHA-256): reconstruye
-  `cforge` sin C++ y sin compiladores en el `PATH` (`make semilla-check` la
-  compara con el arranque desde C++). `install.sh` desde el código fuente en
-  Linux x86-64 ya no necesita C++.
-- Releases Linux: `cforge` = compilador nativo; `cforge-clasico` = intérprete
-  C++ para lo que el compilador nativo todavía no cubre.
+  `cforge` sin compiladores en el `PATH`; `make semilla-check` comprueba que
+  reproduce exactamente al compilador actual.
+- Releases: `cforge` nativo para Linux (x64, ARM64), Windows x64 y macOS
+  (Apple Silicon, Intel). Los 14 módulos de `stdlib/PENDIENTES`, que usaban
+  funciones del antiguo intérprete C++, llegan en 4.1.
 
 **Cobertura actual del compilador nativo:** 25/25 pruebas de `tests/cfv`,
 32/32 ejemplos del sitio y 22/22 programas de `ejemplos/`.
@@ -670,13 +671,8 @@ json = "usuario/repo@v1.2"     # rama, etiqueta o nada (rama por defecto)
   de forma cruzada desde Linux y desde Windows**, byte por byte; 25/25
   `tests/cfv`, 32/32 ejemplos del sitio y 22/22 `ejemplos/` (SDL2 incluido).
 
-**Alcance honesto:** el compilador autoalojado compila el *dialecto nativo*
-(enteros de 64 bits, funciones, recursión, condiciones, ciclos, textos
-literales e intrínsecos). El lenguaje C-Forge completo (clases, mapas,
-listas literales, closures, excepciones, `extern`) todavía se ejecuta con
-`cforgev.cpp`. Retirar ese binario requiere llevar cada característica del
-lenguaje al compilador autoalojado, sobre el runtime de `runtime/`.
-
-Cuando el compilador Core compile sus propias fuentes con su backend ELF y el
-resultado sea idéntico byte por byte (Stage 2 = Stage 3, sin gcc ni clang en
-el `PATH`), C-Forge será autónomo en Linux; luego Mach-O y PE.
+**Alcance:** el compilador autoalojado compila el lenguaje C-Forge completo
+(clases, mapas, listas, cierres, excepciones, hilos, `extern`) a ELF, PE y
+Mach-O. Pendiente para 4.1: los módulos de `stdlib/PENDIENTES` (cripto, bases
+de datos, HTTP/TLS, WebSocket, UDP, OpenGL, audio), un recolector de basura
+para cadenas temporales y `cforge repl`.
