@@ -315,8 +315,8 @@ nativo-check:
 ## y sin compiladores en el PATH. Stage 2 y Stage 3 deben ser idénticos.
 ## Lenguaje completo compilado por cforge_self: runtime nativo + mapas en
 ## dialecto nativo, y runtime/dyn.cfv en modo puente (valores del lenguaje).
-RUNTIME_LENGUAJE := $(RUNTIME_NATIVO) runtime/map.cfv --puente runtime/dyn.cfv
-PRUEBAS_LENGUAJE_NATIVAS := 01_nucleo 03_colecciones 06_stdlib_lista 08_clases 10_stdlib_mapa 14_control_avanzado 16_colecciones_avanzadas 22_funciones_propias 25_idioma_ingles
+RUNTIME_LENGUAJE := $(RUNTIME_NATIVO) runtime/map.cfv --puente runtime/dyn.cfv --lenguaje runtime/lenguaje.cfv
+PRUEBAS_LENGUAJE_NATIVAS := 01_nucleo 02_funciones 03_colecciones 04_errores 06_stdlib_lista 08_clases 10_stdlib_mapa 14_control_avanzado 15_errores_limite 16_colecciones_avanzadas 17_resultados_opciones 21_tareas_async 22_funciones_propias 23_bilingue 25_idioma_ingles
 FUENTES_AUTOALOJADO := $(RUNTIME_NATIVO) bootstrap/nativo/lexer.cfv bootstrap/nativo/cforge_self.cfv
 autoalojado-check:
 	@set -e; dir=$$(mktemp -d /tmp/cforge-self.XXXXXX); \
@@ -342,6 +342,8 @@ autoalojado-check:
 	"$$dir/colecciones" | diff -u tests/nativo/06_colecciones.salida -; \
 	env -i "$$dir/stage3" -o "$$dir/clases" $(RUNTIME_LENGUAJE) --dinamico tests/nativo/08_clases.cfv >/dev/null; \
 	"$$dir/clases" | diff -u tests/nativo/08_clases.salida -; \
+	env -i "$$dir/stage3" -o "$$dir/cierres" $(RUNTIME_LENGUAJE) --dinamico tests/nativo/09_cierres_errores.cfv >/dev/null; \
+	"$$dir/cierres" | diff -u tests/nativo/09_cierres_errores.salida -; \
 	for prueba in $(PRUEBAS_LENGUAJE_NATIVAS); do \
 		env -i "$$dir/stage3" -o "$$dir/$$prueba" --stdlib stdlib $(RUNTIME_LENGUAJE) --dinamico tests/cfv/$$prueba.cfv >/dev/null; \
 		"$$dir/$$prueba" | grep -q '^\[OK\]' || { echo "  ✗ tests/cfv/$$prueba.cfv"; exit 1; }; \

@@ -21,6 +21,9 @@ Sitio oficial: [c-forge.org](https://c-forge.org)
 - **Clases nativas** en el compilador autoalojado: clases, estructuras,
   herencia, `super`, interfaces, despacho dinámico de métodos, palabras clave
   en inglés y errores con `archivo.cfv:línea`.
+- **Funciones anónimas y errores nativos**: cierres con captura por
+  referencia, globales, `intentar`/`capturar`/`finalmente`/`lanzar`, `??`.
+  15 de 25 pruebas de la suite compiladas a ELF sin libc.
 
 ## 3.7.3 — extern C + idioma del programa
 

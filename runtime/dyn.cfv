@@ -12,6 +12,7 @@
 //                 2 lista (dato: vec del runtime)
 //                 3 mapa  (dato: map del runtime)
 //                 4 flotante (dato: bits IEEE-754)
+//                 7 función (dato: [código][aridad][n][celdas capturadas]*)
 //
 // Los números siguen la semántica del intérprete: un resultado con valor
 // entero se representa como entero; si no, como flotante.
@@ -48,21 +49,99 @@ funcion dyn_nombre_tipo(v) {
     si (t == 2) { retornar "lista" }
     si (t == 3) { retornar "mapa" }
     si (t == 5) { retornar "booleano" }
+    si (t == 7) { retornar "función" }
     retornar "número"
 }
 
 funcion dyn_error_tipo(operacion, v) {
     sea m = str_concatenar(operacion, ": valor de tipo ")
     str_agregar(m, dyn_nombre_tipo(v))
-    rt_panico(m)
+    dyn_error(m)
     retornar 0
 }
 
 funcion dyn_verdad(v) {
     si (v == 4) { retornar 1 }
     si (v == 2) { retornar 0 }
-    rt_panico("se esperaba verdadero o falso")
+    dyn_error("se esperaba verdadero o falso")
     retornar 0
+}
+
+// ── Errores: intentar / capturar / lanzar ────────────────────────────────
+// Global 21: pila de manejadores [rsp][rbp][dirección de captura].
+
+funcion dyn_manejadores() {
+    sea h = mem_global(21)
+    si (h == 0) {
+        h = vec_nuevo()
+        mem_fijar_global(21, h)
+    }
+    retornar h
+}
+
+funcion dyn_intentar_entrar(pila, marco, destino) {
+    sea r = mem_reservar(24)
+    __guardar64(r, pila)
+    __guardar64(r + 8, marco)
+    __guardar64(r + 16, destino)
+    vec_agregar(dyn_manejadores(), r)
+    retornar 0
+}
+
+funcion dyn_intentar_salir() {
+    mem_liberar(vec_quitar_ultimo(dyn_manejadores()))
+    retornar 0
+}
+
+funcion dyn_lanzar(v) {
+    sea h = dyn_manejadores()
+    si (vec_largo(h) == 0) {
+        rt_panico(str_concatenar("error no capturado: ", dyn_a_str(v)))
+    }
+    sea r = vec_quitar_ultimo(h)
+    __saltar(__cargar64(r + 8), __cargar64(r), __cargar64(r + 16), v)
+    retornar 0
+}
+
+// Error del lenguaje: se puede capturar con intentar/capturar.
+funcion dyn_error(mensaje) {
+    si (vec_largo(dyn_manejadores()) > 0) { dyn_lanzar(dyn_texto(mensaje)) }
+    rt_panico(mensaje)
+    retornar 0
+}
+
+// ── Funciones anónimas y celdas ──────────────────────────────────────────
+
+funcion dyn_celda_nueva(v) {
+    sea celda = mem_reservar(8)
+    __guardar64(celda, v)
+    retornar celda
+}
+
+funcion dyn_cierre_nuevo(codigo, aridad, capturas) {
+    sea r = mem_reservar(24 + capturas * 8)
+    __guardar64(r, codigo)
+    __guardar64(r + 8, aridad)
+    __guardar64(r + 16, capturas)
+    retornar dyn_caja(7, r)
+}
+
+funcion dyn_cierre_fijar(f, i, celda) {
+    __guardar64(dyn_dato(f) + 24 + i * 8, celda)
+    retornar f
+}
+
+// Dirección del código de f para una llamada con n argumentos.
+funcion dyn_codigo_cierre(f, n) {
+    si (dyn_tipo(f) != 7) { dyn_error_tipo("no se puede llamar", f) }
+    sea r = dyn_dato(f)
+    si (__cargar64(r + 8) != n) {
+        sea m = str_concatenar("la función espera ", str_desde_entero(__cargar64(r + 8)))
+        str_agregar(m, " argumentos y recibió ")
+        str_agregar(m, str_desde_entero(n))
+        dyn_error(m)
+    }
+    retornar __cargar64(r)
 }
 
 // ── Números ───────────────────────────────────────────────────────────────
@@ -133,7 +212,7 @@ funcion dyn_buscar_metodo(objeto, nombre, n) {
             sea entrada = r + 24 + i * 24
             si (str_igual(__cargar64(entrada), nombre)) {
                 si (__cargar64(entrada + 16) != n) {
-                    rt_panico(str_concatenar("cantidad de argumentos incorrecta en el método ", nombre))
+                    dyn_error(str_concatenar("cantidad de argumentos incorrecta en el método ", nombre))
                 }
                 retornar __cargar64(entrada + 8)
             }
@@ -148,7 +227,7 @@ funcion dyn_metodo_desconocido(objeto, nombre) {
     sea m = str_concatenar("método desconocido '", nombre)
     str_agregar(m, "' para un valor de tipo ")
     str_agregar(m, dyn_nombre_tipo(objeto))
-    rt_panico(m)
+    dyn_error(m)
     retornar 0
 }
 
@@ -274,7 +353,8 @@ funcion dyn_agregar_valor(r, v, comillas) {
         str_agregar_byte(r, 125)
         retornar 0
     }
-    rt_panico("valor desconocido")
+    si (t == 7) { str_agregar(r, "<funcion>") retornar 0 }
+    dyn_error("valor desconocido")
     retornar 0
 }
 
@@ -320,7 +400,7 @@ funcion dyn_div(a, b) {
     si (dyn_ambos_enteros(a, b)) {
         sea x = dyn_valor_entero(a)
         sea y = dyn_valor_entero(b)
-        si (y == 0) { rt_panico("división por cero") }
+        si (y == 0) { dyn_error("división por cero") }
         si (x % y == 0) { retornar dyn_entero(x / y) }
     }
     retornar dyn_desde_f64(__f64_div(dyn_a_f64(a), dyn_a_f64(b)))
@@ -329,7 +409,7 @@ funcion dyn_div(a, b) {
 funcion dyn_mod(a, b) {
     si (dyn_ambos_enteros(a, b)) {
         sea y = dyn_valor_entero(b)
-        si (y == 0) { rt_panico("división por cero") }
+        si (y == 0) { dyn_error("división por cero") }
         retornar dyn_entero(dyn_valor_entero(a) % y)
     }
     // fmod: a - trunc(a / b) * b
@@ -400,14 +480,14 @@ funcion dyn_mayor_igual(a, b) { retornar dyn_bool(dyn_comparar(a, b) >= 0) }
 // ── Indexación e iteración ────────────────────────────────────────────────
 
 funcion dyn_indice_lista(l, i) {
-    si (__y_bits(i, 1) != 1) { rt_panico("el índice de lista debe ser un número entero") }
+    si (__y_bits(i, 1) != 1) { dyn_error("el índice de lista debe ser un número entero") }
     sea n = dyn_valor_entero(i)
-    si (n < 0 o n >= vec_largo(l)) { rt_panico("índice de lista inválido") }
+    si (n < 0 o n >= vec_largo(l)) { dyn_error("índice de lista inválido") }
     retornar n
 }
 
 funcion dyn_clave(k) {
-    si (dyn_tipo(k) != 1) { rt_panico("la clave debe ser texto") }
+    si (dyn_tipo(k) != 1) { dyn_error("la clave debe ser texto") }
     retornar dyn_dato(k)
 }
 
@@ -420,14 +500,14 @@ funcion dyn_indice(c, k) {
     si (t == 3) {
         sea m = dyn_dato(c)
         sea e = map_buscar(m, dyn_clave(k))
-        si (e < 0) { rt_panico("clave inexistente") }
+        si (e < 0) { dyn_error("clave inexistente") }
         retornar map_valor_en(m, e)
     }
     si (t == 1) {
         sea s = dyn_dato(c)
-        si (__y_bits(k, 1) != 1) { rt_panico("el índice de texto debe ser un número entero") }
+        si (__y_bits(k, 1) != 1) { dyn_error("el índice de texto debe ser un número entero") }
         sea n = dyn_valor_entero(k)
-        si (n < 0 o n >= str_largo(s)) { rt_panico("índice de texto inválido") }
+        si (n < 0 o n >= str_largo(s)) { dyn_error("índice de texto inválido") }
         retornar dyn_texto(str_rebanar(s, n, n + 1))
     }
     dyn_error_tipo("no se puede indexar", c)
@@ -471,7 +551,7 @@ funcion mostrar(v) {
 }
 
 funcion afirmar(condicion, mensaje) {
-    si (dyn_verdad(condicion) == 0) { rt_panico(dyn_a_str(mensaje)) }
+    si (dyn_verdad(condicion) == 0) { dyn_error(dyn_a_str(mensaje)) }
     retornar 0
 }
 
@@ -603,7 +683,7 @@ funcion a_numero(v) {
         }
         valor = __f64_suma(valor, __f64_div(__f64_desde_entero(fraccion), __f64_desde_entero(escala)))
     }
-    si (digitos == 0 o i != n) { rt_panico(str_concatenar("no es un número: ", s)) }
+    si (digitos == 0 o i != n) { dyn_error(str_concatenar("no es un número: ", s)) }
     si (negativo) { valor = __f64_resta(__f64_desde_entero(0), valor) }
     retornar dyn_desde_f64(valor)
 }

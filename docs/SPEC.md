@@ -440,6 +440,22 @@ bibliotecas) pasan compiladas a ELF sin libc. Estado de la suite completa:
   inglés (`true`, `null`).
 - Los errores de compilación indican `archivo.cfv:línea`.
 
+### Bloque 3: funciones anónimas, globales y errores en el compilador autoalojado ✅
+
+- `funcion(x) { ... }` como valor, con captura por referencia: si una función
+  contiene funciones anónimas, sus variables viven en celdas del heap
+  (`mem.cfv`) y los cierres las comparten. `sea f = funcion(..) { f(..) }`
+  permite recursión. Las funciones con nombre también son valores.
+- Las variables de nivel superior son globales visibles desde las funciones.
+- `intentar { } capturar (e) { } finalmente { }` y `lanzar valor`: el runtime
+  guarda `rsp`/`rbp`/destino y `lanzar` restaura ese marco. Los errores del
+  lenguaje (división por cero, índice inválido, `afirmar`) se pueden capturar.
+  `retornar`, `romper` y `continuar` cierran los bloques `intentar` abiertos.
+  A diferencia del intérprete, `capturar` recibe el valor lanzado tal cual
+  (no convertido a texto).
+- `a ?? b`, argumentos faltantes = `nulo`, `runtime/lenguaje.cfv` (biblioteca
+  del lenguaje en C-Forge: `mapear`, `filtrar`, `reducir`, `tarea`, `esperar`).
+
 **Alcance honesto:** el compilador autoalojado compila el *dialecto nativo*
 (enteros de 64 bits, funciones, recursión, condiciones, ciclos, textos
 literales e intrínsecos). El lenguaje C-Forge completo (clases, mapas,
