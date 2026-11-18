@@ -627,6 +627,30 @@ json = "usuario/repo@v1.2"     # rama, etiqueta o nada (rama por defecto)
 - Extensión de VS Code (`herramientas/vscode-cforgev`): cliente del LSP con
   `vscode-languageclient`; el CI publica el `.vsix` como artefacto.
 
+### Apple: Xcode, iOS y Objective-C ✅
+
+- `cforge build archivo.cfv --lib [-o libx.a | x.o] [--target T]` con
+  `T` = `macos-arm64`, `ios-arm64` o `ios-sim-arm64`: Mach-O objeto ARM64
+  (relocaciones `PAGE21`/`PAGEOFF12`/`UNSIGNED`, símbolos `_nombre`) dentro
+  de un archivo estático `.a` (`__.SYMDEF SORTED`) y la cabecera C `x.h`.
+- Se exportan las funciones marcadas con `#[Exportar]`; sus tipos salen de
+  las anotaciones: `entero` → `int64_t`, `entero32` → `int32_t`, `numero` →
+  `double`, `texto` → `const char *`, `booleano` → `bool`, sin resultado →
+  `void`. Cada envoltura (ABI AAPCS64) usa su propia pila del lenguaje de
+  8 MiB; la primera llamada ejecuta el código de nivel superior; las
+  llamadas se serializan con un cerrojo.
+- `cforge xcode-init [X.xcodeproj]`: regla de compilación de Xcode para
+  `*.cfv` (Cmd + B / Cmd + R: `cforge build --lib` según `PLATFORM_NAME`),
+  `CForge/CForge-Bridging-Header.h` para Swift, `HEADER_SEARCH_PATHS` y
+  `CForge/CForge.xclangspec` (resaltado; Xcode no tiene soporte oficial para
+  lenguajes de terceros, se instala en `~/Library/Developer/Xcode/Specifications`).
+- `importar "apple"` (`stdlib/apple.cfv`): `objc_clase`, `objc_sel`,
+  `objc_enviar(objeto, "selector:", args…)`, `ns_texto`, `texto_de_ns`,
+  `lista_de_ns` sobre `objc_getClass`, `sel_registerName` y `objc_msgSend`.
+- `extern "lib" funcion nombre(...): tipo como "símbolo"` declara varias
+  firmas del mismo símbolo C. Los `puntero`/`largo` que no caben en un entero
+  del lenguaje (tagged pointers de ARM64) viajan exactos en una caja.
+
 ### Capa intermedia y backend AArch64 ✅
 
 - El compilador no emite bytes de máquina: pide operaciones de una máquina de
