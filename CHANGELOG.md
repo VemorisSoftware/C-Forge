@@ -34,6 +34,11 @@ Sitio oficial: [c-forge.org](https://c-forge.org)
   con runtime incrustado, semilla de arranque sin C++ verificada en CI, y
   releases/instalador que distribuyen el compilador nativo como `cforge`
   (con `cforge-clasico` para lo que aún no es nativo).
+- **22/22 `ejemplos/` con el compilador nativo**: `extern` genérico con
+  `dlopen` (SDL2, sqlite3, cualquier `.so`), hilos reales con `clone` y
+  `futex`, canales y mutex, servidor HTTP con sockets, SDL2 en C-Forge,
+  `?.`, ternario, `expr?`, genéricos, valores por defecto, variádicos,
+  `inseguro` con punteros verificados y atributos `#[...]`.
 
 ## 3.7.3 — extern C + idioma del programa
 

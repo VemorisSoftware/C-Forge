@@ -35,9 +35,12 @@
 // 248 bloques intentar abiertos al entrar al ciclo
 // 256 funciones externas [símbolo][biblioteca][etiqueta][casilla GOT][tipos]
 // 264 siguiente declaración externa
+// 272 casillas de dlopen/dlsym en datos (o -1)
+// 280 valores por defecto pendientes [nombre][posición del token]
+// 288 atributos #[...] [atributo][argumentos][función]
 
 funcion ctx_nuevo(tokens) {
-    sea c = mem_reservar(272)
+    sea c = mem_reservar(296)
     __guardar64(c, tokens)
     __guardar64(c + 8, 0)
     __guardar64(c + 16, str_nuevo(65536))
@@ -65,7 +68,9 @@ funcion ctx_nuevo(tokens) {
     __guardar64(c + 192, 0)
     __guardar64(c + 200, 0)
     __guardar64(c + 208, vec_nuevo())
-    __guardar64(c + 216, marco_nuevo(0, 0, 0, 0))
+    // El programa principal usa celdas: sus variables de bloque (no globales)
+    // pueden ser capturadas por funciones anónimas.
+    __guardar64(c + 216, marco_nuevo(0, 1, 0, 0))
     __guardar64(__cargar64(c + 216) + 48, 1)
     __guardar64(c + 224, vec_nuevo())
     __guardar64(c + 232, 0)
@@ -73,6 +78,9 @@ funcion ctx_nuevo(tokens) {
     __guardar64(c + 248, 0)
     __guardar64(c + 256, vec_nuevo())
     __guardar64(c + 264, 0)
+    __guardar64(c + 272, 0 - 1)
+    __guardar64(c + 280, vec_nuevo())
+    __guardar64(c + 288, vec_nuevo())
     retornar c
 }
 
@@ -168,7 +176,44 @@ funcion requerir_ident(c) {
 
 // Anotación de tipo opcional: ": tipo"
 funcion saltar_tipo(c) {
-    si (tomar(c, ":")) { requerir_ident(c) }
+    si (tomar(c, ":")) {
+        requerir_ident(c)
+        saltar_genericos(c)
+        tomar(c, "?")
+        mientras (ver(c, "[") y str_igual(tok_siguiente_lexema(c), "]")) {
+            avanzar(c)
+            avanzar(c)
+        }
+    }
+    retornar 0
+}
+
+// Fin (índice del ">" que cierra) de una lista de tipos genéricos que empieza
+// en el "<" de la posición j, o -1 si no es una lista de tipos.
+funcion fin_genericos(tokens, j) {
+    si (es_simbolo(vec_obtener(tokens, j), "<") == 0) { retornar 0 - 1 }
+    sea nivel = 0
+    mientras (verdadero) {
+        sea t = vec_obtener(tokens, j)
+        si (es_simbolo(t, "<")) {
+            nivel = nivel + 1
+        } sino {
+            si (es_simbolo(t, ">")) {
+                nivel = nivel - 1
+                si (nivel == 0) { retornar j }
+            } sino {
+                si (__cargar64(t) != 1 y es_simbolo(t, ",") == 0 y es_simbolo(t, "?") == 0 y es_simbolo(t, "[") == 0 y es_simbolo(t, "]") == 0) { retornar 0 - 1 }
+            }
+        }
+        j = j + 1
+    }
+    retornar 0 - 1
+}
+
+// <T, U ...> tras un nombre (genéricos: se aceptan y no generan código).
+funcion saltar_genericos(c) {
+    sea fin = fin_genericos(__cargar64(c), __cargar64(c + 8))
+    si (fin >= 0) { __guardar64(c + 8, fin + 1) }
     retornar 0
 }
 
@@ -178,7 +223,7 @@ funcion saltar_tipo(c) {
 
 funcion alias_ingles(lex) {
     si (str_igual(lex, "let") o str_igual(lex, "var")) { retornar "sea" }
-    si (str_igual(lex, "function") o str_igual(lex, "func") o str_igual(lex, "fn")) { retornar "funcion" }
+    si (str_igual(lex, "function")) { retornar "funcion" }
     si (str_igual(lex, "return")) { retornar "retornar" }
     si (str_igual(lex, "if")) { retornar "si" }
     si (str_igual(lex, "else")) { retornar "sino" }
@@ -226,6 +271,10 @@ funcion traducir_ingles(tokens) {
         si (__cargar64(t) == 1 y tras_punto(tokens, i) == 0) {
             sea a = alias_ingles(__cargar64(t + 8))
             si (a != 0) { __guardar64(t + 8, a) }
+            // fn / func solo como "fn nombre(": pueden ser nombres de variables.
+            si ((str_igual(__cargar64(t + 8), "fn") o str_igual(__cargar64(t + 8), "func")) y i + 1 < vec_largo(tokens)) {
+                si (__cargar64(vec_obtener(tokens, i + 1)) == 1) { __guardar64(t + 8, "funcion") }
+            }
         }
         i = i + 1
     }
@@ -378,7 +427,8 @@ funcion buscar_funcion(c, nombre) {
 // dinámico define una función con el nombre de una del lenguaje (puente),
 // la del programa tiene prioridad, como en el intérprete.
 funcion registrar_funcion(c, nombre, parametros, modo) {
-    sea f = mem_reservar(32)
+    sea f = mem_reservar(40)
+    __guardar64(f + 32, 0)
     __guardar64(f, nombre)
     __guardar64(f + 8, nueva_etiqueta(c))
     __guardar64(f + 16, parametros)
@@ -429,22 +479,12 @@ funcion registrar_funciones(c) {
         }
         si (profundidad == 0 y __cargar64(t) == 1 y str_igual(lex, "funcion") y __cargar64(vec_obtener(tokens, i + 1)) == 1) {
             sea nombre = __cargar64(vec_obtener(tokens, i + 1) + 8)
-            sea j = i + 3
-            sea parametros = 0
-            sea nivel = 1
-            mientras (nivel > 0) {
-                sea u = vec_obtener(tokens, j)
-                sea ul = __cargar64(u + 8)
-                si (__cargar64(u) == 4 y str_igual(ul, "(")) { nivel = nivel + 1 }
-                si (__cargar64(u) == 4 y str_igual(ul, ")")) { nivel = nivel - 1 }
-                si (nivel == 1 y __cargar64(u) == 1) {
-                    // Un parámetro es un IDENT que no es un tipo (no sigue a ':').
-                    sea previo = __cargar64(vec_obtener(tokens, j - 1) + 8)
-                    si (str_igual(previo, ":") == 0) { parametros = parametros + 1 }
-                }
-                j = j + 1
-            }
-            registrar_funcion(c, nombre, parametros, modo)
+            sea abre = i + 2
+            sea fin_gen = fin_genericos(tokens, abre)
+            si (fin_gen >= 0) { abre = fin_gen + 1 }
+            sea f = registrar_funcion(c, nombre, contar_parametros(tokens, abre + 1), modo)
+            __guardar64(f + 32, es_variadica(tokens, abre + 1))
+            registrar_atributos(c, tokens, i, nombre)
             i = i + 1
         }
         i = i + 1
@@ -454,6 +494,61 @@ funcion registrar_funciones(c) {
 }
 
 funcion lexema_en(tokens, i) { retornar __cargar64(vec_obtener(tokens, i) + 8) }
+
+// ¿Tiene la firma un parámetro "...resto"? (j apunta tras el "(")
+funcion es_variadica(tokens, j) {
+    sea nivel = 1
+    mientras (nivel > 0) {
+        sea t = vec_obtener(tokens, j)
+        si (es_simbolo(t, "(")) { nivel = nivel + 1 }
+        si (es_simbolo(t, ")")) { nivel = nivel - 1 }
+        si (nivel == 1 y es_simbolo(t, ".") y es_simbolo(vec_obtener(tokens, j + 1), ".") y es_simbolo(vec_obtener(tokens, j + 2), ".")) { retornar 1 }
+        j = j + 1
+    }
+    retornar 0
+}
+
+// #[Atributo("a", "b")] antes de "funcion nombre" (i apunta a "funcion").
+funcion registrar_atributos(c, tokens, i, nombre) {
+    si (i < 2) { retornar 0 }
+    si (es_simbolo(vec_obtener(tokens, i - 1), "]") == 0) { retornar 0 }
+    sea j = i - 1
+    sea hallado = 0
+    mientras (j > 0 y hallado == 0) {
+        si (es_simbolo(vec_obtener(tokens, j - 1), "#") y es_simbolo(vec_obtener(tokens, j), "[")) { hallado = 1 } sino { j = j - 1 }
+    }
+    si (hallado == 0) { retornar 0 }
+    sea atributo = lexema_en(tokens, j + 1)
+    sea argumentos = vec_nuevo()
+    sea k = j + 2
+    mientras (k < i - 1) {
+        si (__cargar64(vec_obtener(tokens, k)) == 3) { vec_agregar(argumentos, lexema_en(tokens, k)) }
+        k = k + 1
+    }
+    sea a = mem_reservar(24)
+    __guardar64(a, atributo)
+    __guardar64(a + 8, argumentos)
+    __guardar64(a + 16, nombre)
+    vec_agregar(__cargar64(c + 288), a)
+    retornar 0
+}
+
+// Fin (token "," o ")" del nivel) de un valor por defecto que empieza en j.
+funcion fin_valor_defecto(tokens, j) {
+    sea nivel = 0
+    mientras (verdadero) {
+        sea t = vec_obtener(tokens, j)
+        si (__cargar64(t) == 5) { retornar j }
+        si (es_simbolo(t, "(") o es_simbolo(t, "[") o es_simbolo(t, "{")) { nivel = nivel + 1 }
+        si (es_simbolo(t, ")") o es_simbolo(t, "]") o es_simbolo(t, "}")) {
+            si (nivel == 0) { retornar j }
+            nivel = nivel - 1
+        }
+        si (nivel == 0 y es_simbolo(t, ",")) { retornar j }
+        j = j + 1
+    }
+    retornar j
+}
 
 // Parámetros de una firma; j apunta al token siguiente a '('.
 funcion contar_parametros(tokens, j) {
@@ -467,6 +562,7 @@ funcion contar_parametros(tokens, j) {
         si (nivel == 1 y __cargar64(u) == 1) {
             si (str_igual(lexema_en(tokens, j - 1), ":") == 0) { parametros = parametros + 1 }
         }
+        si (nivel == 1 y es_simbolo(u, "=")) { j = fin_valor_defecto(tokens, j + 1) - 1 }
         j = j + 1
     }
     retornar parametros
@@ -480,6 +576,23 @@ funcion contar_parametros(tokens, j) {
 funcion registrar_externa(c, i) {
     sea tokens = __cargar64(c)
     sea simbolo = lexema_en(tokens, i + 3)
+    // Repetir una declaración (como un prototipo de C) reutiliza la primera.
+    sea externas = __cargar64(c + 256)
+    sea k = 0
+    mientras (k < vec_largo(externas)) {
+        sea previa_e = vec_obtener(externas, k)
+        si (__cargar64(previa_e + 32) == 0 y str_igual(__cargar64(previa_e), simbolo)) {
+            sea alias = mem_reservar(40)
+            __guardar64(alias, simbolo)
+            __guardar64(alias + 8, __cargar64(previa_e + 8))
+            __guardar64(alias + 16, __cargar64(previa_e + 16))
+            __guardar64(alias + 24, 0 - 1)
+            __guardar64(alias + 32, previa_e)
+            vec_agregar(externas, alias)
+            retornar 0
+        }
+        k = k + 1
+    }
     // Una externa reemplaza a una función del lenguaje con el mismo nombre.
     sea previa = indice_funcion(c, simbolo)
     si (previa >= 0) {
@@ -495,7 +608,9 @@ funcion registrar_externa(c, i) {
     __guardar64(e + 24, 0 - 1)
     __guardar64(e + 32, 0)
     vec_agregar(__cargar64(c + 256), e)
-    sea f = mem_reservar(32)
+    casillas_dl(c)
+    sea f = mem_reservar(40)
+    __guardar64(f + 32, 0)
     __guardar64(f, simbolo)
     __guardar64(f + 8, __cargar64(e + 16))
     __guardar64(f + 16, contar_parametros(tokens, i + 5))
@@ -504,12 +619,40 @@ funcion registrar_externa(c, i) {
     retornar 0
 }
 
+// Dos casillas en datos que el enlazador dinámico llena con dlopen y dlsym.
+funcion casillas_dl(c) {
+    si (__cargar64(c + 272) >= 0) { retornar __cargar64(c + 272) }
+    sea datos = ctx_datos(c)
+    mientras (str_largo(datos) % 8 != 0) { str_agregar_byte(datos, 0) }
+    __guardar64(c + 272, str_largo(datos))
+    bytes_le(datos, 0, 16)
+    retornar __cargar64(c + 272)
+}
+
+// rax ← dirección de la función externa e (se resuelve en el primer uso).
+funcion asegurar_externa(c, e) {
+    sea listo = nueva_etiqueta(c)
+    e4(c, 72, 139, 4, 37)                                      // mov rax, [casilla]
+    ref_dato(c, __cargar64(e + 24))
+    e5(c, 72, 133, 192, 15, 133)                               // test rax, rax; jne listo
+    ref_etiqueta(c, listo)
+    cargar_texto_crudo(c, __cargar64(e))
+    empujar(c)
+    cargar_texto_crudo(c, nombre_biblioteca(__cargar64(e + 8)))
+    empujar(c)
+    llamar_runtime(c, "dyn_extern_resolver", 2)
+    e4(c, 72, 137, 4, 37)                                      // mov [casilla], rax
+    ref_dato(c, __cargar64(e + 24))
+    definir_etiqueta(c, listo)
+    retornar 0
+}
+
 // Biblioteca compartida: "libc" → libc.so.6, "libm" → libm.so.6,
 // "sqlite3" → libsqlite3.so, o el nombre tal cual si ya es un .so.
 funcion nombre_biblioteca(nombre) {
     si (str_igual(nombre, "libc") o str_igual(nombre, "c")) { retornar "libc.so.6" }
     si (str_igual(nombre, "libm") o str_igual(nombre, "m")) { retornar "libm.so.6" }
-    si (str_buscar_en(nombre, ".so") >= 0) { retornar nombre }
+    si (str_buscar_en(nombre, ".so") >= 0 o str_buscar_en(nombre, "/") >= 0) { retornar nombre }
     sea r = str_nuevo(16)
     si (str_largo(nombre) < 3 o str_igual(str_rebanar(nombre, 0, 3), "lib") == 0) { str_agregar(r, "lib") }
     str_agregar(r, nombre)
@@ -546,6 +689,16 @@ funcion declaracion_externa(c) {
     requerir_ident(c)
     sea e = vec_obtener(__cargar64(c + 256), __cargar64(c + 264))
     __guardar64(c + 264, __cargar64(c + 264) + 1)
+    si (__cargar64(e + 32) != 0) {
+        // Declaración repetida: solo saltar la firma y resolver.
+        mientras (ver(c, ")") == 0) { avanzar(c) }
+        requerir(c, ")")
+        si (tomar(c, ":")) { requerir_ident(c) }
+        tomar(c, ";")
+        sea original = __cargar64(e + 32)
+        si (__cargar64(original + 24) >= 0) { asegurar_externa(c, original) }
+        retornar 0
+    }
     // Firma: tipos de los parámetros y del resultado.
     sea tipos = vec_nuevo()
     requerir(c, "(")
@@ -562,7 +715,7 @@ funcion declaracion_externa(c) {
     sea resultado = 4
     si (tomar(c, ":")) { resultado = clase_tipo(c, requerir_ident(c)) }
     tomar(c, ";")
-    // Casilla de la GOT (la llena el enlazador dinámico).
+    // Casilla con la dirección de la función (se llena en el primer uso).
     sea datos = ctx_datos(c)
     mientras (str_largo(datos) % 8 != 0) { str_agregar_byte(datos, 0) }
     sea casilla = str_largo(datos)
@@ -578,6 +731,7 @@ funcion declaracion_externa(c) {
         i = i + 1
     }
     sea estado = abrir_funcion(c, __cargar64(e + 16), ocultos)
+    asegurar_externa(c, e)
     sea convertidos = vec_nuevo()
     i = 0
     mientras (i < n) {
@@ -647,18 +801,9 @@ funcion declaracion_externa(c) {
     cerrar_funcion(c, estado)
     vec_liberar(ocultos)
     definir_etiqueta(c, saltar)
-    // Al ejecutarse la declaración: error capturable si el símbolo no existe.
-    sea listo = nueva_etiqueta(c)
-    e4(c, 72, 139, 4, 37)                                      // mov rax, [GOT]
-    ref_dato(c, casilla)
-    e5(c, 72, 133, 192, 15, 133)                               // test rax, rax; jne listo
-    ref_etiqueta(c, listo)
-    cargar_texto_crudo(c, __cargar64(e))
-    empujar(c)
-    cargar_texto_crudo(c, nombre_biblioteca(__cargar64(e + 8)))
-    empujar(c)
-    llamar_runtime(c, "dyn_simbolo_faltante", 2)
-    definir_etiqueta(c, listo)
+    // Al ejecutarse la declaración se resuelve: error capturable si la
+    // biblioteca o el símbolo no existen.
+    asegurar_externa(c, e)
     retornar 0
 }
 
@@ -776,7 +921,8 @@ funcion finalizar_clases(c) {
         si (buscar_funcion(c, __cargar64(k)) != 0) {
             rt_panico(str_concatenar("nombre usado por una clase y una función: ", __cargar64(k)))
         }
-        sea f = mem_reservar(32)
+        sea f = mem_reservar(40)
+        __guardar64(f + 32, 0)
         __guardar64(f, __cargar64(k))
         __guardar64(f + 8, __cargar64(k + 32))
         __guardar64(f + 16, aridad)
@@ -1150,6 +1296,102 @@ funcion intrinseco(c, nombre) {
         ref_global(c, 0)
         retornar 1
     }
+    si (str_igual(nombre, "__intercambiar")) {
+        dos_argumentos(c)
+        e3(c, 72, 135, 8)                                      // xchg [rax], rcx
+        e3(c, 72, 137, 200)                                    // mov rax, rcx
+        retornar 1
+    }
+    si (str_igual(nombre, "__pila")) {
+        argumentos(c)
+        e3(c, 72, 137, 224)                                    // mov rax, rsp
+        retornar 1
+    }
+    si (str_igual(nombre, "__dir")) {
+        // __dir("funcion"): dirección del código de una función.
+        requerir(c, "(")
+        sea f = buscar_funcion(c, decodificar_literal(__cargar64(avanzar(c) + 8)))
+        requerir(c, ")")
+        si (f == 0) { error_en(c, "__dir: función desconocida") }
+        e1(c, 184)
+        nuevo_arreglo(c, 4, __cargar64(f + 8))
+        retornar 1
+    }
+    si (str_igual(nombre, "__llamar_dir")) {
+        // __llamar_dir(dir, a1..an): llamada con la convención del lenguaje.
+        sea n = argumentos(c)
+        e4(c, 76, 139, 156, 36)                                // mov r11, [rsp + 8(n-1)]
+        e32(c, (n - 1) * 8)
+        e3(c, 65, 255, 211)                                    // call r11
+        e3(c, 72, 129, 196)
+        e32(c, n * 8)
+        retornar 1
+    }
+    si (str_igual(nombre, "__hilo")) {
+        // __hilo(tope_pila, funcion, arg, tid): clone con hilo nuevo que
+        // ejecuta funcion(arg) en su pila y termina; devuelve el tid.
+        si (argumentos(c) != 4) { error_en(c, "__hilo recibe 4 argumentos") }
+        e2(c, 65, 90)                                          // pop r10 (tid)
+        e1(c, 88)                                              // pop rax (arg)
+        e1(c, 89)                                              // pop rcx (funcion)
+        e1(c, 94)                                              // pop rsi (pila)
+        e3(c, 76, 137, 210)                                    // mov rdx, r10
+        e4(c, 72, 131, 238, 16)                                // sub rsi, 16
+        e3(c, 72, 137, 14)                                     // mov [rsi], rcx
+        e4(c, 72, 137, 70, 8)                                  // mov [rsi + 8], rax
+        e1(c, 191)                                             // mov edi, banderas
+        e32(c, 3477248)                                        // VM|FS|FILES|SIGHAND|THREAD|SYSVSEM|PARENT_SETTID|CHILD_CLEARTID
+        e3(c, 69, 49, 192)                                     // xor r8d, r8d
+        e1(c, 184)
+        e32(c, 56)                                             // clone
+        e2(c, 15, 5)
+        sea padre = nueva_etiqueta(c)
+        e5(c, 72, 133, 192, 15, 133)                           // test rax, rax; jne padre
+        ref_etiqueta(c, padre)
+        e1(c, 88)                                              // hijo: pop rax (funcion)
+        e1(c, 89)                                              // pop rcx (arg)
+        e2(c, 49, 237)                                         // xor ebp, ebp
+        e1(c, 81)                                              // push rcx
+        e2(c, 255, 208)                                        // call rax
+        e1(c, 191)
+        e32(c, 0)
+        e1(c, 184)
+        e32(c, 60)                                             // exit (solo este hilo)
+        e2(c, 15, 5)
+        definir_etiqueta(c, padre)
+        retornar 1
+    }
+    si (str_igual(nombre, "__ccall")) {
+        // __ccall(funcion, a1..a6): llamada C con enteros (ABI System V).
+        sea n = argumentos(c)
+        si (n < 1 o n > 7) { error_en(c, "__ccall recibe de 1 a 7 argumentos") }
+        sea i = n - 1
+        mientras (i >= 1) {
+            si (i == 1) { e1(c, 95) }                          // pop rdi
+            si (i == 2) { e1(c, 94) }                          // pop rsi
+            si (i == 3) { e1(c, 90) }                          // pop rdx
+            si (i == 4) { e1(c, 89) }                          // pop rcx
+            si (i == 5) { e2(c, 65, 88) }                      // pop r8
+            si (i == 6) { e2(c, 65, 89) }                      // pop r9
+            i = i - 1
+        }
+        e2(c, 65, 91)                                          // pop r11
+        e3(c, 73, 137, 228)                                    // mov r12, rsp
+        e4(c, 72, 131, 228, 240)                               // and rsp, -16
+        e2(c, 49, 192)                                         // xor eax, eax
+        e3(c, 65, 255, 211)                                    // call r11
+        e3(c, 76, 137, 228)                                    // mov rsp, r12
+        retornar 1
+    }
+    si (str_igual(nombre, "__simbolo_dinamico")) {
+        // 0: dlopen · 1: dlsym (0 si el programa no usa extern).
+        un_argumento(c)
+        e3(c, 72, 137, 193)                                    // mov rcx, rax
+        e1(c, 184)
+        ref_dato(c, casillas_dl(c))
+        e4(c, 72, 139, 4, 200)                                 // mov rax, [rax + rcx*8]
+        retornar 1
+    }
     si (str_igual(nombre, "__saltar")) {
         // __saltar(rbp, rsp, destino, valor): restaura el marco y salta.
         si (argumentos(c) != 4) { error_en(c, "__saltar recibe 4 argumentos") }
@@ -1263,8 +1505,41 @@ funcion llamar_runtime(c, nombre, n) {
 funcion llamada(c, nombre) {
     si (intrinseco(c, nombre)) { retornar 0 }
     sea f = funcion_llamable(c, nombre)
+    si (__cargar64(f + 32)) {
+        emitir_llamada(c, f, argumentos_variadicos(c, __cargar64(f + 16) - 1))
+        retornar 0
+    }
     emitir_llamada(c, f, argumentos(c))
     retornar 0
+}
+
+// f(a, b, x, y, z) con f(a, b, ...resto): los argumentos desde el fijo
+// número k se juntan en una lista.
+funcion argumentos_variadicos(c, k) {
+    requerir(c, "(")
+    sea n = 0
+    mientras (n < k y ver(c, ")") == 0) {
+        expresion(c)
+        empujar(c)
+        n = n + 1
+        si (ver(c, ")") == 0) { requerir(c, ",") }
+    }
+    mientras (n < k) {
+        cargar_inmediato(c, 0)
+        empujar(c)
+        n = n + 1
+    }
+    llamar_runtime(c, "dyn_lista_nueva", 0)
+    empujar(c)
+    mientras (ver(c, ")") == 0) {
+        e3(c, 255, 52, 36)                                     // push qword [rsp]
+        expresion(c)
+        empujar(c)
+        llamar_runtime(c, "agregar", 2)
+        si (ver(c, ")") == 0) { requerir(c, ",") }
+    }
+    requerir(c, ")")
+    retornar k + 1
 }
 
 // En modo dinámico convierte rax (valor del lenguaje) en 0/1 para saltos.
@@ -1288,6 +1563,8 @@ funcion numero_dinamico(c) {
     si (ver(c, ".") y __cargar64(vec_obtener(__cargar64(c), __cargar64(c + 8) + 1)) == 2) {
         avanzar(c)
         sea fraccion = __cargar64(avanzar(c) + 8)
+        // Más de 17 cifras no cambian un double y desbordarían el entero.
+        si (str_largo(fraccion) > 17) { fraccion = str_rebanar(fraccion, 0, 17) }
         sea escala = 1
         sea i = 0
         mientras (i < str_largo(fraccion)) {
@@ -1348,32 +1625,91 @@ funcion mapa_literal(c) {
     retornar 0
 }
 
-// Sufijos del modo dinámico: valor[índice] y valor.metodo(args).
+funcion linea_previa(c) {
+    retornar __cargar64(vec_obtener(__cargar64(c), __cargar64(c + 8) - 1) + 16)
+}
+
+// .campo o .metodo(args) sobre el valor de rax.
+funcion sufijo_punto(c) {
+    requerir(c, ".")
+    sea nombre = requerir_ident(c)
+    empujar(c)
+    si (ver(c, "(")) {
+        llamada_metodo(c, nombre)
+    } sino {
+        cargar_caja(c, nombre)
+        empujar(c)
+        llamar_runtime(c, "dyn_campo", 2)
+    }
+    retornar 0
+}
+
+// ¿Termina la expresión después del token actual? (para "valor?")
+funcion fin_de_expresion_tras(c) {
+    sea siguiente = vec_obtener(__cargar64(c), __cargar64(c + 8) + 1)
+    si (__cargar64(siguiente) == 5) { retornar 1 }
+    si (__cargar64(siguiente + 16) > tok_linea(c)) { retornar 1 }
+    retornar es_simbolo(siguiente, ")") o es_simbolo(siguiente, ",") o es_simbolo(siguiente, "]") o es_simbolo(siguiente, "}") o es_simbolo(siguiente, ";")
+}
+
+// valor? : un Resultado con error (u Opción vacía) se retorna de la función
+// actual; si no, queda su "valor".
+funcion propagar_resultado(c) {
+    empujar(c)
+    e3(c, 255, 52, 36)                                         // push qword [rsp]
+    sea sigue = nueva_etiqueta(c)
+    llamar_runtime(c, "dyn_es_fallo", 1)
+    e5(c, 72, 133, 192, 15, 132)                               // test rax, rax; je sigue
+    ref_etiqueta(c, sigue)
+    e1(c, 88)                                                  // pop rax (el fallo)
+    si (__cargar64(c + 240) > 0) {
+        empujar(c)
+        salir_de_intentar(c, __cargar64(c + 240))
+        e1(c, 88)
+    }
+    epilogo(c)
+    definir_etiqueta(c, sigue)
+    llamar_runtime(c, "dyn_desenvolver", 1)
+    retornar 0
+}
+
+// Sufijos del modo dinámico: valor[índice], valor.campo, valor.metodo(args),
+// valor?.campo (nulo si valor es nulo), valor(args) y valor?.
 funcion sufijos(c) {
     sea seguir = 1
     mientras (seguir) {
-        si (tomar(c, "[")) {
+        sea hecho = 0
+        si (ver(c, "?") y str_igual(tok_siguiente_lexema(c), ".")) {
+            avanzar(c)
+            sea fin = nueva_etiqueta(c)
+            e5(c, 72, 133, 192, 15, 132)                       // test rax, rax; je fin
+            ref_etiqueta(c, fin)
+            sufijo_punto(c)
+            definir_etiqueta(c, fin)
+            hecho = 1
+        }
+        si (hecho == 0 y ver(c, "?") y str_igual(tok_siguiente_lexema(c), "?") == 0 y fin_de_expresion_tras(c)) {
+            avanzar(c)
+            propagar_resultado(c)
+            hecho = 1
+        }
+        si (hecho == 0 y ver(c, "(") y tok_linea(c) == linea_previa(c)) {
+            llamada_cierre(c)
+            hecho = 1
+        }
+        si (hecho == 0 y tomar(c, "[")) {
             empujar(c)
             expresion(c)
             empujar(c)
             requerir(c, "]")
             llamar_runtime(c, "dyn_indice", 2)
-        } sino {
-            si (ver(c, ".") y tok_tipo_en(c, 1) == 1) {
-                avanzar(c)
-                sea nombre = requerir_ident(c)
-                empujar(c)
-                si (ver(c, "(")) {
-                    llamada_metodo(c, nombre)
-                } sino {
-                    cargar_caja(c, nombre)
-                    empujar(c)
-                    llamar_runtime(c, "dyn_indice", 2)
-                }
-            } sino {
-                seguir = 0
-            }
+            hecho = 1
         }
+        si (hecho == 0 y ver(c, ".") y tok_tipo_en(c, 1) == 1) {
+            sufijo_punto(c)
+            hecho = 1
+        }
+        si (hecho == 0) { seguir = 0 }
     }
     retornar 0
 }
@@ -1593,6 +1929,19 @@ funcion primaria_dinamica(c) {
     si (tipo == 1) {
         sea nombre = __cargar64(avanzar(c) + 8)
         sea a = resolver(c, nombre)
+        si (a == 0 y ver(c, "<")) {
+            // Nombre<Tipo>(...): genéricos en la instancia o llamada.
+            sea fin_gen = fin_genericos(__cargar64(c), __cargar64(c + 8))
+            si (fin_gen >= 0) {
+                si (es_simbolo(vec_obtener(__cargar64(c), fin_gen + 1), "(")) { __guardar64(c + 8, fin_gen + 1) }
+            }
+        }
+        si (a == 0 y str_igual(nombre, "rutas_compiladas") y buscar_funcion(c, nombre) == 0) {
+            requerir(c, "(")
+            requerir(c, ")")
+            rutas_compiladas(c)
+            retornar 0
+        }
         si (ver(c, "(")) {
             si (a != 0) {
                 cargar_var(c, a)
@@ -1615,6 +1964,42 @@ funcion primaria_dinamica(c) {
         retornar 0
     }
     error_en(c, "expresión inválida")
+    retornar 0
+}
+
+// rutas_compiladas(): tabla de las funciones marcadas con #[Ruta("/r", "M")].
+funcion rutas_compiladas(c) {
+    llamar_runtime(c, "dyn_lista_nueva", 0)
+    empujar(c)
+    sea atributos = __cargar64(c + 288)
+    sea i = 0
+    mientras (i < vec_largo(atributos)) {
+        sea a = vec_obtener(atributos, i)
+        si (str_igual(__cargar64(a), "Ruta")) {
+            sea args = __cargar64(a + 8)
+            e3(c, 255, 52, 36)                                 // push qword [rsp]
+            llamar_runtime(c, "dyn_mapa_nuevo", 0)
+            empujar(c)
+            campo_texto(c, "manejador", comillas(__cargar64(a + 16)))
+            si (vec_largo(args) > 0) { campo_texto(c, "ruta", vec_obtener(args, 0)) }
+            si (vec_largo(args) > 1) { campo_texto(c, "metodo", vec_obtener(args, 1)) } sino { campo_texto(c, "metodo", comillas("GET")) }
+            llamar_runtime(c, "agregar", 2)
+        }
+        i = i + 1
+    }
+    e1(c, 88)                                                  // pop rax
+    retornar 0
+}
+
+// mapa (apilado)["clave"] = literal de texto
+funcion campo_texto(c, clave, lexema) {
+    e3(c, 255, 52, 36)
+    cargar_caja(c, clave)
+    empujar(c)
+    e1(c, 184)
+    ref_dato(c, literal_caja(c, lexema))
+    empujar(c)
+    llamar_runtime(c, "dyn_fijar_indice", 3)
     retornar 0
 }
 
@@ -1657,6 +2042,7 @@ funcion funcion_anonima(c) {
     sea estado = abrir_cierre(c, etiqueta, nombres)
     vec_liberar(nombres)
     sea marco = __cargar64(c + 216)
+    aplicar_defectos(c)
     bloque(c)
     sea capturas = __cargar64(marco + 16)
     cerrar_funcion(c, estado)
@@ -1728,6 +2114,18 @@ funcion unaria(c) {
             retornar 0
         }
         e3(c, 72, 247, 216)                                    // neg rax
+        retornar 0
+    }
+    si (dinamico(c) y tomar(c, "@")) {
+        unaria(c)
+        empujar(c)
+        llamar_runtime(c, "dyn_direccion", 1)
+        retornar 0
+    }
+    si (dinamico(c) y tomar(c, "*")) {
+        unaria(c)
+        empujar(c)
+        llamar_runtime(c, "dyn_leer_puntero", 1)
         retornar 0
     }
     si (tomar(c, "no")) {
@@ -1891,6 +2289,22 @@ funcion expresion(c) {
         ref_etiqueta(c, fin)
         disyuncion(c)
         definir_etiqueta(c, fin)
+    }
+    // condición ? a : b
+    si (dinamico(c) y ver(c, "?") y str_igual(tok_siguiente_lexema(c), "?") == 0) {
+        avanzar(c)
+        condicion(c)
+        sea otro = nueva_etiqueta(c)
+        sea fin_ternario = nueva_etiqueta(c)
+        e5(c, 72, 133, 192, 15, 132)
+        ref_etiqueta(c, otro)
+        expresion(c)
+        requerir(c, ":")
+        e1(c, 233)
+        ref_etiqueta(c, fin_ternario)
+        definir_etiqueta(c, otro)
+        expresion(c)
+        definir_etiqueta(c, fin_ternario)
     }
     retornar 0
 }
@@ -2166,7 +2580,8 @@ funcion sentencia(c) {
         sea g = indice_global(c, nombre)
         // sea f = funcion(..) { .. f(..) .. }: la celda existe antes del cuerpo,
         // así la función anónima puede llamarse a sí misma.
-        si (dinamico(c) y __cargar64(__cargar64(c + 216) + 8) y ver(c, "funcion") y str_igual(tok_siguiente_lexema(c), "(")) {
+        sea es_global = dinamico(c) y g >= 0 y __cargar64(c + 232) == 0 y __cargar64(__cargar64(c + 216) + 48) == 1
+        si (es_global == 0 y dinamico(c) y __cargar64(__cargar64(c + 216) + 8) y ver(c, "funcion") y str_igual(tok_siguiente_lexema(c), "(")) {
             cargar_inmediato(c, 0)
             declarar_usuario(c, nombre)
             expresion(c)
@@ -2216,6 +2631,37 @@ funcion sentencia(c) {
         e1(c, 233)
         ref_etiqueta(c, inicio)
         definir_etiqueta(c, fin)
+        retornar 0
+    }
+    si (dinamico(c) y ver(c, "#") y str_igual(tok_siguiente_lexema(c), "[")) {
+        // #[Atributo(...)]: ya registrado en la primera lectura.
+        avanzar(c)
+        sea nivel = 0
+        sea seguir = 1
+        mientras (seguir) {
+            si (ver(c, "[")) { nivel = nivel + 1 }
+            si (ver(c, "]")) { nivel = nivel - 1 }
+            si (tok_tipo(c) == 5) { error_en(c, "falta ']' en el atributo") }
+            avanzar(c)
+            si (nivel == 0) { seguir = 0 }
+        }
+        retornar 0
+    }
+    si (dinamico(c) y ver(c, "inseguro") y str_igual(tok_siguiente_lexema(c), "{")) {
+        // Bloque inseguro: punteros @x, *(p + i) sobre memoria del runtime
+        // (con límites verificados).
+        avanzar(c)
+        bloque(c)
+        retornar 0
+    }
+    si (dinamico(c) y tomar(c, "*")) {
+        unaria(c)
+        empujar(c)
+        requerir(c, "=")
+        expresion(c)
+        empujar(c)
+        llamar_runtime(c, "dyn_escribir_puntero", 2)
+        tomar(c, ";")
         retornar 0
     }
     si (dinamico(c) y ver(c, "extern") y tok_tipo_en(c, 1) == 3) {
@@ -2405,16 +2851,56 @@ funcion cerrar_funcion(c, estado) {
 funcion parametros(c, nombres) {
     requerir(c, "(")
     si (ver(c, ")") == 0) {
-        vec_agregar(nombres, requerir_ident(c))
-        saltar_tipo(c)
-        mientras (tomar(c, ",")) {
-            vec_agregar(nombres, requerir_ident(c))
-            saltar_tipo(c)
-        }
+        parametro(c, nombres)
+        mientras (tomar(c, ",")) { parametro(c, nombres) }
     }
     requerir(c, ")")
     saltar_tipo(c)
     retornar nombres
+}
+
+// nombre [: tipo] [= valor por defecto]
+funcion parametro(c, nombres) {
+    si (ver(c, ".") y str_igual(tok_siguiente_lexema(c), ".")) {
+        requerir(c, ".")
+        requerir(c, ".")
+        requerir(c, ".")
+    }
+    sea nombre = requerir_ident(c)
+    vec_agregar(nombres, nombre)
+    saltar_tipo(c)
+    si (tomar(c, "=")) {
+        sea d = mem_reservar(16)
+        __guardar64(d, nombre)
+        __guardar64(d + 8, __cargar64(c + 8))
+        vec_agregar(__cargar64(c + 280), d)
+        __guardar64(c + 8, fin_valor_defecto(__cargar64(c), __cargar64(c + 8)))
+    }
+    retornar 0
+}
+
+// Dentro de la función: un parámetro que llegó nulo toma su valor por defecto.
+funcion aplicar_defectos(c) {
+    sea pendientes = __cargar64(c + 280)
+    si (vec_largo(pendientes) == 0) { retornar 0 }
+    __guardar64(c + 280, vec_nuevo())
+    sea posicion = __cargar64(c + 8)
+    sea i = 0
+    mientras (i < vec_largo(pendientes)) {
+        sea d = vec_obtener(pendientes, i)
+        sea a = variable(c, __cargar64(d))
+        sea listo = nueva_etiqueta(c)
+        cargar_var(c, a)
+        e5(c, 72, 133, 192, 15, 133)                           // test rax, rax; jne listo
+        ref_etiqueta(c, listo)
+        __guardar64(c + 8, __cargar64(d + 8))
+        expresion(c)
+        guardar_var(c, a)
+        definir_etiqueta(c, listo)
+        i = i + 1
+    }
+    __guardar64(c + 8, posicion)
+    retornar 0
 }
 
 funcion saltar_por_encima(c) {
@@ -2428,12 +2914,14 @@ funcion saltar_por_encima(c) {
 // Se emite en línea dentro del programa principal, saltándola con un jmp.
 funcion definicion_funcion(c) {
     requerir_ident(c)
+    saltar_genericos(c)
     sea f = vec_obtener(__cargar64(c + 144), __cargar64(c + 152))
     __guardar64(c + 152, __cargar64(c + 152) + 1)
     sea saltar = saltar_por_encima(c)
     sea nombres = parametros(c, vec_nuevo())
     sea estado = abrir_funcion(c, __cargar64(f + 8), nombres)
     vec_liberar(nombres)
+    aplicar_defectos(c)
     bloque(c)
     cerrar_funcion(c, estado)
     definir_etiqueta(c, saltar)
@@ -2586,6 +3074,7 @@ funcion definicion_clase(c) {
                 sea nombres = parametros(c, un_nombre("esto"))
                 sea estado = abrir_funcion(c, __cargar64(m + 8), nombres)
                 vec_liberar(nombres)
+                aplicar_defectos(c)
                 bloque(c)
                 cerrar_funcion(c, estado)
             } sino {
@@ -2705,8 +3194,8 @@ funcion compilar(c) {
     e1(c, 232)
     ref_etiqueta(c, principal)
     e3(c, 72, 137, 199)                                        // mov rdi, rax
-    e3(c, 72, 199, 192)                                        // mov rax, 60
-    e32(c, 60)
+    e3(c, 72, 199, 192)                                        // mov rax, 231 (exit_group)
+    e32(c, 231)
     e2(c, 15, 5)
     definir_etiqueta(c, principal)
     sea marco = prologo(c)
@@ -2741,24 +3230,22 @@ funcion tablas_dinamicas(c, base, inicio_datos) {
     str_agregar(datos, "/lib64/ld-linux-x86-64.so.2")
     str_agregar_byte(datos, 0)
     __guardar64(r + 8, 28)
-    // Cadenas: bibliotecas y símbolos.
-    sea cadenas = str_nuevo(256)
+    // Cadenas: libc.so.6 y los símbolos dlopen y dlsym; cada función
+    // externa se resuelve con ellos en su primer uso.
+    sea cadenas = str_nuevo(64)
     str_agregar_byte(cadenas, 0)
-    sea bibliotecas = vec_nuevo()
     sea nombres_bib = vec_nuevo()
+    vec_agregar(nombres_bib, str_largo(cadenas))
+    str_agregar(cadenas, "libc.so.6")
+    str_agregar_byte(cadenas, 0)
+    sea simbolos = vec_nuevo()
+    vec_agregar(simbolos, "dlopen")
+    vec_agregar(simbolos, "dlsym")
     sea nombres_sim = vec_nuevo()
     sea i = 0
-    mientras (i < vec_largo(externas)) {
-        sea e = vec_obtener(externas, i)
-        sea bib = nombre_biblioteca(__cargar64(e + 8))
-        si (contiene_texto(bibliotecas, bib) == 0) {
-            vec_agregar(bibliotecas, bib)
-            vec_agregar(nombres_bib, str_largo(cadenas))
-            str_agregar(cadenas, bib)
-            str_agregar_byte(cadenas, 0)
-        }
+    mientras (i < vec_largo(simbolos)) {
         vec_agregar(nombres_sim, str_largo(cadenas))
-        str_agregar(cadenas, __cargar64(e))
+        str_agregar(cadenas, vec_obtener(simbolos, i))
         str_agregar_byte(cadenas, 0)
         i = i + 1
     }
@@ -2766,11 +3253,10 @@ funcion tablas_dinamicas(c, base, inicio_datos) {
     sea strtab = str_largo(datos)
     str_agregar(datos, cadenas)
     mientras (str_largo(datos) % 8 != 0) { str_agregar_byte(datos, 0) }
-    // Símbolos: el nulo y uno débil por función externa.
     sea symtab = str_largo(datos)
     bytes_le(datos, 0, 24)
     i = 0
-    mientras (i < vec_largo(externas)) {
+    mientras (i < vec_largo(simbolos)) {
         bytes_le(datos, vec_obtener(nombres_sim, i), 4)
         bytes_le(datos, 34, 1)                                 // STB_WEAK | STT_FUNC
         bytes_le(datos, 0, 1)
@@ -2781,18 +3267,17 @@ funcion tablas_dinamicas(c, base, inicio_datos) {
     }
     // Tabla hash mínima: un balde, cadena vacía.
     sea hash = str_largo(datos)
-    sea nsimbolos = vec_largo(externas) + 1
+    sea nsimbolos = vec_largo(simbolos) + 1
     bytes_le(datos, 1, 4)
     bytes_le(datos, nsimbolos, 4)
     bytes_le(datos, 0, 4)
     bytes_le(datos, 0, 4 * nsimbolos)
     mientras (str_largo(datos) % 8 != 0) { str_agregar_byte(datos, 0) }
-    // Relocaciones R_X86_64_GLOB_DAT hacia cada casilla de la GOT.
+    // Relocaciones R_X86_64_GLOB_DAT hacia las casillas de dlopen y dlsym.
     sea rela = str_largo(datos)
     i = 0
-    mientras (i < vec_largo(externas)) {
-        sea e = vec_obtener(externas, i)
-        bytes_le(datos, dir + __cargar64(e + 24), 8)
+    mientras (i < vec_largo(simbolos)) {
+        bytes_le(datos, dir + __cargar64(c + 272) + i * 8, 8)
         bytes_le(datos, __o_bits(__desplazar_izq(i + 1, 32), 6), 8)
         bytes_le(datos, 0, 8)
         i = i + 1
@@ -2984,6 +3469,22 @@ funcion ruta_importacion(stdlib, nombre) {
     retornar r
 }
 
+// Primero junto al archivo que importa; si no, en la biblioteca estándar.
+funcion ruta_importacion_desde(stdlib, importador, nombre) {
+    sea i = str_largo(importador)
+    mientras (i > 0 y str_byte(importador, i - 1) != 47) { i = i - 1 }
+    sea local = 0
+    si (i == 0) { local = str_rebanar(ruta_importacion(".", nombre), 2, str_largo(ruta_importacion(".", nombre))) } sino { local = ruta_importacion(str_rebanar(importador, 0, i - 1), nombre) }
+    // Un archivo no se importa a sí mismo (p. ej. json.cfv con importar "json").
+    si (str_igual(local, importador)) { retornar ruta_importacion(stdlib, nombre) }
+    sea fd = sys_abrir(str_c(local), sys_abrir_lectura(), 0)
+    si (fd >= 0) {
+        sys_cerrar(fd)
+        retornar local
+    }
+    retornar ruta_importacion(stdlib, nombre)
+}
+
 funcion contiene_texto(lista, texto) {
     sea i = 0
     mientras (i < vec_largo(lista)) {
@@ -3003,7 +3504,7 @@ funcion agregar_con_importaciones(fuente, stdlib, texto, nombre, vistas, archivo
         sea t = vec_obtener(tokens, i)
         sea u = vec_obtener(tokens, i + 1)
         si (__cargar64(t) == 1 y __cargar64(u) == 3 y (str_igual(__cargar64(t + 8), "importar") o str_igual(__cargar64(t + 8), "import")) y tras_punto(tokens, i) == 0) {
-            sea ruta = ruta_importacion(stdlib, decodificar_literal(__cargar64(u + 8)))
+            sea ruta = ruta_importacion_desde(stdlib, nombre, decodificar_literal(__cargar64(u + 8)))
             si (contiene_texto(vistas, ruta) == 0) {
                 vec_agregar(vistas, ruta)
                 agregar_con_importaciones(fuente, stdlib, archivo_leer(ruta), ruta, vistas, archivos)
