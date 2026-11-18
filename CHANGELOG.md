@@ -2,7 +2,7 @@
 
 Sitio oficial: [c-forge.org](https://c-forge.org)
 
-## Sin publicar
+## 4.0.0 — 2026-11-18
 
 - **100 % C-Forge: se retiró el C++.** El intérprete `cforgev.cpp`
   (`cforge-clasico`), el Stage 0 en C++20, `include/` y la cadena de
