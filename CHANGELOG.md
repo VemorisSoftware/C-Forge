@@ -2,6 +2,16 @@
 
 Sitio oficial: [c-forge.org](https://c-forge.org)
 
+## Sin publicar
+
+- **c-forge.org rehecho**: sin inicio de sesión ni panel; páginas Inicio y
+  Aprende generadas desde el repo. Ejemplos, versión, estado y novedades salen
+  de fuentes verificables y `site/verificar.sh` los comprueba en CI.
+- **Corrección**: una función definida por el programa ya no queda tapada por
+  una integrada con el mismo nombre (p. ej. `dividir`, `contiene`).
+- `capabilities.json`: multiplataforma pasa a estable (CI verde en Linux,
+  macOS y Windows).
+
 ## 3.7.1 — instalación en un comando + Windows estable
 
 - **install.sh único** (repo y c-forge.org): descarga el binario de GitHub

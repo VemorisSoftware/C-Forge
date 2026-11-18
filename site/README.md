@@ -1,18 +1,27 @@
 # c-forge.org
 
-Sitio oficial de C-Forge, desplegado en **Cloudflare Pages** desde este repo.
+Sitio oficial de C-Forge, desplegado en **Cloudflare Pages** desde este repo
+(proyecto `c-forge`: directorio raíz `site`, comando `sh build.sh`, salida `dist`).
 
-| Proyecto Pages | Directorio raíz | Comando de build | Salida | Dominio |
-|---|---|---|---|---|
-| `c-forge` | `site` | `sh build.sh` | `dist` | `c-forge.org` |
-| `c-forge-panel` | `site/panel` | *(ninguno)* | `.` | `panel.c-forge.org` |
+## Regla: todo lo que dice el sitio es verificable
+
+| Lo que muestra | De dónde sale |
+|---|---|
+| Versión | `Makefile` (`VERSION`) |
+| Tabla de estado | `capabilities.json` |
+| Novedades | `site/data/releases.json` |
+| Ejemplos y su salida | `site/ejemplos/*.cfv` y `*.salida` |
+
+`site/verificar.sh` ejecuta cada ejemplo con `cforge` y compara su salida, y
+comprueba que las páginas generadas estén al día. Corre en CI en cada cambio.
+
+## Editar
+
+1. Cambia `site/plantillas/*.html`, `site/assets/` o los ejemplos.
+2. Si cambias un ejemplo, actualiza su salida:
+   `(cd /tmp && ./cforge site/ejemplos/X.cfv) > site/ejemplos/X.salida`
+3. Regenera: `python3 site/generar.py`
+4. Verifica: `sh site/verificar.sh ./cforge`
 
 `build.sh` copia `install.sh` e `install.ps1` desde la raíz del repo: el
 instalador del sitio y el del repo son siempre el mismo archivo.
-
-Los binarios **no** se alojan en el sitio: `data/releases.json` apunta a
-GitHub Releases.
-
-En Cloudflare, `/install.sh`, `/install.ps1` y `/data/*` no deben pasar por
-desafíos anti-bots (Bot Fight Mode / Under Attack): `curl` e `irm` no pueden
-resolverlos.

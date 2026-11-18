@@ -6163,7 +6163,11 @@ Value cfv_eval_expr(Value cfv_nodo_e, Value cfv_env, Value cfv_fns) {
       (void)(cfv_agregar(cfv_args_eval, cfv_eval_expr(indice(indice(cfv_nodo_e, Value{std::string("hijos", 5)}), cfv_ai), cfv_env, cfv_fns)));
       asignar(cfv_ai, cfv_ai_tipo, suma(cfv_ai, Value{1.0}), "ai");
     }
-    Value cfv_res_b = cfv_eval_builtin(cfv_nombre_fn, cfv_args_eval, cfv_env, cfv_fns);
+    // Las funciones definidas por el programa tienen prioridad sobre las
+    // integradas con el mismo nombre (p. ej. una función propia 'dividir').
+    Value cfv_res_b = verdad(cfv_tiene_clave(cfv_fns, cfv_nombre_fn))
+        ? Value{std::string("__no_builtin__")}
+        : cfv_eval_builtin(cfv_nombre_fn, cfv_args_eval, cfv_env, cfv_fns);
  [[maybe_unused]] size_t cfv_res_b_tipo = 99;
     if (verdad(compara(cfv_res_b, Value{std::string("__no_builtin__", 14)}, "!="))) {
       if (verdad(compara(cfv_res_b, Value{std::string("__ok__", 6)}, "=="))) {
