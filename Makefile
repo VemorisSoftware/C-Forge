@@ -235,6 +235,25 @@ tipos-check: build
 	CFORGE_STDLIB=../../stdlib ../../$(TARGET) valido.cfv | grep -q '^\[OK\]'; \
 	echo "  ✓ tipos: 11 errores detectados antes de ejecutar y un programa válido"
 
+## --release: "hola" < 60 KB, la suite completa sin el código muerto y el
+## benchmark de enteros (holgura para máquinas lentas del CI).
+release-modo-check: build
+	@set -e; dir=$$(mktemp -d /tmp/cforge-rel.XXXXXX); \
+	echo 'mostrar("hola")' > $$dir/hola.cfv; \
+	./$(TARGET) build $$dir/hola.cfv --release -o $$dir/hola >/dev/null; \
+	tam=$$(wc -c < $$dir/hola); [ "$$($$dir/hola)" = hola ]; \
+	[ $$tam -lt 61440 ] || { echo "  ✗ hola --release: $$tam bytes"; exit 1; }; \
+	for file in tests/cfv/*.cfv; do \
+		CFORGE_STDLIB=./stdlib ./$(TARGET) build "$$file" --release -o $$dir/p >/dev/null; \
+		(cd tests/cfv && $$dir/p) | grep -q '^\[OK\]' || { echo "  ✗ $$file con --release"; exit 1; }; \
+	done; \
+	./$(TARGET) build benchmarks/07_enteros_primos_fib.cfv --release -o $$dir/b >/dev/null; \
+	ini=$$(date +%s%N); $$dir/b > $$dir/b.txt; ms=$$(( ($$(date +%s%N) - ini) / 1000000 )); \
+	grep -q '^17984$$' $$dir/b.txt; grep -q '^832040$$' $$dir/b.txt; \
+	[ $$ms -lt 250 ] || { echo "  ✗ benchmark de enteros: $$ms ms"; exit 1; }; \
+	rm -rf $$dir; \
+	echo "  ✓ --release: hola $$tam bytes, suite completa, benchmark de enteros $$ms ms"
+
 ## cforge repl: sesión guardada (sin la línea de versión).
 repl-check: build
 	@set -e; CFORGE_STDLIB=./stdlib ./$(TARGET) repl < tests/repl/entrada.txt 2>&1 | tail -n +2 | diff -u tests/repl/esperado.txt - || { echo "  ✗ cforge repl"; exit 1; }; \
@@ -280,7 +299,7 @@ smoke-test: build
 
 ## Gate único exigido antes de publicar una versión.
 release-check: build nativo-check autoalojado-check semilla-check check test \
-	stdlib-load-check stdlib-check repl-check gc-check tipos-check cli-check malformed-check install-check smoke-test
+	stdlib-load-check stdlib-check repl-check gc-check tipos-check release-modo-check cli-check malformed-check install-check smoke-test
 	@echo ""
 	@echo "  ✓ GATE DE ESTABILIDAD C-FORGE COMPLETO (100 % C-Forge)"
 
