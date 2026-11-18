@@ -10,7 +10,7 @@ LIBS     := -lpthread -ldl
 TARGET   := cforge
 SRC      := cforgev.cpp
 PREFIX   ?= /usr/local
-VERSION  := 3.7.2
+VERSION  := 3.7.3
 
 # Detección de plataforma
 UNAME := $(shell uname -s)
