@@ -2,6 +2,18 @@
 
 Sitio oficial: [c-forge.org](https://c-forge.org)
 
+## Sin publicar (4.2)
+
+- **`cforge repl`:** consola interactiva con estado (variables, funciones de
+  varias líneas, `:programa`, `:limpiar`); una expresión suelta muestra su
+  valor y los errores no cortan la sesión.
+- **Interpolación estricta:** `{` interpola solo si la sigue una letra, `_` o
+  `(` y cierra en la línea; JSON y GLSL ya no necesitan `\{`.
+- **Notación científica:** `1e5`, `2.5e-3`, `6.02E+23`.
+- **`docs/GLOBALES.md`:** mapa de las casillas globales del runtime. Corrige
+  dos choques de 4.1: las tablas de AES usaban la caché de `argv` en Windows
+  (ahora casilla 15) y el handle de libssl la casilla de `sys_casilla` (16).
+
 ## 4.1.0 — 2026-11-18
 
 - **Biblioteca estándar completa en C-Forge:** los 35 módulos de `stdlib/`

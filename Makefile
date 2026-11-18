@@ -217,6 +217,11 @@ stdlib-check: build
 	rm -rf $$dir; \
 	echo "  ✓ db: SQLite (CRUD, parámetros, transacciones, archivo)"
 
+## cforge repl: sesión guardada (sin la línea de versión).
+repl-check: build
+	@set -e; CFORGE_STDLIB=./stdlib ./$(TARGET) repl < tests/repl/entrada.txt 2>&1 | tail -n +2 | diff -u tests/repl/esperado.txt - || { echo "  ✗ cforge repl"; exit 1; }; \
+	echo "  ✓ cforge repl: expresiones, funciones de varias líneas, errores y estado"
+
 ## Contrato público mínimo del CLI.
 cli-check: build
 	@set -e; \
@@ -257,7 +262,7 @@ smoke-test: build
 
 ## Gate único exigido antes de publicar una versión.
 release-check: build nativo-check autoalojado-check semilla-check check test \
-	stdlib-load-check stdlib-check cli-check malformed-check install-check smoke-test
+	stdlib-load-check stdlib-check repl-check cli-check malformed-check install-check smoke-test
 	@echo ""
 	@echo "  ✓ GATE DE ESTABILIDAD C-FORGE COMPLETO (100 % C-Forge)"
 

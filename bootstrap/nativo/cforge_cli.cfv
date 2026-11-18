@@ -39,6 +39,7 @@ funcion cli_ayuda() {
     mostrar("")
     mostrar("Herramientas:")
     mostrar("  cforge fmt [--check] [rutas]     Formatear el código (.cfv)")
+    mostrar("  cforge repl                      Consola interactiva (:salir para terminar)")
     mostrar("  cforge lsp                       Servidor de lenguaje (LSP) por stdio")
     mostrar("  cforge xcode-init [X.xcodeproj]  Integrar C-Forge en un proyecto de Xcode")
     mostrar("  cforge doctor                    Revisar la instalación")
@@ -172,6 +173,220 @@ funcion ejecutar(ruta, desde) {
     retornar 0
 }
 
+// ── cforge repl ───────────────────────────────────────────────────────────
+// Cada entrada se valida con "cforge check" (subproceso silencioso) y luego
+// se ejecuta el programa acumulado; el runtime omite las líneas que ya se
+// mostraron (repl_preparar). Una expresión suelta muestra su valor.
+
+// Línea de stdin sin el salto (0 al terminar la entrada).
+funcion repl_leer_linea() {
+    sea r = str_nuevo(128)
+    sea b = mem_reservar(8)
+    sea leidos = 0
+    sea seguir = 1
+    mientras (seguir) {
+        sea n = sys_leer(0, b, 1)
+        si (n <= 0) {
+            seguir = 0
+            si (leidos == 0) {
+                mem_liberar(b)
+                retornar 0
+            }
+        } sino {
+            leidos = leidos + 1
+            sea c = __cargar8(b)
+            si (c == 10) { seguir = 0 } sino { si (c != 13) { str_agregar_byte(r, c) } }
+        }
+    }
+    mem_liberar(b)
+    retornar r
+}
+
+// Paréntesis, corchetes y llaves abiertos (fuera de textos y comentarios).
+funcion repl_abiertos(s) {
+    sea n = 0
+    sea i = 0
+    mientras (i < str_largo(s)) {
+        sea c = str_byte(s, i)
+        si (c == 34) {
+            i = i + 1
+            mientras (i < str_largo(s) y str_byte(s, i) != 34) {
+                si (str_byte(s, i) == 92) { i = i + 1 }
+                i = i + 1
+            }
+        } sino {
+            si (c == 47 y i + 1 < str_largo(s) y str_byte(s, i + 1) == 47) {
+                mientras (i < str_largo(s) y str_byte(s, i) != 10) { i = i + 1 }
+            } sino {
+                si (c == 40 o c == 91 o c == 123) { n = n + 1 }
+                si (c == 41 o c == 93 o c == 125) { n = n - 1 }
+            }
+        }
+        i = i + 1
+    }
+    retornar n
+}
+
+funcion repl_empieza(s, palabra) {
+    si (str_largo(s) < str_largo(palabra)) { retornar 0 }
+    si (str_igual(str_rebanar(s, 0, str_largo(palabra)), palabra) == 0) { retornar 0 }
+    si (str_largo(s) == str_largo(palabra)) { retornar 1 }
+    sea c = str_byte(s, str_largo(palabra))
+    retornar es_identificador(c) == 0
+}
+
+// ¿Es una declaración o sentencia (no se envuelve como expresión)?
+funcion repl_es_sentencia(s) {
+    sea i = 0
+    mientras (i < str_largo(s) y es_espacio(str_byte(s, i))) { i = i + 1 }
+    sea t = str_rebanar(s, i, str_largo(s))
+    sea palabras = "sea let var constante const funcion function fn clase class estructura struct interfaz interface importar import extern si if mientras while para for intentar try retornar return lanzar throw"
+    sea inicio = 0
+    sea k = 0
+    mientras (k <= str_largo(palabras)) {
+        si (k == str_largo(palabras) o str_byte(palabras, k) == 32) {
+            si (repl_empieza(t, str_rebanar(palabras, inicio, k))) { retornar 1 }
+            inicio = k + 1
+        }
+        k = k + 1
+    }
+    retornar 0
+}
+
+funcion repl_buscar(s, aguja, desde) {
+    sea i = desde
+    mientras (i + str_largo(aguja) <= str_largo(s)) {
+        si (str_igual(str_rebanar(s, i, i + str_largo(aguja)), aguja)) { retornar i }
+        i = i + 1
+    }
+    retornar 0 - 1
+}
+
+// Texto como literal del lenguaje (rutas de Windows con "\").
+funcion repl_literal(s) {
+    sea r = str_nuevo(str_largo(s) + 8)
+    str_agregar_byte(r, 34)
+    sea i = 0
+    mientras (i < str_largo(s)) {
+        sea c = str_byte(s, i)
+        si (c == 92 o c == 34) { str_agregar_byte(r, 92) }
+        str_agregar_byte(r, c)
+        i = i + 1
+    }
+    str_agregar_byte(r, 34)
+    retornar r
+}
+
+// Escribe el programa (historia + entrada) y lo revisa; 0 si compila, si
+// no, el mensaje de error.
+funcion repl_revisar(exe, ruta, diag, encabezado, historia, entrada) {
+    sea p = str_concatenar(encabezado, historia)
+    str_agregar(p, entrada)
+    str_agregar(p, "\n")
+    archivo_escribir(ruta, p)
+    archivo_escribir(diag, "")
+    sea args = vec_nuevo()
+    vec_agregar(args, "check")
+    vec_agregar(args, ruta)
+    vec_agregar(args, "--diagnosticos")
+    vec_agregar(args, diag)
+    vec_agregar(args, "--silencioso")
+    si (sys_ejecutar_programa(exe, args) == 0) { retornar 0 }
+    sea m = archivo_leer(diag)
+    si (str_largo(m) == 0) { m = "error al compilar" }
+    retornar m
+}
+
+funcion orden_repl() {
+    sea exe = sys_ruta_ejecutable()
+    si (exe == 0) { rt_panico("repl: no se encontró el ejecutable de cforge") }
+    sea base = str_concatenar(sys_ruta_temporal(), str_concatenar("cforge-repl-", str_desde_entero(sys_proceso_id())))
+    sea ruta = str_concatenar(base, ".cfv")
+    sea diag = str_concatenar(base, ".diag")
+    sea conteo = str_concatenar(base, ".n")
+    sea historia = str_nuevo(4096)
+    sea mostradas = 0
+    rt_escribir_texto(1, str_concatenar(str_concatenar("C-Forge ", version_cforge()), " — repl (:salir para terminar, :programa, :limpiar)\n"))
+    sea seguir = 1
+    mientras (seguir) {
+        rt_escribir_texto(1, "cforge> ")
+        sea entrada = repl_leer_linea()
+        si (entrada == 0) {
+            seguir = 0
+            rt_escribir_texto(1, "\n")
+        } sino {
+            mientras (repl_abiertos(entrada) > 0 y entrada != 0) {
+                rt_escribir_texto(1, "   ...> ")
+                sea mas = repl_leer_linea()
+                si (mas == 0) {
+                    entrada = 0
+                } sino {
+                    str_agregar_byte(entrada, 10)
+                    str_agregar(entrada, mas)
+                }
+            }
+        }
+        si (entrada == 0) {
+            seguir = 0
+        } sino {
+            sea limpia = entrada
+            sea i = 0
+            mientras (i < str_largo(limpia) y es_espacio(str_byte(limpia, i))) { i = i + 1 }
+            limpia = str_rebanar(limpia, i, str_largo(limpia))
+            si (str_igual(limpia, ":salir") o str_igual(limpia, ":q") o str_igual(limpia, "salir()") o str_igual(limpia, "exit()")) {
+                seguir = 0
+            } sino {
+                si (str_igual(limpia, ":programa")) {
+                    rt_escribir_texto(1, historia)
+                } sino {
+                    si (str_igual(limpia, ":limpiar")) {
+                        historia = str_nuevo(4096)
+                        mostradas = 0
+                    } sino {
+                        si (str_largo(limpia) > 0) {
+                            sea encabezado = str_concatenar("repl_preparar(", str_desde_entero(mostradas))
+                            str_agregar(encabezado, ", ")
+                            str_agregar(encabezado, repl_literal(conteo))
+                            str_agregar(encabezado, ")\n")
+                            sea candidata = entrada
+                            sea error = 1
+                            si (repl_es_sentencia(entrada) == 0) {
+                                candidata = str_concatenar("repl_valor(", entrada)
+                                str_agregar(candidata, ")")
+                                error = repl_revisar(exe, ruta, diag, encabezado, historia, candidata)
+                                si (error != 0) { candidata = entrada }
+                            }
+                            si (error != 0) { error = repl_revisar(exe, ruta, diag, encabezado, historia, candidata) }
+                            si (error != 0) {
+                                // "/tmp/cforge-repl-N.cfv:12: mensaje" → "mensaje"
+                                sea p = repl_buscar(error, ".cfv:", 0)
+                                si (p >= 0) {
+                                    sea q = repl_buscar(error, ": ", p + 5)
+                                    si (q >= 0) { error = str_rebanar(error, q + 2, str_largo(error)) }
+                                }
+                                rt_escribir_texto(2, str_concatenar(str_concatenar("error: ", error), "\n"))
+                            } sino {
+                                sea args = vec_nuevo()
+                                vec_agregar(args, ruta)
+                                si (sys_ejecutar_programa(exe, args) == 0) {
+                                    str_agregar(historia, candidata)
+                                    str_agregar(historia, "\n")
+                                    sea n = archivo_leer(conteo)
+                                    mostradas = numero_literal(n)
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+    sys_borrar(str_c(ruta))
+    sys_borrar(str_c(diag))
+    sys_borrar(str_c(conteo))
+    retornar 0
+}
+
 funcion construir(ruta, salida) {
     si (mem_global(40) != 0) { retornar construir_biblioteca(ruta, salida) }
     si (salida == 0) {
@@ -267,6 +482,9 @@ si (str_igual(orden, "-o")) {
             si (str_igual(orden, "install")) {
                 orden_install()
             } sino {
+            si (str_igual(orden, "repl")) {
+                orden_repl()
+            } sino {
             si (str_igual(orden, "fmt")) {
                 orden_fmt(2)
             } sino {
@@ -313,8 +531,14 @@ si (str_igual(orden, "-o")) {
                             }
                             q = q + 1
                         }
+                        sea silencioso = 0
+                        q = 3
+                        mientras (q < rt_argc()) {
+                            si (str_igual(rt_argumento(q), "--silencioso")) { silencioso = 1 }
+                            q = q + 1
+                        }
                         compilar_archivo(revisado)
-                        mostrar(str_concatenar("✓ sin errores: ", revisado))
+                        si (silencioso == 0) { mostrar(str_concatenar("✓ sin errores: ", revisado)) }
                     } sino {
                         si (termina_en(orden, ".cfv") o existe_ruta(orden)) {
                             ejecutar(orden, 2)
@@ -323,6 +547,7 @@ si (str_igual(orden, "-o")) {
                         }
                     }
                 }
+            }
             }
             }
             }
