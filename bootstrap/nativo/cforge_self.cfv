@@ -38,7 +38,7 @@
 // 272 casillas de dlopen/dlsym en datos (o -1)
 // 280 valores por defecto pendientes [nombre][posición del token]
 // 288 atributos #[...] [atributo][argumentos][función]
-// 296 plataforma objetivo: 0 Linux (ELF) · 1 Windows (PE64)
+// 296 plataforma objetivo: 0 Linux (ELF) · 1 Windows (PE64) · 2 macOS x86-64 (Mach-O)
 // 304 importaciones de Windows [dll][función]
 // 312 etiqueta del trampolín de hilos de Windows (o -1)
 
@@ -92,6 +92,7 @@ funcion ctx_nuevo(tokens) {
 
 funcion ctx_codigo(c) { retornar __cargar64(c + 16) }
 funcion es_windows(c) { retornar __cargar64(c + 296) == 1 }
+funcion es_macos(c) { retornar __cargar64(c + 296) == 2 }
 funcion ctx_modo(c) { retornar __cargar64(c + 104) }
 // 2: programa del usuario · 3: biblioteca del lenguaje (también dinámica)
 funcion dinamico(c) { retornar __cargar64(c + 104) >= 2 }
@@ -699,8 +700,19 @@ funcion nombre_biblioteca_windows(nombre) {
     retornar str_concatenar(nombre, ".dll")
 }
 
+funcion nombre_biblioteca_macos(nombre) {
+    si (str_igual(nombre, "libc") o str_igual(nombre, "c") o str_igual(nombre, "libm") o str_igual(nombre, "m")) { retornar "/usr/lib/libSystem.B.dylib" }
+    si (str_buscar_en(nombre, ".dylib") >= 0 o str_buscar_en(nombre, "/") >= 0) { retornar nombre }
+    sea r = str_nuevo(16)
+    si (str_largo(nombre) < 3 o str_igual(str_rebanar(nombre, 0, 3), "lib") == 0) { str_agregar(r, "lib") }
+    str_agregar(r, nombre)
+    str_agregar(r, ".dylib")
+    retornar r
+}
+
 funcion nombre_biblioteca(nombre) {
     si (mem_global(33) == 1) { retornar nombre_biblioteca_windows(nombre) }
+    si (mem_global(33) == 2) { retornar nombre_biblioteca_macos(nombre) }
     si (str_igual(nombre, "libc") o str_igual(nombre, "c")) { retornar "libc.so.6" }
     si (str_igual(nombre, "libm") o str_igual(nombre, "m")) { retornar "libm.so.6" }
     si (str_buscar_en(nombre, ".so") >= 0 o str_buscar_en(nombre, "/") >= 0) { retornar nombre }
@@ -1327,6 +1339,10 @@ funcion intrinseco(c, nombre) {
         nuevo_arreglo(c, 4, __cargar64(c + 312))
         retornar 1
     }
+    si (str_igual(nombre, "__libsistema")) {
+        llamada_libsistema(c)
+        retornar 1
+    }
     si (str_igual(nombre, "__winapi")) {
         llamada_winapi(c)
         retornar 1
@@ -1574,6 +1590,45 @@ funcion llamar_iat(c, indice, n) {
         e3(c, 72, 129, 196)
         e32(c, 8 * n)
     }
+    retornar 0
+}
+
+// call [GOT] de la importación i (macOS: puntero que llena dyld) con la ABI
+// SysV: los n argumentos apilados van a rdi, rsi, rdx, rcx, r8, r9.
+funcion llamar_sysv_importada(c, indice, n) {
+    si (n > 6) { error_en(c, "__libsistema admite hasta 6 argumentos") }
+    sea i = n
+    mientras (i >= 1) {
+        si (i == 1) { e1(c, 95) }                              // pop rdi
+        si (i == 2) { e1(c, 94) }                              // pop rsi
+        si (i == 3) { e1(c, 90) }                              // pop rdx
+        si (i == 4) { e1(c, 89) }                              // pop rcx
+        si (i == 5) { e2(c, 65, 88) }                          // pop r8
+        si (i == 6) { e2(c, 65, 89) }                          // pop r9
+        i = i - 1
+    }
+    e3(c, 73, 137, 228)                                        // mov r12, rsp
+    e4(c, 72, 131, 228, 240)                                   // and rsp, -16
+    e2(c, 49, 192)                                             // xor eax, eax
+    e3(c, 255, 20, 37)                                         // call [GOT]
+    nuevo_arreglo(c, 5, indice)
+    e3(c, 76, 137, 228)                                        // mov rsp, r12
+    retornar 0
+}
+
+// __libsistema("write", a1, ..., an): función de /usr/lib/libSystem.B.dylib.
+funcion llamada_libsistema(c) {
+    si (es_macos(c) == 0) { error_en(c, "__libsistema solo existe al compilar para macOS") }
+    requerir(c, "(")
+    sea simbolo = decodificar_literal(__cargar64(avanzar(c) + 8))
+    sea n = 0
+    mientras (tomar(c, ",")) {
+        expresion(c)
+        empujar(c)
+        n = n + 1
+    }
+    requerir(c, ")")
+    llamar_sysv_importada(c, importacion_windows(c, "libSystem", simbolo), n)
     retornar 0
 }
 
@@ -3326,16 +3381,33 @@ funcion compilar(c) {
     e3(c, 72, 137, 224)
     e4(c, 72, 137, 4, 37)
     ref_global(c, 504)
+    si (es_macos(c)) {
+        // dyld llama a main(argc, argv, envp): globales 60, 61 y 62.
+        e3(c, 72, 137, 248)                                    // mov rax, rdi
+        e4(c, 72, 137, 4, 37)
+        ref_global(c, 480)
+        e3(c, 72, 137, 240)                                    // mov rax, rsi
+        e4(c, 72, 137, 4, 37)
+        ref_global(c, 488)
+        e3(c, 72, 137, 208)                                    // mov rax, rdx
+        e4(c, 72, 137, 4, 37)
+        ref_global(c, 496)
+    }
     e1(c, 232)
     ref_etiqueta(c, principal)
     si (es_windows(c)) {
         empujar(c)                                             // ExitProcess(código)
         llamar_iat(c, importacion_windows(c, "kernel32.dll", "ExitProcess"), 1)
     } sino {
+    si (es_macos(c)) {
+        empujar(c)                                             // exit(código)
+        llamar_sysv_importada(c, importacion_windows(c, "libSystem", "exit"), 1)
+    } sino {
         e3(c, 72, 137, 199)                                    // mov rdi, rax
         e3(c, 72, 199, 192)                                    // mov rax, 231 (exit_group)
         e32(c, 231)
         e2(c, 15, 5)
+    }
     }
     definir_etiqueta(c, principal)
     sea marco = prologo(c)
@@ -3369,9 +3441,13 @@ funcion emitir_trampolin_hilo(c) {
     e1(c, 83)                                                  // push rbx
     e2(c, 65, 85)                                              // push r13
     e2(c, 65, 84)                                              // push r12
-    e3(c, 73, 137, 205)                                        // mov r13, rcx
+    si (es_macos(c)) {
+        e3(c, 73, 137, 253)                                    // mov r13, rdi (pthread: ABI SysV)
+    } sino {
+        e3(c, 73, 137, 205)                                    // mov r13, rcx (CreateThread)
+    }
     e3(c, 72, 137, 227)                                        // mov rbx, rsp
-    e3(c, 72, 137, 200)                                        // mov rax, rcx
+    e3(c, 76, 137, 232)                                        // mov rax, r13
     e2(c, 72, 5)                                               // add rax, 8 MiB
     e32(c, 8388608)
     e3(c, 72, 137, 196)                                        // mov rsp, rax
@@ -3543,6 +3619,7 @@ funcion aplicar_arreglos(c, va_codigo, va_datos, va_globales, iat) {
 
 funcion empaquetar(c) {
     si (es_windows(c)) { retornar empaquetar_pe(c) }
+    si (es_macos(c)) { retornar empaquetar_macho(c) }
     sea base = 4194304
     sea codigo = ctx_codigo(c)
     sea datos = ctx_datos(c)
@@ -3762,6 +3839,161 @@ funcion empaquetar_pe(c) {
     retornar pe
 }
 
+// ── macOS: ejecutable Mach-O x86-64 ───────────────────────────────────────
+// __PAGEZERO, __TEXT (encabezado y código, r-x), __DATA (datos, punteros de
+// libSystem y globales, rw-) y __LINKEDIT (instrucciones de enlace de dyld).
+// Se carga en 0x400000 (sin PIE); dyld llena los punteros de las funciones
+// de /usr/lib/libSystem.B.dylib y llama a la entrada (LC_MAIN).
+
+funcion uleb128(s, valor) {
+    sea seguir = 1
+    mientras (seguir) {
+        sea b = __y_bits(valor, 127)
+        valor = __desplazar_der(valor, 7)
+        si (valor != 0) { str_agregar_byte(s, __o_bits(b, 128)) } sino {
+            str_agregar_byte(s, b)
+            seguir = 0
+        }
+    }
+    retornar 0
+}
+
+funcion nombre_de_16(s, nombre) {
+    str_agregar(s, nombre)
+    bytes_le(s, 0, 16 - str_largo(nombre))
+    retornar 0
+}
+
+funcion comando_segmento(s, nombre, vmaddr, vmsize, fileoff, filesize, maxprot, initprot, nsects) {
+    bytes_le(s, 25, 4)                                         // LC_SEGMENT_64
+    bytes_le(s, 72 + 80 * nsects, 4)
+    nombre_de_16(s, nombre)
+    bytes_le(s, vmaddr, 8)
+    bytes_le(s, vmsize, 8)
+    bytes_le(s, fileoff, 8)
+    bytes_le(s, filesize, 8)
+    bytes_le(s, maxprot, 4)
+    bytes_le(s, initprot, 4)
+    bytes_le(s, nsects, 4)
+    bytes_le(s, 0, 4)
+    retornar 0
+}
+
+funcion seccion_macho(s, nombre, segmento, addr, tam, offset, alineacion, banderas) {
+    nombre_de_16(s, nombre)
+    nombre_de_16(s, segmento)
+    bytes_le(s, addr, 8)
+    bytes_le(s, tam, 8)
+    bytes_le(s, offset, 4)
+    bytes_le(s, alineacion, 4)
+    bytes_le(s, 0, 8)
+    bytes_le(s, banderas, 4)
+    bytes_le(s, 0, 12)
+    retornar 0
+}
+
+funcion empaquetar_macho(c) {
+    sea base = 4194304
+    sea codigo = ctx_codigo(c)
+    sea datos = ctx_datos(c)
+    sea tam_comandos = 72 + 152 + 152 + 72 + 48 + 24 + 80 + 32 + 24 + 56 + 24
+    sea inicio_codigo = alinear(32 + tam_comandos, 16)
+    sea tam_texto = alinear(inicio_codigo + str_largo(codigo), 4096)
+    // Punteros de libSystem (los llena dyld) al final de los datos.
+    mientras (str_largo(datos) % 8 != 0) { str_agregar_byte(datos, 0) }
+    sea imps = __cargar64(c + 304)
+    sea va_datos = base + tam_texto
+    sea got = vec_nuevo()
+    sea enlaces = str_nuevo(256)
+    str_agregar_byte(enlaces, 17)                              // SET_DYLIB_ORDINAL_IMM 1
+    str_agregar_byte(enlaces, 81)                              // SET_TYPE_IMM POINTER
+    sea i = 0
+    mientras (i < vec_largo(imps)) {
+        sea desplazamiento = str_largo(datos)
+        vec_agregar(got, va_datos + desplazamiento)
+        bytes_le(datos, 0, 8)
+        str_agregar_byte(enlaces, 64)                          // SET_SYMBOL_TRAILING_FLAGS_IMM
+        str_agregar_byte(enlaces, 95)                          // "_" + nombre
+        str_agregar(enlaces, __cargar64(vec_obtener(imps, i) + 8))
+        str_agregar_byte(enlaces, 0)
+        str_agregar_byte(enlaces, 114)                         // SET_SEGMENT_AND_OFFSET_ULEB (segmento 2)
+        uleb128(enlaces, desplazamiento)
+        str_agregar_byte(enlaces, 144)                         // DO_BIND
+        i = i + 1
+    }
+    str_agregar_byte(enlaces, 0)                               // DONE
+    mientras (str_largo(enlaces) % 8 != 0) { str_agregar_byte(enlaces, 0) }
+    sea tam_datos_archivo = alinear(str_largo(datos), 4096)
+    sea inicio_globales = alinear(str_largo(datos), 16)
+    sea tam_datos_memoria = alinear(inicio_globales + 512 + vec_largo(__cargar64(c + 224)) * 8, 4096)
+    aplicar_arreglos(c, base + inicio_codigo, va_datos, va_datos + inicio_globales, got)
+    sea inicio_enlace = tam_texto + tam_datos_archivo
+    sea tabla_cadenas = inicio_enlace + str_largo(enlaces)
+    sea tam_enlace = str_largo(enlaces) + 8
+    sea m = str_nuevo(inicio_enlace + tam_enlace + 64)
+    // mach_header_64
+    bytes_le(m, 4277009103, 4)                                 // MH_MAGIC_64
+    bytes_le(m, 16777223, 4)                                   // CPU_TYPE_X86_64
+    bytes_le(m, 3, 4)
+    bytes_le(m, 2, 4)                                          // MH_EXECUTE
+    bytes_le(m, 11, 4)
+    bytes_le(m, tam_comandos, 4)
+    bytes_le(m, 133, 4)                                        // NOUNDEFS | DYLDLINK | TWOLEVEL
+    bytes_le(m, 0, 4)
+    comando_segmento(m, "__PAGEZERO", 0, base, 0, 0, 0, 0, 0)
+    comando_segmento(m, "__TEXT", base, tam_texto, 0, tam_texto, 5, 5, 1)
+    seccion_macho(m, "__text", "__TEXT", base + inicio_codigo, str_largo(codigo), inicio_codigo, 4, 2147484672)
+    comando_segmento(m, "__DATA", va_datos, tam_datos_memoria, tam_texto, tam_datos_archivo, 3, 3, 1)
+    seccion_macho(m, "__data", "__DATA", va_datos, str_largo(datos), tam_texto, 3, 0)
+    comando_segmento(m, "__LINKEDIT", va_datos + tam_datos_memoria, alinear(tam_enlace, 4096), inicio_enlace, tam_enlace, 1, 1, 0)
+    bytes_le(m, 2147483682, 4)                                 // LC_DYLD_INFO_ONLY
+    bytes_le(m, 48, 4)
+    bytes_le(m, 0, 8)                                          // rebase
+    bytes_le(m, inicio_enlace, 4)                              // bind
+    bytes_le(m, str_largo(enlaces), 4)
+    bytes_le(m, 0, 24)                                         // weak, lazy, export
+    bytes_le(m, 2, 4)                                          // LC_SYMTAB
+    bytes_le(m, 24, 4)
+    bytes_le(m, tabla_cadenas, 4)
+    bytes_le(m, 0, 4)
+    bytes_le(m, tabla_cadenas, 4)
+    bytes_le(m, 8, 4)
+    bytes_le(m, 11, 4)                                         // LC_DYSYMTAB
+    bytes_le(m, 80, 4)
+    bytes_le(m, 0, 72)
+    bytes_le(m, 14, 4)                                         // LC_LOAD_DYLINKER
+    bytes_le(m, 32, 4)
+    bytes_le(m, 12, 4)
+    str_agregar(m, "/usr/lib/dyld")
+    bytes_le(m, 0, 7)
+    bytes_le(m, 2147483688, 4)                                 // LC_MAIN
+    bytes_le(m, 24, 4)
+    bytes_le(m, inicio_codigo, 8)                              // entryoff
+    bytes_le(m, 67108864, 8)                                   // pila: 64 MiB
+    bytes_le(m, 12, 4)                                         // LC_LOAD_DYLIB
+    bytes_le(m, 56, 4)
+    bytes_le(m, 24, 4)
+    bytes_le(m, 2, 4)
+    bytes_le(m, 85197824, 4)                                   // 1300.0.0
+    bytes_le(m, 65536, 4)
+    str_agregar(m, "/usr/lib/libSystem.B.dylib")
+    bytes_le(m, 0, 6)
+    bytes_le(m, 50, 4)                                         // LC_BUILD_VERSION
+    bytes_le(m, 24, 4)
+    bytes_le(m, 1, 4)                                          // macOS
+    bytes_le(m, 659200, 4)                                     // minos 10.15
+    bytes_le(m, 659200, 4)                                     // sdk 10.15
+    bytes_le(m, 0, 4)
+    mientras (str_largo(m) < inicio_codigo) { str_agregar_byte(m, 0) }
+    str_agregar(m, codigo)
+    mientras (str_largo(m) < tam_texto) { str_agregar_byte(m, 0) }
+    str_agregar(m, datos)
+    mientras (str_largo(m) < inicio_enlace) { str_agregar_byte(m, 0) }
+    str_agregar(m, enlaces)
+    bytes_le(m, 0, 8)                                          // tabla de cadenas vacía
+    retornar m
+}
+
 // ── Programa ──────────────────────────────────────────────────────────────
 //
 // cforge-self -o salida [--stdlib DIR] archivos... [--puente archivos...]
@@ -3901,7 +4133,7 @@ funcion cli_bajo_nivel() {
         } sino {
         si (str_igual(argumento, "--target")) {
             indice = indice + 1
-            si (str_igual(rt_argumento(indice), "windows")) { mem_fijar_global(33, 1) } sino { mem_fijar_global(33, 0) }
+            mem_fijar_global(33, numero_plataforma(rt_argumento(indice)))
         } sino {
             sea nuevo_modo = modo_de_opcion(argumento)
             si (nuevo_modo >= 0) {
@@ -3926,6 +4158,15 @@ funcion cli_bajo_nivel() {
     str_agregar(mensaje, str_desde_entero(str_largo(ejecutable)))
     str_agregar(mensaje, " bytes)")
     mostrar(mensaje)
+    retornar 0
+}
+
+// linux → 0 · windows → 1 · macos → 2
+funcion numero_plataforma(nombre) {
+    si (str_igual(nombre, "windows") o str_igual(nombre, "win64")) { retornar 1 }
+    si (str_igual(nombre, "macos") o str_igual(nombre, "macos-x64") o str_igual(nombre, "darwin")) { retornar 2 }
+    si (str_igual(nombre, "linux")) { retornar 0 }
+    rt_panico(str_concatenar("plataforma desconocida: ", str_concatenar(nombre, " (linux, windows, macos)")))
     retornar 0
 }
 

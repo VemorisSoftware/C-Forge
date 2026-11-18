@@ -16,10 +16,11 @@ falla() { fallas="$fallas $1"; echo "  ✗ $1: $2"; }
 case "$(uname -s)" in MINGW*|MSYS*|CYGWIN*) WINDOWS=1 ;; *) WINDOWS=0 ;; esac
 hay_sdl() {
   if [ $WINDOWS = 1 ]; then [ -f "$(dirname "$C")/SDL2.dll" ]; return; fi
+  if [ "$(uname -s)" = Darwin ]; then file /usr/local/lib/libSDL2.dylib 2>/dev/null | grep -q x86_64; return; fi
   ldconfig -p 2>/dev/null | grep -q libSDL2-2.0
 }
 puerto_escuchando() {
-  if [ -r /proc/net/tcp ]; then grep -q ":0FA0 00000000:0000 0A" /proc/net/tcp; else netstat -an 2>/dev/null | grep -q ":4000 .*LISTEN"; fi
+  if [ -r /proc/net/tcp ]; then grep -q ":0FA0 00000000:0000 0A" /proc/net/tcp; else netstat -an 2>/dev/null | grep -Eq "[.:]4000 .*LISTEN"; fi
 }
 detener_programas() {
   if [ $WINDOWS = 1 ]; then taskkill //F //FI "IMAGENAME eq cforge-run-*" >/dev/null 2>&1; else pkill -f cforge-run- >/dev/null 2>&1; fi
@@ -58,7 +59,7 @@ for f in ejemplos/*.cfv; do
     *)
       (cd ejemplos && SDL_VIDEODRIVER=${SDL_VIDEODRIVER:-dummy} timeout 10 "$C" "$b.cfv") > "$tmp/out" 2>/dev/null
       echo $? > "$tmp/codigo"
-      sed -i "s/random \(.*\): .*/random \1: N/" "$tmp/out"
+      sed "s/random \(.*\): .*/random \1: N/" "$tmp/out" > "$tmp/out2" && mv "$tmp/out2" "$tmp/out"
       if diff -u "ejemplos/salidas/$b.salida" "$tmp/out" && diff -q "ejemplos/salidas/$b.codigo" "$tmp/codigo" >/dev/null; then ok=$((ok + 1)); else falla "$b" "salida o código distintos"; fi
       ;;
   esac
