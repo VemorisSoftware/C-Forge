@@ -1,38 +1,34 @@
 #!/usr/bin/env bash
+# build-deb.sh VERSION ARQUITECTURA BINARIO — paquete .deb de C-Forge.
+# El binario (cforge para Linux x64 o ARM64) lo compila C-Forge mismo
+# (make build / compilación cruzada); no se necesita C++.
 set -euo pipefail
 
-VERSION="${1:-2.6.0}"
-ARCH="${2:-all}"
+VERSION="${1:?versión}"
+ARCH="${2:?arquitectura (amd64 | arm64)}"
+BINARIO="${3:?ruta del binario cforge}"
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
-STAGE="$ROOT/dist/deb-root"
+STAGE="$ROOT/dist/deb-root-$ARCH"
 PACKAGE="$ROOT/dist/cforge_${VERSION}_${ARCH}.deb"
 
 rm -rf "$STAGE"
 mkdir -p "$STAGE/DEBIAN" "$STAGE/usr/lib/cforge/stdlib" "$STAGE/usr/bin"
-if [ "$ARCH" = "amd64" ] && [ -x "$ROOT/cforge-nativo" ]; then
-  # cforge oficial: compilador nativo autoalojado; el intérprete C++ queda
-  # como cforge-clasico para lo que el compilador nativo aún no cubre.
-  install -m 0755 "$ROOT/cforge-nativo" "$STAGE/usr/bin/cforge"
-  "${CXX:-g++}" -std=c++20 -O2 -I"$ROOT" -I"$ROOT/include" \
-    "$ROOT/cforgev.cpp" -o "$STAGE/usr/bin/cforge-clasico" -pthread -ldl
-else
-  "${CXX:-g++}" -std=c++20 -O2 -I"$ROOT" -I"$ROOT/include" \
-    "$ROOT/cforgev.cpp" -o "$STAGE/usr/bin/cforge" -pthread -ldl
-fi
+install -m 0755 "$BINARIO" "$STAGE/usr/bin/cforge"
 install -m 0644 "$ROOT"/stdlib/*.cfv "$STAGE/usr/lib/cforge/stdlib/"
-ln -s cforge "$STAGE/usr/bin/cforgev"
 
-cat > "$STAGE/DEBIAN/control" <<EOF
+cat > "$STAGE/DEBIAN/control" <<CONTROL
 Package: cforge
 Version: $VERSION
 Section: devel
 Priority: optional
 Architecture: $ARCH
 Maintainer: Vemoris Group <hola@vemorisgroup.com>
-Homepage: https://github.com/VemorisSoftware/C-Forge
-Description: Runtime estable del lenguaje C-Forge
- Ejecuta programas y pruebas .cfv sin Python, JVM, .NET ni Node.
-EOF
-dpkg-deb --root-owner-group --build "$STAGE" "$PACKAGE"
+Homepage: https://c-forge.org
+Recommends: git
+Description: Lenguaje de programación C-Forge (100 % C-Forge)
+ Compilador nativo autoalojado de C-Forge: genera ejecutables para Linux,
+ Windows, macOS e iOS sin C++, libc ni enlazador externo.
+CONTROL
+dpkg-deb --root-owner-group --build "$STAGE" "$PACKAGE" >/dev/null
 rm -rf "$STAGE"
 echo "$PACKAGE"

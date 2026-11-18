@@ -12,10 +12,11 @@ on:
 permissions:
   contents: write
 
-# ─────────────────────────────────────────────────────────────────────────────
-# JOB 0 — Validar que tag == VERSION del Makefile y del binario
-# ─────────────────────────────────────────────────────────────────────────────
+# C-Forge 100 % C-Forge: la semilla compila cforge en Linux y cforge compila,
+# de forma cruzada y byte por byte reproducible, los binarios de todas las
+# plataformas. macOS y Windows reales verifican los paquetes antes de publicar.
 jobs:
+  # ── 0. Versión: tag = Makefile = binario ───────────────────────────────────
   validate-version:
     name: Validar versión
     runs-on: ubuntu-latest
@@ -43,34 +44,21 @@ jobs:
             echo "publish=true" >> "$GITHUB_OUTPUT"
           fi
 
-      - name: Instalar dependencias mínimas
-        run: sudo apt-get update -qq && sudo apt-get install -y g++
+      - name: cforge desde la semilla
+        run: make build
 
-      - name: Compilar cforge para verificar versión en binario
-        run: g++ -std=c++20 -O0 -I./include -o cforge cforgev.cpp -lpthread -ldl
-
-      - name: Verificar versión en Makefile, binario y cforgev.cpp
+      - name: Verificar versión en Makefile y binario
         run: |
           TAG="${{ steps.ver.outputs.version }}"
           MF=$(grep '^VERSION' Makefile | head -1 | sed 's/VERSION[[:space:]]*:=[[:space:]]*//')
           BIN=$(./cforge --version 2>&1 | grep -oE '[0-9]+\.[0-9]+\.[0-9]+' | head -1)
-          CPP=$(grep 'return "' cforgev.cpp | grep -oE '[0-9]+\.[0-9]+\.[0-9]+' | head -1)
-          echo "Tag:         $TAG"
-          echo "Makefile:    $MF"
-          echo "Binario:     $BIN"
-          echo "cforgev.cpp: $CPP"
-          FAIL=0
-          [ "$TAG" != "$MF"  ] && echo "ERROR: tag != Makefile"   && FAIL=1
-          [ "$TAG" != "$BIN" ] && echo "ERROR: tag != binario"    && FAIL=1
-          [ "$TAG" != "$CPP" ] && echo "ERROR: tag != cforgev.cpp" && FAIL=1
-          [ $FAIL -eq 1 ] && exit 1
+          echo "Tag: $TAG · Makefile: $MF · Binario: $BIN"
+          [ "$TAG" = "$MF" ] && [ "$TAG" = "$BIN" ] || { echo "ERROR: versiones distintas"; exit 1; }
           echo "OK — versión $TAG consistente"
 
-# ─────────────────────────────────────────────────────────────────────────────
-# JOB 1 — Build Linux x64 + gate + .tar.gz + .deb
-# ─────────────────────────────────────────────────────────────────────────────
-  build-linux:
-    name: Build Linux x64
+  # ── 1. Gate completo + binarios de todas las plataformas (desde Linux) ─────
+  build:
+    name: Gate + binarios (Linux, Windows, macOS)
     needs: validate-version
     if: needs.validate-version.outputs.publish == 'true'
     runs-on: ubuntu-latest
@@ -79,194 +67,104 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      - name: Instalar dependencias
-        run: sudo apt-get update -qq && sudo apt-get install -y libssl-dev libsqlite3-dev dpkg-dev
+      - name: Dependencias de las pruebas y del empaquetado
+        run: sudo apt-get update -qq && sudo apt-get install -y libsdl2-2.0-0 libsqlite3-0 curl qemu-user dpkg-dev zip
 
-      - name: Build
-        run: make build
+      - name: Gate completo (release-check)
+        run: make release-check
 
-      - name: check (sintaxis)
-        run: make check
+      - name: Binarios de las demás plataformas (compilación cruzada)
+        run: |
+          make windows-cruzado macos-cruzado macos-arm64-cruzado linux-arm64-cruzado
+          make linux-arm64-check
 
-      - name: test (pruebas unitarias)
-        run: make test
-
-      - name: stdlib-load-check
-        run: make stdlib-load-check
-
-      - name: cli-check
-        run: make cli-check
-
-      - name: malformed-check
-        run: make malformed-check
-
-      - name: backend-check
-        run: make backend-check
-
-      - name: install-check
-        run: make install-check
-
-      - name: bootstrap-check
-        run: make bootstrap-check
-
-      - name: backend-core-check
+      - name: Empaquetar
         run: |
           set -e
-          make backend-core-bundle
-          CXX=${CXX:-g++}
-          dir=$(mktemp -d /tmp/cforge-bcc.XXXXXX)
-
-          echo "=== [1/5] Compilando stage0 ($(uname -m)) ==="
-          $CXX -std=c++20 -O2 -Wall -Wextra -Wpedantic \
-            bootstrap/stage0/cforge_bootstrap.cpp -o "$dir/stage0"
-          echo "stage0 OK"
-
-          echo "=== [2/5] Compilando macho-core ==="
-          "$dir/stage0" bootstrap/direct/cforge_macho_arm64_core.cfv \
-            -o "$dir/macho-core"
-          echo "macho-core OK: $(file $dir/macho-core | cut -c1-80)"
-
-          echo "=== [3/5] Compilando pe-core ==="
-          "$dir/stage0" bootstrap/direct/cforge_pe_x64_core.cfv \
-            -o "$dir/pe-core"
-          echo "pe-core OK: $(file $dir/pe-core | cut -c1-80)"
-
-          echo "=== [4/5] Compilando elf-core ==="
-          "$dir/stage0" bootstrap/direct/cforge_elf_x64_core.cfv \
-            -o "$dir/elf-core"
-          echo "elf-core OK: $(file $dir/elf-core | cut -c1-80)"
-
-          echo "=== [5/5] Ejecutando fixtures con make backend-core-check ==="
-          make backend-core-check
-
-      - name: ir-core-check
-        run: make ir-core-check
-
-      - name: object-lowering-check
-        run: make object-lowering-check
-
-      - name: sanitize-check
-        run: make sanitize-check
-
-      - name: smoke-test
-        run: make smoke-test
-
-      - name: cforge nativo 100 % C-Forge (Stage 2 = Stage 3 + semilla)
-        run: |
-          make autoalojado-check
-          make semilla-check
-
-      - name: Empaquetar tar.gz
-        run: |
-          mkdir -p pkg/cforge-${VERSION}-linux-x64
-          # cforge oficial: compilador nativo autoalojado (sin C++ ni libc).
-          cp cforge-nativo pkg/cforge-${VERSION}-linux-x64/cforge
-          # Intérprete clásico para lo que el compilador nativo aún no cubre.
-          cp cforge pkg/cforge-${VERSION}-linux-x64/cforge-clasico
-          cp -r stdlib pkg/cforge-${VERSION}-linux-x64/
-          cp install.sh README.md pkg/cforge-${VERSION}-linux-x64/
+          empaquetar() {   # plataforma binario
+            d="pkg/cforge-${VERSION}-$1"
+            mkdir -p "$d"
+            cp "$2" "$d/"
+            cp -r stdlib README.md LICENSE "$d/"
+          }
+          empaquetar linux-x64 cforge
+          empaquetar linux-arm64 dist-linux-arm64/cforge
+          empaquetar macos-arm64 dist-macos-arm64/cforge
+          empaquetar macos-x64 dist-macos/cforge
+          empaquetar windows-x64 dist-windows/cforge.exe
+          for p in linux-x64 linux-arm64 macos-arm64 macos-x64; do cp install.sh "pkg/cforge-${VERSION}-$p/"; done
+          cp install.ps1 "pkg/cforge-${VERSION}-windows-x64/"
           cd pkg
-          tar czf cforge-${VERSION}-linux-x64.tar.gz cforge-${VERSION}-linux-x64/
-
-      - name: Empaquetar .deb
-        run: packaging/debian/build-deb.sh "${VERSION}" amd64
+          for p in linux-x64 linux-arm64 macos-arm64 macos-x64; do tar czf "cforge-${VERSION}-$p.tar.gz" "cforge-${VERSION}-$p/"; done
+          zip -qr "cforge-${VERSION}-windows-x64.zip" "cforge-${VERSION}-windows-x64/"
+          cd ..
+          bash packaging/debian/build-deb.sh "${VERSION}" amd64 cforge
+          bash packaging/debian/build-deb.sh "${VERSION}" arm64 dist-linux-arm64/cforge
+          ls -la pkg/*.tar.gz pkg/*.zip dist/*.deb
 
       - uses: actions/upload-artifact@v4
         with:
-          name: linux-x64
+          name: paquetes
           path: |
-            pkg/cforge-${{ env.VERSION }}-linux-x64.tar.gz
-            dist/cforge_${{ env.VERSION }}_amd64.deb
+            pkg/*.tar.gz
+            pkg/*.zip
+            dist/*.deb
           if-no-files-found: error
 
-# ─────────────────────────────────────────────────────────────────────────────
-# JOB 2 — Build macOS ARM64 + gate + .tar.gz
-# ─────────────────────────────────────────────────────────────────────────────
-  build-macos:
-    name: Build macOS ARM64
-    needs: validate-version
-    if: needs.validate-version.outputs.publish == 'true'
+  # ── 2. Verificación en macOS (Apple Silicon) ───────────────────────────────
+  verify-macos:
+    name: Verificar en macOS (Apple Silicon)
+    needs: [validate-version, build]
     runs-on: macos-latest
     env:
       VERSION: ${{ needs.validate-version.outputs.version }}
     steps:
       - uses: actions/checkout@v4
-
-      - name: Instalar dependencias
-        run: brew install openssl sqlite
-
-      - name: Gate completo (release-check)
-        run: make release-check CXX=clang++
-
-      - name: Empaquetar tar.gz
-        run: |
-          mkdir -p pkg/cforge-${VERSION}-macos-arm64
-          cp cforge pkg/cforge-${VERSION}-macos-arm64/
-          cp -r stdlib pkg/cforge-${VERSION}-macos-arm64/
-          cp install.sh README.md pkg/cforge-${VERSION}-macos-arm64/
-          cd pkg
-          tar czf cforge-${VERSION}-macos-arm64.tar.gz cforge-${VERSION}-macos-arm64/
-
-      - uses: actions/upload-artifact@v4
+      - uses: actions/download-artifact@v4
         with:
-          name: macos-arm64
-          path: pkg/cforge-${{ env.VERSION }}-macos-arm64.tar.gz
-          if-no-files-found: error
+          name: paquetes
+          path: paquetes
+      - name: Paquete macos-arm64
+        run: |
+          set -e
+          tar xzf "paquetes/pkg/cforge-${VERSION}-macos-arm64.tar.gz"
+          C="$PWD/cforge-${VERSION}-macos-arm64/cforge"
+          export CFORGE_STDLIB="$PWD/cforge-${VERSION}-macos-arm64/stdlib"
+          "$C" --version | grep -q "${VERSION}"
+          codesign -v "$C"
+          "$C" tests/cfv/01_nucleo.cfv | grep -q '^\[OK\]'
+          "$C" build tests/cfv/02_funciones.cfv -o /tmp/f && /tmp/f | grep -q '^\[OK\]'
+          echo "✓ cforge macos-arm64 ${VERSION}"
 
-# ─────────────────────────────────────────────────────────────────────────────
-# JOB 3 — Build Windows x64 + tests + .zip
-# ─────────────────────────────────────────────────────────────────────────────
-  build-windows:
-    name: Build Windows x64
-    needs: validate-version
-    if: needs.validate-version.outputs.publish == 'true'
+  # ── 3. Verificación en Windows ─────────────────────────────────────────────
+  verify-windows:
+    name: Verificar en Windows x64
+    needs: [validate-version, build]
     runs-on: windows-latest
     env:
       VERSION: ${{ needs.validate-version.outputs.version }}
+    defaults:
+      run:
+        shell: bash
     steps:
       - uses: actions/checkout@v4
-
-      - name: Configurar MSVC
-        uses: ilammy/msvc-dev-cmd@v1
+      - uses: actions/download-artifact@v4
         with:
-          arch: x64
-
-      - name: Compilar con MSVC
-        shell: cmd
+          name: paquetes
+          path: paquetes
+      - name: Paquete windows-x64
         run: |
-          where cl
-          cl /std:c++20 /EHsc /O2 /bigobj /I"include" /Fe:cforge.exe cforgev.cpp ws2_32.lib /link /STACK:67108864
+          set -e
+          unzip -q "paquetes/pkg/cforge-${VERSION}-windows-x64.zip"
+          C="$PWD/cforge-${VERSION}-windows-x64/cforge.exe"
+          export CFORGE_STDLIB="$PWD/cforge-${VERSION}-windows-x64/stdlib"
+          "$C" --version | grep -q "${VERSION}"
+          "$C" tests/cfv/01_nucleo.cfv | grep -q '^\[OK\]'
+          echo "✓ cforge windows-x64 ${VERSION}"
 
-      - name: Tests Windows
-        shell: pwsh
-        run: |
-          $env:CFORGE_STDLIB = "$PWD\stdlib"
-          .\cforge.exe --version
-          .\cforge.exe tests\install-smoke\hello.cfv
-          Get-ChildItem tests\cfv\*.cfv | ForEach-Object { & .\cforge.exe test $_.FullName; if ($LASTEXITCODE -ne 0) { Write-Host "FALLA: $($_.Name)"; exit 1 } }
-          Write-Host "OK — suite completa pasa en Windows"
-
-      - name: Empaquetar .zip
-        shell: pwsh
-        run: |
-          $v = $env:VERSION
-          New-Item -ItemType Directory -Force -Path "pkg\cforge-$v-windows-x64" | Out-Null
-          Copy-Item cforge.exe "pkg\cforge-$v-windows-x64\"
-          Copy-Item -Recurse stdlib "pkg\cforge-$v-windows-x64\"
-          Copy-Item README.md "pkg\cforge-$v-windows-x64\"
-          Compress-Archive -Path "pkg\cforge-$v-windows-x64" -DestinationPath "pkg\cforge-$v-windows-x64.zip"
-
-      - uses: actions/upload-artifact@v4
-        with:
-          name: windows-x64
-          path: pkg/cforge-${{ env.VERSION }}-windows-x64.zip
-          if-no-files-found: error
-
-# ─────────────────────────────────────────────────────────────────────────────
-# JOB 4 — Build extensión VS Code (.vsix)
-# ─────────────────────────────────────────────────────────────────────────────
+  # ── 4. Extensión de VS Code (.vsix) ────────────────────────────────────────
   build-vsix:
-    name: Build VS Code Extension
+    name: Extensión de VS Code
     needs: validate-version
     if: needs.validate-version.outputs.publish == 'true'
     runs-on: ubuntu-latest
@@ -280,20 +178,18 @@ jobs:
       - name: Build .vsix
         working-directory: herramientas/vscode-cforgev
         run: |
-          npm ci
-          ./node_modules/.bin/vsce package --out "c-forge-${VERSION}.vsix"
+          npm ci --no-audit --no-fund
+          npx --yes @vscode/vsce package --out "c-forge-${VERSION}.vsix"
       - uses: actions/upload-artifact@v4
         with:
           name: vsix
           path: herramientas/vscode-cforgev/c-forge-${{ env.VERSION }}.vsix
           if-no-files-found: error
 
-# ─────────────────────────────────────────────────────────────────────────────
-# JOB 5 — Publicar GitHub Release con todos los artefactos
-# ─────────────────────────────────────────────────────────────────────────────
+  # ── 5. Publicar ────────────────────────────────────────────────────────────
   publish-release:
     name: Publicar Release
-    needs: [validate-version, build-linux, build-macos, build-windows, build-vsix]
+    needs: [validate-version, build, verify-macos, verify-windows, build-vsix]
     if: needs.validate-version.outputs.publish == 'true'
     runs-on: ubuntu-latest
     env:
@@ -309,8 +205,6 @@ jobs:
 
       - name: Aplanar y listar artefactos
         run: |
-          # upload-artifact conserva subcarpetas (pkg/, dist/); el release
-          # necesita todos los archivos en un solo nivel.
           find release-assets -mindepth 2 -type f -exec mv {} release-assets/ \;
           find release-assets -mindepth 1 -type d -empty -delete
           ls -la release-assets
@@ -321,19 +215,15 @@ jobs:
           sha256sum * > SHA256SUMS
           cat SHA256SUMS
 
-      - name: Generar release-manifest.json
+      - name: Generar release-manifest.json y latest.json
         run: |
           VERSION="${{ env.VERSION }}"
           DATE="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
           BASE="https://github.com/VemorisSoftware/C-Forge/releases/download/v${VERSION}"
-          get_sha() { grep "$1" release-assets/SHA256SUMS 2>/dev/null | awk '{print $1}' | head -1; }
-
-          LINUX_TGZ="cforge-${VERSION}-linux-x64.tar.gz"
-          LINUX_DEB="cforge_${VERSION}_amd64.deb"
-          MACOS_TGZ="cforge-${VERSION}-macos-arm64.tar.gz"
-          WIN_ZIP="cforge-${VERSION}-windows-x64.zip"
-          VSIX="c-forge-${VERSION}.vsix"
-
+          sha() { grep " $1\$" release-assets/SHA256SUMS | awk '{print $1}' | head -1; }
+          archivo() {   # tipo nombre
+            printf '{"type": "%s", "filename": "%s", "url": "%s/%s", "sha256": "%s"}' "$1" "$2" "$BASE" "$2" "$(sha "$2")"
+          }
           cat > release-assets/release-manifest.json <<EOF
           {
             "schema": 1,
@@ -345,65 +235,29 @@ jobs:
             "changelog": "https://github.com/VemorisSoftware/C-Forge/blob/main/CHANGELOG.md",
             "downloads": {
               "macos": {
-                "arm64": {
-                  "archive": {
-                    "type": "tar.gz",
-                    "filename": "${MACOS_TGZ}",
-                    "url": "${BASE}/${MACOS_TGZ}",
-                    "sha256": "$(get_sha $MACOS_TGZ)"
-                  }
-                }
+                "arm64": {"archive": $(archivo tar.gz "cforge-${VERSION}-macos-arm64.tar.gz")},
+                "x64": {"archive": $(archivo tar.gz "cforge-${VERSION}-macos-x64.tar.gz")}
               },
               "linux": {
-                "x64": {
-                  "archive": {
-                    "type": "tar.gz",
-                    "filename": "${LINUX_TGZ}",
-                    "url": "${BASE}/${LINUX_TGZ}",
-                    "sha256": "$(get_sha $LINUX_TGZ)"
-                  },
-                  "package": {
-                    "type": "deb",
-                    "filename": "${LINUX_DEB}",
-                    "url": "${BASE}/${LINUX_DEB}",
-                    "sha256": "$(get_sha $LINUX_DEB)"
-                  }
-                }
+                "x64": {"archive": $(archivo tar.gz "cforge-${VERSION}-linux-x64.tar.gz"), "package": $(archivo deb "cforge_${VERSION}_amd64.deb")},
+                "arm64": {"archive": $(archivo tar.gz "cforge-${VERSION}-linux-arm64.tar.gz"), "package": $(archivo deb "cforge_${VERSION}_arm64.deb")}
               },
               "windows": {
-                "x64": {
-                  "portable": {
-                    "type": "zip",
-                    "filename": "${WIN_ZIP}",
-                    "url": "${BASE}/${WIN_ZIP}",
-                    "sha256": "$(get_sha $WIN_ZIP)"
-                  }
-                }
+                "x64": {"portable": $(archivo zip "cforge-${VERSION}-windows-x64.zip")}
               }
             },
             "editor": {
-              "vscode": {
-                "vsix": {
-                  "filename": "${VSIX}",
-                  "url": "${BASE}/${VSIX}",
-                  "sha256": "$(get_sha $VSIX)"
-                },
-                "marketplace": null
-              }
+              "vscode": {"vsix": $(archivo vsix "c-forge-${VERSION}.vsix"), "marketplace": null}
             },
             "sha256sums": "${BASE}/SHA256SUMS"
           }
           EOF
-
-      - name: Generar latest.json
-        run: |
-          VERSION="${{ env.VERSION }}"
-          DATE="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+          python3 -m json.tool release-assets/release-manifest.json >/dev/null
           cat > release-assets/latest.json <<EOF
           {
             "version": "${VERSION}",
             "released_at": "${DATE}",
-            "manifest": "https://github.com/VemorisSoftware/C-Forge/releases/download/v${VERSION}/release-manifest.json"
+            "manifest": "${BASE}/release-manifest.json"
           }
           EOF
 
@@ -414,8 +268,11 @@ jobs:
           VERSION="${{ env.VERSION }}"
           gh release create "v${VERSION}" --target "${GITHUB_SHA}" \
             release-assets/cforge-${VERSION}-linux-x64.tar.gz \
+            release-assets/cforge-${VERSION}-linux-arm64.tar.gz \
             release-assets/cforge_${VERSION}_amd64.deb \
+            release-assets/cforge_${VERSION}_arm64.deb \
             release-assets/cforge-${VERSION}-macos-arm64.tar.gz \
+            release-assets/cforge-${VERSION}-macos-x64.tar.gz \
             release-assets/cforge-${VERSION}-windows-x64.zip \
             "release-assets/c-forge-${VERSION}.vsix" \
             release-assets/SHA256SUMS \

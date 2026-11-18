@@ -48,11 +48,9 @@ oficial. Un cambio de umbral debe actualizar los tres en el mismo commit.
 
 ## Núcleo autónomo
 
-No existe una implementación Python activa. Stage 0 es un motor C++20 usado
-únicamente para construir el binario distribuido. No se
-declarará autónomo hasta que el compilador escrito en C-Forge compile y ejecute
-el núcleo sin depender de Python, C++, JVM, .NET, Node ni LLVM y pase el contrato
-Stage 2/3.
+C-Forge es autónomo: el compilador escrito en C-Forge compila y ejecuta el
+núcleo sin depender de Python, C++, JVM, .NET, Node ni LLVM y cumple el
+contrato Stage 2/3 desde la semilla (ver `docs/BOOTSTRAP.md`).
 
 El contrato de Stage 0/1/2/3 y el subconjunto congelado están definidos en
 [`BOOTSTRAP.md`](BOOTSTRAP.md). Un componente escrito en `.cfv` no convierte por

@@ -47,10 +47,11 @@ VERSION="${VERSION#v}"
 OS=$(uname -s); ARCH=$(uname -m)
 PAQUETE=""
 case "$OS-$ARCH" in
-  Linux-x86_64|Linux-amd64) PAQUETE="cforge-${VERSION}-linux-x64" ;;
-  Darwin-arm64)             PAQUETE="cforge-${VERSION}-macos-arm64" ;;
-  Linux-*|Darwin-*)         warn "no hay binario para ${OS} ${ARCH}; se compilará desde el código fuente" ;;
-  *) fail "sistema no soportado: ${OS}. En Windows descarga el .zip desde ${GITHUB}/releases" ;;
+  Linux-x86_64|Linux-amd64)  PAQUETE="cforge-${VERSION}-linux-x64" ;;
+  Linux-aarch64|Linux-arm64) PAQUETE="cforge-${VERSION}-linux-arm64" ;;
+  Darwin-arm64)              PAQUETE="cforge-${VERSION}-macos-arm64" ;;
+  Darwin-x86_64)             PAQUETE="cforge-${VERSION}-macos-x64" ;;
+  *) fail "sistema no soportado: ${OS} ${ARCH}. En Windows: irm https://c-forge.org/install.ps1 | iex" ;;
 esac
 [ "${CFORGE_FROM_SOURCE:-0}" = "1" ] && PAQUETE=""
 
@@ -89,31 +90,19 @@ if [ -n "$PAQUETE" ]; then
   tar -xzf "$TMP/${PAQUETE}.tar.gz" -C "$TMP"
   ORIGEN="$TMP/${PAQUETE}"
   [ -x "$ORIGEN/cforge" ] || fail "el paquete no contiene el binario cforge"
-elif [ "$OS" = "Linux" ] && { [ "$ARCH" = "x86_64" ] || [ "$ARCH" = "amd64" ]; } && [ "${CFORGE_CLASICO:-0}" != "1" ]; then
-  # ── Desde el código fuente, sin C++: la semilla compila cforge ──────────
-  info "descargando código fuente v${VERSION}"
-  descargar "${GITHUB}/archive/refs/tags/v${VERSION}.tar.gz" "$TMP/src.tar.gz" \
-    || fail "no existe la versión v${VERSION}"
-  tar -xzf "$TMP/src.tar.gz" -C "$TMP"
-  ORIGEN=$(find "$TMP" -maxdepth 1 -type d -name 'C-Forge-*' | head -1)
-  [ -f "$ORIGEN/bootstrap/semilla/cforge-linux-x64" ] || fail "esta versión no trae la semilla nativa (usa CFORGE_CLASICO=1)"
-  info "compilando cforge con la semilla (C-Forge se compila a sí mismo)"
-  (cd "$ORIGEN" && make cforge-desde-semilla >/dev/null) || fail "la compilación falló"
-else
-  # ── Compilación desde el código fuente ───────────────────────────────────
-  CXX="${CXX:-}"
-  if [ -z "$CXX" ]; then
-    if tiene clang++; then CXX=clang++; elif tiene g++; then CXX=g++; fi
-  fi
-  [ -n "$CXX" ] || fail "se necesita un compilador C++20 (macOS: xcode-select --install · Ubuntu: sudo apt install g++)"
+elif [ "$OS" = "Linux" ] && { [ "$ARCH" = "x86_64" ] || [ "$ARCH" = "amd64" ]; }; then
+  # ── Desde el código fuente: la semilla compila cforge (sin C++) ─────────
   tiene make || fail "se necesita make"
   info "descargando código fuente v${VERSION}"
   descargar "${GITHUB}/archive/refs/tags/v${VERSION}.tar.gz" "$TMP/src.tar.gz" \
     || fail "no existe la versión v${VERSION}"
   tar -xzf "$TMP/src.tar.gz" -C "$TMP"
   ORIGEN=$(find "$TMP" -maxdepth 1 -type d -name 'C-Forge-*' | head -1)
-  info "compilando con ${CXX} (tarda un par de minutos)"
-  (cd "$ORIGEN" && make build CXX="$CXX" >/dev/null) || fail "la compilación falló"
+  [ -f "$ORIGEN/bootstrap/semilla/cforge-linux-x64" ] || fail "esta versión no trae la semilla nativa"
+  info "compilando cforge con la semilla (C-Forge se compila a sí mismo)"
+  (cd "$ORIGEN" && make build >/dev/null) || fail "la compilación falló"
+else
+  fail "no hay binario para ${OS} ${ARCH}"
 fi
 
 # ── Instalar ───────────────────────────────────────────────────────────────
@@ -122,11 +111,6 @@ $SUDO rm -rf "$LIB_DIR/stdlib"
 $SUDO cp -R "$ORIGEN/stdlib" "$LIB_DIR/stdlib"
 $SUDO cp "$ORIGEN/cforge" "$BIN_DIR/cforge"
 $SUDO chmod 755 "$BIN_DIR/cforge"
-if [ -f "$ORIGEN/cforge-clasico" ]; then
-  # Intérprete clásico para lo que el compilador nativo aún no cubre.
-  $SUDO cp "$ORIGEN/cforge-clasico" "$BIN_DIR/cforge-clasico"
-  $SUDO chmod 755 "$BIN_DIR/cforge-clasico"
-fi
 $SUDO ln -sf cforge "$BIN_DIR/c-forge"
 if [ "$OS" = "Darwin" ]; then
   # Quita la cuarentena de Gatekeeper del binario descargado.

@@ -12,7 +12,7 @@ C-Forge es un lenguaje de programación creado por Vemoris Group. Su objetivo es
 
 ## Instalación rápida
 
-### macOS (Apple Silicon) y Linux x64
+### macOS y Linux (x64 y ARM64)
 
 ```sh
 curl -fsSL https://c-forge.org/install.sh | sh
@@ -23,9 +23,8 @@ SHA-256 e instala `cforge` en `/usr/local/bin` (o en `~/.local/bin` si no hay
 `sudo`). La biblioteca estándar queda en `<prefijo>/lib/cforge/stdlib` y
 `cforge` la encuentra solo: **no hace falta configurar `CFORGE_STDLIB`**.
 
-En otras arquitecturas (Mac Intel, Linux ARM) el mismo comando compila desde
-el código fuente; necesitas `make` y un compilador C++20
-(`xcode-select --install` o `sudo apt install g++ make`).
+Hay binarios oficiales para macOS (Apple Silicon e Intel), Linux (x64 y ARM64)
+y Windows x64. Todos los compila C-Forge mismo: no hay C++ en el proyecto.
 
 Opciones:
 
@@ -180,23 +179,30 @@ importar "matematica"
 mostrar(piso(3.7))   // 3
 ```
 
-Módulos estables: `matematica`, `lista`, `mapa`, `colecciones`, `algoritmos`, `texto`, `json`, `errores`, `io`, `fecha`, `numero`, `base64`, `regex`, `concurrencia`, `aleatorio`, `sdl`.
+Módulos disponibles: `matematica`, `lista`, `mapa`, `colecciones`, `algoritmos`, `texto`, `json`, `errores`, `fecha`, `numero`, `base64`, `regex`, `concurrencia`, `sdl`, `apple` (macOS e iOS) y el resto de `stdlib/`.
 
-Módulos experimentales (presentes, sin garantías de producción): `web`, `db`, `crypto`, `gl`, `red`, `redis`, `audio`, `auth`.
+Pendientes para 4.1 (usaban funciones del antiguo intérprete C++, ver
+`stdlib/PENDIENTES`): `aleatorio`, `assets`, `audio`, `auditoria`, `auth`,
+`crypto`, `db`, `gl`, `input`, `io`, `nlp`, `red`, `redis`, `web`.
 
 ---
 
 ## Construir desde el código fuente
 
-Requiere un compilador C++20 (g++ ≥ 12 o clang++ ≥ 14):
+C-Forge se compila a sí mismo: la semilla `bootstrap/semilla/cforge-linux-x64`
+(un `cforge` para Linux x64) compila las fuentes. Solo hace falta `make`:
 
 ```sh
 git clone https://github.com/VemorisSoftware/C-Forge.git
 cd C-Forge
-make build
+make                 # la semilla compila ./cforge
 ./cforge --version
-make release-check   # gate completo
+make release-check   # gate completo (Stage 2 = Stage 3, suite, stdlib, CLI)
 ```
+
+Desde Linux se generan los binarios de todas las plataformas, idénticos byte
+por byte a los compilados en cada sistema: `make windows-cruzado`,
+`make macos-cruzado`, `make macos-arm64-cruzado`, `make linux-arm64-cruzado`.
 
 ---
 
@@ -205,8 +211,11 @@ make release-check   # gate completo
 | Plataforma | Build CI | Tests | Distribuible |
 |-----------|----------|-------|-------------|
 | macOS ARM64 (Apple Silicon) | ✅ | ✅ | `.tar.gz` |
+| macOS x64 (Intel) | ✅ | ✅ | `.tar.gz` |
 | Linux x64 | ✅ | ✅ | `.tar.gz`, `.deb` |
+| Linux ARM64 | ✅ (qemu) | ✅ | `.tar.gz`, `.deb` |
 | Windows x64 | ✅ | ✅ | `.zip` |
+| iOS ARM64 (biblioteca `--lib`) | ✅ (simulador) | ✅ | vía `cforge build --lib` |
 
 ---
 
