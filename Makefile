@@ -48,6 +48,7 @@ endif
 
 # ── Targets ────────────────────────────────────────────────────────────────────
 
+.PHONY: cforge-nativo embebido semilla semilla-check cforge-desde-semilla autoalojado-check
 .PHONY: all build debug release install uninstall test check stdlib-load-check \
 	cli-check malformed-check sanitize-check backend-check install-check \
 	bootstrap-bundle backend-core-bundle bootstrap-check backend-core-check ir-core-check object-lowering-check release-check clean help
@@ -309,52 +310,103 @@ nativo-check:
 	done; \
 	echo "  ✓ Backend nativo ELF sin libc: memoria, textos, listas, archivos, f64 y lexer autoalojado"
 
-## Autoalojamiento: cforge_self.cfv (compilador de una pasada escrito en el
-## dialecto nativo) se compila a sí mismo. Stage 1 lo construye x64_nativo;
-## Stage 2 y Stage 3 los construye el propio compilador, con un entorno vacío
-## y sin compiladores en el PATH. Stage 2 y Stage 3 deben ser idénticos.
-## Lenguaje completo compilado por cforge_self: runtime nativo + mapas en
-## dialecto nativo, y runtime/dyn.cfv en modo puente (valores del lenguaje).
+## ── C-Forge 100 % C-Forge (Linux x86-64) ─────────────────────────────────
+## cforge_self.cfv es el compilador (escrito en C-Forge); cforge_cli.cfv es
+## el comando cforge oficial, con el runtime incrustado (embebido.cfv).
+##   Stage 0  C++ (solo arranque)  → x64_nativo
+##   Stage 1  x64_nativo           → compilador mínimo (principal_bootstrap)
+##   Stage 2  Stage 1              → cforge oficial
+##   Stage 3  Stage 2              → cforge oficial  (Stage 2 = Stage 3)
+## La semilla bootstrap/semilla/cforge-linux-x64 (= Stage 3) permite
+## reconstruir sin C++: semilla → cforge (idéntico byte por byte).
 RUNTIME_LENGUAJE := $(RUNTIME_NATIVO) runtime/map.cfv --puente runtime/dyn.cfv runtime/biblioteca.cfv --lenguaje runtime/lenguaje.cfv
-PRUEBAS_LENGUAJE_NATIVAS := 01_nucleo 02_funciones 03_colecciones 04_errores 05_stdlib_matematica 06_stdlib_lista 07_json_texto 08_clases 09_stdlib_algoritmos 10_stdlib_mapa 11_texto_base64 12_fechas 13_archivos 14_control_avanzado 15_errores_limite 16_colecciones_avanzadas 17_resultados_opciones 18_regex 19_vectores 20_sistema 21_tareas_async 22_funciones_propias 23_bilingue 24_extern_c 25_idioma_ingles
-FUENTES_AUTOALOJADO := $(RUNTIME_NATIVO) bootstrap/nativo/lexer.cfv bootstrap/nativo/cforge_self.cfv
-autoalojado-check:
-	@set -e; dir=$$(mktemp -d /tmp/cforge-self.XXXXXX); \
+PRUEBAS_LENGUAJE_NATIVAS := $(basename $(notdir $(wildcard tests/cfv/*.cfv)))
+FUENTES_COMPILADOR := $(RUNTIME_NATIVO) bootstrap/nativo/lexer.cfv bootstrap/nativo/cforge_self.cfv
+FUENTES_CFORGE := $(FUENTES_COMPILADOR) bootstrap/nativo/embebido.cfv bootstrap/nativo/cforge_cli.cfv
+EMBEBIDO_ARGS := --nativo $(RUNTIME_NATIVO) runtime/map.cfv --puente runtime/dyn.cfv runtime/biblioteca.cfv --lenguaje runtime/lenguaje.cfv
+SEMILLA := bootstrap/semilla/cforge-linux-x64
+
+## Construye ./cforge-nativo desde C++ (Stage 0) y verifica Stage 2 = Stage 3.
+cforge-nativo:
+	@set -e; dir=$$(mktemp -d /tmp/cforge-nativo.XXXXXX); \
 	$(CXX) -std=c++20 -O2 bootstrap/stage0/cforge_bootstrap.cpp -o "$$dir/stage0"; \
 	cat bootstrap/core_lexer.cfv bootstrap/core_ast.cfv bootstrap/core_parser.cfv \
 		bootstrap/nativo/x64_nativo.cfv bootstrap/nativo/driver_nativo.cfv > "$$dir/nativo.cfv"; \
 	"$$dir/stage0" "$$dir/nativo.cfv" -o "$$dir/nativo" >/dev/null; \
-	"$$dir/nativo" -o "$$dir/stage1" $(FUENTES_AUTOALOJADO) >/dev/null; \
-	env -i "$$dir/stage1" -o "$$dir/stage2" $(FUENTES_AUTOALOJADO) >/dev/null; \
-	env -i "$$dir/stage2" -o "$$dir/stage3" $(FUENTES_AUTOALOJADO) >/dev/null; \
+	"$$dir/nativo" -o "$$dir/stage1" $(FUENTES_COMPILADOR) bootstrap/nativo/principal_bootstrap.cfv >/dev/null; \
+	env -i "$$dir/stage1" -o "$$dir/embeber" $(RUNTIME_NATIVO) bootstrap/nativo/embeber.cfv >/dev/null; \
+	"$$dir/embeber" "$$dir/embebido.cfv" $(VERSION) $(EMBEBIDO_ARGS) >/dev/null; \
+	if ! cmp -s "$$dir/embebido.cfv" bootstrap/nativo/embebido.cfv; then \
+		echo "  ✗ bootstrap/nativo/embebido.cfv está desactualizado: ejecuta make embebido"; exit 1; fi; \
+	env -i "$$dir/stage1" -o "$$dir/stage2" $(FUENTES_CFORGE) >/dev/null; \
+	env -i "$$dir/stage2" -o "$$dir/stage3" $(FUENTES_CFORGE) >/dev/null; \
 	cmp "$$dir/stage2" "$$dir/stage3"; \
-	if ldd "$$dir/stage3" >/dev/null 2>&1; then echo "  ✗ stage3 enlaza librerías dinámicas"; exit 1; fi; \
+	if ldd "$$dir/stage3" >/dev/null 2>&1; then echo "  ✗ cforge enlaza librerías dinámicas"; exit 1; fi; \
+	cp "$$dir/stage3" cforge-nativo; \
+	sha256sum "$$dir/stage2" "$$dir/stage3" | sed "s#$$dir/##"; \
+	echo "  ✓ cforge-nativo: Stage 2 = Stage 3, $$(wc -c < cforge-nativo) bytes, sin libc ni C++"
+
+## Regenera el runtime incrustado (tras cambiar runtime/*.cfv o VERSION).
+embebido:
+	@set -e; dir=$$(mktemp -d /tmp/cforge-emb.XXXXXX); \
+	$(CXX) -std=c++20 -O2 bootstrap/stage0/cforge_bootstrap.cpp -o "$$dir/stage0"; \
+	cat bootstrap/core_lexer.cfv bootstrap/core_ast.cfv bootstrap/core_parser.cfv \
+		bootstrap/nativo/x64_nativo.cfv bootstrap/nativo/driver_nativo.cfv > "$$dir/nativo.cfv"; \
+	"$$dir/stage0" "$$dir/nativo.cfv" -o "$$dir/nativo" >/dev/null; \
+	"$$dir/nativo" -o "$$dir/embeber" $(RUNTIME_NATIVO) bootstrap/nativo/embeber.cfv >/dev/null; \
+	"$$dir/embeber" bootstrap/nativo/embebido.cfv $(VERSION) $(EMBEBIDO_ARGS)
+
+## Actualiza la semilla con el cforge actual (tras cambiar el compilador).
+semilla: cforge-nativo
+	@mkdir -p bootstrap/semilla
+	@cp cforge-nativo $(SEMILLA)
+	@sha256sum $(SEMILLA) | sed 's#bootstrap/semilla/##' > $(SEMILLA).sha256
+	@echo "  ✓ semilla actualizada: $$(cat $(SEMILLA).sha256)"
+
+## cforge desde la semilla, sin C++ (lo usa install.sh desde el código fuente).
+cforge-desde-semilla:
+	@cp $(SEMILLA) ./.semilla && chmod +x ./.semilla
+	@./.semilla -o cforge $(FUENTES_CFORGE) >/dev/null && rm -f ./.semilla
+	@echo "  ✓ cforge compilado por la semilla: $$(./cforge --version)"
+
+## Reconstruye cforge desde la semilla, sin C++, y comprueba que el resultado
+## es idéntico a la semilla y al cforge construido desde C++.
+semilla-check: cforge-nativo
+	@set -e; dir=$$(mktemp -d /tmp/cforge-semilla.XXXXXX); \
+	(cd bootstrap/semilla && sha256sum -c cforge-linux-x64.sha256 >/dev/null); \
+	cp $(SEMILLA) "$$dir/semilla"; chmod +x "$$dir/semilla"; \
+	env -i PATH=/nonexistent "$$dir/semilla" -o "$$dir/s1" $(FUENTES_CFORGE) >/dev/null; \
+	env -i PATH=/nonexistent "$$dir/s1" -o "$$dir/s2" $(FUENTES_CFORGE) >/dev/null; \
+	cmp "$$dir/s1" "$$dir/s2"; \
+	if ! cmp -s "$$dir/s1" $(SEMILLA); then echo "  ✗ la semilla está desactualizada: ejecuta make semilla"; exit 1; fi; \
+	cmp "$$dir/s1" cforge-nativo; \
+	echo "  ✓ semilla → cforge sin C++: idéntico a la semilla y al arranque desde C++"
+
+## Pruebas del cforge nativo: dialecto nativo, lenguaje completo y CLI.
+autoalojado-check: cforge-nativo
+	@set -e; dir=$$(mktemp -d /tmp/cforge-self.XXXXXX); C=./cforge-nativo; \
 	for prueba in 01_memoria 02_textos 03_listas; do \
-		env -i "$$dir/stage3" -o "$$dir/$$prueba" $(RUNTIME_NATIVO) tests/nativo/$$prueba.cfv >/dev/null; \
+		env -i $$C -o "$$dir/$$prueba" $(RUNTIME_NATIVO) tests/nativo/$$prueba.cfv >/dev/null; \
 		"$$dir/$$prueba" | diff -u tests/nativo/$$prueba.salida -; \
 	done; \
-	env -i "$$dir/stage3" -o "$$dir/fuego" $(RUNTIME_NATIVO) tests/nativo/04_prueba_de_fuego.cfv >/dev/null; \
+	env -i $$C -o "$$dir/fuego" $(RUNTIME_NATIVO) tests/nativo/04_prueba_de_fuego.cfv >/dev/null; \
 	"$$dir/fuego" tests/nativo/fixtures/entrada.cfv "$$dir/reporte" >/dev/null; \
 	diff -u tests/nativo/fixtures/reporte.esperado "$$dir/reporte"; \
-	env -i "$$dir/stage3" -o "$$dir/mapa" $(RUNTIME_NATIVO) runtime/map.cfv tests/nativo/07_mapa.cfv >/dev/null; \
+	env -i $$C -o "$$dir/mapa" $(RUNTIME_NATIVO) runtime/map.cfv tests/nativo/07_mapa.cfv >/dev/null; \
 	"$$dir/mapa" | diff -u tests/nativo/07_mapa.salida -; \
-	env -i "$$dir/stage3" -o "$$dir/colecciones" $(RUNTIME_LENGUAJE) --dinamico tests/nativo/06_colecciones.cfv >/dev/null; \
-	"$$dir/colecciones" | diff -u tests/nativo/06_colecciones.salida -; \
-	env -i "$$dir/stage3" -o "$$dir/clases" $(RUNTIME_LENGUAJE) --dinamico tests/nativo/08_clases.cfv >/dev/null; \
-	"$$dir/clases" | diff -u tests/nativo/08_clases.salida -; \
-	env -i "$$dir/stage3" -o "$$dir/cierres" $(RUNTIME_LENGUAJE) --dinamico tests/nativo/09_cierres_errores.cfv >/dev/null; \
-	"$$dir/cierres" | diff -u tests/nativo/09_cierres_errores.salida -; \
-	env -i "$$dir/stage3" -o "$$dir/biblioteca" --stdlib stdlib $(RUNTIME_LENGUAJE) --dinamico tests/nativo/10_biblioteca.cfv >/dev/null; \
-	"$$dir/biblioteca" | diff -u tests/nativo/10_biblioteca.salida -; \
-	env -i "$$dir/stage3" -o "$$dir/externo" $(RUNTIME_LENGUAJE) --dinamico tests/nativo/11_extern.cfv >/dev/null; \
-	env -i "$$dir/externo" | diff -u tests/nativo/11_extern.salida -; \
-	for prueba in $(PRUEBAS_LENGUAJE_NATIVAS); do \
-		env -i "$$dir/stage3" -o "$$dir/$$prueba" --stdlib stdlib $(RUNTIME_LENGUAJE) --dinamico tests/cfv/$$prueba.cfv >/dev/null; \
-		"$$dir/$$prueba" | grep -q '^\[OK\]' || { echo "  ✗ tests/cfv/$$prueba.cfv"; exit 1; }; \
+	for prueba in 06_colecciones 08_clases 09_cierres_errores 10_biblioteca 11_extern; do \
+		env -i CFORGE_STDLIB=stdlib $$C tests/nativo/$$prueba.cfv | diff -u tests/nativo/$$prueba.salida -; \
 	done; \
-	sha256sum "$$dir/stage2" "$$dir/stage3" | sed "s#$$dir/##"; \
-	echo "  ✓ C-Forge se compila a sí mismo: Stage 2 = Stage 3, sin libc ni C++"; \
-	echo "  ✓ Suite del lenguaje compilada nativa ($(words $(PRUEBAS_LENGUAJE_NATIVAS)) pruebas): $(PRUEBAS_LENGUAJE_NATIVAS)"
+	for prueba in $(PRUEBAS_LENGUAJE_NATIVAS); do \
+		env -i CFORGE_STDLIB=stdlib $$C tests/cfv/$$prueba.cfv | grep -q '^\[OK\]' || { echo "  ✗ tests/cfv/$$prueba.cfv"; exit 1; }; \
+	done; \
+	for ejemplo in site/ejemplos/*.cfv site/ejemplos/en/*.cfv; do \
+		env -i CFORGE_STDLIB=stdlib $$C $$ejemplo | diff -u $${ejemplo%.cfv}.salida - || { echo "  ✗ $$ejemplo"; exit 1; }; \
+	done; \
+	env -i CFORGE_STDLIB=stdlib $$C build tests/cfv/01_nucleo.cfv -o "$$dir/nucleo" >/dev/null; "$$dir/nucleo" | grep -q '^\[OK\]'; \
+	env -i $$C check tests/cfv/08_clases.cfv >/dev/null; \
+	env -i $$C --version | grep -q "$(VERSION)"; \
+	echo "  ✓ Suite del lenguaje con cforge nativo: $(words $(PRUEBAS_LENGUAJE_NATIVAS)) pruebas, ejemplos del sitio y CLI (run, build, check)"
 
 ## Verificar los backends Core B6.8 sin toolchain durante la emisión.
 backend-core-check: backend-core-bundle

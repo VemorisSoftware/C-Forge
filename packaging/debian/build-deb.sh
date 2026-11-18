@@ -9,8 +9,16 @@ PACKAGE="$ROOT/dist/cforge_${VERSION}_${ARCH}.deb"
 
 rm -rf "$STAGE"
 mkdir -p "$STAGE/DEBIAN" "$STAGE/usr/lib/cforge/stdlib" "$STAGE/usr/bin"
-"${CXX:-g++}" -std=c++20 -O2 -I"$ROOT" -I"$ROOT/include" \
-  "$ROOT/cforgev.cpp" -o "$STAGE/usr/bin/cforge" -pthread -ldl
+if [ "$ARCH" = "amd64" ] && [ -x "$ROOT/cforge-nativo" ]; then
+  # cforge oficial: compilador nativo autoalojado; el intérprete C++ queda
+  # como cforge-clasico para lo que el compilador nativo aún no cubre.
+  install -m 0755 "$ROOT/cforge-nativo" "$STAGE/usr/bin/cforge"
+  "${CXX:-g++}" -std=c++20 -O2 -I"$ROOT" -I"$ROOT/include" \
+    "$ROOT/cforgev.cpp" -o "$STAGE/usr/bin/cforge-clasico" -pthread -ldl
+else
+  "${CXX:-g++}" -std=c++20 -O2 -I"$ROOT" -I"$ROOT/include" \
+    "$ROOT/cforgev.cpp" -o "$STAGE/usr/bin/cforge" -pthread -ldl
+fi
 install -m 0644 "$ROOT"/stdlib/*.cfv "$STAGE/usr/lib/cforge/stdlib/"
 ln -s cforge "$STAGE/usr/bin/cforgev"
 
