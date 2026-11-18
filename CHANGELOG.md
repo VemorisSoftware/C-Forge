@@ -30,6 +30,10 @@ Sitio oficial: [c-forge.org](https://c-forge.org)
 - **`extern` nativo**: `cforge_self` genera ELF dinámicos por sí mismo
   (PT_INTERP, PT_DYNAMIC, GOT, ABI System V). **25 de 25 pruebas de la suite
   compiladas por el compilador autoalojado.**
+- **`cforge` 100 % C-Forge en Linux**: CLI nativo (`run`, `build`, `check`)
+  con runtime incrustado, semilla de arranque sin C++ verificada en CI, y
+  releases/instalador que distribuyen el compilador nativo como `cforge`
+  (con `cforge-clasico` para lo que aún no es nativo).
 
 ## 3.7.3 — extern C + idioma del programa
 

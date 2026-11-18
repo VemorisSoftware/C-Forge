@@ -495,6 +495,29 @@ un ELF dinámico por sí mismo, sin `gcc` ni `ld`:
 
 Los programas sin `extern` siguen siendo estáticos y sin libc.
 
+### Bloque 5: `cforge` 100 % C-Forge en Linux ✅
+
+- `bootstrap/nativo/cforge_cli.cfv` es el comando `cforge` oficial en Linux
+  x86-64: `cforge archivo.cfv`, `run`, `build [-o]`, `check`, `--version`.
+  Compila a un ELF nativo y lo ejecuta (`fork` + `execve` + `wait4`). El
+  runtime va incrustado (`embebido.cfv`, generado por `embeber.cfv`), así el
+  binario (~236 KB, estático, sin libc) no depende de archivos externos; la
+  biblioteca estándar se busca en `$CFORGE_STDLIB` o junto al ejecutable.
+- Cadena: Stage 0 (C++) → x64_nativo → Stage 1 → **Stage 2 = Stage 3**.
+- **Semilla** `bootstrap/semilla/cforge-linux-x64` (+ SHA-256): reconstruye
+  `cforge` sin C++ y sin compiladores en el `PATH` (`make semilla-check` la
+  compara con el arranque desde C++). `install.sh` desde el código fuente en
+  Linux x86-64 ya no necesita C++.
+- Releases Linux: `cforge` = compilador nativo; `cforge-clasico` = intérprete
+  C++ para lo que el compilador nativo todavía no cubre.
+
+**Cobertura actual del compilador nativo:** 25/25 pruebas de `tests/cfv`,
+32/32 ejemplos del sitio. Pendiente para jubilar `cforge-clasico`: los
+programas de `ejemplos/` que usan concurrencia real (`canal_*`, `mutex_*`),
+el operador `?` de Resultado, genéricos con restricciones, `inseguro`,
+atributos `#[...]`, SDL y el resto de módulos de `stdlib/` (red, db, crypto,
+web…), además de `repl`, `test`, `fmt`, `new`, `init` y `doctor`.
+
 **Alcance honesto:** el compilador autoalojado compila el *dialecto nativo*
 (enteros de 64 bits, funciones, recursión, condiciones, ciclos, textos
 literales e intrínsecos). El lenguaje C-Forge completo (clases, mapas,

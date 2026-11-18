@@ -1,0 +1,186 @@
+// bootstrap/nativo/cforge_cli.cfv — el comando cforge, 100 % C-Forge.
+//
+// Compila el programa a un ejecutable nativo (ELF x86-64) con el compilador
+// autoalojado y el runtime incrustado (embebido.cfv), y lo ejecuta.
+//
+//   cforge archivo.cfv [args]        compila y ejecuta
+//   cforge run archivo.cfv [args]    igual
+//   cforge build archivo.cfv [-o s]  genera el ejecutable
+//   cforge check archivo.cfv         verifica que compila
+//   cforge --version | --help
+//   cforge -o salida archivos...     modo de bajo nivel (arranque)
+
+funcion cli_ayuda() {
+    mostrar(str_concatenar("C-Forge ", version_cforge()))
+    mostrar("Sitio:   https://c-forge.org")
+    mostrar("")
+    mostrar("Uso:")
+    mostrar("  cforge archivo.cfv [args]        Compilar y ejecutar un programa")
+    mostrar("  cforge run archivo.cfv [args]    Compilar y ejecutar un programa")
+    mostrar("  cforge build archivo.cfv [-o s]  Compilar a un ejecutable nativo")
+    mostrar("  cforge check archivo.cfv         Verificar que el programa compila")
+    mostrar("  cforge --version                 Mostrar versión")
+    mostrar("  cforge --help                    Mostrar esta ayuda")
+    mostrar("")
+    mostrar("Compilador autoalojado: escrito en C-Forge, sin C++ ni libc.")
+    retornar 0
+}
+
+funcion termina_en(s, sufijo) {
+    si (str_largo(s) < str_largo(sufijo)) { retornar 0 }
+    retornar str_igual(str_rebanar(s, str_largo(s) - str_largo(sufijo), str_largo(s)), sufijo)
+}
+
+funcion empieza_con(s, prefijo) {
+    si (str_largo(s) < str_largo(prefijo)) { retornar 0 }
+    retornar str_igual(str_rebanar(s, 0, str_largo(prefijo)), prefijo)
+}
+
+funcion existe_ruta(ruta) {
+    sea fd = sys_abrir(str_c(ruta), sys_abrir_lectura(), 0)
+    si (fd < 0) { retornar 0 }
+    sys_cerrar(fd)
+    retornar 1
+}
+
+// Variable de entorno o 0.
+funcion entorno(nombre) {
+    sea prefijo = str_concatenar(nombre, "=")
+    sea i = 0
+    sea p = sys_entorno(0)
+    mientras (p != 0) {
+        sea e = str_desde_c(p)
+        si (empieza_con(e, prefijo)) { retornar str_rebanar(e, str_largo(prefijo), str_largo(e)) }
+        i = i + 1
+        p = sys_entorno(i)
+    }
+    retornar 0
+}
+
+// Biblioteca estándar: $CFORGE_STDLIB, o junto al ejecutable
+// (bin/../lib/cforge/stdlib como instala install.sh, o ./stdlib).
+funcion ruta_stdlib() {
+    sea desde_entorno = entorno("CFORGE_STDLIB")
+    si (desde_entorno != 0) { retornar desde_entorno }
+    sea exe = sys_leer_enlace(str_c("/proc/self/exe"))
+    si (exe != 0) {
+        sea i = str_largo(exe)
+        mientras (i > 0 y str_byte(exe, i - 1) != 47) { i = i - 1 }
+        sea dir = str_rebanar(exe, 0, i)
+        sea candidatos = vec_nuevo()
+        vec_agregar(candidatos, str_concatenar(dir, "stdlib"))
+        vec_agregar(candidatos, str_concatenar(dir, "../lib/cforge/stdlib"))
+        vec_agregar(candidatos, str_concatenar(dir, "../stdlib"))
+        vec_agregar(candidatos, str_concatenar(dir, "../../stdlib"))
+        sea k = 0
+        mientras (k < vec_largo(candidatos)) {
+            si (existe_ruta(vec_obtener(candidatos, k))) { retornar vec_obtener(candidatos, k) }
+            k = k + 1
+        }
+    }
+    retornar "stdlib"
+}
+
+// Compila un programa del lenguaje con el runtime incrustado.
+funcion compilar_archivo(ruta) {
+    si (existe_ruta(ruta) == 0) { rt_panico(str_concatenar("no existe el archivo: ", ruta)) }
+    mem_fijar_global(30, 1)
+    sea fuente = str_nuevo(262144)
+    sea archivos = vec_nuevo()
+    sea i = 0
+    mientras (i < runtime_cantidad()) {
+        agregar_fuente(fuente, runtime_modo(i), runtime_fuente(i), runtime_nombre(i), archivos)
+        i = i + 1
+    }
+    sea texto = archivo_leer(ruta)
+    sea puntaje = puntaje_ingles(tokenizar(texto))
+    agregar_con_importaciones(fuente, ruta_stdlib(), texto, ruta, vec_nuevo(), archivos)
+    retornar compilar_programa(fuente, archivos, puntaje)
+}
+
+// Compila, ejecuta con los argumentos desde "desde" y sale con su código.
+funcion ejecutar(ruta, desde) {
+    sea ejecutable = compilar_archivo(ruta)
+    sea temporal = str_concatenar("/tmp/cforge-run-", str_desde_entero(sys_proceso_id()))
+    escribir_ejecutable(temporal, ejecutable)
+    sea n = rt_argc() - desde
+    sea argv = mem_reservar((n + 2) * 8)
+    __guardar64(argv, str_c(temporal))
+    sea i = 0
+    mientras (i < n) {
+        __guardar64(argv + 8 + i * 8, str_c(rt_argumento(desde + i)))
+        i = i + 1
+    }
+    __guardar64(argv + 8 + n * 8, 0)
+    sea envp = __cargar64(__globales() + 504) + 8 * (rt_argc() + 2)
+    sea pid = sys_bifurcar()
+    si (pid == 0) {
+        sys_ejecutar(str_c(temporal), argv, envp)
+        rt_panico(str_concatenar("no se pudo ejecutar ", temporal))
+    }
+    sea codigo = sys_esperar(pid)
+    sys_borrar(str_c(temporal))
+    sys_salir(codigo)
+    retornar 0
+}
+
+funcion construir(ruta, salida) {
+    si (salida == 0) {
+        salida = ruta
+        si (termina_en(ruta, ".cfv")) { salida = str_rebanar(ruta, 0, str_largo(ruta) - 4) }
+    }
+    sea ejecutable = compilar_archivo(ruta)
+    escribir_ejecutable(salida, ejecutable)
+    sea m = str_concatenar("✓ ", salida)
+    str_agregar(m, " (")
+    str_agregar(m, str_desde_entero(str_largo(ejecutable)))
+    str_agregar(m, " bytes)")
+    mostrar(m)
+    retornar 0
+}
+
+funcion requerir_archivo(i) {
+    si (rt_argc() <= i) {
+        cli_ayuda()
+        sys_salir(2)
+    }
+    retornar rt_argumento(i)
+}
+
+si (rt_argc() < 2) {
+    cli_ayuda()
+    sys_salir(0)
+}
+sea orden = rt_argumento(1)
+si (str_igual(orden, "-o")) {
+    cli_bajo_nivel()
+} sino {
+    si (str_igual(orden, "--version") o str_igual(orden, "-v") o str_igual(orden, "version")) {
+        mostrar(str_concatenar(str_concatenar("C-Forge ", version_cforge()), " (compilador nativo autoalojado, Linux x86-64)"))
+    } sino {
+        si (str_igual(orden, "--help") o str_igual(orden, "-h") o str_igual(orden, "help") o str_igual(orden, "ayuda")) {
+            cli_ayuda()
+        } sino {
+            si (str_igual(orden, "run")) {
+                ejecutar(requerir_archivo(2), 3)
+            } sino {
+                si (str_igual(orden, "build")) {
+                    sea salida = 0
+                    si (rt_argc() >= 5 y str_igual(rt_argumento(3), "-o")) { salida = rt_argumento(4) }
+                    construir(requerir_archivo(2), salida)
+                } sino {
+                    si (str_igual(orden, "check")) {
+                        compilar_archivo(requerir_archivo(2))
+                        mostrar(str_concatenar("✓ sin errores: ", rt_argumento(2)))
+                    } sino {
+                        si (termina_en(orden, ".cfv") o existe_ruta(orden)) {
+                            ejecutar(orden, 2)
+                        } sino {
+                            rt_panico(str_concatenar("orden desconocida: ", str_concatenar(orden, " (usa cforge --help)")))
+                        }
+                    }
+                }
+            }
+        }
+    }
+}
