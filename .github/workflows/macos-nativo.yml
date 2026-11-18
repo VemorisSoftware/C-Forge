@@ -1,0 +1,102 @@
+name: macOS nativo (Mach-O 100 % C-Forge)
+
+on:
+  push:
+    branches: [main, "nativo/**"]
+  pull_request:
+
+jobs:
+  cruzado:
+    name: Compilación cruzada Linux → macOS
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: cforge (Mach-O) y pruebas para macOS
+        run: make macos-cruzado
+      - uses: actions/upload-artifact@v4
+        with:
+          name: dist-macos
+          path: dist-macos/
+
+  macos:
+    name: macOS ${{ matrix.nombre }} (Stage 2 = Stage 3)
+    needs: cruzado
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - runner: macos-15-intel
+            nombre: x86-64 (Intel)
+          - runner: macos-latest
+            nombre: x86-64 en Apple Silicon (Rosetta 2)
+    runs-on: ${{ matrix.runner }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/download-artifact@v4
+        with:
+          name: dist-macos
+          path: dist-macos/
+      - name: Preparar
+        run: |
+          chmod +x dist-macos/cforge dist-macos/pruebas/*
+          uname -a
+          if [ "$(uname -m)" = arm64 ]; then softwareupdate --install-rosetta --agree-to-license >/dev/null 2>&1 || true; fi
+          command -v gtimeout >/dev/null || brew install coreutils >/dev/null 2>&1 || true
+
+      - name: Pruebas del dialecto nativo
+        run: |
+          fallas=0
+          for prueba in 01_memoria 02_textos 03_listas; do
+            ./dist-macos/pruebas/$prueba > salida.txt; codigo=$?
+            if diff -u tests/nativo/$prueba.salida salida.txt; then echo "✓ $prueba"; else echo "✗ $prueba (código $codigo)"; fallas=1; fi
+          done
+          ./dist-macos/pruebas/04_prueba_de_fuego tests/nativo/fixtures/entrada.cfv reporte.txt; echo "código $?"
+          if diff -u tests/nativo/fixtures/reporte.esperado reporte.txt; then echo "✓ prueba de fuego"; else fallas=1; fi
+          exit $fallas
+
+      - name: cforge se compila a sí mismo en macOS (Stage 2 = Stage 3)
+        run: |
+          set -e
+          ./dist-macos/cforge --version
+          F="runtime/sys_macos.cfv runtime/mem.cfv runtime/str.cfv runtime/vec.cfv runtime/io.cfv runtime/f64.cfv bootstrap/nativo/lexer.cfv bootstrap/nativo/cforge_self.cfv bootstrap/nativo/embebido.cfv bootstrap/nativo/cforge_cli.cfv"
+          ./dist-macos/cforge -o stage2 --target macos $F
+          ./stage2 -o stage3 --target macos $F
+          cmp stage2 stage3
+          cmp stage2 dist-macos/cforge
+          shasum -a 256 stage2 stage3 dist-macos/cforge
+          echo "✓ macOS: Stage 2 = Stage 3 = compilación cruzada desde Linux"
+
+      - name: Suite del lenguaje
+        run: |
+          export CFORGE_STDLIB="$PWD/stdlib"
+          ok=0; total=0
+          for t in tests/cfv/*.cfv; do
+            total=$((total + 1))
+            if ./dist-macos/cforge "$t" 2>err.txt | grep -q '^\[OK\]'; then ok=$((ok + 1)); else echo "✗ $t: $(head -c 200 err.txt)"; fi
+          done
+          echo "tests/cfv en macOS: $ok/$total"
+          [ "$ok" = "$total" ]
+
+      - name: Hilos y CLI
+        run: |
+          export CFORGE_STDLIB="$PWD/stdlib"
+          ./dist-macos/cforge tests/nativo/12_hilos.cfv > hilos.txt
+          diff -u tests/nativo/12_hilos.salida hilos.txt && echo "✓ hilos (pthread)"
+          ./dist-macos/cforge build tests/cfv/01_nucleo.cfv -o nucleo && ./nucleo | grep -q '^\[OK\]' && echo "✓ cforge build"
+
+      - name: Ejemplos del sitio
+        run: |
+          export CFORGE_STDLIB="$PWD/stdlib"
+          ok=0; total=0
+          for e in site/ejemplos/*.cfv site/ejemplos/en/*.cfv; do
+            total=$((total + 1))
+            if ./dist-macos/cforge "$e" 2>/dev/null | diff -q "${e%.cfv}.salida" - >/dev/null; then ok=$((ok + 1)); else echo "✗ $e"; fi
+          done
+          echo "ejemplos del sitio en macOS: $ok/$total"
+          [ "$ok" = "$total" ]
+
+      - name: ejemplos/ (servidor HTTP, hilos, SDL2 si está)
+        run: |
+          brew install sdl2 >/dev/null 2>&1 || true
+          export PATH="$(brew --prefix coreutils)/libexec/gnubin:$PATH"
+          sh tests/nativo/ejemplos.sh dist-macos/cforge
