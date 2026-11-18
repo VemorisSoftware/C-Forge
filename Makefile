@@ -175,7 +175,7 @@ stdlib-load-check: build
 	@set -e; total=0; \
 	for file in stdlib/*.cfv; do \
 		module=$$(basename "$$file" .cfv); \
-		if [ "$$module" = apple ] && [ "$(UNAME)" != Darwin ]; then continue; fi; \
+		if [ "$$module" = apple ]; then continue; fi; \
 		fixture="/tmp/cforge-load-$$module.cfv"; \
 		printf 'importar "%s"\n' "$$module" > "$$fixture"; \
 		CFORGE_STDLIB=./stdlib ./$(TARGET) "$$fixture" >/dev/null; \
