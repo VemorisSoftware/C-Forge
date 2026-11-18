@@ -21,7 +21,7 @@ function activate(context) {
   context.subscriptions.push(diagnostics);
 
   function check(document, notify = false) {
-    if (document.languageId !== "cforgev" || document.isUntitled) return;
+    if (document.languageId !== "cforge" || document.isUntitled) return;
     runCForge(["check", document.uri.fsPath], (error, stdout, stderr) => {
       diagnostics.delete(document.uri);
       if (error) {
@@ -41,7 +41,7 @@ function activate(context) {
   }
 
   context.subscriptions.push(vscode.workspace.onDidSaveTextDocument(document => check(document)));
-  context.subscriptions.push(vscode.languages.registerCompletionItemProvider("cforgev", {
+  context.subscriptions.push(vscode.languages.registerCompletionItemProvider("cforge", {
     provideCompletionItems() {
       return words.map(word => new vscode.CompletionItem(word, vscode.CompletionItemKind.Keyword));
     }

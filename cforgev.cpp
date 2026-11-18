@@ -23,6 +23,7 @@
 #include <cstring>
 #include <cstdint>
 #include <deque>
+#include <set>
 #ifdef _WIN32
 #include <windows.h>
 #define popen _popen
@@ -180,7 +181,11 @@ static double numero(const Value& v) { if (auto p=std::get_if<double>(&v.data)) 
 [[maybe_unused]] static Value bit_shr(const Value&a,const Value&b){int s=(int)numero(b);if(s<0)throw std::runtime_error("desplazamiento negativo no permitido");return (double)((long long)numero(a)>>s);}
 [[maybe_unused]] static Value compara(const Value&a,const Value&b,const std::string&o){if(o=="==")return a.data==b.data;if(o=="!=")return a.data!=b.data;if(a.index()==1&&b.index()==1){double x=numero(a),y=numero(b);if(o==">")return x>y;if(o==">=")return x>=y;if(o=="<")return x<y;return x<=y;}if(a.index()==2&&b.index()==2){auto x=std::get<std::string>(a.data),y=std::get<std::string>(b.data);if(o==">")return x>y;if(o==">=")return x>=y;if(o=="<")return x<y;return x<=y;}throw std::runtime_error("comparación entre tipos incompatibles");}
 [[maybe_unused]] static std::string cfv_number_text(double value){std::ostringstream stream;if(std::floor(value)==value)stream<<(long long)value;else stream<<value;return stream.str();}
-[[maybe_unused]] static std::string texto(const Value&v){if(v.index()==0)return "nulo";if(auto p=std::get_if<double>(&v.data))return cfv_number_text(*p);if(auto p=std::get_if<std::string>(&v.data))return *p;if(auto p=std::get_if<bool>(&v.data))return *p?"verdadero":"falso";if(auto p=std::get_if<Lista>(&v.data)){std::string s="[";for(size_t i=0;i<(*p)->size();++i){if(i)s+=", ";s+=texto((*p)->at(i));}return s+"]";}if(auto p=std::get_if<Mapa>(&v.data)){auto marker=(*p)->find("__opcion");if(marker!=(*p)->end()){auto has=(*p)->find("tiene");if(has==(*p)->end()||!verdad(has->second))return "ninguno";return "algunos("+texto((*p)->at("valor"))+")";}std::string s="{";bool first=true;for(auto&[k,x]:**p){if(!first)s+=", ";first=false;s+="\""+k+"\": "+texto(x);}return s+"}";}if(auto p=std::get_if<FastArray>(&v.data)){std::string s="[";for(size_t i=0;i<(*p)->size();++i){if(i)s+=", ";s+=cfv_number_text((*p)->at(i));}return s+"]";}if(auto p=std::get_if<DenseMatrix>(&v.data)){std::string s="[";for(size_t row=0;row<(*p)->rows;++row){if(row)s+=", ";s+="[";for(size_t column=0;column<(*p)->columns;++column){if(column)s+=", ";s+=cfv_number_text((*p)->values[row*(*p)->columns+column]);}s+="]";}return s+"]";}if(auto p=std::get_if<Tupla>(&v.data)){std::string s="(";for(size_t i=0;i<(*p)->values.size();++i){if(i)s+=", ";s+=texto((*p)->values[i]);}if((*p)->values.size()==1)s+=",";return s+")";}if(auto p=std::get_if<Conjunto>(&v.data)){std::string s="conjunto(";for(size_t i=0;i<(*p)->values.size();++i){if(i)s+=", ";s+=texto((*p)->values[i]);}return s+")";}throw std::runtime_error("ForgeValue desconocido");}
+// Idioma del programa principal: si usa más palabras clave en inglés que en
+// español, los valores (true/false/null) y los errores se muestran en inglés.
+static bool cfv_idioma_ingles = false;
+static int cfv_tokenizaciones = 0, cfv_claves_en = 0, cfv_claves_es = 0;
+[[maybe_unused]] static std::string texto(const Value&v){if(v.index()==0)return cfv_idioma_ingles?"null":"nulo";if(auto p=std::get_if<double>(&v.data))return cfv_number_text(*p);if(auto p=std::get_if<std::string>(&v.data))return *p;if(auto p=std::get_if<bool>(&v.data))return cfv_idioma_ingles?(*p?"true":"false"):(*p?"verdadero":"falso");if(auto p=std::get_if<Lista>(&v.data)){std::string s="[";for(size_t i=0;i<(*p)->size();++i){if(i)s+=", ";s+=texto((*p)->at(i));}return s+"]";}if(auto p=std::get_if<Mapa>(&v.data)){auto marker=(*p)->find("__opcion");if(marker!=(*p)->end()){auto has=(*p)->find("tiene");if(has==(*p)->end()||!verdad(has->second))return "ninguno";return "algunos("+texto((*p)->at("valor"))+")";}std::string s="{";bool first=true;for(auto&[k,x]:**p){if(!first)s+=", ";first=false;s+="\""+k+"\": "+texto(x);}return s+"}";}if(auto p=std::get_if<FastArray>(&v.data)){std::string s="[";for(size_t i=0;i<(*p)->size();++i){if(i)s+=", ";s+=cfv_number_text((*p)->at(i));}return s+"]";}if(auto p=std::get_if<DenseMatrix>(&v.data)){std::string s="[";for(size_t row=0;row<(*p)->rows;++row){if(row)s+=", ";s+="[";for(size_t column=0;column<(*p)->columns;++column){if(column)s+=", ";s+=cfv_number_text((*p)->values[row*(*p)->columns+column]);}s+="]";}return s+"]";}if(auto p=std::get_if<Tupla>(&v.data)){std::string s="(";for(size_t i=0;i<(*p)->values.size();++i){if(i)s+=", ";s+=texto((*p)->values[i]);}if((*p)->values.size()==1)s+=",";return s+")";}if(auto p=std::get_if<Conjunto>(&v.data)){std::string s="conjunto(";for(size_t i=0;i<(*p)->values.size();++i){if(i)s+=", ";s+=texto((*p)->values[i]);}return s+")";}throw std::runtime_error("ForgeValue desconocido");}
 [[maybe_unused]] static std::string cfv_json_escape(const std::string&input){std::string out="\"";for(unsigned char c:input){switch(c){case '\"':out+="\\\"";break;case '\\':out+="\\\\";break;case '\n':out+="\\n";break;case '\r':out+="\\r";break;case '\t':out+="\\t";break;default:if(c<32){char b[7];std::snprintf(b,sizeof(b),"\\u%04x",c);out+=b;}else out+=(char)c;}}return out+"\"";}
 [[maybe_unused]] static std::string cfv_canonical_json(const Value&v){if(v.index()==0)return "null";if(auto p=std::get_if<double>(&v.data))return cfv_number_text(*p);if(auto p=std::get_if<std::string>(&v.data))return cfv_json_escape(*p);if(auto p=std::get_if<bool>(&v.data))return *p?"true":"false";if(auto p=std::get_if<Lista>(&v.data)){std::string s="[";for(size_t i=0;i<(*p)->size();++i){if(i)s+=",";s+=cfv_canonical_json((*p)->at(i));}return s+"]";}if(auto p=std::get_if<Mapa>(&v.data)){std::string s="{";bool first=true;for(const auto&[k,x]:**p){if(!first)s+=",";first=false;s+=cfv_json_escape(k)+":"+cfv_canonical_json(x);}return s+"}";}if(auto p=std::get_if<Tupla>(&v.data)){std::string s="[";for(size_t i=0;i<(*p)->values.size();++i){if(i)s+=",";s+=cfv_canonical_json((*p)->values[i]);}return s+"]";}if(auto p=std::get_if<Conjunto>(&v.data)){std::string s="[";for(size_t i=0;i<(*p)->values.size();++i){if(i)s+=",";s+=cfv_canonical_json((*p)->values[i]);}return s+"]";}return cfv_json_escape(texto(v));}
 struct CfvArenaRuntime{std::filesystem::path path;std::unique_ptr<cforge::arena::ForgeSharedArena>arena;std::mutex mutex;std::map<std::string,cforge::arena::Offset>latest;CfvArenaRuntime(){auto id=
@@ -1429,8 +1434,15 @@ static Value cfv_palabra_clave_ingles(const Value& lexema, const Value& tokens) 
         {"false", "falso"}, {"null", "nulo"}, {"print", "mostrar"},
         {"assert", "afirmar"},
     };
+    static const std::set<std::string> espanol = {
+        "sea", "funcion", "retornar", "si", "sino", "mientras", "para",
+        "intentar", "capturar", "lanzar", "clase", "esto", "importar",
+        "romper", "continuar", "verdadero", "falso", "nulo", "mostrar", "afirmar",
+    };
     const auto* texto_lex = std::get_if<std::string>(&lexema.data);
     if (!texto_lex) return lexema;
+    const bool contar = cfv_tokenizaciones == 1;
+    if (contar && espanol.count(*texto_lex)) ++cfv_claves_es;
     const auto encontrado = alias.find(*texto_lex);
     if (encontrado == alias.end()) return lexema;
     if (const auto* lista = std::get_if<Lista>(&tokens.data)) {
@@ -1439,6 +1451,7 @@ static Value cfv_palabra_clave_ingles(const Value& lexema, const Value& tokens) 
             if (const auto* p = std::get_if<std::string>(&previo.data); p && *p == ".") return lexema;
         }
     }
+    if (contar) ++cfv_claves_en;
     return Value{encontrado->second};
 }
 Value cfv_Token(Value cfv_tipo, Value cfv_lexema, Value cfv_linea) {
@@ -1520,6 +1533,7 @@ Value cfv_subcadena(Value cfv_fuente, Value cfv_inicio, Value cfv_fin) {
 }
 Value cfv_tokenizar(Value cfv_fuente) {
   cfv_jit_hit("tokenizar");
+  ++cfv_tokenizaciones;
  [[maybe_unused]] size_t cfv_fuente_tipo = cfv_fuente.index();
   Value cfv_tokens = crear_lista({});
   if (cfv_tokens.index() != 4) throw std::runtime_error("tipo incompatible para tokens");
@@ -1658,6 +1672,7 @@ Value cfv_tokenizar(Value cfv_fuente) {
     }
   }
   (void)(cfv_agregar(cfv_tokens, cfv_Token(Value{std::string("EOF", 3)}, Value{std::string("", 0)}, cfv_linea)));
+  if (cfv_tokenizaciones == 1) cfv_idioma_ingles = cfv_claves_en > cfv_claves_es;
   return cfv_tokens;
   return Value{};
 }
@@ -2331,6 +2346,31 @@ Value cfv_parse_sentencia(Value cfv_p) {
     }
     return cfv_nodo(Value{std::string("Clase")}, cfv_clase_nombre, cfv_miembros);
   }
+  // extern "libreria" funcion nombre(parametro: tipo, ...): tipo
+  // Declara una función de una librería C. Ver cfv_externa_llamar.
+  if (verdad(cfv_ver(cfv_p, Value{std::string("extern")}))) {
+    (void)(cfv_avanzar(cfv_p));
+    (void)(cfv_afirmar(cfv_ver_tipo(cfv_p, Value{std::string("STRING")}), Value{std::string("extern: se esperaba el nombre de la librería entre comillas")}));
+    Value cfv_ext_lib = indice(cfv_avanzar(cfv_p), Value{std::string("lexema")});
+    (void)(cfv_requerir(cfv_p, Value{std::string("funcion")}, Value{std::string("extern: se esperaba 'funcion'")}));
+    Value cfv_ext_nombre = indice(cfv_requerir_tipo(cfv_p, Value{std::string("IDENT")}, Value{std::string("extern: se esperaba el nombre de la función")}), Value{std::string("lexema")});
+    (void)(cfv_requerir(cfv_p, Value{std::string("(")}, Value{std::string("extern: se esperaba '('")}));
+    Value cfv_ext_tipos = crear_lista({});
+    while (!verdad(cfv_ver(cfv_p, Value{std::string(")")}))) {
+      (void)(cfv_requerir_tipo(cfv_p, Value{std::string("IDENT")}, Value{std::string("extern: se esperaba el nombre del parámetro")}));
+      (void)(cfv_requerir(cfv_p, Value{std::string(":")}, Value{std::string("extern: cada parámetro necesita tipo (nombre: tipo)")}));
+      (void)(cfv_agregar(cfv_ext_tipos, indice(cfv_requerir_tipo(cfv_p, Value{std::string("IDENT")}, Value{std::string("extern: se esperaba el tipo del parámetro")}), Value{std::string("lexema")})));
+      if (!verdad(cfv_tomar(cfv_p, Value{std::string(",")}))) break;
+    }
+    (void)(cfv_requerir(cfv_p, Value{std::string(")")}, Value{std::string("extern: se esperaba ')'")}));
+    Value cfv_ext_retorno = Value{std::string("vacio")};
+    if (verdad(cfv_tomar(cfv_p, Value{std::string(":")})) || verdad(cfv_tomar(cfv_p, Value{std::string("->")}))) {
+      cfv_ext_retorno = indice(cfv_requerir_tipo(cfv_p, Value{std::string("IDENT")}, Value{std::string("extern: se esperaba el tipo de retorno")}), Value{std::string("lexema")});
+    }
+    (void)(cfv_tomar(cfv_p, Value{std::string(";")}));
+    return cfv_nodo(Value{std::string("Externa")}, cfv_ext_nombre,
+                    crear_lista({cfv_ext_lib, cfv_ext_retorno, cfv_ext_tipos}));
+  }
   // importar "ruta"
   if (verdad(cfv_ver(cfv_p, Value{std::string("importar")}))) {
     (void)(cfv_avanzar(cfv_p));
@@ -2992,13 +3032,13 @@ Value cfv_formato_valor(Value cfv_v) {
   cfv_jit_hit("formato_valor");
  [[maybe_unused]] size_t cfv_v_tipo = cfv_v.index();
   if (verdad(compara(cfv_v, Value{}, "=="))) {
-    return Value{std::string("nulo", 4)};
+    return Value{std::string(cfv_idioma_ingles ? "null" : "nulo")};
   }
   if (verdad(compara(cfv_v, Value{true}, "=="))) {
-    return Value{std::string("verdadero", 9)};
+    return Value{std::string(cfv_idioma_ingles ? "true" : "verdadero")};
   }
   if (verdad(compara(cfv_v, Value{false}, "=="))) {
-    return Value{std::string("falso", 5)};
+    return Value{std::string(cfv_idioma_ingles ? "false" : "falso")};
   }
   return cfv_a_texto(cfv_v);
   return Value{};
@@ -5950,6 +5990,168 @@ static Value cfv_funcion_ingles(const Value& nombre, const Value& env, const Val
     try { (void)cfv_env_buscar(env, nombre); return nombre; } catch (...) {}
     return Value{encontrado->second};
 }
+// Traduce los fragmentos más comunes de los mensajes de error cuando el
+// programa está escrito en inglés. Los mensajes del usuario (lanzar/throw)
+// se dejan tal cual.
+static std::string cfv_mensaje_en_idioma(std::string mensaje) {
+    if (!cfv_idioma_ingles) return mensaje;
+    static const std::vector<std::pair<std::string, std::string>> tabla = {
+        {"afirmación fallida: ", "assertion failed: "},
+        {"variable desconocida", "unknown variable"},
+        {"función desconocida", "unknown function"},
+        {"índice fuera de rango", "index out of range"},
+        {"división por cero", "division by zero"},
+        {"Token inesperado", "Unexpected token"},
+        {"Se esperaba", "Expected"},
+        {"se encontró", "found"},
+        {"en línea", "at line"},
+        {"(línea", "(line"},
+        {"no se pudo abrir", "could not open"},
+        {"no se pudo cargar la librería", "could not load library"},
+        {"símbolo extranjero no encontrado", "foreign symbol not found"},
+        {"tipos incompatibles", "incompatible types"},
+        {"se esperaba numero", "expected a number"},
+        {"se esperaba texto", "expected text"},
+        {"requiere", "requires"},
+        {"argumentos", "arguments"},
+    };
+    for (const auto& [es, en] : tabla) {
+        for (size_t pos = mensaje.find(es); pos != std::string::npos; pos = mensaje.find(es, pos + en.size()))
+            mensaje.replace(pos, es.size(), en);
+    }
+    return mensaje;
+}
+
+// ── FFI con C: extern "libreria" funcion ... ─────────────────────────────
+// Las llamadas usan la ABI de C de la plataforma (System V AMD64, AAPCS64 o
+// Microsoft x64): el compilador de esta unidad genera la llamada con los
+// tipos exactos, armados en tiempo de ejecución sobre hasta 8 parámetros.
+// No admite funciones variádicas (printf): usa puts, snprintf envuelto, etc.
+enum class CfvTipoC { Entero, Largo, Doble, Texto, Puntero, Booleano, Vacio };
+struct CfvFuncionExterna {
+    std::string libreria, simbolo;
+    void* direccion = nullptr;
+    CfvTipoC retorno = CfvTipoC::Vacio;
+    std::vector<CfvTipoC> parametros;
+};
+static std::vector<CfvFuncionExterna>& cfv_externas() { static std::vector<CfvFuncionExterna> v; return v; }
+
+static CfvTipoC cfv_tipo_c(const std::string& t) {
+    if (t == "entero" || t == "int" || t == "i32") return CfvTipoC::Entero;
+    if (t == "largo" || t == "long" || t == "i64" || t == "tamano" || t == "size") return CfvTipoC::Largo;
+    if (t == "numero" || t == "number" || t == "decimal" || t == "double" || t == "f64") return CfvTipoC::Doble;
+    if (t == "texto" || t == "string" || t == "cadena") return CfvTipoC::Texto;
+    if (t == "puntero" || t == "pointer" || t == "ptr") return CfvTipoC::Puntero;
+    if (t == "booleano" || t == "bool") return CfvTipoC::Booleano;
+    if (t == "vacio" || t == "void") return CfvTipoC::Vacio;
+    throw std::runtime_error("extern: tipo C desconocido '" + t + "'");
+}
+
+static void* cfv_abrir_libreria_c(const std::string& nombre) {
+    static std::map<std::string, void*> abiertas;
+    auto it = abiertas.find(nombre);
+    if (it != abiertas.end()) return it->second;
+    std::vector<std::string> candidatos;
+#if defined(_WIN32)
+    if (nombre == "c" || nombre == "libc" || nombre == "m" || nombre == "libm") candidatos = {"ucrtbase.dll", "msvcrt.dll"};
+    else candidatos = {nombre, nombre + ".dll", "lib" + nombre + ".dll"};
+    void* h = nullptr;
+    for (const auto& c : candidatos) if ((h = (void*)LoadLibraryA(c.c_str()))) break;
+#else
+#  if defined(__APPLE__)
+    if (nombre == "c" || nombre == "libc" || nombre == "m" || nombre == "libm") candidatos = {"/usr/lib/libSystem.B.dylib"};
+    else candidatos = {nombre, "lib" + nombre + ".dylib", nombre + ".dylib", "/opt/homebrew/lib/lib" + nombre + ".dylib", "/usr/local/lib/lib" + nombre + ".dylib"};
+#  else
+    if (nombre == "c" || nombre == "libc") candidatos = {"libc.so.6"};
+    else if (nombre == "m" || nombre == "libm") candidatos = {"libm.so.6"};
+    else candidatos = {nombre, "lib" + nombre + ".so", nombre + ".so", "lib" + nombre + ".so.0"};
+#  endif
+    void* h = nullptr;
+    for (const auto& c : candidatos) if ((h = dlopen(c.c_str(), RTLD_NOW | RTLD_LOCAL))) break;
+#endif
+    if (!h) throw std::runtime_error("no se pudo cargar la librería: " + nombre);
+    abiertas[nombre] = h;
+    return h;
+}
+
+static void* cfv_simbolo_c(void* libreria, const std::string& simbolo) {
+#if defined(_WIN32)
+    return (void*)GetProcAddress((HMODULE)libreria, simbolo.c_str());
+#else
+    return dlsym(libreria, simbolo.c_str());
+#endif
+}
+
+struct CfvArgumentoC { bool doble = false; long long entero = 0; double real = 0; };
+
+// Construye la llamada con los tipos exactos: cada parámetro es long long
+// (enteros, punteros, textos) o double, de modo que el compilador aplique la
+// convención de llamada correcta de la plataforma.
+template <typename R, typename... Acum>
+static R cfv_llamar_c(void* f, const std::vector<CfvArgumentoC>& args, size_t k, Acum... acum) {
+    if (k == args.size()) return reinterpret_cast<R (*)(Acum...)>(f)(acum...);
+    if constexpr (sizeof...(Acum) < 8) {
+        if (args[k].doble) return cfv_llamar_c<R>(f, args, k + 1, acum..., args[k].real);
+        return cfv_llamar_c<R>(f, args, k + 1, acum..., args[k].entero);
+    } else {
+        throw std::runtime_error("extern: como máximo 8 parámetros");
+    }
+}
+
+static Value cfv_externa_llamar(size_t id, const Value& valores) {
+    auto& fn = cfv_externas().at(id);
+    const auto* lista = std::get_if<Lista>(&valores.data);
+    const size_t n = lista ? (*lista)->size() : 0;
+    if (n != fn.parametros.size())
+        throw std::runtime_error(fn.simbolo + ": se esperaban " + std::to_string(fn.parametros.size()) +
+                                 " argumentos y llegaron " + std::to_string(n));
+    std::vector<std::string> textos; textos.reserve(n);
+    std::vector<CfvArgumentoC> args(n);
+    for (size_t i = 0; i < n; ++i) {
+        const Value& v = (**lista)[i];
+        switch (fn.parametros[i]) {
+            case CfvTipoC::Doble: args[i].doble = true; args[i].real = numero(v); break;
+            case CfvTipoC::Entero: args[i].entero = (long long)(int)numero(v); break;
+            case CfvTipoC::Largo: case CfvTipoC::Puntero: args[i].entero = (long long)numero(v); break;
+            case CfvTipoC::Booleano: args[i].entero = verdad(v) ? 1 : 0; break;
+            case CfvTipoC::Texto:
+                if (v.index() == 0) { args[i].entero = 0; break; }
+                textos.push_back(texto(v));
+                args[i].entero = (long long)(intptr_t)textos.back().c_str();
+                break;
+            case CfvTipoC::Vacio: throw std::runtime_error(fn.simbolo + ": un parámetro no puede ser vacio");
+        }
+    }
+    switch (fn.retorno) {
+        case CfvTipoC::Vacio: cfv_llamar_c<void>(fn.direccion, args, 0); return Value{};
+        case CfvTipoC::Doble: return Value{cfv_llamar_c<double>(fn.direccion, args, 0)};
+        case CfvTipoC::Entero: return Value{(double)(int)cfv_llamar_c<long long>(fn.direccion, args, 0)};
+        case CfvTipoC::Booleano: return Value{((int)cfv_llamar_c<long long>(fn.direccion, args, 0)) != 0};
+        case CfvTipoC::Largo: case CfvTipoC::Puntero: return Value{(double)cfv_llamar_c<long long>(fn.direccion, args, 0)};
+        case CfvTipoC::Texto: {
+            const char* r = (const char*)(intptr_t)cfv_llamar_c<long long>(fn.direccion, args, 0);
+            return r ? Value{std::string(r)} : Value{};
+        }
+    }
+    return Value{};
+}
+
+static Value cfv_externa_declarar(const Value& nombre, const Value& hijos) {
+    CfvFuncionExterna fn;
+    std::string lib = texto(indice(hijos, Value{0.0}));
+    fn.libreria = lib.size() >= 2 ? lib.substr(1, lib.size() - 2) : lib;
+    fn.simbolo = texto(nombre);
+    fn.retorno = cfv_tipo_c(texto(indice(hijos, Value{1.0})));
+    Value cfv_lista_tipos = indice(hijos, Value{2.0});
+    if (const auto* tipos = std::get_if<Lista>(&cfv_lista_tipos.data))
+        for (const auto& t : **tipos) fn.parametros.push_back(cfv_tipo_c(texto(t)));
+    if (fn.parametros.size() > 8) throw std::runtime_error("extern: como máximo 8 parámetros");
+    fn.direccion = cfv_simbolo_c(cfv_abrir_libreria_c(fn.libreria), fn.simbolo);
+    if (!fn.direccion) throw std::runtime_error("símbolo extranjero no encontrado: " + fn.simbolo + " en " + fn.libreria);
+    cfv_externas().push_back(fn);
+    return crear_mapa({{std::string("__externa"), Value{(double)(cfv_externas().size() - 1)}},
+                       {std::string("nombre"), nombre}});
+}
 Value cfv_eval_expr(Value cfv_nodo_e, Value cfv_env, Value cfv_fns) {
   cfv_jit_hit("eval_expr");
  [[maybe_unused]] size_t cfv_nodo_e_tipo = cfv_nodo_e.index();
@@ -6220,6 +6422,16 @@ Value cfv_eval_expr(Value cfv_nodo_e, Value cfv_env, Value cfv_fns) {
         return Value{};
       }
       return cfv_res_b;
+    }
+    // Funciones C declaradas con extern
+    {
+      Value cfv_maybe_ext;
+      bool cfv_hay_ext = false;
+      try { cfv_maybe_ext = cfv_env_buscar(cfv_env, cfv_nombre_fn); cfv_hay_ext = true; } catch (...) {}
+      if (cfv_hay_ext) {
+        if (auto cfv_mp_ext = std::get_if<Mapa>(&cfv_maybe_ext.data); cfv_mp_ext && (*cfv_mp_ext)->count("__externa"))
+          return cfv_externa_llamar((size_t)numero((**cfv_mp_ext)["__externa"]), cfv_args_eval);
+      }
     }
     // Check if fn_nombre is a lambda in env
     try {
@@ -6919,6 +7131,11 @@ Value cfv_exec_stmt(Value cfv_stmt, Value cfv_env, Value cfv_fns) {
     (void)(cfv_eval_expr(cfv_stmt, cfv_env, cfv_fns));
     return crear_lista({Value{std::string("normal", 6)}, Value{}});
   }
+  if (verdad(compara(cfv_t, Value{std::string("Externa")}, "=="))) {
+    (void)(cfv_env_declarar(cfv_env, indice(cfv_stmt, Value{std::string("valor")}),
+        cfv_externa_declarar(indice(cfv_stmt, Value{std::string("valor")}), indice(cfv_stmt, Value{std::string("hijos")}))));
+    return crear_lista({Value{std::string("normal", 6)}, Value{}});
+  }
   if (verdad(compara(cfv_t, Value{std::string("Importar")}, "=="))) {
     Value cfv_ruta_raw = indice(cfv_stmt, Value{std::string("valor")});
     Value cfv_ruta_imp = cfv_subcadena(cfv_ruta_raw, Value{1.0}, resta(cfv_longitud(cfv_ruta_raw), Value{1.0}));
@@ -7272,9 +7489,9 @@ const char* cfv_eval_json(const char* code) {
 }
 
 // Obtener version del interprete
-// FUENTE DE VERDAD: Makefile VERSION := 3.7.2
+// FUENTE DE VERDAD: Makefile VERSION := 3.7.3
 // Actualizar ambos a la vez con: sed -i 's/3\.7\.0/NUEVA/g' Makefile cforgev.cpp
-const char* cfv_version() { return "3.7.2"; }
+const char* cfv_version() { return "3.7.3"; }
 
 // Verificar disponibilidad de SDL2
 int cfv_has_sdl2() {
@@ -8431,11 +8648,11 @@ int main(int argc, char** argv){
 
     return 0;
   } catch(const std::exception& e) {
-    std::cerr << "[C-Forge Error] " << e.what() << '\n';
+    std::cerr << "[C-Forge Error] " << cfv_mensaje_en_idioma(e.what()) << '\n';
     if (!cfv_call_stack.empty()) {
       std::cerr << "Stack trace:\n";
       for (int i = (int)cfv_call_stack.size()-1; i >= 0; --i)
-        std::cerr << "  en " << cfv_call_stack[i] << "\n";
+        std::cerr << (cfv_idioma_ingles ? "  at " : "  en ") << cfv_call_stack[i] << "\n";
     }
     return 1;
   }
