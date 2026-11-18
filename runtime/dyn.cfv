@@ -1,0 +1,549 @@
+// runtime/dyn.cfv — valores dinámicos del lenguaje C-Forge completo.
+//
+// Escrito en el dialecto nativo, pero con la convención de valores del
+// lenguaje (el compilador lo carga en modo "puente"). Cada valor es una
+// palabra de 64 bits con etiqueta:
+//
+//   0           nulo
+//   2 / 4       falso / verdadero
+//   impar       entero: n * 2 + 1
+//   puntero     caja de 16 bytes [tipo][dato]:
+//                 1 texto (dato: texto del runtime)
+//                 2 lista (dato: vec del runtime)
+//                 3 mapa  (dato: map del runtime)
+//                 4 flotante (dato: bits IEEE-754)
+//
+// Los números siguen la semántica del intérprete: un resultado con valor
+// entero se representa como entero; si no, como flotante.
+
+// ── Construcción y consulta ───────────────────────────────────────────────
+
+funcion dyn_caja(tipo, dato) {
+    sea c = mem_reservar(16)
+    __guardar64(c, tipo)
+    __guardar64(c + 8, dato)
+    retornar c
+}
+
+// 0 nulo · 1 texto · 2 lista · 3 mapa · 4 flotante · 5 booleano · 6 entero
+funcion dyn_tipo(v) {
+    si (v == 0) { retornar 0 }
+    si (__y_bits(v, 1) == 1) { retornar 6 }
+    si (v == 2 o v == 4) { retornar 5 }
+    retornar __cargar64(v)
+}
+
+funcion dyn_dato(v) { retornar __cargar64(v + 8) }
+funcion dyn_entero(n) { retornar n * 2 + 1 }
+funcion dyn_valor_entero(v) { retornar (v - 1) / 2 }
+funcion dyn_bool(b) { si (b) { retornar 4 } retornar 2 }
+funcion dyn_texto(s) { retornar dyn_caja(1, s) }
+funcion dyn_lista_nueva() { retornar dyn_caja(2, vec_nuevo()) }
+funcion dyn_mapa_nuevo() { retornar dyn_caja(3, map_nuevo()) }
+
+funcion dyn_nombre_tipo(v) {
+    sea t = dyn_tipo(v)
+    si (t == 0) { retornar "nulo" }
+    si (t == 1) { retornar "texto" }
+    si (t == 2) { retornar "lista" }
+    si (t == 3) { retornar "mapa" }
+    si (t == 5) { retornar "booleano" }
+    retornar "número"
+}
+
+funcion dyn_error_tipo(operacion, v) {
+    sea m = str_concatenar(operacion, ": valor de tipo ")
+    str_agregar(m, dyn_nombre_tipo(v))
+    rt_panico(m)
+    retornar 0
+}
+
+funcion dyn_verdad(v) {
+    si (v == 4) { retornar 1 }
+    si (v == 2) { retornar 0 }
+    rt_panico("se esperaba verdadero o falso")
+    retornar 0
+}
+
+// ── Números ───────────────────────────────────────────────────────────────
+
+funcion dyn_es_numero(v) {
+    sea t = dyn_tipo(v)
+    retornar t == 6 o t == 4
+}
+
+funcion dyn_a_f64(v) {
+    sea t = dyn_tipo(v)
+    si (t == 6) { retornar __f64_desde_entero(dyn_valor_entero(v)) }
+    si (t == 4) { retornar dyn_dato(v) }
+    dyn_error_tipo("se esperaba un número", v)
+    retornar 0
+}
+
+// Normaliza: un flotante con valor entero exacto vuelve a ser entero.
+funcion dyn_desde_f64(bits) {
+    sea e = __f64_a_entero(bits)
+    si (e > 0 - 4503599627370496 y e < 4503599627370496) {
+        si (__f64_desde_entero(e) == bits) { retornar dyn_entero(e) }
+        // -0.0 también es el entero 0.
+        si (__desplazar_izq(bits, 1) == 0) { retornar dyn_entero(0) }
+    }
+    retornar dyn_caja(4, bits)
+}
+
+funcion dyn_flotante(bits) { retornar dyn_desde_f64(bits) }
+
+funcion dyn_ambos_enteros(a, b) {
+    retornar __y_bits(__y_bits(a, b), 1) == 1
+}
+
+// ── Claves ordenadas (como el intérprete: orden por bytes) ───────────────
+
+funcion dyn_str_comparar(x, y) {
+    sea i = 0
+    mientras (i < str_largo(x) y i < str_largo(y)) {
+        sea cx = str_byte(x, i)
+        sea cy = str_byte(y, i)
+        si (cx < cy) { retornar 0 - 1 }
+        si (cx > cy) { retornar 1 }
+        i = i + 1
+    }
+    si (str_largo(x) < str_largo(y)) { retornar 0 - 1 }
+    si (str_largo(x) > str_largo(y)) { retornar 1 }
+    retornar 0
+}
+
+// Ordena por mezcla el tramo [desde, hasta) de v usando aux.
+funcion dyn_ordenar_tramo(v, aux, desde, hasta) {
+    si (hasta - desde < 2) { retornar 0 }
+    sea medio = (desde + hasta) / 2
+    dyn_ordenar_tramo(v, aux, desde, medio)
+    dyn_ordenar_tramo(v, aux, medio, hasta)
+    sea i = desde
+    sea j = medio
+    sea k = desde
+    mientras (k < hasta) {
+        si (j >= hasta o (i < medio y dyn_str_comparar(vec_obtener(v, i), vec_obtener(v, j)) <= 0)) {
+            vec_fijar(aux, k, vec_obtener(v, i))
+            i = i + 1
+        } sino {
+            vec_fijar(aux, k, vec_obtener(v, j))
+            j = j + 1
+        }
+        k = k + 1
+    }
+    k = desde
+    mientras (k < hasta) {
+        vec_fijar(v, k, vec_obtener(aux, k))
+        k = k + 1
+    }
+    retornar 0
+}
+
+// Claves del mapa (textos del runtime) en orden.
+funcion dyn_claves_ordenadas(m) {
+    sea v = map_claves(m)
+    sea aux = vec_nuevo()
+    sea i = 0
+    mientras (i < vec_largo(v)) {
+        vec_agregar(aux, 0)
+        i = i + 1
+    }
+    dyn_ordenar_tramo(v, aux, 0, vec_largo(v))
+    vec_liberar(aux)
+    retornar v
+}
+
+// ── Texto ─────────────────────────────────────────────────────────────────
+
+funcion dyn_agregar_valor(r, v, comillas) {
+    sea t = dyn_tipo(v)
+    si (t == 1 y comillas) {
+        str_agregar_byte(r, 34)
+        str_agregar(r, dyn_dato(v))
+        str_agregar_byte(r, 34)
+        retornar 0
+    }
+    si (t == 1) { str_agregar(r, dyn_dato(v)) retornar 0 }
+    si (t == 0) { str_agregar(r, "nulo") retornar 0 }
+    si (t == 5) {
+        si (v == 4) { str_agregar(r, "verdadero") } sino { str_agregar(r, "falso") }
+        retornar 0
+    }
+    si (t == 6) {
+        sea s = str_desde_entero(dyn_valor_entero(v))
+        str_agregar(r, s)
+        str_liberar(s)
+        retornar 0
+    }
+    si (t == 4) {
+        sea f = str_desde_f64(dyn_dato(v))
+        str_agregar(r, f)
+        str_liberar(f)
+        retornar 0
+    }
+    si (t == 2) {
+        sea l = dyn_dato(v)
+        str_agregar_byte(r, 91)
+        sea i = 0
+        mientras (i < vec_largo(l)) {
+            si (i > 0) { str_agregar(r, ", ") }
+            dyn_agregar_valor(r, vec_obtener(l, i), 0)
+            i = i + 1
+        }
+        str_agregar_byte(r, 93)
+        retornar 0
+    }
+    si (t == 3) {
+        sea m = dyn_dato(v)
+        str_agregar_byte(r, 123)
+        sea orden = dyn_claves_ordenadas(m)
+        sea j = 0
+        mientras (j < vec_largo(orden)) {
+            sea k = vec_obtener(orden, j)
+            si (j > 0) { str_agregar(r, ", ") }
+            str_agregar_byte(r, 34)
+            str_agregar(r, k)
+            str_agregar(r, "\": ")
+            dyn_agregar_valor(r, map_obtener(m, k), 0)
+            j = j + 1
+        }
+        vec_liberar(orden)
+        str_agregar_byte(r, 125)
+        retornar 0
+    }
+    rt_panico("valor desconocido")
+    retornar 0
+}
+
+// Texto del runtime con la representación del valor.
+funcion dyn_a_str(v) {
+    si (dyn_tipo(v) == 1) { retornar dyn_dato(v) }
+    sea r = str_nuevo(16)
+    dyn_agregar_valor(r, v, 0)
+    retornar r
+}
+
+funcion dyn_texto_de(v, operacion) {
+    si (dyn_tipo(v) != 1) { dyn_error_tipo(operacion, v) }
+    retornar dyn_dato(v)
+}
+
+// ── Operadores ────────────────────────────────────────────────────────────
+
+funcion dyn_suma(a, b) {
+    si (dyn_ambos_enteros(a, b)) { retornar a + b - 1 }
+    si (dyn_tipo(a) == 1 o dyn_tipo(b) == 1) {
+        sea r = str_nuevo(16)
+        dyn_agregar_valor(r, a, 0)
+        dyn_agregar_valor(r, b, 0)
+        retornar dyn_texto(r)
+    }
+    retornar dyn_desde_f64(__f64_suma(dyn_a_f64(a), dyn_a_f64(b)))
+}
+
+funcion dyn_resta(a, b) {
+    si (dyn_ambos_enteros(a, b)) { retornar a - b + 1 }
+    retornar dyn_desde_f64(__f64_resta(dyn_a_f64(a), dyn_a_f64(b)))
+}
+
+funcion dyn_mul(a, b) {
+    si (dyn_ambos_enteros(a, b)) {
+        retornar dyn_entero(dyn_valor_entero(a) * dyn_valor_entero(b))
+    }
+    retornar dyn_desde_f64(__f64_mul(dyn_a_f64(a), dyn_a_f64(b)))
+}
+
+funcion dyn_div(a, b) {
+    si (dyn_ambos_enteros(a, b)) {
+        sea x = dyn_valor_entero(a)
+        sea y = dyn_valor_entero(b)
+        si (y == 0) { rt_panico("división por cero") }
+        si (x % y == 0) { retornar dyn_entero(x / y) }
+    }
+    retornar dyn_desde_f64(__f64_div(dyn_a_f64(a), dyn_a_f64(b)))
+}
+
+funcion dyn_mod(a, b) {
+    si (dyn_ambos_enteros(a, b)) {
+        sea y = dyn_valor_entero(b)
+        si (y == 0) { rt_panico("división por cero") }
+        retornar dyn_entero(dyn_valor_entero(a) % y)
+    }
+    // fmod: a - trunc(a / b) * b
+    sea x = dyn_a_f64(a)
+    sea y = dyn_a_f64(b)
+    sea cociente = __f64_desde_entero(__f64_a_entero(__f64_div(x, y)))
+    retornar dyn_desde_f64(__f64_resta(x, __f64_mul(cociente, y)))
+}
+
+funcion dyn_neg(a) {
+    si (__y_bits(a, 1) == 1) { retornar 2 - a }
+    retornar dyn_desde_f64(__f64_resta(__f64_desde_entero(0), dyn_a_f64(a)))
+}
+
+funcion dyn_no(a) { retornar dyn_bool(dyn_verdad(a) == 0) }
+
+funcion dyn_igual_crudo(a, b) {
+    si (a == b) { retornar 1 }
+    sea ta = dyn_tipo(a)
+    sea tb = dyn_tipo(b)
+    si (ta == 1 y tb == 1) { retornar str_igual(dyn_dato(a), dyn_dato(b)) }
+    si (dyn_es_numero(a) y dyn_es_numero(b)) {
+        si (ta == 6 y tb == 6) { retornar 0 }
+        sea x = dyn_a_f64(a)
+        sea y = dyn_a_f64(b)
+        retornar __f64_menor(x, y) == 0 y __f64_menor(y, x) == 0
+    }
+    retornar 0
+}
+
+funcion dyn_igual(a, b) { retornar dyn_bool(dyn_igual_crudo(a, b)) }
+funcion dyn_distinto(a, b) { retornar dyn_bool(dyn_igual_crudo(a, b) == 0) }
+
+// -1, 0 o 1 para números o textos.
+funcion dyn_comparar(a, b) {
+    si (dyn_ambos_enteros(a, b)) {
+        si (a < b) { retornar 0 - 1 }
+        si (a > b) { retornar 1 }
+        retornar 0
+    }
+    si (dyn_tipo(a) == 1 y dyn_tipo(b) == 1) {
+        sea x = dyn_dato(a)
+        sea y = dyn_dato(b)
+        sea i = 0
+        mientras (i < str_largo(x) y i < str_largo(y)) {
+            sea cx = str_byte(x, i)
+            sea cy = str_byte(y, i)
+            si (cx < cy) { retornar 0 - 1 }
+            si (cx > cy) { retornar 1 }
+            i = i + 1
+        }
+        si (str_largo(x) < str_largo(y)) { retornar 0 - 1 }
+        si (str_largo(x) > str_largo(y)) { retornar 1 }
+        retornar 0
+    }
+    sea fx = dyn_a_f64(a)
+    sea fy = dyn_a_f64(b)
+    si (__f64_menor(fx, fy)) { retornar 0 - 1 }
+    si (__f64_menor(fy, fx)) { retornar 1 }
+    retornar 0
+}
+
+funcion dyn_menor(a, b) { retornar dyn_bool(dyn_comparar(a, b) < 0) }
+funcion dyn_menor_igual(a, b) { retornar dyn_bool(dyn_comparar(a, b) <= 0) }
+funcion dyn_mayor(a, b) { retornar dyn_bool(dyn_comparar(a, b) > 0) }
+funcion dyn_mayor_igual(a, b) { retornar dyn_bool(dyn_comparar(a, b) >= 0) }
+
+// ── Indexación e iteración ────────────────────────────────────────────────
+
+funcion dyn_indice_lista(l, i) {
+    si (__y_bits(i, 1) != 1) { rt_panico("el índice de lista debe ser un número entero") }
+    sea n = dyn_valor_entero(i)
+    si (n < 0 o n >= vec_largo(l)) { rt_panico("índice de lista inválido") }
+    retornar n
+}
+
+funcion dyn_clave(k) {
+    si (dyn_tipo(k) != 1) { rt_panico("la clave debe ser texto") }
+    retornar dyn_dato(k)
+}
+
+funcion dyn_indice(c, k) {
+    sea t = dyn_tipo(c)
+    si (t == 2) {
+        sea l = dyn_dato(c)
+        retornar vec_obtener(l, dyn_indice_lista(l, k))
+    }
+    si (t == 3) {
+        sea m = dyn_dato(c)
+        sea e = map_buscar(m, dyn_clave(k))
+        si (e < 0) { rt_panico("clave inexistente") }
+        retornar map_valor_en(m, e)
+    }
+    si (t == 1) {
+        sea s = dyn_dato(c)
+        si (__y_bits(k, 1) != 1) { rt_panico("el índice de texto debe ser un número entero") }
+        sea n = dyn_valor_entero(k)
+        si (n < 0 o n >= str_largo(s)) { rt_panico("índice de texto inválido") }
+        retornar dyn_texto(str_rebanar(s, n, n + 1))
+    }
+    dyn_error_tipo("no se puede indexar", c)
+    retornar 0
+}
+
+funcion dyn_fijar_indice(c, k, v) {
+    sea t = dyn_tipo(c)
+    si (t == 2) {
+        sea l = dyn_dato(c)
+        vec_fijar(l, dyn_indice_lista(l, k), v)
+        retornar 0
+    }
+    si (t == 3) {
+        map_fijar(dyn_dato(c), dyn_clave(k), v)
+        retornar 0
+    }
+    dyn_error_tipo("no se puede asignar por índice", c)
+    retornar 0
+}
+
+// Para "para x en c": cantidad de elementos (entero crudo) y elemento i.
+funcion dyn_iter_largo(c) {
+    sea t = dyn_tipo(c)
+    si (t == 2) { retornar vec_largo(dyn_dato(c)) }
+    si (t == 1) { retornar str_largo(dyn_dato(c)) }
+    dyn_error_tipo("no se puede recorrer", c)
+    retornar 0
+}
+
+funcion dyn_iter_obtener(c, i) {
+    si (dyn_tipo(c) == 2) { retornar vec_obtener(dyn_dato(c), i) }
+    retornar dyn_texto(str_rebanar(dyn_dato(c), i, i + 1))
+}
+
+// ── Funciones del lenguaje ────────────────────────────────────────────────
+
+funcion mostrar(v) {
+    rt_mostrar(dyn_a_str(v))
+    retornar 0
+}
+
+funcion afirmar(condicion, mensaje) {
+    si (dyn_verdad(condicion) == 0) { rt_panico(dyn_a_str(mensaje)) }
+    retornar 0
+}
+
+funcion a_texto(v) {
+    si (dyn_tipo(v) == 1) { retornar v }
+    retornar dyn_texto(dyn_a_str(v))
+}
+
+funcion longitud(v) {
+    sea t = dyn_tipo(v)
+    si (t == 2) { retornar dyn_entero(vec_largo(dyn_dato(v))) }
+    si (t == 1) { retornar dyn_entero(str_largo(dyn_dato(v))) }
+    si (t == 3) { retornar dyn_entero(map_tamano(dyn_dato(v))) }
+    dyn_error_tipo("longitud", v)
+    retornar 0
+}
+
+funcion agregar(l, v) {
+    si (dyn_tipo(l) != 2) { dyn_error_tipo("agregar", l) }
+    vec_agregar(dyn_dato(l), v)
+    retornar 0
+}
+
+funcion claves(m) {
+    si (dyn_tipo(m) != 3) { dyn_error_tipo("claves", m) }
+    sea crudas = dyn_claves_ordenadas(dyn_dato(m))
+    sea r = vec_nuevo()
+    sea i = 0
+    mientras (i < vec_largo(crudas)) {
+        vec_agregar(r, dyn_texto(vec_obtener(crudas, i)))
+        i = i + 1
+    }
+    vec_liberar(crudas)
+    retornar dyn_caja(2, r)
+}
+
+funcion tiene_clave(m, k) {
+    si (dyn_tipo(m) != 3) { dyn_error_tipo("tiene_clave", m) }
+    retornar dyn_bool(map_tiene(dyn_dato(m), dyn_clave(k)))
+}
+
+funcion quitar_clave(m, k) {
+    si (dyn_tipo(m) != 3) { dyn_error_tipo("quitar_clave", m) }
+    retornar dyn_bool(map_quitar(dyn_dato(m), dyn_clave(k)))
+}
+
+funcion lista_rango(inicio, fin) {
+    sea r = vec_nuevo()
+    sea i = dyn_valor_entero(inicio)
+    sea n = dyn_valor_entero(fin)
+    mientras (i < n) {
+        vec_agregar(r, dyn_entero(i))
+        i = i + 1
+    }
+    retornar dyn_caja(2, r)
+}
+
+funcion lista_invertir(l) {
+    si (dyn_tipo(l) != 2) { dyn_error_tipo("lista_invertir", l) }
+    sea origen = dyn_dato(l)
+    sea r = vec_nuevo()
+    sea i = vec_largo(origen) - 1
+    mientras (i >= 0) {
+        vec_agregar(r, vec_obtener(origen, i))
+        i = i - 1
+    }
+    retornar dyn_caja(2, r)
+}
+
+funcion lista_contiene(l, v) {
+    si (dyn_tipo(l) != 2) { dyn_error_tipo("lista_contiene", l) }
+    sea origen = dyn_dato(l)
+    sea i = 0
+    mientras (i < vec_largo(origen)) {
+        si (dyn_igual_crudo(vec_obtener(origen, i), v)) { retornar 4 }
+        i = i + 1
+    }
+    retornar 2
+}
+
+funcion quitar_ultimo(l) {
+    si (dyn_tipo(l) != 2) { dyn_error_tipo("quitar_ultimo", l) }
+    retornar vec_quitar_ultimo(dyn_dato(l))
+}
+
+funcion piso(v) {
+    si (__y_bits(v, 1) == 1) { retornar v }
+    sea x = dyn_a_f64(v)
+    sea e = __f64_a_entero(x)
+    si (__f64_menor(x, __f64_desde_entero(e))) { e = e - 1 }
+    retornar dyn_entero(e)
+}
+
+funcion techo(v) {
+    si (__y_bits(v, 1) == 1) { retornar v }
+    sea x = dyn_a_f64(v)
+    sea e = __f64_a_entero(x)
+    si (__f64_menor(__f64_desde_entero(e), x)) { e = e + 1 }
+    retornar dyn_entero(e)
+}
+
+funcion a_numero(v) {
+    si (dyn_es_numero(v)) { retornar v }
+    sea s = dyn_texto_de(v, "a_numero")
+    sea i = 0
+    sea n = str_largo(s)
+    sea negativo = 0
+    si (n > 0 y str_byte(s, 0) == 45) {
+        negativo = 1
+        i = 1
+    }
+    sea entero = 0
+    sea digitos = 0
+    mientras (i < n y str_byte(s, i) >= 48 y str_byte(s, i) <= 57) {
+        entero = entero * 10 + str_byte(s, i) - 48
+        digitos = digitos + 1
+        i = i + 1
+    }
+    sea valor = __f64_desde_entero(entero)
+    si (i < n y str_byte(s, i) == 46) {
+        i = i + 1
+        sea fraccion = 0
+        sea escala = 1
+        mientras (i < n y str_byte(s, i) >= 48 y str_byte(s, i) <= 57) {
+            fraccion = fraccion * 10 + str_byte(s, i) - 48
+            escala = escala * 10
+            digitos = digitos + 1
+            i = i + 1
+        }
+        valor = __f64_suma(valor, __f64_div(__f64_desde_entero(fraccion), __f64_desde_entero(escala)))
+    }
+    si (digitos == 0 o i != n) { rt_panico(str_concatenar("no es un número: ", s)) }
+    si (negativo) { valor = __f64_resta(__f64_desde_entero(0), valor) }
+    retornar dyn_desde_f64(valor)
+}
+
+funcion tipo_de(v) { retornar dyn_texto(dyn_nombre_tipo(v)) }
