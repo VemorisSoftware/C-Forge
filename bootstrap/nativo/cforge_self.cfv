@@ -971,6 +971,13 @@ funcion intrinseco(c, nombre) {
         e5(c, 242, 72, 15, 44, 192)
         retornar 1
     }
+    si (str_igual(nombre, "__f64_raiz")) {
+        un_argumento(c)
+        e5(c, 102, 72, 15, 110, 192)                           // movq xmm0, rax
+        e4(c, 242, 15, 81, 192)                                // sqrtsd xmm0, xmm0
+        e5(c, 102, 72, 15, 126, 192)                           // movq rax, xmm0
+        retornar 1
+    }
     si (str_igual(nombre, "__f64_suma")) { f64_dos(c, 88) retornar 1 }
     si (str_igual(nombre, "__f64_resta")) { f64_dos(c, 92) retornar 1 }
     si (str_igual(nombre, "__f64_mul")) { f64_dos(c, 89) retornar 1 }
@@ -1210,11 +1217,110 @@ funcion tok_tipo_en(c, salto) {
     retornar __cargar64(vec_obtener(__cargar64(c), i))
 }
 
+// ¿Tiene el literal una "{" sin escapar? (interpolación)
+funcion tiene_interpolacion(lexema) {
+    sea i = 1
+    mientras (i < str_largo(lexema) - 1) {
+        sea b = str_byte(lexema, i)
+        si (b == 92) {
+            i = i + 2
+        } sino {
+            si (b == 123) { retornar 1 }
+            i = i + 1
+        }
+    }
+    retornar 0
+}
+
+// Compila una expresión escrita dentro de un texto: "Hola {nombre}".
+funcion expresion_incrustada(c, texto) {
+    sea tokens = __cargar64(c)
+    sea posicion = __cargar64(c + 8)
+    sea linea = tok_linea(c)
+    sea nuevos = traducir_ingles(tokenizar(texto))
+    sea i = 0
+    mientras (i < vec_largo(nuevos)) {
+        __guardar64(vec_obtener(nuevos, i) + 16, linea)
+        i = i + 1
+    }
+    __guardar64(c, nuevos)
+    __guardar64(c + 8, 0)
+    expresion(c)
+    si (tok_tipo(c) != 5) { error_en(c, "expresión inválida dentro del texto") }
+    __guardar64(c, tokens)
+    __guardar64(c + 8, posicion)
+    retornar 0
+}
+
+// "a {x} b" → "a " + x + " b" (concatenación de textos del lenguaje).
+funcion texto_interpolado(c, lexema) {
+    cargar_caja(c, "")
+    sea parte = str_nuevo(16)
+    str_agregar_byte(parte, 34)
+    sea i = 1
+    sea fin = str_largo(lexema) - 1
+    mientras (i < fin) {
+        sea b = str_byte(lexema, i)
+        si (b == 92 y i + 1 < fin) {
+            str_agregar_byte(parte, b)
+            str_agregar_byte(parte, str_byte(lexema, i + 1))
+            i = i + 2
+        } sino {
+            si (b == 123) {
+                si (str_largo(parte) > 1) {
+                    str_agregar_byte(parte, 34)
+                    empujar(c)
+                    e1(c, 184)
+                    ref_dato(c, literal_caja(c, parte))
+                    llamar_operador_suma(c)
+                }
+                parte = str_nuevo(16)
+                str_agregar_byte(parte, 34)
+                sea nivel = 1
+                sea inicio = i + 1
+                i = i + 1
+                mientras (i < fin y nivel > 0) {
+                    si (str_byte(lexema, i) == 123) { nivel = nivel + 1 }
+                    si (str_byte(lexema, i) == 125) { nivel = nivel - 1 }
+                    i = i + 1
+                }
+                si (nivel != 0) { error_en(c, "falta '}' en la interpolación del texto") }
+                empujar(c)
+                expresion_incrustada(c, str_rebanar(lexema, inicio, i - 1))
+                llamar_operador_suma(c)
+            } sino {
+                str_agregar_byte(parte, b)
+                i = i + 1
+            }
+        }
+    }
+    si (str_largo(parte) > 1) {
+        str_agregar_byte(parte, 34)
+        empujar(c)
+        e1(c, 184)
+        ref_dato(c, literal_caja(c, parte))
+        llamar_operador_suma(c)
+    }
+    retornar 0
+}
+
+// Izquierda apilada, derecha en rax → texto concatenado (dyn_suma).
+funcion llamar_operador_suma(c) {
+    empujar(c)
+    llamar_runtime(c, "dyn_suma", 2)
+    retornar 0
+}
+
 funcion primaria_dinamica(c) {
     sea tipo = tok_tipo(c)
     si (tipo == 2) { numero_dinamico(c) retornar 0 }
     si (tipo == 3) {
-        sea d = literal_caja(c, __cargar64(avanzar(c) + 8))
+        sea lexema = __cargar64(avanzar(c) + 8)
+        si (tiene_interpolacion(lexema)) {
+            texto_interpolado(c, lexema)
+            retornar 0
+        }
+        sea d = literal_caja(c, lexema)
         e1(c, 184)
         ref_dato(c, d)
         retornar 0
@@ -1222,6 +1328,27 @@ funcion primaria_dinamica(c) {
     si (tomar(c, "verdadero")) { cargar_inmediato(c, 4) retornar 0 }
     si (tomar(c, "falso")) { cargar_inmediato(c, 2) retornar 0 }
     si (tomar(c, "nulo")) { cargar_inmediato(c, 0) retornar 0 }
+    si (ver(c, "si") y str_igual(tok_siguiente_lexema(c), "(")) {
+        // si(condición, a, b): solo se evalúa la rama elegida.
+        avanzar(c)
+        avanzar(c)
+        expresion(c)
+        condicion(c)
+        sea otro = nueva_etiqueta(c)
+        sea fin = nueva_etiqueta(c)
+        e5(c, 72, 133, 192, 15, 132)
+        ref_etiqueta(c, otro)
+        requerir(c, ",")
+        expresion(c)
+        e1(c, 233)
+        ref_etiqueta(c, fin)
+        definir_etiqueta(c, otro)
+        requerir(c, ",")
+        expresion(c)
+        requerir(c, ")")
+        definir_etiqueta(c, fin)
+        retornar 0
+    }
     si (ver(c, "super") y str_igual(tok_siguiente_lexema(c), ".")) {
         avanzar(c)
         llamada_super(c)
@@ -2526,8 +2653,10 @@ funcion contiene_texto(lista, texto) {
     retornar 0
 }
 
-// Agrega cada importar "x" (y sus importaciones) una sola vez, en modo dinámico.
-funcion resolver_importaciones(fuente, stdlib, texto, vistas, archivos) {
+// Agrega un archivo dinámico precedido por sus importaciones (cada módulo una
+// sola vez, en profundidad), así las globales de un módulo existen antes de
+// que el archivo que lo importa empiece a ejecutarse.
+funcion agregar_con_importaciones(fuente, stdlib, texto, nombre, vistas, archivos) {
     sea tokens = tokenizar(texto)
     sea i = 0
     mientras (i + 1 < vec_largo(tokens)) {
@@ -2537,13 +2666,12 @@ funcion resolver_importaciones(fuente, stdlib, texto, vistas, archivos) {
             sea ruta = ruta_importacion(stdlib, decodificar_literal(__cargar64(u + 8)))
             si (contiene_texto(vistas, ruta) == 0) {
                 vec_agregar(vistas, ruta)
-                sea importado = archivo_leer(ruta)
-                agregar_fuente(fuente, 2, importado, ruta, archivos)
-                resolver_importaciones(fuente, stdlib, importado, vistas, archivos)
+                agregar_con_importaciones(fuente, stdlib, archivo_leer(ruta), ruta, vistas, archivos)
             }
         }
         i = i + 1
     }
+    agregar_fuente(fuente, 2, texto, nombre, archivos)
     retornar 0
 }
 
@@ -2576,10 +2704,11 @@ mientras (indice < rt_argc()) {
                     modo = 3
                 } sino {
                     sea texto = archivo_leer(argumento)
-                    agregar_fuente(fuente, modo, texto, argumento, archivos)
                     si (modo == 2) {
                         puntaje = puntaje + puntaje_ingles(tokenizar(texto))
-                        resolver_importaciones(fuente, stdlib, texto, vistas, archivos)
+                        agregar_con_importaciones(fuente, stdlib, texto, argumento, vistas, archivos)
+                    } sino {
+                        agregar_fuente(fuente, modo, texto, argumento, archivos)
                     }
                 }
                 }

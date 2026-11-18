@@ -24,6 +24,9 @@ Sitio oficial: [c-forge.org](https://c-forge.org)
 - **Funciones anónimas y errores nativos**: cierres con captura por
   referencia, globales, `intentar`/`capturar`/`finalmente`/`lanzar`, `??`.
   15 de 25 pruebas de la suite compiladas a ELF sin libc.
+- **Biblioteca estándar nativa** (`runtime/biblioteca.cfv`, JSON y regex en
+  `runtime/lenguaje.cfv`), interpolación de textos y `si(c, a, b)`:
+  24 de 25 pruebas de la suite compiladas a ELF sin libc.
 
 ## 3.7.3 — extern C + idioma del programa
 
