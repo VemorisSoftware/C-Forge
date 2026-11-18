@@ -15,6 +15,9 @@ Sitio oficial: [c-forge.org](https://c-forge.org)
 - **Compilador autoalojado** (`bootstrap/nativo/cforge_self.cfv`): compilador
   de una pasada escrito en el dialecto nativo que se compila a sí mismo.
   Stage 2 = Stage 3 byte por byte, sin libc ni C++ (`make autoalojado-check`).
+- **Listas y mapas nativos** en el compilador autoalojado: valores dinámicos
+  etiquetados, `runtime/map.cfv` (tabla hash) y `runtime/dyn.cfv`. Las pruebas
+  de colecciones de la suite pasan compiladas a ELF sin libc.
 
 ## 3.7.3 — extern C + idioma del programa
 

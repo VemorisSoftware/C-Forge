@@ -386,6 +386,39 @@ mientras lee los tokens, sin árbol de sintaxis, y empaqueta el ELF.
 Desde Stage 1 en adelante no interviene C++, libc, enlazador ni ensamblador.
 C++ queda solo en Stage 0, el paso de arranque.
 
+### Bloque 1: listas y mapas en el compilador autoalojado ✅
+
+`cforge_self` compila ahora el lenguaje dinámico (`--dinamico`) con valores
+etiquetados de 64 bits, igual que el intérprete:
+
+| Valor | Representación |
+|---|---|
+| `nulo` | 0 |
+| `falso` / `verdadero` | 2 / 4 |
+| entero | n·2 + 1 (impar) |
+| texto, lista, mapa, flotante | caja `[tipo][dato]` |
+
+- `runtime/map.cfv`: tabla hash FNV-1a con direccionamiento abierto,
+  crecimiento ×2 con 2/3 de carga, lápidas para borrar.
+- `runtime/dyn.cfv`: operadores, indexación, `para … en`, `mostrar`,
+  `longitud`, `agregar`, `claves`, `tiene_clave`, `a_texto`, `a_numero`,
+  `piso`, `lista_rango`, etc. Las claves se recorren en orden, como en el
+  intérprete.
+- Sintaxis nueva en el compilador: `[..]`, `{..}`, `x[i]`, `x[i][j] = v`,
+  `x.metodo(..)`, `para x en c`, `romper`, `continuar`, `+= -= *= /= %=`,
+  `sino si`, flotantes literales, `nulo` e `importar "modulo"`.
+
+```sh
+cforge-self -o prog --stdlib stdlib runtime/{sys_linux,mem,str,vec,io,f64,map}.cfv \
+    --puente runtime/dyn.cfv --dinamico prog.cfv
+```
+
+Verificado en CI: `tests/nativo/06_colecciones.cfv` produce exactamente la
+salida del intérprete, y `tests/cfv/03, 06, 10 y 16` (colecciones y sus
+bibliotecas) pasan compiladas a ELF sin libc. Estado de la suite completa:
+7 de 25 pruebas ya compilan nativas; el resto espera los bloques 2 a 4
+(clases, closures, errores, `extern`, más funciones de la biblioteca).
+
 **Alcance honesto:** el compilador autoalojado compila el *dialecto nativo*
 (enteros de 64 bits, funciones, recursión, condiciones, ciclos, textos
 literales e intrínsecos). El lenguaje C-Forge completo (clases, mapas,
