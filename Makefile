@@ -322,7 +322,7 @@ nativo-check:
 RUNTIME_LENGUAJE := $(RUNTIME_NATIVO) runtime/sys_linux_ext.cfv runtime/map.cfv --puente runtime/dyn.cfv runtime/biblioteca.cfv --lenguaje runtime/lenguaje.cfv
 PRUEBAS_LENGUAJE_NATIVAS := $(basename $(notdir $(wildcard tests/cfv/*.cfv)))
 FUENTES_COMPILADOR := $(RUNTIME_NATIVO) bootstrap/nativo/lexer.cfv bootstrap/nativo/cforge_self.cfv bootstrap/nativo/gen.cfv bootstrap/nativo/gen_x64.cfv bootstrap/nativo/gen_a64.cfv
-FUENTES_CFORGE := $(FUENTES_COMPILADOR) bootstrap/nativo/embebido.cfv bootstrap/nativo/paquetes.cfv bootstrap/nativo/cforge_cli.cfv
+FUENTES_CFORGE := $(FUENTES_COMPILADOR) bootstrap/nativo/embebido.cfv bootstrap/nativo/paquetes.cfv bootstrap/nativo/formato.cfv bootstrap/nativo/lsp.cfv bootstrap/nativo/cforge_cli.cfv
 EMBEBIDO_ARGS := --nativo $(RUNTIME_NATIVO) runtime/sys_linux_ext.cfv runtime/sys_linux_arm64.cfv runtime/sys_linux_arm64_ext.cfv runtime/sys_windows.cfv runtime/sys_windows_ext.cfv runtime/sys_macos.cfv runtime/sys_macos_ext.cfv runtime/map.cfv --puente runtime/dyn.cfv runtime/biblioteca.cfv --lenguaje runtime/lenguaje.cfv --opcional runtime/sdl.cfv
 SEMILLA := bootstrap/semilla/cforge-linux-x64
 
@@ -348,7 +348,7 @@ cforge-nativo:
 
 ## ── Windows x86-64 (PE64), compilado de forma cruzada desde Linux ───────
 RUNTIME_WINDOWS := runtime/sys_windows.cfv runtime/mem.cfv runtime/str.cfv runtime/vec.cfv runtime/io.cfv runtime/f64.cfv
-FUENTES_CFORGE_WINDOWS := $(RUNTIME_WINDOWS) bootstrap/nativo/lexer.cfv bootstrap/nativo/cforge_self.cfv bootstrap/nativo/gen.cfv bootstrap/nativo/gen_x64.cfv bootstrap/nativo/gen_a64.cfv bootstrap/nativo/embebido.cfv bootstrap/nativo/paquetes.cfv bootstrap/nativo/cforge_cli.cfv
+FUENTES_CFORGE_WINDOWS := $(RUNTIME_WINDOWS) bootstrap/nativo/lexer.cfv bootstrap/nativo/cforge_self.cfv bootstrap/nativo/gen.cfv bootstrap/nativo/gen_x64.cfv bootstrap/nativo/gen_a64.cfv bootstrap/nativo/embebido.cfv bootstrap/nativo/paquetes.cfv bootstrap/nativo/formato.cfv bootstrap/nativo/lsp.cfv bootstrap/nativo/cforge_cli.cfv
 windows-cruzado: cforge-nativo
 	@set -e; rm -rf dist-windows; mkdir -p dist-windows/pruebas; \
 	./cforge-nativo -o dist-windows/cforge.exe --target windows $(FUENTES_CFORGE_WINDOWS) >/dev/null; \
@@ -360,7 +360,7 @@ windows-cruzado: cforge-nativo
 
 ## ── macOS x86-64 (Mach-O), compilado de forma cruzada ───────────────────
 RUNTIME_MACOS := runtime/sys_macos.cfv runtime/mem.cfv runtime/str.cfv runtime/vec.cfv runtime/io.cfv runtime/f64.cfv
-FUENTES_CFORGE_MACOS := $(RUNTIME_MACOS) bootstrap/nativo/lexer.cfv bootstrap/nativo/cforge_self.cfv bootstrap/nativo/gen.cfv bootstrap/nativo/gen_x64.cfv bootstrap/nativo/gen_a64.cfv bootstrap/nativo/embebido.cfv bootstrap/nativo/paquetes.cfv bootstrap/nativo/cforge_cli.cfv
+FUENTES_CFORGE_MACOS := $(RUNTIME_MACOS) bootstrap/nativo/lexer.cfv bootstrap/nativo/cforge_self.cfv bootstrap/nativo/gen.cfv bootstrap/nativo/gen_x64.cfv bootstrap/nativo/gen_a64.cfv bootstrap/nativo/embebido.cfv bootstrap/nativo/paquetes.cfv bootstrap/nativo/formato.cfv bootstrap/nativo/lsp.cfv bootstrap/nativo/cforge_cli.cfv
 macos-cruzado: cforge-nativo
 	@set -e; rm -rf dist-macos; mkdir -p dist-macos/pruebas; \
 	./cforge-nativo -o dist-macos/cforge --target macos $(FUENTES_CFORGE_MACOS) >/dev/null; \
@@ -458,6 +458,9 @@ autoalojado-check: cforge-nativo
 	env -i $$C --version | grep -q "$(VERSION)"; \
 	sh tests/nativo/ejemplos.sh $$C; \
 	sh tests/paquetes/prueba.sh $$C; \
+	$$C fmt --stdout tests/formato/entrada.cfv | cmp - tests/formato/esperado.cfv; \
+	$$C fmt --check tests/formato/esperado.cfv; \
+	echo "  ✓ cforge fmt: salida esperada e idempotente"; \
 	echo "  ✓ Suite del lenguaje con cforge nativo: $(words $(PRUEBAS_LENGUAJE_NATIVAS)) pruebas, ejemplos del sitio, ejemplos/ y CLI (run, build, check)"
 
 ## Verificar los backends Core B6.8 sin toolchain durante la emisión.

@@ -1,0 +1,323 @@
+// bootstrap/nativo/formato.cfv — cforge fmt: formateador de código C-Forge.
+//
+//   cforge fmt [archivos o directorios...]   formatea en el lugar
+//   cforge fmt --check [...]                 lista los que cambiarían (código 1)
+//   cforge fmt --stdout archivo.cfv          imprime el resultado
+//
+// Sin argumentos formatea todos los .cfv del proyecto (o del directorio
+// actual). Reglas (conservadoras e idempotentes):
+//   · indentación de 4 espacios por cada {, ( o [ abierto;
+//   · sin espacios al final de línea, como máximo una línea en blanco
+//     seguida, sin líneas en blanco al principio ni al final;
+//   · un espacio después de cada coma y ninguno antes;
+//   · "si (", "mientras (", "para (", ") {", "} sino {";
+//   · el interior de los textos (también de varias líneas) y de los
+//     comentarios no se toca; tampoco el espacio que alinea un comentario.
+
+funcion es_ident_formato(b) {
+    retornar (b >= 97 y b <= 122) o (b >= 65 y b <= 90) o (b >= 48 y b <= 57) o b == 95 o b >= 128
+}
+
+// Palabra que termina justo antes de la posición fin en s.
+funcion palabra_final(s) {
+    sea i = str_largo(s)
+    mientras (i > 0 y es_ident_formato(str_byte(s, i - 1))) { i = i - 1 }
+    si (i > 0 y str_byte(s, i - 1) == 46) { retornar "" }                // x.si(...) no es una palabra clave
+    retornar str_rebanar(s, i, str_largo(s))
+}
+
+funcion es_clave_con_parentesis(p) {
+    retornar str_igual(p, "si") o str_igual(p, "mientras") o str_igual(p, "para") o str_igual(p, "capturar") o str_igual(p, "if") o str_igual(p, "while") o str_igual(p, "for") o str_igual(p, "catch")
+}
+
+funcion quitar_espacios_finales(s) {
+    sea j = str_largo(s)
+    mientras (j > 0 y (str_byte(s, j - 1) == 32 o str_byte(s, j - 1) == 9 o str_byte(s, j - 1) == 13)) { j = j - 1 }
+    retornar str_rebanar(s, 0, j)
+}
+
+// Estado entre líneas: [dentro de un texto][profundidad]
+funcion formatear(texto) {
+    sea lineas = lineas_de(texto)
+    sea r = str_nuevo(str_largo(texto) + 1024)
+    sea en_texto = 0
+    sea pila = str_nuevo(64)                                   // grupos abiertos: { ( [
+    sea pesos = str_nuevo(64)                                  // 0, 1 nivel o 2 (nivel + continuación)
+    sea blancas = 0
+    sea escrito = 0
+    sea continua = 0
+    sea i = 0
+    mientras (i < vec_largo(lineas)) {
+        sea original = vec_obtener(lineas, i)
+        si (en_texto) {
+            // Continuación de un texto de varias líneas: se copia tal cual.
+            str_agregar(r, original)
+            str_agregar_byte(r, 10)
+            en_texto = escanear_linea(original, 1, pila, pesos, 0)
+            escrito = 1
+            blancas = 0
+        } sino {
+            sea l = recortar(original)
+            si (str_largo(l) == 0) {
+                blancas = blancas + 1
+            } sino {
+                si (blancas > 0 y escrito) { str_agregar_byte(r, 10) }
+                blancas = 0
+                sea codigo = espaciar(l)
+                // Cerradores al inicio de la línea: se dedentan.
+                sea cierres = 0
+                mientras (cierres < str_largo(codigo) y (str_byte(codigo, cierres) == 125 o str_byte(codigo, cierres) == 41 o str_byte(codigo, cierres) == 93)) { cierres = cierres + 1 }
+                sea nivel = niveles(pesos, cierres)
+                // Continuación de una expresión dentro de un bloque (no
+                // dentro de paréntesis, que ya sangran): un nivel más.
+                sea en_bloque = str_largo(pila) == 0 o str_byte(pila, str_largo(pila) - 1) == 123
+                sea es_continuacion = cierres == 0 y en_bloque y (continua o empieza_continuacion(codigo))
+                si (es_continuacion) { nivel = nivel + 1 }
+                sea k = 0
+                mientras (k < nivel) {
+                    str_agregar(r, "    ")
+                    k = k + 1
+                }
+                en_texto = escanear_linea(codigo, 0, pila, pesos, es_continuacion)
+                si (en_texto == 0) { codigo = quitar_espacios_finales(codigo) }
+                continua = en_texto == 0 y termina_en_operador(codigo)
+                str_agregar(r, codigo)
+                str_agregar_byte(r, 10)
+                escrito = 1
+            }
+        }
+        i = i + 1
+    }
+    retornar r
+}
+
+// Último carácter de código de la línea (fuera de textos y comentarios),
+// o la palabra final si es "y" / "o".
+funcion termina_en_operador(l) {
+    sea ultimo = 0
+    sea fin = 0
+    sea en_texto = 0
+    sea i = 0
+    sea seguir = 1
+    mientras (seguir y i < str_largo(l)) {
+        sea b = str_byte(l, i)
+        si (en_texto) {
+            si (b == 92) { i = i + 1 } sino { si (b == 34) { en_texto = 0 } }
+        } sino {
+            si (b == 34) { en_texto = 1 }
+            si (b == 47 y i + 1 < str_largo(l) y str_byte(l, i + 1) == 47) { seguir = 0 }
+        }
+        si (seguir y b != 32 y b != 9) {
+            ultimo = b
+            fin = i + 1
+        }
+        i = i + 1
+    }
+    si (ultimo == 43 o ultimo == 45 o ultimo == 42 o ultimo == 47 o ultimo == 37 o ultimo == 61 o ultimo == 60 o ultimo == 38 o ultimo == 124 o ultimo == 63 o ultimo == 58) {
+        // "x = -" no, pero "a +", "b ==", "c &&", "x ?" sí; "=>" y "->" abren bloque.
+        si (fin >= 2 y (str_byte(l, fin - 2) == 61 o str_byte(l, fin - 2) == 45) y ultimo == 62) { retornar 0 }
+        retornar 1
+    }
+    sea palabra = palabra_final(str_rebanar(l, 0, fin))
+    retornar str_igual(palabra, "y") o str_igual(palabra, "o") o str_igual(palabra, "and") o str_igual(palabra, "or")
+}
+
+funcion empieza_continuacion(l) {
+    sea b = str_byte(l, 0)
+    si (b == 46 o b == 43 o b == 63 o b == 124 o b == 38) {
+        si (b == 46 y str_largo(l) > 1 y str_byte(l, 1) == 46) { retornar 0 }   // ...resto
+        retornar 1
+    }
+    retornar 0
+}
+
+// Niveles de sangría según los pesos de los grupos abiertos, sin contar
+// los "cierres" del tope (cerradores al inicio de la línea); un grupo que
+// se abrió en una línea de continuación deja su cierre a esa altura.
+funcion niveles(pesos, cierres) {
+    sea n = 0
+    sea i = 0
+    mientras (i < str_largo(pesos)) {
+        sea p = str_byte(pesos, i)
+        si (i < str_largo(pesos) - cierres) { n = n + p } sino { si (p == 2) { n = n + 1 } }
+        i = i + 1
+    }
+    retornar n
+}
+
+// Recorre una línea desde el estado "en_texto" apilando { ( [ y
+// desapilando } ) ] fuera de textos y comentarios; devuelve si la línea
+// termina dentro de un texto.
+funcion escanear_linea(l, en_texto, pila, pesos, continuacion) {
+    sea minimo = str_largo(pila)                               // altura mínima de la pila en la línea
+    sea i = 0
+    sea seguir = 1
+    mientras (seguir y i < str_largo(l)) {
+        sea b = str_byte(l, i)
+        si (en_texto) {
+            si (b == 92) { i = i + 1 } sino { si (b == 34) { en_texto = 0 } }
+        } sino {
+            si (b == 34) { en_texto = 1 }
+            si (b == 47 y i + 1 < str_largo(l) y str_byte(l, i + 1) == 47) { seguir = 0 }
+            si (seguir y (b == 123 o b == 40 o b == 91)) {
+                str_agregar_byte(pila, b)
+                str_agregar_byte(pesos, 0)
+            }
+            si (seguir y (b == 125 o b == 41 o b == 93) y str_largo(pila) > 0) {
+                __guardar64(pila, str_largo(pila) - 1)
+                __guardar64(pesos, str_largo(pesos) - 1)
+                si (str_largo(pila) < minimo) { minimo = str_largo(pila) }
+            }
+        }
+        i = i + 1
+    }
+    // El primer grupo que la línea deja abierto suma un nivel (dos si la
+    // línea es la continuación de una expresión).
+    si (str_largo(pila) > minimo) { __guardar8(str_datos(pesos) + minimo, 1 + continuacion) }
+    retornar en_texto
+}
+
+// Normaliza los espacios del código de una línea (sin su indentación),
+// fuera de textos y comentarios.
+funcion espaciar(l) {
+    sea r = str_nuevo(str_largo(l) + 16)
+    sea i = 0
+    mientras (i < str_largo(l)) {
+        sea b = str_byte(l, i)
+        si (b == 34) {
+            // Texto: hasta la comilla de cierre (o el final de la línea).
+            sea j = i + 1
+            sea cerrado = 0
+            mientras (j < str_largo(l) y cerrado == 0) {
+                si (str_byte(l, j) == 92) { j = j + 1 } sino { si (str_byte(l, j) == 34) { cerrado = 1 } }
+                j = j + 1
+            }
+            si (j > str_largo(l)) { j = str_largo(l) }
+            str_agregar(r, str_rebanar(l, i, j))
+            i = j
+        } sino {
+            si (b == 47 y i + 1 < str_largo(l) y str_byte(l, i + 1) == 47) {
+                // Comentario: se conserva con el espacio que lo precede.
+                str_agregar(r, str_rebanar(l, i, str_largo(l)))
+                i = str_largo(l)
+            } sino {
+                si (b == 32 o b == 9) {
+                    // Espacios: uno solo, salvo si alinean un comentario.
+                    sea j = i
+                    mientras (j < str_largo(l) y (str_byte(l, j) == 32 o str_byte(l, j) == 9)) { j = j + 1 }
+                    sea antes_de_comentario = j + 1 < str_largo(l) y str_byte(l, j) == 47 y str_byte(l, j + 1) == 47
+                    si (antes_de_comentario) {
+                        str_agregar(r, str_rebanar(l, i, j))
+                    } sino {
+                        si (j < str_largo(l) y str_byte(l, j) != 44 y str_byte(l, j) != 41 y str_byte(l, j) != 93) {
+                            sea previo = 0
+                            si (str_largo(r) > 0) { previo = str_byte(r, str_largo(r) - 1) }
+                            si (previo != 40 y previo != 91) { str_agregar_byte(r, 32) }
+                        }
+                    }
+                    i = j
+                } sino {
+                    si (b == 44) {
+                        str_agregar_byte(r, 44)
+                        si (i + 1 < str_largo(l) y str_byte(l, i + 1) != 32 y str_byte(l, i + 1) != 9) { str_agregar_byte(r, 32) }
+                        i = i + 1
+                    } sino {
+                        si (b == 40 y es_clave_con_parentesis(palabra_final(r))) {
+                            str_agregar(r, " (")
+                            i = i + 1
+                        } sino {
+                            si (b == 123 y str_largo(r) > 0 y str_byte(r, str_largo(r) - 1) != 32 y str_byte(r, str_largo(r) - 1) != 40 y str_byte(r, str_largo(r) - 1) != 91 y str_byte(r, str_largo(r) - 1) != 123) {
+                                str_agregar(r, " {")
+                                i = i + 1
+                            } sino {
+                                si (b == 125 y i + 1 < str_largo(l) y es_ident_formato(str_byte(l, i + 1))) {
+                                    str_agregar(r, "} ")
+                                    i = i + 1
+                                } sino {
+                                    str_agregar_byte(r, b)
+                                    i = i + 1
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+    retornar r
+}
+
+// ── Orden cforge fmt ──────────────────────────────────────────────────────
+
+funcion archivos_cfv(ruta, r) {
+    sea nombres = sys_listar(ruta)
+    si (nombres == 0) {
+        si (termina_en(ruta, ".cfv")) { vec_agregar(r, ruta) }
+        retornar 0
+    }
+    sea i = 0
+    mientras (i < vec_largo(nombres)) {
+        sea n = vec_obtener(nombres, i)
+        si (str_largo(n) > 0 y str_byte(n, 0) != 46) {
+            sea hijo = unir_ruta(ruta, n)
+            si (termina_en(n, ".cfv")) {
+                si (sys_listar(hijo) == 0) { vec_agregar(r, hijo) }
+            } sino {
+                archivos_cfv_dir(hijo, r)
+            }
+        }
+        i = i + 1
+    }
+    retornar 0
+}
+
+funcion archivos_cfv_dir(ruta, r) {
+    si (sys_listar(ruta) != 0) { archivos_cfv(ruta, r) }
+    retornar 0
+}
+
+funcion orden_fmt(desde) {
+    sea revisar = 0
+    sea a_salida = 0
+    sea rutas = vec_nuevo()
+    sea k = desde
+    mientras (k < rt_argc()) {
+        sea a = rt_argumento(k)
+        si (str_igual(a, "--check")) { revisar = 1 } sino {
+            si (str_igual(a, "--stdout")) { a_salida = 1 } sino { vec_agregar(rutas, a) }
+        }
+        k = k + 1
+    }
+    si (vec_largo(rutas) == 0) {
+        sea proyecto = buscar_proyecto(".")
+        si (proyecto == 0) { proyecto = "." }
+        vec_agregar(rutas, proyecto)
+    }
+    sea archivos = vec_nuevo()
+    sea i = 0
+    mientras (i < vec_largo(rutas)) {
+        archivos_cfv(vec_obtener(rutas, i), archivos)
+        i = i + 1
+    }
+    sea cambiados = 0
+    i = 0
+    mientras (i < vec_largo(archivos)) {
+        sea ruta = vec_obtener(archivos, i)
+        sea original = archivo_leer(ruta)
+        sea nuevo = formatear(original)
+        si (a_salida) {
+            rt_escribir_texto(1, nuevo)
+        } sino {
+            si (str_igual(original, nuevo) == 0) {
+                cambiados = cambiados + 1
+                si (revisar) { mostrar(ruta) } sino {
+                    archivo_escribir(ruta, nuevo)
+                    mostrar(str_concatenar("✓ ", ruta))
+                }
+            }
+        }
+        i = i + 1
+    }
+    si (revisar y cambiados > 0) { sys_salir(1) }
+    retornar 0
+}

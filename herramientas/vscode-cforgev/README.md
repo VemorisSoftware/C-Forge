@@ -1,52 +1,30 @@
-# C-Forge Language
+# C-Forge para VS Code
 
-Soporte oficial de lenguaje para archivos `.cfv` de **C-Forge 3.2**.
-
-**[c-forge.org](https://c-forge.org)** · [Documentación](https://docs.c-forge.org) · [Playground](https://play.c-forge.org)
+Soporte oficial del lenguaje **C-Forge** (`.cfv`) — [c-forge.org](https://c-forge.org)
 
 ## Funciones
 
-- Resaltado TextMate para palabras clave, tipos, funciones, números y textos.
-- Reconocimiento de `gpu`, `cluster` y `test` como sintaxis experimental.
-- Soporte para funciones nativas de sistema, archivos, TCP, matrices y arrays.
-- Resaltado de la sintaxis propia `mostrar`, `agregar` y `longitud`.
-- Comentarios de línea mediante `//`.
-- Cierre automático de llaves, corchetes, paréntesis y comillas.
-- Comprobación mediante el comando estable `cforge check`.
-- Ejecución del archivo activo mediante el comando estable `cforge`.
-- Autocompletado básico de palabras reservadas.
-
-## Ejemplo
-
-```cfv
-cluster proyecto = "C-Forge";
-
-funcion cuadrado(numero) {
-    retornar numero * numero;
-}
-
-gpu {
-    resultados = paralelo("cuadrado", [2, 3, 4, 5]);
-    mostrar(resultados);
-}
-
-agregar(resultados, 36)
-mostrar(longitud(resultados))
-```
+- **Servidor de lenguaje** (`cforge lsp`, escrito en C-Forge):
+  - diagnósticos mientras escribes, en la línea exacta del error;
+  - autocompletado de tus funciones, clases y variables, de lo que importas
+    (archivos, paquetes de `cforge.toml` y biblioteca estándar), de la
+    biblioteca del lenguaje y de las palabras clave;
+  - ir a la definición (F12) e información al pasar el cursor;
+  - formateo del documento (`cforge fmt`, Shift+Alt+F).
+- Resaltado de sintaxis, fragmentos y cierre automático de llaves y comillas.
+- Comandos: *C-Forge: Ejecutar archivo*, *Comprobar archivo*, *Formatear
+  archivo* y *Reiniciar el servidor de lenguaje*.
 
 ## Requisitos
 
-Esta extensión proporciona soporte visual y no instala el compilador. Para
-ejecutar programas necesitas una instalación independiente de C-Forge.
+Instala C-Forge (`cforge --version`) desde [c-forge.org](https://c-forge.org).
+Si `cforge` no está en el `PATH`, indica su ruta en el ajuste `cforge.ruta`.
 
-```bash
-cforge --version
-cforge programa.cfv
-```
+## Ajustes
 
-## Estado
+| Ajuste | Por defecto | Descripción |
+|---|---|---|
+| `cforge.ruta` | `cforge` | Ejecutable de C-Forge |
+| `cforge.lsp.habilitado` | `true` | Iniciar el servidor de lenguaje |
 
-Versión `2.6.0`, alineada con el núcleo estable. LSP y DAP permanecen fuera de
-esta versión hasta disponer de implementación y pruebas públicas.
-
-Copyright © 2026 Vemoris Group y Javier. Todos los derechos reservados.
+Copyright © 2026 Vemoris Group. Todos los derechos reservados.

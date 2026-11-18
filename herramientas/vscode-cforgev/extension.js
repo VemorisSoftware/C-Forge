@@ -1,66 +1,63 @@
 "use strict";
 
-// Integración estable de VS Code. Solo usa comandos públicos de C-Forge 2.6:
-// check y ejecución de archivos. LSP y DAP no se anuncian hasta que formen
-// parte del contrato probado del CLI.
+// Extensión de C-Forge para VS Code: cliente del servidor de lenguaje
+// "cforge lsp" (diagnósticos, autocompletado, ir a la definición,
+// información al pasar el cursor y formateo) y comandos para ejecutar,
+// comprobar y formatear archivos .cfv.
 const vscode = require("vscode");
-const { execFile } = require("child_process");
+const { LanguageClient, TransportKind } = require("vscode-languageclient/node");
 
-const words = [
-  "sea", "si", "sino", "mientras", "para", "en", "funcion", "retornar",
-  "clase", "esto", "intentar", "capturar", "lanzar", "importar", "mostrar",
-  "verdadero", "falso", "nulo", "afirmar", "agregar", "longitud"
-];
+let client;
 
-function runCForge(args, callback) {
-  execFile("cforge", args, { timeout: 30000, maxBuffer: 4 * 1024 * 1024 }, callback);
+function cforgePath() {
+  return vscode.workspace.getConfiguration("cforge").get("ruta") || "cforge";
+}
+
+function startClient(context) {
+  if (!vscode.workspace.getConfiguration("cforge").get("lsp.habilitado", true)) return;
+  const serverOptions = {
+    command: cforgePath(),
+    args: ["lsp"],
+    transport: TransportKind.stdio
+  };
+  const clientOptions = {
+    documentSelector: [{ scheme: "file", language: "cforge" }, { scheme: "untitled", language: "cforge" }],
+    outputChannelName: "C-Forge"
+  };
+  client = new LanguageClient("cforge", "C-Forge", serverOptions, clientOptions);
+  client.start().catch(error => {
+    vscode.window.showWarningMessage(
+      `C-Forge: no se pudo iniciar "${cforgePath()} lsp" (${error.message}). ` +
+      "Instala C-Forge desde https://c-forge.org o ajusta el ajuste cforge.ruta."
+    );
+  });
+  context.subscriptions.push({ dispose: () => client && client.stop() });
+}
+
+function runInTerminal(args) {
+  const editor = vscode.window.activeTextEditor;
+  if (!editor || editor.document.isUntitled) return;
+  editor.document.save().then(() => {
+    const terminal = vscode.window.createTerminal("C-Forge");
+    terminal.show();
+    terminal.sendText([cforgePath(), ...args, JSON.stringify(editor.document.uri.fsPath)].join(" "));
+  });
 }
 
 function activate(context) {
-  const diagnostics = vscode.languages.createDiagnosticCollection("cforge");
-  context.subscriptions.push(diagnostics);
-
-  function check(document, notify = false) {
-    if (document.languageId !== "cforge" || document.isUntitled) return;
-    runCForge(["check", document.uri.fsPath], (error, stdout, stderr) => {
-      diagnostics.delete(document.uri);
-      if (error) {
-        const text = (stderr || stdout || error.message).trim();
-        const match = /línea\s+(\d+)/i.exec(text);
-        const line = Math.max(0, Number(match?.[1] || 1) - 1);
-        diagnostics.set(document.uri, [new vscode.Diagnostic(
-          new vscode.Range(line, 0, line, Number.MAX_SAFE_INTEGER),
-          text,
-          vscode.DiagnosticSeverity.Error
-        )]);
-        if (notify) vscode.window.showErrorMessage("C-Forge: el archivo contiene errores");
-      } else if (notify) {
-        vscode.window.showInformationMessage("C-Forge: sintaxis válida");
-      }
-    });
-  }
-
-  context.subscriptions.push(vscode.workspace.onDidSaveTextDocument(document => check(document)));
-  context.subscriptions.push(vscode.languages.registerCompletionItemProvider("cforge", {
-    provideCompletionItems() {
-      return words.map(word => new vscode.CompletionItem(word, vscode.CompletionItemKind.Keyword));
-    }
-  }));
-
-  context.subscriptions.push(vscode.commands.registerCommand("cforge.checkFile", () => {
-    const editor = vscode.window.activeTextEditor;
-    if (editor) check(editor.document, true);
-  }));
-
-  context.subscriptions.push(vscode.commands.registerCommand("cforge.runFile", () => {
-    const editor = vscode.window.activeTextEditor;
-    if (!editor || editor.document.isUntitled) return;
-    const terminal = vscode.window.createTerminal("C-Forge");
-    terminal.show();
-    terminal.sendText(`cforge ${JSON.stringify(editor.document.uri.fsPath)}`);
+  startClient(context);
+  context.subscriptions.push(vscode.commands.registerCommand("cforge.runFile", () => runInTerminal(["run"])));
+  context.subscriptions.push(vscode.commands.registerCommand("cforge.checkFile", () => runInTerminal(["check"])));
+  context.subscriptions.push(vscode.commands.registerCommand("cforge.formatFile", () =>
+    vscode.commands.executeCommand("editor.action.formatDocument")));
+  context.subscriptions.push(vscode.commands.registerCommand("cforge.restartServer", async () => {
+    if (client) await client.stop();
+    startClient(context);
   }));
 }
 
-function deactivate() {}
+function deactivate() {
+  return client ? client.stop() : undefined;
+}
 
 module.exports = { activate, deactivate };

@@ -610,6 +610,23 @@ json = "usuario/repo@v1.2"     # rama, etiqueta o nada (rama por defecto)
 - `CFORGE_GIT_BASE` cambia el origen de las descargas (p. ej. un espejo o
   `file://` para pruebas: `tests/paquetes/prueba.sh`).
 
+### `cforge fmt` y servidor de lenguaje (`cforge lsp`) ✅
+
+- `cforge fmt [--check] [--stdout] [rutas]`: formatea en el lugar (sin
+  rutas, todos los `.cfv` del proyecto). Sangría de 4 espacios por grupo
+  abierto (un nivel por línea), continuación de expresiones, un espacio tras
+  las comas, `si (`, `} sino {`, sin espacios finales y como máximo una
+  línea en blanco seguida. No toca textos, comentarios ni la alineación de
+  los comentarios. Conserva los tokens y es idempotente (probado con los
+  234 `.cfv` del repositorio).
+- `cforge lsp`: servidor LSP por stdio escrito en C-Forge. Diagnósticos con
+  la línea exacta (ejecuta `cforge check --contenido … --diagnosticos …`
+  con el texto sin guardar), autocompletado (documento, importaciones,
+  paquetes, biblioteca del lenguaje y palabras clave), ir a la definición,
+  información al pasar el cursor y formateo.
+- Extensión de VS Code (`herramientas/vscode-cforgev`): cliente del LSP con
+  `vscode-languageclient`; el CI publica el `.vsix` como artefacto.
+
 ### Capa intermedia y backend AArch64 ✅
 
 - El compilador no emite bytes de máquina: pide operaciones de una máquina de
