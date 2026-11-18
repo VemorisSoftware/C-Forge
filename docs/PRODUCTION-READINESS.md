@@ -23,8 +23,9 @@ compromisos distintos.
 ## No verificado o no terminado
 
 - Cobertura funcional exhaustiva de los módulos experimentales.
-- Paridad con el antiguo intérprete C++ en 14 módulos de la stdlib
-  (`stdlib/PENDIENTES`), previstos para 4.1.
+- WebSocket real (el módulo `red` ofrece HTTP/HTTPS, TCP y UDP), y MySQL o
+  PostgreSQL en `db` (hoy solo SQLite).
+- Auditoría independiente de la criptografía (`crypto`, AES y HMAC en C-Forge).
 - Backends directos para el lenguaje completo.
 - Sandboxing fuerte de archivos, procesos y red.
 - Modelo formal y comprobado de ownership para toda la sintaxis.

@@ -2,6 +2,28 @@
 
 Sitio oficial: [c-forge.org](https://c-forge.org)
 
+## Sin publicar (4.1)
+
+- **Biblioteca estándar completa en C-Forge:** los 35 módulos de `stdlib/`
+  cargan con el compilador nativo; `stdlib/PENDIENTES` desaparece.
+- **Red:** cliente HTTP/1.1 (`http_solicitud`, chunked, redirecciones,
+  cabeceras en un mapa), TCP (`net_*`), UDP (`udp_*`) y DNS propio en Linux
+  (`/etc/hosts` y consulta A por UDP); `getaddrinfo` en macOS y Windows.
+- **HTTPS:** `stdlib/tls.cfv` con OpenSSL 3/1.1 (Linux, macOS con
+  `openssl@3`) y Schannel (Windows), verificando certificados y nombre.
+- **SQLite:** `stdlib/sqlite.cfv` y `db.cfv` sobre la biblioteca del sistema
+  (`libsqlite3`, `/usr/lib/libsqlite3.dylib`, `winsqlite3.dll`).
+- **OpenGL 3.3 core:** `runtime/gl3d.cfv` (shaders, VBO, uniformes,
+  profundidad, `glReadPixels`) y `gl_ventana`; matrices con trigonometría real.
+- **Cripto:** `hmac_sha256`, AES-256-CBC compatible con OpenSSL y
+  `crypto_rand_bytes` con el generador del sistema.
+- **Lenguaje y runtime:** `lista + lista`, `__ccall` con la ABI de Windows y
+  hasta 8 argumentos, `c_llamar`, `c_f32`, `c_cadena`, `c_leer64`; nombres de
+  3.x que faltaban (`subarray`, `separar`, `unir`, `texto_subcadena`, …).
+- Correcciones en módulos que estaban rotos en 3.x: `redis` (respuestas con
+  CRLF), `auth` (OAuth con `http_solicitud`), `db_actualizar`/`db_eliminar`
+  devuelven filas afectadas, el ejemplo de `gl`.
+
 ## 4.0.0 — 2026-11-18
 
 - **100 % C-Forge: se retiró el C++.** El intérprete `cforgev.cpp`
