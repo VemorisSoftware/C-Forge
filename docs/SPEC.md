@@ -69,7 +69,27 @@ Tras un `.` las palabras no se traducen (`objeto.in` es un campo llamado `in`).
 ### 3.1 Tipos dinámicos actuales ✅
 
 `numero`, `texto`, `booleano`, `lista`, `mapa`, `nulo`, funciones y objetos de
-clase. Las anotaciones (`sea x: numero = 1`) se aceptan.
+clase.
+
+### 3.1b Verificación de tipos antes de ejecutar ✅ (4.2)
+
+Las anotaciones se comprueban al compilar (`cforge check`, `build`, `run` y
+el LSP), con inferencia local para `sea n = 5` cuando la variable no se
+vuelve a asignar. Es tipado gradual: lo que no se conoce (resultado de una
+llamada sin anotación, un índice, un campo) sigue siendo dinámico.
+
+```cfv
+funcion area(ancho: numero, alto: numero): numero { retornar ancho * alto }
+area("dos", 3)        // error de tipos: el argumento 1 de area espera numero y recibe texto
+sea n = 5
+si (n) { … }          // error de tipos: la condición espera booleano y recibe entero
+```
+
+Se comprueban: asignaciones y `sea` anotados, argumentos y valores de
+retorno anotados, `+ - * / %` y comparaciones entre tipos incompatibles, y
+condiciones o `no` que no son booleanas. `nulo` es compatible con cualquier
+tipo y `entero` con `numero`. Tipos: `entero`, `numero`, `texto`,
+`booleano`, `lista` (o `T[]`), `mapa`, `nulo`, `funcion` (también en inglés).
 
 ### 3.2 Tipos estáticos 📐
 
