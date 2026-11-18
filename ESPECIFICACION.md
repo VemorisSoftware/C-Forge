@@ -125,6 +125,6 @@ prueba se ejecutan con `cforge test archivo.cfv`.
 El compilador, el runtime y la biblioteca estándar están escritos en C-Forge
 (sin C++). No existen en esta especificación puentes a Python, Java,
 JavaScript, TypeScript o C#. Los backends ELF, PE y Mach-O (x86-64 y ARM64)
-compilan el lenguaje completo; los módulos de `stdlib/PENDIENTES` aún no.
+compilan el lenguaje completo y los 35 módulos de `stdlib/`.
 
 La lista exacta de capacidades y su estado está en `capabilities.json`.

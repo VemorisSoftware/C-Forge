@@ -179,11 +179,17 @@ importar "matematica"
 mostrar(piso(3.7))   // 3
 ```
 
-Módulos disponibles: `matematica`, `lista`, `mapa`, `colecciones`, `algoritmos`, `texto`, `json`, `errores`, `fecha`, `numero`, `base64`, `regex`, `concurrencia`, `sdl`, `apple` (macOS e iOS) y el resto de `stdlib/`.
+Módulos disponibles: `matematica`, `lista`, `mapa`, `colecciones`, `algoritmos`, `texto`, `json`, `errores`, `fecha`, `numero`, `base64`, `regex`, `concurrencia`, `crypto`, `red` (HTTP/HTTPS, TCP, UDP), `tls`, `redis`, `db` y `sqlite`, `sdl`, `gl` (OpenGL 3.3), `apple` (macOS e iOS) y el resto de `stdlib/`: los 35 módulos cargan con el compilador nativo.
 
-Pendientes para 4.1 (usaban funciones del antiguo intérprete C++, ver
-`stdlib/PENDIENTES`): `aleatorio`, `assets`, `audio`, `auditoria`, `auth`,
-`crypto`, `db`, `gl`, `input`, `io`, `nlp`, `red`, `redis`, `web`.
+```cfv
+importar "red"
+sea r = http_solicitud("GET", "https://example.com/", {})
+mostrar(r["estado"])                      // 200
+
+importar "db"
+sea db = db_conectar("datos.db")          // SQLite del sistema
+db_consulta_p(db, "INSERT INTO notas (texto) VALUES (?)", ["hola"])
+```
 
 ---
 

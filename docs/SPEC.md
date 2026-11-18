@@ -509,8 +509,8 @@ Los programas sin `extern` siguen siendo estáticos y sin libc.
   `cforge` sin compiladores en el `PATH`; `make semilla-check` comprueba que
   reproduce exactamente al compilador actual.
 - Releases: `cforge` nativo para Linux (x64, ARM64), Windows x64 y macOS
-  (Apple Silicon, Intel). Los 14 módulos de `stdlib/PENDIENTES`, que usaban
-  funciones del antiguo intérprete C++, llegan en 4.1.
+  (Apple Silicon, Intel). Desde 4.1 los 35 módulos de `stdlib/` cargan con el
+  compilador nativo (red y HTTPS, SQLite, OpenGL 3.3, crypto, …).
 
 **Cobertura actual del compilador nativo:** 25/25 pruebas de `tests/cfv`,
 32/32 ejemplos del sitio y 22/22 programas de `ejemplos/`.
@@ -673,6 +673,6 @@ json = "usuario/repo@v1.2"     # rama, etiqueta o nada (rama por defecto)
 
 **Alcance:** el compilador autoalojado compila el lenguaje C-Forge completo
 (clases, mapas, listas, cierres, excepciones, hilos, `extern`) a ELF, PE y
-Mach-O. Pendiente para 4.1: los módulos de `stdlib/PENDIENTES` (cripto, bases
-de datos, HTTP/TLS, WebSocket, UDP, OpenGL, audio), un recolector de basura
-para cadenas temporales y `cforge repl`.
+Mach-O. Desde 4.1 la biblioteca estándar está completa (HTTP/HTTPS, TCP, UDP,
+DNS, SQLite, OpenGL 3.3, HMAC y AES). Pendiente: WebSocket real, un recolector
+de basura para cadenas temporales y `cforge repl`.
