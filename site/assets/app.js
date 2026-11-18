@@ -1,6 +1,63 @@
 // c-forge.org — interacciones mínimas, sin dependencias.
 (function () {
   "use strict";
+  document.documentElement.classList.add("js");
+  var sinMovimiento = window.matchMedia && window.matchMedia("(prefers-reduced-motion: reduce)").matches;
+
+  // Aparición al hacer scroll
+  var revelar = document.querySelectorAll(".r");
+  if ("IntersectionObserver" in window && !sinMovimiento) {
+    var io = new IntersectionObserver(function (entradas) {
+      entradas.forEach(function (e) {
+        if (e.isIntersecting) { e.target.classList.add("on"); io.unobserve(e.target); }
+      });
+    }, { threshold: 0.05, rootMargin: "0px 0px -30px 0px" });
+    revelar.forEach(function (el, i) { el.style.transitionDelay = (i % 5) * 0.07 + "s"; io.observe(el); });
+    setTimeout(function () { revelar.forEach(function (e) { e.classList.add("on"); }); }, 6000);
+  } else {
+    revelar.forEach(function (e) { e.classList.add("on"); });
+  }
+
+  // Terminal animada: las líneas vienen del HTML (data-secuencia)
+  var term = document.getElementById("terminal");
+  if (term) {
+    var pasos = JSON.parse(term.getAttribute("data-secuencia"));
+    var linea = function (clase, texto) {
+      var d = document.createElement("div");
+      if (clase) { var s = document.createElement("span"); s.className = clase; s.textContent = texto; d.appendChild(s); }
+      else d.textContent = texto || " ";
+      term.appendChild(d); return d;
+    };
+    var cursor = function () {
+      var d = document.createElement("div");
+      d.innerHTML = '<span class="tp">$ </span><span class="cursor"></span>';
+      term.appendChild(d);
+    };
+    if (sinMovimiento) {
+      pasos.forEach(function (p) { if (p[0] === "$") { var d = linea("tp", "$ "); d.appendChild(document.createTextNode(p[1])); } else linea(p[0], p[1]); });
+      cursor();
+    } else {
+      var i = 0;
+      var siguiente = function () {
+        if (i >= pasos.length) { cursor(); return; }
+        var p = pasos[i++];
+        if (p[0] === "$") {
+          var d = linea("tp", "$ "); var t = document.createElement("span"); d.appendChild(t);
+          var k = 0;
+          var teclear = function () {
+            if (k >= p[1].length) { setTimeout(siguiente, 450); return; }
+            t.textContent += p[1][k++];
+            var demora = 38 * (0.6 + Math.random() * 0.8);
+            setTimeout(teclear, p[1][k - 1] === " " ? demora * 1.5 : demora);
+          };
+          teclear();
+        } else {
+          linea(p[0], p[1]); setTimeout(siguiente, p[0] === "" ? 60 : 220);
+        }
+      };
+      setTimeout(siguiente, 400);
+    }
+  }
 
   // Copiar comandos
   document.addEventListener("click", function (e) {
