@@ -39,6 +39,10 @@ Sitio oficial: [c-forge.org](https://c-forge.org)
   `futex`, canales y mutex, servidor HTTP con sockets, SDL2 en C-Forge,
   `?.`, ternario, `expr?`, genéricos, valores por defecto, variádicos,
   `inseguro` con punteros verificados y atributos `#[...]`.
+- **Windows x86-64 100 % C-Forge**: backend PE64 con IAT, ABI x64 de
+  Windows, `runtime/sys_windows*.cfv`, hilos con `CreateThread`, Winsock y
+  `extern` con `LoadLibrary`. En Windows real: Stage 2 = Stage 3 = compilación
+  cruzada desde Linux; 25/25, 32/32 y 22/22.
 
 ## 3.7.3 — extern C + idioma del programa
 

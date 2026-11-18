@@ -1,0 +1,205 @@
+// runtime/sys_windows.cfv — capa del sistema para Windows x86-64.
+//
+// Misma interfaz que runtime/sys_linux.cfv, sobre la API de Windows
+// (kernel32.dll) llamada con __winapi: el compilador genera la tabla de
+// importaciones del PE64 y usa la ABI x64 de Windows. Los descriptores 0, 1
+// y 2 son la entrada, la salida y el error estándar; los demás son HANDLE.
+
+funcion sys_mano(fd) {
+    si (fd == 0) { retornar __winapi("kernel32.dll", "GetStdHandle", 0 - 10) }
+    si (fd == 1) { retornar __winapi("kernel32.dll", "GetStdHandle", 0 - 11) }
+    si (fd == 2) { retornar __winapi("kernel32.dll", "GetStdHandle", 0 - 12) }
+    retornar fd
+}
+
+// Casilla temporal de 8 bytes para parámetros de salida (DWORD*).
+funcion sys_casilla() {
+    sea c = __cargar64(__globales() + 216)
+    si (c == 0) {
+        c = __winapi("kernel32.dll", "VirtualAlloc", 0, 4096, 12288, 4)
+        __guardar64(__globales() + 216, c)
+    }
+    __guardar64(c, 0)
+    retornar c
+}
+
+funcion sys_leer(fd, destino, cantidad) {
+    sea leidos = sys_casilla()
+    si (__y_bits(__winapi("kernel32.dll", "ReadFile", sys_mano(fd), destino, cantidad, leidos, 0), 4294967295) == 0) { retornar 0 }
+    retornar __y_bits(__cargar64(leidos), 4294967295)
+}
+
+funcion sys_escribir(fd, origen, cantidad) {
+    sea escritos = sys_casilla()
+    si (__y_bits(__winapi("kernel32.dll", "WriteFile", sys_mano(fd), origen, cantidad, escritos, 0), 4294967295) == 0) { retornar 0 - 1 }
+    retornar __y_bits(__cargar64(escritos), 4294967295)
+}
+
+// Rutas "/tmp/..." (habituales en programas de Linux) van a la carpeta
+// temporal de Windows.
+funcion sys_ruta_nativa(ruta_c) {
+    sea r = str_desde_c(ruta_c)
+    si (str_largo(r) >= 5) {
+        si (str_igual(str_rebanar(r, 0, 5), "/tmp/")) { retornar str_c(str_concatenar(sys_ruta_temporal(), str_rebanar(r, 5, str_largo(r)))) }
+    }
+    retornar ruta_c
+}
+
+// banderas como en Linux: 0 lectura · 577 escritura (crear/truncar) ·
+// 65536 directorio.
+funcion sys_abrir(ruta_c, banderas, modo) {
+    ruta_c = sys_ruta_nativa(ruta_c)
+    sea acceso = 2147483648                                    // GENERIC_READ
+    sea disposicion = 3                                        // OPEN_EXISTING
+    sea atributos = 33554560                                   // NORMAL | BACKUP_SEMANTICS (también directorios)
+    si (banderas == 577) {
+        acceso = 1073741824                                    // GENERIC_WRITE
+        disposicion = 2                                        // CREATE_ALWAYS
+        atributos = 128
+    }
+    sea h = __winapi("kernel32.dll", "CreateFileA", ruta_c, acceso, 7, 0, disposicion, atributos, 0)
+    si (h == 0 - 1 o h == 4294967295) { retornar 0 - 1 }
+    retornar h
+}
+
+funcion sys_cerrar(fd) {
+    si (fd > 2) { __winapi("kernel32.dll", "CloseHandle", fd) }
+    retornar 0
+}
+
+funcion sys_mapear(tamano) {
+    sea p = __winapi("kernel32.dll", "VirtualAlloc", 0, tamano, 12288, 4)   // COMMIT|RESERVE, READWRITE
+    si (p == 0) { retornar 0 - 1 }
+    retornar p
+}
+
+funcion sys_desmapear(direccion, tamano) {
+    __winapi("kernel32.dll", "VirtualFree", direccion, 0, 32768)          // MEM_RELEASE
+    retornar 0
+}
+
+funcion sys_salir(codigo) {
+    __winapi("kernel32.dll", "ExitProcess", codigo)
+    retornar 0
+}
+
+// argv a partir de GetCommandLineA (comillas y barras invertidas como el
+// runtime de C de Windows), en la global 26 como lista de textos.
+funcion sys_argumentos() {
+    sea v = __cargar64(__globales() + 208)
+    si (v != 0) { retornar v }
+    v = vec_nuevo()
+    sea linea = str_desde_c(__winapi("kernel32.dll", "GetCommandLineA"))
+    sea i = 0
+    sea n = str_largo(linea)
+    mientras (i < n) {
+        mientras (i < n y (str_byte(linea, i) == 32 o str_byte(linea, i) == 9)) { i = i + 1 }
+        si (i < n) {
+            sea arg = str_nuevo(32)
+            sea comillas = 0
+            mientras (i < n y (comillas == 1 o (str_byte(linea, i) != 32 y str_byte(linea, i) != 9))) {
+                sea b = str_byte(linea, i)
+                si (b == 92 y i + 1 < n y str_byte(linea, i + 1) == 34) {
+                    str_agregar_byte(arg, 34)
+                    i = i + 2
+                } sino {
+                    si (b == 34) { comillas = 1 - comillas } sino { str_agregar_byte(arg, b) }
+                    i = i + 1
+                }
+            }
+            vec_agregar(v, arg)
+        }
+    }
+    __guardar64(__globales() + 208, v)
+    retornar v
+}
+
+funcion sys_argc() { retornar vec_largo(sys_argumentos()) }
+funcion sys_argv(indice) { retornar str_datos(vec_obtener(sys_argumentos(), indice)) }
+
+funcion sys_abrir_lectura() { retornar 0 }
+funcion sys_abrir_escritura() { retornar 577 }
+funcion sys_modo_archivo() { retornar 420 }
+funcion sys_permisos(ruta_c, modo) { retornar 0 }
+
+funcion sys_proceso_id() { retornar __y_bits(__winapi("kernel32.dll", "GetCurrentProcessId"), 4294967295) }
+funcion sys_nombre_plataforma() { retornar "Windows x86-64" }
+funcion sys_borrar(ruta_c) {
+    ruta_c = sys_ruta_nativa(ruta_c)
+    retornar __y_bits(__winapi("kernel32.dll", "DeleteFileA", ruta_c), 4294967295)
+}
+funcion sys_ceder() { __winapi("kernel32.dll", "SwitchToThread") retornar 0 }
+funcion sys_es_windows() { retornar 1 }
+
+funcion sys_ruta_ejecutable() {
+    sea buf = mem_reservar(4096)
+    sea n = __y_bits(__winapi("kernel32.dll", "GetModuleFileNameA", 0, buf, 4095), 4294967295)
+    __guardar8(buf + n, 0)
+    sea r = str_desde_c(buf)
+    mem_liberar(buf)
+    retornar r
+}
+
+funcion sys_ruta_temporal() {
+    sea buf = mem_reservar(1024)
+    sea n = __y_bits(__winapi("kernel32.dll", "GetTempPathA", 1023, buf), 4294967295)
+    __guardar8(buf + n, 0)
+    sea r = str_desde_c(buf)
+    mem_liberar(buf)
+    retornar r
+}
+
+// Valor de una variable de entorno o 0.
+funcion sys_variable_entorno(nombre) {
+    sea buf = mem_reservar(32768)
+    sea n = __y_bits(__winapi("kernel32.dll", "GetEnvironmentVariableA", str_c(nombre), buf, 32767), 4294967295)
+    si (n == 0 o n > 32767) {
+        mem_liberar(buf)
+        retornar 0
+    }
+    __guardar8(buf + n, 0)
+    sea r = str_desde_c(buf)
+    mem_liberar(buf)
+    retornar r
+}
+
+// Argumento citado para la línea de órdenes de Windows.
+funcion sys_citar(r, arg) {
+    str_agregar_byte(r, 34)
+    sea i = 0
+    mientras (i < str_largo(arg)) {
+        si (str_byte(arg, i) == 34) { str_agregar_byte(r, 92) }
+        str_agregar_byte(r, str_byte(arg, i))
+        i = i + 1
+    }
+    str_agregar_byte(r, 34)
+    retornar 0
+}
+
+// Ejecuta un programa con sus argumentos (lista de textos) y devuelve su
+// código de salida (CreateProcessA + WaitForSingleObject).
+funcion sys_ejecutar_programa(ruta, argumentos) {
+    sea linea = str_nuevo(256)
+    sys_citar(linea, ruta)
+    sea i = 0
+    mientras (i < vec_largo(argumentos)) {
+        str_agregar_byte(linea, 32)
+        sys_citar(linea, vec_obtener(argumentos, i))
+        i = i + 1
+    }
+    sea inicio = mem_reservar(104)                             // STARTUPINFOA
+    mem_llenar(inicio, 0, 104)
+    __guardar8(inicio, 104)
+    sea info = mem_reservar(24)                                // PROCESS_INFORMATION
+    mem_llenar(info, 0, 24)
+    si (__y_bits(__winapi("kernel32.dll", "CreateProcessA", str_c(ruta), str_c(linea), 0, 0, 1, 0, 0, 0, inicio, info), 4294967295) == 0) {
+        retornar 0 - 1
+    }
+    sea proceso = __cargar64(info)
+    __winapi("kernel32.dll", "WaitForSingleObject", proceso, 4294967295)
+    sea codigo = sys_casilla()
+    __winapi("kernel32.dll", "GetExitCodeProcess", proceso, codigo)
+    __winapi("kernel32.dll", "CloseHandle", proceso)
+    __winapi("kernel32.dll", "CloseHandle", __cargar64(info + 8))
+    retornar __y_bits(__cargar64(codigo), 4294967295)
+}

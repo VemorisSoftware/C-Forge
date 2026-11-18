@@ -541,6 +541,27 @@ Los programas sin `extern` siguen siendo estáticos y sin libc.
   `ejemplos/salidas/` (generadas con el intérprete de referencia), prueba el
   servidor con `curl` y el ciclo de SDL.
 
+### Windows x86-64 (PE64) 100 % C-Forge ✅
+
+- `cforge build archivo.cfv --target windows` (o `-o x.exe --target windows`
+  en el modo de bajo nivel) genera ejecutables PE32+ x86-64 desde cualquier
+  plataforma: una sección RWX con código, datos y la tabla de importaciones
+  (IAT de `kernel32.dll`, `ws2_32.dll`), ImageBase fija sin relocaciones.
+- `__winapi("dll", "Función", args…)`: llamadas con la ABI x64 de Windows
+  (rcx/rdx/r8/r9, 32 bytes de sombra, pila alineada).
+- `runtime/sys_windows.cfv` (archivos, memoria con `VirtualAlloc`,
+  argumentos de `GetCommandLineA`, procesos con `CreateProcessA`, entorno) y
+  `runtime/sys_windows_ext.cfv` (tiempo, `Sleep`, directorios, hilos con
+  `CreateThread` y un trampolín que cambia a la pila propia del hilo, red con
+  Winsock, `LoadLibraryA`/`GetProcAddress`). `extern` usa la ABI de Windows;
+  `"libc"`/`"libm"` → `msvcrt.dll`, `"SDL2"` → `SDL2.dll`.
+- El runtime y la biblioteca acceden al sistema solo mediante funciones
+  `sys_*` (`sys_linux*.cfv` / `sys_windows*.cfv`), elegidas por plataforma.
+- CI en Windows real (`windows-nativo.yml`): `cforge.exe` se compila a sí
+  mismo y **Stage 2 = Stage 3 = el `.exe` compilado de forma cruzada desde
+  Linux**, byte por byte; 25/25 `tests/cfv`, 32/32 ejemplos del sitio y
+  22/22 `ejemplos/` (servidor HTTP con Winsock, SDL2).
+
 **Alcance honesto:** el compilador autoalojado compila el *dialecto nativo*
 (enteros de 64 bits, funciones, recursión, condiciones, ciclos, textos
 literales e intrínsecos). El lenguaje C-Forge completo (clases, mapas,

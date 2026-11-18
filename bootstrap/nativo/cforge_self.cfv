@@ -38,9 +38,12 @@
 // 272 casillas de dlopen/dlsym en datos (o -1)
 // 280 valores por defecto pendientes [nombre][posición del token]
 // 288 atributos #[...] [atributo][argumentos][función]
+// 296 plataforma objetivo: 0 Linux (ELF) · 1 Windows (PE64)
+// 304 importaciones de Windows [dll][función]
+// 312 etiqueta del trampolín de hilos de Windows (o -1)
 
 funcion ctx_nuevo(tokens) {
-    sea c = mem_reservar(296)
+    sea c = mem_reservar(320)
     __guardar64(c, tokens)
     __guardar64(c + 8, 0)
     __guardar64(c + 16, str_nuevo(65536))
@@ -81,10 +84,14 @@ funcion ctx_nuevo(tokens) {
     __guardar64(c + 272, 0 - 1)
     __guardar64(c + 280, vec_nuevo())
     __guardar64(c + 288, vec_nuevo())
+    __guardar64(c + 296, 0)
+    __guardar64(c + 304, vec_nuevo())
+    __guardar64(c + 312, 0 - 1)
     retornar c
 }
 
 funcion ctx_codigo(c) { retornar __cargar64(c + 16) }
+funcion es_windows(c) { retornar __cargar64(c + 296) == 1 }
 funcion ctx_modo(c) { retornar __cargar64(c + 104) }
 // 2: programa del usuario · 3: biblioteca del lenguaje (también dinámica)
 funcion dinamico(c) { retornar __cargar64(c + 104) >= 2 }
@@ -647,9 +654,53 @@ funcion asegurar_externa(c, e) {
     retornar 0
 }
 
+// Llamada externa con la ABI x64 de Windows: los argumentos ya convertidos
+// (en locales) van por posición a rcx/rdx/r8/r9 o xmm0-3, el resto a la pila
+// tras 32 bytes de sombra; rsp alineado a 16.
+funcion llamada_externa_windows(c, e, tipos, convertidos) {
+    sea n = vec_largo(tipos)
+    sea extra = 0
+    si (n > 4) { extra = n - 4 }
+    e3(c, 73, 137, 228)                                        // mov r12, rsp
+    e3(c, 72, 129, 236)                                        // sub rsp, 32 + 8·extra + 8
+    e32(c, 40 + 8 * extra)
+    e4(c, 72, 131, 228, 240)                                   // and rsp, -16
+    sea i = 4
+    mientras (i < n) {
+        cargar_local(c, vec_obtener(convertidos, i))
+        e4(c, 72, 137, 132, 36)                                // mov [rsp + 32 + 8(i-4)], rax
+        e32(c, 32 + 8 * (i - 4))
+        i = i + 1
+    }
+    i = 0
+    mientras (i < n y i < 4) {
+        cargar_local(c, vec_obtener(convertidos, i))
+        si (vec_obtener(tipos, i) == 1) {
+            e5(c, 102, 72, 15, 110, 192 + i * 8)               // movq xmm_i, rax
+        } sino {
+            si (i == 0) { e3(c, 72, 137, 193) }                // mov rcx, rax
+            si (i == 1) { e3(c, 72, 137, 194) }                // mov rdx, rax
+            si (i == 2) { e3(c, 73, 137, 192) }                // mov r8, rax
+            si (i == 3) { e3(c, 73, 137, 193) }                // mov r9, rax
+        }
+        i = i + 1
+    }
+    e3(c, 255, 20, 37)                                         // call [casilla]
+    ref_dato(c, __cargar64(e + 24))
+    e3(c, 76, 137, 228)                                        // mov rsp, r12
+    retornar 0
+}
+
 // Biblioteca compartida: "libc" → libc.so.6, "libm" → libm.so.6,
 // "sqlite3" → libsqlite3.so, o el nombre tal cual si ya es un .so.
+funcion nombre_biblioteca_windows(nombre) {
+    si (str_igual(nombre, "libc") o str_igual(nombre, "c") o str_igual(nombre, "libm") o str_igual(nombre, "m")) { retornar "msvcrt.dll" }
+    si (str_buscar_en(nombre, ".dll") >= 0 o str_buscar_en(nombre, "/") >= 0 o str_buscar_en(nombre, "\\") >= 0) { retornar nombre }
+    retornar str_concatenar(nombre, ".dll")
+}
+
 funcion nombre_biblioteca(nombre) {
+    si (mem_global(33) == 1) { retornar nombre_biblioteca_windows(nombre) }
     si (str_igual(nombre, "libc") o str_igual(nombre, "c")) { retornar "libc.so.6" }
     si (str_igual(nombre, "libm") o str_igual(nombre, "m")) { retornar "libm.so.6" }
     si (str_buscar_en(nombre, ".so") >= 0 o str_buscar_en(nombre, "/") >= 0) { retornar nombre }
@@ -746,6 +797,9 @@ funcion declaracion_externa(c) {
         vec_agregar(convertidos, d)
         i = i + 1
     }
+    si (es_windows(c)) {
+        llamada_externa_windows(c, e, tipos, convertidos)
+    } sino {
     // Registros: enteros en rdi, rsi, rdx, rcx, r8, r9; flotantes en xmm0..7.
     sea enteros = 0
     sea flotantes = 0
@@ -775,6 +829,7 @@ funcion declaracion_externa(c) {
     e3(c, 255, 20, 37)                                         // call [GOT]
     ref_dato(c, casilla)
     e3(c, 76, 137, 228)                                        // mov rsp, r12
+    }
     si (resultado == 1) {
         e5(c, 102, 72, 15, 126, 192)                           // movq rax, xmm0
         empujar(c)
@@ -1264,7 +1319,20 @@ funcion f64_dos(c, operacion) {
 }
 
 funcion intrinseco(c, nombre) {
+    si (str_igual(nombre, "__trampolin_hilo")) {
+        // Dirección del trampolín de hilos de Windows (CreateThread).
+        argumentos(c)
+        si (__cargar64(c + 312) < 0) { __guardar64(c + 312, nueva_etiqueta(c)) }
+        e1(c, 184)
+        nuevo_arreglo(c, 4, __cargar64(c + 312))
+        retornar 1
+    }
+    si (str_igual(nombre, "__winapi")) {
+        llamada_winapi(c)
+        retornar 1
+    }
     si (str_igual(nombre, "__syscall")) {
+        si (es_windows(c)) { error_en(c, "__syscall no existe en Windows (usa __winapi)") }
         sea n = argumentos(c)
         si (n < 1 o n > 7) { error_en(c, "__syscall recibe de 1 a 7 argumentos") }
         sea i = n - 1
@@ -1457,6 +1525,73 @@ funcion intrinseco(c, nombre) {
         e3(c, 15, 182, 192)
         retornar 1
     }
+    retornar 0
+}
+
+// Índice de una importación de Windows (dll, función), creándola si hace falta.
+funcion importacion_windows(c, dll, funcion_win) {
+    sea imps = __cargar64(c + 304)
+    sea i = 0
+    mientras (i < vec_largo(imps)) {
+        sea r = vec_obtener(imps, i)
+        si (str_igual(__cargar64(r), dll) y str_igual(__cargar64(r + 8), funcion_win)) { retornar i }
+        i = i + 1
+    }
+    sea r = mem_reservar(16)
+    __guardar64(r, dll)
+    __guardar64(r + 8, funcion_win)
+    vec_agregar(imps, r)
+    retornar vec_largo(imps) - 1
+}
+
+// call [IAT] de la importación i, con la ABI x64 de Windows: los n
+// argumentos ya están apilados (el primero, el más profundo); van a rcx,
+// rdx, r8, r9 y el resto a la pila tras 32 bytes de sombra, con rsp
+// alineado a 16. El resultado queda en rax.
+funcion llamar_iat(c, indice, n) {
+    e3(c, 73, 137, 228)                                        // mov r12, rsp
+    sea extra = 0
+    si (n > 4) { extra = n - 4 }
+    e3(c, 72, 129, 236)                                        // sub rsp, 32 + 8·extra
+    e32(c, 32 + 8 * extra + 8)
+    e4(c, 72, 131, 228, 240)                                   // and rsp, -16
+    sea i = 4
+    mientras (i < n) {
+        e4(c, 73, 139, 132, 36)                                // mov rax, [r12 + 8(n-1-i)]
+        e32(c, 8 * (n - 1 - i))
+        e4(c, 72, 137, 132, 36)                                // mov [rsp + 32 + 8(i-4)], rax
+        e32(c, 32 + 8 * (i - 4))
+        i = i + 1
+    }
+    si (n > 0) { e4(c, 73, 139, 140, 36) e32(c, 8 * (n - 1)) }  // mov rcx, [r12 + ..]
+    si (n > 1) { e4(c, 73, 139, 148, 36) e32(c, 8 * (n - 2)) }  // mov rdx, [r12 + ..]
+    si (n > 2) { e4(c, 77, 139, 132, 36) e32(c, 8 * (n - 3)) }  // mov r8, [r12 + ..]
+    si (n > 3) { e4(c, 77, 139, 140, 36) e32(c, 8 * (n - 4)) }  // mov r9, [r12 + ..]
+    e3(c, 255, 20, 37)                                         // call [IAT]
+    nuevo_arreglo(c, 5, indice)
+    e3(c, 76, 137, 228)                                        // mov rsp, r12
+    si (n > 0) {
+        e3(c, 72, 129, 196)
+        e32(c, 8 * n)
+    }
+    retornar 0
+}
+
+// __winapi("kernel32.dll", "WriteFile", a1, ..., an)
+funcion llamada_winapi(c) {
+    si (es_windows(c) == 0) { error_en(c, "__winapi solo existe al compilar para Windows") }
+    requerir(c, "(")
+    sea dll = decodificar_literal(__cargar64(avanzar(c) + 8))
+    requerir(c, ",")
+    sea funcion_win = decodificar_literal(__cargar64(avanzar(c) + 8))
+    sea n = 0
+    mientras (tomar(c, ",")) {
+        expresion(c)
+        empujar(c)
+        n = n + 1
+    }
+    requerir(c, ")")
+    llamar_iat(c, importacion_windows(c, dll, funcion_win), n)
     retornar 0
 }
 
@@ -3193,10 +3328,15 @@ funcion compilar(c) {
     ref_global(c, 504)
     e1(c, 232)
     ref_etiqueta(c, principal)
-    e3(c, 72, 137, 199)                                        // mov rdi, rax
-    e3(c, 72, 199, 192)                                        // mov rax, 231 (exit_group)
-    e32(c, 231)
-    e2(c, 15, 5)
+    si (es_windows(c)) {
+        empujar(c)                                             // ExitProcess(código)
+        llamar_iat(c, importacion_windows(c, "kernel32.dll", "ExitProcess"), 1)
+    } sino {
+        e3(c, 72, 137, 199)                                    // mov rdi, rax
+        e3(c, 72, 199, 192)                                    // mov rax, 231 (exit_group)
+        e32(c, 231)
+        e2(c, 15, 5)
+    }
     definir_etiqueta(c, principal)
     sea marco = prologo(c)
     si (__cargar64(c + 200) y buscar_funcion(c, "dyn_fijar_ingles") != 0) {
@@ -3213,7 +3353,38 @@ funcion compilar(c) {
     cargar_inmediato(c, 0)
     epilogo(c)
     cerrar_marco(c, marco)
+    si (__cargar64(c + 312) >= 0) { emitir_trampolin_hilo(c) }
     emitir_tabla_clases(c)
+    retornar 0
+}
+
+// Trampolín de CreateThread (ABI x64 de Windows, rcx = registro del hilo en
+// la base de su pila de 8 MiB alineada): cambia a esa pila, llama a
+// [registro + 32](t = [registro + 24]) con la convención del lenguaje,
+// marca el hilo como terminado ([registro + 16] = 0) y vuelve a la pila de
+// Windows. El registro se guarda en r13 y la pila de Windows en rbx: el
+// código generado no usa esos registros (lanzar/__saltar sí usa rsi).
+funcion emitir_trampolin_hilo(c) {
+    definir_etiqueta(c, __cargar64(c + 312))
+    e1(c, 83)                                                  // push rbx
+    e2(c, 65, 85)                                              // push r13
+    e2(c, 65, 84)                                              // push r12
+    e3(c, 73, 137, 205)                                        // mov r13, rcx
+    e3(c, 72, 137, 227)                                        // mov rbx, rsp
+    e3(c, 72, 137, 200)                                        // mov rax, rcx
+    e2(c, 72, 5)                                               // add rax, 8 MiB
+    e32(c, 8388608)
+    e3(c, 72, 137, 196)                                        // mov rsp, rax
+    e4(c, 65, 255, 117, 24)                                    // push qword [r13 + 24]
+    e4(c, 65, 255, 85, 32)                                     // call qword [r13 + 32]
+    e3(c, 72, 137, 220)                                        // mov rsp, rbx
+    e4(c, 73, 199, 69, 16)                                     // mov qword [r13 + 16], 0
+    e32(c, 0)
+    e2(c, 65, 92)                                              // pop r12
+    e2(c, 65, 93)                                              // pop r13
+    e1(c, 91)                                                  // pop rbx
+    e2(c, 49, 192)                                             // xor eax, eax
+    e1(c, 195)                                                 // ret
     retornar 0
 }
 
@@ -3318,7 +3489,60 @@ funcion encabezado_programa(elf, tipo, banderas, desplazamiento, direccion, tam_
     retornar 0
 }
 
+// Aplica los arreglos de código y datos con las direcciones finales.
+funcion aplicar_arreglos(c, va_codigo, va_datos, va_globales, iat) {
+    sea codigo = ctx_codigo(c)
+    sea datos = ctx_datos(c)
+    sea etiquetas = __cargar64(c + 40)
+    sea arreglos = __cargar64(c + 32)
+    sea i = 0
+    mientras (i < vec_largo(arreglos)) {
+        sea a = vec_obtener(arreglos, i)
+        sea posicion = __cargar64(a)
+        sea tipo = __cargar64(a + 8)
+        sea valor = __cargar64(a + 16)
+        si (tipo == 0) {
+            sea destino = vec_obtener(etiquetas, valor)
+            si (destino < 0) { rt_panico("etiqueta sin definir") }
+            parchear32(codigo, posicion, destino - (posicion + 4))
+        }
+        si (tipo == 1) { parchear32(codigo, posicion, va_datos + valor) }
+        si (tipo == 2) { parchear32(codigo, posicion, va_globales + valor) }
+        si (tipo == 3) { parchear32(codigo, posicion, va_datos + __cargar64(c + 192)) }
+        si (tipo == 4) {
+            sea direccion = vec_obtener(etiquetas, valor)
+            si (direccion < 0) { rt_panico("etiqueta sin definir") }
+            parchear32(codigo, posicion, va_codigo + direccion)
+        }
+        si (tipo == 5) { parchear32(codigo, posicion, vec_obtener(iat, valor)) }
+        i = i + 1
+    }
+    sea reubicaciones = __cargar64(c + 80)
+    i = 0
+    mientras (i < vec_largo(reubicaciones)) {
+        sea campo = vec_obtener(reubicaciones, i)
+        parchear64(datos, campo, va_datos + campo + 16)
+        i = i + 1
+    }
+    sea a_codigo = __cargar64(c + 176)
+    i = 0
+    mientras (i < vec_largo(a_codigo)) {
+        sea p = vec_obtener(a_codigo, i)
+        parchear64(datos, __cargar64(p), va_codigo + vec_obtener(etiquetas, __cargar64(p + 8)))
+        i = i + 1
+    }
+    sea punteros = __cargar64(c + 112)
+    i = 0
+    mientras (i < vec_largo(punteros)) {
+        sea p = vec_obtener(punteros, i)
+        parchear64(datos, __cargar64(p), va_datos + __cargar64(p + 8))
+        i = i + 1
+    }
+    retornar 0
+}
+
 funcion empaquetar(c) {
+    si (es_windows(c)) { retornar empaquetar_pe(c) }
     sea base = 4194304
     sea codigo = ctx_codigo(c)
     sea datos = ctx_datos(c)
@@ -3333,54 +3557,7 @@ funcion empaquetar(c) {
     sea fin_datos = inicio_datos + str_largo(datos)
     sea inicio_globales = fin_datos
     mientras (inicio_globales % 16 != 0) { inicio_globales = inicio_globales + 1 }
-    // Arreglos de código.
-    sea etiquetas = __cargar64(c + 40)
-    sea arreglos = __cargar64(c + 32)
-    sea i = 0
-    mientras (i < vec_largo(arreglos)) {
-        sea a = vec_obtener(arreglos, i)
-        sea posicion = __cargar64(a)
-        sea tipo = __cargar64(a + 8)
-        sea valor = __cargar64(a + 16)
-        si (tipo == 0) {
-            sea destino = vec_obtener(etiquetas, valor)
-            si (destino < 0) { rt_panico("etiqueta sin definir") }
-            parchear32(codigo, posicion, destino - (posicion + 4))
-        }
-        si (tipo == 1) { parchear32(codigo, posicion, base + inicio_datos + valor) }
-        si (tipo == 2) { parchear32(codigo, posicion, base + inicio_globales + valor) }
-        si (tipo == 3) { parchear32(codigo, posicion, base + inicio_datos + __cargar64(c + 192)) }
-        si (tipo == 4) {
-            sea direccion = vec_obtener(etiquetas, valor)
-            si (direccion < 0) { rt_panico("etiqueta sin definir") }
-            parchear32(codigo, posicion, base + cabecera + direccion)
-        }
-        i = i + 1
-    }
-    // Punteros internos de los textos literales.
-    sea reubicaciones = __cargar64(c + 80)
-    i = 0
-    mientras (i < vec_largo(reubicaciones)) {
-        sea campo = vec_obtener(reubicaciones, i)
-        parchear64(datos, campo, base + inicio_datos + campo + 16)
-        i = i + 1
-    }
-    // Punteros de datos a código (métodos en la tabla de clases).
-    sea a_codigo = __cargar64(c + 176)
-    i = 0
-    mientras (i < vec_largo(a_codigo)) {
-        sea p = vec_obtener(a_codigo, i)
-        parchear64(datos, __cargar64(p), base + cabecera + vec_obtener(etiquetas, __cargar64(p + 8)))
-        i = i + 1
-    }
-    // Punteros entre datos (cajas de texto, registros de clase).
-    sea punteros = __cargar64(c + 112)
-    i = 0
-    mientras (i < vec_largo(punteros)) {
-        sea p = vec_obtener(punteros, i)
-        parchear64(datos, __cargar64(p), base + inicio_datos + __cargar64(p + 8))
-        i = i + 1
-    }
+    aplicar_arreglos(c, base + cabecera, base + inicio_datos, base + inicio_globales, vec_nuevo())
     sea memoria = inicio_globales + 512 + vec_largo(__cargar64(c + 224)) * 8
     sea elf = str_nuevo(fin_datos + 16)
     bytes_le(elf, 1179403647, 4)                               // \x7fELF
@@ -3413,6 +3590,176 @@ funcion empaquetar(c) {
     mientras (str_largo(elf) < inicio_datos) { str_agregar_byte(elf, 0) }
     str_agregar(elf, datos)
     retornar elf
+}
+
+funcion alinear(n, a) {
+    mientras (n % a != 0) { n = n + 1 }
+    retornar n
+}
+
+// ── Windows: ejecutable PE32+ (x86-64) ────────────────────────────────────
+// Una sola sección .text (RWX) en RVA 0x1000: código, datos, tablas de
+// importación y, sin ocupar archivo, las globales. ImageBase fija 0x400000
+// sin relocaciones (las direcciones absolutas de 32 bits son válidas).
+funcion empaquetar_pe(c) {
+    sea base = 4194304
+    sea rva_seccion = 4096
+    sea codigo = ctx_codigo(c)
+    sea datos = ctx_datos(c)
+    sea inicio_datos = alinear(str_largo(codigo), 16)          // dentro de la sección
+    mientras (str_largo(datos) % 8 != 0) { str_agregar_byte(datos, 0) }
+    // Tablas de importación al final de los datos, agrupadas por DLL.
+    sea imps = __cargar64(c + 304)
+    sea dlls = vec_nuevo()
+    sea i = 0
+    mientras (i < vec_largo(imps)) {
+        si (contiene_texto(dlls, __cargar64(vec_obtener(imps, i))) == 0) { vec_agregar(dlls, __cargar64(vec_obtener(imps, i))) }
+        i = i + 1
+    }
+    sea rva_datos = rva_seccion + inicio_datos
+    // Nombres (hint + nombre) y nombres de DLL.
+    sea nombre_rva = vec_nuevo()
+    i = 0
+    mientras (i < vec_largo(imps)) {
+        mientras (str_largo(datos) % 2 != 0) { str_agregar_byte(datos, 0) }
+        vec_agregar(nombre_rva, rva_datos + str_largo(datos))
+        bytes_le(datos, 0, 2)
+        str_agregar(datos, __cargar64(vec_obtener(imps, i) + 8))
+        str_agregar_byte(datos, 0)
+        i = i + 1
+    }
+    sea dll_rva = vec_nuevo()
+    i = 0
+    mientras (i < vec_largo(dlls)) {
+        vec_agregar(dll_rva, rva_datos + str_largo(datos))
+        str_agregar(datos, vec_obtener(dlls, i))
+        str_agregar_byte(datos, 0)
+        i = i + 1
+    }
+    mientras (str_largo(datos) % 8 != 0) { str_agregar_byte(datos, 0) }
+    // ILT e IAT por DLL (las IAT contiguas).
+    sea iat = vec_nuevo()
+    i = 0
+    mientras (i < vec_largo(imps)) {
+        vec_agregar(iat, 0)
+        i = i + 1
+    }
+    sea ilt_rva = vec_nuevo()
+    sea iat_rva = vec_nuevo()
+    sea d = 0
+    mientras (d < vec_largo(dlls)) {
+        vec_agregar(ilt_rva, rva_datos + str_largo(datos))
+        i = 0
+        mientras (i < vec_largo(imps)) {
+            si (str_igual(__cargar64(vec_obtener(imps, i)), vec_obtener(dlls, d))) { bytes_le(datos, vec_obtener(nombre_rva, i), 8) }
+            i = i + 1
+        }
+        bytes_le(datos, 0, 8)
+        d = d + 1
+    }
+    sea inicio_iat = rva_datos + str_largo(datos)
+    d = 0
+    mientras (d < vec_largo(dlls)) {
+        vec_agregar(iat_rva, rva_datos + str_largo(datos))
+        i = 0
+        mientras (i < vec_largo(imps)) {
+            si (str_igual(__cargar64(vec_obtener(imps, i)), vec_obtener(dlls, d))) {
+                vec_fijar(iat, i, base + rva_datos + str_largo(datos))
+                bytes_le(datos, vec_obtener(nombre_rva, i), 8)
+            }
+            i = i + 1
+        }
+        bytes_le(datos, 0, 8)
+        d = d + 1
+    }
+    sea fin_iat = rva_datos + str_largo(datos)
+    sea descriptores = rva_datos + str_largo(datos)
+    d = 0
+    mientras (d < vec_largo(dlls)) {
+        bytes_le(datos, vec_obtener(ilt_rva, d), 4)            // OriginalFirstThunk
+        bytes_le(datos, 0, 4)
+        bytes_le(datos, 0, 4)
+        bytes_le(datos, vec_obtener(dll_rva, d), 4)            // Name
+        bytes_le(datos, vec_obtener(iat_rva, d), 4)            // FirstThunk
+        d = d + 1
+    }
+    bytes_le(datos, 0, 20)
+    sea tam_descriptores = (vec_largo(dlls) + 1) * 20
+    sea fin_datos = inicio_datos + str_largo(datos)
+    sea inicio_globales = alinear(fin_datos, 16)
+    sea tam_virtual = inicio_globales + 512 + vec_largo(__cargar64(c + 224)) * 8
+    aplicar_arreglos(c, base + rva_seccion, base + rva_datos, base + rva_seccion + inicio_globales, iat)
+    sea tam_crudo = alinear(fin_datos, 512)
+    sea tam_imagen = alinear(rva_seccion + tam_virtual, 4096)
+    sea pe = str_nuevo(512 + tam_crudo)
+    // Encabezado DOS.
+    bytes_le(pe, 23117, 2)                                     // "MZ"
+    bytes_le(pe, 0, 58)
+    bytes_le(pe, 64, 4)                                        // e_lfanew
+    bytes_le(pe, 17744, 4)                                     // "PE\0\0"
+    // Encabezado COFF.
+    bytes_le(pe, 34404, 2)                                     // AMD64
+    bytes_le(pe, 1, 2)                                         // 1 sección
+    bytes_le(pe, 0, 12)
+    bytes_le(pe, 240, 2)                                       // tamaño del opcional
+    bytes_le(pe, 35, 2)                                        // RELOCS_STRIPPED | EXECUTABLE | LARGE_ADDRESS_AWARE
+    // Encabezado opcional PE32+.
+    bytes_le(pe, 523, 2)
+    bytes_le(pe, 0, 2)
+    bytes_le(pe, tam_crudo, 4)                                 // SizeOfCode
+    bytes_le(pe, 0, 8)
+    bytes_le(pe, rva_seccion, 4)                               // AddressOfEntryPoint
+    bytes_le(pe, rva_seccion, 4)                               // BaseOfCode
+    bytes_le(pe, base, 8)                                      // ImageBase
+    bytes_le(pe, 4096, 4)
+    bytes_le(pe, 512, 4)
+    bytes_le(pe, 6, 2)
+    bytes_le(pe, 0, 2)
+    bytes_le(pe, 0, 4)
+    bytes_le(pe, 6, 2)
+    bytes_le(pe, 0, 2)
+    bytes_le(pe, 0, 4)
+    bytes_le(pe, tam_imagen, 4)
+    bytes_le(pe, 512, 4)                                       // SizeOfHeaders
+    bytes_le(pe, 0, 4)
+    bytes_le(pe, 3, 2)                                         // consola
+    bytes_le(pe, 0, 2)
+    bytes_le(pe, 67108864, 8)                                  // pila: 64 MiB reservados
+    bytes_le(pe, 1048576, 8)
+    bytes_le(pe, 1048576, 8)
+    bytes_le(pe, 4096, 8)
+    bytes_le(pe, 0, 4)
+    bytes_le(pe, 16, 4)
+    i = 0
+    mientras (i < 16) {
+        si (i == 1) {
+            bytes_le(pe, descriptores, 4)
+            bytes_le(pe, tam_descriptores, 4)
+        } sino {
+            si (i == 12) {
+                bytes_le(pe, inicio_iat, 4)
+                bytes_le(pe, fin_iat - inicio_iat, 4)
+            } sino {
+                bytes_le(pe, 0, 8)
+            }
+        }
+        i = i + 1
+    }
+    // Encabezado de sección.
+    str_agregar(pe, ".text")
+    bytes_le(pe, 0, 3)
+    bytes_le(pe, tam_virtual, 4)
+    bytes_le(pe, rva_seccion, 4)
+    bytes_le(pe, tam_crudo, 4)
+    bytes_le(pe, 512, 4)
+    bytes_le(pe, 0, 12)
+    bytes_le(pe, 3758096480, 4)                                // CODE | INITIALIZED | EXECUTE | READ | WRITE
+    mientras (str_largo(pe) < 512) { str_agregar_byte(pe, 0) }
+    str_agregar(pe, codigo)
+    mientras (str_largo(pe) < 512 + inicio_datos) { str_agregar_byte(pe, 0) }
+    str_agregar(pe, datos)
+    mientras (str_largo(pe) < 512 + tam_crudo) { str_agregar_byte(pe, 0) }
+    retornar pe
 }
 
 // ── Programa ──────────────────────────────────────────────────────────────
@@ -3519,6 +3866,8 @@ funcion agregar_con_importaciones(fuente, stdlib, texto, nombre, vistas, archivo
 // Compila la fuente concatenada y devuelve el ejecutable ELF.
 funcion compilar_programa(fuente, archivos, puntaje) {
     sea contexto = ctx_nuevo(traducir_ingles(tokenizar(fuente)))
+    // Plataforma de destino (global 33): 0 Linux ELF · 1 Windows PE64.
+    __guardar64(contexto + 296, mem_global(33))
     __guardar64(contexto + 208, archivos)
     si (puntaje > 0) { __guardar64(contexto + 200, 1) }
     compilar(contexto)
@@ -3550,6 +3899,10 @@ funcion cli_bajo_nivel() {
             indice = indice + 1
             stdlib = rt_argumento(indice)
         } sino {
+        si (str_igual(argumento, "--target")) {
+            indice = indice + 1
+            si (str_igual(rt_argumento(indice), "windows")) { mem_fijar_global(33, 1) } sino { mem_fijar_global(33, 0) }
+        } sino {
             sea nuevo_modo = modo_de_opcion(argumento)
             si (nuevo_modo >= 0) {
                 modo = nuevo_modo
@@ -3562,6 +3915,7 @@ funcion cli_bajo_nivel() {
                     agregar_fuente(fuente, modo, texto, argumento, archivos)
                 }
             }
+        }
         }
         indice = indice + 1
     }

@@ -17,7 +17,8 @@ funcion cli_ayuda() {
     mostrar("Uso:")
     mostrar("  cforge archivo.cfv [args]        Compilar y ejecutar un programa")
     mostrar("  cforge run archivo.cfv [args]    Compilar y ejecutar un programa")
-    mostrar("  cforge build archivo.cfv [-o s]  Compilar a un ejecutable nativo")
+    mostrar("  cforge build archivo.cfv [-o s] [--target linux|windows]")
+    mostrar("                                   Compilar a un ejecutable nativo")
     mostrar("  cforge check archivo.cfv         Verificar que el programa compila")
     mostrar("  cforge --version                 Mostrar versión")
     mostrar("  cforge --help                    Mostrar esta ayuda")
@@ -43,29 +44,16 @@ funcion existe_ruta(ruta) {
     retornar 1
 }
 
-// Variable de entorno o 0.
-funcion entorno(nombre) {
-    sea prefijo = str_concatenar(nombre, "=")
-    sea i = 0
-    sea p = sys_entorno(0)
-    mientras (p != 0) {
-        sea e = str_desde_c(p)
-        si (empieza_con(e, prefijo)) { retornar str_rebanar(e, str_largo(prefijo), str_largo(e)) }
-        i = i + 1
-        p = sys_entorno(i)
-    }
-    retornar 0
-}
 
 // Biblioteca estándar: $CFORGE_STDLIB, o junto al ejecutable
 // (bin/../lib/cforge/stdlib como instala install.sh, o ./stdlib).
 funcion ruta_stdlib() {
-    sea desde_entorno = entorno("CFORGE_STDLIB")
+    sea desde_entorno = sys_variable_entorno("CFORGE_STDLIB")
     si (desde_entorno != 0) { retornar desde_entorno }
-    sea exe = sys_leer_enlace(str_c("/proc/self/exe"))
+    sea exe = sys_ruta_ejecutable()
     si (exe != 0) {
         sea i = str_largo(exe)
-        mientras (i > 0 y str_byte(exe, i - 1) != 47) { i = i - 1 }
+        mientras (i > 0 y str_byte(exe, i - 1) != 47 y str_byte(exe, i - 1) != 92) { i = i - 1 }
         sea dir = str_rebanar(exe, 0, i)
         sea candidatos = vec_nuevo()
         vec_agregar(candidatos, str_concatenar(dir, "stdlib"))
@@ -79,6 +67,16 @@ funcion ruta_stdlib() {
         }
     }
     retornar "stdlib"
+}
+
+// Plataforma de destino (global 33): 0 Linux · 1 Windows.
+funcion destino_windows() { retornar mem_global(33) == 1 }
+
+// sys_linux*.cfv solo para Linux y sys_windows*.cfv solo para Windows.
+funcion modulo_de_plataforma(nombre) {
+    si (contiene_prefijo(nombre, "sys_windows")) { retornar destino_windows() }
+    si (contiene_prefijo(nombre, "sys_linux")) { retornar destino_windows() == 0 }
+    retornar 1
 }
 
 // "runtime/sdl.cfv" → "sdl_"
@@ -108,7 +106,7 @@ funcion compilar_archivo(ruta) {
     sea archivos = vec_nuevo()
     sea i = 0
     mientras (i < runtime_cantidad()) {
-        si (runtime_modo(i) != 4) { agregar_fuente(fuente, runtime_modo(i), runtime_fuente(i), runtime_nombre(i), archivos) }
+        si (runtime_modo(i) != 4 y modulo_de_plataforma(runtime_nombre(i))) { agregar_fuente(fuente, runtime_modo(i), runtime_fuente(i), runtime_nombre(i), archivos) }
         i = i + 1
     }
     sea inicio_programa = str_largo(fuente)
@@ -130,25 +128,18 @@ funcion compilar_archivo(ruta) {
 // Compila, ejecuta con los argumentos desde "desde" y sale con su código.
 funcion ejecutar(ruta, desde) {
     sea ejecutable = compilar_archivo(ruta)
-    sea temporal = str_concatenar("/tmp/cforge-run-", str_desde_entero(sys_proceso_id()))
+    sea temporal = str_concatenar(sys_ruta_temporal(), str_concatenar("cforge-run-", str_desde_entero(sys_proceso_id())))
+    si (sys_es_windows()) { str_agregar(temporal, ".exe") }
     escribir_ejecutable(temporal, ejecutable)
-    sea n = rt_argc() - desde
-    sea argv = mem_reservar((n + 2) * 8)
-    __guardar64(argv, str_c(temporal))
-    sea i = 0
-    mientras (i < n) {
-        __guardar64(argv + 8 + i * 8, str_c(rt_argumento(desde + i)))
+    sea argumentos = vec_nuevo()
+    sea i = desde
+    mientras (i < rt_argc()) {
+        vec_agregar(argumentos, rt_argumento(i))
         i = i + 1
     }
-    __guardar64(argv + 8 + n * 8, 0)
-    sea envp = __cargar64(__globales() + 504) + 8 * (rt_argc() + 2)
-    sea pid = sys_bifurcar()
-    si (pid == 0) {
-        sys_ejecutar(str_c(temporal), argv, envp)
-        rt_panico(str_concatenar("no se pudo ejecutar ", temporal))
-    }
-    sea codigo = sys_esperar(pid)
+    sea codigo = sys_ejecutar_programa(temporal, argumentos)
     sys_borrar(str_c(temporal))
+    si (codigo < 0) { rt_panico(str_concatenar("no se pudo ejecutar ", temporal)) }
     sys_salir(codigo)
     retornar 0
 }
@@ -157,6 +148,7 @@ funcion construir(ruta, salida) {
     si (salida == 0) {
         salida = ruta
         si (termina_en(ruta, ".cfv")) { salida = str_rebanar(ruta, 0, str_largo(ruta) - 4) }
+        si (destino_windows()) { salida = str_concatenar(salida, ".exe") }
     }
     sea ejecutable = compilar_archivo(ruta)
     escribir_ejecutable(salida, ejecutable)
@@ -168,6 +160,15 @@ funcion construir(ruta, salida) {
     retornar 0
 }
 
+funcion fijar_destino(nombre) {
+    si (str_igual(nombre, "windows") o str_igual(nombre, "win64")) {
+        mem_fijar_global(33, 1)
+    } sino {
+        si (str_igual(nombre, "linux")) { mem_fijar_global(33, 0) } sino { rt_panico(str_concatenar("plataforma desconocida: ", str_concatenar(nombre, " (linux, windows)"))) }
+    }
+    retornar 0
+}
+
 funcion requerir_archivo(i) {
     si (rt_argc() <= i) {
         cli_ayuda()
@@ -176,6 +177,7 @@ funcion requerir_archivo(i) {
     retornar rt_argumento(i)
 }
 
+si (sys_es_windows()) { mem_fijar_global(33, 1) }
 si (rt_argc() < 2) {
     cli_ayuda()
     sys_salir(0)
@@ -185,7 +187,7 @@ si (str_igual(orden, "-o")) {
     cli_bajo_nivel()
 } sino {
     si (str_igual(orden, "--version") o str_igual(orden, "-v") o str_igual(orden, "version")) {
-        mostrar(str_concatenar(str_concatenar("C-Forge ", version_cforge()), " (compilador nativo autoalojado, Linux x86-64)"))
+        mostrar(str_concatenar(str_concatenar(str_concatenar("C-Forge ", version_cforge()), " (compilador nativo autoalojado, "), str_concatenar(sys_nombre_plataforma(), ")")))
     } sino {
         si (str_igual(orden, "--help") o str_igual(orden, "-h") o str_igual(orden, "help") o str_igual(orden, "ayuda")) {
             cli_ayuda()
@@ -194,8 +196,20 @@ si (str_igual(orden, "-o")) {
                 ejecutar(requerir_archivo(2), 3)
             } sino {
                 si (str_igual(orden, "build")) {
+                    // cforge build archivo.cfv [-o salida] [--target linux|windows]
                     sea salida = 0
-                    si (rt_argc() >= 5 y str_igual(rt_argumento(3), "-o")) { salida = rt_argumento(4) }
+                    sea k = 3
+                    mientras (k < rt_argc()) {
+                        si (str_igual(rt_argumento(k), "-o") y k + 1 < rt_argc()) {
+                            salida = rt_argumento(k + 1)
+                            k = k + 1
+                        }
+                        si (str_igual(rt_argumento(k), "--target") y k + 1 < rt_argc()) {
+                            fijar_destino(rt_argumento(k + 1))
+                            k = k + 1
+                        }
+                        k = k + 1
+                    }
                     construir(requerir_archivo(2), salida)
                 } sino {
                     si (str_igual(orden, "check")) {

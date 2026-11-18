@@ -48,7 +48,7 @@ endif
 
 # ── Targets ────────────────────────────────────────────────────────────────────
 
-.PHONY: cforge-nativo embebido semilla semilla-check cforge-desde-semilla autoalojado-check
+.PHONY: windows-cruzado cforge-nativo embebido semilla semilla-check cforge-desde-semilla autoalojado-check
 .PHONY: all build debug release install uninstall test check stdlib-load-check \
 	cli-check malformed-check sanitize-check backend-check install-check \
 	bootstrap-bundle backend-core-bundle bootstrap-check backend-core-check ir-core-check object-lowering-check release-check clean help
@@ -319,11 +319,11 @@ nativo-check:
 ##   Stage 3  Stage 2              → cforge oficial  (Stage 2 = Stage 3)
 ## La semilla bootstrap/semilla/cforge-linux-x64 (= Stage 3) permite
 ## reconstruir sin C++: semilla → cforge (idéntico byte por byte).
-RUNTIME_LENGUAJE := $(RUNTIME_NATIVO) runtime/map.cfv --puente runtime/dyn.cfv runtime/biblioteca.cfv --lenguaje runtime/lenguaje.cfv
+RUNTIME_LENGUAJE := $(RUNTIME_NATIVO) runtime/sys_linux_ext.cfv runtime/map.cfv --puente runtime/dyn.cfv runtime/biblioteca.cfv --lenguaje runtime/lenguaje.cfv
 PRUEBAS_LENGUAJE_NATIVAS := $(basename $(notdir $(wildcard tests/cfv/*.cfv)))
 FUENTES_COMPILADOR := $(RUNTIME_NATIVO) bootstrap/nativo/lexer.cfv bootstrap/nativo/cforge_self.cfv
 FUENTES_CFORGE := $(FUENTES_COMPILADOR) bootstrap/nativo/embebido.cfv bootstrap/nativo/cforge_cli.cfv
-EMBEBIDO_ARGS := --nativo $(RUNTIME_NATIVO) runtime/map.cfv --puente runtime/dyn.cfv runtime/biblioteca.cfv --lenguaje runtime/lenguaje.cfv --opcional runtime/sdl.cfv
+EMBEBIDO_ARGS := --nativo $(RUNTIME_NATIVO) runtime/sys_linux_ext.cfv runtime/sys_windows.cfv runtime/sys_windows_ext.cfv runtime/map.cfv --puente runtime/dyn.cfv runtime/biblioteca.cfv --lenguaje runtime/lenguaje.cfv --opcional runtime/sdl.cfv
 SEMILLA := bootstrap/semilla/cforge-linux-x64
 
 ## Construye ./cforge-nativo desde C++ (Stage 0) y verifica Stage 2 = Stage 3.
@@ -345,6 +345,18 @@ cforge-nativo:
 	cp "$$dir/stage3" cforge-nativo; \
 	sha256sum "$$dir/stage2" "$$dir/stage3" | sed "s#$$dir/##"; \
 	echo "  ✓ cforge-nativo: Stage 2 = Stage 3, $$(wc -c < cforge-nativo) bytes, sin libc ni C++"
+
+## ── Windows x86-64 (PE64), compilado de forma cruzada desde Linux ───────
+RUNTIME_WINDOWS := runtime/sys_windows.cfv runtime/mem.cfv runtime/str.cfv runtime/vec.cfv runtime/io.cfv runtime/f64.cfv
+FUENTES_CFORGE_WINDOWS := $(RUNTIME_WINDOWS) bootstrap/nativo/lexer.cfv bootstrap/nativo/cforge_self.cfv bootstrap/nativo/embebido.cfv bootstrap/nativo/cforge_cli.cfv
+windows-cruzado: cforge-nativo
+	@set -e; rm -rf dist-windows; mkdir -p dist-windows/pruebas; \
+	./cforge-nativo -o dist-windows/cforge.exe --target windows $(FUENTES_CFORGE_WINDOWS) >/dev/null; \
+	for prueba in 01_memoria 02_textos 03_listas 04_prueba_de_fuego; do \
+		./cforge-nativo -o dist-windows/pruebas/$$prueba.exe --target windows $(RUNTIME_WINDOWS) tests/nativo/$$prueba.cfv >/dev/null; \
+	done; \
+	sha256sum dist-windows/cforge.exe; \
+	echo "  ✓ cforge.exe (PE64) y pruebas compiladas para Windows desde Linux"
 
 ## Regenera el runtime incrustado (tras cambiar runtime/*.cfv o VERSION).
 embebido:
