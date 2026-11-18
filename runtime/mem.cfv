@@ -32,6 +32,10 @@ funcion mem_tamano_clase(clase) {
 }
 
 funcion mem_reservar_sin_cerrojo(bytes) {
+    sea gc = mem_global(18)
+    si (gc != 0) {
+        si (mem_global(14) > __cargar64(gc + 48)) { gc_recolectar(gc) }
+    }
     sea total = bytes + 8
     sea clase = mem_clase(total)
     si (clase > 11) {
@@ -40,6 +44,7 @@ funcion mem_reservar_sin_cerrojo(bytes) {
         si (grande < 0) { rt_panico("sin memoria") }
         __guardar64(grande, 0 - paginas)
         mem_fijar_global(14, mem_global(14) + paginas)
+        si (mem_global(18) != 0) { gc_registrar_grande(grande) }
         retornar grande + 8
     }
     sea libre = mem_global(2 + clase)
@@ -47,19 +52,44 @@ funcion mem_reservar_sin_cerrojo(bytes) {
         mem_fijar_global(2 + clase, __cargar64(libre))
         __guardar64(libre - 8, clase)
         mem_fijar_global(14, mem_global(14) + mem_tamano_clase(clase))
+        // Con el recolector, un bloque reciclado empieza en cero: punteros
+        // viejos en su parte sin usar retendrían basura.
+        si (gc != 0) { mem_poner_cero(libre, mem_tamano_clase(clase) - 8) }
         retornar libre
+    }
+    // Sin libres de esta clase: partir uno libre de una clase mayor (cada
+    // mitad sobrante va a la lista de su clase) antes de crecer la arena.
+    sea mayor = clase + 1
+    mientras (mayor <= 11 y mem_global(2 + mayor) == 0) { mayor = mayor + 1 }
+    si (mayor <= 11) {
+        sea bloque = mem_global(2 + mayor)
+        mem_fijar_global(2 + mayor, __cargar64(bloque))
+        mientras (mayor > clase) {
+            mayor = mayor - 1
+            sea mitad = bloque + mem_tamano_clase(mayor)          // dato de la mitad alta
+            __guardar64(mitad - 8, mayor + 128)
+            __guardar64(mitad, mem_global(2 + mayor))
+            mem_fijar_global(2 + mayor, mitad)
+            si (mem_global(18) != 0) { gc_marcar_inicio(mitad - 8) }
+        }
+        __guardar64(bloque - 8, clase)
+        mem_fijar_global(14, mem_global(14) + mem_tamano_clase(clase))
+        si (gc != 0) { mem_poner_cero(bloque, mem_tamano_clase(clase) - 8) }
+        retornar bloque
     }
     sea tamano = mem_tamano_clase(clase)
     sea cursor = mem_global(0)
     si (cursor == 0 o cursor + tamano > mem_global(1)) {
         sea arena = sys_mapear(67108864)
         si (arena < 0) { rt_panico("sin memoria") }
+        si (mem_global(18) != 0) { gc_registrar_arena(arena, cursor) }
         cursor = arena
         mem_fijar_global(1, arena + 67108864)
     }
     mem_fijar_global(0, cursor + tamano)
     __guardar64(cursor, clase)
     mem_fijar_global(14, mem_global(14) + tamano)
+    si (mem_global(18) != 0) { gc_marcar_inicio(cursor) }
     retornar cursor + 8
 }
 
@@ -67,12 +97,15 @@ funcion mem_liberar_sin_cerrojo(puntero) {
     si (puntero == 0) { retornar 0 }
     sea cabecera = __cargar64(puntero - 8)
     si (cabecera < 0) {
+        si (mem_global(18) != 0) { gc_quitar_grande(puntero - 8) }
         mem_fijar_global(14, mem_global(14) + cabecera)
         sys_desmapear(puntero - 8, 0 - cabecera)
         retornar 0
     }
+    si (cabecera >= 128) { retornar 0 }                         // ya libre
     __guardar64(puntero, mem_global(2 + cabecera))
     mem_fijar_global(2 + cabecera, puntero)
+    __guardar64(puntero - 8, cabecera + 128)                   // marca de libre
     mem_fijar_global(14, mem_global(14) - mem_tamano_clase(cabecera))
     retornar 0
 }
@@ -92,6 +125,15 @@ funcion mem_copiar(destino, origen, bytes) {
         i = i + 1
     }
     retornar destino
+}
+
+funcion mem_poner_cero(destino, bytes) {
+    sea i = 0
+    mientras (i < bytes) {
+        __guardar64(destino + i, 0)
+        i = i + 8
+    }
+    retornar 0
 }
 
 funcion mem_llenar(destino, byte, bytes) {
@@ -128,5 +170,266 @@ funcion mem_liberar(puntero) {
     mem_cerrar()
     mem_liberar_sin_cerrojo(puntero)
     mem_abrir()
+    retornar 0
+}
+
+// ── Recolector de basura (marcado y barrido conservador) ──────────────────
+// Solo para programas del lenguaje (gc_activar, al inicio del programa); el
+// compilador y el dialecto nativo liberan a mano. Raíces: las casillas
+// globales y las variables de nivel superior, y la pila del lenguaje
+// (desde __pila() hasta la base, casilla 63). Cualquier palabra que apunte
+// al inicio de un bloque vivo lo mantiene vivo (y se recorre su contenido
+// palabra por palabra): no hace falta conocer el tipo de cada bloque.
+//
+// Estado (casilla 18, 64 KiB fuera del heap):
+//   0 arenas · 8 tabla de bloques grandes · 16 grandes · 24 capacidad
+//   32 pila de marcado · 40 capacidad · 48 umbral · 56 fin de las globales
+//   64 recolecciones · 72 bytes liberados · 80 umbral mínimo · 88 tope de
+//   la pila de marcado · 128 arenas de 32 bytes:
+//   [inicio][fin usado][mapa de inicios][mapa de marcas] (1 bit cada 16 B)
+
+funcion gc_activar(fin_globales, minimo) {
+    si (mem_global(18) != 0) { retornar 0 }
+    sea gc = sys_mapear(65536)
+    si (gc < 0) { retornar 0 }
+    __guardar64(gc + 8, sys_mapear(65536))
+    __guardar64(gc + 24, 4096)
+    __guardar64(gc + 32, sys_mapear(1048576))
+    __guardar64(gc + 40, 131072)
+    __guardar64(gc + 48, minimo)
+    __guardar64(gc + 56, fin_globales)
+    __guardar64(gc + 80, minimo)
+    mem_fijar_global(18, gc)
+    // Una arena que ya existía: registrar sus bloques.
+    sea cursor = mem_global(0)
+    si (cursor != 0) {
+        sea inicio = mem_global(1) - 67108864
+        gc_registrar_arena(inicio, 0)
+        sea p = inicio
+        mientras (p < cursor) {
+            gc_marcar_inicio(p)
+            p = p + mem_tamano_clase(__y_bits(__cargar64(p), 127))
+        }
+    }
+    retornar 0
+}
+
+// Nueva arena; la anterior termina en fin_anterior (0: no hay).
+funcion gc_registrar_arena(inicio, fin_anterior) {
+    sea gc = mem_global(18)
+    sea n = __cargar64(gc)
+    si (n > 0 y fin_anterior != 0) { __guardar64(gc + 128 + (n - 1) * 32 + 8, fin_anterior) }
+    si (n >= 2040) { rt_panico("gc: demasiadas arenas") }
+    sea r = gc + 128 + n * 32
+    __guardar64(r, inicio)
+    __guardar64(r + 8, inicio)
+    __guardar64(r + 16, sys_mapear(524288))
+    __guardar64(r + 24, sys_mapear(524288))
+    __guardar64(gc, n + 1)
+    retornar 0
+}
+
+funcion gc_arena_de(gc, direccion) {
+    sea n = __cargar64(gc)
+    sea i = 0
+    mientras (i < n) {
+        sea r = gc + 128 + i * 32
+        si (direccion >= __cargar64(r) y direccion < __cargar64(r) + 67108864) { retornar r }
+        i = i + 1
+    }
+    retornar 0
+}
+
+funcion gc_marcar_inicio(bloque) {
+    sea r = gc_arena_de(mem_global(18), bloque)
+    si (r == 0) { retornar 0 }
+    sea k = (bloque - __cargar64(r)) / 16
+    sea b = __cargar64(r + 16) + k / 8
+    __guardar8(b, __o_bits(__cargar8(b), __desplazar_izq(1, k % 8)))
+    retornar 0
+}
+
+funcion gc_bit(mapa, k) { retornar __y_bits(__cargar8(mapa + k / 8), __desplazar_izq(1, k % 8)) != 0 }
+
+funcion gc_fijar_bit(mapa, k) {
+    __guardar8(mapa + k / 8, __o_bits(__cargar8(mapa + k / 8), __desplazar_izq(1, k % 8)))
+    retornar 0
+}
+
+// Tabla de bloques grandes: entradas [bloque][marca].
+funcion gc_registrar_grande(bloque) {
+    sea gc = mem_global(18)
+    sea n = __cargar64(gc + 16)
+    si (n >= __cargar64(gc + 24)) {
+        sea cap = __cargar64(gc + 24) * 2
+        sea nueva = sys_mapear(cap * 16)
+        mem_copiar(nueva, __cargar64(gc + 8), n * 16)
+        sys_desmapear(__cargar64(gc + 8), __cargar64(gc + 24) * 16)
+        __guardar64(gc + 8, nueva)
+        __guardar64(gc + 24, cap)
+    }
+    __guardar64(__cargar64(gc + 8) + n * 16, bloque)
+    __guardar64(__cargar64(gc + 8) + n * 16 + 8, 0)
+    __guardar64(gc + 16, n + 1)
+    retornar 0
+}
+
+funcion gc_quitar_grande(bloque) {
+    sea gc = mem_global(18)
+    sea t = __cargar64(gc + 8)
+    sea n = __cargar64(gc + 16)
+    sea i = 0
+    mientras (i < n) {
+        si (__cargar64(t + i * 16) == bloque) {
+            __guardar64(t + i * 16, __cargar64(t + (n - 1) * 16))
+            __guardar64(t + i * 16 + 8, __cargar64(t + (n - 1) * 16 + 8))
+            __guardar64(gc + 16, n - 1)
+            retornar 0
+        }
+        i = i + 1
+    }
+    retornar 0
+}
+
+funcion gc_apilar(gc, w) {
+    sea pila = __cargar64(gc + 32)
+    sea tope = __cargar64(gc + 88)
+    si (tope >= __cargar64(gc + 40)) {
+        sea cap = __cargar64(gc + 40) * 2
+        sea nueva = sys_mapear(cap * 8)
+        mem_copiar(nueva, pila, tope * 8)
+        sys_desmapear(pila, __cargar64(gc + 40) * 8)
+        __guardar64(gc + 32, nueva)
+        __guardar64(gc + 40, cap)
+        pila = nueva
+    }
+    __guardar64(pila + tope * 8, w)
+    __guardar64(gc + 88, tope + 1)
+    retornar 0
+}
+
+// ¿w apunta al inicio (dato) de un bloque vivo sin marcar? Lo marca y apila.
+funcion gc_considerar(gc, w) {
+    si (__y_bits(w, 15) != 8) { retornar 0 }
+    sea bloque = w - 8
+    sea n = __cargar64(gc)
+    sea i = 0
+    mientras (i < n) {
+        sea r = gc + 128 + i * 32
+        sea inicio = __cargar64(r)
+        si (bloque >= inicio y bloque < inicio + 67108864) {
+            sea fin = __cargar64(r + 8)
+            si (i == n - 1) { fin = mem_global(0) }
+            si (bloque >= fin) { retornar 0 }
+            sea k = (bloque - inicio) / 16
+            si (gc_bit(__cargar64(r + 16), k) == 0) { retornar 0 }
+            si (gc_bit(__cargar64(r + 24), k)) { retornar 0 }
+            sea cabecera = __cargar64(bloque)
+            si (cabecera < 0 o cabecera >= 128) { retornar 0 }
+            gc_fijar_bit(__cargar64(r + 24), k)
+            gc_apilar(gc, w)
+            retornar 0
+        }
+        i = i + 1
+    }
+    // Bloques grandes (mapeados aparte: alineados a página).
+    si (__y_bits(bloque, 4095) != 0) { retornar 0 }
+    sea t = __cargar64(gc + 8)
+    sea g = __cargar64(gc + 16)
+    sea j = 0
+    mientras (j < g) {
+        si (__cargar64(t + j * 16) == bloque) {
+            si (__cargar64(t + j * 16 + 8) == 0) {
+                __guardar64(t + j * 16 + 8, 1)
+                gc_apilar(gc, w)
+            }
+            retornar 0
+        }
+        j = j + 1
+    }
+    retornar 0
+}
+
+funcion gc_escanear(gc, desde, hasta) {
+    sea p = __y_bits(desde, 0 - 8)
+    mientras (p + 8 <= hasta) {
+        gc_considerar(gc, __cargar64(p))
+        p = p + 8
+    }
+    retornar 0
+}
+
+// ¿Hay hilos de tarea() vivos? (casilla 34: bases; [base + 16] = vivo)
+funcion gc_hay_hilos() {
+    sea bases = mem_global(34)
+    si (bases == 0) { retornar 0 }
+    sea i = 0
+    mientras (i < __cargar64(bases)) {
+        sea base = __cargar64(__cargar64(bases + 16) + i * 8)
+        si (__cargar64(base + 16) != 0) { retornar 1 }
+        i = i + 1
+    }
+    retornar 0
+}
+
+funcion gc_recolectar(gc) {
+    si (gc_hay_hilos()) {
+        __guardar64(gc + 48, mem_global(14) * 2)
+        retornar 0
+    }
+    __guardar64(gc + 88, 0)
+    // Raíces: casillas globales y variables de nivel superior; pila del
+    // lenguaje (incluye los marcos de esta misma llamada).
+    gc_escanear(gc, __globales(), __cargar64(gc + 56))
+    gc_escanear(gc, __pila(), mem_global(63))
+    // Marcado transitivo.
+    mientras (__cargar64(gc + 88) > 0) {
+        sea tope = __cargar64(gc + 88) - 1
+        __guardar64(gc + 88, tope)
+        sea w = __cargar64(__cargar64(gc + 32) + tope * 8)
+        sea cabecera = __cargar64(w - 8)
+        sea bytes = 0
+        si (cabecera < 0) { bytes = 0 - cabecera - 8 } sino { bytes = mem_tamano_clase(cabecera) - 8 }
+        gc_escanear(gc, w, w + bytes)
+    }
+    // Barrido de las arenas: lo vivo sin marcar va a las listas libres.
+    sea antes = mem_global(14)
+    sea n = __cargar64(gc)
+    sea i = 0
+    mientras (i < n) {
+        sea r = gc + 128 + i * 32
+        sea inicio = __cargar64(r)
+        sea fin = __cargar64(r + 8)
+        si (i == n - 1) { fin = mem_global(0) }
+        sea marcas = __cargar64(r + 24)
+        sea p = inicio
+        mientras (p < fin) {
+            sea cabecera = __cargar64(p)
+            sea clase = __y_bits(cabecera, 127)
+            si (cabecera < 128 y gc_bit(marcas, (p - inicio) / 16) == 0) {
+                mem_liberar_sin_cerrojo(p + 8)
+            }
+            p = p + mem_tamano_clase(clase)
+        }
+        mem_llenar(marcas, 0, (fin - inicio) / 128 + 1)
+        i = i + 1
+    }
+    // Bloques grandes sin marcar.
+    sea t = __cargar64(gc + 8)
+    sea j = 0
+    mientras (j < __cargar64(gc + 16)) {
+        si (__cargar64(t + j * 16 + 8) == 0) {
+            sea bloque = __cargar64(t + j * 16)
+            mem_liberar_sin_cerrojo(bloque + 8)                  // la quita de la tabla
+        } sino {
+            __guardar64(t + j * 16 + 8, 0)
+            j = j + 1
+        }
+    }
+    __guardar64(gc + 64, __cargar64(gc + 64) + 1)
+    __guardar64(gc + 72, __cargar64(gc + 72) + antes - mem_global(14))
+    sea umbral = mem_global(14) * 2
+    si (umbral < __cargar64(gc + 80)) { umbral = __cargar64(gc + 80) }
+    __guardar64(gc + 48, umbral)
     retornar 0
 }
