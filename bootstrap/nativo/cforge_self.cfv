@@ -38,7 +38,8 @@
 // 272 casillas de dlopen/dlsym en datos (o -1)
 // 280 valores por defecto pendientes [nombre][posición del token]
 // 288 atributos #[...] [atributo][argumentos][función]
-// 296 plataforma objetivo: 0 Linux (ELF) · 1 Windows (PE64) · 2 macOS x86-64 (Mach-O)
+// 296 plataforma objetivo: 0 Linux x86-64 (ELF) · 1 Windows (PE64) ·
+//     2 macOS x86-64 (Mach-O) · 3 macOS ARM64 (Mach-O) · 4 Linux ARM64 (ELF)
 // 304 importaciones de Windows [dll][función]
 // 312 etiqueta del trampolín de hilos de Windows (o -1)
 
@@ -92,7 +93,8 @@ funcion ctx_nuevo(tokens) {
 
 funcion ctx_codigo(c) { retornar __cargar64(c + 16) }
 funcion es_windows(c) { retornar __cargar64(c + 296) == 1 }
-funcion es_macos(c) { retornar __cargar64(c + 296) == 2 }
+funcion es_macos(c) { retornar __cargar64(c + 296) == 2 o __cargar64(c + 296) == 3 }
+funcion es_arm64(c) { retornar __cargar64(c + 296) == 3 o __cargar64(c + 296) == 4 }
 funcion ctx_modo(c) { retornar __cargar64(c + 104) }
 // 2: programa del usuario · 3: biblioteca del lenguaje (también dinámica)
 funcion dinamico(c) { retornar __cargar64(c + 104) >= 2 }
@@ -672,7 +674,7 @@ funcion nombre_biblioteca_macos(nombre) {
 
 funcion nombre_biblioteca(nombre) {
     si (mem_global(33) == 1) { retornar nombre_biblioteca_windows(nombre) }
-    si (mem_global(33) == 2) { retornar nombre_biblioteca_macos(nombre) }
+    si (mem_global(33) == 2 o mem_global(33) == 3) { retornar nombre_biblioteca_macos(nombre) }
     si (str_igual(nombre, "libc") o str_igual(nombre, "c")) { retornar "libc.so.6" }
     si (str_igual(nombre, "libm") o str_igual(nombre, "m")) { retornar "libm.so.6" }
     si (str_buscar_en(nombre, ".so") >= 0 o str_buscar_en(nombre, "/") >= 0) { retornar nombre }
@@ -1247,6 +1249,12 @@ funcion intrinseco(c, nombre) {
         argumentos(c)
         si (__cargar64(c + 312) < 0) { __guardar64(c + 312, nueva_etiqueta(c)) }
         op_direccion(c, 4, __cargar64(c + 312))
+        retornar 1
+    }
+    si (str_igual(nombre, "__plataforma")) {
+        // Plataforma de destino del ejecutable (ver el campo 296).
+        argumentos(c)
+        cargar_inmediato(c, __cargar64(c + 296))
         retornar 1
     }
     si (str_igual(nombre, "__libsistema")) {
@@ -3135,9 +3143,11 @@ funcion tablas_dinamicas(c, base, inicio_datos) {
     sea r = mem_reservar(32)
     // Intérprete.
     __guardar64(r, str_largo(datos))
-    str_agregar(datos, "/lib64/ld-linux-x86-64.so.2")
+    sea interprete = "/lib64/ld-linux-x86-64.so.2"
+    si (es_arm64(c)) { interprete = "/lib/ld-linux-aarch64.so.1" }
+    str_agregar(datos, interprete)
     str_agregar_byte(datos, 0)
-    __guardar64(r + 8, 28)
+    __guardar64(r + 8, str_largo(interprete) + 1)
     // Cadenas: libc.so.6 y los símbolos dlopen y dlsym; cada función
     // externa se resuelve con ellos en su primer uso.
     sea cadenas = str_nuevo(64)
@@ -3186,7 +3196,9 @@ funcion tablas_dinamicas(c, base, inicio_datos) {
     i = 0
     mientras (i < vec_largo(simbolos)) {
         bytes_le(datos, dir + __cargar64(c + 272) + i * 8, 8)
-        bytes_le(datos, __o_bits(__desplazar_izq(i + 1, 32), 6), 8)
+        sea tipo_reubicacion = 6                               // R_X86_64_GLOB_DAT
+        si (es_arm64(c)) { tipo_reubicacion = 1025 }           // R_AARCH64_GLOB_DAT
+        bytes_le(datos, __o_bits(__desplazar_izq(i + 1, 32), tipo_reubicacion), 8)
         bytes_le(datos, 0, 8)
         i = i + 1
     }
@@ -3252,6 +3264,19 @@ funcion aplicar_arreglos(c, va_codigo, va_datos, va_globales, iat) {
             parchear32(codigo, posicion, va_codigo + direccion)
         }
         si (tipo == 5) { parchear32(codigo, posicion, vec_obtener(iat, valor)) }
+        si (tipo >= 10) {
+            sea destino = 0
+            si (tipo == 10 o tipo == 24) {
+                destino = vec_obtener(etiquetas, valor)
+                si (destino < 0) { rt_panico("etiqueta sin definir") }
+                destino = va_codigo + destino
+            }
+            si (tipo == 21) { destino = va_datos + valor }
+            si (tipo == 22) { destino = va_globales + valor }
+            si (tipo == 23) { destino = va_datos + __cargar64(c + 192) }
+            si (tipo == 25) { destino = vec_obtener(iat, valor) }
+            a64_aplicar(codigo, posicion, tipo, va_codigo + posicion, destino)
+        }
         i = i + 1
     }
     sea reubicaciones = __cargar64(c + 80)
@@ -3304,7 +3329,7 @@ funcion empaquetar(c) {
     bytes_le(elf, 1, 1)
     bytes_le(elf, 0, 9)
     bytes_le(elf, 2, 2)                                        // ET_EXEC
-    bytes_le(elf, 62, 2)                                       // x86-64
+    si (es_arm64(c)) { bytes_le(elf, 183, 2) } sino { bytes_le(elf, 62, 2) }   // AArch64 / x86-64
     bytes_le(elf, 1, 4)
     bytes_le(elf, base + cabecera, 8)                          // entrada
     bytes_le(elf, 64, 8)
@@ -3554,12 +3579,22 @@ funcion seccion_macho(s, nombre, segmento, addr, tam, offset, alineacion, bander
 }
 
 funcion empaquetar_macho(c) {
+    // x86-64: carga fija en 0x400000, páginas de 4 KiB, sin firma.
+    // ARM64: PIE en 0x100000000 (dyld reubica los punteros de datos),
+    // páginas de 16 KiB y firma ad-hoc obligatoria (LC_CODE_SIGNATURE).
+    sea arm = es_arm64(c)
     sea base = 4194304
+    sea pagina = 4096
+    si (arm) {
+        base = 4294967296
+        pagina = 16384
+    }
     sea codigo = ctx_codigo(c)
     sea datos = ctx_datos(c)
     sea tam_comandos = 72 + 152 + 152 + 72 + 48 + 24 + 80 + 32 + 24 + 56 + 24
+    si (arm) { tam_comandos = tam_comandos + 16 }
     sea inicio_codigo = alinear(32 + tam_comandos, 16)
-    sea tam_texto = alinear(inicio_codigo + str_largo(codigo), 4096)
+    sea tam_texto = alinear(inicio_codigo + str_largo(codigo), pagina)
     // Punteros de libSystem (los llena dyld) al final de los datos.
     mientras (str_largo(datos) % 8 != 0) { str_agregar_byte(datos, 0) }
     sea imps = __cargar64(c + 304)
@@ -3584,33 +3619,58 @@ funcion empaquetar_macho(c) {
     }
     str_agregar_byte(enlaces, 0)                               // DONE
     mientras (str_largo(enlaces) % 8 != 0) { str_agregar_byte(enlaces, 0) }
-    sea tam_datos_archivo = alinear(str_largo(datos), 4096)
+    // PIE: cada puntero absoluto de los datos se reubica al cargar.
+    sea rebase = str_nuevo(64)
+    si (arm) {
+        str_agregar_byte(rebase, 17)                           // REBASE SET_TYPE_IMM POINTER
+        reubicaciones_macho(c, rebase)
+        str_agregar_byte(rebase, 0)                            // DONE
+        mientras (str_largo(rebase) % 8 != 0) { str_agregar_byte(rebase, 0) }
+    }
+    sea tam_datos_archivo = alinear(str_largo(datos), pagina)
     sea inicio_globales = alinear(str_largo(datos), 16)
-    sea tam_datos_memoria = alinear(inicio_globales + 512 + vec_largo(__cargar64(c + 224)) * 8, 4096)
+    sea tam_datos_memoria = alinear(inicio_globales + 512 + vec_largo(__cargar64(c + 224)) * 8, pagina)
     aplicar_arreglos(c, base + inicio_codigo, va_datos, va_datos + inicio_globales, got)
     sea inicio_enlace = tam_texto + tam_datos_archivo
-    sea tabla_cadenas = inicio_enlace + str_largo(enlaces)
-    sea tam_enlace = str_largo(enlaces) + 8
+    sea inicio_bind = inicio_enlace + str_largo(rebase)
+    sea tabla_cadenas = inicio_bind + str_largo(enlaces)
+    sea tam_enlace = str_largo(rebase) + str_largo(enlaces) + 8
+    sea inicio_firma = alinear(tabla_cadenas + 8, 16)
+    sea tam_firma = 0
+    si (arm) {
+        tam_firma = tamano_firma(inicio_firma)
+        tam_enlace = inicio_firma + tam_firma - inicio_enlace
+    }
     sea m = str_nuevo(inicio_enlace + tam_enlace + 64)
     // mach_header_64
     bytes_le(m, 4277009103, 4)                                 // MH_MAGIC_64
-    bytes_le(m, 16777223, 4)                                   // CPU_TYPE_X86_64
-    bytes_le(m, 3, 4)
+    si (arm) {
+        bytes_le(m, 16777228, 4)                               // CPU_TYPE_ARM64
+        bytes_le(m, 0, 4)
+    } sino {
+        bytes_le(m, 16777223, 4)                               // CPU_TYPE_X86_64
+        bytes_le(m, 3, 4)
+    }
     bytes_le(m, 2, 4)                                          // MH_EXECUTE
-    bytes_le(m, 11, 4)
+    si (arm) { bytes_le(m, 12, 4) } sino { bytes_le(m, 11, 4) }
     bytes_le(m, tam_comandos, 4)
-    bytes_le(m, 133, 4)                                        // NOUNDEFS | DYLDLINK | TWOLEVEL
+    si (arm) { bytes_le(m, 2097285, 4) } sino { bytes_le(m, 133, 4) }   // NOUNDEFS | DYLDLINK | TWOLEVEL (| PIE)
     bytes_le(m, 0, 4)
     comando_segmento(m, "__PAGEZERO", 0, base, 0, 0, 0, 0, 0)
     comando_segmento(m, "__TEXT", base, tam_texto, 0, tam_texto, 5, 5, 1)
     seccion_macho(m, "__text", "__TEXT", base + inicio_codigo, str_largo(codigo), inicio_codigo, 4, 2147484672)
     comando_segmento(m, "__DATA", va_datos, tam_datos_memoria, tam_texto, tam_datos_archivo, 3, 3, 1)
     seccion_macho(m, "__data", "__DATA", va_datos, str_largo(datos), tam_texto, 3, 0)
-    comando_segmento(m, "__LINKEDIT", va_datos + tam_datos_memoria, alinear(tam_enlace, 4096), inicio_enlace, tam_enlace, 1, 1, 0)
+    comando_segmento(m, "__LINKEDIT", va_datos + tam_datos_memoria, alinear(tam_enlace, pagina), inicio_enlace, tam_enlace, 1, 1, 0)
     bytes_le(m, 2147483682, 4)                                 // LC_DYLD_INFO_ONLY
     bytes_le(m, 48, 4)
-    bytes_le(m, 0, 8)                                          // rebase
-    bytes_le(m, inicio_enlace, 4)                              // bind
+    si (arm) {
+        bytes_le(m, inicio_enlace, 4)                          // rebase
+        bytes_le(m, str_largo(rebase), 4)
+    } sino {
+        bytes_le(m, 0, 8)
+    }
+    bytes_le(m, inicio_bind, 4)                                // bind
     bytes_le(m, str_largo(enlaces), 4)
     bytes_le(m, 0, 24)                                         // weak, lazy, export
     bytes_le(m, 2, 4)                                          // LC_SYMTAB
@@ -3642,17 +3702,288 @@ funcion empaquetar_macho(c) {
     bytes_le(m, 50, 4)                                         // LC_BUILD_VERSION
     bytes_le(m, 24, 4)
     bytes_le(m, 1, 4)                                          // macOS
-    bytes_le(m, 659200, 4)                                     // minos 10.15
-    bytes_le(m, 659200, 4)                                     // sdk 10.15
+    si (arm) {
+        bytes_le(m, 720896, 4)                                 // minos 11.0
+        bytes_le(m, 720896, 4)
+    } sino {
+        bytes_le(m, 659200, 4)                                 // minos 10.15
+        bytes_le(m, 659200, 4)                                 // sdk 10.15
+    }
     bytes_le(m, 0, 4)
+    si (arm) {
+        bytes_le(m, 29, 4)                                     // LC_CODE_SIGNATURE
+        bytes_le(m, 16, 4)
+        bytes_le(m, inicio_firma, 4)
+        bytes_le(m, tam_firma, 4)
+    }
     mientras (str_largo(m) < inicio_codigo) { str_agregar_byte(m, 0) }
     str_agregar(m, codigo)
     mientras (str_largo(m) < tam_texto) { str_agregar_byte(m, 0) }
     str_agregar(m, datos)
     mientras (str_largo(m) < inicio_enlace) { str_agregar_byte(m, 0) }
+    str_agregar(m, rebase)
     str_agregar(m, enlaces)
     bytes_le(m, 0, 8)                                          // tabla de cadenas vacía
+    si (arm) {
+        mientras (str_largo(m) < inicio_firma) { str_agregar_byte(m, 0) }
+        firma_adhoc(m, inicio_firma, tam_texto)
+    }
     retornar m
+}
+
+// Instrucciones de rebase de dyld para cada puntero absoluto de __DATA
+// (segmento 2): textos literales, punteros entre datos y a código.
+funcion reubicaciones_macho(c, r) {
+    sea reubicaciones = __cargar64(c + 80)
+    sea i = 0
+    mientras (i < vec_largo(reubicaciones)) {
+        rebase_en(r, vec_obtener(reubicaciones, i))
+        i = i + 1
+    }
+    sea a_codigo = __cargar64(c + 176)
+    i = 0
+    mientras (i < vec_largo(a_codigo)) {
+        rebase_en(r, __cargar64(vec_obtener(a_codigo, i)))
+        i = i + 1
+    }
+    sea punteros = __cargar64(c + 112)
+    i = 0
+    mientras (i < vec_largo(punteros)) {
+        rebase_en(r, __cargar64(vec_obtener(punteros, i)))
+        i = i + 1
+    }
+    retornar 0
+}
+
+funcion rebase_en(r, desplazamiento) {
+    str_agregar_byte(r, 34)                                    // SET_SEGMENT_AND_OFFSET_ULEB (segmento 2)
+    uleb128(r, desplazamiento)
+    str_agregar_byte(r, 81)                                    // DO_REBASE_IMM_TIMES 1
+    retornar 0
+}
+
+// ── Firma de código ad-hoc (macOS ARM64) ──────────────────────────────────
+// SuperBlob con un CodeDirectory (versión 0x20400, banderas adhoc |
+// linker-signed) con el SHA-256 de cada página de 4 KiB del archivo hasta
+// el inicio de la firma. El identificador es fijo para que la salida no
+// dependa del nombre del archivo.
+
+funcion bytes_be(s, valor, cantidad) {
+    sea i = cantidad - 1
+    mientras (i >= 0) {
+        str_agregar_byte(s, __y_bits(__desplazar_der(valor, i * 8), 255))
+        i = i - 1
+    }
+    retornar 0
+}
+
+funcion identificador_firma() { retornar "cforge" }
+
+funcion tamano_firma(limite) {
+    sea paginas = (limite + 4095) / 4096
+    retornar 20 + 88 + str_largo(identificador_firma()) + 1 + paginas * 32
+}
+
+funcion firma_adhoc(m, limite, tam_texto) {
+    sea paginas = (limite + 4095) / 4096
+    sea ident = identificador_firma()
+    sea tam_cd = 88 + str_largo(ident) + 1 + paginas * 32
+    bytes_be(m, 4208856256, 4)                                 // CSMAGIC_EMBEDDED_SIGNATURE
+    bytes_be(m, 20 + tam_cd, 4)
+    bytes_be(m, 1, 4)
+    bytes_be(m, 0, 4)                                          // CSSLOT_CODEDIRECTORY
+    bytes_be(m, 20, 4)
+    bytes_be(m, 4208856066, 4)                                 // CSMAGIC_CODEDIRECTORY
+    bytes_be(m, tam_cd, 4)
+    bytes_be(m, 132096, 4)                                     // versión 0x20400
+    bytes_be(m, 131074, 4)                                     // CS_ADHOC | CS_LINKER_SIGNED
+    bytes_be(m, 88 + str_largo(ident) + 1, 4)                  // hashOffset
+    bytes_be(m, 88, 4)                                         // identOffset
+    bytes_be(m, 0, 4)                                          // nSpecialSlots
+    bytes_be(m, paginas, 4)                                    // nCodeSlots
+    bytes_be(m, limite, 4)                                     // codeLimit
+    str_agregar_byte(m, 32)                                    // hashSize
+    str_agregar_byte(m, 2)                                     // SHA-256
+    str_agregar_byte(m, 0)
+    str_agregar_byte(m, 12)                                    // páginas de 4 KiB
+    bytes_be(m, 0, 4)                                          // spare2
+    bytes_be(m, 0, 4)                                          // scatterOffset
+    bytes_be(m, 0, 4)                                          // teamOffset
+    bytes_be(m, 0, 4)                                          // spare3
+    bytes_be(m, 0, 8)                                          // codeLimit64
+    bytes_be(m, 0, 8)                                          // execSegBase
+    bytes_be(m, tam_texto, 8)                                  // execSegLimit
+    bytes_be(m, 1, 8)                                          // CS_EXECSEG_MAIN_BINARY
+    str_agregar(m, ident)
+    str_agregar_byte(m, 0)
+    sea k = sha256_constantes()
+    sea i = 0
+    mientras (i < paginas) {
+        sea largo = 4096
+        si ((i + 1) * 4096 > limite) { largo = limite - i * 4096 }
+        str_agregar(m, sha256(m, i * 4096, largo, k))
+        i = i + 1
+    }
+    vec_liberar(k)
+    retornar 0
+}
+
+// ── SHA-256 (dialecto base; enteros de 64 bits con máscaras de 32) ────────
+
+funcion sha256_constantes() {
+    sea k = vec_nuevo()
+    vec_agregar(k, 1116352408)
+    vec_agregar(k, 1899447441)
+    vec_agregar(k, 3049323471)
+    vec_agregar(k, 3921009573)
+    vec_agregar(k, 961987163)
+    vec_agregar(k, 1508970993)
+    vec_agregar(k, 2453635748)
+    vec_agregar(k, 2870763221)
+    vec_agregar(k, 3624381080)
+    vec_agregar(k, 310598401)
+    vec_agregar(k, 607225278)
+    vec_agregar(k, 1426881987)
+    vec_agregar(k, 1925078388)
+    vec_agregar(k, 2162078206)
+    vec_agregar(k, 2614888103)
+    vec_agregar(k, 3248222580)
+    vec_agregar(k, 3835390401)
+    vec_agregar(k, 4022224774)
+    vec_agregar(k, 264347078)
+    vec_agregar(k, 604807628)
+    vec_agregar(k, 770255983)
+    vec_agregar(k, 1249150122)
+    vec_agregar(k, 1555081692)
+    vec_agregar(k, 1996064986)
+    vec_agregar(k, 2554220882)
+    vec_agregar(k, 2821834349)
+    vec_agregar(k, 2952996808)
+    vec_agregar(k, 3210313671)
+    vec_agregar(k, 3336571891)
+    vec_agregar(k, 3584528711)
+    vec_agregar(k, 113926993)
+    vec_agregar(k, 338241895)
+    vec_agregar(k, 666307205)
+    vec_agregar(k, 773529912)
+    vec_agregar(k, 1294757372)
+    vec_agregar(k, 1396182291)
+    vec_agregar(k, 1695183700)
+    vec_agregar(k, 1986661051)
+    vec_agregar(k, 2177026350)
+    vec_agregar(k, 2456956037)
+    vec_agregar(k, 2730485921)
+    vec_agregar(k, 2820302411)
+    vec_agregar(k, 3259730800)
+    vec_agregar(k, 3345764771)
+    vec_agregar(k, 3516065817)
+    vec_agregar(k, 3600352804)
+    vec_agregar(k, 4094571909)
+    vec_agregar(k, 275423344)
+    vec_agregar(k, 430227734)
+    vec_agregar(k, 506948616)
+    vec_agregar(k, 659060556)
+    vec_agregar(k, 883997877)
+    vec_agregar(k, 958139571)
+    vec_agregar(k, 1322822218)
+    vec_agregar(k, 1537002063)
+    vec_agregar(k, 1747873779)
+    vec_agregar(k, 1955562222)
+    vec_agregar(k, 2024104815)
+    vec_agregar(k, 2227730452)
+    vec_agregar(k, 2361852424)
+    vec_agregar(k, 2428436474)
+    vec_agregar(k, 2756734187)
+    vec_agregar(k, 3204031479)
+    vec_agregar(k, 3329325298)
+    retornar k
+}
+
+funcion sha_rotr(x, n) {
+    retornar __y_bits(__o_bits(__desplazar_der(x, n), __desplazar_izq(x, 32 - n)), 4294967295)
+}
+
+funcion sha_suma(a, b) { retornar __y_bits(a + b, 4294967295) }
+
+// SHA-256 de los bytes [inicio, inicio + largo) de s: texto de 32 bytes.
+funcion sha256(s, inicio, largo, k) {
+    sea msg = str_nuevo(largo + 72)
+    str_agregar(msg, str_rebanar(s, inicio, inicio + largo))
+    str_agregar_byte(msg, 128)
+    mientras (str_largo(msg) % 64 != 56) { str_agregar_byte(msg, 0) }
+    bytes_be(msg, largo * 8, 8)
+    sea h = mem_reservar(64)
+    __guardar64(h + 0, 1779033703)
+    __guardar64(h + 8, 3144134277)
+    __guardar64(h + 16, 1013904242)
+    __guardar64(h + 24, 2773480762)
+    __guardar64(h + 32, 1359893119)
+    __guardar64(h + 40, 2600822924)
+    __guardar64(h + 48, 528734635)
+    __guardar64(h + 56, 1541459225)
+    sea w = mem_reservar(512)
+    sea bloque = 0
+    mientras (bloque < str_largo(msg)) {
+        sea t = 0
+        mientras (t < 16) {
+            sea p = bloque + t * 4
+            __guardar64(w + t * 8, str_byte(msg, p) * 16777216 + str_byte(msg, p + 1) * 65536 + str_byte(msg, p + 2) * 256 + str_byte(msg, p + 3))
+            t = t + 1
+        }
+        mientras (t < 64) {
+            sea w15 = __cargar64(w + (t - 15) * 8)
+            sea w2 = __cargar64(w + (t - 2) * 8)
+            sea s0 = __xo_bits(__xo_bits(sha_rotr(w15, 7), sha_rotr(w15, 18)), __desplazar_der(w15, 3))
+            sea s1 = __xo_bits(__xo_bits(sha_rotr(w2, 17), sha_rotr(w2, 19)), __desplazar_der(w2, 10))
+            __guardar64(w + t * 8, __y_bits(__cargar64(w + (t - 16) * 8) + s0 + __cargar64(w + (t - 7) * 8) + s1, 4294967295))
+            t = t + 1
+        }
+        sea a = __cargar64(h)
+        sea b = __cargar64(h + 8)
+        sea cc = __cargar64(h + 16)
+        sea d = __cargar64(h + 24)
+        sea e = __cargar64(h + 32)
+        sea f = __cargar64(h + 40)
+        sea g = __cargar64(h + 48)
+        sea hh = __cargar64(h + 56)
+        t = 0
+        mientras (t < 64) {
+            sea S1 = __xo_bits(__xo_bits(sha_rotr(e, 6), sha_rotr(e, 11)), sha_rotr(e, 25))
+            sea ch = __xo_bits(__y_bits(e, f), __y_bits(__xo_bits(e, 4294967295), g))
+            sea t1 = __y_bits(hh + S1 + ch + vec_obtener(k, t) + __cargar64(w + t * 8), 4294967295)
+            sea S0 = __xo_bits(__xo_bits(sha_rotr(a, 2), sha_rotr(a, 13)), sha_rotr(a, 22))
+            sea may = __xo_bits(__xo_bits(__y_bits(a, b), __y_bits(a, cc)), __y_bits(b, cc))
+            sea t2 = sha_suma(S0, may)
+            hh = g
+            g = f
+            f = e
+            e = sha_suma(d, t1)
+            d = cc
+            cc = b
+            b = a
+            a = sha_suma(t1, t2)
+            t = t + 1
+        }
+        __guardar64(h, sha_suma(__cargar64(h), a))
+        __guardar64(h + 8, sha_suma(__cargar64(h + 8), b))
+        __guardar64(h + 16, sha_suma(__cargar64(h + 16), cc))
+        __guardar64(h + 24, sha_suma(__cargar64(h + 24), d))
+        __guardar64(h + 32, sha_suma(__cargar64(h + 32), e))
+        __guardar64(h + 40, sha_suma(__cargar64(h + 40), f))
+        __guardar64(h + 48, sha_suma(__cargar64(h + 48), g))
+        __guardar64(h + 56, sha_suma(__cargar64(h + 56), hh))
+        bloque = bloque + 64
+    }
+    sea r = str_nuevo(32)
+    sea i = 0
+    mientras (i < 8) {
+        bytes_be(r, __cargar64(h + i * 8), 4)
+        i = i + 1
+    }
+    mem_liberar(w)
+    mem_liberar(h)
+    str_liberar(msg)
+    retornar r
 }
 
 // ── Programa ──────────────────────────────────────────────────────────────
@@ -3822,12 +4153,14 @@ funcion cli_bajo_nivel() {
     retornar 0
 }
 
-// linux → 0 · windows → 1 · macos → 2
+// linux → 0 · windows → 1 · macos → 2 · macos-arm64 → 3 · linux-arm64 → 4
 funcion numero_plataforma(nombre) {
     si (str_igual(nombre, "windows") o str_igual(nombre, "win64")) { retornar 1 }
     si (str_igual(nombre, "macos") o str_igual(nombre, "macos-x64") o str_igual(nombre, "darwin")) { retornar 2 }
-    si (str_igual(nombre, "linux")) { retornar 0 }
-    rt_panico(str_concatenar("plataforma desconocida: ", str_concatenar(nombre, " (linux, windows, macos)")))
+    si (str_igual(nombre, "macos-arm64") o str_igual(nombre, "macos-aarch64")) { retornar 3 }
+    si (str_igual(nombre, "linux-arm64") o str_igual(nombre, "linux-aarch64")) { retornar 4 }
+    si (str_igual(nombre, "linux") o str_igual(nombre, "linux-x64")) { retornar 0 }
+    rt_panico(str_concatenar("plataforma desconocida: ", str_concatenar(nombre, " (linux, linux-arm64, windows, macos, macos-arm64)")))
     retornar 0
 }
 

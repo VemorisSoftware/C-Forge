@@ -16,7 +16,10 @@ falla() { fallas="$fallas $1"; echo "  ✗ $1: $2"; }
 case "$(uname -s)" in MINGW*|MSYS*|CYGWIN*) WINDOWS=1 ;; *) WINDOWS=0 ;; esac
 hay_sdl() {
   if [ $WINDOWS = 1 ]; then [ -f "$(dirname "$C")/SDL2.dll" ]; return; fi
-  if [ "$(uname -s)" = Darwin ]; then file /usr/local/lib/libSDL2.dylib 2>/dev/null | grep -q x86_64; return; fi
+  if [ "$(uname -s)" = Darwin ]; then
+    if file "$C" | grep -q arm64; then [ -f /opt/homebrew/lib/libSDL2.dylib ]; return; fi
+    file /usr/local/lib/libSDL2.dylib 2>/dev/null | grep -q x86_64; return
+  fi
   ldconfig -p 2>/dev/null | grep -q libSDL2-2.0
 }
 puerto_escuchando() {
