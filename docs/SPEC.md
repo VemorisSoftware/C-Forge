@@ -562,6 +562,26 @@ Los programas sin `extern` siguen siendo estáticos y sin libc.
   Linux**, byte por byte; 25/25 `tests/cfv`, 32/32 ejemplos del sitio y
   22/22 `ejemplos/` (servidor HTTP con Winsock, SDL2).
 
+### macOS x86-64 (Mach-O) 100 % C-Forge ✅
+
+- `cforge build archivo.cfv --target macos` genera ejecutables Mach-O x86-64
+  desde Linux, Windows o macOS: `__PAGEZERO`, `__TEXT` (r-x), `__DATA`
+  (datos, punteros de libSystem y globales) y `__LINKEDIT` con las
+  instrucciones de enlace de `dyld` (`LC_DYLD_INFO_ONLY`), `LC_MAIN` y
+  `LC_LOAD_DYLIB /usr/lib/libSystem.B.dylib`. Carga fija en 0x400000.
+- `__libsistema("función", args…)`: llamada SysV a una función de
+  libSystem (la interfaz estable de macOS; no se usan syscalls directas).
+- `runtime/sys_macos.cfv` (archivos, `mmap`, argumentos y entorno que entrega
+  `dyld` a la entrada, `fork`/`execve`/`waitpid`, `_NSGetExecutablePath`) y
+  `runtime/sys_macos_ext.cfv` (`clock_gettime`, `usleep`, `opendir`/`readdir`,
+  hilos con `pthread_create` y el trampolín de pila propia, sockets BSD,
+  `dlopen`/`dlsym`). `extern` usa SysV; `"libc"`/`"libm"` →
+  `libSystem.B.dylib`, `"SDL2"` → `libSDL2.dylib`.
+- CI en macOS real (`macos-nativo.yml`, Intel y Apple Silicon con Rosetta 2):
+  **Stage 2 = Stage 3 = el Mach-O compilado de forma cruzada desde Linux**,
+  byte por byte; 25/25 `tests/cfv`, 32/32 ejemplos del sitio y 22/22
+  `ejemplos/` (servidor HTTP, hilos, SDL2 de Homebrew).
+
 **Alcance honesto:** el compilador autoalojado compila el *dialecto nativo*
 (enteros de 64 bits, funciones, recursión, condiciones, ciclos, textos
 literales e intrínsecos). El lenguaje C-Forge completo (clases, mapas,
