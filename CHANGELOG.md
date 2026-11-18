@@ -12,6 +12,9 @@ Sitio oficial: [c-forge.org](https://c-forge.org)
 - **Primer hito de autoalojamiento**: el lexer de C-Forge escrito en el
   dialecto nativo produce los mismos tokens que el lexer Core.
 - `make nativo-check` y job de CI "Backend nativo (Linux, sin libc)".
+- **Compilador autoalojado** (`bootstrap/nativo/cforge_self.cfv`): compilador
+  de una pasada escrito en el dialecto nativo que se compila a sí mismo.
+  Stage 2 = Stage 3 byte por byte, sin libc ni C++ (`make autoalojado-check`).
 
 ## 3.7.3 — extern C + idioma del programa
 
