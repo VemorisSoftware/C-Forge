@@ -24,6 +24,12 @@ Sitio oficial: [c-forge.org](https://c-forge.org)
   retorno, operadores (`texto - numero`, comparar lista con número),
   condiciones y `no` que no son booleanas. Lo que no se conoce sigue siendo
   dinámico (tipado gradual): ningún programa válido deja de compilar.
+- **Velocidad:** `+ - * %` y comparaciones de enteros en línea (sin llamar
+  al runtime), enteros probados por el verificador sin comprobar etiquetas y
+  condiciones booleanas de una instrucción. Primos hasta 200 000 + fib(30):
+  de 460 ms a 73 ms (Java 21: 67 ms, gcc -O2: 25 ms).
+- **`cforge build --release`:** elimina las funciones que el programa no usa
+  (dos pasadas). "hola": de 231 KB a 34 KB en Linux.
 - **`docs/GLOBALES.md`:** mapa de las casillas globales del runtime. Corrige
   dos choques de 4.1: las tablas de AES usaban la caché de `argv` en Windows
   (ahora casilla 15) y el handle de libssl la casilla de `sys_casilla` (16).
