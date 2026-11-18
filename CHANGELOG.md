@@ -2,7 +2,7 @@
 
 Sitio oficial: [c-forge.org](https://c-forge.org)
 
-## Sin publicar (4.2)
+## 4.2.0 — 2026-11-18
 
 - **`cforge repl`:** consola interactiva con estado (variables, funciones de
   varias líneas, `:programa`, `:limpiar`); una expresión suelta muestra su
