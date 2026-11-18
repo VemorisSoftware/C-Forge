@@ -6,7 +6,7 @@
 
 C-Forge es un lenguaje de programación creado por Vemoris Group. Su objetivo es ofrecer una sintaxis clara, ejecución nativa y una biblioteca estándar escrita en el propio lenguaje.
 
-> **C-Forge 3.7.3** — El núcleo, CLI y biblioteca estándar superan el gate reproducible `make release-check` en macOS ARM64, Linux x64 y Windows x64. Las capacidades marcadas como experimentales no forman parte del contrato estable.
+> **C-Forge 4.0.0** — El núcleo, CLI y biblioteca estándar superan el gate reproducible `make release-check` en macOS ARM64, Linux x64 y Windows x64. Las capacidades marcadas como experimentales no forman parte del contrato estable.
 
 ---
 
@@ -29,7 +29,7 @@ y Windows x64. Todos los compila C-Forge mismo: no hay C++ en el proyecto.
 Opciones:
 
 ```sh
-curl -fsSL https://c-forge.org/install.sh | CFORGE_VERSION=3.7.3 sh   # versión fija
+curl -fsSL https://c-forge.org/install.sh | CFORGE_VERSION=4.0.0 sh   # versión fija
 curl -fsSL https://c-forge.org/install.sh | CFORGE_PREFIX=$HOME/.local sh   # sin sudo
 ```
 
@@ -39,13 +39,13 @@ curl -fsSL https://c-forge.org/install.sh | CFORGE_PREFIX=$HOME/.local sh   # si
 ### Linux x64 (.deb)
 
 ```sh
-wget https://github.com/VemorisSoftware/C-Forge/releases/download/v3.7.3/cforge_3.7.3_amd64.deb
-sudo dpkg -i cforge_3.7.3_amd64.deb
+wget https://github.com/VemorisSoftware/C-Forge/releases/download/v4.0.0/cforge_4.0.0_amd64.deb
+sudo dpkg -i cforge_4.0.0_amd64.deb
 ```
 
 ### Windows x64
 
-1. Descarga `cforge-3.7.3-windows-x64.zip` desde [Releases](https://github.com/VemorisSoftware/C-Forge/releases/latest).
+1. Descarga `cforge-4.0.0-windows-x64.zip` desde [Releases](https://github.com/VemorisSoftware/C-Forge/releases/latest).
 2. Extrae el ZIP en una carpeta fija, por ejemplo `C:\cforge`.
 3. Añade esa carpeta al `PATH`. La `stdlib` incluida junto a `cforge.exe` se detecta sola.
 4. Abre una nueva terminal y ejecuta `cforge --version`.
@@ -65,7 +65,7 @@ Con `.deb`: `sudo dpkg -r cforge`.
 
 ```sh
 cforge --version
-# → C-Forge 3.7.3
+# → C-Forge 4.0.0
 
 cforge --help
 # → muestra todos los comandos disponibles
@@ -144,7 +144,7 @@ s.decir()                     // Hola desde C-Forge
 
 ## Extensión de Visual Studio Code
 
-1. Descarga `c-forge-3.7.3.vsix` desde [Releases](https://github.com/VemorisSoftware/C-Forge/releases/tag/v3.7.3).
+1. Descarga `c-forge-4.0.0.vsix` desde [Releases](https://github.com/VemorisSoftware/C-Forge/releases/tag/v4.0.0).
 2. En VS Code: **Extensions** (⇧⌘X) → **···** → **Install from VSIX…** → selecciona el archivo.
 3. Los archivos `.cfv` tendrán resaltado de sintaxis, snippets y diagnósticos automáticos al guardar.
 
@@ -206,7 +206,7 @@ por byte a los compilados en cada sistema: `make windows-cruzado`,
 
 ---
 
-## Plataformas verificadas en 3.7.3
+## Plataformas verificadas en 4.0.0
 
 | Plataforma | Build CI | Tests | Distribuible |
 |-----------|----------|-------|-------------|
