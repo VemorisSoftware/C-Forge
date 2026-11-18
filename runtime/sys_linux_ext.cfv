@@ -1,0 +1,121 @@
+// runtime/sys_linux_ext.cfv — funciones de sistema de Linux para los
+// programas del lenguaje (tiempo, hilos, futex, sockets, dlopen). No forman
+// parte del compilador: usan intrínsecos que solo tiene cforge_self.
+
+// Nombres de archivo en un directorio (getdents64), o 0 si no existe.
+funcion sys_listar(ruta) {
+    sea fd = sys_abrir(str_c(ruta), 65536, 0)                  // O_DIRECTORY
+    si (fd < 0) { retornar 0 }
+    sea r = vec_nuevo()
+    sea buf = mem_reservar(8192)
+    sea seguir = 1
+    mientras (seguir) {
+        sea n = __syscall(217, fd, buf, 8192)
+        si (n <= 0) {
+            seguir = 0
+        } sino {
+            sea p = 0
+            mientras (p < n) {
+                sea largo = __cargar8(buf + p + 16) + __cargar8(buf + p + 17) * 256
+                vec_agregar(r, str_desde_c(buf + p + 19))
+                p = p + largo
+            }
+        }
+    }
+    mem_liberar(buf)
+    sys_cerrar(fd)
+    retornar r
+}
+
+funcion sys_reloj_ns() {
+    sea ts = mem_reservar(16)
+    __syscall(228, 0, ts)                                      // CLOCK_REALTIME
+    sea ns = __cargar64(ts) * 1000000000 + __cargar64(ts + 8)
+    mem_liberar(ts)
+    retornar ns
+}
+
+funcion sys_nucleos() {
+    sea mascara = mem_reservar(128)
+    mem_llenar(mascara, 0, 128)
+    sea n = __syscall(204, 0, 128, mascara)                    // sched_getaffinity
+    sea total = 0
+    si (n > 0) {
+        sea i = 0
+        mientras (i < n) {
+            sea b = __cargar8(mascara + i)
+            mientras (b > 0) {
+                total = total + __y_bits(b, 1)
+                b = __desplazar_der(b, 1)
+            }
+            i = i + 1
+        }
+    }
+    mem_liberar(mascara)
+    si (total < 1) { total = 1 }
+    retornar total
+}
+
+funcion sys_dormir_ms(n) {
+    sea ts = mem_reservar(16)
+    __guardar64(ts, n / 1000)
+    __guardar64(ts + 8, (n % 1000) * 1000000)
+    __syscall(35, ts, 0)                                       // nanosleep
+    mem_liberar(ts)
+    retornar 0
+}
+
+// op 128: FUTEX_WAIT_PRIVATE · op 0: FUTEX_WAIT compartido (tid de clone).
+funcion sys_futex_esperar(direccion, valor, ms, op) {
+    si (ms < 0) {
+        __syscall(202, direccion, op, __y_bits(valor, 4294967295), 0)
+        retornar 0
+    }
+    sea ts = mem_reservar(16)
+    __guardar64(ts, ms / 1000)
+    __guardar64(ts + 8, (ms % 1000) * 1000000)
+    __syscall(202, direccion, op, __y_bits(valor, 4294967295), ts)
+    mem_liberar(ts)
+    retornar 0
+}
+
+funcion sys_futex_despertar(direccion) {
+    __syscall(202, direccion, 129, 2147483647)                 // FUTEX_WAKE_PRIVATE
+    retornar 0
+}
+
+// Hilo con clone en la pila [base, base + tam) que ejecuta dyn_hilo_inicio(t);
+// al terminar, el kernel pone en 0 el tid de base + 16 y despierta (futex).
+funcion sys_hilo_crear(base, tam, t) {
+    retornar __hilo(base + tam, __dir("dyn_hilo_inicio"), t, base + 16)
+}
+
+funcion sys_dl_disponible() { retornar __simbolo_dinamico(0) != 0 }
+funcion sys_cargar_biblioteca(nombre) { retornar __ccall(__simbolo_dinamico(0), str_c(nombre), 258) }   // RTLD_NOW | RTLD_GLOBAL
+funcion sys_simbolo(h, nombre) { retornar __ccall(__simbolo_dinamico(1), h, str_c(nombre)) }
+
+// Socket TCP escuchando en el puerto: descriptor, o -1 (socket), -2 (bind),
+// -3 (listen).
+funcion sys_red_escuchar(puerto) {
+    sea fd = __syscall(41, 2, 1, 0)                            // socket(AF_INET, SOCK_STREAM)
+    si (fd < 0) { retornar 0 - 1 }
+    sea uno = mem_reservar(8)
+    __guardar64(uno, 1)
+    __syscall(54, fd, 1, 2, uno, 4)                            // SO_REUSEADDR
+    mem_liberar(uno)
+    sea dir = mem_reservar(16)
+    mem_llenar(dir, 0, 16)
+    __guardar8(dir, 2)                                         // AF_INET
+    __guardar8(dir + 2, __desplazar_der(puerto, 8))            // puerto (big-endian)
+    __guardar8(dir + 3, __y_bits(puerto, 255))
+    sea r = __syscall(49, fd, dir, 16)
+    mem_liberar(dir)
+    si (r != 0) { retornar 0 - 2 }
+    si (__syscall(50, fd, 64) != 0) { retornar 0 - 3 }
+    retornar fd
+}
+
+funcion sys_red_aceptar(fd, dir, largo_dir) { retornar __syscall(43, fd, dir, largo_dir) }
+funcion sys_red_leer(fd, buf, n) { retornar sys_leer(fd, buf, n) }
+funcion sys_red_escribir(fd, buf, n) { retornar sys_escribir(fd, buf, n) }
+funcion sys_red_cerrar(fd) { retornar sys_cerrar(fd) }

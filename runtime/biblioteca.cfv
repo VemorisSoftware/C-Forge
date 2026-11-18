@@ -893,13 +893,6 @@ funcion existe_archivo(ruta) {
 
 // ── Tiempo (clock_gettime) ────────────────────────────────────────────────
 
-funcion sys_reloj_ns() {
-    sea ts = mem_reservar(16)
-    __syscall(228, 0, ts)                                      // CLOCK_REALTIME
-    sea ns = __cargar64(ts) * 1000000000 + __cargar64(ts + 8)
-    mem_liberar(ts)
-    retornar ns
-}
 
 funcion cfv_fecha_ahora_ms() { retornar dyn_entero(sys_reloj_ns() / 1000000) }
 
@@ -932,26 +925,6 @@ funcion cfv_fecha_ahora() {
 
 // ── Sistema y rutas ───────────────────────────────────────────────────────
 
-funcion sys_nucleos() {
-    sea mascara = mem_reservar(128)
-    mem_llenar(mascara, 0, 128)
-    sea n = __syscall(204, 0, 128, mascara)                    // sched_getaffinity
-    sea total = 0
-    si (n > 0) {
-        sea i = 0
-        mientras (i < n) {
-            sea b = __cargar8(mascara + i)
-            mientras (b > 0) {
-                total = total + __y_bits(b, 1)
-                b = __desplazar_der(b, 1)
-            }
-            i = i + 1
-        }
-    }
-    mem_liberar(mascara)
-    si (total < 1) { total = 1 }
-    retornar total
-}
 
 funcion sys_info() {
     sea r = map_nuevo()
@@ -1035,30 +1008,6 @@ funcion dyn_texto_desde_c(p) {
 
 // ── Carga diferida de bibliotecas compartidas (dlopen / dlsym) ───────────
 
-// Nombres de archivo en un directorio (getdents64), o 0 si no existe.
-funcion sys_listar(ruta) {
-    sea fd = sys_abrir(str_c(ruta), 65536, 0)                  // O_DIRECTORY
-    si (fd < 0) { retornar 0 }
-    sea r = vec_nuevo()
-    sea buf = mem_reservar(8192)
-    sea seguir = 1
-    mientras (seguir) {
-        sea n = __syscall(217, fd, buf, 8192)
-        si (n <= 0) {
-            seguir = 0
-        } sino {
-            sea p = 0
-            mientras (p < n) {
-                sea largo = __cargar8(buf + p + 16) + __cargar8(buf + p + 17) * 256
-                vec_agregar(r, str_desde_c(buf + p + 19))
-                p = p + largo
-            }
-        }
-    }
-    mem_liberar(buf)
-    sys_cerrar(fd)
-    retornar r
-}
 
 // "sqlite3" → libsqlite3.so.0, "SDL2" → libSDL2-2.0.so.0: busca en los
 // directorios del sistema un archivo lib<nombre>.so* o lib<nombre>-*.so*.
@@ -1096,8 +1045,7 @@ funcion dyn_empieza(s, prefijo) {
 }
 
 funcion dyn_abrir_biblioteca(nombre) {
-    sea dlopen = __simbolo_dinamico(0)
-    si (dlopen == 0) { retornar 0 }
+    si (sys_dl_disponible() == 0) { retornar 0 }
     sea cache = mem_global(31)
     si (cache == 0) {
         cache = map_nuevo()
@@ -1105,12 +1053,12 @@ funcion dyn_abrir_biblioteca(nombre) {
     }
     sea h = map_obtener_o(cache, nombre, 0)
     si (h != 0) { retornar h }
-    h = __ccall(dlopen, str_c(nombre), 258)                    // RTLD_NOW | RTLD_GLOBAL
+    h = sys_cargar_biblioteca(nombre)
     si (h == 0 y str_buscar(nombre, "/", 0) < 0) {
         sea base = nombre
         si (str_buscar(nombre, ".so", 0) >= 0) { base = str_rebanar(nombre, 0, str_buscar(nombre, ".so", 0)) }
         sea encontrada = buscar_biblioteca(base)
-        si (encontrada != 0) { h = __ccall(dlopen, str_c(encontrada), 258) }
+        si (encontrada != 0) { h = sys_cargar_biblioteca(encontrada) }
     }
     si (h != 0) { map_fijar(cache, nombre, h) }
     retornar h
@@ -1126,7 +1074,7 @@ funcion dyn_extern_resolver(simbolo, biblioteca) {
         str_agregar(m, "')")
         dyn_error(m)
     }
-    sea p = __ccall(__simbolo_dinamico(1), h, str_c(simbolo))
+    sea p = sys_simbolo(h, simbolo)
     si (p == 0) { dyn_simbolo_faltante(simbolo, biblioteca) }
     retornar p
 }
@@ -1228,12 +1176,7 @@ funcion texto_a_numero(t) { retornar a_numero(t) }
 funcion tiempo_ms() { retornar dyn_entero(sys_reloj_ns() / 1000000) }
 
 funcion hilo_dormir(ms) {
-    sea n = dyn_valor_entero(ms)
-    sea ts = mem_reservar(16)
-    __guardar64(ts, n / 1000)
-    __guardar64(ts + 8, (n % 1000) * 1000000)
-    __syscall(35, ts, 0)                                       // nanosleep
-    mem_liberar(ts)
+    sys_dormir_ms(dyn_valor_entero(ms))
     retornar 0
 }
 
@@ -1246,20 +1189,12 @@ funcion futex_esperar(direccion, valor, ms) { retornar futex_esperar_op(direccio
 // op 128: FUTEX_WAIT_PRIVATE · op 0: FUTEX_WAIT (el kernel despierta el tid
 // de CLONE_CHILD_CLEARTID con un FUTEX_WAKE compartido).
 funcion futex_esperar_op(direccion, valor, ms, op) {
-    si (ms < 0) {
-        __syscall(202, direccion, op, __y_bits(valor, 4294967295), 0)
-        retornar 0
-    }
-    sea ts = mem_reservar(16)
-    __guardar64(ts, ms / 1000)
-    __guardar64(ts + 8, (ms % 1000) * 1000000)
-    __syscall(202, direccion, op, __y_bits(valor, 4294967295), ts)
-    mem_liberar(ts)
+    sys_futex_esperar(direccion, valor, ms, op)
     retornar 0
 }
 
 funcion futex_despertar(direccion) {
-    __syscall(202, direccion, 129, 2147483647)                 // FUTEX_WAKE_PRIVATE
+    sys_futex_despertar(direccion)
     retornar 0
 }
 
@@ -1285,8 +1220,7 @@ funcion dyn_hilo_lanzar(t) {
     __guardar64(base, 1)
     __guardar64(base + 8, 0)
     __guardar64(base + 16, 1)
-    sea tid = __hilo(base + tam, __dir("dyn_hilo_inicio"), t, base + 16)
-    si (tid < 0) { dyn_error("no se pudo crear el hilo") }
+    si (sys_hilo_crear(base, tam, t) < 0) { dyn_error("no se pudo crear el hilo") }
     retornar dyn_entero(base)
 }
 
@@ -1445,23 +1379,10 @@ funcion http_servidor(id) {
 funcion servidor_http_escuchar(puerto) {
     sea p = dyn_valor_entero(puerto)
     si (p < 1 o p > 65535) { dyn_error("servidor_http_escuchar: puerto invalido") }
-    sea fd = __syscall(41, 2, 1, 0)                            // socket(AF_INET, SOCK_STREAM)
-    si (fd < 0) { dyn_error("servidor_http_escuchar: no se pudo crear socket") }
-    sea uno = mem_reservar(8)
-    __guardar64(uno, 1)
-    __syscall(54, fd, 1, 2, uno, 4)                            // SO_REUSEADDR
-    mem_liberar(uno)
-    sea dir = mem_reservar(16)
-    mem_llenar(dir, 0, 16)
-    __guardar8(dir, 2)                                         // AF_INET
-    __guardar8(dir + 2, __desplazar_der(p, 8))                 // puerto (big-endian)
-    __guardar8(dir + 3, __y_bits(p, 255))
-    si (__syscall(49, fd, dir, 16) != 0) {
-        mem_liberar(dir)
-        dyn_error(str_concatenar("servidor_http_escuchar: no se pudo enlazar al puerto ", str_desde_entero(p)))
-    }
-    mem_liberar(dir)
-    si (__syscall(50, fd, 64) != 0) { dyn_error("servidor_http_escuchar: no se pudo escuchar") }
+    sea fd = sys_red_escuchar(p)
+    si (fd == 0 - 1) { dyn_error("servidor_http_escuchar: no se pudo crear socket") }
+    si (fd == 0 - 2) { dyn_error(str_concatenar("servidor_http_escuchar: no se pudo enlazar al puerto ", str_desde_entero(p))) }
+    si (fd < 0) { dyn_error("servidor_http_escuchar: no se pudo escuchar") }
     sea r = mem_reservar(16)
     __guardar64(r, fd)
     __guardar64(r + 8, 0 - 1)
@@ -1493,13 +1414,13 @@ funcion http_minusculas(s) {
 funcion servidor_http_solicitud(id) {
     sea srv = http_servidor(id)
     si (__cargar64(srv + 8) >= 0) {
-        sys_cerrar(__cargar64(srv + 8))
+        sys_red_cerrar(__cargar64(srv + 8))
         __guardar64(srv + 8, 0 - 1)
     }
     sea dir = mem_reservar(16)
     sea largo_dir = mem_reservar(8)
     __guardar64(largo_dir, 16)
-    sea cliente = __syscall(43, __cargar64(srv), dir, largo_dir)   // accept
+    sea cliente = sys_red_aceptar(__cargar64(srv), dir, largo_dir)
     si (cliente < 0) { dyn_error("servidor_http_solicitud: accept fallo") }
     __guardar64(srv + 8, cliente)
     sea ip = str_nuevo(16)
@@ -1518,7 +1439,7 @@ funcion servidor_http_solicitud(id) {
     sea esperado = 0 - 1
     sea seguir = 1
     mientras (seguir) {
-        sea n = sys_leer(cliente, buf, 4096)
+        sea n = sys_red_leer(cliente, buf, 4096)
         si (n <= 0) {
             seguir = 0
         } sino {
@@ -1627,18 +1548,18 @@ funcion servidor_http_responder(id, estado, cuerpo, tipo) {
     str_agregar(r, c)
     sea enviado = 0
     mientras (enviado < str_largo(r)) {
-        sea n = sys_escribir(cliente, str_datos(r) + enviado, str_largo(r) - enviado)
+        sea n = sys_red_escribir(cliente, str_datos(r) + enviado, str_largo(r) - enviado)
         si (n <= 0) { enviado = str_largo(r) } sino { enviado = enviado + n }
     }
-    sys_cerrar(cliente)
+    sys_red_cerrar(cliente)
     __guardar64(srv + 8, 0 - 1)
     retornar 0
 }
 
 funcion servidor_http_cerrar(id) {
     sea srv = http_servidor(id)
-    si (__cargar64(srv + 8) >= 0) { sys_cerrar(__cargar64(srv + 8)) }
-    sys_cerrar(__cargar64(srv))
+    si (__cargar64(srv + 8) >= 0) { sys_red_cerrar(__cargar64(srv + 8)) }
+    sys_red_cerrar(__cargar64(srv))
     retornar 0
 }
 
