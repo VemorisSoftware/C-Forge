@@ -16,14 +16,19 @@
 // 64 bits; argumentos apilados de izquierda a derecha; resultado en rax;
 // locales en [rbp - 8k]; textos literales con forma de texto del runtime.
 
-// ── Contexto (registro de 13 campos de 8 bytes) ──────────────────────────
+// ── Contexto (registro de 20 campos de 8 bytes) ──────────────────────────
 //  0 tokens       8 posición     16 código      24 datos
 // 32 arreglos    40 etiquetas   48 funciones   56 locales
 // 64 n_locales   72 literales   80 reubicaciones de datos
 // 88 base de locales visibles   96 fuente (para errores)
+// 104 modo: 0 nativo · 1 puente (runtime con valores del lenguaje)
+//           2 dinámico (lenguaje C-Forge completo)
+// 112 punteros entre datos [campo][destino]   120 cajas de texto literales
+// 128 etiqueta de "romper"   136 etiqueta de "continuar"
+// 144 funciones en orden de definición       152 siguiente definición
 
 funcion ctx_nuevo(tokens) {
-    sea c = mem_reservar(104)
+    sea c = mem_reservar(160)
     __guardar64(c, tokens)
     __guardar64(c + 8, 0)
     __guardar64(c + 16, str_nuevo(65536))
@@ -37,10 +42,19 @@ funcion ctx_nuevo(tokens) {
     __guardar64(c + 80, vec_nuevo())
     __guardar64(c + 88, 0)
     __guardar64(c + 96, 0)
+    __guardar64(c + 104, 0)
+    __guardar64(c + 112, vec_nuevo())
+    __guardar64(c + 120, vec_nuevo())
+    __guardar64(c + 128, 0 - 1)
+    __guardar64(c + 136, 0 - 1)
+    __guardar64(c + 144, vec_nuevo())
+    __guardar64(c + 152, 0)
     retornar c
 }
 
 funcion ctx_codigo(c) { retornar __cargar64(c + 16) }
+funcion ctx_modo(c) { retornar __cargar64(c + 104) }
+funcion dinamico(c) { retornar __cargar64(c + 104) == 2 }
 funcion ctx_datos(c) { retornar __cargar64(c + 24) }
 
 // ── Tokens ────────────────────────────────────────────────────────────────
@@ -186,27 +200,46 @@ funcion ref_global(c, desplazamiento) { retornar nuevo_arreglo(c, 2, desplazamie
 
 // ── Funciones y variables ─────────────────────────────────────────────────
 
-// Registro de función: [nombre][etiqueta][parámetros]
-funcion buscar_funcion(c, nombre) {
+// Registro de función: [nombre][etiqueta][parámetros][modo]
+funcion indice_funcion(c, nombre) {
     sea funciones = __cargar64(c + 48)
     sea i = 0
     mientras (i < vec_largo(funciones)) {
-        sea f = vec_obtener(funciones, i)
-        si (str_igual(__cargar64(f), nombre)) { retornar f }
+        si (str_igual(__cargar64(vec_obtener(funciones, i)), nombre)) { retornar i }
         i = i + 1
     }
-    retornar 0
+    retornar 0 - 1
 }
 
-funcion registrar_funcion(c, nombre, parametros) {
-    si (buscar_funcion(c, nombre) != 0) {
-        rt_panico(str_concatenar("función definida dos veces: ", nombre))
-    }
-    sea f = mem_reservar(24)
+funcion buscar_funcion(c, nombre) {
+    sea i = indice_funcion(c, nombre)
+    si (i < 0) { retornar 0 }
+    retornar vec_obtener(__cargar64(c + 48), i)
+}
+
+// Cada definición recibe su propio registro (en orden). Si el programa
+// dinámico define una función con el nombre de una del lenguaje (puente),
+// la del programa tiene prioridad, como en el intérprete.
+funcion registrar_funcion(c, nombre, parametros, modo) {
+    sea f = mem_reservar(32)
     __guardar64(f, nombre)
     __guardar64(f + 8, nueva_etiqueta(c))
     __guardar64(f + 16, parametros)
-    vec_agregar(__cargar64(c + 48), f)
+    __guardar64(f + 24, modo)
+    vec_agregar(__cargar64(c + 144), f)
+    sea funciones = __cargar64(c + 48)
+    sea i = indice_funcion(c, nombre)
+    si (i < 0) {
+        vec_agregar(funciones, f)
+        retornar f
+    }
+    sea previa = __cargar64(vec_obtener(funciones, i) + 24)
+    si (previa == 1 y modo == 2) {
+        vec_fijar(funciones, i, f)
+        retornar f
+    }
+    si (previa == 2 y modo == 1) { retornar f }
+    rt_panico(str_concatenar("función definida dos veces: ", nombre))
     retornar f
 }
 
@@ -216,11 +249,15 @@ funcion registrar_funciones(c) {
     sea tokens = __cargar64(c)
     sea i = 0
     sea profundidad = 0
+    sea modo = 0
     mientras (i < vec_largo(tokens)) {
         sea t = vec_obtener(tokens, i)
         sea lex = __cargar64(t + 8)
         si (__cargar64(t) == 4 y str_igual(lex, "{")) { profundidad = profundidad + 1 }
         si (__cargar64(t) == 4 y str_igual(lex, "}")) { profundidad = profundidad - 1 }
+        si (profundidad == 0 y __cargar64(t) == 1 y str_igual(lex, "__dialecto")) {
+            modo = numero_literal(__cargar64(vec_obtener(tokens, i + 1) + 8))
+        }
         si (profundidad == 0 y __cargar64(t) == 1 y str_igual(lex, "funcion")) {
             sea nombre = __cargar64(vec_obtener(tokens, i + 1) + 8)
             sea j = i + 3
@@ -238,7 +275,7 @@ funcion registrar_funciones(c) {
                 }
                 j = j + 1
             }
-            registrar_funcion(c, nombre, parametros)
+            registrar_funcion(c, nombre, parametros, modo)
             i = i + 1
         }
         i = i + 1
@@ -354,6 +391,32 @@ funcion numero_literal(lexema) {
         i = i + 1
     }
     retornar n
+}
+
+// Caja [1][texto] en datos para un literal de texto del lenguaje dinámico.
+funcion literal_caja(c, lexema) {
+    sea cajas = __cargar64(c + 120)
+    sea i = 0
+    mientras (i < vec_largo(cajas)) {
+        sea l = vec_obtener(cajas, i)
+        si (str_igual(__cargar64(l), lexema)) { retornar __cargar64(l + 8) }
+        i = i + 1
+    }
+    sea texto = literal(c, lexema)
+    sea datos = ctx_datos(c)
+    mientras (str_largo(datos) % 8 != 0) { str_agregar_byte(datos, 0) }
+    sea caja = str_largo(datos)
+    bytes_le(datos, 1, 8)
+    sea puntero = mem_reservar(16)
+    __guardar64(puntero, str_largo(datos))
+    __guardar64(puntero + 8, texto)
+    vec_agregar(__cargar64(c + 112), puntero)
+    bytes_le(datos, 0, 8)
+    sea registro = mem_reservar(16)
+    __guardar64(registro, lexema)
+    __guardar64(registro + 8, caja)
+    vec_agregar(cajas, registro)
+    retornar caja
 }
 
 // ── Expresiones (resultado en rax) ────────────────────────────────────────
@@ -479,13 +542,19 @@ funcion intrinseco(c, nombre) {
     retornar 0
 }
 
-funcion llamada(c, nombre) {
-    si (intrinseco(c, nombre)) { retornar 0 }
+funcion funcion_llamable(c, nombre) {
     sea f = buscar_funcion(c, nombre)
     si (f == 0) { error_en(c, str_concatenar("función desconocida ", nombre)) }
-    sea n = argumentos(c)
+    si (dinamico(c) y __cargar64(f + 24) == 0) {
+        error_en(c, str_concatenar("función interna del runtime: ", nombre))
+    }
+    retornar f
+}
+
+// Llama a f con n argumentos ya apilados y los retira.
+funcion emitir_llamada(c, f, n) {
     si (n != __cargar64(f + 16)) {
-        error_en(c, str_concatenar("cantidad de argumentos incorrecta en ", nombre))
+        error_en(c, str_concatenar("cantidad de argumentos incorrecta en ", __cargar64(f)))
     }
     e1(c, 232)
     ref_etiqueta(c, __cargar64(f + 8))
@@ -496,7 +565,174 @@ funcion llamada(c, nombre) {
     retornar 0
 }
 
+// Llamada del compilador a una función del runtime con n argumentos apilados.
+funcion llamar_runtime(c, nombre, n) {
+    sea f = buscar_funcion(c, nombre)
+    si (f == 0) {
+        error_en(c, str_concatenar("falta el runtime del lenguaje (runtime/dyn.cfv): ", nombre))
+    }
+    emitir_llamada(c, f, n)
+    retornar 0
+}
+
+funcion llamada(c, nombre) {
+    si (intrinseco(c, nombre)) { retornar 0 }
+    sea f = funcion_llamable(c, nombre)
+    emitir_llamada(c, f, argumentos(c))
+    retornar 0
+}
+
+// En modo dinámico convierte rax (valor del lenguaje) en 0/1 para saltos.
+funcion condicion(c) {
+    si (dinamico(c)) {
+        empujar(c)
+        llamar_runtime(c, "dyn_verdad", 1)
+    }
+    retornar 0
+}
+
+// 0/1 en rax → falso (2) / verdadero (4).
+funcion booleano_dinamico(c) {
+    e3(c, 72, 1, 192)                                          // add rax, rax
+    e4(c, 72, 131, 192, 2)                                     // add rax, 2
+    retornar 0
+}
+
+funcion numero_dinamico(c) {
+    sea entero = numero_literal(__cargar64(avanzar(c) + 8))
+    si (ver(c, ".") y __cargar64(vec_obtener(__cargar64(c), __cargar64(c + 8) + 1)) == 2) {
+        avanzar(c)
+        sea fraccion = __cargar64(avanzar(c) + 8)
+        sea escala = 1
+        sea i = 0
+        mientras (i < str_largo(fraccion)) {
+            escala = escala * 10
+            i = i + 1
+        }
+        sea parte = __f64_div(__f64_desde_entero(numero_literal(fraccion)), __f64_desde_entero(escala))
+        sea bits = __f64_suma(__f64_desde_entero(entero), parte)
+        cargar_inmediato(c, bits)
+        empujar(c)
+        llamar_runtime(c, "dyn_flotante", 1)
+        retornar 0
+    }
+    cargar_inmediato(c, entero * 2 + 1)
+    retornar 0
+}
+
+// [a, b, ...] → lista del lenguaje.
+funcion lista_literal(c) {
+    llamar_runtime(c, "dyn_lista_nueva", 0)
+    empujar(c)
+    si (ver(c, "]") == 0) {
+        sea seguir = 1
+        mientras (seguir) {
+            e3(c, 255, 52, 36)                                 // push qword [rsp]
+            expresion(c)
+            empujar(c)
+            llamar_runtime(c, "agregar", 2)
+            seguir = tomar(c, ",")
+            si (ver(c, "]")) { seguir = 0 }
+        }
+    }
+    requerir(c, "]")
+    e1(c, 88)                                                  // pop rax
+    retornar 0
+}
+
+// {"clave": valor, ...} → mapa del lenguaje.
+funcion mapa_literal(c) {
+    llamar_runtime(c, "dyn_mapa_nuevo", 0)
+    empujar(c)
+    si (ver(c, "}") == 0) {
+        sea seguir = 1
+        mientras (seguir) {
+            e3(c, 255, 52, 36)                                 // push qword [rsp]
+            expresion(c)
+            empujar(c)
+            requerir(c, ":")
+            expresion(c)
+            empujar(c)
+            llamar_runtime(c, "dyn_fijar_indice", 3)
+            seguir = tomar(c, ",")
+            si (ver(c, "}")) { seguir = 0 }
+        }
+    }
+    requerir(c, "}")
+    e1(c, 88)                                                  // pop rax
+    retornar 0
+}
+
+// Sufijos del modo dinámico: valor[índice] y valor.metodo(args).
+funcion sufijos(c) {
+    sea seguir = 1
+    mientras (seguir) {
+        si (tomar(c, "[")) {
+            empujar(c)
+            expresion(c)
+            empujar(c)
+            requerir(c, "]")
+            llamar_runtime(c, "dyn_indice", 2)
+        } sino {
+            si (ver(c, ".") y tok_tipo_en(c, 1) == 1) {
+                avanzar(c)
+                sea nombre = requerir_ident(c)
+                // a.f(x, y) equivale a f(a, x, y).
+                empujar(c)
+                sea f = funcion_llamable(c, nombre)
+                emitir_llamada(c, f, argumentos(c) + 1)
+            } sino {
+                seguir = 0
+            }
+        }
+    }
+    retornar 0
+}
+
+funcion tok_tipo_en(c, salto) {
+    sea i = __cargar64(c + 8) + salto
+    si (i >= vec_largo(__cargar64(c))) { retornar 5 }
+    retornar __cargar64(vec_obtener(__cargar64(c), i))
+}
+
+funcion primaria_dinamica(c) {
+    sea tipo = tok_tipo(c)
+    si (tipo == 2) { numero_dinamico(c) retornar 0 }
+    si (tipo == 3) {
+        sea d = literal_caja(c, __cargar64(avanzar(c) + 8))
+        e1(c, 184)
+        ref_dato(c, d)
+        retornar 0
+    }
+    si (tomar(c, "verdadero")) { cargar_inmediato(c, 4) retornar 0 }
+    si (tomar(c, "falso")) { cargar_inmediato(c, 2) retornar 0 }
+    si (tomar(c, "nulo")) { cargar_inmediato(c, 0) retornar 0 }
+    si (tomar(c, "[")) { lista_literal(c) retornar 0 }
+    si (tomar(c, "{")) { mapa_literal(c) retornar 0 }
+    si (tomar(c, "(")) {
+        expresion(c)
+        requerir(c, ")")
+        retornar 0
+    }
+    si (tipo == 1) {
+        sea nombre = __cargar64(avanzar(c) + 8)
+        si (ver(c, "(")) {
+            llamada(c, nombre)
+            retornar 0
+        }
+        cargar_local(c, buscar_variable(c, nombre))
+        retornar 0
+    }
+    error_en(c, "expresión inválida")
+    retornar 0
+}
+
 funcion primaria(c) {
+    si (dinamico(c)) {
+        primaria_dinamica(c)
+        sufijos(c)
+        retornar 0
+    }
     sea tipo = tok_tipo(c)
     si (tipo == 2) {
         cargar_inmediato(c, numero_literal(__cargar64(avanzar(c) + 8)))
@@ -531,11 +767,21 @@ funcion primaria(c) {
 funcion unaria(c) {
     si (tomar(c, "-")) {
         unaria(c)
+        si (dinamico(c)) {
+            empujar(c)
+            llamar_runtime(c, "dyn_neg", 1)
+            retornar 0
+        }
         e3(c, 72, 247, 216)                                    // neg rax
         retornar 0
     }
     si (tomar(c, "no")) {
         unaria(c)
+        si (dinamico(c)) {
+            empujar(c)
+            llamar_runtime(c, "dyn_no", 1)
+            retornar 0
+        }
         e3(c, 72, 133, 192)
         e3(c, 15, 148, 192)
         e3(c, 15, 182, 192)
@@ -545,21 +791,56 @@ funcion unaria(c) {
     retornar 0
 }
 
+// Operación binaria: el operando izquierdo está apilado y el derecho en rax.
+funcion aplicar_operador(c, lex) {
+    si (dinamico(c)) {
+        empujar(c)
+        sea nombre = "dyn_suma"
+        si (str_igual(lex, "-")) { nombre = "dyn_resta" }
+        si (str_igual(lex, "*")) { nombre = "dyn_mul" }
+        si (str_igual(lex, "/")) { nombre = "dyn_div" }
+        si (str_igual(lex, "%")) { nombre = "dyn_mod" }
+        si (str_igual(lex, "<")) { nombre = "dyn_menor" }
+        si (str_igual(lex, "<=")) { nombre = "dyn_menor_igual" }
+        si (str_igual(lex, ">")) { nombre = "dyn_mayor" }
+        si (str_igual(lex, ">=")) { nombre = "dyn_mayor_igual" }
+        si (str_igual(lex, "==")) { nombre = "dyn_igual" }
+        si (str_igual(lex, "!=")) { nombre = "dyn_distinto" }
+        llamar_runtime(c, nombre, 2)
+        retornar 0
+    }
+    rax_a_rcx_y_sacar(c)
+    sea op = str_byte(lex, 0)
+    si (str_largo(lex) == 1 y op == 43) { e3(c, 72, 1, 200) retornar 0 }
+    si (str_largo(lex) == 1 y op == 45) { e3(c, 72, 41, 200) retornar 0 }
+    si (str_largo(lex) == 1 y op == 42) { e4(c, 72, 15, 175, 193) retornar 0 }
+    si (str_largo(lex) == 1 y op == 47) { e5(c, 72, 153, 72, 247, 249) retornar 0 }
+    si (str_largo(lex) == 1 y op == 37) {
+        e5(c, 72, 153, 72, 247, 249)
+        e3(c, 72, 137, 208)
+        retornar 0
+    }
+    sea codigo = 156
+    si (str_igual(lex, "<=")) { codigo = 158 }
+    si (str_igual(lex, ">")) { codigo = 159 }
+    si (str_igual(lex, ">=")) { codigo = 157 }
+    si (str_igual(lex, "==")) { codigo = 148 }
+    si (str_igual(lex, "!=")) { codigo = 149 }
+    e3(c, 72, 57, 200)
+    e3(c, 15, codigo, 192)
+    e3(c, 15, 182, 192)
+    retornar 0
+}
+
 funcion producto(c) {
     unaria(c)
     sea seguir = 1
     mientras (seguir) {
         si (ver(c, "*") o ver(c, "/") o ver(c, "%")) {
-            sea op = str_byte(__cargar64(avanzar(c) + 8), 0)
+            sea lex = __cargar64(avanzar(c) + 8)
             empujar(c)
             unaria(c)
-            rax_a_rcx_y_sacar(c)
-            si (op == 42) { e4(c, 72, 15, 175, 193) }
-            si (op == 47) { e5(c, 72, 153, 72, 247, 249) }
-            si (op == 37) {
-                e5(c, 72, 153, 72, 247, 249)
-                e3(c, 72, 137, 208)
-            }
+            aplicar_operador(c, lex)
         } sino {
             seguir = 0
         }
@@ -572,23 +853,14 @@ funcion suma(c) {
     sea seguir = 1
     mientras (seguir) {
         si (ver(c, "+") o ver(c, "-")) {
-            sea op = str_byte(__cargar64(avanzar(c) + 8), 0)
+            sea lex = __cargar64(avanzar(c) + 8)
             empujar(c)
             producto(c)
-            rax_a_rcx_y_sacar(c)
-            si (op == 43) { e3(c, 72, 1, 200) } sino { e3(c, 72, 41, 200) }
+            aplicar_operador(c, lex)
         } sino {
             seguir = 0
         }
     }
-    retornar 0
-}
-
-funcion comparar(c, codigo) {
-    rax_a_rcx_y_sacar(c)
-    e3(c, 72, 57, 200)
-    e3(c, 15, codigo, 192)
-    e3(c, 15, 182, 192)
     retornar 0
 }
 
@@ -600,11 +872,7 @@ funcion comparacion(c) {
             sea lex = __cargar64(avanzar(c) + 8)
             empujar(c)
             suma(c)
-            sea codigo = 156
-            si (str_igual(lex, "<=")) { codigo = 158 }
-            si (str_igual(lex, ">")) { codigo = 159 }
-            si (str_igual(lex, ">=")) { codigo = 157 }
-            comparar(c, codigo)
+            aplicar_operador(c, lex)
         } sino {
             seguir = 0
         }
@@ -620,7 +888,7 @@ funcion igualdad(c) {
             sea lex = __cargar64(avanzar(c) + 8)
             empujar(c)
             comparacion(c)
-            si (str_igual(lex, "==")) { comparar(c, 148) } sino { comparar(c, 149) }
+            aplicar_operador(c, lex)
         } sino {
             seguir = 0
         }
@@ -628,17 +896,20 @@ funcion igualdad(c) {
     retornar 0
 }
 
-// y / o con cortocircuito; el resultado se normaliza a 0 o 1.
+// y / o con cortocircuito; el resultado se normaliza a booleano.
 funcion logica(c, operador, siguiente) {
     sea fin = nueva_etiqueta(c)
+    condicion(c)
     e3(c, 72, 133, 192)
     si (operador == 1) { e2(c, 15, 132) } sino { e2(c, 15, 133) }
     ref_etiqueta(c, fin)
     si (siguiente == 1) { igualdad(c) } sino { conjuncion(c) }
+    condicion(c)
     definir_etiqueta(c, fin)
     e3(c, 72, 133, 192)
     e3(c, 15, 149, 192)
     e3(c, 15, 182, 192)
+    si (dinamico(c)) { booleano_dinamico(c) }
     retornar 0
 }
 
@@ -675,8 +946,140 @@ funcion bloque(c) {
     retornar 0
 }
 
+// Salto incondicional a una etiqueta guardada en el contexto (romper/continuar).
+funcion saltar_a(c, campo, palabra) {
+    sea etiqueta = __cargar64(c + campo)
+    si (etiqueta < 0) { error_en(c, str_concatenar(palabra, " fuera de un ciclo")) }
+    e1(c, 233)
+    ref_etiqueta(c, etiqueta)
+    tomar(c, ";")
+    retornar 0
+}
+
+// Cuerpo de un ciclo con sus etiquetas de romper y continuar.
+funcion cuerpo_ciclo(c, fin, continuar) {
+    sea romper_previo = __cargar64(c + 128)
+    sea continuar_previo = __cargar64(c + 136)
+    __guardar64(c + 128, fin)
+    __guardar64(c + 136, continuar)
+    bloque(c)
+    __guardar64(c + 128, romper_previo)
+    __guardar64(c + 136, continuar_previo)
+    retornar 0
+}
+
+// para x en coleccion { ... }   (listas y textos)
+funcion ciclo_para(c) {
+    sea nombre = requerir_ident(c)
+    requerir(c, "en")
+    expresion(c)
+    sea coleccion = declarar_local(c, str_nuevo(0))
+    guardar_local(c, coleccion)
+    cargar_inmediato(c, 0)
+    sea indice = declarar_local(c, str_nuevo(0))
+    guardar_local(c, indice)
+    sea variable = declarar_local(c, nombre)
+    sea inicio = nueva_etiqueta(c)
+    sea siguiente = nueva_etiqueta(c)
+    sea fin = nueva_etiqueta(c)
+    definir_etiqueta(c, inicio)
+    cargar_local(c, coleccion)
+    empujar(c)
+    llamar_runtime(c, "dyn_iter_largo", 1)
+    e3(c, 72, 137, 193)                                        // mov rcx, rax
+    cargar_local(c, indice)
+    e3(c, 72, 57, 200)                                         // cmp rax, rcx
+    e2(c, 15, 141)                                             // jge fin
+    ref_etiqueta(c, fin)
+    cargar_local(c, coleccion)
+    empujar(c)
+    cargar_local(c, indice)
+    empujar(c)
+    llamar_runtime(c, "dyn_iter_obtener", 2)
+    guardar_local(c, variable)
+    cuerpo_ciclo(c, fin, siguiente)
+    definir_etiqueta(c, siguiente)
+    cargar_local(c, indice)
+    e4(c, 72, 131, 192, 1)                                     // add rax, 1
+    guardar_local(c, indice)
+    e1(c, 233)
+    ref_etiqueta(c, inicio)
+    definir_etiqueta(c, fin)
+    retornar 0
+}
+
+// ¿Empieza aquí "nombre[...]...[...] ="?
+funcion es_asignacion_indice(c) {
+    sea tokens = __cargar64(c)
+    sea j = __cargar64(c + 8) + 1
+    sea grupos = 0
+    mientras (str_igual(__cargar64(vec_obtener(tokens, j) + 8), "[") y __cargar64(vec_obtener(tokens, j)) == 4) {
+        sea nivel = 1
+        j = j + 1
+        mientras (nivel > 0) {
+            sea t = vec_obtener(tokens, j)
+            si (__cargar64(t) == 5) { retornar 0 }
+            si (__cargar64(t) == 4 y str_igual(__cargar64(t + 8), "[")) { nivel = nivel + 1 }
+            si (__cargar64(t) == 4 y str_igual(__cargar64(t + 8), "]")) { nivel = nivel - 1 }
+            j = j + 1
+        }
+        grupos = grupos + 1
+    }
+    si (grupos == 0) { retornar 0 }
+    sea t = vec_obtener(tokens, j)
+    retornar __cargar64(t) == 4 y str_igual(__cargar64(t + 8), "=")
+}
+
+// nombre[i]...[k] = valor
+funcion asignacion_indice(c) {
+    sea nombre = __cargar64(avanzar(c) + 8)
+    cargar_local(c, buscar_variable(c, nombre))
+    sea seguir = 1
+    mientras (seguir) {
+        requerir(c, "[")
+        empujar(c)
+        expresion(c)
+        empujar(c)
+        requerir(c, "]")
+        si (ver(c, "[")) {
+            llamar_runtime(c, "dyn_indice", 2)
+        } sino {
+            seguir = 0
+        }
+    }
+    requerir(c, "=")
+    expresion(c)
+    empujar(c)
+    llamar_runtime(c, "dyn_fijar_indice", 3)
+    tomar(c, ";")
+    retornar 0
+}
+
+// x += e, x -= e, x *= e, x /= e, x %= e
+funcion es_asignacion_compuesta(c) {
+    si (tok_tipo(c) != 1 o tok_tipo_en(c, 1) != 4) { retornar 0 }
+    sea op = tok_siguiente_lexema(c)
+    si (str_igual(op, "+") o str_igual(op, "-") o str_igual(op, "*") o str_igual(op, "/") o str_igual(op, "%")) {
+        sea i = __cargar64(c + 8) + 2
+        sea t = vec_obtener(__cargar64(c), i)
+        retornar __cargar64(t) == 4 y str_igual(__cargar64(t + 8), "=")
+    }
+    retornar 0
+}
+
 funcion sentencia(c) {
     si (tomar(c, ";")) { retornar 0 }
+    si (tomar(c, "__dialecto")) {
+        __guardar64(c + 104, numero_literal(__cargar64(avanzar(c) + 8)))
+        retornar 0
+    }
+    si (ver(c, "importar") y tok_tipo_en(c, 1) == 3) {
+        // Las importaciones se resuelven antes de compilar (ver el programa).
+        avanzar(c)
+        avanzar(c)
+        tomar(c, ";")
+        retornar 0
+    }
     si (tomar(c, "sea")) {
         sea nombre = requerir_ident(c)
         saltar_tipo(c)
@@ -690,6 +1093,7 @@ funcion sentencia(c) {
         requerir(c, "(")
         expresion(c)
         requerir(c, ")")
+        condicion(c)
         sea otro = nueva_etiqueta(c)
         sea fin = nueva_etiqueta(c)
         e5(c, 72, 133, 192, 15, 132)
@@ -698,7 +1102,9 @@ funcion sentencia(c) {
         e1(c, 233)
         ref_etiqueta(c, fin)
         definir_etiqueta(c, otro)
-        si (tomar(c, "sino")) { bloque(c) }
+        si (tomar(c, "sino")) {
+            si (ver(c, "si")) { sentencia(c) } sino { bloque(c) }
+        }
         definir_etiqueta(c, fin)
         retornar 0
     }
@@ -709,21 +1115,29 @@ funcion sentencia(c) {
         requerir(c, "(")
         expresion(c)
         requerir(c, ")")
+        condicion(c)
         e5(c, 72, 133, 192, 15, 132)
         ref_etiqueta(c, fin)
-        bloque(c)
+        cuerpo_ciclo(c, fin, inicio)
         e1(c, 233)
         ref_etiqueta(c, inicio)
         definir_etiqueta(c, fin)
         retornar 0
     }
+    si (ver(c, "para") y tok_tipo_en(c, 1) == 1) {
+        avanzar(c)
+        ciclo_para(c)
+        retornar 0
+    }
+    si (tomar(c, "romper")) { saltar_a(c, 128, "romper") retornar 0 }
+    si (tomar(c, "continuar")) { saltar_a(c, 136, "continuar") retornar 0 }
     si (tomar(c, "retornar")) {
         si (ver(c, "}") o ver(c, ";")) { cargar_inmediato(c, 0) } sino { expresion(c) }
         tomar(c, ";")
         epilogo(c)
         retornar 0
     }
-    si (ver(c, "mostrar") y str_igual(tok_siguiente_lexema(c), "(")) {
+    si (dinamico(c) == 0 y ver(c, "mostrar") y str_igual(tok_siguiente_lexema(c), "(")) {
         avanzar(c)
         llamada(c, "rt_mostrar")
         tomar(c, ";")
@@ -735,6 +1149,23 @@ funcion sentencia(c) {
         expresion(c)
         guardar_local(c, buscar_variable(c, nombre))
         tomar(c, ";")
+        retornar 0
+    }
+    si (es_asignacion_compuesta(c)) {
+        sea nombre = __cargar64(avanzar(c) + 8)
+        sea lex = __cargar64(avanzar(c) + 8)
+        avanzar(c)
+        sea d = buscar_variable(c, nombre)
+        cargar_local(c, d)
+        empujar(c)
+        expresion(c)
+        aplicar_operador(c, lex)
+        guardar_local(c, d)
+        tomar(c, ";")
+        retornar 0
+    }
+    si (dinamico(c) y tok_tipo(c) == 1 y es_asignacion_indice(c)) {
+        asignacion_indice(c)
         retornar 0
     }
     expresion(c)
@@ -761,8 +1192,9 @@ funcion cerrar_marco(c, posicion) {
 // funcion nombre(p1, p2: tipo, ...): tipo { ... }
 // Se emite en línea dentro del programa principal, saltándola con un jmp.
 funcion definicion_funcion(c) {
-    sea nombre = requerir_ident(c)
-    sea f = buscar_funcion(c, nombre)
+    requerir_ident(c)
+    sea f = vec_obtener(__cargar64(c + 144), __cargar64(c + 152))
+    __guardar64(c + 152, __cargar64(c + 152) + 1)
     sea saltar = nueva_etiqueta(c)
     e1(c, 233)
     ref_etiqueta(c, saltar)
@@ -867,6 +1299,14 @@ funcion empaquetar(c) {
         parchear64(datos, campo, base + inicio_datos + campo + 16)
         i = i + 1
     }
+    // Cajas de texto del lenguaje: [1][puntero al texto literal].
+    sea punteros = __cargar64(c + 112)
+    i = 0
+    mientras (i < vec_largo(punteros)) {
+        sea p = vec_obtener(punteros, i)
+        parchear64(datos, __cargar64(p), base + inicio_datos + __cargar64(p + 8))
+        i = i + 1
+    }
     sea elf = str_nuevo(fin_datos + 16)
     bytes_le(elf, 1179403647, 4)                               // \x7fELF
     bytes_le(elf, 2, 1)
@@ -899,19 +1339,102 @@ funcion empaquetar(c) {
 }
 
 // ── Programa ──────────────────────────────────────────────────────────────
+//
+// cforge-self -o salida [--stdlib DIR] archivos... [--puente archivos...]
+//             [--dinamico archivos...] [--nativo archivos...]
+//
+// --nativo   (por defecto) dialecto nativo: enteros de 64 bits
+// --puente   runtime del lenguaje escrito en dialecto nativo (runtime/dyn.cfv)
+// --dinamico lenguaje C-Forge completo; resuelve importar "x" desde --stdlib
 
-si (rt_argc() < 4) {
-    rt_panico("uso: cforge-self -o salida archivo.cfv [más archivos .cfv]")
+funcion uso() {
+    rt_panico("uso: cforge-self -o salida [--stdlib DIR] archivo.cfv [--puente|--dinamico|--nativo archivos...]")
+    retornar 0
 }
-si (str_igual(rt_argumento(1), "-o") == 0) {
-    rt_panico("uso: cforge-self -o salida archivo.cfv [más archivos .cfv]")
+
+funcion agregar_fuente(fuente, modo, texto) {
+    str_agregar(fuente, "\n__dialecto ")
+    str_agregar(fuente, str_desde_entero(modo))
+    str_agregar_byte(fuente, 10)
+    str_agregar(fuente, texto)
+    str_agregar_byte(fuente, 10)
+    retornar 0
 }
+
+// Ruta de la biblioteca para importar "mapa" / "stdlib/mapa.cfv".
+funcion ruta_importacion(stdlib, nombre) {
+    sea n = nombre
+    si (str_largo(n) > 7 y str_igual(str_rebanar(n, 0, 7), "stdlib/")) {
+        n = str_rebanar(n, 7, str_largo(n))
+    }
+    sea r = str_concatenar(stdlib, "/")
+    str_agregar(r, n)
+    si (str_largo(n) < 4 o str_igual(str_rebanar(n, str_largo(n) - 4, str_largo(n)), ".cfv") == 0) {
+        str_agregar(r, ".cfv")
+    }
+    retornar r
+}
+
+funcion contiene_texto(lista, texto) {
+    sea i = 0
+    mientras (i < vec_largo(lista)) {
+        si (str_igual(vec_obtener(lista, i), texto)) { retornar 1 }
+        i = i + 1
+    }
+    retornar 0
+}
+
+// Agrega cada importar "x" (y sus importaciones) una sola vez, en modo dinámico.
+funcion resolver_importaciones(fuente, stdlib, texto, vistas) {
+    sea tokens = tokenizar(texto)
+    sea i = 0
+    mientras (i + 1 < vec_largo(tokens)) {
+        sea t = vec_obtener(tokens, i)
+        sea u = vec_obtener(tokens, i + 1)
+        si (__cargar64(t) == 1 y __cargar64(u) == 3 y str_igual(__cargar64(t + 8), "importar")) {
+            sea ruta = ruta_importacion(stdlib, decodificar_literal(__cargar64(u + 8)))
+            si (contiene_texto(vistas, ruta) == 0) {
+                vec_agregar(vistas, ruta)
+                sea importado = archivo_leer(ruta)
+                agregar_fuente(fuente, 2, importado)
+                resolver_importaciones(fuente, stdlib, importado, vistas)
+            }
+        }
+        i = i + 1
+    }
+    retornar 0
+}
+
+si (rt_argc() < 4) { uso() }
+si (str_igual(rt_argumento(1), "-o") == 0) { uso() }
 sea salida = rt_argumento(2)
 sea fuente = str_nuevo(1048576)
+sea stdlib = "stdlib"
+sea modo = 0
+sea vistas = vec_nuevo()
 sea indice = 3
 mientras (indice < rt_argc()) {
-    str_agregar(fuente, archivo_leer(rt_argumento(indice)))
-    str_agregar_byte(fuente, 10)
+    sea argumento = rt_argumento(indice)
+    si (str_igual(argumento, "--stdlib")) {
+        indice = indice + 1
+        stdlib = rt_argumento(indice)
+    } sino {
+        si (str_igual(argumento, "--nativo")) {
+            modo = 0
+        } sino {
+            si (str_igual(argumento, "--puente")) {
+                modo = 1
+            } sino {
+                si (str_igual(argumento, "--dinamico")) {
+                    modo = 2
+                } sino {
+                    sea texto = archivo_leer(argumento)
+                    agregar_fuente(fuente, modo, texto)
+                    si (modo == 2) { resolver_importaciones(fuente, stdlib, texto, vistas) }
+                }
+            }
+        }
+    }
     indice = indice + 1
 }
 sea contexto = ctx_nuevo(tokenizar(fuente))

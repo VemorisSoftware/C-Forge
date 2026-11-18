@@ -1,0 +1,166 @@
+// runtime/map.cfv — tablas hash con claves de texto, 100 % C-Forge.
+//
+// Direccionamiento abierto con sondeo lineal sobre una tabla de ranuras
+// (potencia de 2) y entradas guardadas en orden de inserción, así que
+// recorrer las claves respeta el orden en que se agregaron.
+//
+// Un mapa es un puntero a 48 bytes:
+//   [vivos][capacidad][ranuras][claves][valores][hashes]
+// Cada ranura guarda 0 (vacía) o índice de entrada + 1. Una entrada borrada
+// conserva su ranura con clave 0 (lápida) hasta el siguiente crecimiento.
+
+funcion map_hash(clave) {
+    // FNV-1a de 64 bits sobre los bytes del texto.
+    sea h = 2166136261
+    sea datos = str_datos(clave)
+    sea i = 0
+    sea n = str_largo(clave)
+    mientras (i < n) {
+        h = __xo_bits(h, __cargar8(datos + i))
+        h = h * 1099511628211
+        i = i + 1
+    }
+    retornar h
+}
+
+funcion map_ranuras_nuevas(capacidad) {
+    sea r = mem_reservar(capacidad * 8)
+    mem_llenar(r, 0, capacidad * 8)
+    retornar r
+}
+
+funcion map_nuevo() {
+    sea m = mem_reservar(48)
+    __guardar64(m, 0)
+    __guardar64(m + 8, 16)
+    __guardar64(m + 16, map_ranuras_nuevas(16))
+    __guardar64(m + 24, vec_nuevo())
+    __guardar64(m + 32, vec_nuevo())
+    __guardar64(m + 40, vec_nuevo())
+    retornar m
+}
+
+funcion map_tamano(m) { retornar __cargar64(m) }
+
+// Índice de la entrada con esa clave, o -1.
+funcion map_buscar(m, clave) {
+    sea h = map_hash(clave)
+    sea mascara = __cargar64(m + 8) - 1
+    sea ranuras = __cargar64(m + 16)
+    sea claves = __cargar64(m + 24)
+    sea hashes = __cargar64(m + 40)
+    sea i = __y_bits(h, mascara)
+    mientras (verdadero) {
+        sea r = __cargar64(ranuras + i * 8)
+        si (r == 0) { retornar 0 - 1 }
+        sea e = r - 1
+        si (vec_obtener(hashes, e) == h) {
+            sea k = vec_obtener(claves, e)
+            si (k != 0) {
+                si (str_igual(k, clave)) { retornar e }
+            }
+        }
+        i = __y_bits(i + 1, mascara)
+    }
+    retornar 0 - 1
+}
+
+funcion map_tiene(m, clave) { retornar map_buscar(m, clave) >= 0 }
+
+funcion map_obtener_o(m, clave, por_defecto) {
+    sea e = map_buscar(m, clave)
+    si (e < 0) { retornar por_defecto }
+    retornar vec_obtener(__cargar64(m + 32), e)
+}
+
+funcion map_obtener(m, clave) {
+    sea e = map_buscar(m, clave)
+    si (e < 0) { rt_panico(str_concatenar("clave inexistente: ", clave)) }
+    retornar vec_obtener(__cargar64(m + 32), e)
+}
+
+funcion map_insertar_ranura(ranuras, mascara, h, entrada) {
+    sea i = __y_bits(h, mascara)
+    mientras (__cargar64(ranuras + i * 8) != 0) { i = __y_bits(i + 1, mascara) }
+    __guardar64(ranuras + i * 8, entrada + 1)
+    retornar 0
+}
+
+// Duplica la tabla y compacta las entradas borradas.
+funcion map_crecer(m) {
+    sea claves = __cargar64(m + 24)
+    sea valores = __cargar64(m + 32)
+    sea hashes = __cargar64(m + 40)
+    sea capacidad = __cargar64(m + 8) * 2
+    sea ranuras = map_ranuras_nuevas(capacidad)
+    sea nuevas_claves = vec_nuevo()
+    sea nuevos_valores = vec_nuevo()
+    sea nuevos_hashes = vec_nuevo()
+    sea i = 0
+    mientras (i < vec_largo(claves)) {
+        sea k = vec_obtener(claves, i)
+        si (k != 0) {
+            sea h = vec_obtener(hashes, i)
+            map_insertar_ranura(ranuras, capacidad - 1, h, vec_largo(nuevas_claves))
+            vec_agregar(nuevas_claves, k)
+            vec_agregar(nuevos_valores, vec_obtener(valores, i))
+            vec_agregar(nuevos_hashes, h)
+        }
+        i = i + 1
+    }
+    mem_liberar(__cargar64(m + 16))
+    vec_liberar(claves)
+    vec_liberar(valores)
+    vec_liberar(hashes)
+    __guardar64(m + 8, capacidad)
+    __guardar64(m + 16, ranuras)
+    __guardar64(m + 24, nuevas_claves)
+    __guardar64(m + 32, nuevos_valores)
+    __guardar64(m + 40, nuevos_hashes)
+    retornar 0
+}
+
+funcion map_fijar(m, clave, valor) {
+    sea e = map_buscar(m, clave)
+    si (e >= 0) {
+        vec_fijar(__cargar64(m + 32), e, valor)
+        retornar 0
+    }
+    // Las entradas (con lápidas) no superan 2/3 de las ranuras.
+    si ((vec_largo(__cargar64(m + 24)) + 1) * 3 > __cargar64(m + 8) * 2) { map_crecer(m) }
+    sea h = map_hash(clave)
+    sea claves = __cargar64(m + 24)
+    map_insertar_ranura(__cargar64(m + 16), __cargar64(m + 8) - 1, h, vec_largo(claves))
+    vec_agregar(claves, clave)
+    vec_agregar(__cargar64(m + 32), valor)
+    vec_agregar(__cargar64(m + 40), h)
+    __guardar64(m, __cargar64(m) + 1)
+    retornar 0
+}
+
+funcion map_quitar(m, clave) {
+    sea e = map_buscar(m, clave)
+    si (e < 0) { retornar 0 }
+    vec_fijar(__cargar64(m + 24), e, 0)
+    vec_fijar(__cargar64(m + 32), e, 0)
+    __guardar64(m, __cargar64(m) - 1)
+    retornar 1
+}
+
+// Claves vivas en orden de inserción (lista nueva de textos).
+funcion map_claves(m) {
+    sea claves = __cargar64(m + 24)
+    sea r = vec_nuevo()
+    sea i = 0
+    mientras (i < vec_largo(claves)) {
+        sea k = vec_obtener(claves, i)
+        si (k != 0) { vec_agregar(r, k) }
+        i = i + 1
+    }
+    retornar r
+}
+
+// Acceso por posición de entrada (incluye lápidas con clave 0).
+funcion map_entradas(m) { retornar vec_largo(__cargar64(m + 24)) }
+funcion map_clave_en(m, i) { retornar vec_obtener(__cargar64(m + 24), i) }
+funcion map_valor_en(m, i) { retornar vec_obtener(__cargar64(m + 32), i) }
