@@ -323,7 +323,7 @@ RUNTIME_LENGUAJE := $(RUNTIME_NATIVO) runtime/map.cfv --puente runtime/dyn.cfv r
 PRUEBAS_LENGUAJE_NATIVAS := $(basename $(notdir $(wildcard tests/cfv/*.cfv)))
 FUENTES_COMPILADOR := $(RUNTIME_NATIVO) bootstrap/nativo/lexer.cfv bootstrap/nativo/cforge_self.cfv
 FUENTES_CFORGE := $(FUENTES_COMPILADOR) bootstrap/nativo/embebido.cfv bootstrap/nativo/cforge_cli.cfv
-EMBEBIDO_ARGS := --nativo $(RUNTIME_NATIVO) runtime/map.cfv --puente runtime/dyn.cfv runtime/biblioteca.cfv --lenguaje runtime/lenguaje.cfv
+EMBEBIDO_ARGS := --nativo $(RUNTIME_NATIVO) runtime/map.cfv --puente runtime/dyn.cfv runtime/biblioteca.cfv --lenguaje runtime/lenguaje.cfv --opcional runtime/sdl.cfv
 SEMILLA := bootstrap/semilla/cforge-linux-x64
 
 ## Construye ./cforge-nativo desde C++ (Stage 0) y verifica Stage 2 = Stage 3.
@@ -394,7 +394,7 @@ autoalojado-check: cforge-nativo
 	diff -u tests/nativo/fixtures/reporte.esperado "$$dir/reporte"; \
 	env -i $$C -o "$$dir/mapa" $(RUNTIME_NATIVO) runtime/map.cfv tests/nativo/07_mapa.cfv >/dev/null; \
 	"$$dir/mapa" | diff -u tests/nativo/07_mapa.salida -; \
-	for prueba in 06_colecciones 08_clases 09_cierres_errores 10_biblioteca 11_extern; do \
+	for prueba in 06_colecciones 08_clases 09_cierres_errores 10_biblioteca 11_extern 12_hilos; do \
 		env -i CFORGE_STDLIB=stdlib $$C tests/nativo/$$prueba.cfv | diff -u tests/nativo/$$prueba.salida -; \
 	done; \
 	for prueba in $(PRUEBAS_LENGUAJE_NATIVAS); do \
@@ -406,7 +406,8 @@ autoalojado-check: cforge-nativo
 	env -i CFORGE_STDLIB=stdlib $$C build tests/cfv/01_nucleo.cfv -o "$$dir/nucleo" >/dev/null; "$$dir/nucleo" | grep -q '^\[OK\]'; \
 	env -i $$C check tests/cfv/08_clases.cfv >/dev/null; \
 	env -i $$C --version | grep -q "$(VERSION)"; \
-	echo "  ✓ Suite del lenguaje con cforge nativo: $(words $(PRUEBAS_LENGUAJE_NATIVAS)) pruebas, ejemplos del sitio y CLI (run, build, check)"
+	sh tests/nativo/ejemplos.sh $$C; \
+	echo "  ✓ Suite del lenguaje con cforge nativo: $(words $(PRUEBAS_LENGUAJE_NATIVAS)) pruebas, ejemplos del sitio, ejemplos/ y CLI (run, build, check)"
 
 ## Verificar los backends Core B6.8 sin toolchain durante la emisión.
 backend-core-check: backend-core-bundle

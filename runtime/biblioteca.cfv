@@ -1033,6 +1033,104 @@ funcion dyn_texto_desde_c(p) {
     retornar dyn_texto(str_desde_c(p))
 }
 
+// ── Carga diferida de bibliotecas compartidas (dlopen / dlsym) ───────────
+
+// Nombres de archivo en un directorio (getdents64), o 0 si no existe.
+funcion sys_listar(ruta) {
+    sea fd = sys_abrir(str_c(ruta), 65536, 0)                  // O_DIRECTORY
+    si (fd < 0) { retornar 0 }
+    sea r = vec_nuevo()
+    sea buf = mem_reservar(8192)
+    sea seguir = 1
+    mientras (seguir) {
+        sea n = __syscall(217, fd, buf, 8192)
+        si (n <= 0) {
+            seguir = 0
+        } sino {
+            sea p = 0
+            mientras (p < n) {
+                sea largo = __cargar8(buf + p + 16) + __cargar8(buf + p + 17) * 256
+                vec_agregar(r, str_desde_c(buf + p + 19))
+                p = p + largo
+            }
+        }
+    }
+    mem_liberar(buf)
+    sys_cerrar(fd)
+    retornar r
+}
+
+// "sqlite3" → libsqlite3.so.0, "SDL2" → libSDL2-2.0.so.0: busca en los
+// directorios del sistema un archivo lib<nombre>.so* o lib<nombre>-*.so*.
+funcion buscar_biblioteca(base) {
+    sea dirs = vec_nuevo()
+    vec_agregar(dirs, "/lib/x86_64-linux-gnu")
+    vec_agregar(dirs, "/usr/lib/x86_64-linux-gnu")
+    vec_agregar(dirs, "/usr/local/lib")
+    vec_agregar(dirs, "/usr/lib64")
+    vec_agregar(dirs, "/lib64")
+    vec_agregar(dirs, "/usr/lib")
+    sea con_so = str_concatenar(base, ".so")
+    sea con_guion = str_concatenar(base, "-")
+    sea i = 0
+    mientras (i < vec_largo(dirs)) {
+        sea nombres = sys_listar(vec_obtener(dirs, i))
+        si (nombres != 0) {
+            sea j = 0
+            mientras (j < vec_largo(nombres)) {
+                sea n = vec_obtener(nombres, j)
+                si ((dyn_empieza(n, con_so) o dyn_empieza(n, con_guion)) y str_buscar(n, ".so", 0) >= 0) {
+                    retornar str_concatenar(str_concatenar(vec_obtener(dirs, i), "/"), n)
+                }
+                j = j + 1
+            }
+        }
+        i = i + 1
+    }
+    retornar 0
+}
+
+funcion dyn_empieza(s, prefijo) {
+    si (str_largo(s) < str_largo(prefijo)) { retornar 0 }
+    retornar str_igual(str_rebanar(s, 0, str_largo(prefijo)), prefijo)
+}
+
+funcion dyn_abrir_biblioteca(nombre) {
+    sea dlopen = __simbolo_dinamico(0)
+    si (dlopen == 0) { retornar 0 }
+    sea cache = mem_global(31)
+    si (cache == 0) {
+        cache = map_nuevo()
+        mem_fijar_global(31, cache)
+    }
+    sea h = map_obtener_o(cache, nombre, 0)
+    si (h != 0) { retornar h }
+    h = __ccall(dlopen, str_c(nombre), 258)                    // RTLD_NOW | RTLD_GLOBAL
+    si (h == 0 y str_buscar(nombre, "/", 0) < 0) {
+        sea base = nombre
+        si (str_buscar(nombre, ".so", 0) >= 0) { base = str_rebanar(nombre, 0, str_buscar(nombre, ".so", 0)) }
+        sea encontrada = buscar_biblioteca(base)
+        si (encontrada != 0) { h = __ccall(dlopen, str_c(encontrada), 258) }
+    }
+    si (h != 0) { map_fijar(cache, nombre, h) }
+    retornar h
+}
+
+// Dirección de simbolo en biblioteca; error capturable si no existe.
+funcion dyn_extern_resolver(simbolo, biblioteca) {
+    sea h = dyn_abrir_biblioteca(biblioteca)
+    si (h == 0) {
+        sea m = str_concatenar("extern: no se pudo cargar la biblioteca ", biblioteca)
+        str_agregar(m, " (para '")
+        str_agregar(m, simbolo)
+        str_agregar(m, "')")
+        dyn_error(m)
+    }
+    sea p = __ccall(__simbolo_dinamico(1), h, str_c(simbolo))
+    si (p == 0) { dyn_simbolo_faltante(simbolo, biblioteca) }
+    retornar p
+}
+
 funcion dyn_simbolo_faltante(simbolo, biblioteca) {
     sea m = str_concatenar("extern: no se encontró el símbolo '", simbolo)
     str_agregar(m, "' en ")
@@ -1085,3 +1183,488 @@ funcion salir(codigo) {
 
 funcion numero_a_texto(v) { retornar a_texto(v) }
 funcion subcadena(t, inicio, fin) { retornar subtexto(t, inicio, fin) }
+
+// ── Texto (más) ───────────────────────────────────────────────────────────
+
+funcion texto_empieza_con(t, prefijo) { retornar dyn_bool(dyn_empieza(dyn_texto_de(t, "texto_empieza_con"), dyn_texto_de(prefijo, "texto_empieza_con"))) }
+
+funcion texto_termina_con(t, sufijo) {
+    sea s = dyn_texto_de(t, "texto_termina_con")
+    sea f = dyn_texto_de(sufijo, "texto_termina_con")
+    si (str_largo(f) > str_largo(s)) { retornar 2 }
+    retornar dyn_bool(str_igual(str_rebanar(s, str_largo(s) - str_largo(f), str_largo(s)), f))
+}
+
+funcion texto_indice(t, buscado) {
+    retornar dyn_entero(str_buscar(dyn_texto_de(t, "texto_indice"), dyn_texto_de(buscado, "texto_indice"), 0))
+}
+
+funcion texto_invertir(t) {
+    sea s = dyn_texto_de(t, "texto_invertir")
+    sea r = str_nuevo(str_largo(s))
+    sea i = str_largo(s) - 1
+    mientras (i >= 0) {
+        str_agregar_byte(r, str_byte(s, i))
+        i = i - 1
+    }
+    retornar dyn_texto(r)
+}
+
+funcion texto_repetir(t, veces) {
+    sea s = dyn_a_str(t)
+    sea r = str_nuevo(16)
+    sea i = 0
+    mientras (i < dyn_valor_entero(veces)) {
+        str_agregar(r, s)
+        i = i + 1
+    }
+    retornar dyn_texto(r)
+}
+
+funcion texto_a_numero(t) { retornar a_numero(t) }
+
+// ── Tiempo ────────────────────────────────────────────────────────────────
+
+funcion tiempo_ms() { retornar dyn_entero(sys_reloj_ns() / 1000000) }
+
+funcion hilo_dormir(ms) {
+    sea n = dyn_valor_entero(ms)
+    sea ts = mem_reservar(16)
+    __guardar64(ts, n / 1000)
+    __guardar64(ts + 8, (n % 1000) * 1000000)
+    __syscall(35, ts, 0)                                       // nanosleep
+    mem_liberar(ts)
+    retornar 0
+}
+
+funcion dormir(ms) { retornar hilo_dormir(ms) }
+
+// ── Hilos, canales y mutex (clone + futex) ────────────────────────────────
+
+funcion futex_esperar(direccion, valor, ms) { retornar futex_esperar_op(direccion, valor, ms, 128) }
+
+// op 128: FUTEX_WAIT_PRIVATE · op 0: FUTEX_WAIT (el kernel despierta el tid
+// de CLONE_CHILD_CLEARTID con un FUTEX_WAKE compartido).
+funcion futex_esperar_op(direccion, valor, ms, op) {
+    si (ms < 0) {
+        __syscall(202, direccion, op, __y_bits(valor, 4294967295), 0)
+        retornar 0
+    }
+    sea ts = mem_reservar(16)
+    __guardar64(ts, ms / 1000)
+    __guardar64(ts + 8, (ms % 1000) * 1000000)
+    __syscall(202, direccion, op, __y_bits(valor, 4294967295), ts)
+    mem_liberar(ts)
+    retornar 0
+}
+
+funcion futex_despertar(direccion) {
+    __syscall(202, direccion, 129, 2147483647)                 // FUTEX_WAKE_PRIVATE
+    retornar 0
+}
+
+funcion cerrojo_tomar(direccion) {
+    mientras (__intercambiar(direccion, 1) != 0) { futex_esperar(direccion, 1, 0 - 1) }
+    retornar 0
+}
+
+funcion cerrojo_soltar(direccion) {
+    __guardar64(direccion, 0)
+    futex_despertar(direccion)
+    retornar 0
+}
+
+// Hilo nuevo con pila propia de 8 MiB alineada; su registro (en la base de
+// la pila): [hilo vivo][manejadores de intentar][tid].
+// La función de entrada es tarea_ejecutar(t) (runtime/lenguaje.cfv).
+funcion dyn_hilo_lanzar(t) {
+    sea tam = 8388608
+    sea zona = sys_mapear(tam * 2)
+    si (zona < 0) { dyn_error("no se pudo reservar la pila del hilo") }
+    sea base = __y_bits(zona + tam - 1, 0 - tam)
+    __guardar64(base, 1)
+    __guardar64(base + 8, 0)
+    __guardar64(base + 16, 1)
+    sea tid = __hilo(base + tam, __dir("dyn_hilo_inicio"), t, base + 16)
+    si (tid < 0) { dyn_error("no se pudo crear el hilo") }
+    retornar dyn_entero(base)
+}
+
+funcion dyn_hilo_inicio(t) {
+    tarea_ejecutar(t)
+    retornar 0
+}
+
+// Espera a que el hilo termine (CLONE_CHILD_CLEARTID pone el tid en 0).
+// Devuelve verdadero si terminó, falso si venció el plazo (ms, o nulo).
+funcion dyn_hilo_esperar(base_v, limite) {
+    sea base = dyn_valor_entero(base_v)
+    sea ms = 0 - 1
+    si (__y_bits(limite, 1) == 1) { ms = dyn_valor_entero(limite) }
+    sea inicio = sys_reloj_ns() / 1000000
+    mientras (__y_bits(__cargar64(base + 16), 4294967295) != 0) {
+        si (ms >= 0) {
+            sea resta = ms - (sys_reloj_ns() / 1000000 - inicio)
+            si (resta <= 0) { retornar 2 }
+            futex_esperar_op(base + 16, __cargar64(base + 16), resta, 0)
+        } sino {
+            futex_esperar_op(base + 16, __cargar64(base + 16), 0 - 1, 0)
+        }
+    }
+    retornar 4
+}
+
+// Canal: [cerrojo][secuencia][cola][inicio][capacidad][cerrado]
+funcion canal_nuevo(capacidad) {
+    sea r = mem_reservar(48)
+    __guardar64(r, 0)
+    __guardar64(r + 8, 0)
+    __guardar64(r + 16, vec_nuevo())
+    __guardar64(r + 24, 0)
+    sea cap = 0
+    si (__y_bits(capacidad, 1) == 1) { cap = dyn_valor_entero(capacidad) }
+    __guardar64(r + 32, cap)
+    __guardar64(r + 40, 0)
+    retornar dyn_caja(9, r)
+}
+
+funcion canal_de(v) {
+    si (dyn_tipo(v) != 9) { dyn_error_tipo("se esperaba un canal", v) }
+    retornar dyn_dato(v)
+}
+
+funcion canal_tam_crudo(r) { retornar vec_largo(__cargar64(r + 16)) - __cargar64(r + 24) }
+
+funcion canal_avisar(r) {
+    __guardar64(r + 8, __cargar64(r + 8) + 1)
+    cerrojo_soltar(r)
+    futex_despertar(r + 8)
+    retornar 0
+}
+
+funcion canal_enviar(canal, v) {
+    sea r = canal_de(canal)
+    mientras (verdadero) {
+        cerrojo_tomar(r)
+        si (__cargar64(r + 40)) {
+            cerrojo_soltar(r)
+            dyn_error("canal_enviar: el canal está cerrado")
+        }
+        si (__cargar64(r + 32) == 0 o canal_tam_crudo(r) < __cargar64(r + 32)) {
+            vec_agregar(__cargar64(r + 16), v)
+            canal_avisar(r)
+            retornar 0
+        }
+        sea secuencia = __cargar64(r + 8)
+        cerrojo_soltar(r)
+        futex_esperar(r + 8, secuencia, 0 - 1)
+    }
+    retornar 0
+}
+
+// Bloquea hasta recibir un valor; nulo si el canal está cerrado y vacío.
+funcion canal_recibir(canal) {
+    sea r = canal_de(canal)
+    mientras (verdadero) {
+        cerrojo_tomar(r)
+        si (canal_tam_crudo(r) > 0) {
+            sea cola = __cargar64(r + 16)
+            sea inicio = __cargar64(r + 24)
+            sea v = vec_obtener(cola, inicio)
+            inicio = inicio + 1
+            si (inicio == vec_largo(cola)) {
+                __guardar64(cola, 0)
+                inicio = 0
+            }
+            __guardar64(r + 24, inicio)
+            canal_avisar(r)
+            retornar v
+        }
+        si (__cargar64(r + 40)) {
+            cerrojo_soltar(r)
+            retornar 0
+        }
+        sea secuencia = __cargar64(r + 8)
+        cerrojo_soltar(r)
+        futex_esperar(r + 8, secuencia, 0 - 1)
+    }
+    retornar 0
+}
+
+funcion canal_tam(canal) {
+    sea r = canal_de(canal)
+    cerrojo_tomar(r)
+    sea n = canal_tam_crudo(r)
+    cerrojo_soltar(r)
+    retornar dyn_entero(n)
+}
+
+funcion canal_cerrar(canal) {
+    sea r = canal_de(canal)
+    cerrojo_tomar(r)
+    __guardar64(r + 40, 1)
+    canal_avisar(r)
+    retornar 0
+}
+
+// Mutex: [estado] con futex.
+funcion mutex_crear() {
+    sea r = mem_reservar(8)
+    __guardar64(r, 0)
+    retornar dyn_caja(10, r)
+}
+
+funcion mutex_de(v) {
+    si (dyn_tipo(v) != 10) { dyn_error_tipo("se esperaba un mutex", v) }
+    retornar dyn_dato(v)
+}
+
+funcion mutex_bloquear(m) { cerrojo_tomar(mutex_de(m)) retornar 0 }
+funcion mutex_desbloquear(m) { cerrojo_soltar(mutex_de(m)) retornar 0 }
+funcion mutex_liberar(m) { retornar mutex_desbloquear(m) }
+
+// ── Servidor HTTP (socket, bind, listen, accept) ──────────────────────────
+// Servidores en la global 32: [descriptor del socket][cliente activo].
+
+funcion http_servidores() {
+    sea v = mem_global(32)
+    si (v == 0) {
+        v = vec_nuevo()
+        mem_fijar_global(32, v)
+    }
+    retornar v
+}
+
+funcion http_servidor(id) {
+    sea v = http_servidores()
+    sea i = dyn_valor_entero(id)
+    si (__y_bits(id, 1) != 1 o i < 0 o i >= vec_largo(v)) { dyn_error("servidor http: id inválido") }
+    retornar vec_obtener(v, i)
+}
+
+funcion servidor_http_escuchar(puerto) {
+    sea p = dyn_valor_entero(puerto)
+    si (p < 1 o p > 65535) { dyn_error("servidor_http_escuchar: puerto invalido") }
+    sea fd = __syscall(41, 2, 1, 0)                            // socket(AF_INET, SOCK_STREAM)
+    si (fd < 0) { dyn_error("servidor_http_escuchar: no se pudo crear socket") }
+    sea uno = mem_reservar(8)
+    __guardar64(uno, 1)
+    __syscall(54, fd, 1, 2, uno, 4)                            // SO_REUSEADDR
+    mem_liberar(uno)
+    sea dir = mem_reservar(16)
+    mem_llenar(dir, 0, 16)
+    __guardar8(dir, 2)                                         // AF_INET
+    __guardar8(dir + 2, __desplazar_der(p, 8))                 // puerto (big-endian)
+    __guardar8(dir + 3, __y_bits(p, 255))
+    si (__syscall(49, fd, dir, 16) != 0) {
+        mem_liberar(dir)
+        dyn_error(str_concatenar("servidor_http_escuchar: no se pudo enlazar al puerto ", str_desde_entero(p)))
+    }
+    mem_liberar(dir)
+    si (__syscall(50, fd, 64) != 0) { dyn_error("servidor_http_escuchar: no se pudo escuchar") }
+    sea r = mem_reservar(16)
+    __guardar64(r, fd)
+    __guardar64(r + 8, 0 - 1)
+    sea v = http_servidores()
+    vec_agregar(v, r)
+    retornar dyn_entero(vec_largo(v) - 1)
+}
+
+funcion http_linea_hasta(s, desde, aguja) {
+    sea p = str_buscar(s, aguja, desde)
+    si (p < 0) { retornar str_largo(s) }
+    retornar p
+}
+
+funcion http_minusculas(s) {
+    sea r = str_nuevo(str_largo(s))
+    sea i = 0
+    mientras (i < str_largo(s)) {
+        sea b = str_byte(s, i)
+        si (b >= 65 y b <= 90) { b = b + 32 }
+        str_agregar_byte(r, b)
+        i = i + 1
+    }
+    retornar r
+}
+
+// Espera una petición y la devuelve como mapa: metodo, ruta, query,
+// cuerpo, cabeceras (en minúsculas), ip y _srv_id.
+funcion servidor_http_solicitud(id) {
+    sea srv = http_servidor(id)
+    si (__cargar64(srv + 8) >= 0) {
+        sys_cerrar(__cargar64(srv + 8))
+        __guardar64(srv + 8, 0 - 1)
+    }
+    sea dir = mem_reservar(16)
+    sea largo_dir = mem_reservar(8)
+    __guardar64(largo_dir, 16)
+    sea cliente = __syscall(43, __cargar64(srv), dir, largo_dir)   // accept
+    si (cliente < 0) { dyn_error("servidor_http_solicitud: accept fallo") }
+    __guardar64(srv + 8, cliente)
+    sea ip = str_nuevo(16)
+    sea k = 0
+    mientras (k < 4) {
+        si (k > 0) { str_agregar_byte(ip, 46) }
+        str_agregar(ip, str_desde_entero(__cargar8(dir + 4 + k)))
+        k = k + 1
+    }
+    mem_liberar(dir)
+    mem_liberar(largo_dir)
+    // Leer cabeceras y luego el cuerpo según Content-Length.
+    sea crudo = str_nuevo(4096)
+    sea buf = mem_reservar(4096)
+    sea fin_cabeceras = 0 - 1
+    sea esperado = 0 - 1
+    sea seguir = 1
+    mientras (seguir) {
+        sea n = sys_leer(cliente, buf, 4096)
+        si (n <= 0) {
+            seguir = 0
+        } sino {
+            sea i = 0
+            mientras (i < n) {
+                str_agregar_byte(crudo, __cargar8(buf + i))
+                i = i + 1
+            }
+            si (fin_cabeceras < 0) {
+                fin_cabeceras = str_buscar(crudo, "\r\n\r\n", 0)
+                si (fin_cabeceras >= 0) {
+                    esperado = 0
+                    sea cabeceras = http_minusculas(str_rebanar(crudo, 0, fin_cabeceras))
+                    sea p = str_buscar(cabeceras, "content-length:", 0)
+                    si (p >= 0) {
+                        p = p + 15
+                        mientras (str_byte(cabeceras, p) == 32) { p = p + 1 }
+                        mientras (p < str_largo(cabeceras) y str_byte(cabeceras, p) >= 48 y str_byte(cabeceras, p) <= 57) {
+                            esperado = esperado * 10 + str_byte(cabeceras, p) - 48
+                            p = p + 1
+                        }
+                    }
+                }
+            }
+            si (fin_cabeceras >= 0 y str_largo(crudo) - fin_cabeceras - 4 >= esperado) { seguir = 0 }
+        }
+    }
+    mem_liberar(buf)
+    si (fin_cabeceras < 0) { fin_cabeceras = str_largo(crudo) }
+    // Línea de petición: MÉTODO RUTA PROTOCOLO
+    sea fin_linea = http_linea_hasta(crudo, 0, "\r\n")
+    sea linea = str_rebanar(crudo, 0, fin_linea)
+    sea e1 = str_buscar(linea, " ", 0)
+    sea metodo = "GET"
+    sea ruta = "/"
+    si (e1 > 0) {
+        metodo = str_rebanar(linea, 0, e1)
+        sea e2 = str_buscar(linea, " ", e1 + 1)
+        si (e2 < 0) { e2 = str_largo(linea) }
+        ruta = str_rebanar(linea, e1 + 1, e2)
+    }
+    sea consulta = ""
+    sea q = str_buscar(ruta, "?", 0)
+    si (q >= 0) {
+        consulta = str_rebanar(ruta, q + 1, str_largo(ruta))
+        ruta = str_rebanar(ruta, 0, q)
+    }
+    sea cabeceras = map_nuevo()
+    sea pos = fin_linea + 2
+    mientras (pos < fin_cabeceras) {
+        sea nl = http_linea_hasta(crudo, pos, "\r\n")
+        si (nl > fin_cabeceras) { nl = fin_cabeceras }
+        sea l = str_rebanar(crudo, pos, nl)
+        sea dos_puntos = str_buscar(l, ":", 0)
+        si (dos_puntos > 0) {
+            sea valor_inicio = dos_puntos + 1
+            mientras (valor_inicio < str_largo(l) y (str_byte(l, valor_inicio) == 32 o str_byte(l, valor_inicio) == 9)) { valor_inicio = valor_inicio + 1 }
+            map_fijar(cabeceras, http_minusculas(str_rebanar(l, 0, dos_puntos)), dyn_texto(str_rebanar(l, valor_inicio, str_largo(l))))
+        }
+        pos = nl + 2
+    }
+    sea cuerpo = ""
+    si (fin_cabeceras + 4 <= str_largo(crudo)) { cuerpo = str_rebanar(crudo, fin_cabeceras + 4, str_largo(crudo)) }
+    sea r = map_nuevo()
+    map_fijar(r, "metodo", dyn_texto(metodo))
+    map_fijar(r, "ruta", dyn_texto(ruta))
+    map_fijar(r, "query", dyn_texto(consulta))
+    map_fijar(r, "cuerpo", dyn_texto(cuerpo))
+    map_fijar(r, "cabeceras", dyn_caja(3, cabeceras))
+    map_fijar(r, "ip", dyn_texto(ip))
+    map_fijar(r, "_srv_id", id)
+    retornar dyn_caja(3, r)
+}
+
+funcion http_texto_estado(estado) {
+    si (estado == 201) { retornar "Created" }
+    si (estado == 204) { retornar "No Content" }
+    si (estado == 400) { retornar "Bad Request" }
+    si (estado == 401) { retornar "Unauthorized" }
+    si (estado == 403) { retornar "Forbidden" }
+    si (estado == 404) { retornar "Not Found" }
+    si (estado == 405) { retornar "Method Not Allowed" }
+    si (estado == 422) { retornar "Unprocessable Entity" }
+    si (estado == 500) { retornar "Internal Server Error" }
+    retornar "OK"
+}
+
+funcion servidor_http_responder(id, estado, cuerpo, tipo) {
+    sea srv = http_servidor(id)
+    sea cliente = __cargar64(srv + 8)
+    si (cliente < 0) { dyn_error("servidor_http_responder: sin cliente activo") }
+    sea e = dyn_valor_entero(estado)
+    sea c = dyn_a_str(cuerpo)
+    sea t = "text/plain; charset=utf-8"
+    si (dyn_tipo(tipo) == 1) { t = dyn_dato(tipo) }
+    sea r = str_nuevo(str_largo(c) + 256)
+    str_agregar(r, "HTTP/1.1 ")
+    str_agregar(r, str_desde_entero(e))
+    str_agregar_byte(r, 32)
+    str_agregar(r, http_texto_estado(e))
+    str_agregar(r, "\r\nContent-Type: ")
+    str_agregar(r, t)
+    str_agregar(r, "\r\nContent-Length: ")
+    str_agregar(r, str_desde_entero(str_largo(c)))
+    str_agregar(r, "\r\nConnection: close\r\nAccess-Control-Allow-Origin: *\r\n\r\n")
+    str_agregar(r, c)
+    sea enviado = 0
+    mientras (enviado < str_largo(r)) {
+        sea n = sys_escribir(cliente, str_datos(r) + enviado, str_largo(r) - enviado)
+        si (n <= 0) { enviado = str_largo(r) } sino { enviado = enviado + n }
+    }
+    sys_cerrar(cliente)
+    __guardar64(srv + 8, 0 - 1)
+    retornar 0
+}
+
+funcion servidor_http_cerrar(id) {
+    sea srv = http_servidor(id)
+    si (__cargar64(srv + 8) >= 0) { sys_cerrar(__cargar64(srv + 8)) }
+    sys_cerrar(__cargar64(srv))
+    retornar 0
+}
+
+// ── Memoria C para bibliotecas externas (estructuras, búferes) ────────────
+funcion c_reservar(bytes) {
+    sea n = dyn_valor_entero(bytes)
+    sea p = mem_reservar(n)
+    mem_llenar(p, 0, n)
+    retornar dyn_entero(p)
+}
+funcion c_liberar(p) { mem_liberar(dyn_valor_entero(p)) retornar 0 }
+funcion c_escribir32(p, desplazamiento, v) {
+    sea d = dyn_valor_entero(p) + dyn_valor_entero(desplazamiento)
+    sea x = dyn_entero_c(v)
+    __guardar8(d, __y_bits(x, 255))
+    __guardar8(d + 1, __y_bits(__desplazar_der(x, 8), 255))
+    __guardar8(d + 2, __y_bits(__desplazar_der(x, 16), 255))
+    __guardar8(d + 3, __y_bits(__desplazar_der(x, 24), 255))
+    retornar 0
+}
+funcion c_leer32(p, desplazamiento) {
+    sea d = dyn_valor_entero(p) + dyn_valor_entero(desplazamiento)
+    sea x = __cargar8(d) + __cargar8(d + 1) * 256 + __cargar8(d + 2) * 65536 + __cargar8(d + 3) * 16777216
+    si (x >= 2147483648) { x = x - 4294967296 }
+    retornar dyn_entero(x)
+}
+funcion c_leer8(p, desplazamiento) {
+    retornar dyn_entero(__cargar8(dyn_valor_entero(p) + dyn_valor_entero(desplazamiento)))
+}

@@ -13,6 +13,7 @@
 //                 3 mapa  (dato: map del runtime)
 //                 4 flotante (dato: bits IEEE-754)
 //                 7 función (dato: [código][aridad][n][celdas capturadas]*)
+//                 8 puntero (dato: [bloque (lista)][desplazamiento])
 //
 // Los números siguen la semántica del intérprete: un resultado con valor
 // entero se representa como entero; si no, como flotante.
@@ -49,8 +50,11 @@ funcion dyn_nombre_tipo(v) {
     si (t == 2) { retornar "lista" }
     si (t == 3) { retornar "mapa" }
     si (t == 5) { retornar "booleano" }
-    si (t == 7) { retornar "función" }
-    retornar "número"
+    si (t == 7) { retornar "funcion" }
+    si (t == 8) { retornar "puntero" }
+    si (t == 9) { retornar "canal" }
+    si (t == 10) { retornar "mutex" }
+    retornar "numero"
 }
 
 funcion dyn_error_tipo(operacion, v) {
@@ -70,13 +74,27 @@ funcion dyn_verdad(v) {
 // ── Errores: intentar / capturar / lanzar ────────────────────────────────
 // Global 21: pila de manejadores [rsp][rbp][dirección de captura].
 
+// Cada hilo tiene su pila de manejadores: el hilo principal usa la global
+// 21; un hilo creado por tarea() la guarda en su registro (base de su pila).
 funcion dyn_manejadores() {
-    sea h = mem_global(21)
+    sea registro = dyn_registro_hilo()
+    sea casilla = __globales() + 168
+    si (registro != 0) { casilla = registro + 8 }
+    sea h = __cargar64(casilla)
     si (h == 0) {
         h = vec_nuevo()
-        mem_fijar_global(21, h)
+        __guardar64(casilla, h)
     }
     retornar h
+}
+
+// Registro del hilo actual (base alineada de su pila de 8 MiB) o 0 si es el
+// hilo principal (su pila está bajo el rsp inicial guardado en la global 63).
+funcion dyn_registro_hilo() {
+    sea rsp = __pila()
+    sea inicial = __cargar64(__globales() + 504)
+    si (rsp <= inicial y inicial - rsp < 268435456) { retornar 0 }
+    retornar __y_bits(rsp, 0 - 8388608)
 }
 
 funcion dyn_intentar_entrar(pila, marco, destino) {
@@ -352,6 +370,9 @@ funcion dyn_agregar_valor(r, v, comillas) {
         retornar 0
     }
     si (t == 7) { str_agregar(r, "<funcion>") retornar 0 }
+    si (t == 9) { str_agregar(r, "<canal>") retornar 0 }
+    si (t == 10) { str_agregar(r, "<mutex>") retornar 0 }
+    si (t == 8) { str_agregar(r, "<puntero>") retornar 0 }
     dyn_error("valor desconocido")
     retornar 0
 }
@@ -373,6 +394,7 @@ funcion dyn_texto_de(v, operacion) {
 
 funcion dyn_suma(a, b) {
     si (dyn_ambos_enteros(a, b)) { retornar a + b - 1 }
+    si (dyn_tipo(a) == 8 y __y_bits(b, 1) == 1) { retornar dyn_puntero(__cargar64(dyn_dato(a)), __cargar64(dyn_dato(a) + 8) + dyn_valor_entero(b)) }
     si (dyn_tipo(a) == 1 o dyn_tipo(b) == 1) {
         sea r = str_nuevo(16)
         dyn_agregar_valor(r, a, 0)
@@ -384,6 +406,7 @@ funcion dyn_suma(a, b) {
 
 funcion dyn_resta(a, b) {
     si (dyn_ambos_enteros(a, b)) { retornar a - b + 1 }
+    si (dyn_tipo(a) == 8 y __y_bits(b, 1) == 1) { retornar dyn_puntero(__cargar64(dyn_dato(a)), __cargar64(dyn_dato(a) + 8) - dyn_valor_entero(b)) }
     retornar dyn_desde_f64(__f64_resta(dyn_a_f64(a), dyn_a_f64(b)))
 }
 
@@ -510,6 +533,34 @@ funcion dyn_indice(c, k) {
     }
     dyn_error_tipo("no se puede indexar", c)
     retornar 0
+}
+
+// valor.campo: campo de un mapa/instancia; .longitud de listas y textos.
+funcion dyn_campo(c, k) {
+    sea t = dyn_tipo(c)
+    si (t == 3) { retornar dyn_indice(c, k) }
+    si ((t == 1 o t == 2) y (str_igual(dyn_dato(k), "longitud") o str_igual(dyn_dato(k), "largo") o str_igual(dyn_dato(k), "length"))) {
+        retornar longitud(c)
+    }
+    si (t == 0) { dyn_error(str_concatenar("acceso a campo de nulo: ", dyn_dato(k))) }
+    dyn_error_tipo(str_concatenar("no tiene el campo ", dyn_dato(k)), c)
+    retornar 0
+}
+
+// Resultado/Opción: ¿es un fallo? (raw 0/1) — {"ok": falso} o {"presente": falso}
+funcion dyn_es_fallo(v) {
+    si (dyn_tipo(v) != 3) { retornar 0 }
+    sea m = dyn_dato(v)
+    si (map_obtener_o(m, "ok", 0) == 2) { retornar 1 }
+    si (map_obtener_o(m, "presente", 0) == 2) { retornar 1 }
+    retornar 0
+}
+
+funcion dyn_desenvolver(v) {
+    si (dyn_tipo(v) != 3) { retornar v }
+    sea m = dyn_dato(v)
+    si (map_tiene(m, "valor") y (map_tiene(m, "ok") o map_tiene(m, "presente"))) { retornar map_obtener(m, "valor") }
+    retornar v
 }
 
 funcion dyn_fijar_indice(c, k, v) {
@@ -703,3 +754,53 @@ funcion dyn_cambiar_letras(v, desde, hasta, operacion) {
 
 funcion texto_mayusculas(v) { retornar dyn_cambiar_letras(v, 97, 122, "texto_mayusculas") }
 funcion texto_minusculas(v) { retornar dyn_cambiar_letras(v, 65, 90, "texto_minusculas") }
+
+// ── Punteros de bloques inseguro (con límites verificados) ───────────────
+
+funcion dyn_puntero(bloque, desplazamiento) {
+    sea r = mem_reservar(16)
+    __guardar64(r, bloque)
+    __guardar64(r + 8, desplazamiento)
+    retornar dyn_caja(8, r)
+}
+
+// @x: puntero al inicio de un bloque (lista) o el mismo puntero.
+funcion dyn_direccion(v) {
+    si (dyn_tipo(v) == 8) { retornar v }
+    si (dyn_tipo(v) != 2) { dyn_error_tipo("@ requiere un bloque de memoria", v) }
+    retornar dyn_puntero(v, 0)
+}
+
+funcion dyn_posicion_puntero(p) {
+    si (dyn_tipo(p) != 8) { dyn_error_tipo("* requiere un puntero", p) }
+    sea bloque = __cargar64(dyn_dato(p))
+    sea i = __cargar64(dyn_dato(p) + 8)
+    si (i < 0 o i >= vec_largo(dyn_dato(bloque))) { dyn_error("acceso inseguro fuera del bloque de memoria") }
+    retornar i
+}
+
+funcion dyn_leer_puntero(p) {
+    sea i = dyn_posicion_puntero(p)
+    retornar vec_obtener(dyn_dato(__cargar64(dyn_dato(p))), i)
+}
+
+funcion dyn_escribir_puntero(p, v) {
+    sea i = dyn_posicion_puntero(p)
+    vec_fijar(dyn_dato(__cargar64(dyn_dato(p))), i, v)
+    retornar 0
+}
+
+funcion memoria_asignar(n) {
+    sea r = vec_nuevo()
+    sea i = 0
+    mientras (i < dyn_valor_entero(n)) {
+        vec_agregar(r, 1)
+        i = i + 1
+    }
+    retornar dyn_caja(2, r)
+}
+
+funcion memoria_liberar(bloque) {
+    si (dyn_tipo(bloque) == 2) { __guardar64(dyn_dato(bloque), 0) }
+    retornar 0
+}
