@@ -1,4 +1,4 @@
-name: macOS nativo (Mach-O 100 % C-Forge)
+name: macOS nativo (Mach-O x86-64 y ARM64, 100 % C-Forge)
 
 on:
   push:
@@ -11,12 +11,22 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-      - name: cforge (Mach-O) y pruebas para macOS
+      - name: cforge (Mach-O x86-64) y pruebas para macOS Intel
         run: make macos-cruzado
+      - name: cforge (Mach-O ARM64 firmado) y pruebas para Apple Silicon
+        run: make macos-arm64-cruzado
+      - name: Linux ARM64 con qemu (mismo backend AArch64)
+        run: |
+          sudo apt-get install -y -q qemu-user >/dev/null
+          make linux-arm64-check
       - uses: actions/upload-artifact@v4
         with:
           name: dist-macos
           path: dist-macos/
+      - uses: actions/upload-artifact@v4
+        with:
+          name: dist-macos-arm64
+          path: dist-macos-arm64/
 
   macos:
     name: macOS ${{ matrix.nombre }} (Stage 2 = Stage 3)
@@ -58,7 +68,7 @@ jobs:
         run: |
           set -e
           ./dist-macos/cforge --version
-          F="runtime/sys_macos.cfv runtime/mem.cfv runtime/str.cfv runtime/vec.cfv runtime/io.cfv runtime/f64.cfv bootstrap/nativo/lexer.cfv bootstrap/nativo/cforge_self.cfv bootstrap/nativo/embebido.cfv bootstrap/nativo/cforge_cli.cfv"
+          F="runtime/sys_macos.cfv runtime/mem.cfv runtime/str.cfv runtime/vec.cfv runtime/io.cfv runtime/f64.cfv bootstrap/nativo/lexer.cfv bootstrap/nativo/cforge_self.cfv bootstrap/nativo/gen.cfv bootstrap/nativo/gen_x64.cfv bootstrap/nativo/gen_a64.cfv bootstrap/nativo/embebido.cfv bootstrap/nativo/cforge_cli.cfv"
           ./dist-macos/cforge -o stage2 --target macos $F
           ./stage2 -o stage3 --target macos $F
           cmp stage2 stage3
@@ -100,3 +110,80 @@ jobs:
           brew install sdl2 >/dev/null 2>&1 || true
           export PATH="$(brew --prefix coreutils)/libexec/gnubin:$PATH"
           sh tests/nativo/ejemplos.sh dist-macos/cforge
+
+  arm64:
+    name: macOS ARM64 nativo en Apple Silicon (Stage 2 = Stage 3)
+    needs: cruzado
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/download-artifact@v4
+        with:
+          name: dist-macos-arm64
+          path: dist-macos-arm64/
+      - name: Preparar
+        run: |
+          chmod +x dist-macos-arm64/cforge dist-macos-arm64/pruebas/*
+          uname -a
+          file dist-macos-arm64/cforge
+          codesign -dv dist-macos-arm64/cforge 2>&1 | head -5 || true
+          brew install coreutils sdl2 >/dev/null 2>&1 || true
+
+      - name: Pruebas del dialecto nativo
+        run: |
+          fallas=0
+          for prueba in 01_memoria 02_textos 03_listas; do
+            ./dist-macos-arm64/pruebas/$prueba > salida.txt; codigo=$?
+            if diff -u tests/nativo/$prueba.salida salida.txt; then echo "✓ $prueba"; else echo "✗ $prueba (código $codigo)"; fallas=1; fi
+          done
+          ./dist-macos-arm64/pruebas/04_prueba_de_fuego tests/nativo/fixtures/entrada.cfv reporte.txt; echo "código $?"
+          if diff -u tests/nativo/fixtures/reporte.esperado reporte.txt; then echo "✓ prueba de fuego"; else fallas=1; fi
+          exit $fallas
+
+      - name: cforge se compila a sí mismo en Apple Silicon (Stage 2 = Stage 3)
+        run: |
+          set -e
+          ./dist-macos-arm64/cforge --version
+          F="runtime/sys_macos.cfv runtime/mem.cfv runtime/str.cfv runtime/vec.cfv runtime/io.cfv runtime/f64.cfv bootstrap/nativo/lexer.cfv bootstrap/nativo/cforge_self.cfv bootstrap/nativo/gen.cfv bootstrap/nativo/gen_x64.cfv bootstrap/nativo/gen_a64.cfv bootstrap/nativo/embebido.cfv bootstrap/nativo/cforge_cli.cfv"
+          ./dist-macos-arm64/cforge -o stage2 $F
+          ./stage2 -o stage3 $F
+          cmp stage2 stage3
+          cmp stage2 dist-macos-arm64/cforge
+          ./dist-macos-arm64/cforge -o x64 --target macos $F
+          shasum -a 256 stage2 stage3 dist-macos-arm64/cforge x64
+          codesign -v stage2 && echo "✓ firma ad-hoc válida (codesign -v)"
+          echo "✓ Apple Silicon: Stage 2 = Stage 3 = compilación cruzada desde Linux"
+
+      - name: Suite del lenguaje
+        run: |
+          export CFORGE_STDLIB="$PWD/stdlib"
+          ok=0; total=0
+          for t in tests/cfv/*.cfv; do
+            total=$((total + 1))
+            if ./dist-macos-arm64/cforge "$t" 2>err.txt | grep -q '^\[OK\]'; then ok=$((ok + 1)); else echo "✗ $t: $(head -c 200 err.txt)"; fi
+          done
+          echo "tests/cfv en Apple Silicon: $ok/$total"
+          [ "$ok" = "$total" ]
+
+      - name: Hilos y CLI
+        run: |
+          export CFORGE_STDLIB="$PWD/stdlib"
+          ./dist-macos-arm64/cforge tests/nativo/12_hilos.cfv > hilos.txt
+          diff -u tests/nativo/12_hilos.salida hilos.txt && echo "✓ hilos (pthread)"
+          ./dist-macos-arm64/cforge build tests/cfv/01_nucleo.cfv -o nucleo && ./nucleo | grep -q '^\[OK\]' && echo "✓ cforge build"
+
+      - name: Ejemplos del sitio
+        run: |
+          export CFORGE_STDLIB="$PWD/stdlib"
+          ok=0; total=0
+          for e in site/ejemplos/*.cfv site/ejemplos/en/*.cfv; do
+            total=$((total + 1))
+            if ./dist-macos-arm64/cforge "$e" 2>/dev/null | diff -q "${e%.cfv}.salida" - >/dev/null; then ok=$((ok + 1)); else echo "✗ $e"; fi
+          done
+          echo "ejemplos del sitio en Apple Silicon: $ok/$total"
+          [ "$ok" = "$total" ]
+
+      - name: ejemplos/ (servidor HTTP, hilos, SDL2 de Homebrew)
+        run: |
+          export PATH="$(brew --prefix coreutils)/libexec/gnubin:$PATH"
+          sh tests/nativo/ejemplos.sh dist-macos-arm64/cforge

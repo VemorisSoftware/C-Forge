@@ -1,0 +1,132 @@
+// runtime/sys_linux_arm64.cfv — llamadas al sistema de Linux AArch64.
+// Mismas funciones que sys_linux.cfv con la tabla de syscalls genérica de
+// ARM64 (sin open/unlink/readlink: sus variantes *at con AT_FDCWD = -100).
+
+funcion sys_leer(fd, destino, cantidad) {
+    retornar __syscall(63, fd, destino, cantidad)
+}
+
+funcion sys_escribir(fd, origen, cantidad) {
+    retornar __syscall(64, fd, origen, cantidad)
+}
+
+// banderas: 0 = solo lectura; 577 = escritura | crear | truncar;
+// 65536 = O_DIRECTORY de x86-64 (16384 en ARM64)
+funcion sys_abrir(ruta_c, banderas, modo) {
+    si (banderas == 65536) { banderas = 16384 }
+    retornar __syscall(56, 0 - 100, ruta_c, banderas, modo)
+}
+
+funcion sys_cerrar(fd) {
+    retornar __syscall(57, fd)
+}
+
+// Memoria anónima de lectura y escritura (PROT_READ|PROT_WRITE = 3,
+// MAP_PRIVATE|MAP_ANONYMOUS = 34).
+funcion sys_mapear(tamano) {
+    retornar __syscall(222, 0, tamano, 3, 34, 0 - 1, 0)
+}
+
+funcion sys_desmapear(direccion, tamano) {
+    retornar __syscall(215, direccion, tamano)
+}
+
+// Termina el proceso completo (todos los hilos): exit_group.
+funcion sys_salir(codigo) {
+    retornar __syscall(94, codigo)
+}
+
+funcion sys_argc() {
+    retornar __argc()
+}
+
+funcion sys_argv(indice) {
+    retornar __argv(indice)
+}
+
+// Constantes del sistema para el resto del runtime.
+funcion sys_abrir_lectura() { retornar 0 }
+funcion sys_abrir_escritura() { retornar 577 }
+funcion sys_modo_archivo() { retornar 420 }
+
+// Cambia los permisos de un archivo (chmod); 493 = 0755.
+funcion sys_permisos(ruta_c, modo) {
+    retornar __syscall(53, 0 - 100, ruta_c, modo, 0)
+}
+
+// ── Procesos y rutas (para el CLI de cforge) ──────────────────────────────
+funcion sys_proceso_id() { retornar __syscall(172) }
+funcion sys_bifurcar() { retornar __syscall(220, 17, 0, 0, 0, 0) }   // clone(SIGCHLD)
+funcion sys_ejecutar(ruta_c, argv, envp) { retornar __syscall(221, ruta_c, argv, envp) }
+funcion sys_borrar(ruta_c) { retornar __syscall(35, 0 - 100, ruta_c, 0) }
+
+// Espera al proceso y devuelve su código de salida (128 + señal si murió).
+funcion sys_esperar(pid) {
+    sea estado = mem_reservar(8)
+    __guardar64(estado, 0)
+    __syscall(260, pid, estado, 0, 0)
+    sea s = __y_bits(__cargar64(estado), 65535)
+    mem_liberar(estado)
+    si (__y_bits(s, 127) == 0) { retornar __y_bits(__desplazar_der(s, 8), 255) }
+    retornar 128 + __y_bits(s, 127)
+}
+
+// Destino de un enlace simbólico (p. ej. /proc/self/exe), o 0.
+funcion sys_leer_enlace(ruta_c) {
+    sea buf = mem_reservar(4096)
+    sea n = __syscall(78, 0 - 100, ruta_c, buf, 4095)
+    si (n < 0) {
+        mem_liberar(buf)
+        retornar 0
+    }
+    __guardar8(buf + n, 0)
+    sea r = str_desde_c(buf)
+    mem_liberar(buf)
+    retornar r
+}
+
+// Entorno del proceso: envp[i] o 0 (envp sigue a argv en la pila inicial).
+funcion sys_entorno(i) { retornar __argv(sys_argc() + 1 + i) }
+
+funcion sys_ceder() { __syscall(124) retornar 0 }                // sched_yield
+funcion sys_es_windows() { retornar 0 }
+funcion sys_nombre_plataforma() { retornar "Linux ARM64" }
+funcion sys_ruta_ejecutable() { retornar sys_leer_enlace(str_c("/proc/self/exe")) }
+funcion sys_ruta_temporal() { retornar "/tmp/" }
+
+// Valor de una variable de entorno o 0.
+funcion sys_variable_entorno(nombre) {
+    sea prefijo = str_concatenar(nombre, "=")
+    sea i = 0
+    sea p = sys_entorno(0)
+    mientras (p != 0) {
+        sea e = str_desde_c(p)
+        si (str_largo(e) >= str_largo(prefijo)) {
+            si (str_igual(str_rebanar(e, 0, str_largo(prefijo)), prefijo)) { retornar str_rebanar(e, str_largo(prefijo), str_largo(e)) }
+        }
+        i = i + 1
+        p = sys_entorno(i)
+    }
+    retornar 0
+}
+
+// Ejecuta un programa con sus argumentos (lista de textos) y devuelve su
+// código de salida (fork + execve + wait4).
+funcion sys_ejecutar_programa(ruta, argumentos) {
+    sea n = vec_largo(argumentos)
+    sea argv = mem_reservar((n + 2) * 8)
+    __guardar64(argv, str_c(ruta))
+    sea i = 0
+    mientras (i < n) {
+        __guardar64(argv + 8 + i * 8, str_c(vec_obtener(argumentos, i)))
+        i = i + 1
+    }
+    __guardar64(argv + 8 + n * 8, 0)
+    sea envp = __cargar64(__globales() + 504) + 8 * (sys_argc() + 2)
+    sea pid = sys_bifurcar()
+    si (pid == 0) {
+        sys_ejecutar(str_c(ruta), argv, envp)
+        sys_salir(127)
+    }
+    retornar sys_esperar(pid)
+}

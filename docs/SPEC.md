@@ -582,6 +582,25 @@ Los programas sin `extern` siguen siendo estáticos y sin libc.
   byte por byte; 25/25 `tests/cfv`, 32/32 ejemplos del sitio y 22/22
   `ejemplos/` (servidor HTTP, hilos, SDL2 de Homebrew).
 
+### Capa intermedia y backend AArch64 ✅
+
+- El compilador no emite bytes de máquina: pide operaciones de una máquina de
+  pila (`bootstrap/nativo/gen.cfv`) que traduce cada backend:
+  `gen_x64.cfv` (x86-64) y `gen_a64.cfv` (AArch64). La refactorización no
+  cambió un solo byte de la salida x86-64 (228 binarios de referencia).
+- AArch64: la pila del lenguaje vive en `x28` con el mismo marco que x86-64
+  (`[x29 + 16]` = argumentos) y `sp` queda alineado a 16 para llamar a C;
+  saltos condicionales de largo alcance (condición inversa + `b`).
+- `--target macos-arm64`: Mach-O PIE en `0x100000000`, páginas de 16 KiB,
+  `rebase` de `dyld` para los punteros de datos y **firma ad-hoc**
+  `LC_CODE_SIGNATURE` (CodeDirectory 0x20400 con el SHA-256 de cada página,
+  calculado por un SHA-256 escrito en C-Forge). `codesign -v` la acepta.
+- `--target linux-arm64`: ELF AArch64 con `runtime/sys_linux_arm64*.cfv`
+  (sin `extern` por ahora); `make linux-arm64-check` lo valida con qemu.
+- CI en Apple Silicon real: **Stage 2 = Stage 3 = el Mach-O ARM64 compilado
+  de forma cruzada desde Linux y desde Windows**, byte por byte; 25/25
+  `tests/cfv`, 32/32 ejemplos del sitio y 22/22 `ejemplos/` (SDL2 incluido).
+
 **Alcance honesto:** el compilador autoalojado compila el *dialecto nativo*
 (enteros de 64 bits, funciones, recursión, condiciones, ciclos, textos
 literales e intrínsecos). El lenguaje C-Forge completo (clases, mapas,

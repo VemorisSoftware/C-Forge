@@ -89,6 +89,10 @@ Sitio oficial: [c-forge.org](https://c-forge.org)
 - **macOS x86-64 nativo (Mach-O)**: `--target macos`, escritor Mach-O propio
   enlazado a `libSystem.B.dylib`, `runtime/sys_macos*.cfv` y CI en macOS real
   (Stage 2 = Stage 3 = compilación cruzada; 25/25, 32/32, 22/22).
+- **Capa intermedia del generador** (`gen.cfv`, `gen_x64.cfv`, `gen_a64.cfv`)
+  y **backend AArch64**: `--target macos-arm64` (Mach-O PIE con firma ad-hoc
+  SHA-256 propia) y `--target linux-arm64`. Apple Silicon: Stage 2 = Stage 3
+  = compilación cruzada desde Linux y Windows; 25/25, 32/32, 22/22.
 - **CI**: smoke test con rutas absolutas; se elimina `build-native.yml`
   (duplicado).
 - **Web**: c-forge.org vive en `site/` y se despliega en Cloudflare Pages; se
