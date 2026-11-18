@@ -105,16 +105,41 @@ Tipos numéricos de tamaño fijo: `i8 i16 i32 i64 u8 u16 u32 u64 f32 f64`, más
 `isize`/`usize`. El verificador de tipos rechaza el programa antes de
 ejecutarlo; no hay conversiones implícitas con pérdida.
 
-### 3.3 Opcionales y punteros seguros 📐
+### 3.3 Opcionales y punteros seguros ✅
 
 ```cfv
-sea p: *Nodo = nuevo Nodo(1)     // nunca nulo
-sea q: ?*Nodo = nulo             // puede ser nulo
+sea p: *Nodo = Nodo(1)           // nunca nulo
+sea q: ?*Nodo = buscar(p, 3)     // puede ser nulo
 si (q) |nodo| { mostrar(nodo.valor) }   // desempaque seguro
+si (q != nulo) { mostrar(q.valor) }     // también estrecha q a *Nodo
 ```
 
-`*T` no puede ser nulo. `?T` obliga a comprobar antes de usar. La aritmética de
-punteros solo existe dentro de `inseguro { ... }`.
+El verificador (en `cforge check`, `build` y el LSP) rechaza antes de ejecutar:
+`nulo` u un `?T` sin comprobar donde se espera `*T` (variable, argumento o
+retorno), y `q.campo`, `q[i]` o `q(...)` sobre un `?T` fuera de un
+`si (q)` / `si (q != nulo)`. La aritmética de punteros solo existe dentro de
+`inseguro { ... }`.
+
+### 3.3b comptime ✅
+
+```cfv
+sea tabla = comptime(generar_tabla(256))      // se ejecuta al compilar
+sea config = comptime {
+    sea m = {"version": 42}
+    retornar m
+}
+funcion maximo(comptime T, a: T, b: T): T { ... }
+maximo(entero, 3, 9)        // a y b se verifican como entero; el resultado es entero
+```
+
+`comptime(expr)` y `comptime { … retornar v }` ejecutan el código al compilar
+(con las funciones, clases y constantes anteriores del programa) y lo
+reemplazan por un literal: nulo, booleano, número, texto, lista o mapa. Un
+error durante la evaluación es un error de compilación. Funciona igual al
+compilar para otra plataforma (se ejecuta en la máquina que compila).
+`comptime T` recibe un nombre de tipo; los parámetros y el retorno `: T` se
+verifican en cada llamada con ese tipo. Dentro de la función, `T` vale el
+nombre del tipo (texto).
 
 ### 3.4 Resultado y operador `?` 📐
 
