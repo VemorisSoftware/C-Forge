@@ -1,0 +1,822 @@
+// bootstrap/nativo/lsp.cfv — cforge lsp: servidor de lenguaje (LSP) por stdio.
+//
+// Capacidades: diagnósticos (archivo.cfv:línea), autocompletado, ir a la
+// definición, información al pasar el cursor y formateo (cforge fmt).
+// Los diagnósticos se obtienen ejecutando "cforge check" como subproceso
+// con el texto del editor (--contenido) y un archivo de diagnóstico; el
+// resto se resuelve aquí con el lexer del compilador.
+
+// ── JSON ──────────────────────────────────────────────────────────────────
+// Nodo: [tipo][a][b] · 1 objeto (a: claves, b: valores) · 2 lista (a) ·
+// 3 texto (a) · 4 número (a) · 5 booleano (a) · 6 nulo
+
+funcion json_nodo(tipo, a, b) {
+    sea n = mem_reservar(24)
+    __guardar64(n, tipo)
+    __guardar64(n + 8, a)
+    __guardar64(n + 16, b)
+    retornar n
+}
+
+funcion json_espacios(s, p) {
+    mientras (__cargar64(p) < str_largo(s) y (es_blanco(str_byte(s, __cargar64(p))))) { __guardar64(p, __cargar64(p) + 1) }
+    retornar 0
+}
+
+// Agrega un punto de código como UTF-8.
+funcion utf8_agregar(r, cp) {
+    si (cp < 128) { retornar str_agregar_byte(r, cp) }
+    si (cp < 2048) {
+        str_agregar_byte(r, 192 + __desplazar_der(cp, 6))
+        retornar str_agregar_byte(r, 128 + __y_bits(cp, 63))
+    }
+    si (cp < 65536) {
+        str_agregar_byte(r, 224 + __desplazar_der(cp, 12))
+        str_agregar_byte(r, 128 + __y_bits(__desplazar_der(cp, 6), 63))
+        retornar str_agregar_byte(r, 128 + __y_bits(cp, 63))
+    }
+    str_agregar_byte(r, 240 + __desplazar_der(cp, 18))
+    str_agregar_byte(r, 128 + __y_bits(__desplazar_der(cp, 12), 63))
+    str_agregar_byte(r, 128 + __y_bits(__desplazar_der(cp, 6), 63))
+    retornar str_agregar_byte(r, 128 + __y_bits(cp, 63))
+}
+
+funcion valor_hex(b) {
+    si (b >= 48 y b <= 57) { retornar b - 48 }
+    si (b >= 97 y b <= 102) { retornar b - 87 }
+    si (b >= 65 y b <= 70) { retornar b - 55 }
+    retornar 0
+}
+
+funcion json_hex4(s, i) {
+    retornar valor_hex(str_byte(s, i)) * 4096 + valor_hex(str_byte(s, i + 1)) * 256 + valor_hex(str_byte(s, i + 2)) * 16 + valor_hex(str_byte(s, i + 3))
+}
+
+funcion json_texto_crudo(s, p) {
+    sea i = __cargar64(p) + 1
+    sea r = str_nuevo(32)
+    sea seguir = 1
+    mientras (seguir y i < str_largo(s)) {
+        sea b = str_byte(s, i)
+        si (b == 34) {
+            seguir = 0
+            i = i + 1
+        } sino {
+            si (b == 92 y i + 1 < str_largo(s)) {
+                sea e = str_byte(s, i + 1)
+                i = i + 2
+                si (e == 110) { str_agregar_byte(r, 10) } sino {
+                si (e == 116) { str_agregar_byte(r, 9) } sino {
+                si (e == 114) { str_agregar_byte(r, 13) } sino {
+                si (e == 98) { str_agregar_byte(r, 8) } sino {
+                si (e == 102) { str_agregar_byte(r, 12) } sino {
+                si (e == 117) {
+                    sea cp = json_hex4(s, i)
+                    i = i + 4
+                    // Par sustituto UTF-16.
+                    si (cp >= 55296 y cp < 56320 y i + 5 < str_largo(s) y str_byte(s, i) == 92 y str_byte(s, i + 1) == 117) {
+                        sea bajo = json_hex4(s, i + 2)
+                        cp = 65536 + (cp - 55296) * 1024 + (bajo - 56320)
+                        i = i + 6
+                    }
+                    utf8_agregar(r, cp)
+                } sino { str_agregar_byte(r, e) } } } } } }
+            } sino {
+                str_agregar_byte(r, b)
+                i = i + 1
+            }
+        }
+    }
+    __guardar64(p, i)
+    retornar r
+}
+
+funcion json_valor(s, p) {
+    json_espacios(s, p)
+    si (__cargar64(p) >= str_largo(s)) { retornar json_nodo(6, 0, 0) }
+    sea b = str_byte(s, __cargar64(p))
+    si (b == 123) {
+        __guardar64(p, __cargar64(p) + 1)
+        sea claves = vec_nuevo()
+        sea valores = vec_nuevo()
+        json_espacios(s, p)
+        mientras (__cargar64(p) < str_largo(s) y str_byte(s, __cargar64(p)) != 125) {
+            json_espacios(s, p)
+            vec_agregar(claves, json_texto_crudo(s, p))
+            json_espacios(s, p)
+            __guardar64(p, __cargar64(p) + 1)                  // :
+            vec_agregar(valores, json_valor(s, p))
+            json_espacios(s, p)
+            si (__cargar64(p) < str_largo(s) y str_byte(s, __cargar64(p)) == 44) { __guardar64(p, __cargar64(p) + 1) }
+            json_espacios(s, p)
+        }
+        __guardar64(p, __cargar64(p) + 1)
+        retornar json_nodo(1, claves, valores)
+    }
+    si (b == 91) {
+        __guardar64(p, __cargar64(p) + 1)
+        sea elementos = vec_nuevo()
+        json_espacios(s, p)
+        mientras (__cargar64(p) < str_largo(s) y str_byte(s, __cargar64(p)) != 93) {
+            vec_agregar(elementos, json_valor(s, p))
+            json_espacios(s, p)
+            si (__cargar64(p) < str_largo(s) y str_byte(s, __cargar64(p)) == 44) { __guardar64(p, __cargar64(p) + 1) }
+            json_espacios(s, p)
+        }
+        __guardar64(p, __cargar64(p) + 1)
+        retornar json_nodo(2, elementos, 0)
+    }
+    si (b == 34) { retornar json_nodo(3, json_texto_crudo(s, p), 0) }
+    si (b == 116) {
+        __guardar64(p, __cargar64(p) + 4)
+        retornar json_nodo(5, 1, 0)
+    }
+    si (b == 102) {
+        __guardar64(p, __cargar64(p) + 5)
+        retornar json_nodo(5, 0, 0)
+    }
+    si (b == 110) {
+        __guardar64(p, __cargar64(p) + 4)
+        retornar json_nodo(6, 0, 0)
+    }
+    // Número (las partes decimales y exponentes se ignoran).
+    sea negativo = 0
+    si (b == 45) {
+        negativo = 1
+        __guardar64(p, __cargar64(p) + 1)
+    }
+    sea n = 0
+    mientras (__cargar64(p) < str_largo(s) y str_byte(s, __cargar64(p)) >= 48 y str_byte(s, __cargar64(p)) <= 57) {
+        n = n * 10 + str_byte(s, __cargar64(p)) - 48
+        __guardar64(p, __cargar64(p) + 1)
+    }
+    mientras (__cargar64(p) < str_largo(s) y (str_byte(s, __cargar64(p)) == 46 o str_byte(s, __cargar64(p)) == 101 o str_byte(s, __cargar64(p)) == 69 o str_byte(s, __cargar64(p)) == 43 o str_byte(s, __cargar64(p)) == 45 o (str_byte(s, __cargar64(p)) >= 48 y str_byte(s, __cargar64(p)) <= 57))) { __guardar64(p, __cargar64(p) + 1) }
+    si (negativo) { n = 0 - n }
+    retornar json_nodo(4, n, 0)
+}
+
+funcion json_leer(s) {
+    sea p = mem_reservar(8)
+    __guardar64(p, 0)
+    sea r = json_valor(s, p)
+    mem_liberar(p)
+    retornar r
+}
+
+// Campo de un objeto (o 0).
+funcion json_campo(n, clave) {
+    si (n == 0 o __cargar64(n) != 1) { retornar 0 }
+    sea claves = __cargar64(n + 8)
+    sea i = 0
+    mientras (i < vec_largo(claves)) {
+        si (str_igual(vec_obtener(claves, i), clave)) { retornar vec_obtener(__cargar64(n + 16), i) }
+        i = i + 1
+    }
+    retornar 0
+}
+
+funcion json_texto_de(n) {
+    si (n == 0 o __cargar64(n) != 3) { retornar 0 }
+    retornar __cargar64(n + 8)
+}
+
+funcion json_numero_de(n) {
+    si (n == 0 o __cargar64(n) != 4) { retornar 0 }
+    retornar __cargar64(n + 8)
+}
+
+// Ruta campo.campo.campo (separada por puntos).
+funcion json_ruta(n, ruta) {
+    sea inicio = 0
+    sea i = 0
+    mientras (i <= str_largo(ruta)) {
+        si (i == str_largo(ruta) o str_byte(ruta, i) == 46) {
+            n = json_campo(n, str_rebanar(ruta, inicio, i))
+            si (n == 0) { retornar 0 }
+            inicio = i + 1
+        }
+        i = i + 1
+    }
+    retornar n
+}
+
+// Texto JSON entre comillas, con escapes.
+funcion json_texto(s) {
+    sea r = str_nuevo(str_largo(s) + 16)
+    str_agregar_byte(r, 34)
+    sea i = 0
+    mientras (i < str_largo(s)) {
+        sea b = str_byte(s, i)
+        si (b == 34 o b == 92) {
+            str_agregar_byte(r, 92)
+            str_agregar_byte(r, b)
+        } sino {
+            si (b == 10) { str_agregar(r, "\\n") } sino {
+            si (b == 13) { str_agregar(r, "\\r") } sino {
+            si (b == 9) { str_agregar(r, "\\t") } sino {
+            si (b < 32) {
+                str_agregar(r, "\\u00")
+                str_agregar_byte(r, digito_hex(__desplazar_der(b, 4)))
+                str_agregar_byte(r, digito_hex(__y_bits(b, 15)))
+            } sino { str_agregar_byte(r, b) } } } }
+        }
+        i = i + 1
+    }
+    str_agregar_byte(r, 34)
+    retornar r
+}
+
+funcion digito_hex(v) {
+    si (v < 10) { retornar 48 + v }
+    retornar 87 + v
+}
+
+// Valor JSON del id de la petición (número o texto), tal cual.
+funcion json_id(n) {
+    si (n == 0) { retornar "null" }
+    si (__cargar64(n) == 4) { retornar str_desde_entero(__cargar64(n + 8)) }
+    si (__cargar64(n) == 3) { retornar json_texto(__cargar64(n + 8)) }
+    retornar "null"
+}
+
+// ── Transporte (Content-Length) ───────────────────────────────────────────
+
+// Entrada con búfer: [texto][posición]
+funcion lsp_entrada() {
+    sea e = mem_reservar(16)
+    __guardar64(e, str_nuevo(65536))
+    __guardar64(e + 8, 0)
+    retornar e
+}
+
+// Asegura n bytes disponibles; 0 si stdin terminó.
+funcion lsp_llenar(e, n) {
+    sea b = __cargar64(e)
+    mientras (str_largo(b) - __cargar64(e + 8) < n) {
+        str_asegurar(b, str_largo(b) + 65536)
+        sea leidos = sys_leer(0, str_datos(b) + str_largo(b), 65536)
+        si (leidos <= 0) { retornar 0 }
+        __guardar64(b, str_largo(b) + leidos)
+    }
+    retornar 1
+}
+
+// Siguiente mensaje (texto JSON) o 0 al terminar la entrada.
+funcion lsp_leer(e) {
+    sea largo = 0 - 1
+    sea seguir = 1
+    mientras (seguir) {
+        // Una línea de encabezado.
+        sea b = __cargar64(e)
+        sea inicio = __cargar64(e + 8)
+        sea fin = 0 - 1
+        mientras (fin < 0) {
+            sea i = __cargar64(e + 8)
+            mientras (i < str_largo(b) y str_byte(b, i) != 10) { i = i + 1 }
+            si (i < str_largo(b)) { fin = i } sino {
+                si (lsp_llenar(e, str_largo(b) - __cargar64(e + 8) + 1) == 0) { retornar 0 }
+                b = __cargar64(e)
+            }
+        }
+        sea linea = recortar(str_rebanar(b, inicio, fin))
+        __guardar64(e + 8, fin + 1)
+        si (str_largo(linea) == 0) {
+            si (largo >= 0) { seguir = 0 }
+        } sino {
+            si (str_largo(linea) > 15 y str_igual(str_rebanar(linea, 0, 15), "Content-Length:")) {
+                largo = numero_de_texto(recortar(str_rebanar(linea, 15, str_largo(linea))))
+            }
+        }
+    }
+    si (lsp_llenar(e, largo) == 0) { retornar 0 }
+    sea b = __cargar64(e)
+    sea p = __cargar64(e + 8)
+    sea cuerpo = str_rebanar(b, p, p + largo)
+    // Compacta el búfer.
+    sea resto = str_rebanar(b, p + largo, str_largo(b))
+    __guardar64(b, 0)
+    str_agregar(b, resto)
+    __guardar64(e + 8, 0)
+    retornar cuerpo
+}
+
+funcion numero_de_texto(s) {
+    sea n = 0
+    sea i = 0
+    mientras (i < str_largo(s) y str_byte(s, i) >= 48 y str_byte(s, i) <= 57) {
+        n = n * 10 + str_byte(s, i) - 48
+        i = i + 1
+    }
+    retornar n
+}
+
+funcion lsp_enviar(cuerpo) {
+    sea m = str_concatenar("Content-Length: ", str_desde_entero(str_largo(cuerpo)))
+    str_agregar(m, "\r\n\r\n")
+    str_agregar(m, cuerpo)
+    rt_escribir_texto(1, m)
+    retornar 0
+}
+
+funcion lsp_responder(id, resultado) {
+    sea c = str_concatenar("{\"jsonrpc\":\"2.0\",\"id\":", json_id(id))
+    str_agregar(c, ",\"result\":")
+    str_agregar(c, resultado)
+    str_agregar(c, "}")
+    retornar lsp_enviar(c)
+}
+
+funcion lsp_notificar(metodo, parametros) {
+    sea c = str_concatenar("{\"jsonrpc\":\"2.0\",\"method\":", json_texto(metodo))
+    str_agregar(c, ",\"params\":")
+    str_agregar(c, parametros)
+    str_agregar(c, "}")
+    retornar lsp_enviar(c)
+}
+
+// ── Documentos y URI ──────────────────────────────────────────────────────
+
+// file:///home/a/b.cfv → /home/a/b.cfv · file:///c%3A/x.cfv → c:/x.cfv
+funcion uri_a_ruta(uri) {
+    sea s = uri
+    si (str_largo(s) > 7 y str_igual(str_rebanar(s, 0, 7), "file://")) { s = str_rebanar(s, 7, str_largo(s)) }
+    sea r = str_nuevo(str_largo(s))
+    sea i = 0
+    mientras (i < str_largo(s)) {
+        sea b = str_byte(s, i)
+        si (b == 37 y i + 2 < str_largo(s)) {
+            str_agregar_byte(r, valor_hex(str_byte(s, i + 1)) * 16 + valor_hex(str_byte(s, i + 2)))
+            i = i + 3
+        } sino {
+            str_agregar_byte(r, b)
+            i = i + 1
+        }
+    }
+    // /c:/x → c:/x en Windows.
+    si (str_largo(r) > 2 y str_byte(r, 0) == 47 y str_byte(r, 2) == 58) { retornar str_rebanar(r, 1, str_largo(r)) }
+    retornar r
+}
+
+funcion ruta_a_uri(ruta) {
+    sea r = str_nuevo(str_largo(ruta) + 8)
+    str_agregar(r, "file://")
+    si (str_largo(ruta) > 1 y str_byte(ruta, 1) == 58) { str_agregar_byte(r, 47) }
+    sea i = 0
+    mientras (i < str_largo(ruta)) {
+        sea b = str_byte(ruta, i)
+        si (b == 92) { b = 47 }
+        si (b == 32 o b == 35 o b == 37 o b == 63) {
+            str_agregar_byte(r, 37)
+            str_agregar_byte(r, digito_hex(__desplazar_der(b, 4)))
+            str_agregar_byte(r, digito_hex(__y_bits(b, 15)))
+        } sino { str_agregar_byte(r, b) }
+        i = i + 1
+    }
+    retornar r
+}
+
+// Documentos abiertos: [uri][texto]
+funcion documento_fijar(docs, uri, texto) {
+    sea i = 0
+    mientras (i < vec_largo(docs)) {
+        sea d = vec_obtener(docs, i)
+        si (str_igual(__cargar64(d), uri)) {
+            __guardar64(d + 8, texto)
+            retornar 0
+        }
+        i = i + 1
+    }
+    sea d = mem_reservar(16)
+    __guardar64(d, uri)
+    __guardar64(d + 8, texto)
+    vec_agregar(docs, d)
+    retornar 0
+}
+
+funcion documento_texto(docs, uri) {
+    sea i = 0
+    mientras (i < vec_largo(docs)) {
+        sea d = vec_obtener(docs, i)
+        si (str_igual(__cargar64(d), uri)) { retornar __cargar64(d + 8) }
+        i = i + 1
+    }
+    si (existe_ruta(uri_a_ruta(uri))) { retornar archivo_leer(uri_a_ruta(uri)) }
+    retornar ""
+}
+
+// Columna UTF-16 → byte de la línea, y al revés.
+funcion byte_de_columna(linea, columna) {
+    sea i = 0
+    sea u = 0
+    mientras (i < str_largo(linea) y u < columna) {
+        sea b = str_byte(linea, i)
+        si (b < 128) { i = i + 1 } sino {
+            si (b >= 240) {
+                i = i + 4
+                u = u + 1
+            } sino { si (b >= 224) { i = i + 3 } sino { i = i + 2 } }
+        }
+        u = u + 1
+    }
+    si (i > str_largo(linea)) { i = str_largo(linea) }
+    retornar i
+}
+
+funcion columna_de_byte(linea, posicion) {
+    sea i = 0
+    sea u = 0
+    mientras (i < posicion y i < str_largo(linea)) {
+        sea b = str_byte(linea, i)
+        si (b < 128) { i = i + 1 } sino {
+            si (b >= 240) {
+                i = i + 4
+                u = u + 1
+            } sino { si (b >= 224) { i = i + 3 } sino { i = i + 2 } }
+        }
+        u = u + 1
+    }
+    retornar u
+}
+
+funcion linea_de(texto, n) {
+    sea lineas = lineas_de(texto)
+    si (n < 0 o n >= vec_largo(lineas)) { retornar "" }
+    retornar vec_obtener(lineas, n)
+}
+
+// Palabra (identificador) en la posición LSP.
+funcion palabra_en(texto, linea_n, columna) {
+    sea l = linea_de(texto, linea_n)
+    sea p = byte_de_columna(l, columna)
+    sea a = p
+    mientras (a > 0 y es_ident_formato(str_byte(l, a - 1))) { a = a - 1 }
+    sea b = p
+    mientras (b < str_largo(l) y es_ident_formato(str_byte(l, b))) { b = b + 1 }
+    retornar str_rebanar(l, a, b)
+}
+
+funcion rango_json(linea, c1, c2) {
+    sea r = str_concatenar("{\"start\":{\"line\":", str_desde_entero(linea))
+    str_agregar(r, ",\"character\":")
+    str_agregar(r, str_desde_entero(c1))
+    str_agregar(r, "},\"end\":{\"line\":")
+    str_agregar(r, str_desde_entero(linea))
+    str_agregar(r, ",\"character\":")
+    str_agregar(r, str_desde_entero(c2))
+    str_agregar(r, "}}")
+    retornar r
+}
+
+// ── Diagnósticos ──────────────────────────────────────────────────────────
+
+funcion diagnosticar(docs, uri) {
+    sea ruta = uri_a_ruta(uri)
+    sea base = str_concatenar(sys_ruta_temporal(), str_concatenar("cforge-lsp-", str_desde_entero(sys_proceso_id())))
+    sea contenido = str_concatenar(base, ".cfv")
+    sea salida = str_concatenar(base, ".diag")
+    archivo_escribir(contenido, documento_texto(docs, uri))
+    sys_borrar(str_c(salida))
+    sea args = vec_nuevo()
+    vec_agregar(args, "check")
+    vec_agregar(args, ruta)
+    vec_agregar(args, "--contenido")
+    vec_agregar(args, contenido)
+    vec_agregar(args, "--diagnosticos")
+    vec_agregar(args, salida)
+    sea programa = sys_ruta_ejecutable()
+    sea lista = str_nuevo(256)
+    str_agregar(lista, "[")
+    si (programa != 0) {
+        sys_ejecutar_programa(programa, args)
+        si (existe_ruta(salida)) {
+            sea mensaje = archivo_leer(salida)
+            sea linea = linea_diagnostico(mensaje, nombre_de(ruta))
+            // Sin "· Si el programa usa ..." (consejo de la línea de órdenes).
+            sea salto = posicion_de(mensaje, 10)
+            si (salto > 0) { mensaje = str_rebanar(mensaje, 0, salto) }
+            mensaje = sin_ubicacion(mensaje)
+            str_agregar(lista, "{\"range\":")
+            str_agregar(lista, rango_json(linea, 0, columna_de_byte(linea_de(documento_texto(docs, uri), linea), 1000000)))
+            str_agregar(lista, ",\"severity\":1,\"source\":\"cforge\",\"message\":")
+            str_agregar(lista, json_texto(mensaje))
+            str_agregar(lista, "}")
+        }
+    }
+    str_agregar(lista, "]")
+    sys_borrar(str_c(contenido))
+    sys_borrar(str_c(salida))
+    sea p = str_concatenar("{\"uri\":", json_texto(uri))
+    str_agregar(p, ",\"diagnostics\":")
+    str_agregar(p, lista)
+    str_agregar(p, "}")
+    retornar lsp_notificar("textDocument/publishDiagnostics", p)
+}
+
+// "ruta/archivo.cfv:42: mensaje" → "mensaje"
+funcion sin_ubicacion(mensaje) {
+    sea i = 0
+    mientras (i + 2 < str_largo(mensaje)) {
+        si (str_byte(mensaje, i) == 58 y str_byte(mensaje, i + 1) >= 48 y str_byte(mensaje, i + 1) <= 57) {
+            sea j = i + 1
+            mientras (j < str_largo(mensaje) y str_byte(mensaje, j) >= 48 y str_byte(mensaje, j) <= 57) { j = j + 1 }
+            si (j + 1 < str_largo(mensaje) y str_byte(mensaje, j) == 58 y str_byte(mensaje, j + 1) == 32) { retornar str_rebanar(mensaje, j + 2, str_largo(mensaje)) }
+        }
+        i = i + 1
+    }
+    retornar mensaje
+}
+
+// "archivo.cfv:42: mensaje" → 41 (línea LSP), si el error es de este archivo.
+funcion linea_diagnostico(mensaje, nombre) {
+    sea dos_puntos = 0 - 1
+    sea i = 0
+    mientras (i < str_largo(mensaje) y dos_puntos < 0) {
+        si (str_byte(mensaje, i) == 58 y i + 1 < str_largo(mensaje) y str_byte(mensaje, i + 1) >= 48 y str_byte(mensaje, i + 1) <= 57) { dos_puntos = i }
+        i = i + 1
+    }
+    si (dos_puntos < 0) { retornar 0 }
+    si (termina_en(str_rebanar(mensaje, 0, dos_puntos), nombre) == 0) { retornar 0 }
+    sea n = numero_de_texto(str_rebanar(mensaje, dos_puntos + 1, str_largo(mensaje)))
+    si (n > 0) { retornar n - 1 }
+    retornar 0
+}
+
+// ── Índice de definiciones ────────────────────────────────────────────────
+// Definición: [nombre][ruta][línea (0..)][tipo LSP][firma]
+
+funcion es_palabra_definicion(p) {
+    retornar str_igual(p, "funcion") o str_igual(p, "function") o str_igual(p, "fn") o str_igual(p, "clase") o str_igual(p, "class") o str_igual(p, "estructura") o str_igual(p, "struct") o str_igual(p, "interfaz") o str_igual(p, "interface") o str_igual(p, "sea") o str_igual(p, "let") o str_igual(p, "metodo")
+}
+
+funcion tipo_definicion(p) {
+    si (str_igual(p, "funcion") o str_igual(p, "function") o str_igual(p, "fn") o str_igual(p, "metodo")) { retornar 3 }
+    si (str_igual(p, "sea") o str_igual(p, "let")) { retornar 6 }
+    si (str_igual(p, "interfaz") o str_igual(p, "interface")) { retornar 8 }
+    si (str_igual(p, "estructura") o str_igual(p, "struct")) { retornar 22 }
+    retornar 7
+}
+
+funcion definiciones_de(texto, ruta, r) {
+    sea lineas = lineas_de(texto)
+    sea i = 0
+    mientras (i < vec_largo(lineas)) {
+        sea l = recortar(vec_obtener(lineas, i))
+        // [publico|privado|estatico|abstracto]* palabra nombre
+        sea palabras = vec_nuevo()
+        sea k = 0
+        mientras (k < str_largo(l) y vec_largo(palabras) < 4) {
+            mientras (k < str_largo(l) y es_ident_formato(str_byte(l, k)) == 0) { k = k + 1 }
+            sea inicio = k
+            mientras (k < str_largo(l) y es_ident_formato(str_byte(l, k))) { k = k + 1 }
+            si (k > inicio) { vec_agregar(palabras, str_rebanar(l, inicio, k)) }
+        }
+        sea j = 0
+        mientras (j < vec_largo(palabras) y (str_igual(vec_obtener(palabras, j), "publico") o str_igual(vec_obtener(palabras, j), "privado") o str_igual(vec_obtener(palabras, j), "estatico") o str_igual(vec_obtener(palabras, j), "abstracto") o str_igual(vec_obtener(palabras, j), "public") o str_igual(vec_obtener(palabras, j), "private") o str_igual(vec_obtener(palabras, j), "static"))) { j = j + 1 }
+        si (j + 1 < vec_largo(palabras) y es_palabra_definicion(vec_obtener(palabras, j)) y empieza_con(l, "//") == 0) {
+            sea d = mem_reservar(40)
+            __guardar64(d, vec_obtener(palabras, j + 1))
+            __guardar64(d + 8, ruta)
+            __guardar64(d + 16, i)
+            __guardar64(d + 24, tipo_definicion(vec_obtener(palabras, j)))
+            sea firma = l
+            sea llave = posicion_de(l, 123)
+            si (llave > 0) { firma = recortar(str_rebanar(l, 0, llave)) }
+            __guardar64(d + 32, firma)
+            vec_agregar(r, d)
+        }
+        i = i + 1
+    }
+    retornar r
+}
+
+// Definiciones del documento y de sus importaciones (transitivas).
+funcion indice(docs, uri) {
+    sea r = vec_nuevo()
+    sea ruta = uri_a_ruta(uri)
+    sea texto = documento_texto(docs, uri)
+    preparar_paquetes(ruta)
+    definiciones_de(texto, ruta, r)
+    sea vistas = vec_nuevo()
+    vec_agregar(vistas, ruta)
+    importaciones_de(texto, ruta, vistas, r)
+    retornar r
+}
+
+funcion importaciones_de(texto, ruta, vistas, r) {
+    sea tokens = tokenizar(texto)
+    sea i = 0
+    mientras (i + 1 < vec_largo(tokens)) {
+        sea t = vec_obtener(tokens, i)
+        sea u = vec_obtener(tokens, i + 1)
+        si (__cargar64(t) == 1 y __cargar64(u) == 3 y (str_igual(__cargar64(t + 8), "importar") o str_igual(__cargar64(t + 8), "import"))) {
+            sea destino = ruta_importacion_desde(ruta_stdlib(), ruta, decodificar_literal(__cargar64(u + 8)))
+            si (contiene_texto(vistas, destino) == 0 y existe_ruta(destino)) {
+                vec_agregar(vistas, destino)
+                sea contenido = archivo_leer(destino)
+                definiciones_de(contenido, destino, r)
+                importaciones_de(contenido, destino, vistas, r)
+            }
+        }
+        i = i + 1
+    }
+    retornar 0
+}
+
+funcion buscar_definicion(defs, nombre) {
+    sea i = 0
+    mientras (i < vec_largo(defs)) {
+        sea d = vec_obtener(defs, i)
+        si (str_igual(__cargar64(d), nombre)) { retornar d }
+        i = i + 1
+    }
+    retornar 0
+}
+
+// Funciones públicas del runtime incrustado (biblioteca del lenguaje).
+funcion funciones_runtime() {
+    sea r = vec_nuevo()
+    sea i = 0
+    mientras (i < runtime_cantidad()) {
+        si (runtime_modo(i) == 1 o runtime_modo(i) == 3) {
+            sea defs = definiciones_de(runtime_fuente(i), runtime_nombre(i), vec_nuevo())
+            sea k = 0
+            mientras (k < vec_largo(defs)) {
+                sea d = vec_obtener(defs, k)
+                sea n = __cargar64(d)
+                si (__cargar64(d + 24) == 3 y empieza_con(n, "dyn_") == 0 y empieza_con(n, "sys_") == 0 y empieza_con(n, "rt_") == 0 y empieza_con(n, "_") == 0 y empieza_con(n, "c_") == 0) {
+                    si (buscar_definicion(r, n) == 0) { vec_agregar(r, d) }
+                }
+                k = k + 1
+            }
+        }
+        i = i + 1
+    }
+    retornar r
+}
+
+// ── Peticiones ────────────────────────────────────────────────────────────
+
+funcion palabras_clave() {
+    sea k = vec_nuevo()
+    sea lista = "funcion sea si sino mientras para en retornar romper continuar clase estructura interfaz extiende implementa importar intentar capturar finalmente lanzar verdadero falso nulo y o no esto super nuevo inseguro publico privado estatico abstracto"
+    sea inicio = 0
+    sea i = 0
+    mientras (i <= str_largo(lista)) {
+        si (i == str_largo(lista) o str_byte(lista, i) == 32) {
+            vec_agregar(k, str_rebanar(lista, inicio, i))
+            inicio = i + 1
+        }
+        i = i + 1
+    }
+    retornar k
+}
+
+funcion item_completado(r, nombre, tipo, detalle, primero) {
+    si (primero == 0) { str_agregar(r, ",") }
+    str_agregar(r, "{\"label\":")
+    str_agregar(r, json_texto(nombre))
+    str_agregar(r, ",\"kind\":")
+    str_agregar(r, str_desde_entero(tipo))
+    si (detalle != 0) {
+        str_agregar(r, ",\"detail\":")
+        str_agregar(r, json_texto(detalle))
+    }
+    str_agregar(r, "}")
+    retornar 0
+}
+
+funcion completar(docs, uri, runtime) {
+    sea r = str_nuevo(16384)
+    str_agregar(r, "[")
+    sea vistos = vec_nuevo()
+    sea primero = 1
+    sea defs = indice(docs, uri)
+    sea i = 0
+    mientras (i < vec_largo(defs)) {
+        sea d = vec_obtener(defs, i)
+        si (contiene_texto(vistos, __cargar64(d)) == 0) {
+            vec_agregar(vistos, __cargar64(d))
+            item_completado(r, __cargar64(d), __cargar64(d + 24), __cargar64(d + 32), primero)
+            primero = 0
+        }
+        i = i + 1
+    }
+    i = 0
+    mientras (i < vec_largo(runtime)) {
+        sea d = vec_obtener(runtime, i)
+        si (contiene_texto(vistos, __cargar64(d)) == 0) {
+            vec_agregar(vistos, __cargar64(d))
+            item_completado(r, __cargar64(d), 3, __cargar64(d + 32), primero)
+            primero = 0
+        }
+        i = i + 1
+    }
+    sea claves = palabras_clave()
+    i = 0
+    mientras (i < vec_largo(claves)) {
+        item_completado(r, vec_obtener(claves, i), 14, 0, primero)
+        primero = 0
+        i = i + 1
+    }
+    str_agregar(r, "]")
+    retornar r
+}
+
+funcion definicion(docs, uri, linea, columna) {
+    sea nombre = palabra_en(documento_texto(docs, uri), linea, columna)
+    si (str_largo(nombre) == 0) { retornar "null" }
+    sea d = buscar_definicion(indice(docs, uri), nombre)
+    si (d == 0) { retornar "null" }
+    sea ruta = __cargar64(d + 8)
+    sea texto = 0
+    si (str_igual(ruta, uri_a_ruta(uri))) { texto = documento_texto(docs, uri) } sino { texto = archivo_leer(ruta) }
+    sea l = linea_de(texto, __cargar64(d + 16))
+    sea c1 = 0
+    sea i = 0
+    mientras (i + str_largo(nombre) <= str_largo(l) y c1 == 0) {
+        si (str_igual(str_rebanar(l, i, i + str_largo(nombre)), nombre) y (i == 0 o es_ident_formato(str_byte(l, i - 1)) == 0)) { c1 = columna_de_byte(l, i) + 1 }
+        i = i + 1
+    }
+    si (c1 > 0) { c1 = c1 - 1 }
+    sea r = str_concatenar("{\"uri\":", json_texto(ruta_a_uri(ruta)))
+    str_agregar(r, ",\"range\":")
+    str_agregar(r, rango_json(__cargar64(d + 16), c1, c1 + str_largo(nombre)))
+    str_agregar(r, "}")
+    retornar r
+}
+
+funcion informacion(docs, uri, linea, columna, runtime) {
+    sea nombre = palabra_en(documento_texto(docs, uri), linea, columna)
+    si (str_largo(nombre) == 0) { retornar "null" }
+    sea d = buscar_definicion(indice(docs, uri), nombre)
+    si (d == 0) { d = buscar_definicion(runtime, nombre) }
+    si (d == 0) { retornar "null" }
+    sea texto = str_concatenar("```cforge\n", __cargar64(d + 32))
+    str_agregar(texto, "\n```\n")
+    str_agregar(texto, nombre_de(__cargar64(d + 8)))
+    str_agregar(texto, ":")
+    str_agregar(texto, str_desde_entero(__cargar64(d + 16) + 1))
+    sea r = str_concatenar("{\"contents\":{\"kind\":\"markdown\",\"value\":", json_texto(texto))
+    str_agregar(r, "}}")
+    retornar r
+}
+
+funcion formatear_documento(docs, uri) {
+    sea original = documento_texto(docs, uri)
+    sea nuevo = formatear(original)
+    si (str_igual(original, nuevo)) { retornar "[]" }
+    sea r = str_concatenar("[{\"range\":{\"start\":{\"line\":0,\"character\":0},\"end\":{\"line\":", str_desde_entero(vec_largo(lineas_de(original)) + 1))
+    str_agregar(r, ",\"character\":0}},\"newText\":")
+    str_agregar(r, json_texto(nuevo))
+    str_agregar(r, "}]")
+    retornar r
+}
+
+// ── Bucle principal ───────────────────────────────────────────────────────
+
+funcion orden_lsp() {
+    mem_fijar_global(39, 1)                                    // mostrar → stderr (stdout es el protocolo)
+    sea entrada = lsp_entrada()
+    sea docs = vec_nuevo()
+    sea runtime = funciones_runtime()
+    sea seguir = 1
+    mientras (seguir) {
+        sea cuerpo = lsp_leer(entrada)
+        si (cuerpo == 0) { seguir = 0 } sino {
+            sea m = json_leer(cuerpo)
+            sea metodo = json_texto_de(json_campo(m, "method"))
+            sea id = json_campo(m, "id")
+            sea params = json_campo(m, "params")
+            sea uri = json_texto_de(json_ruta(params, "textDocument.uri"))
+            sea linea = json_numero_de(json_ruta(params, "position.line"))
+            sea columna = json_numero_de(json_ruta(params, "position.character"))
+            si (metodo == 0) { metodo = "" }
+            si (str_igual(metodo, "initialize")) {
+                sea r = "{\"capabilities\":{\"textDocumentSync\":{\"openClose\":true,\"change\":1,\"save\":true},\"completionProvider\":{},\"definitionProvider\":true,\"hoverProvider\":true,\"documentFormattingProvider\":true},\"serverInfo\":{\"name\":\"cforge\",\"version\":"
+                r = str_concatenar(r, json_texto(version_cforge()))
+                str_agregar(r, "}}")
+                lsp_responder(id, r)
+            }
+            si (str_igual(metodo, "textDocument/didOpen")) {
+                documento_fijar(docs, uri, json_texto_de(json_ruta(params, "textDocument.text")))
+                diagnosticar(docs, uri)
+            }
+            si (str_igual(metodo, "textDocument/didChange")) {
+                sea cambios = json_campo(params, "contentChanges")
+                si (cambios != 0 y __cargar64(cambios) == 2 y vec_largo(__cargar64(cambios + 8)) > 0) {
+                    sea ultimo = vec_obtener(__cargar64(cambios + 8), vec_largo(__cargar64(cambios + 8)) - 1)
+                    documento_fijar(docs, uri, json_texto_de(json_campo(ultimo, "text")))
+                }
+                diagnosticar(docs, uri)
+            }
+            si (str_igual(metodo, "textDocument/didSave")) { diagnosticar(docs, uri) }
+            si (str_igual(metodo, "textDocument/completion")) { lsp_responder(id, completar(docs, uri, runtime)) }
+            si (str_igual(metodo, "textDocument/definition")) { lsp_responder(id, definicion(docs, uri, linea, columna)) }
+            si (str_igual(metodo, "textDocument/hover")) { lsp_responder(id, informacion(docs, uri, linea, columna, runtime)) }
+            si (str_igual(metodo, "textDocument/formatting")) { lsp_responder(id, formatear_documento(docs, uri)) }
+            si (str_igual(metodo, "shutdown")) { lsp_responder(id, "null") }
+            si (str_igual(metodo, "exit")) { seguir = 0 }
+        }
+    }
+    retornar 0
+}
