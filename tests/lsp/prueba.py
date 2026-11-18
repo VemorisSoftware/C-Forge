@@ -5,6 +5,9 @@ ir a la definición, información, autocompletado (documento + runtime +
 palabras clave), formateo y cierre."""
 import json, os, subprocess, sys, tempfile
 
+if hasattr(sys.stdout, "reconfigure"):
+    sys.stdout.reconfigure(encoding="utf-8")
+
 C = os.path.abspath(sys.argv[1])
 raiz = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 d = tempfile.mkdtemp()
