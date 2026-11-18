@@ -1,0 +1,926 @@
+// bootstrap/nativo/cforge_self.cfv — compilador C-Forge autoalojado.
+//
+// Compilador de una sola pasada para el dialecto nativo de C-Forge, escrito
+// en ese mismo dialecto. El parser de descenso recursivo emite código
+// x86-64 directamente mientras lee los tokens (sin árbol de sintaxis) y
+// empaqueta un ELF estático: sin libc, enlazador ni ensamblador.
+//
+// Se compila a sí mismo junto con runtime/*.cfv y bootstrap/nativo/lexer.cfv:
+//   stage1 = x64_nativo (Core) compila estas fuentes
+//   stage2 = stage1 compila estas fuentes
+//   stage3 = stage2 compila estas fuentes      → stage2 y stage3 idénticos
+//
+// Uso: cforge-self -o salida archivo1.cfv [archivo2.cfv ...]
+//
+// Modelo de ejecución (igual que x64_nativo.cfv): todo valor es un entero de
+// 64 bits; argumentos apilados de izquierda a derecha; resultado en rax;
+// locales en [rbp - 8k]; textos literales con forma de texto del runtime.
+
+// ── Contexto (registro de 13 campos de 8 bytes) ──────────────────────────
+//  0 tokens       8 posición     16 código      24 datos
+// 32 arreglos    40 etiquetas   48 funciones   56 locales
+// 64 n_locales   72 literales   80 reubicaciones de datos
+// 88 base de locales visibles   96 fuente (para errores)
+
+funcion ctx_nuevo(tokens) {
+    sea c = mem_reservar(104)
+    __guardar64(c, tokens)
+    __guardar64(c + 8, 0)
+    __guardar64(c + 16, str_nuevo(65536))
+    __guardar64(c + 24, str_nuevo(65536))
+    __guardar64(c + 32, vec_nuevo())
+    __guardar64(c + 40, vec_nuevo())
+    __guardar64(c + 48, vec_nuevo())
+    __guardar64(c + 56, vec_nuevo())
+    __guardar64(c + 64, 0)
+    __guardar64(c + 72, vec_nuevo())
+    __guardar64(c + 80, vec_nuevo())
+    __guardar64(c + 88, 0)
+    __guardar64(c + 96, 0)
+    retornar c
+}
+
+funcion ctx_codigo(c) { retornar __cargar64(c + 16) }
+funcion ctx_datos(c) { retornar __cargar64(c + 24) }
+
+// ── Tokens ────────────────────────────────────────────────────────────────
+
+funcion tok_actual(c) {
+    retornar vec_obtener(__cargar64(c), __cargar64(c + 8))
+}
+
+funcion tok_tipo(c) { retornar __cargar64(tok_actual(c)) }
+funcion tok_lexema(c) { retornar __cargar64(tok_actual(c) + 8) }
+funcion tok_linea(c) { retornar __cargar64(tok_actual(c) + 16) }
+
+funcion tok_siguiente_lexema(c) {
+    sea i = __cargar64(c + 8) + 1
+    si (i >= vec_largo(__cargar64(c))) { retornar str_nuevo(0) }
+    retornar __cargar64(vec_obtener(__cargar64(c), i) + 8)
+}
+
+funcion avanzar(c) {
+    sea t = tok_actual(c)
+    si (__cargar64(t) != 5) { __guardar64(c + 8, __cargar64(c + 8) + 1) }
+    retornar t
+}
+
+funcion ver(c, lexema) {
+    sea t = tok_actual(c)
+    si (__cargar64(t) == 3) { retornar 0 }
+    retornar str_igual(__cargar64(t + 8), lexema)
+}
+
+funcion tomar(c, lexema) {
+    si (ver(c, lexema)) {
+        avanzar(c)
+        retornar 1
+    }
+    retornar 0
+}
+
+funcion error_en(c, mensaje) {
+    sea m = str_nuevo(64)
+    str_agregar(m, "línea ")
+    str_agregar(m, str_desde_entero(tok_linea(c)))
+    str_agregar(m, ": ")
+    str_agregar(m, mensaje)
+    str_agregar(m, " (cerca de '")
+    str_agregar(m, tok_lexema(c))
+    str_agregar(m, "')")
+    rt_panico(m)
+    retornar 0
+}
+
+funcion requerir(c, lexema) {
+    si (tomar(c, lexema) == 0) {
+        error_en(c, str_concatenar("se esperaba ", lexema))
+    }
+    retornar 0
+}
+
+funcion requerir_ident(c) {
+    si (tok_tipo(c) != 1) { error_en(c, "se esperaba un nombre") }
+    retornar __cargar64(avanzar(c) + 8)
+}
+
+// Anotación de tipo opcional: ": tipo"
+funcion saltar_tipo(c) {
+    si (tomar(c, ":")) { requerir_ident(c) }
+    retornar 0
+}
+
+// ── Emisión de bytes ──────────────────────────────────────────────────────
+
+funcion e1(c, b) {
+    str_agregar_byte(ctx_codigo(c), b)
+    retornar 0
+}
+
+funcion e2(c, a, b) { e1(c, a) e1(c, b) retornar 0 }
+funcion e3(c, a, b, d) { e1(c, a) e1(c, b) e1(c, d) retornar 0 }
+funcion e4(c, a, b, d, f) { e1(c, a) e1(c, b) e1(c, d) e1(c, f) retornar 0 }
+funcion e5(c, a, b, d, f, g) { e1(c, a) e1(c, b) e1(c, d) e1(c, f) e1(c, g) retornar 0 }
+
+funcion e32(c, valor) {
+    e1(c, __y_bits(valor, 255))
+    e1(c, __y_bits(__desplazar_der(valor, 8), 255))
+    e1(c, __y_bits(__desplazar_der(valor, 16), 255))
+    e1(c, __y_bits(__desplazar_der(valor, 24), 255))
+    retornar 0
+}
+
+funcion bytes_le(s, valor, cantidad) {
+    sea i = 0
+    mientras (i < cantidad) {
+        str_agregar_byte(s, __y_bits(__desplazar_der(valor, i * 8), 255))
+        i = i + 1
+    }
+    retornar 0
+}
+
+funcion parchear32(s, posicion, valor) {
+    sea d = str_datos(s) + posicion
+    __guardar8(d, __y_bits(valor, 255))
+    __guardar8(d + 1, __y_bits(__desplazar_der(valor, 8), 255))
+    __guardar8(d + 2, __y_bits(__desplazar_der(valor, 16), 255))
+    __guardar8(d + 3, __y_bits(__desplazar_der(valor, 24), 255))
+    retornar 0
+}
+
+funcion parchear64(s, posicion, valor) {
+    parchear32(s, posicion, valor)
+    parchear32(s, posicion + 4, __desplazar_der(valor, 32))
+    retornar 0
+}
+
+funcion posicion_codigo(c) { retornar str_largo(ctx_codigo(c)) }
+
+// ── Etiquetas y arreglos ──────────────────────────────────────────────────
+
+funcion nueva_etiqueta(c) {
+    sea etiquetas = __cargar64(c + 40)
+    vec_agregar(etiquetas, 0 - 1)
+    retornar vec_largo(etiquetas) - 1
+}
+
+funcion definir_etiqueta(c, etiqueta) {
+    vec_fijar(__cargar64(c + 40), etiqueta, posicion_codigo(c))
+    retornar 0
+}
+
+funcion nuevo_arreglo(c, tipo, valor) {
+    sea a = mem_reservar(24)
+    __guardar64(a, posicion_codigo(c))
+    __guardar64(a + 8, tipo)
+    __guardar64(a + 16, valor)
+    vec_agregar(__cargar64(c + 32), a)
+    e32(c, 0)
+    retornar 0
+}
+
+// tipo 0: rel32 a etiqueta · 1: dirección en datos · 2: dirección en globales
+funcion ref_etiqueta(c, etiqueta) { retornar nuevo_arreglo(c, 0, etiqueta) }
+funcion ref_dato(c, desplazamiento) { retornar nuevo_arreglo(c, 1, desplazamiento) }
+funcion ref_global(c, desplazamiento) { retornar nuevo_arreglo(c, 2, desplazamiento) }
+
+// ── Funciones y variables ─────────────────────────────────────────────────
+
+// Registro de función: [nombre][etiqueta][parámetros]
+funcion buscar_funcion(c, nombre) {
+    sea funciones = __cargar64(c + 48)
+    sea i = 0
+    mientras (i < vec_largo(funciones)) {
+        sea f = vec_obtener(funciones, i)
+        si (str_igual(__cargar64(f), nombre)) { retornar f }
+        i = i + 1
+    }
+    retornar 0
+}
+
+funcion registrar_funcion(c, nombre, parametros) {
+    si (buscar_funcion(c, nombre) != 0) {
+        rt_panico(str_concatenar("función definida dos veces: ", nombre))
+    }
+    sea f = mem_reservar(24)
+    __guardar64(f, nombre)
+    __guardar64(f + 8, nueva_etiqueta(c))
+    __guardar64(f + 16, parametros)
+    vec_agregar(__cargar64(c + 48), f)
+    retornar f
+}
+
+// Primera lectura rápida: registra cada "funcion nombre(...)" y su aridad
+// para permitir llamadas hacia adelante.
+funcion registrar_funciones(c) {
+    sea tokens = __cargar64(c)
+    sea i = 0
+    sea profundidad = 0
+    mientras (i < vec_largo(tokens)) {
+        sea t = vec_obtener(tokens, i)
+        sea lex = __cargar64(t + 8)
+        si (__cargar64(t) == 4 y str_igual(lex, "{")) { profundidad = profundidad + 1 }
+        si (__cargar64(t) == 4 y str_igual(lex, "}")) { profundidad = profundidad - 1 }
+        si (profundidad == 0 y __cargar64(t) == 1 y str_igual(lex, "funcion")) {
+            sea nombre = __cargar64(vec_obtener(tokens, i + 1) + 8)
+            sea j = i + 3
+            sea parametros = 0
+            sea nivel = 1
+            mientras (nivel > 0) {
+                sea u = vec_obtener(tokens, j)
+                sea ul = __cargar64(u + 8)
+                si (__cargar64(u) == 4 y str_igual(ul, "(")) { nivel = nivel + 1 }
+                si (__cargar64(u) == 4 y str_igual(ul, ")")) { nivel = nivel - 1 }
+                si (nivel == 1 y __cargar64(u) == 1) {
+                    // Un parámetro es un IDENT que no es un tipo (no sigue a ':').
+                    sea previo = __cargar64(vec_obtener(tokens, j - 1) + 8)
+                    si (str_igual(previo, ":") == 0) { parametros = parametros + 1 }
+                }
+                j = j + 1
+            }
+            registrar_funcion(c, nombre, parametros)
+            i = i + 1
+        }
+        i = i + 1
+    }
+    retornar 0
+}
+
+// Variable: [nombre][desplazamiento]
+funcion declarar_variable(c, nombre, desplazamiento) {
+    sea v = mem_reservar(16)
+    __guardar64(v, nombre)
+    __guardar64(v + 8, desplazamiento)
+    vec_agregar(__cargar64(c + 56), v)
+    retornar desplazamiento
+}
+
+funcion declarar_local(c, nombre) {
+    __guardar64(c + 64, __cargar64(c + 64) + 1)
+    retornar declarar_variable(c, nombre, 0 - __cargar64(c + 64) * 8)
+}
+
+funcion buscar_variable(c, nombre) {
+    sea locales = __cargar64(c + 56)
+    sea i = vec_largo(locales) - 1
+    mientras (i >= __cargar64(c + 88)) {
+        sea v = vec_obtener(locales, i)
+        si (str_igual(__cargar64(v), nombre)) { retornar __cargar64(v + 8) }
+        i = i - 1
+    }
+    error_en(c, str_concatenar("variable desconocida ", nombre))
+    retornar 0
+}
+
+funcion cargar_local(c, d) { e3(c, 72, 139, 133) e32(c, d) retornar 0 }
+funcion guardar_local(c, d) { e3(c, 72, 137, 133) e32(c, d) retornar 0 }
+
+funcion cargar_inmediato(c, valor) {
+    si (valor >= 0 - 2147483648 y valor <= 2147483647) {
+        e3(c, 72, 199, 192)
+        e32(c, valor)
+        retornar 0
+    }
+    e2(c, 72, 184)
+    e32(c, valor)
+    e32(c, __desplazar_der(valor, 32))
+    retornar 0
+}
+
+// ── Literales de texto ────────────────────────────────────────────────────
+
+funcion decodificar_literal(lexema) {
+    sea r = str_nuevo(str_largo(lexema))
+    sea i = 1
+    sea fin = str_largo(lexema) - 1
+    mientras (i < fin) {
+        sea b = str_byte(lexema, i)
+        si (b == 92 y i + 1 < fin) {
+            sea s = str_byte(lexema, i + 1)
+            si (s == 110) {
+                str_agregar_byte(r, 10)
+            } sino {
+                si (s == 116) {
+                    str_agregar_byte(r, 9)
+                } sino {
+                    si (s == 114) {
+                        str_agregar_byte(r, 13)
+                    } sino {
+                        si (s == 48) { str_agregar_byte(r, 0) } sino { str_agregar_byte(r, s) }
+                    }
+                }
+            }
+            i = i + 2
+        } sino {
+            str_agregar_byte(r, b)
+            i = i + 1
+        }
+    }
+    retornar r
+}
+
+// Literal: [lexema][desplazamiento en datos]
+funcion literal(c, lexema) {
+    sea literales = __cargar64(c + 72)
+    sea i = 0
+    mientras (i < vec_largo(literales)) {
+        sea l = vec_obtener(literales, i)
+        si (str_igual(__cargar64(l), lexema)) { retornar __cargar64(l + 8) }
+        i = i + 1
+    }
+    sea datos = ctx_datos(c)
+    mientras (str_largo(datos) % 8 != 0) { str_agregar_byte(datos, 0) }
+    sea inicio = str_largo(datos)
+    sea bytes = decodificar_literal(lexema)
+    bytes_le(datos, str_largo(bytes), 8)
+    bytes_le(datos, str_largo(bytes), 8)
+    vec_agregar(__cargar64(c + 80), inicio + 16)
+    bytes_le(datos, 0, 8)
+    bytes_le(datos, 0, 8)
+    str_agregar(datos, bytes)
+    str_agregar_byte(datos, 0)
+    sea registro = mem_reservar(16)
+    __guardar64(registro, lexema)
+    __guardar64(registro + 8, inicio)
+    vec_agregar(literales, registro)
+    retornar inicio
+}
+
+funcion numero_literal(lexema) {
+    sea n = 0
+    sea i = 0
+    mientras (i < str_largo(lexema)) {
+        n = n * 10 + str_byte(lexema, i) - 48
+        i = i + 1
+    }
+    retornar n
+}
+
+// ── Expresiones (resultado en rax) ────────────────────────────────────────
+
+funcion empujar(c) { e1(c, 80) retornar 0 }                     // push rax
+funcion rax_a_rcx_y_sacar(c) { e3(c, 72, 137, 193) e1(c, 88) retornar 0 }  // mov rcx, rax; pop rax
+
+funcion argumentos(c) {
+    requerir(c, "(")
+    sea n = 0
+    si (ver(c, ")") == 0) {
+        expresion(c)
+        empujar(c)
+        n = 1
+        mientras (tomar(c, ",")) {
+            expresion(c)
+            empujar(c)
+            n = n + 1
+        }
+    }
+    requerir(c, ")")
+    retornar n
+}
+
+// Dos argumentos: el primero en rax y el segundo en rcx.
+funcion dos_argumentos(c) {
+    sea n = argumentos(c)
+    si (n != 2) { error_en(c, "se esperaban 2 argumentos") }
+    e1(c, 89)                                                  // pop rcx
+    e1(c, 88)                                                  // pop rax
+    retornar 0
+}
+
+funcion un_argumento(c) {
+    sea n = argumentos(c)
+    si (n != 1) { error_en(c, "se esperaba 1 argumento") }
+    e1(c, 88)                                                  // pop rax
+    retornar 0
+}
+
+funcion f64_dos(c, operacion) {
+    dos_argumentos(c)
+    e5(c, 102, 72, 15, 110, 192)
+    e5(c, 102, 72, 15, 110, 201)
+    e4(c, 242, 15, operacion, 193)
+    e5(c, 102, 72, 15, 126, 192)
+    retornar 0
+}
+
+funcion intrinseco(c, nombre) {
+    si (str_igual(nombre, "__syscall")) {
+        sea n = argumentos(c)
+        si (n < 1 o n > 7) { error_en(c, "__syscall recibe de 1 a 7 argumentos") }
+        sea i = n - 1
+        mientras (i >= 0) {
+            si (i == 0) { e1(c, 88) }
+            si (i == 1) { e1(c, 95) }
+            si (i == 2) { e1(c, 94) }
+            si (i == 3) { e1(c, 90) }
+            si (i == 4) { e2(c, 65, 90) }
+            si (i == 5) { e2(c, 65, 88) }
+            si (i == 6) { e2(c, 65, 89) }
+            i = i - 1
+        }
+        e2(c, 15, 5)
+        retornar 1
+    }
+    si (str_igual(nombre, "__cargar64")) { un_argumento(c) e3(c, 72, 139, 0) retornar 1 }
+    si (str_igual(nombre, "__cargar8")) { un_argumento(c) e3(c, 15, 182, 0) retornar 1 }
+    si (str_igual(nombre, "__guardar64")) { dos_argumentos(c) e3(c, 72, 137, 8) retornar 1 }
+    si (str_igual(nombre, "__guardar8")) { dos_argumentos(c) e2(c, 136, 8) retornar 1 }
+    si (str_igual(nombre, "__y_bits")) { dos_argumentos(c) e3(c, 72, 33, 200) retornar 1 }
+    si (str_igual(nombre, "__o_bits")) { dos_argumentos(c) e3(c, 72, 9, 200) retornar 1 }
+    si (str_igual(nombre, "__xo_bits")) { dos_argumentos(c) e3(c, 72, 49, 200) retornar 1 }
+    si (str_igual(nombre, "__desplazar_izq")) { dos_argumentos(c) e3(c, 72, 211, 224) retornar 1 }
+    si (str_igual(nombre, "__desplazar_der")) { dos_argumentos(c) e3(c, 72, 211, 232) retornar 1 }
+    si (str_igual(nombre, "__globales")) {
+        argumentos(c)
+        e1(c, 184)
+        ref_global(c, 0)
+        retornar 1
+    }
+    si (str_igual(nombre, "__argc")) {
+        argumentos(c)
+        e4(c, 72, 139, 4, 37)
+        ref_global(c, 504)
+        e3(c, 72, 139, 0)
+        retornar 1
+    }
+    si (str_igual(nombre, "__argv")) {
+        un_argumento(c)
+        e3(c, 72, 137, 193)
+        e4(c, 72, 139, 4, 37)
+        ref_global(c, 504)
+        e5(c, 72, 139, 68, 200, 8)
+        retornar 1
+    }
+    si (str_igual(nombre, "__f64_desde_entero")) {
+        un_argumento(c)
+        e5(c, 242, 72, 15, 42, 192)
+        e5(c, 102, 72, 15, 126, 192)
+        retornar 1
+    }
+    si (str_igual(nombre, "__f64_a_entero")) {
+        un_argumento(c)
+        e5(c, 102, 72, 15, 110, 192)
+        e5(c, 242, 72, 15, 44, 192)
+        retornar 1
+    }
+    si (str_igual(nombre, "__f64_suma")) { f64_dos(c, 88) retornar 1 }
+    si (str_igual(nombre, "__f64_resta")) { f64_dos(c, 92) retornar 1 }
+    si (str_igual(nombre, "__f64_mul")) { f64_dos(c, 89) retornar 1 }
+    si (str_igual(nombre, "__f64_div")) { f64_dos(c, 94) retornar 1 }
+    si (str_igual(nombre, "__f64_menor")) {
+        dos_argumentos(c)
+        e5(c, 102, 72, 15, 110, 192)
+        e5(c, 102, 72, 15, 110, 201)
+        e4(c, 102, 15, 46, 193)
+        e3(c, 15, 146, 192)
+        e3(c, 15, 182, 192)
+        retornar 1
+    }
+    retornar 0
+}
+
+funcion llamada(c, nombre) {
+    si (intrinseco(c, nombre)) { retornar 0 }
+    sea f = buscar_funcion(c, nombre)
+    si (f == 0) { error_en(c, str_concatenar("función desconocida ", nombre)) }
+    sea n = argumentos(c)
+    si (n != __cargar64(f + 16)) {
+        error_en(c, str_concatenar("cantidad de argumentos incorrecta en ", nombre))
+    }
+    e1(c, 232)
+    ref_etiqueta(c, __cargar64(f + 8))
+    si (n > 0) {
+        e3(c, 72, 129, 196)
+        e32(c, n * 8)
+    }
+    retornar 0
+}
+
+funcion primaria(c) {
+    sea tipo = tok_tipo(c)
+    si (tipo == 2) {
+        cargar_inmediato(c, numero_literal(__cargar64(avanzar(c) + 8)))
+        retornar 0
+    }
+    si (tipo == 3) {
+        sea d = literal(c, __cargar64(avanzar(c) + 8))
+        e1(c, 184)
+        ref_dato(c, d)
+        retornar 0
+    }
+    si (tomar(c, "verdadero")) { cargar_inmediato(c, 1) retornar 0 }
+    si (tomar(c, "falso")) { cargar_inmediato(c, 0) retornar 0 }
+    si (tomar(c, "(")) {
+        expresion(c)
+        requerir(c, ")")
+        retornar 0
+    }
+    si (tipo == 1) {
+        sea nombre = __cargar64(avanzar(c) + 8)
+        si (ver(c, "(")) {
+            llamada(c, nombre)
+            retornar 0
+        }
+        cargar_local(c, buscar_variable(c, nombre))
+        retornar 0
+    }
+    error_en(c, "expresión inválida")
+    retornar 0
+}
+
+funcion unaria(c) {
+    si (tomar(c, "-")) {
+        unaria(c)
+        e3(c, 72, 247, 216)                                    // neg rax
+        retornar 0
+    }
+    si (tomar(c, "no")) {
+        unaria(c)
+        e3(c, 72, 133, 192)
+        e3(c, 15, 148, 192)
+        e3(c, 15, 182, 192)
+        retornar 0
+    }
+    primaria(c)
+    retornar 0
+}
+
+funcion producto(c) {
+    unaria(c)
+    sea seguir = 1
+    mientras (seguir) {
+        si (ver(c, "*") o ver(c, "/") o ver(c, "%")) {
+            sea op = str_byte(__cargar64(avanzar(c) + 8), 0)
+            empujar(c)
+            unaria(c)
+            rax_a_rcx_y_sacar(c)
+            si (op == 42) { e4(c, 72, 15, 175, 193) }
+            si (op == 47) { e5(c, 72, 153, 72, 247, 249) }
+            si (op == 37) {
+                e5(c, 72, 153, 72, 247, 249)
+                e3(c, 72, 137, 208)
+            }
+        } sino {
+            seguir = 0
+        }
+    }
+    retornar 0
+}
+
+funcion suma(c) {
+    producto(c)
+    sea seguir = 1
+    mientras (seguir) {
+        si (ver(c, "+") o ver(c, "-")) {
+            sea op = str_byte(__cargar64(avanzar(c) + 8), 0)
+            empujar(c)
+            producto(c)
+            rax_a_rcx_y_sacar(c)
+            si (op == 43) { e3(c, 72, 1, 200) } sino { e3(c, 72, 41, 200) }
+        } sino {
+            seguir = 0
+        }
+    }
+    retornar 0
+}
+
+funcion comparar(c, codigo) {
+    rax_a_rcx_y_sacar(c)
+    e3(c, 72, 57, 200)
+    e3(c, 15, codigo, 192)
+    e3(c, 15, 182, 192)
+    retornar 0
+}
+
+funcion comparacion(c) {
+    suma(c)
+    sea seguir = 1
+    mientras (seguir) {
+        si (ver(c, "<") o ver(c, "<=") o ver(c, ">") o ver(c, ">=")) {
+            sea lex = __cargar64(avanzar(c) + 8)
+            empujar(c)
+            suma(c)
+            sea codigo = 156
+            si (str_igual(lex, "<=")) { codigo = 158 }
+            si (str_igual(lex, ">")) { codigo = 159 }
+            si (str_igual(lex, ">=")) { codigo = 157 }
+            comparar(c, codigo)
+        } sino {
+            seguir = 0
+        }
+    }
+    retornar 0
+}
+
+funcion igualdad(c) {
+    comparacion(c)
+    sea seguir = 1
+    mientras (seguir) {
+        si (ver(c, "==") o ver(c, "!=")) {
+            sea lex = __cargar64(avanzar(c) + 8)
+            empujar(c)
+            comparacion(c)
+            si (str_igual(lex, "==")) { comparar(c, 148) } sino { comparar(c, 149) }
+        } sino {
+            seguir = 0
+        }
+    }
+    retornar 0
+}
+
+// y / o con cortocircuito; el resultado se normaliza a 0 o 1.
+funcion logica(c, operador, siguiente) {
+    sea fin = nueva_etiqueta(c)
+    e3(c, 72, 133, 192)
+    si (operador == 1) { e2(c, 15, 132) } sino { e2(c, 15, 133) }
+    ref_etiqueta(c, fin)
+    si (siguiente == 1) { igualdad(c) } sino { conjuncion(c) }
+    definir_etiqueta(c, fin)
+    e3(c, 72, 133, 192)
+    e3(c, 15, 149, 192)
+    e3(c, 15, 182, 192)
+    retornar 0
+}
+
+funcion conjuncion(c) {
+    igualdad(c)
+    mientras (tomar(c, "y")) { logica(c, 1, 1) }
+    retornar 0
+}
+
+funcion expresion(c) {
+    conjuncion(c)
+    mientras (tomar(c, "o")) { logica(c, 2, 2) }
+    retornar 0
+}
+
+// ── Sentencias ────────────────────────────────────────────────────────────
+
+funcion epilogo(c) {
+    e3(c, 72, 137, 236)                                        // mov rsp, rbp
+    e2(c, 93, 195)                                             // pop rbp; ret
+    retornar 0
+}
+
+funcion bloque(c) {
+    requerir(c, "{")
+    sea locales = __cargar64(c + 56)
+    sea marca = vec_largo(locales)
+    mientras (ver(c, "}") == 0) {
+        si (tok_tipo(c) == 5) { error_en(c, "falta '}'") }
+        sentencia(c)
+    }
+    requerir(c, "}")
+    __guardar64(locales, marca)
+    retornar 0
+}
+
+funcion sentencia(c) {
+    si (tomar(c, ";")) { retornar 0 }
+    si (tomar(c, "sea")) {
+        sea nombre = requerir_ident(c)
+        saltar_tipo(c)
+        requerir(c, "=")
+        expresion(c)
+        guardar_local(c, declarar_local(c, nombre))
+        tomar(c, ";")
+        retornar 0
+    }
+    si (tomar(c, "si")) {
+        requerir(c, "(")
+        expresion(c)
+        requerir(c, ")")
+        sea otro = nueva_etiqueta(c)
+        sea fin = nueva_etiqueta(c)
+        e5(c, 72, 133, 192, 15, 132)
+        ref_etiqueta(c, otro)
+        bloque(c)
+        e1(c, 233)
+        ref_etiqueta(c, fin)
+        definir_etiqueta(c, otro)
+        si (tomar(c, "sino")) { bloque(c) }
+        definir_etiqueta(c, fin)
+        retornar 0
+    }
+    si (tomar(c, "mientras")) {
+        sea inicio = nueva_etiqueta(c)
+        sea fin = nueva_etiqueta(c)
+        definir_etiqueta(c, inicio)
+        requerir(c, "(")
+        expresion(c)
+        requerir(c, ")")
+        e5(c, 72, 133, 192, 15, 132)
+        ref_etiqueta(c, fin)
+        bloque(c)
+        e1(c, 233)
+        ref_etiqueta(c, inicio)
+        definir_etiqueta(c, fin)
+        retornar 0
+    }
+    si (tomar(c, "retornar")) {
+        si (ver(c, "}") o ver(c, ";")) { cargar_inmediato(c, 0) } sino { expresion(c) }
+        tomar(c, ";")
+        epilogo(c)
+        retornar 0
+    }
+    si (ver(c, "mostrar") y str_igual(tok_siguiente_lexema(c), "(")) {
+        avanzar(c)
+        llamada(c, "rt_mostrar")
+        tomar(c, ";")
+        retornar 0
+    }
+    si (tok_tipo(c) == 1 y str_igual(tok_siguiente_lexema(c), "=")) {
+        sea nombre = __cargar64(avanzar(c) + 8)
+        avanzar(c)
+        expresion(c)
+        guardar_local(c, buscar_variable(c, nombre))
+        tomar(c, ";")
+        retornar 0
+    }
+    expresion(c)
+    tomar(c, ";")
+    retornar 0
+}
+
+// Prólogo con reserva de marco; devuelve la posición del tamaño a parchear.
+funcion prologo(c) {
+    e4(c, 85, 72, 137, 229)                                    // push rbp; mov rbp, rsp
+    e3(c, 72, 129, 236)                                        // sub rsp, imm32
+    sea posicion = posicion_codigo(c)
+    e32(c, 0)
+    retornar posicion
+}
+
+funcion cerrar_marco(c, posicion) {
+    sea tamano = __cargar64(c + 64) * 8
+    si (tamano % 16 != 0) { tamano = tamano + 8 }
+    parchear32(ctx_codigo(c), posicion, tamano)
+    retornar 0
+}
+
+// funcion nombre(p1, p2: tipo, ...): tipo { ... }
+// Se emite en línea dentro del programa principal, saltándola con un jmp.
+funcion definicion_funcion(c) {
+    sea nombre = requerir_ident(c)
+    sea f = buscar_funcion(c, nombre)
+    sea saltar = nueva_etiqueta(c)
+    e1(c, 233)
+    ref_etiqueta(c, saltar)
+    // Guardar el estado del programa principal.
+    sea locales = __cargar64(c + 56)
+    sea marca = vec_largo(locales)
+    sea n_principal = __cargar64(c + 64)
+    sea base_principal = __cargar64(c + 88)
+    __guardar64(c + 88, marca)
+    __guardar64(c + 64, 0)
+    definir_etiqueta(c, __cargar64(f + 8))
+    sea posicion = prologo(c)
+    requerir(c, "(")
+    sea nombres = vec_nuevo()
+    si (ver(c, ")") == 0) {
+        vec_agregar(nombres, requerir_ident(c))
+        saltar_tipo(c)
+        mientras (tomar(c, ",")) {
+            vec_agregar(nombres, requerir_ident(c))
+            saltar_tipo(c)
+        }
+    }
+    requerir(c, ")")
+    saltar_tipo(c)
+    sea n = vec_largo(nombres)
+    sea i = 0
+    mientras (i < n) {
+        declarar_variable(c, vec_obtener(nombres, i), 16 + (n - 1 - i) * 8)
+        i = i + 1
+    }
+    vec_liberar(nombres)
+    bloque(c)
+    cargar_inmediato(c, 0)
+    epilogo(c)
+    cerrar_marco(c, posicion)
+    // Restaurar el programa principal.
+    __guardar64(locales, marca)
+    __guardar64(c + 64, n_principal)
+    __guardar64(c + 88, base_principal)
+    definir_etiqueta(c, saltar)
+    retornar 0
+}
+
+funcion compilar(c) {
+    registrar_funciones(c)
+    sea principal = nueva_etiqueta(c)
+    // _start: guarda rsp (argc/argv), llama al programa y termina.
+    e3(c, 72, 137, 224)
+    e4(c, 72, 137, 4, 37)
+    ref_global(c, 504)
+    e1(c, 232)
+    ref_etiqueta(c, principal)
+    e3(c, 72, 137, 199)                                        // mov rdi, rax
+    e3(c, 72, 199, 192)                                        // mov rax, 60
+    e32(c, 60)
+    e2(c, 15, 5)
+    definir_etiqueta(c, principal)
+    sea marco = prologo(c)
+    mientras (tok_tipo(c) != 5) {
+        si (tomar(c, "funcion")) { definicion_funcion(c) } sino { sentencia(c) }
+    }
+    cargar_inmediato(c, 0)
+    epilogo(c)
+    cerrar_marco(c, marco)
+    retornar 0
+}
+
+// ── Enlazado y ELF ────────────────────────────────────────────────────────
+
+funcion empaquetar(c) {
+    sea base = 4194304
+    sea codigo = ctx_codigo(c)
+    sea datos = ctx_datos(c)
+    sea inicio_datos = 120 + str_largo(codigo)
+    mientras (inicio_datos % 16 != 0) { inicio_datos = inicio_datos + 1 }
+    sea fin_datos = inicio_datos + str_largo(datos)
+    sea inicio_globales = fin_datos
+    mientras (inicio_globales % 16 != 0) { inicio_globales = inicio_globales + 1 }
+    // Arreglos de código.
+    sea etiquetas = __cargar64(c + 40)
+    sea arreglos = __cargar64(c + 32)
+    sea i = 0
+    mientras (i < vec_largo(arreglos)) {
+        sea a = vec_obtener(arreglos, i)
+        sea posicion = __cargar64(a)
+        sea tipo = __cargar64(a + 8)
+        sea valor = __cargar64(a + 16)
+        si (tipo == 0) {
+            sea destino = vec_obtener(etiquetas, valor)
+            si (destino < 0) { rt_panico("etiqueta sin definir") }
+            parchear32(codigo, posicion, destino - (posicion + 4))
+        }
+        si (tipo == 1) { parchear32(codigo, posicion, base + inicio_datos + valor) }
+        si (tipo == 2) { parchear32(codigo, posicion, base + inicio_globales + valor) }
+        i = i + 1
+    }
+    // Punteros internos de los textos literales.
+    sea reubicaciones = __cargar64(c + 80)
+    i = 0
+    mientras (i < vec_largo(reubicaciones)) {
+        sea campo = vec_obtener(reubicaciones, i)
+        parchear64(datos, campo, base + inicio_datos + campo + 16)
+        i = i + 1
+    }
+    sea elf = str_nuevo(fin_datos + 16)
+    bytes_le(elf, 1179403647, 4)                               // \x7fELF
+    bytes_le(elf, 2, 1)
+    bytes_le(elf, 1, 1)
+    bytes_le(elf, 1, 1)
+    bytes_le(elf, 0, 9)
+    bytes_le(elf, 2, 2)                                        // ET_EXEC
+    bytes_le(elf, 62, 2)                                       // x86-64
+    bytes_le(elf, 1, 4)
+    bytes_le(elf, base + 120, 8)                               // entrada
+    bytes_le(elf, 64, 8)
+    bytes_le(elf, 0, 8)
+    bytes_le(elf, 0, 4)
+    bytes_le(elf, 64, 2)
+    bytes_le(elf, 56, 2)
+    bytes_le(elf, 1, 2)
+    bytes_le(elf, 0, 6)
+    bytes_le(elf, 1, 4)                                        // PT_LOAD
+    bytes_le(elf, 7, 4)                                        // RWX
+    bytes_le(elf, 0, 8)
+    bytes_le(elf, base, 8)
+    bytes_le(elf, base, 8)
+    bytes_le(elf, fin_datos, 8)
+    bytes_le(elf, inicio_globales + 512, 8)
+    bytes_le(elf, 4096, 8)
+    str_agregar(elf, codigo)
+    mientras (str_largo(elf) < inicio_datos) { str_agregar_byte(elf, 0) }
+    str_agregar(elf, datos)
+    retornar elf
+}
+
+// ── Programa ──────────────────────────────────────────────────────────────
+
+si (rt_argc() < 4) {
+    rt_panico("uso: cforge-self -o salida archivo.cfv [más archivos .cfv]")
+}
+si (str_igual(rt_argumento(1), "-o") == 0) {
+    rt_panico("uso: cforge-self -o salida archivo.cfv [más archivos .cfv]")
+}
+sea salida = rt_argumento(2)
+sea fuente = str_nuevo(1048576)
+sea indice = 3
+mientras (indice < rt_argc()) {
+    str_agregar(fuente, archivo_leer(rt_argumento(indice)))
+    str_agregar_byte(fuente, 10)
+    indice = indice + 1
+}
+sea contexto = ctx_nuevo(tokenizar(fuente))
+compilar(contexto)
+sea ejecutable = empaquetar(contexto)
+archivo_escribir(salida, ejecutable)
+sys_permisos(str_c(salida), 493)
+sea mensaje = str_concatenar("C-Forge (autoalojado) creó: ", salida)
+str_agregar(mensaje, " (")
+str_agregar(mensaje, str_desde_entero(str_largo(ejecutable)))
+str_agregar(mensaje, " bytes, sin libc)")
+mostrar(mensaje)

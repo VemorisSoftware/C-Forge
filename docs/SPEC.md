@@ -368,8 +368,30 @@ Primer hito de autoalojamiento: `tests/nativo/05_lexer.cfv` es el lexer de
 C-Forge compilado por este backend; produce exactamente los mismos tokens que
 el lexer Core sobre las fuentes del compilador (`make nativo-check`, en CI).
 
-Siguiente: el parser en el dialecto nativo, luego el generador de código, y
-finalmente que `x64_nativo.cfv` se compile a sí mismo.
+### Hito: compilador autoalojado (Linux x86-64) ✅
+
+`bootstrap/nativo/cforge_self.cfv` es un compilador de una sola pasada escrito
+en el dialecto nativo: el parser de descenso recursivo emite código x86-64
+mientras lee los tokens, sin árbol de sintaxis, y empaqueta el ELF.
+
+`make autoalojado-check` (en CI):
+
+1. `x64_nativo` construye **Stage 1** a partir de `runtime/*.cfv`,
+   `lexer.cfv` y `cforge_self.cfv`.
+2. Stage 1 se compila a sí mismo → **Stage 2**, con entorno vacío.
+3. Stage 2 se compila a sí mismo → **Stage 3**.
+4. Stage 2 y Stage 3 son idénticos byte por byte (≈48 KB, estáticos, sin
+   libc). Stage 3 vuelve a compilar y pasar todas las pruebas nativas.
+
+Desde Stage 1 en adelante no interviene C++, libc, enlazador ni ensamblador.
+C++ queda solo en Stage 0, el paso de arranque.
+
+**Alcance honesto:** el compilador autoalojado compila el *dialecto nativo*
+(enteros de 64 bits, funciones, recursión, condiciones, ciclos, textos
+literales e intrínsecos). El lenguaje C-Forge completo (clases, mapas,
+listas literales, closures, excepciones, `extern`) todavía se ejecuta con
+`cforgev.cpp`. Retirar ese binario requiere llevar cada característica del
+lenguaje al compilador autoalojado, sobre el runtime de `runtime/`.
 
 Cuando el compilador Core compile sus propias fuentes con su backend ELF y el
 resultado sea idéntico byte por byte (Stage 2 = Stage 3, sin gcc ni clang en

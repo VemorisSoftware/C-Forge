@@ -289,7 +289,8 @@ nativo-check:
 		bootstrap/nativo/x64_nativo.cfv bootstrap/nativo/driver_nativo.cfv > "$$dir/nativo.cfv"; \
 	"$$dir/stage0" "$$dir/nativo.cfv" -o "$$dir/nativo" >/dev/null; \
 	for prueba in 01_memoria 02_textos 03_listas 04_prueba_de_fuego 05_lexer; do \
-		env PATH=/nonexistent "$$dir/nativo" -o "$$dir/$$prueba" $(RUNTIME_NATIVO) tests/nativo/$$prueba.cfv >/dev/null; \
+		extra=""; [ "$$prueba" = 05_lexer ] && extra=bootstrap/nativo/lexer.cfv; \
+		env PATH=/nonexistent "$$dir/nativo" -o "$$dir/$$prueba" $(RUNTIME_NATIVO) $$extra tests/nativo/$$prueba.cfv >/dev/null; \
 		if ldd "$$dir/$$prueba" >/dev/null 2>&1; then echo "  ✗ $$prueba enlaza librerías dinámicas"; exit 1; fi; \
 	done; \
 	for prueba in 01_memoria 02_textos 03_listas; do \
@@ -307,6 +308,32 @@ nativo-check:
 		cmp -s "$$dir/lex.nativo" "$$dir/lex.ref" || { echo "  ✗ el lexer nativo difiere en $$fuente"; exit 1; }; \
 	done; \
 	echo "  ✓ Backend nativo ELF sin libc: memoria, textos, listas, archivos, f64 y lexer autoalojado"
+
+## Autoalojamiento: cforge_self.cfv (compilador de una pasada escrito en el
+## dialecto nativo) se compila a sí mismo. Stage 1 lo construye x64_nativo;
+## Stage 2 y Stage 3 los construye el propio compilador, con un entorno vacío
+## y sin compiladores en el PATH. Stage 2 y Stage 3 deben ser idénticos.
+FUENTES_AUTOALOJADO := $(RUNTIME_NATIVO) bootstrap/nativo/lexer.cfv bootstrap/nativo/cforge_self.cfv
+autoalojado-check:
+	@set -e; dir=$$(mktemp -d /tmp/cforge-self.XXXXXX); \
+	$(CXX) -std=c++20 -O2 bootstrap/stage0/cforge_bootstrap.cpp -o "$$dir/stage0"; \
+	cat bootstrap/core_lexer.cfv bootstrap/core_ast.cfv bootstrap/core_parser.cfv \
+		bootstrap/nativo/x64_nativo.cfv bootstrap/nativo/driver_nativo.cfv > "$$dir/nativo.cfv"; \
+	"$$dir/stage0" "$$dir/nativo.cfv" -o "$$dir/nativo" >/dev/null; \
+	"$$dir/nativo" -o "$$dir/stage1" $(FUENTES_AUTOALOJADO) >/dev/null; \
+	env -i "$$dir/stage1" -o "$$dir/stage2" $(FUENTES_AUTOALOJADO) >/dev/null; \
+	env -i "$$dir/stage2" -o "$$dir/stage3" $(FUENTES_AUTOALOJADO) >/dev/null; \
+	cmp "$$dir/stage2" "$$dir/stage3"; \
+	if ldd "$$dir/stage3" >/dev/null 2>&1; then echo "  ✗ stage3 enlaza librerías dinámicas"; exit 1; fi; \
+	for prueba in 01_memoria 02_textos 03_listas; do \
+		env -i "$$dir/stage3" -o "$$dir/$$prueba" $(RUNTIME_NATIVO) tests/nativo/$$prueba.cfv >/dev/null; \
+		"$$dir/$$prueba" | diff -u tests/nativo/$$prueba.salida -; \
+	done; \
+	env -i "$$dir/stage3" -o "$$dir/fuego" $(RUNTIME_NATIVO) tests/nativo/04_prueba_de_fuego.cfv >/dev/null; \
+	"$$dir/fuego" tests/nativo/fixtures/entrada.cfv "$$dir/reporte" >/dev/null; \
+	diff -u tests/nativo/fixtures/reporte.esperado "$$dir/reporte"; \
+	sha256sum "$$dir/stage2" "$$dir/stage3" | sed "s#$$dir/##"; \
+	echo "  ✓ C-Forge se compila a sí mismo: Stage 2 = Stage 3, sin libc ni C++"
 
 ## Verificar los backends Core B6.8 sin toolchain durante la emisión.
 backend-core-check: backend-core-bundle
