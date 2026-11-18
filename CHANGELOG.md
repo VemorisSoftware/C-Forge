@@ -2,6 +2,19 @@
 
 Sitio oficial: [c-forge.org](https://c-forge.org)
 
+## 3.7.3 — extern C + idioma del programa
+
+- **FFI con C**: `extern "libreria" funcion nombre(p: tipo): tipo` carga la
+  librería (dlopen / LoadLibrary) y llama con la ABI de C de la plataforma.
+  Tipos: entero, largo, numero, texto, puntero, booleano, vacio (y sus nombres
+  en inglés). `"libc"` y `"libm"` se resuelven solos. Hasta 8 parámetros, sin
+  variádicas. Prueba `24_extern_c.cfv`.
+- **Idioma del programa**: si predominan las palabras clave en inglés, los
+  booleanos/nulo se muestran como true/false/null y los errores comunes en
+  inglés. Prueba `25_idioma_ingles.cfv`.
+- **docs/SPEC.md**: especificación oficial con estado real de cada pieza.
+- Ejemplos de `extern` en c-forge.org (Aprende / Learn).
+
 ## 3.7.2 — sintaxis bilingüe + nuevo c-forge.org
 
 - **Sintaxis bilingüe**: las palabras clave en inglés (`let`, `function`,
