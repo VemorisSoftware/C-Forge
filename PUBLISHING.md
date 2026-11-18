@@ -15,7 +15,7 @@ git init
 git add .
 git commit -m "Release C-Forge 3.2.0"
 git branch -M main
-git remote add origin https://github.com/VemorisGroup/C-Forge.git
+git remote add origin https://github.com/VemorisSoftware/C-Forge.git
 git push -u origin main
 ```
 
