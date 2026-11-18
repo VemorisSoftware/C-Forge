@@ -276,6 +276,38 @@ bootstrap-check: bootstrap-bundle
 	test "$$($$dir/excepciones)" = "capturado: saldo insuficiente"; \
 	echo "  ✓ Stage 2 y Stage 3 son idénticos; compilador Core autoalojado"
 
+## Backend nativo x86-64 / ELF sin libc + runtime propio (runtime/*.cfv).
+## Compila cada prueba de tests/nativo a un ELF estático, verifica que no
+## enlace nada dinámico, la ejecuta y compara su salida. El lexer nativo debe
+## producir exactamente los mismos tokens que el lexer Core.
+RUNTIME_NATIVO := runtime/sys_linux.cfv runtime/mem.cfv runtime/str.cfv \
+	runtime/vec.cfv runtime/io.cfv runtime/f64.cfv
+nativo-check:
+	@set -e; dir=$$(mktemp -d /tmp/cforge-nativo.XXXXXX); \
+	$(CXX) -std=c++20 -O2 bootstrap/stage0/cforge_bootstrap.cpp -o "$$dir/stage0"; \
+	cat bootstrap/core_lexer.cfv bootstrap/core_ast.cfv bootstrap/core_parser.cfv \
+		bootstrap/nativo/x64_nativo.cfv bootstrap/nativo/driver_nativo.cfv > "$$dir/nativo.cfv"; \
+	"$$dir/stage0" "$$dir/nativo.cfv" -o "$$dir/nativo" >/dev/null; \
+	for prueba in 01_memoria 02_textos 03_listas 04_prueba_de_fuego 05_lexer; do \
+		env PATH=/nonexistent "$$dir/nativo" -o "$$dir/$$prueba" $(RUNTIME_NATIVO) tests/nativo/$$prueba.cfv >/dev/null; \
+		if ldd "$$dir/$$prueba" >/dev/null 2>&1; then echo "  ✗ $$prueba enlaza librerías dinámicas"; exit 1; fi; \
+	done; \
+	for prueba in 01_memoria 02_textos 03_listas; do \
+		"$$dir/$$prueba" > "$$dir/$$prueba.real"; \
+		diff -u tests/nativo/$$prueba.salida "$$dir/$$prueba.real"; \
+	done; \
+	"$$dir/04_prueba_de_fuego" tests/nativo/fixtures/entrada.cfv "$$dir/reporte" > "$$dir/04.real"; \
+	diff -u tests/nativo/04_prueba_de_fuego.salida "$$dir/04.real"; \
+	diff -u tests/nativo/fixtures/reporte.esperado "$$dir/reporte"; \
+	cat bootstrap/core_lexer.cfv bootstrap/nativo/referencia_lexer.cfv > "$$dir/ref.cfv"; \
+	"$$dir/stage0" "$$dir/ref.cfv" -o "$$dir/ref" >/dev/null; \
+	for fuente in bootstrap/core_parser.cfv bootstrap/nativo/x64_nativo.cfv $(RUNTIME_NATIVO); do \
+		"$$dir/05_lexer" "$$fuente" "$$dir/lex.nativo" >/dev/null; \
+		"$$dir/ref" "$$fuente" "$$dir/lex.ref"; \
+		cmp -s "$$dir/lex.nativo" "$$dir/lex.ref" || { echo "  ✗ el lexer nativo difiere en $$fuente"; exit 1; }; \
+	done; \
+	echo "  ✓ Backend nativo ELF sin libc: memoria, textos, listas, archivos, f64 y lexer autoalojado"
+
 ## Verificar los backends Core B6.8 sin toolchain durante la emisión.
 backend-core-check: backend-core-bundle
 	@set -e; dir=$$(mktemp -d /tmp/cforge-backend-core.XXXXXX); \

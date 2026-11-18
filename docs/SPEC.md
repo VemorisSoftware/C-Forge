@@ -342,6 +342,35 @@ Lo que falta en los backends directos para compilar el propio compilador:
 5. **Formato de números decimales** (`a_texto(3.5)`).
 6. **Despacho de métodos por nombre** y `cualquiera` en tiempo de ejecución.
 
+### Avance: backend nativo con runtime propio (Linux x86-64) ✅
+
+`bootstrap/nativo/x64_nativo.cfv` es un backend nuevo, escrito en C-Forge, que
+genera ELF estáticos **sin libc, sin enlazador y sin ensamblador**. A diferencia
+de los backends Core anteriores, tiene marcos de pila por función (recursión
+real) y un runtime escrito en C-Forge sobre intrínsecos mínimos:
+
+| Archivo | Contenido |
+|---|---|
+| `runtime/sys_linux.cfv` | Única capa que conoce el sistema: `read`, `write`, `open`, `close`, `mmap`, `munmap`, `exit`, argumentos. Portar = escribir `sys_macos.cfv` / `sys_windows.cfv`. |
+| `runtime/mem.cfv` | Asignador propio: arenas de 64 MiB con `mmap` + listas libres por clase (16 B – 32 KiB); bloques grandes con `mmap`/`munmap` directo. |
+| `runtime/str.cfv` | Textos que crecen, concatenación, rebanado, comparación, enteros → texto. |
+| `runtime/vec.cfv` | Listas dinámicas con verificación de límites. |
+| `runtime/io.cfv` | `mostrar`, lectura y escritura de archivos, argumentos. |
+| `runtime/f64.cfv` | Decimales → texto. |
+
+Intrínsecos del dialecto nativo: `__syscall`, `__cargar64`, `__cargar8`,
+`__guardar64`, `__guardar8`, `__y_bits`, `__o_bits`, `__xo_bits`,
+`__desplazar_izq`, `__desplazar_der`, `__globales`, `__argc`, `__argv`,
+`__f64_desde_entero`, `__f64_a_entero`, `__f64_suma`, `__f64_resta`,
+`__f64_mul`, `__f64_div`, `__f64_menor`.
+
+Primer hito de autoalojamiento: `tests/nativo/05_lexer.cfv` es el lexer de
+C-Forge compilado por este backend; produce exactamente los mismos tokens que
+el lexer Core sobre las fuentes del compilador (`make nativo-check`, en CI).
+
+Siguiente: el parser en el dialecto nativo, luego el generador de código, y
+finalmente que `x64_nativo.cfv` se compile a sí mismo.
+
 Cuando el compilador Core compile sus propias fuentes con su backend ELF y el
 resultado sea idéntico byte por byte (Stage 2 = Stage 3, sin gcc ni clang en
 el `PATH`), C-Forge será autónomo en Linux; luego Mach-O y PE.

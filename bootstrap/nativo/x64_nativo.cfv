@@ -1,0 +1,799 @@
+// Backend nativo x86-64 / ELF de C-Forge (Linux).
+//
+// Compila el subconjunto "Core nativo" a código máquina y lo empaqueta en un
+// ejecutable ELF estático: sin libc, sin enlazador, sin ensamblador externo.
+//
+// Modelo de ejecución
+//   - Todo valor es un entero de 64 bits (números, punteros, booleanos).
+//   - Cada función tiene su propio marco en la pila: la recursión funciona.
+//   - Argumentos: el llamador los apila de izquierda a derecha; el resultado
+//     vuelve en rax. Los locales viven en [rbp - 8k].
+//   - Los textos literales son objetos estáticos con la misma forma que los
+//     textos del runtime: [largo][capacidad][datos][propio=0] + bytes.
+//   - El runtime (runtime/*.cfv) se escribe en C-Forge sobre intrínsecos
+//     __syscall, __cargar64/8, __guardar64/8, operaciones de bits y f64.
+
+estructura MarcaNativa {
+    posicion: numero
+    tipo: texto
+    etiqueta: numero
+    valor: numero
+}
+
+estructura FuncionNativa {
+    nombre: texto
+    etiqueta: numero
+    parametros: numero
+}
+
+estructura VariableNativa {
+    nombre: texto
+    desplazamiento: numero
+}
+
+estructura ContextoNativo {
+    codigo: lista
+    datos: lista
+    marcas: lista
+    etiquetas: lista
+    funciones: lista
+    ambitos: lista
+    locales: numero
+    literales: lista
+    literales_pos: lista
+}
+
+// ── Utilidades de bytes ────────────────────────────────────────────────────
+
+funcion potencia_dos_nativo(n: numero): numero {
+    sea r: numero = 1
+    sea i: numero = 0
+    mientras (i < n) {
+        r = r * 2
+        i = i + 1
+    }
+    retornar r
+}
+
+funcion agregar_le_nativo(bytes: lista, valor_inicial: numero, cantidad: numero) {
+    sea valor: numero = valor_inicial
+    si (valor < 0) {
+        valor = valor + potencia_dos_nativo(cantidad * 8)
+    }
+    sea i: numero = 0
+    mientras (i < cantidad) {
+        sea byte: numero = valor % 256
+        agregar(bytes, byte)
+        valor = (valor - byte) / 256
+        i = i + 1
+    }
+}
+
+funcion emitir_nativo(ctx: cualquiera, bytes: lista) {
+    sea i: numero = 0
+    mientras (i < longitud(bytes)) {
+        agregar(ctx.codigo, bytes[i])
+        i = i + 1
+    }
+}
+
+funcion emitir32_nativo(ctx: cualquiera, valor: numero) {
+    agregar_le_nativo(ctx.codigo, valor, 4)
+}
+
+funcion nueva_etiqueta_nativo(ctx: cualquiera): numero {
+    agregar(ctx.etiquetas, -1)
+    retornar longitud(ctx.etiquetas) - 1
+}
+
+funcion definir_etiqueta_nativo(ctx: cualquiera, etiqueta: numero) {
+    // Las posiciones se guardan como marcas "def" y se resuelven al final.
+    agregar(ctx.marcas, MarcaNativa(longitud(ctx.codigo), "def", etiqueta, 0))
+}
+
+// rel32 hacia una etiqueta (call, jmp, jcc): 4 bytes a parchear.
+funcion referencia_etiqueta_nativo(ctx: cualquiera, etiqueta: numero) {
+    agregar(ctx.marcas, MarcaNativa(longitud(ctx.codigo), "rel", etiqueta, 0))
+    emitir32_nativo(ctx, 0)
+}
+
+// Dirección absoluta de 32 bits dentro de la zona de datos.
+funcion referencia_dato_nativo(ctx: cualquiera, desplazamiento: numero) {
+    agregar(ctx.marcas, MarcaNativa(longitud(ctx.codigo), "dato", -1, desplazamiento))
+    emitir32_nativo(ctx, 0)
+}
+
+// Dirección absoluta de 32 bits dentro de la tabla de globales (BSS).
+funcion referencia_global_nativo(ctx: cualquiera, desplazamiento: numero) {
+    agregar(ctx.marcas, MarcaNativa(longitud(ctx.codigo), "global", -1, desplazamiento))
+    emitir32_nativo(ctx, 0)
+}
+
+// ── Nombres y literales ───────────────────────────────────────────────────
+
+funcion nombre_sin_tipo_nativo(valor: texto): texto {
+    sea salida: texto = ""
+    sea i: numero = 0
+    mientras (i < longitud(valor) y valor[i] != ":") {
+        salida = salida + valor[i]
+        i = i + 1
+    }
+    retornar salida
+}
+
+funcion valor_digito_nativo(c: texto): numero {
+    sea digitos: texto = "0123456789"
+    sea i: numero = 0
+    mientras (i < 10) {
+        si (digitos[i] == c) { retornar i }
+        i = i + 1
+    }
+    afirmar(falso, "dígito inválido '" + c + "'")
+    retornar 0
+}
+
+funcion numero_literal_nativo(valor: texto): numero {
+    sea n: numero = 0
+    sea i: numero = 0
+    mientras (i < longitud(valor)) {
+        n = n * 10 + valor_digito_nativo(valor[i])
+        i = i + 1
+    }
+    retornar n
+}
+
+// Código de un carácter (ASCII y UTF-8 vía bytes_texto).
+funcion bytes_literal_nativo(lexema: texto): lista {
+    // lexema incluye las comillas; se decodifican \n \t \r \0 \\ \" \{ \}
+    sea bytes: lista = []
+    sea crudo: lista = bytes_texto(lexema)
+    sea i: numero = 1
+    mientras (i < longitud(crudo) - 1) {
+        sea b: numero = crudo[i]
+        si (b == 92 y i + 1 < longitud(crudo) - 1) {
+            sea s: numero = crudo[i + 1]
+            si (s == 110) { agregar(bytes, 10) } sino {
+                si (s == 116) { agregar(bytes, 9) } sino {
+                    si (s == 114) { agregar(bytes, 13) } sino {
+                        si (s == 48) { agregar(bytes, 0) } sino {
+                            agregar(bytes, s)
+                        }
+                    }
+                }
+            }
+            i = i + 2
+        } sino {
+            agregar(bytes, b)
+            i = i + 1
+        }
+    }
+    retornar bytes
+}
+
+// Devuelve el desplazamiento en datos del objeto texto estático.
+funcion literal_nativo(ctx: cualquiera, lexema: texto): numero {
+    sea i: numero = 0
+    mientras (i < longitud(ctx.literales)) {
+        si (ctx.literales[i] == lexema) { retornar ctx.literales_pos[i] }
+        i = i + 1
+    }
+    // Alinear a 8 bytes.
+    mientras (longitud(ctx.datos) % 8 != 0) { agregar(ctx.datos, 0) }
+    sea inicio: numero = longitud(ctx.datos)
+    sea bytes: lista = bytes_literal_nativo(lexema)
+    agregar_le_nativo(ctx.datos, longitud(bytes), 8)     // largo
+    agregar_le_nativo(ctx.datos, longitud(bytes), 8)     // capacidad
+    agregar(ctx.marcas, MarcaNativa(-1, "puntero_dato", -1, inicio))
+    agregar_le_nativo(ctx.datos, inicio + 32, 8)          // datos (se reubica)
+    agregar_le_nativo(ctx.datos, 0, 8)                   // propio = 0 (estático)
+    sea j: numero = 0
+    mientras (j < longitud(bytes)) {
+        agregar(ctx.datos, bytes[j])
+        j = j + 1
+    }
+    agregar(ctx.datos, 0)
+    agregar(ctx.literales, lexema)
+    agregar(ctx.literales_pos, inicio)
+    retornar inicio
+}
+
+// ── Funciones y variables ─────────────────────────────────────────────────
+
+funcion buscar_funcion_nativo(ctx: cualquiera, nombre: texto): cualquiera {
+    sea i: numero = 0
+    mientras (i < longitud(ctx.funciones)) {
+        sea f: cualquiera = ctx.funciones[i]
+        si (f.nombre == nombre) { retornar f }
+        i = i + 1
+    }
+    afirmar(falso, "función desconocida '" + nombre + "'")
+    retornar ctx.funciones[0]
+}
+
+funcion entrar_ambito_nativo(ctx: cualquiera) {
+    agregar(ctx.ambitos, [])
+}
+
+funcion salir_ambito_nativo(ctx: cualquiera) {
+    sea nuevos: lista = []
+    sea i: numero = 0
+    mientras (i < longitud(ctx.ambitos) - 1) {
+        agregar(nuevos, ctx.ambitos[i])
+        i = i + 1
+    }
+    ctx.ambitos = nuevos
+}
+
+funcion declarar_local_nativo(ctx: cualquiera, nombre: texto): numero {
+    ctx.locales = ctx.locales + 1
+    sea desplazamiento: numero = 0 - ctx.locales * 8
+    agregar(ctx.ambitos[longitud(ctx.ambitos) - 1], VariableNativa(nombre, desplazamiento))
+    retornar desplazamiento
+}
+
+funcion buscar_variable_nativo(ctx: cualquiera, nombre: texto): numero {
+    sea a: numero = longitud(ctx.ambitos) - 1
+    mientras (a >= 0) {
+        sea ambito: lista = ctx.ambitos[a]
+        sea i: numero = longitud(ambito) - 1
+        mientras (i >= 0) {
+            sea v: cualquiera = ambito[i]
+            si (v.nombre == nombre) { retornar v.desplazamiento }
+            i = i - 1
+        }
+        a = a - 1
+    }
+    afirmar(falso, "variable desconocida '" + nombre + "'")
+    retornar 0
+}
+
+// mov rax, [rbp + d] / mov [rbp + d], rax
+funcion cargar_local_nativo(ctx: cualquiera, d: numero) {
+    emitir_nativo(ctx, [72, 139, 133])
+    emitir32_nativo(ctx, d)
+}
+
+funcion guardar_local_nativo(ctx: cualquiera, d: numero) {
+    emitir_nativo(ctx, [72, 137, 133])
+    emitir32_nativo(ctx, d)
+}
+
+// mov rax, imm32 (con signo)
+funcion cargar_inmediato_nativo(ctx: cualquiera, valor: numero) {
+    si (valor >= -2147483648 y valor <= 2147483647) {
+        emitir_nativo(ctx, [72, 199, 192])
+        emitir32_nativo(ctx, valor)
+        retornar 0
+    }
+    // movabs rax, imm64 (constantes positivas hasta 2^53, exactas en f64)
+    afirmar(valor > 0 y valor <= 9007199254740992, "constante fuera de rango: " + a_texto(valor))
+    sea alto: numero = 0
+    sea bajo: numero = valor
+    mientras (bajo >= 4294967296) {
+        bajo = bajo - 4294967296
+        alto = alto + 1
+    }
+    emitir_nativo(ctx, [72, 184])
+    agregar_le_nativo(ctx.codigo, bajo, 4)
+    agregar_le_nativo(ctx.codigo, alto, 4)
+    retornar 0
+}
+
+// ── Expresiones ───────────────────────────────────────────────────────────
+
+funcion emitir_argumentos_pila_nativo(ctx: cualquiera, argumentos_n: lista) {
+    sea i: numero = 0
+    mientras (i < longitud(argumentos_n)) {
+        emitir_expresion_nativo(ctx, argumentos_n[i])
+        emitir_nativo(ctx, [80])                          // push rax
+        i = i + 1
+    }
+}
+
+// Evalúa dos operandos: izquierdo en rax, derecho en rcx.
+funcion emitir_dos_nativo(ctx: cualquiera, a: cualquiera, b: cualquiera) {
+    emitir_expresion_nativo(ctx, a)
+    emitir_nativo(ctx, [80])                              // push rax
+    emitir_expresion_nativo(ctx, b)
+    emitir_nativo(ctx, [72, 137, 193])                    // mov rcx, rax
+    emitir_nativo(ctx, [88])                              // pop rax
+}
+
+funcion emitir_comparacion_nativo(ctx: cualquiera, codigo_set: numero) {
+    emitir_nativo(ctx, [72, 57, 200])                     // cmp rax, rcx
+    emitir_nativo(ctx, [15, codigo_set, 192])             // setcc al
+    emitir_nativo(ctx, [15, 182, 192])                    // movzx eax, al
+}
+
+funcion emitir_f64_dos_nativo(ctx: cualquiera, argumentos_n: lista, operacion: numero) {
+    emitir_dos_nativo(ctx, argumentos_n[0], argumentos_n[1])
+    emitir_nativo(ctx, [102, 72, 15, 110, 192])           // movq xmm0, rax
+    emitir_nativo(ctx, [102, 72, 15, 110, 201])           // movq xmm1, rcx
+    emitir_nativo(ctx, [242, 15, operacion, 193])         // op sd xmm0, xmm1
+    emitir_nativo(ctx, [102, 72, 15, 126, 192])           // movq rax, xmm0
+}
+
+funcion emitir_intrinseco_nativo(ctx: cualquiera, nombre: texto, argumentos_n: lista): booleano {
+    si (nombre == "__syscall") {
+        afirmar(longitud(argumentos_n) >= 1 y longitud(argumentos_n) <= 7, "__syscall recibe de 1 a 7 argumentos")
+        emitir_argumentos_pila_nativo(ctx, argumentos_n)
+        // pop en orden inverso: r9, r8, r10, rdx, rsi, rdi, rax
+        sea registros: lista = [[88], [95], [94], [90], [65, 90], [65, 88], [65, 89]]
+        sea i: numero = longitud(argumentos_n) - 1
+        mientras (i >= 0) {
+            emitir_nativo(ctx, registros[i])
+            i = i - 1
+        }
+        emitir_nativo(ctx, [15, 5])                       // syscall
+        retornar verdadero
+    }
+    si (nombre == "__cargar64") {
+        emitir_expresion_nativo(ctx, argumentos_n[0])
+        emitir_nativo(ctx, [72, 139, 0])                  // mov rax, [rax]
+        retornar verdadero
+    }
+    si (nombre == "__cargar8") {
+        emitir_expresion_nativo(ctx, argumentos_n[0])
+        emitir_nativo(ctx, [15, 182, 0])                  // movzx eax, byte [rax]
+        retornar verdadero
+    }
+    si (nombre == "__guardar64") {
+        emitir_dos_nativo(ctx, argumentos_n[0], argumentos_n[1])
+        emitir_nativo(ctx, [72, 137, 8])                  // mov [rax], rcx
+        retornar verdadero
+    }
+    si (nombre == "__guardar8") {
+        emitir_dos_nativo(ctx, argumentos_n[0], argumentos_n[1])
+        emitir_nativo(ctx, [136, 8])                      // mov [rax], cl
+        retornar verdadero
+    }
+    si (nombre == "__y_bits") {
+        emitir_dos_nativo(ctx, argumentos_n[0], argumentos_n[1])
+        emitir_nativo(ctx, [72, 33, 200])                 // and rax, rcx
+        retornar verdadero
+    }
+    si (nombre == "__o_bits") {
+        emitir_dos_nativo(ctx, argumentos_n[0], argumentos_n[1])
+        emitir_nativo(ctx, [72, 9, 200])                  // or rax, rcx
+        retornar verdadero
+    }
+    si (nombre == "__xo_bits") {
+        emitir_dos_nativo(ctx, argumentos_n[0], argumentos_n[1])
+        emitir_nativo(ctx, [72, 49, 200])                 // xor rax, rcx
+        retornar verdadero
+    }
+    si (nombre == "__desplazar_izq") {
+        emitir_dos_nativo(ctx, argumentos_n[0], argumentos_n[1])
+        emitir_nativo(ctx, [72, 211, 224])                // shl rax, cl
+        retornar verdadero
+    }
+    si (nombre == "__desplazar_der") {
+        emitir_dos_nativo(ctx, argumentos_n[0], argumentos_n[1])
+        emitir_nativo(ctx, [72, 211, 232])                // shr rax, cl
+        retornar verdadero
+    }
+    si (nombre == "__globales") {
+        emitir_nativo(ctx, [184])                         // mov eax, imm32
+        referencia_global_nativo(ctx, 0)
+        retornar verdadero
+    }
+    si (nombre == "__argc") {
+        emitir_nativo(ctx, [72, 139, 4, 37])              // mov rax, [abs32]
+        referencia_global_nativo(ctx, 63 * 8)
+        emitir_nativo(ctx, [72, 139, 0])                  // mov rax, [rax]
+        retornar verdadero
+    }
+    si (nombre == "__argv") {
+        emitir_expresion_nativo(ctx, argumentos_n[0])
+        emitir_nativo(ctx, [72, 137, 193])                // mov rcx, rax
+        emitir_nativo(ctx, [72, 139, 4, 37])              // mov rax, [abs32]
+        referencia_global_nativo(ctx, 63 * 8)
+        emitir_nativo(ctx, [72, 139, 68, 200, 8])         // mov rax, [rax + rcx*8 + 8]
+        retornar verdadero
+    }
+    si (nombre == "__f64_desde_entero") {
+        emitir_expresion_nativo(ctx, argumentos_n[0])
+        emitir_nativo(ctx, [242, 72, 15, 42, 192])        // cvtsi2sd xmm0, rax
+        emitir_nativo(ctx, [102, 72, 15, 126, 192])       // movq rax, xmm0
+        retornar verdadero
+    }
+    si (nombre == "__f64_a_entero") {
+        emitir_expresion_nativo(ctx, argumentos_n[0])
+        emitir_nativo(ctx, [102, 72, 15, 110, 192])       // movq xmm0, rax
+        emitir_nativo(ctx, [242, 72, 15, 44, 192])        // cvttsd2si rax, xmm0
+        retornar verdadero
+    }
+    si (nombre == "__f64_suma") { emitir_f64_dos_nativo(ctx, argumentos_n, 88) retornar verdadero }
+    si (nombre == "__f64_resta") { emitir_f64_dos_nativo(ctx, argumentos_n, 92) retornar verdadero }
+    si (nombre == "__f64_mul") { emitir_f64_dos_nativo(ctx, argumentos_n, 89) retornar verdadero }
+    si (nombre == "__f64_div") { emitir_f64_dos_nativo(ctx, argumentos_n, 94) retornar verdadero }
+    si (nombre == "__f64_menor") {
+        emitir_dos_nativo(ctx, argumentos_n[0], argumentos_n[1])
+        emitir_nativo(ctx, [102, 72, 15, 110, 192])       // movq xmm0, rax
+        emitir_nativo(ctx, [102, 72, 15, 110, 201])       // movq xmm1, rcx
+        emitir_nativo(ctx, [102, 15, 46, 193])            // ucomisd xmm0, xmm1
+        emitir_nativo(ctx, [15, 146, 192])                // setb al
+        emitir_nativo(ctx, [15, 182, 192])                // movzx eax, al
+        retornar verdadero
+    }
+    retornar falso
+}
+
+funcion emitir_llamada_nativo(ctx: cualquiera, nombre: texto, argumentos_n: lista) {
+    si (emitir_intrinseco_nativo(ctx, nombre, argumentos_n)) { retornar 0 }
+    sea f: cualquiera = buscar_funcion_nativo(ctx, nombre)
+    afirmar(
+        longitud(argumentos_n) == f.parametros,
+        nombre + " espera " + a_texto(f.parametros) + " argumentos y recibe " + a_texto(longitud(argumentos_n))
+    )
+    emitir_argumentos_pila_nativo(ctx, argumentos_n)
+    emitir_nativo(ctx, [232])                             // call rel32
+    referencia_etiqueta_nativo(ctx, f.etiqueta)
+    si (longitud(argumentos_n) > 0) {
+        emitir_nativo(ctx, [72, 129, 196])                // add rsp, imm32
+        emitir32_nativo(ctx, longitud(argumentos_n) * 8)
+    }
+}
+
+funcion emitir_expresion_nativo(ctx: cualquiera, nodo: cualquiera) {
+    si (nodo.tipo == "Numero") {
+        cargar_inmediato_nativo(ctx, numero_literal_nativo(nodo.valor))
+        retornar 0
+    }
+    si (nodo.tipo == "Booleano") {
+        si (nodo.valor == "verdadero") { cargar_inmediato_nativo(ctx, 1) } sino { cargar_inmediato_nativo(ctx, 0) }
+        retornar 0
+    }
+    si (nodo.tipo == "Texto") {
+        sea d: numero = literal_nativo(ctx, nodo.valor)
+        emitir_nativo(ctx, [184])                         // mov eax, imm32
+        referencia_dato_nativo(ctx, d)
+        retornar 0
+    }
+    si (nodo.tipo == "Identificador") {
+        cargar_local_nativo(ctx, buscar_variable_nativo(ctx, nodo.valor))
+        retornar 0
+    }
+    sea hijos: lista = nodo.hijos
+    si (nodo.tipo == "Llamada") {
+        emitir_llamada_nativo(ctx, nodo.valor, hijos)
+        retornar 0
+    }
+    si (nodo.tipo == "Unario") {
+        emitir_expresion_nativo(ctx, hijos[0])
+        si (nodo.valor == "-") {
+            emitir_nativo(ctx, [72, 247, 216])            // neg rax
+        } sino {
+            emitir_nativo(ctx, [72, 133, 192])            // test rax, rax
+            emitir_nativo(ctx, [15, 148, 192])            // sete al
+            emitir_nativo(ctx, [15, 182, 192])            // movzx eax, al
+        }
+        retornar 0
+    }
+    si (nodo.tipo == "Binario") {
+        sea op: texto = nodo.valor
+        si (op == "y" o op == "o") {
+            sea fin: numero = nueva_etiqueta_nativo(ctx)
+            emitir_expresion_nativo(ctx, hijos[0])
+            emitir_nativo(ctx, [72, 133, 192])            // test rax, rax
+            si (op == "y") { emitir_nativo(ctx, [15, 132]) } sino { emitir_nativo(ctx, [15, 133]) }
+            referencia_etiqueta_nativo(ctx, fin)          // je/jne fin (rax = 0/≠0)
+            emitir_expresion_nativo(ctx, hijos[1])
+            definir_etiqueta_nativo(ctx, fin)
+            emitir_nativo(ctx, [72, 133, 192])            // test rax, rax
+            emitir_nativo(ctx, [15, 149, 192])            // setne al
+            emitir_nativo(ctx, [15, 182, 192])            // movzx eax, al
+            retornar 0
+        }
+        emitir_dos_nativo(ctx, hijos[0], hijos[1])
+        si (op == "+") { emitir_nativo(ctx, [72, 1, 200]) retornar 0 }           // add
+        si (op == "-") { emitir_nativo(ctx, [72, 41, 200]) retornar 0 }          // sub
+        si (op == "*") { emitir_nativo(ctx, [72, 15, 175, 193]) retornar 0 }     // imul rax, rcx
+        si (op == "/") { emitir_nativo(ctx, [72, 153, 72, 247, 249]) retornar 0 } // cqo; idiv rcx
+        si (op == "%") {
+            emitir_nativo(ctx, [72, 153, 72, 247, 249])                        // cqo; idiv rcx
+            emitir_nativo(ctx, [72, 137, 208])                                 // mov rax, rdx
+            retornar 0
+        }
+        si (op == "==") { emitir_comparacion_nativo(ctx, 148) retornar 0 }
+        si (op == "!=") { emitir_comparacion_nativo(ctx, 149) retornar 0 }
+        si (op == "<") { emitir_comparacion_nativo(ctx, 156) retornar 0 }
+        si (op == "<=") { emitir_comparacion_nativo(ctx, 158) retornar 0 }
+        si (op == ">") { emitir_comparacion_nativo(ctx, 159) retornar 0 }
+        si (op == ">=") { emitir_comparacion_nativo(ctx, 157) retornar 0 }
+        afirmar(falso, "operador no soportado en el backend nativo: " + op)
+    }
+    afirmar(falso, "expresión no soportada en el backend nativo: " + nodo.tipo + " (línea " + a_texto(nodo.linea) + ")")
+}
+
+// ── Sentencias ────────────────────────────────────────────────────────────
+
+funcion emitir_bloque_nativo(ctx: cualquiera, bloque: cualquiera) {
+    entrar_ambito_nativo(ctx)
+    sea sentencias: lista = bloque.hijos
+    sea i: numero = 0
+    mientras (i < longitud(sentencias)) {
+        emitir_sentencia_nativo(ctx, sentencias[i])
+        i = i + 1
+    }
+    salir_ambito_nativo(ctx)
+}
+
+funcion emitir_retorno_nativo(ctx: cualquiera) {
+    emitir_nativo(ctx, [72, 137, 236])                    // mov rsp, rbp
+    emitir_nativo(ctx, [93, 195])                         // pop rbp; ret
+}
+
+funcion emitir_sentencia_nativo(ctx: cualquiera, nodo: cualquiera) {
+    sea hijos: lista = nodo.hijos
+    si (nodo.tipo == "Declaracion") {
+        emitir_expresion_nativo(ctx, hijos[0])
+        guardar_local_nativo(ctx, declarar_local_nativo(ctx, nombre_sin_tipo_nativo(nodo.valor)))
+        retornar 0
+    }
+    si (nodo.tipo == "Asignacion") {
+        sea objetivo: cualquiera = hijos[0]
+        afirmar(objetivo.tipo == "Identificador", "el backend nativo solo asigna variables (línea " + a_texto(nodo.linea) + ")")
+        emitir_expresion_nativo(ctx, hijos[1])
+        guardar_local_nativo(ctx, buscar_variable_nativo(ctx, objetivo.valor))
+        retornar 0
+    }
+    si (nodo.tipo == "Expresion") {
+        emitir_expresion_nativo(ctx, hijos[0])
+        retornar 0
+    }
+    si (nodo.tipo == "Mostrar") {
+        emitir_llamada_nativo(ctx, "rt_mostrar", hijos)
+        retornar 0
+    }
+    si (nodo.tipo == "Retornar") {
+        si (longitud(hijos) > 0) { emitir_expresion_nativo(ctx, hijos[0]) } sino { cargar_inmediato_nativo(ctx, 0) }
+        emitir_retorno_nativo(ctx)
+        retornar 0
+    }
+    si (nodo.tipo == "Si") {
+        sea sino_et: numero = nueva_etiqueta_nativo(ctx)
+        sea fin: numero = nueva_etiqueta_nativo(ctx)
+        emitir_expresion_nativo(ctx, hijos[0])
+        emitir_nativo(ctx, [72, 133, 192, 15, 132])       // test rax, rax; je
+        referencia_etiqueta_nativo(ctx, sino_et)
+        emitir_bloque_nativo(ctx, hijos[1])
+        emitir_nativo(ctx, [233])                         // jmp fin
+        referencia_etiqueta_nativo(ctx, fin)
+        definir_etiqueta_nativo(ctx, sino_et)
+        si (longitud(hijos) > 2) { emitir_bloque_nativo(ctx, hijos[2]) }
+        definir_etiqueta_nativo(ctx, fin)
+        retornar 0
+    }
+    si (nodo.tipo == "Mientras") {
+        sea inicio: numero = nueva_etiqueta_nativo(ctx)
+        sea fin: numero = nueva_etiqueta_nativo(ctx)
+        definir_etiqueta_nativo(ctx, inicio)
+        emitir_expresion_nativo(ctx, hijos[0])
+        emitir_nativo(ctx, [72, 133, 192, 15, 132])       // test rax, rax; je fin
+        referencia_etiqueta_nativo(ctx, fin)
+        emitir_bloque_nativo(ctx, hijos[1])
+        emitir_nativo(ctx, [233])                         // jmp inicio
+        referencia_etiqueta_nativo(ctx, inicio)
+        definir_etiqueta_nativo(ctx, fin)
+        retornar 0
+    }
+    si (nodo.tipo == "Vacia") { retornar 0 }
+    afirmar(falso, "sentencia no soportada en el backend nativo: " + nodo.tipo + " (línea " + a_texto(nodo.linea) + ")")
+}
+
+// Prólogo con reserva del marco: el tamaño se parchea al terminar la función.
+funcion emitir_cuerpo_funcion_nativo(ctx: cualquiera, etiqueta: numero, parametros: lista, cuerpo: lista) {
+    definir_etiqueta_nativo(ctx, etiqueta)
+    emitir_nativo(ctx, [85, 72, 137, 229])                // push rbp; mov rbp, rsp
+    emitir_nativo(ctx, [72, 129, 236])                    // sub rsp, imm32
+    sea marca_marco: cualquiera = MarcaNativa(longitud(ctx.codigo), "marco", -1, 0)
+    agregar(ctx.marcas, marca_marco)
+    emitir32_nativo(ctx, 0)
+    ctx.locales = 0
+    ctx.ambitos = [[]]
+    sea n: numero = longitud(parametros)
+    sea i: numero = 0
+    mientras (i < n) {
+        agregar(ctx.ambitos[0], VariableNativa(parametros[i], 16 + (n - 1 - i) * 8))
+        i = i + 1
+    }
+    sea j: numero = 0
+    mientras (j < longitud(cuerpo)) {
+        emitir_sentencia_nativo(ctx, cuerpo[j])
+        j = j + 1
+    }
+    cargar_inmediato_nativo(ctx, 0)
+    emitir_retorno_nativo(ctx)
+    // Marco alineado a 16 bytes.
+    sea tamano: numero = ctx.locales * 8
+    si (tamano % 16 != 0) { tamano = tamano + 8 }
+    marca_marco.valor = tamano
+}
+
+// ── Programa ──────────────────────────────────────────────────────────────
+
+funcion compilar_programa_nativo(programa: cualquiera): cualquiera {
+    sea ctx: cualquiera = ContextoNativo([], [], [], [], [], [], 0, [], [])
+    sea declaraciones: lista = programa.hijos
+    sea principal: lista = []
+    // 1. Registrar funciones (permite llamadas hacia adelante).
+    sea i: numero = 0
+    mientras (i < longitud(declaraciones)) {
+        sea d: cualquiera = declaraciones[i]
+        si (d.tipo == "Funcion") {
+            sea params: numero = longitud(d.hijos) - 1
+            agregar(ctx.funciones, FuncionNativa(nombre_sin_tipo_nativo(d.valor), nueva_etiqueta_nativo(ctx), params))
+        } sino {
+            afirmar(
+                d.tipo != "Clase" y d.tipo != "Estructura" y d.tipo != "Interfaz" y d.tipo != "Importar",
+                "el backend nativo aún no admite '" + d.tipo + "' (línea " + a_texto(d.linea) + ")"
+            )
+            agregar(principal, d)
+        }
+        i = i + 1
+    }
+    sea et_principal: numero = nueva_etiqueta_nativo(ctx)
+    // 2. _start: guarda rsp (argc/argv), llama al programa y termina.
+    emitir_nativo(ctx, [72, 137, 224])                    // mov rax, rsp
+    emitir_nativo(ctx, [72, 137, 4, 37])                  // mov [abs32], rax
+    referencia_global_nativo(ctx, 63 * 8)
+    emitir_nativo(ctx, [232])                             // call principal
+    referencia_etiqueta_nativo(ctx, et_principal)
+    emitir_nativo(ctx, [72, 199, 199, 0, 0, 0, 0])        // mov rdi, 0
+    emitir_nativo(ctx, [72, 199, 192, 60, 0, 0, 0])       // mov rax, 60 (exit)
+    emitir_nativo(ctx, [15, 5])                           // syscall
+    // 3. Programa principal.
+    emitir_cuerpo_funcion_nativo(ctx, et_principal, [], principal)
+    // 4. Funciones.
+    i = 0
+    sea k: numero = 0
+    mientras (i < longitud(declaraciones)) {
+        sea d: cualquiera = declaraciones[i]
+        si (d.tipo == "Funcion") {
+            sea f: cualquiera = ctx.funciones[k]
+            sea nodos: lista = d.hijos
+            sea nombres: lista = []
+            sea p: numero = 0
+            mientras (p < longitud(nodos) - 1) {
+                sea parametro: cualquiera = nodos[p]
+                agregar(nombres, nombre_sin_tipo_nativo(parametro.valor))
+                p = p + 1
+            }
+            sea bloque: cualquiera = nodos[longitud(nodos) - 1]
+            emitir_cuerpo_funcion_nativo(ctx, f.etiqueta, nombres, bloque.hijos)
+            k = k + 1
+        }
+        i = i + 1
+    }
+    retornar ctx
+}
+
+// ── Enlazado final: parches y ELF ─────────────────────────────────────────
+
+funcion empaquetar_elf_nativo(ctx: cualquiera): lista {
+    sea base: numero = 4194304                            // 0x400000
+    sea cabeceras: numero = 120                           // ELF (64) + 1 PHDR (56)
+    sea inicio_datos: numero = cabeceras + longitud(ctx.codigo)
+    mientras (inicio_datos % 16 != 0) { inicio_datos = inicio_datos + 1 }
+    sea relleno: numero = inicio_datos - cabeceras - longitud(ctx.codigo)
+    sea fin_datos: numero = inicio_datos + longitud(ctx.datos)
+    sea inicio_globales: numero = fin_datos
+    mientras (inicio_globales % 16 != 0) { inicio_globales = inicio_globales + 1 }
+
+    // Posiciones de etiquetas.
+    sea posiciones: lista = []
+    sea e: numero = 0
+    mientras (e < longitud(ctx.etiquetas)) { agregar(posiciones, -1) e = e + 1 }
+    sea definidas: lista = []
+    sea m: numero = 0
+    mientras (m < longitud(ctx.marcas)) {
+        sea marca: cualquiera = ctx.marcas[m]
+        si (marca.tipo == "def") { agregar(definidas, marca) }
+        m = m + 1
+    }
+    // posiciones[etiqueta] sin asignación indexada: lista reconstruida.
+    sea tabla: lista = []
+    e = 0
+    mientras (e < longitud(ctx.etiquetas)) {
+        sea pos: numero = -1
+        sea d: numero = 0
+        mientras (d < longitud(definidas)) {
+            sea def: cualquiera = definidas[d]
+            si (def.etiqueta == e) { pos = def.posicion }
+            d = d + 1
+        }
+        afirmar(pos >= 0, "etiqueta sin definir " + a_texto(e))
+        agregar(tabla, pos)
+        e = e + 1
+    }
+
+    // Código parcheado: recorre el código y las marcas (ordenadas por posición).
+    sea parches: lista = []
+    m = 0
+    mientras (m < longitud(ctx.marcas)) {
+        sea marca: cualquiera = ctx.marcas[m]
+        si (marca.tipo == "rel" o marca.tipo == "dato" o marca.tipo == "global" o marca.tipo == "marco") {
+            agregar(parches, marca)
+        }
+        m = m + 1
+    }
+    sea codigo: lista = []
+    sea p: numero = 0
+    sea i: numero = 0
+    mientras (i < longitud(ctx.codigo)) {
+        si (p < longitud(parches)) {
+            sea parche: cualquiera = parches[p]
+            si (parche.posicion == i) {
+                sea valor: numero = 0
+                si (parche.tipo == "rel") { valor = tabla[parche.etiqueta] - (i + 4) }
+                si (parche.tipo == "dato") { valor = base + inicio_datos + parche.valor }
+                si (parche.tipo == "global") { valor = base + inicio_globales + parche.valor }
+                si (parche.tipo == "marco") { valor = parche.valor }
+                agregar_le_nativo(codigo, valor, 4)
+                i = i + 4
+                p = p + 1
+            } sino {
+                agregar(codigo, ctx.codigo[i])
+                i = i + 1
+            }
+        } sino {
+            agregar(codigo, ctx.codigo[i])
+            i = i + 1
+        }
+    }
+
+    // Datos con punteros reubicados (campo "datos" de cada texto literal).
+    sea reubicar: lista = []
+    m = 0
+    mientras (m < longitud(ctx.marcas)) {
+        sea marca: cualquiera = ctx.marcas[m]
+        si (marca.tipo == "puntero_dato") { agregar(reubicar, marca.valor + 16) }
+        m = m + 1
+    }
+    sea datos: lista = []
+    sea r: numero = 0
+    i = 0
+    mientras (i < longitud(ctx.datos)) {
+        si (r < longitud(reubicar) y reubicar[r] == i) {
+            agregar_le_nativo(datos, base + inicio_datos + (i - 16) + 32, 8)
+            i = i + 8
+            r = r + 1
+        } sino {
+            agregar(datos, ctx.datos[i])
+            i = i + 1
+        }
+    }
+
+    sea tamano_archivo: numero = fin_datos
+    sea tamano_memoria: numero = inicio_globales + 64 * 8
+    sea elf: lista = [127, 69, 76, 70, 2, 1, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0]
+    agregar_le_nativo(elf, 2, 2)                          // ET_EXEC
+    agregar_le_nativo(elf, 62, 2)                         // x86-64
+    agregar_le_nativo(elf, 1, 4)
+    agregar_le_nativo(elf, base + cabeceras, 8)           // entrada = _start
+    agregar_le_nativo(elf, 64, 8)                         // phoff
+    agregar_le_nativo(elf, 0, 8)                          // shoff
+    agregar_le_nativo(elf, 0, 4)
+    agregar_le_nativo(elf, 64, 2)
+    agregar_le_nativo(elf, 56, 2)
+    agregar_le_nativo(elf, 1, 2)                          // 1 PHDR
+    agregar_le_nativo(elf, 0, 2)
+    agregar_le_nativo(elf, 0, 2)
+    agregar_le_nativo(elf, 0, 2)
+    agregar_le_nativo(elf, 1, 4)                          // PT_LOAD
+    agregar_le_nativo(elf, 7, 4)                          // RWX
+    agregar_le_nativo(elf, 0, 8)
+    agregar_le_nativo(elf, base, 8)
+    agregar_le_nativo(elf, base, 8)
+    agregar_le_nativo(elf, tamano_archivo, 8)
+    agregar_le_nativo(elf, tamano_memoria, 8)
+    agregar_le_nativo(elf, 4096, 8)
+    sea k: numero = 0
+    mientras (k < longitud(codigo)) { agregar(elf, codigo[k]) k = k + 1 }
+    k = 0
+    mientras (k < relleno) { agregar(elf, 0) k = k + 1 }
+    k = 0
+    mientras (k < longitud(datos)) { agregar(elf, datos[k]) k = k + 1 }
+    retornar elf
+}
