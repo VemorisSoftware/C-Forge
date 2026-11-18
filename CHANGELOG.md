@@ -2,6 +2,17 @@
 
 Sitio oficial: [c-forge.org](https://c-forge.org)
 
+## Sin publicar
+
+- **Backend nativo ELF sin libc** (`bootstrap/nativo/`): código máquina x86-64
+  directo con marcos de pila y recursión; ejecutables estáticos de pocos KB.
+- **Runtime 100 % C-Forge** (`runtime/`): syscalls de Linux aisladas en
+  `sys_linux.cfv`, asignador propio sobre `mmap` con listas libres, textos y
+  listas dinámicas, archivos y formato de decimales.
+- **Primer hito de autoalojamiento**: el lexer de C-Forge escrito en el
+  dialecto nativo produce los mismos tokens que el lexer Core.
+- `make nativo-check` y job de CI "Backend nativo (Linux, sin libc)".
+
 ## 3.7.3 — extern C + idioma del programa
 
 - **FFI con C**: `extern "libreria" funcion nombre(p: tipo): tipo` carga la
