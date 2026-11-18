@@ -476,6 +476,25 @@ bibliotecas) pasan compiladas a ELF sin libc. Estado de la suite completa:
 - Diferencias con el intérprete: `md5` da el MD5 real (el intérprete devolvía
   SHA-256) y `fecha_ahora` usa UTC.
 
+### Bloque 4B: `extern` nativo con enlace dinámico ELF ✅ (25 de 25 pruebas)
+
+`extern "libc" funcion strlen(s: texto): largo` hace que `cforge_self` genere
+un ELF dinámico por sí mismo, sin `gcc` ni `ld`:
+
+- encabezados `PT_INTERP` (`/lib64/ld-linux-x86-64.so.2`), `PT_LOAD` y
+  `PT_DYNAMIC`; tablas `DT_NEEDED`, `.dynstr`, `.dynsym`, `.hash` y
+  relocaciones `R_X86_64_GLOB_DAT` hacia una GOT, con `DT_BIND_NOW`;
+- símbolos débiles: si un símbolo no existe, la declaración lanza un error
+  capturable que lo nombra;
+- envolturas con la ABI System V AMD64: enteros en `rdi rsi rdx rcx r8 r9`,
+  flotantes en `xmm0`–`xmm7`, pila alineada a 16, `al` = registros vectoriales;
+- tipos: `entero` (32 bits), `largo`/`puntero` (64), `numero` (double),
+  `texto` (`char*`), `booleano`, `nulo`;
+- `"libc"` → `libc.so.6`, `"libm"` → `libm.so.6`, `"sqlite3"` →
+  `libsqlite3.so`, o una ruta `.so`.
+
+Los programas sin `extern` siguen siendo estáticos y sin libc.
+
 **Alcance honesto:** el compilador autoalojado compila el *dialecto nativo*
 (enteros de 64 bits, funciones, recursión, condiciones, ciclos, textos
 literales e intrínsecos). El lenguaje C-Forge completo (clases, mapas,
