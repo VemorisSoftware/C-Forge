@@ -93,6 +93,9 @@ Sitio oficial: [c-forge.org](https://c-forge.org)
   y **backend AArch64**: `--target macos-arm64` (Mach-O PIE con firma ad-hoc
   SHA-256 propia) y `--target linux-arm64`. Apple Silicon: Stage 2 = Stage 3
   = compilación cruzada desde Linux y Windows; 25/25, 32/32, 22/22.
+- **Gestor de paquetes**: `cforge init`, `cforge add usuario/repo[@ref]`,
+  `cforge remove`, `cforge install`, `cforge.toml` y `cforge.lock`; caché
+  global de descargas de GitHub e `importar "alias"` / `"alias/modulo"`.
 - **CI**: smoke test con rutas absolutas; se elimina `build-native.yml`
   (duplicado).
 - **Web**: c-forge.org vive en `site/` y se despliega en Cloudflare Pages; se
