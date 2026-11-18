@@ -89,6 +89,16 @@ if [ -n "$PAQUETE" ]; then
   tar -xzf "$TMP/${PAQUETE}.tar.gz" -C "$TMP"
   ORIGEN="$TMP/${PAQUETE}"
   [ -x "$ORIGEN/cforge" ] || fail "el paquete no contiene el binario cforge"
+elif [ "$OS" = "Linux" ] && { [ "$ARCH" = "x86_64" ] || [ "$ARCH" = "amd64" ]; } && [ "${CFORGE_CLASICO:-0}" != "1" ]; then
+  # ── Desde el código fuente, sin C++: la semilla compila cforge ──────────
+  info "descargando código fuente v${VERSION}"
+  descargar "${GITHUB}/archive/refs/tags/v${VERSION}.tar.gz" "$TMP/src.tar.gz" \
+    || fail "no existe la versión v${VERSION}"
+  tar -xzf "$TMP/src.tar.gz" -C "$TMP"
+  ORIGEN=$(find "$TMP" -maxdepth 1 -type d -name 'C-Forge-*' | head -1)
+  [ -f "$ORIGEN/bootstrap/semilla/cforge-linux-x64" ] || fail "esta versión no trae la semilla nativa (usa CFORGE_CLASICO=1)"
+  info "compilando cforge con la semilla (C-Forge se compila a sí mismo)"
+  (cd "$ORIGEN" && make cforge-desde-semilla >/dev/null) || fail "la compilación falló"
 else
   # ── Compilación desde el código fuente ───────────────────────────────────
   CXX="${CXX:-}"
@@ -112,6 +122,11 @@ $SUDO rm -rf "$LIB_DIR/stdlib"
 $SUDO cp -R "$ORIGEN/stdlib" "$LIB_DIR/stdlib"
 $SUDO cp "$ORIGEN/cforge" "$BIN_DIR/cforge"
 $SUDO chmod 755 "$BIN_DIR/cforge"
+if [ -f "$ORIGEN/cforge-clasico" ]; then
+  # Intérprete clásico para lo que el compilador nativo aún no cubre.
+  $SUDO cp "$ORIGEN/cforge-clasico" "$BIN_DIR/cforge-clasico"
+  $SUDO chmod 755 "$BIN_DIR/cforge-clasico"
+fi
 $SUDO ln -sf cforge "$BIN_DIR/c-forge"
 if [ "$OS" = "Darwin" ]; then
   # Quita la cuarentena de Gatekeeper del binario descargado.
