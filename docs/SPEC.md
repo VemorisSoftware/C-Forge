@@ -36,9 +36,12 @@ Nada marcado como 📐 debe aparecer en c-forge.org como si ya existiera.
 
 - Archivos UTF-8 con extensión `.cfv`.
 - Comentarios de línea: `// ...`
-- Textos entre comillas dobles. `{expresión}` interpola; `\{` y `\}` son llaves
-  literales. Escapes: `\n`, `\t`, `\"`, `\\`.
-- Números decimales (`42`, `3.14`).
+- Textos entre comillas dobles. `{expresión}` interpola cuando la llave va
+  seguida de una letra, `_` o `(` y se cierra en la misma línea
+  (`"Hola {nombre}"`, `"{(a + b)}"`); cualquier otra llave es literal, así
+  JSON (`"{\"a\": 1}"`) y GLSL (`"main() {"`) no necesitan escapes. `\{` y
+  `\}` siguen siendo llaves literales. Escapes: `\n`, `\t`, `\"`, `\\`.
+- Números decimales (`42`, `3.14`) y con exponente (`1e5`, `2.5e-3`, `6.02E+23`).
 
 ### Palabras clave (español ⇄ inglés) ✅
 
