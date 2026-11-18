@@ -582,6 +582,34 @@ Los programas sin `extern` siguen siendo estáticos y sin libc.
   byte por byte; 25/25 `tests/cfv`, 32/32 ejemplos del sitio y 22/22
   `ejemplos/` (servidor HTTP, hilos, SDL2 de Homebrew).
 
+### Gestor de paquetes (`cforge.toml`) ✅
+
+```toml
+[paquete]
+nombre = "mi_app"
+version = "0.1.0"
+principal = "principal.cfv"
+
+[dependencias]
+json = "usuario/repo@v1.2"     # rama, etiqueta o nada (rama por defecto)
+```
+
+- `cforge init [nombre]` crea `cforge.toml`, `principal.cfv` y `.gitignore`.
+- `cforge add usuario/repo[@ref] [--como alias]` descarga el paquete de
+  GitHub (clon superficial con `git`) a la caché global
+  `$CFORGE_HOME/paquetes/usuario/repo/ref` (por defecto `~/.cforge`), lo
+  agrega a `[dependencias]` y escribe `cforge.lock` con el commit exacto de
+  cada dependencia, también de las transitivas. `cforge remove alias` y
+  `cforge install` (descarga lo que falte) completan el ciclo.
+- `importar "alias"` carga el archivo principal del paquete (`principal` de
+  su `cforge.toml`, o `repo.cfv`, `lib.cfv`, `principal.cfv`);
+  `importar "alias/modulo"` carga `modulo.cfv` del paquete. Orden de
+  búsqueda: archivo local, paquetes del proyecto, biblioteca estándar.
+- `cforge run`, `build` y `check` sin archivo usan el `principal` del
+  proyecto (buscando `cforge.toml` hacia arriba desde el directorio actual).
+- `CFORGE_GIT_BASE` cambia el origen de las descargas (p. ej. un espejo o
+  `file://` para pruebas: `tests/paquetes/prueba.sh`).
+
 ### Capa intermedia y backend AArch64 ✅
 
 - El compilador no emite bytes de máquina: pide operaciones de una máquina de

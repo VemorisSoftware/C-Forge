@@ -1,0 +1,530 @@
+// bootstrap/nativo/paquetes.cfv — gestor de paquetes de cforge.
+//
+//   cforge init [nombre]              crea cforge.toml y principal.cfv
+//   cforge add usuario/repo[@ref] [--como alias]
+//   cforge remove alias
+//   cforge install                    descarga las dependencias de cforge.toml
+//
+// cforge.toml:
+//   [paquete]
+//   nombre = "mi_app"
+//   version = "0.1.0"
+//   principal = "principal.cfv"
+//
+//   [dependencias]
+//   json = "usuario/repo@v1.2"
+//
+// Los paquetes se descargan de GitHub con git (clon superficial) a una caché
+// global: $CFORGE_HOME/paquetes/usuario/repo/ref (por defecto ~/.cforge).
+// cforge.lock guarda el commit exacto de cada dependencia. En el código,
+// importar "json" carga el archivo principal del paquete e importar
+// "json/util" su archivo util.cfv. CFORGE_GIT_BASE cambia la base de las
+// URL (por defecto https://github.com/).
+
+// ── Textos y rutas ────────────────────────────────────────────────────────
+
+funcion es_blanco(b) { retornar b == 32 o b == 9 o b == 13 o b == 10 }
+
+funcion recortar(s) {
+    sea i = 0
+    sea j = str_largo(s)
+    mientras (i < j y es_blanco(str_byte(s, i))) { i = i + 1 }
+    mientras (j > i y es_blanco(str_byte(s, j - 1))) { j = j - 1 }
+    retornar str_rebanar(s, i, j)
+}
+
+funcion posicion_de(s, byte) {
+    sea i = 0
+    mientras (i < str_largo(s)) {
+        si (str_byte(s, i) == byte) { retornar i }
+        i = i + 1
+    }
+    retornar 0 - 1
+}
+
+funcion lineas_de(texto) {
+    sea r = vec_nuevo()
+    sea inicio = 0
+    sea i = 0
+    mientras (i < str_largo(texto)) {
+        si (str_byte(texto, i) == 10) {
+            vec_agregar(r, str_rebanar(texto, inicio, i))
+            inicio = i + 1
+        }
+        i = i + 1
+    }
+    si (inicio < str_largo(texto)) { vec_agregar(r, str_rebanar(texto, inicio, str_largo(texto))) }
+    retornar r
+}
+
+funcion unir_lineas(lineas) {
+    sea r = str_nuevo(1024)
+    sea i = 0
+    mientras (i < vec_largo(lineas)) {
+        str_agregar(r, vec_obtener(lineas, i))
+        str_agregar_byte(r, 10)
+        i = i + 1
+    }
+    retornar r
+}
+
+funcion unir_ruta(a, b) {
+    sea r = str_concatenar(a, "")
+    si (str_largo(r) > 0 y str_byte(r, str_largo(r) - 1) != 47 y str_byte(r, str_largo(r) - 1) != 92) { str_agregar_byte(r, 47) }
+    str_agregar(r, b)
+    retornar r
+}
+
+funcion es_absoluta(ruta) {
+    si (str_largo(ruta) > 0 y (str_byte(ruta, 0) == 47 o str_byte(ruta, 0) == 92)) { retornar 1 }
+    retornar str_largo(ruta) > 1 y str_byte(ruta, 1) == 58          // C:\...
+}
+
+funcion directorio_de(ruta) {
+    sea i = str_largo(ruta)
+    mientras (i > 0 y str_byte(ruta, i - 1) != 47 y str_byte(ruta, i - 1) != 92) { i = i - 1 }
+    si (i == 0) { retornar "." }
+    si (i == 1) { retornar str_rebanar(ruta, 0, 1) }
+    retornar str_rebanar(ruta, 0, i - 1)
+}
+
+funcion nombre_de(ruta) {
+    sea i = str_largo(ruta)
+    mientras (i > 0 y str_byte(ruta, i - 1) != 47 y str_byte(ruta, i - 1) != 92) { i = i - 1 }
+    retornar str_rebanar(ruta, i, str_largo(ruta))
+}
+
+funcion absoluta(ruta) {
+    si (es_absoluta(ruta)) { retornar ruta }
+    sea actual = sys_directorio_actual()
+    si (actual == 0) { retornar ruta }
+    si (str_igual(ruta, ".")) { retornar actual }
+    retornar unir_ruta(actual, ruta)
+}
+
+// mkdir -p
+funcion crear_directorios(ruta) {
+    sea i = 1
+    mientras (i <= str_largo(ruta)) {
+        si (i == str_largo(ruta) o str_byte(ruta, i) == 47 o str_byte(ruta, i) == 92) {
+            sea parte = str_rebanar(ruta, 0, i)
+            si (str_largo(parte) > 0 y str_byte(parte, str_largo(parte) - 1) != 58) { sys_crear_directorio(str_c(parte)) }
+        }
+        i = i + 1
+    }
+    retornar 0
+}
+
+// ── cforge.toml (subconjunto de TOML: secciones y clave = "valor") ────────
+
+// Entradas [sección][clave][valor] de un archivo TOML.
+funcion toml_leer(ruta) {
+    sea r = vec_nuevo()
+    si (existe_ruta(ruta) == 0) { retornar r }
+    sea lineas = lineas_de(archivo_leer(ruta))
+    sea seccion = ""
+    sea i = 0
+    mientras (i < vec_largo(lineas)) {
+        sea l = recortar(vec_obtener(lineas, i))
+        si (str_largo(l) > 0 y str_byte(l, 0) != 35) {
+            si (str_byte(l, 0) == 91) {
+                seccion = recortar(str_rebanar(l, 1, str_largo(l) - 1))
+            } sino {
+                sea igual = posicion_de(l, 61)
+                si (igual > 0) {
+                    sea e = mem_reservar(24)
+                    __guardar64(e, seccion)
+                    __guardar64(e + 8, recortar(str_rebanar(l, 0, igual)))
+                    __guardar64(e + 16, valor_toml(recortar(str_rebanar(l, igual + 1, str_largo(l)))))
+                    vec_agregar(r, e)
+                }
+            }
+        }
+        i = i + 1
+    }
+    retornar r
+}
+
+// "texto" → texto (también quita un comentario final).
+funcion valor_toml(v) {
+    si (str_largo(v) > 0 y str_byte(v, 0) == 34) {
+        sea fin = 1
+        mientras (fin < str_largo(v) y str_byte(v, fin) != 34) { fin = fin + 1 }
+        retornar str_rebanar(v, 1, fin)
+    }
+    sea comentario = posicion_de(v, 35)
+    si (comentario >= 0) { retornar recortar(str_rebanar(v, 0, comentario)) }
+    retornar v
+}
+
+funcion toml_valor(entradas, seccion, clave) {
+    sea i = 0
+    mientras (i < vec_largo(entradas)) {
+        sea e = vec_obtener(entradas, i)
+        si (str_igual(__cargar64(e), seccion) y str_igual(__cargar64(e + 8), clave)) { retornar __cargar64(e + 16) }
+        i = i + 1
+    }
+    retornar 0
+}
+
+funcion es_seccion_dependencias(seccion) {
+    retornar str_igual(seccion, "dependencias") o str_igual(seccion, "dependencies")
+}
+
+// Pares [alias][especificación] de las dependencias.
+funcion toml_dependencias(entradas) {
+    sea r = vec_nuevo()
+    sea i = 0
+    mientras (i < vec_largo(entradas)) {
+        sea e = vec_obtener(entradas, i)
+        si (es_seccion_dependencias(__cargar64(e))) { vec_agregar(r, e) }
+        i = i + 1
+    }
+    retornar r
+}
+
+// Fija (o con valor 0, quita) clave = "valor" en una sección del archivo,
+// conservando el resto del texto.
+funcion toml_fijar(ruta, seccion, clave, valor) {
+    sea lineas = vec_nuevo()
+    si (existe_ruta(ruta)) { lineas = lineas_de(archivo_leer(ruta)) }
+    sea r = vec_nuevo()
+    sea actual = ""
+    sea en_seccion = 0
+    sea hecho = 0
+    sea ultima = 0 - 1
+    sea i = 0
+    mientras (i < vec_largo(lineas)) {
+        sea linea = vec_obtener(lineas, i)
+        sea l = recortar(linea)
+        sea copiar = 1
+        si (str_largo(l) > 0 y str_byte(l, 0) == 91) {
+            actual = recortar(str_rebanar(l, 1, str_largo(l) - 1))
+            en_seccion = str_igual(actual, seccion) o (es_seccion_dependencias(seccion) y es_seccion_dependencias(actual))
+        } sino {
+            si (en_seccion y str_largo(l) > 0 y str_byte(l, 0) != 35) {
+                sea igual = posicion_de(l, 61)
+                si (igual > 0 y str_igual(recortar(str_rebanar(l, 0, igual)), clave)) {
+                    copiar = 0
+                    si (valor != 0 y hecho == 0) { vec_agregar(r, linea_toml(clave, valor)) }
+                    hecho = 1
+                }
+            }
+        }
+        si (copiar) { vec_agregar(r, linea) }
+        si (en_seccion y str_largo(l) > 0) { ultima = vec_largo(r) - 1 }
+        i = i + 1
+    }
+    si (hecho == 0 y valor != 0) {
+        si (ultima < 0) {
+            si (vec_largo(r) > 0 y str_largo(recortar(vec_obtener(r, vec_largo(r) - 1))) > 0) { vec_agregar(r, "") }
+            vec_agregar(r, str_concatenar(str_concatenar("[", seccion), "]"))
+            vec_agregar(r, linea_toml(clave, valor))
+        } sino {
+            // Insertar después de la última línea de la sección.
+            sea nuevas = vec_nuevo()
+            sea k = 0
+            mientras (k < vec_largo(r)) {
+                vec_agregar(nuevas, vec_obtener(r, k))
+                si (k == ultima) { vec_agregar(nuevas, linea_toml(clave, valor)) }
+                k = k + 1
+            }
+            r = nuevas
+        }
+    }
+    archivo_escribir(ruta, unir_lineas(r))
+    retornar 0
+}
+
+funcion linea_toml(clave, valor) {
+    sea r = str_concatenar(clave, " = \"")
+    str_agregar(r, valor)
+    str_agregar(r, "\"")
+    retornar r
+}
+
+// ── Proyecto y caché ──────────────────────────────────────────────────────
+
+// Directorio con cforge.toml desde "dir" hacia arriba, o 0.
+funcion buscar_proyecto(dir) {
+    sea d = absoluta(dir)
+    sea seguir = 1
+    mientras (seguir) {
+        si (existe_ruta(unir_ruta(d, "cforge.toml"))) { retornar d }
+        sea padre = directorio_de(d)
+        si (str_igual(padre, d) o str_largo(padre) <= 1 o str_igual(padre, ".")) { seguir = 0 }
+        d = padre
+    }
+    retornar 0
+}
+
+funcion directorio_cforge() {
+    sea propio = sys_variable_entorno("CFORGE_HOME")
+    si (propio != 0) { retornar propio }
+    sea casa = sys_variable_entorno("HOME")
+    si (casa == 0) { casa = sys_variable_entorno("USERPROFILE") }
+    si (casa == 0) { casa = sys_ruta_temporal() }
+    retornar unir_ruta(casa, ".cforge")
+}
+
+// "usuario/repo@ref" → [usuario][repo][ref o 0]
+funcion especificacion(texto) {
+    sea e = mem_reservar(24)
+    sea arroba = posicion_de(texto, 64)
+    sea fuente = texto
+    __guardar64(e + 16, 0)
+    si (arroba >= 0) {
+        fuente = str_rebanar(texto, 0, arroba)
+        __guardar64(e + 16, str_rebanar(texto, arroba + 1, str_largo(texto)))
+    }
+    sea barra = posicion_de(fuente, 47)
+    si (barra <= 0 o barra == str_largo(fuente) - 1) {
+        rt_panico(str_concatenar("paquete inválido (se espera usuario/repo[@ref]): ", texto))
+    }
+    __guardar64(e, str_rebanar(fuente, 0, barra))
+    __guardar64(e + 8, str_rebanar(fuente, barra + 1, str_largo(fuente)))
+    retornar e
+}
+
+funcion directorio_paquete(e) {
+    sea ref = __cargar64(e + 16)
+    si (ref == 0) { ref = "_" }
+    retornar unir_ruta(unir_ruta(unir_ruta(unir_ruta(directorio_cforge(), "paquetes"), __cargar64(e)), __cargar64(e + 8)), ref)
+}
+
+// Archivo principal de un paquete descargado.
+funcion principal_paquete(dir, repo) {
+    sea toml = toml_leer(unir_ruta(dir, "cforge.toml"))
+    sea p = toml_valor(toml, "paquete", "principal")
+    si (p == 0) { p = toml_valor(toml, "package", "main") }
+    si (p != 0) { retornar p }
+    sea candidatos = vec_nuevo()
+    vec_agregar(candidatos, str_concatenar(repo, ".cfv"))
+    vec_agregar(candidatos, "lib.cfv")
+    vec_agregar(candidatos, "principal.cfv")
+    vec_agregar(candidatos, "main.cfv")
+    sea i = 0
+    mientras (i < vec_largo(candidatos)) {
+        si (existe_ruta(unir_ruta(dir, vec_obtener(candidatos, i)))) { retornar vec_obtener(candidatos, i) }
+        i = i + 1
+    }
+    retornar str_concatenar(repo, ".cfv")
+}
+
+// ── git ───────────────────────────────────────────────────────────────────
+
+// Ruta completa de un programa del PATH, o 0.
+funcion buscar_programa(nombre) {
+    sea camino = sys_variable_entorno("PATH")
+    si (camino == 0) { retornar 0 }
+    sea separador = 58
+    si (sys_es_windows()) {
+        separador = 59
+        nombre = str_concatenar(nombre, ".exe")
+    }
+    sea inicio = 0
+    sea i = 0
+    mientras (i <= str_largo(camino)) {
+        si (i == str_largo(camino) o str_byte(camino, i) == separador) {
+            si (i > inicio) {
+                sea candidato = unir_ruta(str_rebanar(camino, inicio, i), nombre)
+                si (existe_ruta(candidato)) { retornar candidato }
+            }
+            inicio = i + 1
+        }
+        i = i + 1
+    }
+    retornar 0
+}
+
+funcion git(argumentos) {
+    sea programa = buscar_programa("git")
+    si (programa == 0) { rt_panico("cforge necesita git en el PATH para descargar paquetes") }
+    retornar sys_ejecutar_programa(programa, argumentos)
+}
+
+// Commit del clon (lee .git/HEAD y la referencia), o "".
+funcion commit_de(dir) {
+    sea cabeza = unir_ruta(dir, ".git/HEAD")
+    si (existe_ruta(cabeza) == 0) { retornar "" }
+    sea h = recortar(archivo_leer(cabeza))
+    si (str_largo(h) > 5 y str_igual(str_rebanar(h, 0, 5), "ref: ")) {
+        sea ref = str_rebanar(h, 5, str_largo(h))
+        sea archivo = unir_ruta(unir_ruta(dir, ".git"), ref)
+        si (existe_ruta(archivo)) { retornar recortar(archivo_leer(archivo)) }
+        sea empaquetadas = unir_ruta(dir, ".git/packed-refs")
+        si (existe_ruta(empaquetadas)) {
+            sea lineas = lineas_de(archivo_leer(empaquetadas))
+            sea i = 0
+            mientras (i < vec_largo(lineas)) {
+                sea l = recortar(vec_obtener(lineas, i))
+                si (str_largo(l) > 41 y str_igual(str_rebanar(l, 41, str_largo(l)), ref)) { retornar str_rebanar(l, 0, 40) }
+                i = i + 1
+            }
+        }
+        retornar ""
+    }
+    retornar h
+}
+
+// Descarga el paquete a la caché si falta; devuelve su directorio.
+funcion descargar(e) {
+    sea dir = directorio_paquete(e)
+    si (existe_ruta(unir_ruta(dir, ".git/HEAD"))) { retornar dir }
+    crear_directorios(directorio_de(dir))
+    sea base = sys_variable_entorno("CFORGE_GIT_BASE")
+    si (base == 0) { base = "https://github.com/" }
+    sea url = str_concatenar(base, __cargar64(e))
+    str_agregar(url, "/")
+    str_agregar(url, __cargar64(e + 8))
+    si (empieza_con(base, "https://")) { str_agregar(url, ".git") }
+    sea m = str_concatenar("⬇ ", __cargar64(e))
+    str_agregar(m, "/")
+    str_agregar(m, __cargar64(e + 8))
+    si (__cargar64(e + 16) != 0) {
+        str_agregar(m, "@")
+        str_agregar(m, __cargar64(e + 16))
+    }
+    mostrar(m)
+    sea args = vec_nuevo()
+    vec_agregar(args, "clone")
+    vec_agregar(args, "-q")
+    vec_agregar(args, "--depth")
+    vec_agregar(args, "1")
+    si (__cargar64(e + 16) != 0) {
+        vec_agregar(args, "--branch")
+        vec_agregar(args, __cargar64(e + 16))
+    }
+    vec_agregar(args, url)
+    vec_agregar(args, dir)
+    si (git(args) != 0) { rt_panico(str_concatenar("no se pudo descargar ", url)) }
+    retornar dir
+}
+
+// ── Carga de dependencias para compilar ───────────────────────────────────
+
+// Registra [alias][directorio][principal] de las dependencias de un
+// proyecto (y de las de cada paquete), descargando las que falten.
+funcion registrar_dependencias(dir_proyecto, paquetes, lock) {
+    sea deps = toml_dependencias(toml_leer(unir_ruta(dir_proyecto, "cforge.toml")))
+    sea i = 0
+    mientras (i < vec_largo(deps)) {
+        sea d = vec_obtener(deps, i)
+        sea alias = __cargar64(d + 8)
+        si (paquete_registrado(paquetes, alias) == 0) {
+            sea e = especificacion(__cargar64(d + 16))
+            sea dir = descargar(e)
+            sea r = mem_reservar(24)
+            __guardar64(r, alias)
+            __guardar64(r + 8, dir)
+            __guardar64(r + 16, principal_paquete(dir, __cargar64(e + 8)))
+            vec_agregar(paquetes, r)
+            si (lock != 0) {
+                sea l = str_concatenar(__cargar64(d + 16), "#")
+                str_agregar(l, commit_de(dir))
+                vec_agregar(lock, linea_toml(alias, l))
+            }
+            registrar_dependencias(dir, paquetes, lock)
+        }
+        i = i + 1
+    }
+    retornar 0
+}
+
+funcion paquete_registrado(paquetes, alias) {
+    sea i = 0
+    mientras (i < vec_largo(paquetes)) {
+        si (str_igual(__cargar64(vec_obtener(paquetes, i)), alias)) { retornar 1 }
+        i = i + 1
+    }
+    retornar 0
+}
+
+// Antes de compilar un archivo: si pertenece a un proyecto, registra sus
+// paquetes para que importar "alias" los encuentre (global 36).
+funcion preparar_paquetes(ruta_archivo) {
+    sea proyecto = buscar_proyecto(directorio_de(absoluta(ruta_archivo)))
+    si (proyecto == 0) { retornar 0 }
+    sea paquetes = vec_nuevo()
+    registrar_dependencias(proyecto, paquetes, 0)
+    mem_fijar_global(36, paquetes)
+    retornar proyecto
+}
+
+// Archivo principal del proyecto actual (para cforge run/build sin archivo).
+funcion principal_proyecto() {
+    sea proyecto = buscar_proyecto(".")
+    si (proyecto == 0) { retornar 0 }
+    sea p = toml_valor(toml_leer(unir_ruta(proyecto, "cforge.toml")), "paquete", "principal")
+    si (p == 0) { p = "principal.cfv" }
+    retornar unir_ruta(proyecto, p)
+}
+
+// ── Órdenes ───────────────────────────────────────────────────────────────
+
+funcion orden_init(nombre) {
+    sea dir = "."
+    si (nombre != 0) {
+        dir = nombre
+        crear_directorios(dir)
+    } sino {
+        nombre = nombre_de(absoluta("."))
+    }
+    sea toml = unir_ruta(dir, "cforge.toml")
+    si (existe_ruta(toml)) { rt_panico(str_concatenar("ya existe ", toml)) }
+    sea t = str_nuevo(256)
+    str_agregar(t, "[paquete]\n")
+    str_agregar(t, linea_toml("nombre", nombre))
+    str_agregar(t, "\nversion = \"0.1.0\"\nprincipal = \"principal.cfv\"\n\n[dependencias]\n")
+    archivo_escribir(toml, t)
+    sea principal = unir_ruta(dir, "principal.cfv")
+    si (existe_ruta(principal) == 0) {
+        sea p = str_concatenar("// ", nombre)
+        str_agregar(p, "\n\nmostrar(\"¡Hola desde ")
+        str_agregar(p, nombre)
+        str_agregar(p, "!\")\n")
+        archivo_escribir(principal, p)
+    }
+    sea ignorar = unir_ruta(dir, ".gitignore")
+    si (existe_ruta(ignorar) == 0) { archivo_escribir(ignorar, "/principal\n/principal.exe\n") }
+    mostrar(str_concatenar("✓ proyecto creado: ", toml))
+    mostrar("  cforge run                 ejecutar")
+    mostrar("  cforge add usuario/repo    agregar una dependencia")
+    retornar 0
+}
+
+funcion proyecto_requerido() {
+    sea proyecto = buscar_proyecto(".")
+    si (proyecto == 0) { rt_panico("no hay cforge.toml aquí ni en los directorios superiores (usa cforge init)") }
+    retornar proyecto
+}
+
+// Descarga todas las dependencias y escribe cforge.lock.
+funcion orden_install() {
+    sea proyecto = proyecto_requerido()
+    sea paquetes = vec_nuevo()
+    sea lock = vec_nuevo()
+    vec_agregar(lock, "# cforge.lock — generado por cforge: commit exacto de cada dependencia.")
+    vec_agregar(lock, "[paquetes]")
+    registrar_dependencias(proyecto, paquetes, lock)
+    archivo_escribir(unir_ruta(proyecto, "cforge.lock"), unir_lineas(lock))
+    mostrar(str_concatenar(str_concatenar("✓ ", str_desde_entero(vec_largo(paquetes))), " paquete(s) listos"))
+    retornar 0
+}
+
+funcion orden_add(texto, alias) {
+    sea proyecto = proyecto_requerido()
+    sea e = especificacion(texto)
+    si (alias == 0) { alias = __cargar64(e + 8) }
+    descargar(e)
+    toml_fijar(unir_ruta(proyecto, "cforge.toml"), "dependencias", alias, texto)
+    mostrar(str_concatenar(str_concatenar(str_concatenar("✓ ", alias), " = "), texto))
+    retornar orden_install()
+}
+
+funcion orden_remove(alias) {
+    sea proyecto = proyecto_requerido()
+    toml_fijar(unir_ruta(proyecto, "cforge.toml"), "dependencias", alias, 0)
+    mostrar(str_concatenar("✓ quitado: ", alias))
+    retornar orden_install()
+}
