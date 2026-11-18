@@ -512,11 +512,34 @@ Los programas sin `extern` siguen siendo estáticos y sin libc.
   C++ para lo que el compilador nativo todavía no cubre.
 
 **Cobertura actual del compilador nativo:** 25/25 pruebas de `tests/cfv`,
-32/32 ejemplos del sitio. Pendiente para jubilar `cforge-clasico`: los
-programas de `ejemplos/` que usan concurrencia real (`canal_*`, `mutex_*`),
-el operador `?` de Resultado, genéricos con restricciones, `inseguro`,
-atributos `#[...]`, SDL y el resto de módulos de `stdlib/` (red, db, crypto,
-web…), además de `repl`, `test`, `fmt`, `new`, `init` y `doctor`.
+32/32 ejemplos del sitio y 22/22 programas de `ejemplos/`.
+
+### Sprint 22/22: `ejemplos/` completo con el compilador nativo ✅
+
+- **`extern` genérico:** cualquier biblioteca compartida (`"SDL2"`,
+  `"sqlite3"`, `"ssl"`, una ruta `.so`), resuelta con `dlopen`/`dlsym` en el
+  primer uso (búsqueda `lib<nombre>.so*` con `getdents64`). Si falta la
+  biblioteca o el símbolo, el error es capturable. Declaraciones repetidas
+  reutilizan la primera. Intrínseco `__ccall` para punteros a funciones C.
+- **Concurrencia real:** `tarea(f)`/`hilo(f)` crean hilos con `clone` (pila
+  propia de 8 MiB alineada, con su pila de manejadores de errores);
+  `esperar(t[, ms])` usa `futex` sobre `CLONE_CHILD_CLEARTID` y relanza el
+  error del hilo. `canal_nuevo/enviar/recibir/tam/cerrar` y
+  `mutex_crear/bloquear/desbloquear` con `futex`. El asignador de memoria se
+  protege con `xchg` atómico. El proceso termina con `exit_group`.
+- **Servidor HTTP** (`servidor_http_escuchar/solicitud/responder/cerrar`)
+  con syscalls de sockets; lee el cuerpo según `Content-Length`.
+- **SDL2** (`runtime/sdl.cfv`, escrito en C-Forge sobre `extern`): se incluye
+  solo si el programa usa `sdl_`; SDL2_ttf/SDL2_image opcionales.
+- **Sintaxis:** `x?.campo`, ternario `c ? a : b`, `expr?` (propaga un
+  Resultado con error u Opción vacía), genéricos `<T>` en clases, funciones,
+  tipos e instancias, parámetros por defecto y variádicos (`...resto`),
+  `inseguro { }` con punteros `@x`, `*(p + i)` verificados, atributos
+  `#[Ruta("/r", "POST")]` con `rutas_compiladas()`, `.longitud`,
+  importaciones relativas al archivo que importa.
+- Verificación sin el intérprete: `tests/nativo/ejemplos.sh` compara con
+  `ejemplos/salidas/` (generadas con el intérprete de referencia), prueba el
+  servidor con `curl` y el ciclo de SDL.
 
 **Alcance honesto:** el compilador autoalojado compila el *dialecto nativo*
 (enteros de 64 bits, funciones, recursión, condiciones, ciclos, textos
