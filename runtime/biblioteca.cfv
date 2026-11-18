@@ -1183,6 +1183,345 @@ funcion texto_a_numero(t) { retornar a_numero(t) }
 // ── Tiempo ────────────────────────────────────────────────────────────────
 
 funcion tiempo_ms() { retornar dyn_entero(sys_reloj_ns() / 1000000) }
+
+// ── HMAC-SHA256 y bytes aleatorios del sistema ────────────────────────────
+
+// Texto hexadecimal → bytes crudos.
+funcion hex_a_bytes(h) {
+    sea r = str_nuevo(str_largo(h) / 2)
+    sea i = 0
+    mientras (i + 1 < str_largo(h)) {
+        str_agregar_byte(r, valor_hex(str_byte(h, i)) * 16 + valor_hex(str_byte(h, i + 1)))
+        i = i + 2
+    }
+    retornar r
+}
+
+// HMAC-SHA256 (RFC 2104) en hexadecimal, igual que en 3.x.
+funcion hmac_sha256(clave, mensaje) {
+    sea k = dyn_a_str(clave)
+    si (str_largo(k) > 64) { k = hex_a_bytes(dyn_texto_de(cfv_sha256(dyn_texto(k)), "hmac_sha256")) }
+    sea interno = str_nuevo(64 + str_largo(dyn_a_str(mensaje)))
+    sea externo = str_nuevo(96)
+    sea i = 0
+    mientras (i < 64) {
+        sea b = 0
+        si (i < str_largo(k)) { b = str_byte(k, i) }
+        str_agregar_byte(interno, __xo_bits(b, 54))
+        str_agregar_byte(externo, __xo_bits(b, 92))
+        i = i + 1
+    }
+    str_agregar(interno, dyn_a_str(mensaje))
+    str_agregar(externo, hex_a_bytes(dyn_texto_de(cfv_sha256(dyn_texto(interno)), "hmac_sha256")))
+    retornar cfv_sha256(dyn_texto(externo))
+}
+
+// n bytes aleatorios criptográficos del sistema, en hexadecimal.
+funcion crypto_rand_bytes(n) {
+    sea k = dyn_valor_entero(n)
+    si (k < 1 o k > 65536) { dyn_error("crypto_rand_bytes: n debe ser 1..65536") }
+    sea buf = mem_reservar(k)
+    si (sys_aleatorio(buf, k) != 0) { dyn_error("crypto_rand_bytes: el sistema no entregó bytes aleatorios") }
+    sea r = str_nuevo(k * 2)
+    sea i = 0
+    mientras (i < k) {
+        sea b = __cargar8(buf + i)
+        str_agregar_byte(r, __o_bits(hex_digito(b / 16), 32))
+        str_agregar_byte(r, __o_bits(hex_digito(b % 16), 32))
+        i = i + 1
+    }
+    mem_liberar(buf)
+    retornar dyn_texto(r)
+}
+
+// ── AES-256-CBC con PKCS#7 (FIPS 197), en C-Forge puro ────────────────────
+// Formato compatible con 3.x: hex(iv) + ":" + hex(cifrado); la clave es el
+// SHA-256 del texto que pasa el programa.
+
+funcion aes_xtime(b) {
+    sea r = b * 2
+    si (r >= 256) { r = __xo_bits(r, 283) }
+    retornar r
+}
+
+funcion aes_mul(a, b) {
+    sea r = 0
+    mientras (b > 0) {
+        si (__y_bits(b, 1)) { r = __xo_bits(r, a) }
+        a = aes_xtime(a)
+        b = __desplazar_der(b, 1)
+    }
+    retornar r
+}
+
+// S-box (0..255) y su inversa (256..511), una sola vez (global 26; la 25
+// es el cerrojo del asignador de memoria).
+funcion aes_tablas() {
+    sea t = mem_global(26)
+    si (t != 0) { retornar t }
+    t = mem_reservar(512)
+    sea p = 1
+    sea q = 1
+    __guardar8(t, 99)
+    __guardar8(t + 256 + 99, 0)
+    sea vuelta = 0
+    sea x = 0
+    sea k = 0
+    mientras (vuelta < 255) {
+        // p · 3, q / 3 en GF(2^8)
+        p = __xo_bits(p, aes_xtime(p))
+        q = __xo_bits(q, q * 2)
+        q = __xo_bits(q, q * 4)
+        q = __xo_bits(q, q * 16)
+        q = __y_bits(q, 255)
+        si (__y_bits(q, 128)) { q = __xo_bits(q, 9) }
+        x = __xo_bits(q, 99)
+        k = 1
+        mientras (k <= 4) {
+            x = __xo_bits(x, __y_bits(__o_bits(__desplazar_izq(q, k), __desplazar_der(q, 8 - k)), 255))
+            k = k + 1
+        }
+        __guardar8(t + p, x)
+        __guardar8(t + 256 + x, p)
+        vuelta = vuelta + 1
+    }
+    mem_fijar_global(26, t)
+    retornar t
+}
+
+// Expansión de la clave de 32 bytes → 240 bytes (15 claves de ronda).
+funcion aes_expandir(clave) {
+    sea s = aes_tablas()
+    sea w = mem_reservar(240)
+    sea i = 0
+    mientras (i < 32) {
+        __guardar8(w + i, __cargar8(clave + i))
+        i = i + 1
+    }
+    sea rcon = 1
+    mientras (i < 240) {
+        sea a = __cargar8(w + i - 4)
+        sea b = __cargar8(w + i - 3)
+        sea c = __cargar8(w + i - 2)
+        sea d = __cargar8(w + i - 1)
+        si (i % 32 == 0) {
+            sea tmp = a
+            a = __xo_bits(__cargar8(s + b), rcon)
+            b = __cargar8(s + c)
+            c = __cargar8(s + d)
+            d = __cargar8(s + tmp)
+            rcon = aes_xtime(rcon)
+        } sino {
+            si (i % 32 == 16) {
+                a = __cargar8(s + a)
+                b = __cargar8(s + b)
+                c = __cargar8(s + c)
+                d = __cargar8(s + d)
+            }
+        }
+        __guardar8(w + i, __xo_bits(__cargar8(w + i - 32), a))
+        __guardar8(w + i + 1, __xo_bits(__cargar8(w + i - 31), b))
+        __guardar8(w + i + 2, __xo_bits(__cargar8(w + i - 30), c))
+        __guardar8(w + i + 3, __xo_bits(__cargar8(w + i - 29), d))
+        i = i + 4
+    }
+    retornar w
+}
+
+funcion aes_sumar_clave(e, w, ronda) {
+    sea i = 0
+    mientras (i < 16) {
+        __guardar8(e + i, __xo_bits(__cargar8(e + i), __cargar8(w + ronda * 16 + i)))
+        i = i + 1
+    }
+    retornar 0
+}
+
+// SubBytes + ShiftRows (directo o inverso) sobre el estado e (16 bytes).
+funcion aes_sustituir_desplazar(e, tabla, inverso) {
+    sea tmp = mem_reservar(16)
+    sea i = 0
+    mientras (i < 16) {
+        sea fila = i % 4
+        sea col = i / 4
+        sea origen = ((col + fila) % 4) * 4 + fila
+        si (inverso) { origen = ((col + 4 - fila) % 4) * 4 + fila }
+        __guardar8(tmp + i, __cargar8(tabla + __cargar8(e + origen)))
+        i = i + 1
+    }
+    i = 0
+    mientras (i < 16) {
+        __guardar8(e + i, __cargar8(tmp + i))
+        i = i + 1
+    }
+    mem_liberar(tmp)
+    retornar 0
+}
+
+funcion aes_mezclar(e, inverso) {
+    sea c = 0
+    mientras (c < 4) {
+        sea p = e + c * 4
+        sea a0 = __cargar8(p)
+        sea a1 = __cargar8(p + 1)
+        sea a2 = __cargar8(p + 2)
+        sea a3 = __cargar8(p + 3)
+        si (inverso) {
+            __guardar8(p, __xo_bits(__xo_bits(aes_mul(a0, 14), aes_mul(a1, 11)), __xo_bits(aes_mul(a2, 13), aes_mul(a3, 9))))
+            __guardar8(p + 1, __xo_bits(__xo_bits(aes_mul(a0, 9), aes_mul(a1, 14)), __xo_bits(aes_mul(a2, 11), aes_mul(a3, 13))))
+            __guardar8(p + 2, __xo_bits(__xo_bits(aes_mul(a0, 13), aes_mul(a1, 9)), __xo_bits(aes_mul(a2, 14), aes_mul(a3, 11))))
+            __guardar8(p + 3, __xo_bits(__xo_bits(aes_mul(a0, 11), aes_mul(a1, 13)), __xo_bits(aes_mul(a2, 9), aes_mul(a3, 14))))
+        } sino {
+            __guardar8(p, __xo_bits(__xo_bits(aes_xtime(a0), __xo_bits(aes_xtime(a1), a1)), __xo_bits(a2, a3)))
+            __guardar8(p + 1, __xo_bits(__xo_bits(a0, aes_xtime(a1)), __xo_bits(__xo_bits(aes_xtime(a2), a2), a3)))
+            __guardar8(p + 2, __xo_bits(__xo_bits(a0, a1), __xo_bits(aes_xtime(a2), __xo_bits(aes_xtime(a3), a3))))
+            __guardar8(p + 3, __xo_bits(__xo_bits(__xo_bits(aes_xtime(a0), a0), a1), __xo_bits(a2, aes_xtime(a3))))
+        }
+        c = c + 1
+    }
+    retornar 0
+}
+
+funcion aes_bloque_cifrar(e, w) {
+    sea s = aes_tablas()
+    aes_sumar_clave(e, w, 0)
+    sea r = 1
+    mientras (r < 14) {
+        aes_sustituir_desplazar(e, s, 0)
+        aes_mezclar(e, 0)
+        aes_sumar_clave(e, w, r)
+        r = r + 1
+    }
+    aes_sustituir_desplazar(e, s, 0)
+    aes_sumar_clave(e, w, 14)
+    retornar 0
+}
+
+funcion aes_bloque_descifrar(e, w) {
+    sea s = aes_tablas() + 256
+    aes_sumar_clave(e, w, 14)
+    sea r = 13
+    mientras (r > 0) {
+        aes_sustituir_desplazar(e, s, 1)
+        aes_sumar_clave(e, w, r)
+        aes_mezclar(e, 1)
+        r = r - 1
+    }
+    aes_sustituir_desplazar(e, s, 1)
+    aes_sumar_clave(e, w, 0)
+    retornar 0
+}
+
+funcion aes_clave_de(clave) {
+    sea k = hex_a_bytes(dyn_texto_de(cfv_sha256(dyn_texto(dyn_a_str(clave))), "aes"))
+    retornar aes_expandir(str_datos(k))
+}
+
+funcion hex_de_memoria(r, p, n) {
+    sea i = 0
+    mientras (i < n) {
+        sea b = __cargar8(p + i)
+        str_agregar_byte(r, __o_bits(hex_digito(b / 16), 32))
+        str_agregar_byte(r, __o_bits(hex_digito(b % 16), 32))
+        i = i + 1
+    }
+    retornar 0
+}
+
+funcion aes_cifrar(clave, texto) {
+    sea w = aes_clave_de(clave)
+    sea m = dyn_a_str(texto)
+    sea n = str_largo(m)
+    sea relleno = 16 - n % 16
+    sea total = n + relleno
+    sea datos = mem_reservar(total)
+    sea i = 0
+    mientras (i < n) {
+        __guardar8(datos + i, str_byte(m, i))
+        i = i + 1
+    }
+    mientras (i < total) {
+        __guardar8(datos + i, relleno)
+        i = i + 1
+    }
+    sea iv = mem_reservar(16)
+    si (sys_aleatorio(iv, 16) != 0) { dyn_error("aes_cifrar: el sistema no entregó bytes aleatorios") }
+    sea previo = iv
+    sea b = 0
+    mientras (b < total) {
+        sea j = 0
+        mientras (j < 16) {
+            __guardar8(datos + b + j, __xo_bits(__cargar8(datos + b + j), __cargar8(previo + j)))
+            j = j + 1
+        }
+        aes_bloque_cifrar(datos + b, w)
+        previo = datos + b
+        b = b + 16
+    }
+    sea r = str_nuevo(33 + total * 2)
+    hex_de_memoria(r, iv, 16)
+    str_agregar_byte(r, 58)
+    hex_de_memoria(r, datos, total)
+    mem_liberar(datos)
+    mem_liberar(iv)
+    mem_liberar(w)
+    retornar dyn_texto(r)
+}
+
+funcion aes_descifrar(clave, cifrado) {
+    sea c = dyn_texto_de(cifrado, "aes_descifrar")
+    si (str_largo(c) < 33 o str_byte(c, 32) != 58) { dyn_error("aes_descifrar: formato invalido (usar salida de aes_cifrar)") }
+    sea iv = hex_a_bytes(str_rebanar(c, 0, 32))
+    sea ct = hex_a_bytes(str_rebanar(c, 33, str_largo(c)))
+    sea total = str_largo(ct)
+    si (total == 0 o total % 16 != 0) { dyn_error("aes_descifrar: clave incorrecta o datos corruptos") }
+    sea w = aes_clave_de(clave)
+    sea datos = mem_reservar(total)
+    sea i = 0
+    mientras (i < total) {
+        __guardar8(datos + i, str_byte(ct, i))
+        i = i + 1
+    }
+    sea b = total - 16
+    mientras (b >= 0) {
+        aes_bloque_descifrar(datos + b, w)
+        sea j = 0
+        mientras (j < 16) {
+            sea anterior = 0
+            si (b == 0) { anterior = str_byte(iv, j) } sino { anterior = str_byte(ct, b - 16 + j) }
+            __guardar8(datos + b + j, __xo_bits(__cargar8(datos + b + j), anterior))
+            j = j + 1
+        }
+        b = b - 16
+    }
+    sea relleno = __cargar8(datos + total - 1)
+    sea valido = relleno >= 1 y relleno <= 16
+    i = 0
+    mientras (valido y i < relleno) {
+        si (__cargar8(datos + total - 1 - i) != relleno) { valido = 0 }
+        i = i + 1
+    }
+    mem_liberar(w)
+    si (valido == 0) {
+        mem_liberar(datos)
+        dyn_error("aes_descifrar: clave incorrecta o datos corruptos")
+    }
+    sea r = str_nuevo(total)
+    i = 0
+    mientras (i < total - relleno) {
+        str_agregar_byte(r, __cargar8(datos + i))
+        i = i + 1
+    }
+    mem_liberar(datos)
+    retornar dyn_texto(r)
+}
+
+// Un byte como texto de un carácter (sin codificar UTF-8).
+funcion char_de(n) {
+    sea r = str_nuevo(1)
+    str_agregar_byte(r, __y_bits(dyn_valor_entero(n), 255))
+    retornar dyn_texto(r)
+}
 // Segundos desde la época (Unix) con decimales.
 funcion tiempo_actual() { retornar dyn_desde_f64(__f64_div(__f64_desde_entero(sys_reloj_ns()), __f64_desde_entero(1000000000))) }
 
