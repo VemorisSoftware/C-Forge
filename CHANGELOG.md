@@ -2,7 +2,7 @@
 
 Sitio oficial: [c-forge.org](https://c-forge.org)
 
-## Sin publicar (4.4)
+## 4.4.0 — 2026-11-18
 
 - **Criptografía estable:** ChaCha20-Poly1305, XChaCha20, AES-256-GCM,
   X25519, Ed25519, BLAKE2b, BLAKE3, Argon2id, SHA-384/512, HKDF y RSA-OAEP en
