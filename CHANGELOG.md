@@ -2,7 +2,7 @@
 
 Sitio oficial: [c-forge.org](https://c-forge.org)
 
-## Sin publicar (5.0)
+## 4.6.0 — 2026-11-19
 
 - **`Ok(v)` / `Error(e)` y `Alguno(v)` / `Ninguno`** de primera clase,
   integrados con `?`, y **`coincidir`** (`match`): expresión con patrones de
