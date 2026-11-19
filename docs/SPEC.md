@@ -105,6 +105,13 @@ Tipos numéricos de tamaño fijo: `i8 i16 i32 i64 u8 u16 u32 u64 f32 f64`, más
 `isize`/`usize`. El verificador de tipos rechaza el programa antes de
 ejecutarlo; no hay conversiones implícitas con pérdida.
 
+**Parámetros `entero` (5.0):** un parámetro anotado `n: entero` se
+comprueba una vez al entrar a la función (si llega otro tipo: `error de
+tipos: el parámetro n espera entero y recibe …`, capturable) y, si el cuerpo
+solo le reasigna enteros, se compila como entero probado: aritmética,
+`%` y comparaciones sin comprobaciones dinámicas. `decimal` / `numero` solo
+los verifica `cforge check`.
+
 ### 3.3 Opcionales y punteros seguros ✅
 
 ```cfv

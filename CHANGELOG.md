@@ -2,6 +2,17 @@
 
 Sitio oficial: [c-forge.org](https://c-forge.org)
 
+## Sin publicar (5.0)
+
+- **Parámetros `entero` probados:** se comprueban una sola vez al entrar a
+  la función (error de tipos claro y capturable si llega otra cosa) y, si el
+  cuerpo solo les reasigna enteros, sus operaciones y comparaciones se
+  emiten sin volver a comprobarlos. Las variables `sea x: entero = …` también
+  quedan probadas. Primos con tipos (`benchmarks/08_primos_tipados.cfv`):
+  ~43 → ~35 ms con `--release`.
+- Corregido: los tipos de los parámetros de cierres y métodos se alineaban
+  con el nombre oculto (la función o `esto`) en vez del parámetro.
+
 ## 4.6.0 — 2026-11-19
 
 - **`Ok(v)` / `Error(e)` y `Alguno(v)` / `Ninguno`** de primera clase,
