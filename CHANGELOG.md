@@ -2,7 +2,7 @@
 
 Sitio oficial: [c-forge.org](https://c-forge.org)
 
-## Sin publicar (4.5)
+## 4.5.0 — 2026-11-19
 
 - **Seguridad:** endurecimiento contra entradas hostiles tras una auditoría
   ofensiva (detalle en `SECURITY.md`): `cforge add` sin path traversal,
