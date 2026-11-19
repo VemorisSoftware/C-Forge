@@ -2,7 +2,7 @@
 
 Sitio oficial: [c-forge.org](https://c-forge.org)
 
-## Sin publicar (4.3)
+## 4.3.0 — 2026-11-18
 
 - **WebAssembly (`cforge build --target wasm`):** nuevo backend
   `gen_wasm.cfv` sobre la misma capa `gen.cfv`. Genera `app.wasm`, el
