@@ -116,6 +116,7 @@ autoalojado-check: cforge-nativo
 	env -i $$C --version | grep -q "$(VERSION)"; \
 	sh tests/nativo/ejemplos.sh $$C; \
 	sh tests/paquetes/prueba.sh $$C; \
+	sh tests/herramientas/prueba.sh $$C; \
 	$$C fmt --stdout tests/formato/entrada.cfv | cmp - tests/formato/esperado.cfv; \
 	$$C fmt --check tests/formato/esperado.cfv; \
 	echo "  ✓ cforge fmt: salida esperada e idempotente"; \

@@ -60,7 +60,7 @@ funcion ctx_nuevo(tokens) {
     sea c = mem_reservar(456)
     mem_llenar(c, 0, 456)
     __guardar64(c + 400, 0 - 1)
-    __guardar64(c, tokens)
+    __guardar64(c, reescribir_async(tokens))
     __guardar64(c + 8, 0)
     __guardar64(c + 16, str_nuevo(65536))
     __guardar64(c + 24, str_nuevo(65536))
@@ -2402,6 +2402,101 @@ funcion sufijo_punto(c) {
     retornar 0
 }
 
+// ── coincidir (match) ─────────────────────────────────────────────────────
+// coincidir valor {
+//     Ok(x) => …, Error(e) => …, Alguno(v) => …, Ninguno => …,
+//     1 => …, "texto" => …, _ => …
+// }
+// Es una expresión: vale lo que valga la rama elegida (un bloque { … } vale
+// nulo); sin rama que coincida, nulo. Las ramas se prueban en orden.
+funcion variante_de(nombre) {
+    si (str_igual(nombre, "Ok")) { retornar 1 }
+    si (str_igual(nombre, "Error")) { retornar 2 }
+    si (str_igual(nombre, "Alguno")) { retornar 3 }
+    si (str_igual(nombre, "Ninguno")) { retornar 4 }
+    retornar 0
+}
+
+funcion requerir_flecha(c) {
+    si (tomar(c, "=>")) { retornar 0 }
+    requerir(c, "=")
+    requerir(c, ">")
+    retornar 0
+}
+
+funcion coincidir(c) {
+    si (dinamico(c) == 0) { error_en(c, "coincidir solo existe en el lenguaje dinámico") }
+    mem_fijar_global(45, 0)
+    expresion(c)
+    sea sujeto = declarar_local(c, str_nuevo(0))
+    guardar_local(c, sujeto)
+    sea resultado = declarar_local(c, str_nuevo(0))
+    cargar_inmediato(c, 0)
+    guardar_local(c, resultado)
+    sea fin = nueva_etiqueta(c)
+    requerir(c, "{")
+    mientras (ver(c, "}") == 0) {
+        si (tok_tipo(c) == 5) { error_en(c, "coincidir: falta '}'") }
+        sea siguiente = nueva_etiqueta(c)
+        sea locales = __cargar64(c + 56)
+        sea marca = vec_largo(locales)
+        __guardar64(c + 232, __cargar64(c + 232) + 1)
+        sea k = 0
+        si (tok_tipo(c) == 1) { k = variante_de(tok_lexema(c)) }
+        si (ver(c, "_")) {
+            avanzar(c)
+        } sino {
+            si (k > 0) {
+                avanzar(c)
+                cargar_local(c, sujeto)
+                empujar(c)
+                cargar_inmediato(c, k)
+                empujar(c)
+                llamar_runtime(c, "dyn_variante", 2)
+                op_saltar_si_cero(c, siguiente)
+                si (k != 4 y tomar(c, "(")) {
+                    sea nombre = requerir_ident(c)
+                    requerir(c, ")")
+                    si (str_igual(nombre, "_") == 0) {
+                        cargar_local(c, sujeto)
+                        empujar(c)
+                        cargar_inmediato(c, k)
+                        empujar(c)
+                        llamar_runtime(c, "dyn_variante_valor", 2)
+                        declarar_usuario(c, nombre)
+                    }
+                }
+            } sino {
+                // Patrón de valor (literal o expresión simple): igualdad.
+                cargar_local(c, sujeto)
+                empujar(c)
+                unaria(c)
+                empujar(c)
+                llamar_runtime(c, "dyn_igual_crudo", 2)
+                op_saltar_si_cero(c, siguiente)
+            }
+        }
+        requerir_flecha(c)
+        si (ver(c, "{")) {
+            bloque_sin_nivel(c)
+            cargar_inmediato(c, 0)
+        } sino {
+            expresion(c)
+        }
+        guardar_local(c, resultado)
+        tomar(c, ",")
+        __guardar64(c + 232, __cargar64(c + 232) - 1)
+        __guardar64(locales, marca)
+        op_saltar(c, fin)
+        definir_etiqueta(c, siguiente)
+    }
+    requerir(c, "}")
+    definir_etiqueta(c, fin)
+    cargar_local(c, resultado)
+    fijar_tipo(c, 0)
+    retornar 0
+}
+
 // ¿Termina la expresión después del token actual? (para "valor?")
 funcion fin_de_expresion_tras(c) {
     sea siguiente = vec_obtener(__cargar64(c), __cargar64(c + 8) + 1)
@@ -2671,6 +2766,18 @@ funcion primaria_dinamica(c) {
     si (tomar(c, "verdadero")) { cargar_inmediato(c, 4) fijar_tipo(c, 3) retornar 0 }
     si (tomar(c, "falso")) { cargar_inmediato(c, 2) fijar_tipo(c, 3) retornar 0 }
     si (tomar(c, "nulo")) { cargar_inmediato(c, 0) fijar_tipo(c, 6) retornar 0 }
+    si (ver(c, "coincidir") o ver(c, "match")) {
+        avanzar(c)
+        coincidir(c)
+        retornar 0
+    }
+    // Ninguno sin paréntesis: la Opción vacía.
+    si (ver(c, "Ninguno") y str_igual(tok_siguiente_lexema(c), "(") == 0 y dinamico(c)) {
+        avanzar(c)
+        llamar_runtime(c, "Ninguno", 0)
+        fijar_tipo(c, 0)
+        retornar 0
+    }
     si (ver(c, "si") y str_igual(tok_siguiente_lexema(c), "(")) {
         // si(condición, a, b): solo se evalúa la rama elegida.
         avanzar(c)
@@ -2902,6 +3009,14 @@ funcion primaria(c) {
 }
 
 funcion unaria(c) {
+    si (dinamico(c) y (ver(c, "await") o ver(c, "aguardar")) y str_igual(tok_siguiente_lexema(c), "(") == 0) {
+        avanzar(c)
+        unaria(c)
+        empujar(c)
+        llamar_runtime(c, "aguardar", 1)
+        fijar_tipo(c, 0)
+        retornar 0
+    }
     si (tomar(c, "-")) {
         unaria(c)
         si (dinamico(c)) {
@@ -3808,7 +3923,67 @@ funcion es_asignacion_compuesta(c) {
     retornar 0
 }
 
+// Cobertura (global 55 del compilador = lista de líneas instrumentadas;
+// 59 = [primera línea global del archivo probado][fin]): cada línea con
+// sentencias del archivo cuenta sus ejecuciones.
+// Global 58 del compilador: [archivo probado][ruta donde el programa vuelca
+// los conteos]. Busca las líneas globales del archivo y emite el inicio.
+funcion preparar_cobertura(c) {
+    si (mem_global(55) == 0 o mem_global(58) == 0) { retornar 0 }
+    sea objetivo = __cargar64(mem_global(58))
+    sea archivos = __cargar64(c + 208)
+    sea i = 0
+    mientras (i < vec_largo(archivos)) {
+        sea a = vec_obtener(archivos, i)
+        si (str_igual(__cargar64(a + 8), objetivo) o termina_con(__cargar64(a + 8), objetivo) o termina_con(objetivo, __cargar64(a + 8))) {
+            sea r = mem_reservar(16)
+            __guardar64(r, __cargar64(a))
+            __guardar64(r + 8, 4611686018427387904)
+            si (i + 1 < vec_largo(archivos)) { __guardar64(r + 8, __cargar64(vec_obtener(archivos, i + 1))) }
+            mem_fijar_global(59, r)
+        }
+        i = i + 1
+    }
+    si (buscar_funcion(c, "cobertura_iniciar") != 0) {
+        sea ruta = __cargar64(mem_global(58) + 8)
+        sea lit = str_nuevo(str_largo(ruta) + 8)
+        str_agregar_byte(lit, 34)
+        sea k = 0
+        mientras (k < str_largo(ruta)) {
+            si (str_byte(ruta, k) == 92 o str_byte(ruta, k) == 34) { str_agregar_byte(lit, 92) }
+            str_agregar_byte(lit, str_byte(ruta, k))
+            k = k + 1
+        }
+        str_agregar_byte(lit, 34)
+        op_direccion(c, 1, literal_caja(c, lit))
+        empujar(c)
+        llamar_runtime(c, "cobertura_iniciar", 1)
+    }
+    retornar 0
+}
+
+funcion termina_con(s, fin) {
+    si (str_largo(fin) > str_largo(s) o str_largo(fin) == 0) { retornar 0 }
+    retornar str_igual(str_rebanar(s, str_largo(s) - str_largo(fin), str_largo(s)), fin)
+}
+
+funcion instrumentar_linea(c) {
+    sea lineas = mem_global(55)
+    si (lineas == 0 o dinamico(c) == 0 o mem_global(59) == 0) { retornar 0 }
+    sea l = tok_linea(c)
+    sea r = mem_global(59)
+    si (l < __cargar64(r) o l >= __cargar64(r + 8)) { retornar 0 }
+    sea relativa = l - __cargar64(r) + 1
+    si (vec_largo(lineas) > 0 y vec_obtener(lineas, vec_largo(lineas) - 1) == relativa) { retornar 0 }
+    vec_agregar(lineas, relativa)
+    cargar_inmediato(c, relativa)
+    empujar(c)
+    llamar_runtime(c, "cobertura_marcar", 1)
+    retornar 0
+}
+
 funcion sentencia(c) {
+    si (mem_global(55) != 0) { instrumentar_linea(c) }
     si (tomar(c, ";")) { retornar 0 }
     si (tomar(c, "__dialecto")) {
         __guardar64(c + 104, numero_literal(__cargar64(avanzar(c) + 8)))
@@ -4527,6 +4702,62 @@ funcion emitir_tabla_clases(c) {
 
 // Salta un grupo balanceado que empieza en j ("(" o "{"); devuelve el
 // índice siguiente al cierre.
+// async funcion f(…) { cuerpo } → funcion f(…) { retornar tarea(funcion() { cuerpo }) }
+// (también "asincrona funcion"): llamarla devuelve una tarea que corre en su
+// propio hilo; await / aguardar la espera y entrega su resultado.
+funcion es_ident_lexema(t, lexema) { retornar __cargar64(t) == 1 y str_igual(__cargar64(t + 8), lexema) }
+
+funcion reescribir_async(toks) {
+    sea n = vec_largo(toks)
+    sea hay = 0
+    sea j = 0
+    mientras (j + 1 < n y hay == 0) {
+        sea t = vec_obtener(toks, j)
+        si ((es_ident_lexema(t, "async") o es_ident_lexema(t, "asincrona")) y es_ident_lexema(vec_obtener(toks, j + 1), "funcion")) { hay = 1 }
+        j = j + 1
+    }
+    si (hay == 0) { retornar toks }
+    sea r = vec_nuevo()
+    sea cierres = vec_nuevo()                                  // índices de "}" que cierran un cuerpo async
+    j = 0
+    mientras (j < n) {
+        sea t = vec_obtener(toks, j)
+        si (vec_largo(cierres) > 0 y vec_obtener(cierres, vec_largo(cierres) - 1) == j) {
+            sea linea = __cargar64(t + 16)
+            vec_agregar(r, token_nuevo(4, "}", linea))
+            vec_agregar(r, token_nuevo(4, ")", linea))
+            __guardar64(cierres, vec_largo(cierres) - 1)
+        }
+        si ((es_ident_lexema(t, "async") o es_ident_lexema(t, "asincrona")) y j + 1 < n y es_ident_lexema(vec_obtener(toks, j + 1), "funcion")) {
+            // Hasta el "{" del cuerpo: nombre, parámetros y tipo de retorno.
+            sea k = j + 1
+            mientras (k < n y es_simbolo(vec_obtener(toks, k), "(") == 0 y __cargar64(vec_obtener(toks, k)) != 5) { k = k + 1 }
+            k = saltar_grupo(toks, k, "(", ")")
+            mientras (k < n y es_simbolo(vec_obtener(toks, k), "{") == 0 y __cargar64(vec_obtener(toks, k)) != 5) { k = k + 1 }
+            sea cierre = saltar_grupo(toks, k, "{", "}") - 1
+            sea i = j + 1
+            mientras (i <= k) {
+                vec_agregar(r, vec_obtener(toks, i))
+                i = i + 1
+            }
+            sea linea = __cargar64(vec_obtener(toks, k) + 16)
+            vec_agregar(r, token_nuevo(1, "retornar", linea))
+            vec_agregar(r, token_nuevo(1, "tarea", linea))
+            vec_agregar(r, token_nuevo(4, "(", linea))
+            vec_agregar(r, token_nuevo(1, "funcion", linea))
+            vec_agregar(r, token_nuevo(4, "(", linea))
+            vec_agregar(r, token_nuevo(4, ")", linea))
+            vec_agregar(r, token_nuevo(4, "{", linea))
+            vec_agregar(cierres, cierre)
+            j = k + 1
+        } sino {
+            vec_agregar(r, t)
+            j = j + 1
+        }
+    }
+    retornar r
+}
+
 funcion saltar_grupo(toks, j, abre, cierra) {
     sea nivel = 0
     mientras (j < vec_largo(toks)) {
@@ -4583,6 +4814,7 @@ funcion compilar(c) {
     si (biblioteca == 0 y buscar_funcion(c, "dyn_gc_iniciar") != 0) {
         llamar_runtime(c, "dyn_gc_iniciar", 0)
     }
+    preparar_cobertura(c)
     mientras (tok_tipo(c) != 5) {
         si (ver(c, "funcion") y tok_tipo_en(c, 1) == 1) {
             avanzar(c)
@@ -4591,6 +4823,7 @@ funcion compilar(c) {
             sentencia(c)
         }
     }
+    si (mem_global(55) != 0 y buscar_funcion(c, "cobertura_volcar") != 0) { llamar_runtime(c, "cobertura_volcar", 0) }
     cargar_inmediato(c, 0)
     epilogo(c)
     cerrar_marco(c, marco)
