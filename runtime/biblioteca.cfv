@@ -2029,6 +2029,14 @@ funcion tls_cerrar(t) {
     retornar 0
 }
 
+// Versión negociada ("TLSv1.3", "TLSv1.2"…).
+funcion tls_version(t) {
+    sea estado = dyn_entero_c(t)
+    si (__cargar64(estado + 24) == 2) { retornar dyn_texto(sys_tls_version(estado)) }
+    si (__cargar64(estado) == 0) { retornar dyn_texto("desconocida") }
+    retornar dyn_texto(str_desde_c(__ccall(tls_f("SSL_get_version"), __cargar64(estado))))
+}
+
 // Schannel (Windows): el trabajo está en sys_windows_ext.cfv.
 funcion tls_abrir_schannel(estado, host) {
     __guardar64(estado + 24, 2)
@@ -2755,12 +2763,23 @@ funcion bytes_leer_entero(t, pos, ancho, orden) {
 funcion bytes_xor(a, b) {
     sea x = dyn_a_str(a)
     sea y = dyn_a_str(b)
-    sea r = str_nuevo(str_largo(x))
+    sea n = str_largo(x)
+    sea m = str_largo(y)
+    si (m == 0 y n > 0) { dyn_error("bytes_xor: la clave está vacía") }
+    sea r = str_nuevo(n)
+    sea px = str_datos(x)
+    sea py = str_datos(y)
+    sea pr = str_datos(r)
     sea i = 0
-    mientras (i < str_largo(x)) {
-        str_agregar_byte(r, __xo_bits(str_byte(x, i), str_byte(y, i % str_largo(y))))
+    sea j = 0
+    mientras (i < n) {
+        __guardar8(pr + i, __xo_bits(__cargar8(px + i), __cargar8(py + j)))
         i = i + 1
+        j = j + 1
+        si (j == m) { j = 0 }
     }
+    __guardar8(pr + n, 0)
+    __guardar64(r, n)
     retornar dyn_texto(r)
 }
 
@@ -2888,6 +2907,58 @@ funcion net_recibir_exacto(sock, n) {
         __guardar64(r, str_largo(r) + k)
     }
     retornar dyn_texto(r)
+}
+
+// Búfer de bytes propio y reutilizable (p. ej. uno por conexión).
+funcion bytes_bufer(capacidad) {
+    sea c = dyn_valor_entero(capacidad)
+    si (c < 16) { c = 16 }
+    si (c > 16777216) { dyn_error("bytes_bufer: capacidad mayor que 16 MiB") }
+    retornar dyn_texto(str_nuevo(c))
+}
+
+// Lee exactamente n bytes del socket dentro de buf (lo reemplaza) sin
+// reservar un texto nuevo; devuelve cuántos llegaron.
+funcion net_recibir_en(sock, buf, n) {
+    sea fd = dyn_valor_entero(sock)
+    sea total = dyn_valor_entero(n)
+    si (total < 0) { dyn_error("net_recibir_en: largo negativo") }
+    sea r = dyn_a_str(buf)
+    __guardar64(r, 0)
+    str_asegurar(r, total + 1)
+    mientras (str_largo(r) < total) {
+        sea k = sys_red_leer(fd, str_datos(r) + str_largo(r), total - str_largo(r))
+        si (k <= 0) {
+            __guardar8(str_datos(r) + str_largo(r), 0)
+            retornar dyn_entero(str_largo(r))
+        }
+        __guardar64(r, str_largo(r) + k)
+    }
+    __guardar8(str_datos(r) + total, 0)
+    retornar dyn_entero(total)
+}
+
+// XOR en el sitio con la máscara de 4 bytes de WebSocket (los 4 primeros
+// bytes de clave), de a 8 bytes. Solo para textos recién recibidos.
+funcion bytes_desenmascarar(datos, clave) {
+    sea d = dyn_a_str(datos)
+    sea k = dyn_a_str(clave)
+    si (str_largo(k) < 4) { dyn_error("bytes_desenmascarar: la máscara tiene 4 bytes") }
+    si (__cargar64(d + 24) != 1) { retornar bytes_xor(datos, dyn_texto(str_rebanar(k, 0, 4))) }   // texto prestado: copia
+    sea p = str_datos(d)
+    sea n = str_largo(d)
+    sea m4 = __y_bits(__cargar64(str_datos(k)), 4294967295)
+    sea m8 = __o_bits(m4, __desplazar_izq(m4, 32))
+    sea i = 0
+    mientras (i + 8 <= n) {
+        __guardar64(p + i, __xo_bits(__cargar64(p + i), m8))
+        i = i + 8
+    }
+    mientras (i < n) {
+        __guardar8(p + i, __xo_bits(__cargar8(p + i), __cargar8(str_datos(k) + i % 4)))
+        i = i + 1
+    }
+    retornar datos
 }
 
 // Saca la conexión activa del servidor HTTP (para WebSocket): el servidor ya

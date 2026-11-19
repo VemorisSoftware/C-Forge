@@ -234,10 +234,11 @@ stdlib-check: build
 ## perdidas.
 gc-check: build
 	@set -e; CFORGE_STDLIB=./stdlib ./$(TARGET) tests/memoria/prueba.cfv | grep -q '^\[OK\]' || { echo "  ✗ tests/memoria"; exit 1; }; \
+	CFORGE_STDLIB=./stdlib ./$(TARGET) tests/memoria/arena_llena.cfv | grep -q '^\[OK\]' || { echo "  ✗ tests/memoria/arena_llena"; exit 1; }; \
 	for file in tests/cfv/*.cfv; do \
 		CFORGE_GC_ESTRES=1 CFORGE_STDLIB=./stdlib ./$(TARGET) "$$file" | grep -q '^\[OK\]' || { echo "  ✗ $$file (GC en estrés)"; exit 1; }; \
 	done; \
-	echo "  ✓ recolector: 2 M iteraciones con arena < 50 MB y suite completa en modo estrés"
+	echo "  ✓ recolector: 2 M iteraciones con arena < 50 MB, arenas llenas sin corrupción y suite completa en modo estrés"
 
 ## Verificador de tipos: 19 errores detectados al compilar y un programa
 ## con tipos anotados e inferidos que se acepta y ejecuta.
