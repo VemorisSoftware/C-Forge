@@ -11,7 +11,7 @@
 
 TARGET   := cforge
 PREFIX   ?= /usr/local
-VERSION  := 4.3.0
+VERSION  := 4.4.0
 UNAME    := $(shell uname -s)
 ARCH     := $(shell uname -m)
 
