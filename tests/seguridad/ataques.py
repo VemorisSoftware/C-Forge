@@ -17,9 +17,19 @@ def esperar(nombre, cond):
 # ── Gestor de paquetes ──
 with tempfile.TemporaryDirectory() as d:
     subprocess.run([CF, "init"], cwd=d, env=ENV, capture_output=True)
-    for spec in ["evil/../.ssh/authorized_keys@main", "evil/../../../../tmp/evil@ref", "a/b@../../x", "a/b@-uexploit", "-c/x", "../x/y"]:
+    for spec in ["evil/../.ssh/authorized_keys@main", "evil/../../../../tmp/evil@ref", "a/b@../../x", "a/b@-uexploit", "-c/x", "../x/y",
+                 "a/%2e%2e@x", "a/b%2f..%2f..", "a/b@%5c..%5cx", "a/\\u002e\\u002e/x", "a/b\\..\\x", "a/b\x01", "a/b@v1@v2",
+                 "a/b c", "a/b;rm -rf", "a/b@v1\nx", "a/\u00e9b"]:
         r = subprocess.run([CF, "add", spec], cwd=d, env=dict(ENV, CFORGE_HOME=os.path.join(d, "h"), CFORGE_GIT_BASE="/nada/"), capture_output=True, text=True, timeout=30)
         esperar(f"paquete rechazado: {spec}", r.returncode != 0 and "inválid" in (r.stdout + r.stderr) and not os.path.exists(os.path.join(d, "h", "..", ".ssh")))
+
+    # Byte nulo: no cabe en argv, va dentro de cforge.toml (cforge install).
+    with open(os.path.join(d, "cforge.toml"), "a") as f: f.write('\n[dependencias]\nx = "a/b\x00/../../h"\n')
+    r = subprocess.run([CF, "install"], cwd=d, env=dict(ENV, CFORGE_HOME=os.path.join(d, "h"), CFORGE_GIT_BASE="/nada/"), capture_output=True, text=True, timeout=30)
+    esperar("byte nulo en cforge.toml rechazado", r.returncode != 0 and "inválid" in (r.stdout + r.stderr))
+    for alias in ["../x", "a/b", "-c", ".."]:
+        r = subprocess.run([CF, "add", "a/b", "--como", alias], cwd=d, env=dict(ENV, CFORGE_HOME=os.path.join(d, "h"), CFORGE_GIT_BASE="/nada/"), capture_output=True, text=True, timeout=30)
+        esperar(f"alias rechazado: {alias}", r.returncode != 0 and "inválid" in (r.stdout + r.stderr))
 
 # ── Parser: anidamiento extremo ──
 with tempfile.NamedTemporaryFile("w", suffix=".cfv", delete=False) as f:
