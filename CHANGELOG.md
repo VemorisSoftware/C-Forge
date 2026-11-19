@@ -2,6 +2,20 @@
 
 Sitio oficial: [c-forge.org](https://c-forge.org)
 
+## Sin publicar (4.5)
+
+- **Seguridad:** endurecimiento contra entradas hostiles tras una auditoría
+  ofensiva (detalle en `SECURITY.md`): `cforge add` sin path traversal,
+  límites de imágenes y de descompresión, servidor HTTP con límites,
+  timeouts y rechazo de smuggling, WebSocket con límites y validación RFC
+  6455, TLS 1.2+ con suites AEAD, borrado de secretos con barrera de memoria,
+  tope de anidamiento en el parser y JPEG progresivo con bandas validadas.
+- **`byte_en`** fuera de rango ahora es un error capturable.
+- **`zlib_descomprimir`, `gzip_descomprimir` e `inflar`** aceptan un límite
+  de salida; **`servidor_http_limites`** y **`ws_limites`** configuran los
+  del servidor.
+- Pruebas `tests/seguridad` (las tres plataformas) y `ataques.py` (CI).
+
 ## 4.4.0 — 2026-11-18
 
 - **Criptografía estable:** ChaCha20-Poly1305, XChaCha20, AES-256-GCM,
