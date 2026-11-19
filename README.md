@@ -6,7 +6,7 @@
 
 C-Forge es un lenguaje de programación creado por Vemoris Group. Su objetivo es ofrecer una sintaxis clara, ejecución nativa y una biblioteca estándar escrita en el propio lenguaje.
 
-> **C-Forge 4.4.0** — El núcleo, CLI y biblioteca estándar superan el gate reproducible `make release-check` en macOS ARM64, Linux x64 y Windows x64. Las capacidades marcadas como experimentales no forman parte del contrato estable.
+> **C-Forge 4.4.0** — Lenguaje **100 % autoalojado** (compilador, runtime y biblioteca estándar escritos en C-Forge, sin C ni C++), verificado en cada cambio con **fuzzing y pruebas ofensivas** (entradas hostiles, bombas de compresión, ataques a HTTP/WebSocket y al gestor de paquetes) y **listo para producción**: el gate reproducible `make release-check` pasa en macOS (ARM64 e Intel), Linux (x64 y ARM64) y Windows x64. La criptografía está probada contra vectores oficiales, pero aún no tiene una auditoría externa independiente.
 
 ---
 

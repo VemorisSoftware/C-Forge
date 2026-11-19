@@ -15,6 +15,30 @@ Sitio oficial: [c-forge.org](https://c-forge.org)
   de salida; **`servidor_http_limites`** y **`ws_limites`** configuran los
   del servidor.
 - Pruebas `tests/seguridad` (las tres plataformas) y `ataques.py` (CI).
+- **TLS 1.3 en Windows:** Schannel con `SCH_CREDENTIALS` (TLS 1.3 y 1.2,
+  cifrados AEAD, SSL 2/3 y TLS 1.0/1.1 desactivados), respaldo automático a
+  `SCHANNEL_CRED` en Windows anteriores a 1809 y mensajes de sesión de TLS
+  1.3 con el host real. Nueva **`tls_version(t)`**; el CI de Windows exige
+  `TLSv1.3`.
+- **`--release` más rápido** (benchmark de enteros: 73 → ~45 ms; listas y
+  mapas ×2): plegado de constantes, reducción de fuerza (× / % por potencias
+  de 2 → desplazamientos y máscaras en x64, ARM64 y WASM), comparación y
+  salto fusionados, mirilla que quita cargas tras un guardado, marco
+  principal sin celdas cuando no hay cierres, asignador con máscara de
+  listas libres y concatenación de enteros sin texto intermedio.
+- **GC:** corregida una corrupción latente — con una arena de 64 MiB llena,
+  limpiar su mapa de marcas pisaba un byte de la arena vecina. Prueba de
+  regresión `tests/memoria/arena_llena.cfv`.
+- **Búferes:** `ws_recibir` reutiliza un búfer por conexión, desenmascara en
+  el sitio (de a 8 bytes) y no copia los mensajes de una sola trama
+  (`bytes_bufer`, `net_recibir_en`, `bytes_desenmascarar`); `db_insertar` y
+  `db_actualizar` reutilizan el SQL validado (20 000 inserciones: 490 → 293
+  ms); `motor_textura` cachea por ruta (`motor_textura_olvidar`) y las
+  cachés de juego tienen tope; inflar copia de a 8 bytes (×2) y deflate
+  compara coincidencias de a 8 bytes; validación temprana de índices WASM
+  (< 2^32).
+- **`CFORGE_MAPA=archivo`** escribe el mapa de símbolos del ejecutable ELF
+  (para perfiladores).
 
 ## 4.4.0 — 2026-11-18
 

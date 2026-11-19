@@ -41,7 +41,7 @@ Revisado con una auditoría ofensiva; cada punto tiene una prueba en
 | Ejecutables | se rechazan programas de más de 1 GiB (campos de 32 bits en ELF, PE, Mach-O y la firma); LEB128 sin signo rechaza negativos |
 | Servidor HTTP | cabeceras ≤ 8 KiB (431), cuerpo ≤ 16 MiB (413), timeout por lectura y plazo total para las cabeceras (408, anti Slowloris), `Content-Length` + `Transfer-Encoding`, `Content-Length` repetido o no numérico (400), `Transfer-Encoding` sin soporte (501); configurable con `servidor_http_limites` |
 | WebSocket | tramas ≤ 1 MiB y mensajes ≤ 16 MiB antes de reservar (1009), bits RSV, opcodes, tramas de control y continuaciones según RFC 6455 (1002); `ws_limites` |
-| TLS | TLS 1.2 como mínimo; en 1.2 solo suites ECDHE con AES-GCM o ChaCha20-Poly1305 (OpenSSL); TLS 1.2 fijo en Schannel |
+| TLS | TLS 1.2 como mínimo; en 1.2 solo suites ECDHE con AES-GCM o ChaCha20-Poly1305 (OpenSSL); Schannel con `SCH_CREDENTIALS`: TLS 1.3 o 1.2 con cifrados fuertes, SSL 2/3 y TLS 1.0/1.1 desactivados (respaldo a TLS 1.2 en Windows anteriores a 1809) |
 | Fuentes TrueType | tablas dentro del archivo, índices de glifo y contornos validados |
 | Parser | anidamiento máximo de 1000 niveles (antes, un archivo con 200 000 paréntesis tumbaba el compilador) |
 | Runtime | `byte_en` fuera de rango lanza un error capturable en vez de abortar |

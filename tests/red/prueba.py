@@ -27,3 +27,9 @@ if os.environ.get("CFORGE_TLS_INTERNET"):
     if t.returncode != 0 or s != "200 verdadero":
         print(s, t.stderr.decode("utf-8", "replace")); print("  ✗ HTTPS a Internet"); sys.exit(1)
     print("  ✓ HTTPS a Internet con el almacén de certificados del sistema")
+    t = subprocess.run([cforge, os.path.join(AQUI, "version_tls.cfv")], capture_output=True, timeout=120)
+    v = t.stdout.decode("utf-8", "replace").strip()
+    exigida = os.environ.get("CFORGE_TLS_VERSION_MINIMA", "TLSv1.2")
+    if t.returncode != 0 or v not in ("TLSv1.2", "TLSv1.3") or v < exigida:
+        print(v, t.stderr.decode("utf-8", "replace")); print("  ✗ versión TLS negociada (se exige " + exigida + ")"); sys.exit(1)
+    print("  ✓ versión TLS negociada: " + v)
