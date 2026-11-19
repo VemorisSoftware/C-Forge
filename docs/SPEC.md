@@ -141,18 +141,32 @@ compilar para otra plataforma (se ejecuta en la máquina que compila).
 verifican en cada llamada con ese tipo. Dentro de la función, `T` vale el
 nombre del tipo (texto).
 
-### 3.4 Resultado y operador `?` 📐
+### 3.4 Resultado, Opción, `?` y `coincidir` ✅ (5.0)
 
 ```cfv
-funcion leer_config(ruta: texto): Resultado<Config, Error> {
-    sea texto = leer_archivo(ruta)?      // si falla, retorna el error
-    retornar Ok(parsear(texto)?)
+funcion dividir(a, b) {
+    si (b == 0) { retornar Error("división por cero") }
+    retornar Ok(a / b)
 }
+funcion mitad_mas_uno(a, b) {
+    sea q = dividir(a, b)?               // un Error se retorna tal cual
+    retornar Ok(q + 1)
+}
+mostrar(coincidir mitad_mas_uno(8, 0) {
+    Ok(v) => "vale " + v,
+    Error(e) => "falló: " + e
+})
 ```
 
-`Resultado<T, E>` es un valor normal: no hay desenrollado de pila ni costo
-oculto. `intentar` / `capturar` sigue disponible para errores lanzados con
-`lanzar`.
+`Ok(v)` / `Error(e)` y `Alguno(v)` / `Ninguno` son valores normales (sin
+desenrollado de pila ni costo oculto). `valor?` retorna de la función un
+`Error` o un `Ninguno` y, si no, entrega lo envuelto. `coincidir` (o
+`match`) es una expresión: prueba las ramas en orden con patrones de
+variante (`Ok(x)`, `Error(_)`, `Alguno(v)`, `Ninguno`), de valor (`1`,
+`"texto"`, `nulo`) o el comodín `_`; una rama puede ser una expresión o un
+bloque (que vale `nulo`), y sin rama que coincida vale `nulo`. Las
+ligaduras de una rama no salen de ella. `intentar` / `capturar` sigue
+disponible para errores lanzados con `lanzar`.
 
 ---
 
@@ -301,17 +315,25 @@ sea t = tarea(funcion() { retornar 20 + 22 })
 mostrar(esperar(t))          // 42
 ```
 
-### 9.2 `async` / `await` 📐
+### 9.2 `async` / `await` ✅ (5.0)
 
 ```cfv
-asincrona funcion descargar(url: texto): texto {
-    sea r = esperar http.obtener(url)
-    retornar r.cuerpo
+async funcion cuadrado(x) { retornar x * x }
+async funcion suma(lista) {
+    sea tareas = []
+    para v en lista { tareas.agregar(cuadrado(v)) }   // corren en paralelo
+    sea total = 0
+    para t en tareas { total = total + await t }
+    retornar total
 }
+mostrar(await suma([1, 2, 3]))
 ```
 
-En inglés: `async function` y `await`. Se compila a una máquina de estados sin
-hilos ocultos.
+En español: `asincrona funcion` y `aguardar`. Llamar a una función `async`
+devuelve una tarea (9.1) que corre en su propio hilo nativo; `await` la
+espera, entrega su resultado y relanza su error si falló (un valor que no es
+tarea pasa tal cual). En WebAssembly las tareas corren de forma síncrona al
+crearse (sin hilos todavía), con el mismo resultado.
 
 ---
 
@@ -435,7 +457,9 @@ WebAssembly (`tests/graficos`, `tests/juego`):
 | `cforge archivo.cfv`, `run`, `repl`, `check`, `test`, `fmt`, `new`, `init`, `doctor` | ✅ |
 | `cforge build archivo.cfv -o app` (requiere hoy gcc o clang) | ✅ |
 | `cforge build` con compilador 100 % C-Forge | ✅ |
-| `cforge add usuario/repo`, `cforge.toml` y `cforge.lock` | ✅ |
+| `cforge add usuario/repo[@v1.2.3 \| @^1.2.0 \| @~1.2.0]`, `cforge.toml` y `cforge.lock` con SHA-256 del árbol | ✅ (5.0) |
+| `cforge test archivo.cfv --coverage` (cobertura de líneas) | ✅ (5.0) |
+| `cforge doc archivo\|carpeta [-o x.md\|x.html]` (desde los comentarios `///`) | ✅ (5.0) |
 | LSP completo (diagnósticos, autocompletado, ir a definición) | ✅ |
 
 ---
