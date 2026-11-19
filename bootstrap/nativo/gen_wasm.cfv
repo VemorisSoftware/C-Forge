@@ -22,7 +22,7 @@ funcion w_reg(r) { retornar 1 + r }
 funcion w_pc() { retornar 0 }
 funcion w_t1() { retornar 17 }
 funcion w_t2() { retornar 18 }
-funcion w_bloques_por_trozo() { retornar 256 }
+funcion w_bloques_por_trozo() { retornar 1024 }
 
 funcion es_wasm(c) { retornar __cargar64(c + 296) == 7 }
 
@@ -118,12 +118,18 @@ funcion w_br_despacho(c, extra) {
     retornar 0
 }
 
-// pc ← bloque de la etiqueta; br despacho.
+// pc ← bloque de la etiqueta; br. Si el destino está más adelante en el
+// mismo trozo, el br va directo a su bloque (sin pasar por el despacho).
 funcion w_ir(c, etiqueta, extra) {
     e1(c, 65)
     w_hueco(c, 30, etiqueta)
     w_set(c, w_pc())
-    w_br_despacho(c, extra)
+    e1(c, 12)
+    sea r = mem_reservar(24)
+    __guardar64(r, etiqueta)
+    __guardar64(r + 8, w_bloque_actual(c))
+    __guardar64(r + 16, extra)
+    w_hueco(c, 37, r)
     retornar 0
 }
 
@@ -671,6 +677,17 @@ funcion empaquetar_wasm(c) {
         si (tipo == 31) { w_parchear5(codigo, posicion, va_datos + valor) }
         si (tipo == 32) { w_parchear5(codigo, posicion, va_globales + valor) }
         si (tipo == 33) { w_parchear5(codigo, posicion, va_datos + __cargar64(c + 192)) }
+        si (tipo == 37) {
+            sea destino = vec_obtener(etiquetas, __cargar64(valor))
+            sea bloque = __cargar64(valor + 8)
+            sea extra = __cargar64(valor + 16)
+            sea fin_trozo = minimo_entero((bloque / k_trozo + 1) * k_trozo, n)
+            si (destino > bloque y destino < fin_trozo) {
+                w_parchear5(codigo, posicion, destino - bloque - 1 + extra)
+            } sino {
+                w_parchear5(codigo, posicion, fin_trozo - bloque + extra)
+            }
+        }
         si (tipo == 34 o tipo == 36) {
             sea bloque = valor / 8
             sea fin_trozo = minimo_entero((bloque / k_trozo + 1) * k_trozo, n)
@@ -713,10 +730,28 @@ funcion empaquetar_wasm(c) {
         sea b = minimo_entero(a + k_trozo, n)
         sea m = b - a
         sea cuerpo = str_nuevo(4096)
-        w_uleb_str(cuerpo, 1)
+        w_uleb_str(cuerpo, 2)
         w_uleb_str(cuerpo, 18) str_agregar_byte(cuerpo, 126)
+        w_uleb_str(cuerpo, 1) str_agregar_byte(cuerpo, 127)            // 19: contador
         w_cargar_registros(cuerpo)
         str_agregar_byte(cuerpo, 3) str_agregar_byte(cuerpo, 64)       // loop
+        // Cada tanto se vuelve al trampolín: V8 no reemplaza una función que
+        // está corriendo, así que un trozo que nunca termina (un ciclo largo)
+        // seguiría en el primer nivel aunque ya esté optimizado.
+        str_agregar_byte(cuerpo, 35) w_uleb_str(cuerpo, 17)
+        str_agregar_byte(cuerpo, 65) w_sleb_str(cuerpo, 1)
+        str_agregar_byte(cuerpo, 107)
+        str_agregar_byte(cuerpo, 34) w_uleb_str(cuerpo, w_pc() + 19)
+        str_agregar_byte(cuerpo, 36) w_uleb_str(cuerpo, 17)
+        str_agregar_byte(cuerpo, 32) w_uleb_str(cuerpo, w_pc() + 19)
+        str_agregar_byte(cuerpo, 69)                                   // i32.eqz
+        str_agregar_byte(cuerpo, 4) str_agregar_byte(cuerpo, 64)
+        str_agregar_byte(cuerpo, 65) w_sleb_str(cuerpo, 50000)
+        str_agregar_byte(cuerpo, 36) w_uleb_str(cuerpo, 17)
+        w_guardar_registros(cuerpo)
+        str_agregar_byte(cuerpo, 32) w_uleb_str(cuerpo, w_pc())
+        str_agregar_byte(cuerpo, 15)
+        str_agregar_byte(cuerpo, 11)
         str_agregar_byte(cuerpo, 2) str_agregar_byte(cuerpo, 64)       // salir
         sea j = 0
         mientras (j < m) {
@@ -881,7 +916,7 @@ funcion empaquetar_wasm(c) {
     // Globales: 16 registros (mutables) y el fin de datos y globales (el
     // cargador pone la pila y el montículo después).
     sea globales = str_nuevo(256)
-    w_uleb_str(globales, 17)
+    w_uleb_str(globales, 18)
     k = 0
     mientras (k < 16) {
         str_agregar_byte(globales, 126)
@@ -895,6 +930,11 @@ funcion empaquetar_wasm(c) {
     str_agregar_byte(globales, 0)
     str_agregar_byte(globales, 65)
     w_sleb_str(globales, fin)
+    str_agregar_byte(globales, 11)
+    str_agregar_byte(globales, 127)
+    str_agregar_byte(globales, 1)
+    str_agregar_byte(globales, 65)
+    w_sleb_str(globales, 50000)
     str_agregar_byte(globales, 11)
     w_seccion(m, 6, globales)
     sea exportaciones = str_nuevo(64)

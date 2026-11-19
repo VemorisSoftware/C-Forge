@@ -1,99 +1,146 @@
-// stdlib/crypto.cfv — Criptografia para C-Forge
-// Uso: importar "stdlib/crypto.cfv"
+// stdlib/crypto.cfv — criptografía de C-Forge, segura por defecto.
+//   importar "crypto"
 //
-// Incluye: SHA-256, HMAC-SHA256, AES-256-CBC, bytes aleatorios seguros,
-//          hashing de contrasenas, tokens seguros.
-
-// SHA-256: retorna el hash en hexadecimal (64 chars)
-// Compilado con OpenSSL: hash real RFC 6234
-// Sin OpenSSL: implementacion pure-C++ integrada en el interprete
+// Todo está escrito en C-Forge (runtime/cripto.cfv y biblioteca.cfv), sin
+// OpenSSL ni libsodium, y se verifica contra los vectores oficiales (RFC 8439,
+// 7693, 7748, 8032, 9106, 5869, 8017, BLAKE3) en cada cambio.
+//
+// API de alto nivel (no hay nonces ni IV que manejar):
+//   sea clave = crypto_clave()                          // 32 bytes aleatorios
+//   sea caja = crypto_cerrar(clave, "secreto")          // XChaCha20-Poly1305
+//   mostrar(crypto_abrir(clave, caja))                   // "secreto" (o error)
+//   sea h = crypto_hash_contrasena("hunter2")           // Argon2id (PHC)
+//   crypto_verificar_contrasena("hunter2", h)           // verdadero
+//   sea par = crypto_par_firma()                         // Ed25519
+//   sea firma = crypto_firmar(par["secreta"], "mensaje")
+//   crypto_verificar_firma(par["publica"], "mensaje", firma)
+//   sea a = crypto_par_intercambio()                     // X25519
+//   crypto_secreto_compartido(a["secreta"], b["publica"])
+//
+// Primitivas (bytes en textos): sha256/sha384/sha512, blake2b, blake3,
+// hmac_sha256/512, hkdf_sha256/512, pbkdf2_sha256, argon2id,
+// chacha20_poly1305_cifrar/descifrar (nonce de 12 o 24 bytes),
+// aes_gcm_cifrar/descifrar, ed25519_*, x25519, rsa_oaep_cifrar,
+// comparar_seguro (tiempo constante) y borrar_texto (pone en 0 una clave).
 importar "base64"
 importar "json"
 
-funcion crypto_sha256(texto_v: texto): texto {
-    retornar sha256(texto_v)
-}
+// ── Resúmenes ──
+funcion crypto_sha256(texto_v: texto): texto { retornar sha256(texto_v) }
+funcion crypto_sha512(texto_v: texto): texto { retornar sha512(texto_v) }
+// BLAKE3 en hexadecimal (el más rápido y seguro para resúmenes generales).
+funcion crypto_hash(texto_v: texto): texto { retornar hex_de_bytes(blake3(texto_v, 32, nulo)) }
+funcion crypto_hmac(clave: texto, mensaje: texto): texto { retornar hmac_sha256(clave, mensaje) }
 
-// HMAC-SHA256: autenticacion de mensajes con clave secreta
-// Retorna hex de 64 chars
-funcion crypto_hmac(clave: texto, mensaje: texto): texto {
-    retornar hmac_sha256(clave, mensaje)
-}
+// ── Aleatorio ──
+funcion crypto_rand(n: numero): texto { retornar crypto_rand_bytes(n) }
+funcion crypto_token(n: numero): texto { retornar crypto_rand_bytes(n) }
+funcion crypto_clave(): texto { retornar bytes_aleatorios(32) }
 
-// AES-256-CBC: cifrar texto con clave.
-// La clave puede ser cualquier texto (se hashea internamente a 32 bytes).
-// Retorna formato "iv_hex:ciphertext_hex" (requiere OpenSSL)
+// ── Cifrado autenticado (caja) ──
+// clave de 32 bytes (crypto_clave) o cualquier texto (se deriva con BLAKE2b).
+funcion crypto_clave_de(clave: texto): texto {
+    si (longitud(clave) == 32) { retornar clave }
+    retornar blake2b(clave, 32, "c-forge.caja")
+}
+funcion crypto_cerrar(clave: texto, texto_plano: texto): texto { retornar caja_cerrar(crypto_clave_de(clave), texto_plano) }
+funcion crypto_abrir(clave: texto, caja: texto): texto { retornar caja_abrir(crypto_clave_de(clave), caja) }
+
+// Compatibles con versiones anteriores: texto en hexadecimal. Lo nuevo usa
+// XChaCha20-Poly1305 ("cf2:…"); lo que tiene "iv:datos" sigue siendo
+// AES-256-CBC y se descifra igual.
 funcion crypto_cifrar(clave: texto, texto_plano: texto): texto {
-    retornar aes_cifrar(clave, texto_plano)
+    retornar "cf2:" + hex_de_bytes(crypto_cerrar(clave, texto_plano))
 }
-
-// AES-256-CBC: descifrar. Requiere el output de crypto_cifrar y la misma clave.
 funcion crypto_descifrar(clave: texto, cifrado: texto): texto {
+    si (texto_empieza_con(cifrado, "cf2:")) { retornar crypto_abrir(clave, bytes_de_hex(subtexto(cifrado, 4, longitud(cifrado)))) }
     retornar aes_descifrar(clave, cifrado)
 }
 
-// Bytes aleatorios criptograficamente seguros (hex string)
-// n: cantidad de bytes (resultado tiene longitud n*2 en hex)
-funcion crypto_rand(n: numero): texto {
-    retornar crypto_rand_bytes(n)
+// ── Contraseñas: Argon2id en formato PHC ──
+// $argon2id$v=19$m=19456,t=2,p=1$<sal>$<hash> (parámetros de OWASP).
+funcion base64_sin_relleno(t: texto): texto { retornar texto_reemplazar(base64_codificar(t), "=", "") }
+funcion base64_con_relleno(t: texto): texto {
+    sea r = t
+    mientras (longitud(r) % 4 != 0) { r = r + "=" }
+    retornar base64_decodificar(r)
 }
 
-// Generar token aleatorio seguro de longitud n bytes → hex de n*2 chars
-funcion crypto_token(n: numero): texto {
-    retornar crypto_rand_bytes(n)
+funcion crypto_hash_contrasena(contrasena: texto, memoria_kib = 19456, iteraciones = 2): texto {
+    sea sal = bytes_aleatorios(16)
+    sea h = argon2id(contrasena, sal, iteraciones, memoria_kib, 1, 32)
+    retornar "$argon2id$v=19$m=" + memoria_kib + ",t=" + iteraciones + ",p=1$" + base64_sin_relleno(sal) + "$" + base64_sin_relleno(h)
 }
 
-// Hashear contrasena (PBKDF2-like simple usando HMAC iterado)
-// Retorna "sal_hex:hash_hex" para almacenar en base de datos
-funcion crypto_hash_contrasena(contrasena: texto): texto {
-    sea sal = crypto_rand(16)
-    sea h = contrasena
-    sea i = 0
-    mientras (i < 10000) {
-        h = hmac_sha256(sal, h)
-        i = i + 1
-    }
-    retornar "{sal}:{h}"
-}
-
-// Verificar contrasena contra hash almacenado
 funcion crypto_verificar_contrasena(contrasena: texto, hash_almacenado: texto): booleano {
+    si (texto_empieza_con(hash_almacenado, "$argon2id$")) {
+        sea partes = texto_dividir(hash_almacenado, "$")
+        si (longitud(partes) != 6) { retornar falso }
+        sea m = 0
+        sea t = 0
+        sea p = 1
+        para par en texto_dividir(partes[3], ",") {
+            sea kv = texto_dividir(par, "=")
+            si (kv[0] == "m") { m = a_numero(kv[1]) }
+            si (kv[0] == "t") { t = a_numero(kv[1]) }
+            si (kv[0] == "p") { p = a_numero(kv[1]) }
+        }
+        sea esperado = base64_con_relleno(partes[5])
+        sea h = argon2id(contrasena, base64_con_relleno(partes[4]), t, m, p, longitud(esperado))
+        retornar comparar_seguro(h, esperado)
+    }
+    // Formato anterior "sal:hash" (HMAC iterado).
     sea partes = texto_dividir(hash_almacenado, ":")
     si (longitud(partes) < 2) { retornar falso }
-    sea sal = partes[0]
-    sea hash_esperado = partes[1]
     sea h = contrasena
     sea i = 0
     mientras (i < 10000) {
-        h = hmac_sha256(sal, h)
+        h = hmac_sha256(partes[0], h)
         i = i + 1
     }
-    retornar h == hash_esperado
+    retornar comparar_seguro(h, partes[1])
 }
 
-// Generar token JWT simple (HS256) — solo header.payload.firma sin claims extras
-// payload: mapa con datos del usuario
-// clave_secreta: clave para firmar
+// ── Firmas (Ed25519) e intercambio de claves (X25519) ──
+funcion crypto_par_firma(): mapa {
+    sea semilla = bytes_aleatorios(32)
+    retornar {"secreta": semilla, "publica": ed25519_publica(semilla)}
+}
+funcion crypto_firmar(secreta: texto, mensaje: texto): texto { retornar ed25519_firmar(secreta, mensaje) }
+funcion crypto_verificar_firma(publica: texto, mensaje: texto, firma: texto): booleano { retornar ed25519_verificar(publica, mensaje, firma) }
+
+funcion crypto_par_intercambio(): mapa {
+    sea secreta = bytes_aleatorios(32)
+    retornar {"secreta": secreta, "publica": x25519_base(secreta)}
+}
+// Secreto compartido listo para usar como clave (X25519 + HKDF).
+funcion crypto_secreto_compartido(mi_secreta: texto, su_publica: texto): texto {
+    retornar hkdf_sha256(x25519(mi_secreta, su_publica), "", "c-forge x25519", 32)
+}
+
+// ── JWT (HS256) ──
+funcion base64url(t: texto): texto {
+    retornar texto_reemplazar(texto_reemplazar(base64_sin_relleno(t), "+", "-"), "/", "_")
+}
+funcion base64url_decodificar(t: texto): texto {
+    retornar base64_con_relleno(texto_reemplazar(texto_reemplazar(t, "-", "+"), "_", "/"))
+}
+
 funcion crypto_jwt_crear(payload: mapa, clave_secreta: texto): texto {
-    sea header_json = "\{\"alg\":\"HS256\",\"typ\":\"JWT\"}"
-    sea header_b64 = base64_codificar(header_json)
-    sea payload_json = json_serializar(payload)
-    sea payload_b64 = base64_codificar(payload_json)
-    sea datos = "{header_b64}.{payload_b64}"
-    sea firma = hmac_sha256(clave_secreta, datos)
-    sea firma_b64 = base64_codificar(firma)
-    retornar "{datos}.{firma_b64}"
+    sea datos = base64url("\{\"alg\":\"HS256\",\"typ\":\"JWT\"}") + "." + base64url(json_serializar(payload))
+    retornar datos + "." + base64url(hmac_sha256_bytes(clave_secreta, datos))
 }
 
-// Verificar y parsear JWT. Retorna el payload si la firma es valida, nulo si no.
+// Devuelve el payload si la firma es válida y no venció ("exp"), si no nulo.
 funcion crypto_jwt_verificar(token: texto, clave_secreta: texto): cualquiera {
     sea partes = texto_dividir(token, ".")
     si (longitud(partes) != 3) { retornar nulo }
-    sea datos = "{partes[0]}.{partes[1]}"
-    sea firma_esperada = base64_codificar(hmac_sha256(clave_secreta, datos))
-    si (partes[2] != firma_esperada) { retornar nulo }
+    sea datos = partes[0] + "." + partes[1]
+    si (comparar_seguro(base64url(hmac_sha256_bytes(clave_secreta, datos)), partes[2]) == falso) { retornar nulo }
     intentar {
-        retornar json_parsear(base64_decodificar(partes[1]))
+        sea payload = json_parsear(base64url_decodificar(partes[1]))
+        si (tipo(payload) == "mapa" y tiene_clave(payload, "exp") y payload["exp"] < tiempo_actual()) { retornar nulo }
+        retornar payload
     } capturar (e) {
         retornar nulo
     }
