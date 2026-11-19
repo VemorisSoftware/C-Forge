@@ -335,8 +335,8 @@ cf.llamar("mi_funcion", 3);                                  // C-Forge desde JS
 ```
 
 - El mismo compilador y la misma capa `gen.cfv`: `gen_wasm.cfv` emula la
-  máquina virtual dentro de una función wasm (registros en locales, pila y
-  marcos en la memoria lineal, un bloque por etiqueta). El recolector de
+  máquina virtual en wasm (registros en locales, pila y marcos en la memoria
+  lineal, un bloque por etiqueta). El recolector de
   basura, `intentar`/`capturar` y los punteros a funciones funcionan igual.
 - `extern "js" funcion f(x: numero): texto` importa funciones de JavaScript
   (números, enteros, booleanos y textos se convierten solos).
@@ -346,9 +346,9 @@ cf.llamar("mi_funcion", 3);                                  // C-Forge desde JS
   en línea: con ellos la física en enteros no crea objetos.
 - `tarea()` corre completa al lanzarse (no hay hilos); `extern` de C no
   existe en el navegador.
-- Rendimiento: el código que se llama muchas veces (animación, eventos)
-  corre a ~2,5× del nativo; un programa que hace todo en `main` corre en el
-  primer nivel de V8 (~7×).
+- El código va en funciones wasm de 256 bloques unidas por un trampolín,
+  así V8 optimiza cada una por separado. Rendimiento: entre 2,5× y 4× del
+  nativo (primos + fib(30): 73 ms nativo, ~250 ms en Node.js).
 
 ## 11. Biblioteca estándar
 
