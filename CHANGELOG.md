@@ -2,6 +2,23 @@
 
 Sitio oficial: [c-forge.org](https://c-forge.org)
 
+## Sin publicar (4.3)
+
+- **WebAssembly (`cforge build --target wasm`):** nuevo backend
+  `gen_wasm.cfv` sobre la misma capa `gen.cfv`. Genera `app.wasm`, el
+  cargador `app.mjs` (navegador y Node.js) y `app.d.ts`. 28 de las 29 suites
+  del lenguaje pasan en Node.js (la otra usa librerías C).
+- **`extern "js"`** y llamadas de JavaScript a funciones de C-Forge
+  (`cf.llamar("nombre", n)`).
+- **`stdlib/navegador.cfv`:** DOM, eventos, animación, lienzo 2D y partículas
+  WebGL2. Ejemplo: `ejemplos/web/particulas`.
+- **c-forge.org:** la física de las partículas del sitio está escrita en
+  C-Forge (`site/forja/forja.cfv`) y corre en WebAssembly.
+- **`cociente(a, b)`** (división entera) y **`bits_y`, `bits_o`, `bits_xo`**,
+  en línea entre enteros; `lista[i]` y `lista[i] = v` en línea.
+- **`lista_direccion(l)`** para compartir los elementos de una lista sin
+  copiarlos.
+
 ## 4.2.0 — 2026-11-18
 
 - **`cforge repl`:** consola interactiva con estado (variables, funciones de

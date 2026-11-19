@@ -1,7 +1,8 @@
 // c-forge.org — "La forja": partículas en WebGL2 que siguen el scroll y el mouse.
-// Sin dependencias. La simulación (física de cada partícula) está separada del
-// dibujo: la versión WebAssembly compilada desde C-Forge reemplaza a
-// simularJS() cuando está disponible (ver forja-cfv.wasm).
+// Sin dependencias. La física de las partículas está escrita en C-Forge
+// (site/forja/forja.cfv) y compilada a WebAssembly (assets/forja/forja.wasm);
+// este archivo solo dibuja. Mientras el módulo carga, o si el navegador no
+// puede usarlo, una versión en JavaScript hace lo mismo.
 (function () {
   "use strict";
   var lienzo = document.getElementById("forja");
@@ -169,15 +170,75 @@
     "}"].join("\n")));
   gl.linkProgram(prog);
   if (!gl.getProgramParameter(prog, gl.LINK_STATUS)) { lienzo.remove(); return; }
+  // Variante para C-Forge: lee las listas del módulo tal cual (enteros
+  // etiquetados 2v + 1, en milésimas).
+  var fuenteFrag = gl.getAttachedShaders(prog)[1];
+  var progCF = gl.createProgram();
+  gl.attachShader(progCF, sombreador(gl.VERTEX_SHADER, [
+    "#version 300 es",
+    "layout(location=1) in float ex; layout(location=2) in float ey; layout(location=3) in float ez; layout(location=4) in float ec;",
+    "uniform vec2 u_aspecto; uniform float u_tam, u_tiempo; uniform vec2 u_parallax;",
+    "out float v_calor; out float v_prof;",
+    "void main(){",
+    "  vec4 p = (vec4(ex, ey, ez, ec) - 1.0) * 0.0005;",
+    "  vec3 q = p.xyz;",
+    "  float a = u_parallax.x * 0.12, b = u_parallax.y * 0.08;",
+    "  q = vec3(q.x*cos(a) + q.z*sin(a), q.y, -q.x*sin(a) + q.z*cos(a));",
+    "  q = vec3(q.x, q.y*cos(b) - q.z*sin(b), q.y*sin(b) + q.z*cos(b));",
+    "  float z = 6.0 - q.z;",
+    "  float f = 1.0 / tan(radians(25.0));",
+    "  gl_Position = vec4(q.x * f / u_aspecto.x, q.y * f, (z - 0.1) / 40.0 * z, z);",
+    "  gl_PointSize = u_tam * (1.0 + p.w * 1.6) / z;",
+    "  v_calor = p.w; v_prof = clamp((z - 3.0) / 6.0, 0.0, 1.0);",
+    "}"].join("\n")));
+  gl.attachShader(progCF, fuenteFrag);
+  gl.linkProgram(progCF);
+  var listaCF = null, bufCF = [], vaoJS = null, vaoCF = null;
   gl.useProgram(prog);
+  vaoJS = gl.createVertexArray(); gl.bindVertexArray(vaoJS);
   var buf = gl.createBuffer();
   gl.bindBuffer(gl.ARRAY_BUFFER, buf);
   gl.bufferData(gl.ARRAY_BUFFER, salida.byteLength, gl.DYNAMIC_DRAW);
   gl.enableVertexAttribArray(0);
   gl.vertexAttribPointer(0, 4, gl.FLOAT, false, 0, 0);
+  vaoCF = gl.createVertexArray(); gl.bindVertexArray(vaoCF);
+  for (var b = 0; b < 4; b++) {
+    bufCF.push(gl.createBuffer());
+    gl.bindBuffer(gl.ARRAY_BUFFER, bufCF[b]);
+    gl.bufferData(gl.ARRAY_BUFFER, N * 8, gl.DYNAMIC_DRAW);
+    gl.enableVertexAttribArray(b + 1);
+    // Los 32 bits bajos de cada entero de 64 bits (little endian).
+    gl.vertexAttribPointer(b + 1, 1, gl.INT, false, 8, 0);
+  }
+  gl.bindVertexArray(null);
   gl.enable(gl.BLEND); gl.blendFunc(gl.SRC_ALPHA, gl.ONE);
-  var uAsp = gl.getUniformLocation(prog, "u_aspecto"), uTam = gl.getUniformLocation(prog, "u_tam"),
-      uBri = gl.getUniformLocation(prog, "u_brillo"), uPar = gl.getUniformLocation(prog, "u_parallax"), uT = gl.getUniformLocation(prog, "u_tiempo");
+  function uniformes(p) {
+    return { asp: gl.getUniformLocation(p, "u_aspecto"), tam: gl.getUniformLocation(p, "u_tam"), bri: gl.getUniformLocation(p, "u_brillo"),
+             par: gl.getUniformLocation(p, "u_parallax"), t: gl.getUniformLocation(p, "u_tiempo") };
+  }
+  var uJS = uniformes(prog), uCF = gl.getProgramParameter(progCF, gl.LINK_STATUS) ? uniformes(progCF) : null;
+
+  // ── Física en C-Forge (WebAssembly) ──
+  var cf = null, entrada = [N, 0, 0, 0, 0, 0, 0, 0, 0];
+  if (uCF && typeof WebAssembly === "object") {
+    import("/assets/forja/forja.mjs").then(function (m) {
+      return m.iniciar({ web: true, js: {
+        forja_entrada: function (k) { return entrada[k]; },
+        forja_listas: function (x, y, z, calor, n) { listaCF = [x, y, z, calor, n]; }
+      } });
+    }).then(function (programa) {
+      if (!listaCF || listaCF[4] !== N) return;
+      // Arranca desde donde iban las partículas de JavaScript.
+      cf = programa;
+      api.motor = "C-Forge → WebAssembly";
+      var d = new DataView(cf.memoria.buffer);
+      for (var i = 0; i < N; i++) for (var e = 0; e < 3; e++) d.setBigInt64(listaCF[e] + i * 8, BigInt(Math.round(pos[i * 3 + e] * 1000)) * 2n + 1n, true);
+      var marca = document.createElement("a");
+      marca.className = "forja-motor"; marca.href = "https://github.com/VemorisSoftware/C-Forge/blob/main/site/forja/forja.cfv";
+      marca.rel = "noopener"; marca.textContent = "partículas: C-Forge → WebAssembly";
+      document.body.appendChild(marca); api.marca = marca;
+    }).catch(function (e) { api.errorCF = String(e); });
+  }
 
   var t0 = performance.now(), visible = true, parallax = [0, 0], mediciones = [];
   document.addEventListener("visibilitychange", function () { visible = !document.hidden; if (visible) requestAnimationFrame(cuadro); });
@@ -189,18 +250,35 @@
     // Núcleo (hero) → malla → CF → galaxia a lo largo de la página.
     var etapa = suave(p / 0.12) + suave((p - 0.25) / 0.2) + suave((p - 0.6) / 0.25);
     var mezcla = etapa - Math.floor(etapa);
-    var inicio = performance.now();
-    var datos = api.simular(t, etapa, mezcla, centroNucleo());
+    var inicio = performance.now(), u;
+    var centro = centroNucleo();
+    if (cf) {
+      entrada[1] = Math.round(t * 1000); entrada[2] = Math.round(etapa * 1000); entrada[3] = Math.round(mezcla * 1024);
+      entrada[4] = Math.round(centro[0] * 1000); entrada[5] = Math.round(centro[1] * 1000);
+      entrada[6] = Math.round(raton.x * 1000); entrada[7] = Math.round(raton.y * 1000); entrada[8] = raton.activo;
+      cf.llamar("forja_paso", 0);
+      gl.useProgram(progCF); gl.bindVertexArray(vaoCF); u = uCF;
+      var mem = new Uint8Array(cf.memoria.buffer);
+      for (var b = 0; b < 4; b++) {
+        gl.bindBuffer(gl.ARRAY_BUFFER, bufCF[b]);
+        gl.bufferSubData(gl.ARRAY_BUFFER, 0, mem, listaCF[b], N * 8);
+      }
+    } else {
+      var datos = api.simular(t, etapa, mezcla, centro);
+      gl.useProgram(prog); gl.bindVertexArray(vaoJS); u = uJS;
+      gl.bindBuffer(gl.ARRAY_BUFFER, buf);
+      gl.bufferSubData(gl.ARRAY_BUFFER, 0, datos);
+    }
     mediciones.push(performance.now() - inicio); if (mediciones.length > 60) mediciones.shift();
     api.msPorCuadro = mediciones.reduce(function (a, b) { return a + b; }, 0) / mediciones.length;
+    if (api.marca && mediciones.length === 60 && Math.round(ahora) % 30 < 17) api.marca.textContent = "partículas: C-Forge → WebAssembly · " + api.msPorCuadro.toFixed(1) + " ms";
     parallax[0] += (raton.mx - parallax[0]) * 0.05; parallax[1] += (raton.my - parallax[1]) * 0.05;
     gl.clearColor(0, 0, 0, 0); gl.clear(gl.COLOR_BUFFER_BIT);
-    gl.bufferSubData(gl.ARRAY_BUFFER, 0, datos);
-    gl.uniform2f(uAsp, ancho / alto, 1);
-    gl.uniform1f(uTam, (movil ? 24 : 21) * dpr);
+    gl.uniform2f(u.asp, ancho / alto, 1);
+    gl.uniform1f(u.tam, (movil ? 24 : 21) * dpr);
     // Más intenso en el hero; más tenue detrás del contenido.
-    gl.uniform1f(uBri, 0.75 - 0.3 * suave(p / 0.1) + 0.2 * suave((p - 0.85) / 0.15));
-    gl.uniform2f(uPar, parallax[0], parallax[1]); gl.uniform1f(uT, t);
+    gl.uniform1f(u.bri, 0.75 - 0.3 * suave(p / 0.1) + 0.2 * suave((p - 0.85) / 0.15));
+    gl.uniform2f(u.par, parallax[0], parallax[1]); gl.uniform1f(u.t, t);
     gl.drawArrays(gl.POINTS, 0, N);
     if (!quieto) requestAnimationFrame(cuadro);
   }

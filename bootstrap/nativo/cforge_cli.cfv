@@ -40,6 +40,7 @@ funcion cli_ayuda() {
     mostrar("Herramientas:")
     mostrar("  cforge fmt [--check] [rutas]     Formatear el código (.cfv)")
     mostrar("  cforge build --release a.cfv     Ejecutable sin el código que no usa")
+    mostrar("  cforge build a.cfv --target wasm WebAssembly: a.wasm + a.mjs (navegador y Node)")
     mostrar("  cforge repl                      Consola interactiva (:salir para terminar)")
     mostrar("  cforge lsp                       Servidor de lenguaje (LSP) por stdio")
     mostrar("  cforge xcode-init [X.xcodeproj]  Integrar C-Forge en un proyecto de Xcode")
@@ -101,7 +102,8 @@ funcion modulo_de_plataforma(nombre) {
     si (contiene_prefijo(nombre, "sys_windows")) { retornar mem_global(33) == 1 }
     si (contiene_prefijo(nombre, "sys_macos")) { retornar es_darwin_numero(mem_global(33)) }
     si (contiene_prefijo(nombre, "sys_linux_arm64")) { retornar mem_global(33) == 4 }
-    si (contiene_prefijo(nombre, "sys_linux")) { retornar mem_global(33) == 0 }
+    // WebAssembly usa los módulos de Linux x86-64 (el cargador emula sus llamadas).
+    si (contiene_prefijo(nombre, "sys_linux")) { retornar mem_global(33) == 0 o mem_global(33) == 7 }
     retornar 1
 }
 
@@ -135,7 +137,7 @@ funcion compilar_archivo(ruta) {
     sea archivos = vec_nuevo()
     sea i = 0
     mientras (i < runtime_cantidad()) {
-        si (runtime_modo(i) != 4 y modulo_de_plataforma(runtime_nombre(i))) { agregar_fuente(fuente, runtime_modo(i), runtime_fuente(i), runtime_nombre(i), archivos) }
+        si (runtime_modo(i) <= 3 y modulo_de_plataforma(runtime_nombre(i))) { agregar_fuente(fuente, runtime_modo(i), runtime_fuente(i), runtime_nombre(i), archivos) }
         i = i + 1
     }
     sea inicio_programa = str_largo(fuente)
@@ -395,12 +397,58 @@ funcion construir(ruta, salida) {
         si (termina_en(ruta, ".cfv")) { salida = str_rebanar(ruta, 0, str_largo(ruta) - 4) }
         si (destino_windows()) { salida = str_concatenar(salida, ".exe") }
     }
+    si (mem_global(33) == 7) { retornar construir_wasm(ruta, salida) }
     sea ejecutable = compilar_archivo(ruta)
     escribir_ejecutable(salida, ejecutable)
     sea m = str_concatenar("✓ ", salida)
     str_agregar(m, " (")
     str_agregar(m, str_desde_entero(str_largo(ejecutable)))
     str_agregar(m, " bytes)")
+    mostrar(m)
+    retornar 0
+}
+
+// Texto de un recurso incrustado (make embebido --recurso).
+funcion recurso_embebido(nombre) {
+    sea i = 0
+    mientras (i < runtime_cantidad()) {
+        si (runtime_modo(i) == 5 y str_igual(runtime_nombre(i), nombre)) { retornar runtime_fuente(i) }
+        i = i + 1
+    }
+    rt_panico(str_concatenar("falta el recurso incrustado ", nombre))
+    retornar 0
+}
+
+// cforge build archivo.cfv --target wasm [-o app]: app.wasm, el cargador
+// app.mjs (navegador y Node.js) y sus tipos app.d.ts.
+funcion construir_wasm(ruta, salida) {
+    si (termina_en(salida, ".wasm")) { salida = str_rebanar(salida, 0, str_largo(salida) - 5) }
+    si (termina_en(salida, ".mjs")) { salida = str_rebanar(salida, 0, str_largo(salida) - 4) }
+    si (termina_en(salida, ".js")) { salida = str_rebanar(salida, 0, str_largo(salida) - 3) }
+    sea modulo = compilar_archivo(ruta)
+    sea ruta_wasm = str_concatenar(salida, ".wasm")
+    archivo_escribir(ruta_wasm, modulo)
+    sea cargador = str_nuevo(32768)
+    str_agregar(cargador, mem_global(41))
+    str_agregar(cargador, "const WASM = \"./")
+    str_agregar(cargador, nombre_de(ruta_wasm))
+    str_agregar(cargador, "\";\n")
+    str_agregar(cargador, recurso_embebido("runtime/wasm_cargador.js"))
+    sea ruta_js = str_concatenar(salida, ".mjs")
+    archivo_escribir(ruta_js, cargador)
+    sea tipos = str_nuevo(2048)
+    str_agregar(tipos, "// Generado por cforge build --target wasm.\n")
+    str_agregar(tipos, "export interface ProgramaCForge {\n  codigo: number;\n  memoria: WebAssembly.Memory;\n  funciones: string[];\n  llamar(nombre: string, entero?: number): number | bigint;\n}\n")
+    str_agregar(tipos, "export interface OpcionesCForge {\n  js?: Record<string, (...args: any[]) => any>;\n  modulos?: Record<string, Record<string, (...args: any[]) => any>>;\n  argumentos?: string[];\n  web?: boolean;\n  wasm?: BufferSource;\n  escribir?: (fd: number, texto: string) => void;\n}\n")
+    str_agregar(tipos, "export function iniciar(opciones?: OpcionesCForge): Promise<ProgramaCForge>;\n")
+    archivo_escribir(str_concatenar(salida, ".d.ts"), tipos)
+    sea m = str_concatenar("✓ ", ruta_wasm)
+    str_agregar(m, " (")
+    str_agregar(m, str_desde_entero(str_largo(modulo)))
+    str_agregar(m, " bytes) + ")
+    str_agregar(m, ruta_js)
+    str_agregar(m, " + ")
+    str_agregar(m, str_concatenar(salida, ".d.ts"))
     mostrar(m)
     retornar 0
 }

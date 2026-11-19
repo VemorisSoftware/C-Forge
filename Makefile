@@ -20,9 +20,9 @@ RUNTIME_NATIVO := runtime/sys_linux.cfv runtime/mem.cfv runtime/str.cfv \
 	runtime/vec.cfv runtime/io.cfv runtime/f64.cfv
 RUNTIME_LENGUAJE := $(RUNTIME_NATIVO) runtime/sys_linux_ext.cfv runtime/map.cfv --puente runtime/dyn.cfv runtime/biblioteca.cfv --lenguaje runtime/lenguaje.cfv
 PRUEBAS_LENGUAJE_NATIVAS := $(basename $(notdir $(wildcard tests/cfv/*.cfv)))
-FUENTES_COMPILADOR := $(RUNTIME_NATIVO) bootstrap/nativo/lexer.cfv bootstrap/nativo/cforge_self.cfv bootstrap/nativo/gen.cfv bootstrap/nativo/gen_x64.cfv bootstrap/nativo/gen_a64.cfv bootstrap/nativo/biblioteca_c.cfv
+FUENTES_COMPILADOR := $(RUNTIME_NATIVO) bootstrap/nativo/lexer.cfv bootstrap/nativo/cforge_self.cfv bootstrap/nativo/gen.cfv bootstrap/nativo/gen_x64.cfv bootstrap/nativo/gen_a64.cfv bootstrap/nativo/gen_wasm.cfv bootstrap/nativo/biblioteca_c.cfv
 FUENTES_CFORGE := $(FUENTES_COMPILADOR) bootstrap/nativo/embebido.cfv bootstrap/nativo/paquetes.cfv bootstrap/nativo/formato.cfv bootstrap/nativo/lsp.cfv bootstrap/nativo/xcode.cfv bootstrap/nativo/cforge_cli.cfv
-EMBEBIDO_ARGS := --nativo $(RUNTIME_NATIVO) runtime/sys_linux_ext.cfv runtime/sys_linux_arm64.cfv runtime/sys_linux_arm64_ext.cfv runtime/sys_windows.cfv runtime/sys_windows_ext.cfv runtime/sys_macos.cfv runtime/sys_macos_ext.cfv runtime/map.cfv --puente runtime/dyn.cfv runtime/biblioteca.cfv --lenguaje runtime/lenguaje.cfv --opcional runtime/sdl.cfv runtime/gl3d.cfv
+EMBEBIDO_ARGS := --nativo $(RUNTIME_NATIVO) runtime/sys_linux_ext.cfv runtime/sys_linux_arm64.cfv runtime/sys_linux_arm64_ext.cfv runtime/sys_windows.cfv runtime/sys_windows_ext.cfv runtime/sys_macos.cfv runtime/sys_macos_ext.cfv runtime/map.cfv --puente runtime/dyn.cfv runtime/biblioteca.cfv --lenguaje runtime/lenguaje.cfv --opcional runtime/sdl.cfv runtime/gl3d.cfv --recurso runtime/wasm_cargador.js
 SEMILLA := bootstrap/semilla/cforge-linux-x64
 
 
@@ -123,7 +123,7 @@ autoalojado-check: cforge-nativo
 
 ## ── Windows x86-64 (PE64), compilado de forma cruzada desde Linux ───────
 RUNTIME_WINDOWS := runtime/sys_windows.cfv runtime/mem.cfv runtime/str.cfv runtime/vec.cfv runtime/io.cfv runtime/f64.cfv
-FUENTES_CFORGE_WINDOWS := $(RUNTIME_WINDOWS) bootstrap/nativo/lexer.cfv bootstrap/nativo/cforge_self.cfv bootstrap/nativo/gen.cfv bootstrap/nativo/gen_x64.cfv bootstrap/nativo/gen_a64.cfv bootstrap/nativo/biblioteca_c.cfv bootstrap/nativo/embebido.cfv bootstrap/nativo/paquetes.cfv bootstrap/nativo/formato.cfv bootstrap/nativo/lsp.cfv bootstrap/nativo/xcode.cfv bootstrap/nativo/cforge_cli.cfv
+FUENTES_CFORGE_WINDOWS := $(RUNTIME_WINDOWS) bootstrap/nativo/lexer.cfv bootstrap/nativo/cforge_self.cfv bootstrap/nativo/gen.cfv bootstrap/nativo/gen_x64.cfv bootstrap/nativo/gen_a64.cfv bootstrap/nativo/gen_wasm.cfv bootstrap/nativo/biblioteca_c.cfv bootstrap/nativo/embebido.cfv bootstrap/nativo/paquetes.cfv bootstrap/nativo/formato.cfv bootstrap/nativo/lsp.cfv bootstrap/nativo/xcode.cfv bootstrap/nativo/cforge_cli.cfv
 windows-cruzado: cforge-nativo
 	@set -e; rm -rf dist-windows; mkdir -p dist-windows/pruebas; \
 	./cforge-nativo -o dist-windows/cforge.exe --target windows $(FUENTES_CFORGE_WINDOWS) >/dev/null; \
@@ -135,7 +135,7 @@ windows-cruzado: cforge-nativo
 
 ## ── macOS x86-64 (Mach-O), compilado de forma cruzada ───────────────────
 RUNTIME_MACOS := runtime/sys_macos.cfv runtime/mem.cfv runtime/str.cfv runtime/vec.cfv runtime/io.cfv runtime/f64.cfv
-FUENTES_CFORGE_MACOS := $(RUNTIME_MACOS) bootstrap/nativo/lexer.cfv bootstrap/nativo/cforge_self.cfv bootstrap/nativo/gen.cfv bootstrap/nativo/gen_x64.cfv bootstrap/nativo/gen_a64.cfv bootstrap/nativo/biblioteca_c.cfv bootstrap/nativo/embebido.cfv bootstrap/nativo/paquetes.cfv bootstrap/nativo/formato.cfv bootstrap/nativo/lsp.cfv bootstrap/nativo/xcode.cfv bootstrap/nativo/cforge_cli.cfv
+FUENTES_CFORGE_MACOS := $(RUNTIME_MACOS) bootstrap/nativo/lexer.cfv bootstrap/nativo/cforge_self.cfv bootstrap/nativo/gen.cfv bootstrap/nativo/gen_x64.cfv bootstrap/nativo/gen_a64.cfv bootstrap/nativo/gen_wasm.cfv bootstrap/nativo/biblioteca_c.cfv bootstrap/nativo/embebido.cfv bootstrap/nativo/paquetes.cfv bootstrap/nativo/formato.cfv bootstrap/nativo/lsp.cfv bootstrap/nativo/xcode.cfv bootstrap/nativo/cforge_cli.cfv
 macos-cruzado: cforge-nativo
 	@set -e; rm -rf dist-macos; mkdir -p dist-macos/pruebas; \
 	./cforge-nativo -o dist-macos/cforge --target macos $(FUENTES_CFORGE_MACOS) >/dev/null; \
@@ -235,6 +235,27 @@ tipos-check: build
 	CFORGE_STDLIB=../../stdlib ../../$(TARGET) valido.cfv | grep -q '^\[OK\]'; \
 	echo "  ✓ tipos: 19 errores detectados antes de ejecutar y un programa válido"
 
+## WebAssembly (--target wasm): la suite del lenguaje en Node.js (menos
+## extern C), extern "js" y llamadas desde JavaScript, y el .wasm publicado de
+## la forja de c-forge.org igual al que sale de su fuente.
+wasm-check: build
+	@if ! command -v node >/dev/null 2>&1; then echo "  - wasm: sin Node.js, se omite"; exit 0; fi; \
+	set -e; dir=$$(mktemp -d /tmp/cforge-wasm.XXXXXX); n=0; \
+	for file in tests/cfv/*.cfv; do \
+		case "$$file" in *24_extern_c*) continue ;; esac; \
+		CFORGE_STDLIB=./stdlib ./$(TARGET) build "$$file" --target wasm --release -o $$dir/p >/dev/null; \
+		(cd tests/cfv && node $$dir/p.mjs) | grep -q '^\[OK\]' || { echo "  ✗ $$file en WebAssembly"; exit 1; }; \
+		n=$$((n + 1)); \
+	done; \
+	mkdir -p tests/wasm/salida; \
+	CFORGE_STDLIB=./stdlib ./$(TARGET) build tests/wasm/interop.cfv --target wasm -o tests/wasm/salida/interop >/dev/null; \
+	node tests/wasm/prueba.mjs; \
+	./$(TARGET) build site/forja/forja.cfv --target wasm --release -o $$dir/forja >/dev/null; \
+	cmp -s $$dir/forja.wasm site/assets/forja/forja.wasm && cmp -s $$dir/forja.mjs site/assets/forja/forja.mjs || { echo "  ✗ site/assets/forja desactualizado (cforge build site/forja/forja.cfv --target wasm --release -o site/assets/forja/forja)"; exit 1; }; \
+	CFORGE_STDLIB=./stdlib ./$(TARGET) build ejemplos/web/particulas/particulas.cfv --target wasm --release -o $$dir/particulas >/dev/null; \
+	rm -rf $$dir; \
+	echo "  ✓ wasm: $$n suites del lenguaje en Node.js, interop con JavaScript y la forja del sitio"
+
 ## --release: "hola" < 60 KB, la suite completa sin el código muerto y el
 ## benchmark de enteros (holgura para máquinas lentas del CI).
 release-modo-check: build
@@ -299,7 +320,7 @@ smoke-test: build
 
 ## Gate único exigido antes de publicar una versión.
 release-check: build nativo-check autoalojado-check semilla-check check test \
-	stdlib-load-check stdlib-check repl-check gc-check tipos-check release-modo-check cli-check malformed-check install-check smoke-test
+	stdlib-load-check stdlib-check repl-check gc-check tipos-check release-modo-check wasm-check cli-check malformed-check install-check smoke-test
 	@echo ""
 	@echo "  ✓ GATE DE ESTABILIDAD C-FORGE COMPLETO (100 % C-Forge)"
 
