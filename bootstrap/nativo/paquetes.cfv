@@ -16,7 +16,10 @@
 //
 // Los paquetes se descargan de GitHub con git (clon superficial) a una caché
 // global: $CFORGE_HOME/paquetes/usuario/repo/ref (por defecto ~/.cforge).
-// cforge.lock guarda el commit exacto de cada dependencia. En el código,
+// Versiones: @v1.2.3 (tag exacto), @^1.2.3 y @~1.2.3 (rangos semver; se
+// elige el tag más alto que cumple). cforge.lock guarda el commit, el
+// SHA-256 del árbol y el tag elegido: compilar usa ese tag y verifica el
+// hash (reproducible; un paquete alterado en la caché se rechaza). En el código,
 // importar "json" carga el archivo principal del paquete e importar
 // "json/util" su archivo util.cfv. CFORGE_GIT_BASE cambia la base de las
 // URL (por defecto https://github.com/).
@@ -319,6 +322,7 @@ funcion especificacion_cruda_segura(texto) {
             arrobas = arrobas + 1
             ok = arrobas == 1
         }
+        si ((c == 94 o c == 126) y i > 0 y str_byte(texto, i - 1) == 64) { ok = 1 }   // @^1.2.0 / @~1.2.0
         si (ok == 0) { retornar 0 }
         i = i + 1
     }
@@ -330,10 +334,11 @@ funcion especificacion(texto) {
     si (especificacion_cruda_segura(texto) == 0) {
         rt_panico(str_concatenar("paquete inválido (solo letras, números, '.', '_', '-', '/' y una '@'; sin secuencias codificadas ni bytes nulos): ", texto))
     }
-    sea e = mem_reservar(24)
+    sea e = mem_reservar(32)
     sea arroba = posicion_de(texto, 64)
     sea fuente = texto
     __guardar64(e + 16, 0)
+    __guardar64(e + 24, 0)                                     // tag elegido para un rango
     si (arroba >= 0) {
         fuente = str_rebanar(texto, 0, arroba)
         __guardar64(e + 16, str_rebanar(texto, arroba + 1, str_largo(texto)))
@@ -348,13 +353,353 @@ funcion especificacion(texto) {
         rt_panico(str_concatenar("paquete inválido (usuario y repo solo admiten letras, números, '-', '_' y '.'): ", texto))
     }
     si (__cargar64(e + 16) != 0) {
-        si (componente_seguro(__cargar64(e + 16), 1) == 0) { rt_panico(str_concatenar("versión (@ref) inválida: ", texto)) }
+        sea ref = __cargar64(e + 16)
+        si (es_rango(ref)) {
+            si (semver_partes(str_rebanar(ref, 1, str_largo(ref))) == 0) { rt_panico(str_concatenar("rango de versión inválido (se espera ^X.Y.Z o ~X.Y.Z): ", texto)) }
+        } sino {
+            si (componente_seguro(ref, 1) == 0) { rt_panico(str_concatenar("versión (@ref) inválida: ", texto)) }
+        }
     }
     retornar e
 }
 
-funcion directorio_paquete(e) {
+// Ref con la que se descarga: el tag elegido para un rango, o la @ref.
+funcion ref_efectiva(e) {
+    si (__cargar64(e + 24) != 0) { retornar __cargar64(e + 24) }
+    retornar __cargar64(e + 16)
+}
+
+// ── Versionado semántico ──────────────────────────────────────────────────
+// @v1.2.3 (o @1.2.3) es un tag exacto; @^1.2.3 acepta >= 1.2.3 y < 2.0.0
+// (< 0.3.0 si la mayor es 0); @~1.2.3 acepta >= 1.2.3 y < 1.3.0. Se elige el
+// tag más alto que cumpla (sin pre-lanzamientos).
+
+funcion es_rango(ref) { retornar str_largo(ref) > 1 y (str_byte(ref, 0) == 94 o str_byte(ref, 0) == 126) }
+
+// "v1.2.3" / "1.2.3" → [mayor][menor][parche], o 0.
+funcion semver_partes(t) {
+    sea i = 0
+    si (str_largo(t) > 0 y str_byte(t, 0) == 118) { i = 1 }
+    sea r = mem_reservar(24)
+    sea k = 0
+    mientras (k < 3) {
+        si (i >= str_largo(t)) { retornar 0 }
+        sea v = 0
+        sea cifras = 0
+        mientras (i < str_largo(t) y str_byte(t, i) >= 48 y str_byte(t, i) <= 57 y cifras < 9) {
+            v = v * 10 + str_byte(t, i) - 48
+            i = i + 1
+            cifras = cifras + 1
+        }
+        si (cifras == 0) { retornar 0 }
+        __guardar64(r + k * 8, v)
+        k = k + 1
+        si (k < 3) {
+            si (i >= str_largo(t) o str_byte(t, i) != 46) { retornar 0 }
+            i = i + 1
+        }
+    }
+    si (i != str_largo(t)) { retornar 0 }
+    retornar r
+}
+
+funcion semver_comparar(a, b) {
+    sea k = 0
+    mientras (k < 3) {
+        si (__cargar64(a + k * 8) < __cargar64(b + k * 8)) { retornar 0 - 1 }
+        si (__cargar64(a + k * 8) > __cargar64(b + k * 8)) { retornar 1 }
+        k = k + 1
+    }
+    retornar 0
+}
+
+funcion semver_cumple(v, rango) {
+    sea base = semver_partes(str_rebanar(rango, 1, str_largo(rango)))
+    si (base == 0 o semver_comparar(v, base) < 0) { retornar 0 }
+    si (__cargar64(v) != __cargar64(base)) { retornar 0 }
+    si (str_byte(rango, 0) == 126 o __cargar64(base) == 0) { retornar __cargar64(v + 8) == __cargar64(base + 8) }
+    retornar 1
+}
+
+// Tags del repositorio remoto (de un clon "bare" en la caché).
+funcion etiquetas_de(e, url) {
+    sea dir = unir_ruta(unir_ruta(unir_ruta(directorio_cforge(), "indices"), __cargar64(e)), __cargar64(e + 8))
+    sea args = vec_nuevo()
+    si (existe_ruta(unir_ruta(dir, "HEAD"))) {
+        vec_agregar(args, "--git-dir")
+        vec_agregar(args, dir)
+        vec_agregar(args, "fetch")
+        vec_agregar(args, "-q")
+        vec_agregar(args, "--tags")
+        vec_agregar(args, "--force")
+        vec_agregar(args, url)
+    } sino {
+        crear_directorios(directorio_de(dir))
+        vec_agregar(args, "clone")
+        vec_agregar(args, "-q")
+        vec_agregar(args, "--bare")
+        vec_agregar(args, url)
+        vec_agregar(args, dir)
+    }
+    si (git(args) != 0) { rt_panico(str_concatenar("no se pudieron leer las versiones de ", url)) }
+    sea tags = vec_nuevo()
+    sea empaquetadas = unir_ruta(dir, "packed-refs")
+    si (existe_ruta(empaquetadas)) {
+        sea lineas = lineas_de(archivo_leer(empaquetadas))
+        sea i = 0
+        mientras (i < vec_largo(lineas)) {
+            sea l = recortar(vec_obtener(lineas, i))
+            si (str_largo(l) > 51 y str_igual(str_rebanar(l, 41, 51), "refs/tags/")) { vec_agregar(tags, str_rebanar(l, 51, str_largo(l))) }
+            i = i + 1
+        }
+    }
+    sea sueltas = sys_listar(unir_ruta(dir, "refs/tags"))
+    si (sueltas != 0) {
+        sea i = 0
+        mientras (i < vec_largo(sueltas)) {
+            vec_agregar(tags, vec_obtener(sueltas, i))
+            i = i + 1
+        }
+    }
+    retornar tags
+}
+
+// Elige el tag más alto que cumple el rango de e (o el del cforge.lock).
+funcion resolver_rango(e, url, bloqueado) {
     sea ref = __cargar64(e + 16)
+    si (ref == 0 o es_rango(ref) == 0) { retornar 0 }
+    si (bloqueado != 0) {
+        __guardar64(e + 24, bloqueado)
+        retornar 0
+    }
+    sea tags = etiquetas_de(e, url)
+    sea mejor = 0
+    sea mejor_v = 0
+    sea i = 0
+    mientras (i < vec_largo(tags)) {
+        sea t = vec_obtener(tags, i)
+        sea v = semver_partes(t)
+        si (v != 0 y componente_seguro(t, 0) y semver_cumple(v, ref)) {
+            si (mejor == 0 o semver_comparar(v, mejor_v) > 0) {
+                mejor = t
+                mejor_v = v
+            }
+        }
+        i = i + 1
+    }
+    si (mejor == 0) { rt_panico(str_concatenar(str_concatenar("ninguna versión de ", url), str_concatenar(" cumple ", ref))) }
+    __guardar64(e + 24, mejor)
+    retornar 0
+}
+
+// ── SHA-256 (integridad de cforge.lock) ───────────────────────────────────
+
+funcion pq_hex_valor(b) {
+    si (b >= 97) { retornar b - 87 }
+    retornar b - 48
+}
+
+funcion pq_sha_k() {
+    sea k = mem_global(53)
+    si (k != 0) { retornar k }
+    k = vec_nuevo()
+    sea v = "428a2f9871374491b5c0fbcfe9b5dba53956c25b59f111f1923f82a4ab1c5ed5d807aa9812835b01243185be550c7dc372be5d7480deb1fe9bdc06a7c19bf174e49b69c1efbe47860fc19dc6240ca1cc2de92c6f4a7484aa5cb0a9dc76f988da983e5152a831c66db00327c8bf597fc7c6e00bf3d5a7914706ca63511429296727b70a852e1b21384d2c6dfc53380d13650a7354766a0abb81c2c92e92722c85a2bfe8a1a81a664bc24b8b70c76c51a3d192e819d6990624f40e3585106aa07019a4c1161e376c082748774c34b0bcb5391c0cb34ed8aa4a5b9cca4f682e6ff3748f82ee78a5636f84c878148cc7020890befffaa4506cebbef9a3f7c67178f2"
+    sea i = 0
+    mientras (i < str_largo(v)) {
+        sea x = 0
+        sea j = 0
+        mientras (j < 8) {
+            x = x * 16 + pq_hex_valor(str_byte(v, i + j))
+            j = j + 1
+        }
+        vec_agregar(k, x)
+        i = i + 8
+    }
+    mem_fijar_global(53, k)
+    retornar k
+}
+
+funcion pq_rotr(x, n) { retornar __y_bits(__o_bits(__desplazar_der(x, n), __desplazar_izq(x, 32 - n)), 4294967295) }
+
+funcion pq_sha256_hex(s) {
+    sea M = 4294967295
+    sea n = str_largo(s)
+    sea total = (n + 9 + 63) / 64 * 64
+    sea m = mem_reservar(total)
+    mem_llenar(m, 0, total)
+    mem_copiar(m, str_datos(s), n)
+    __guardar8(m + n, 128)
+    sea bits = n * 8
+    sea q = 0
+    mientras (q < 8) {
+        __guardar8(m + total - 1 - q, __y_bits(__desplazar_der(bits, q * 8), 255))
+        q = q + 1
+    }
+    sea k = pq_sha_k()
+    sea h = mem_reservar(64)
+    __guardar64(h, 1779033703)
+    __guardar64(h + 8, 3144134277)
+    __guardar64(h + 16, 1013904242)
+    __guardar64(h + 24, 2773480762)
+    __guardar64(h + 32, 1359893119)
+    __guardar64(h + 40, 2600822924)
+    __guardar64(h + 48, 528734635)
+    __guardar64(h + 56, 1541459225)
+    sea w = mem_reservar(512)
+    sea b = 0
+    mientras (b < total) {
+        sea i = 0
+        mientras (i < 16) {
+            sea p = m + b + i * 4
+            __guardar64(w + i * 8, __o_bits(__o_bits(__desplazar_izq(__cargar8(p), 24), __desplazar_izq(__cargar8(p + 1), 16)), __o_bits(__desplazar_izq(__cargar8(p + 2), 8), __cargar8(p + 3))))
+            i = i + 1
+        }
+        mientras (i < 64) {
+            sea w15 = __cargar64(w + (i - 15) * 8)
+            sea w2 = __cargar64(w + (i - 2) * 8)
+            sea s0 = __xo_bits(__xo_bits(pq_rotr(w15, 7), pq_rotr(w15, 18)), __desplazar_der(w15, 3))
+            sea s1 = __xo_bits(__xo_bits(pq_rotr(w2, 17), pq_rotr(w2, 19)), __desplazar_der(w2, 10))
+            __guardar64(w + i * 8, __y_bits(__cargar64(w + (i - 16) * 8) + s0 + __cargar64(w + (i - 7) * 8) + s1, M))
+            i = i + 1
+        }
+        sea a = __cargar64(h)
+        sea bb = __cargar64(h + 8)
+        sea cc = __cargar64(h + 16)
+        sea d = __cargar64(h + 24)
+        sea ee = __cargar64(h + 32)
+        sea f = __cargar64(h + 40)
+        sea g = __cargar64(h + 48)
+        sea hh = __cargar64(h + 56)
+        i = 0
+        mientras (i < 64) {
+            sea S1 = __xo_bits(__xo_bits(pq_rotr(ee, 6), pq_rotr(ee, 11)), pq_rotr(ee, 25))
+            sea ch = __xo_bits(__y_bits(ee, f), __y_bits(__xo_bits(ee, M), g))
+            sea t1 = __y_bits(hh + S1 + ch + vec_obtener(k, i) + __cargar64(w + i * 8), M)
+            sea S0 = __xo_bits(__xo_bits(pq_rotr(a, 2), pq_rotr(a, 13)), pq_rotr(a, 22))
+            sea mayoria = __xo_bits(__xo_bits(__y_bits(a, bb), __y_bits(a, cc)), __y_bits(bb, cc))
+            sea t2 = __y_bits(S0 + mayoria, M)
+            hh = g
+            g = f
+            f = ee
+            ee = __y_bits(d + t1, M)
+            d = cc
+            cc = bb
+            bb = a
+            a = __y_bits(t1 + t2, M)
+            i = i + 1
+        }
+        __guardar64(h, __y_bits(__cargar64(h) + a, M))
+        __guardar64(h + 8, __y_bits(__cargar64(h + 8) + bb, M))
+        __guardar64(h + 16, __y_bits(__cargar64(h + 16) + cc, M))
+        __guardar64(h + 24, __y_bits(__cargar64(h + 24) + d, M))
+        __guardar64(h + 32, __y_bits(__cargar64(h + 32) + ee, M))
+        __guardar64(h + 40, __y_bits(__cargar64(h + 40) + f, M))
+        __guardar64(h + 48, __y_bits(__cargar64(h + 48) + g, M))
+        __guardar64(h + 56, __y_bits(__cargar64(h + 56) + hh, M))
+        b = b + 64
+    }
+    sea r = str_nuevo(64)
+    sea digitos = "0123456789abcdef"
+    sea i = 0
+    mientras (i < 8) {
+        sea x = __cargar64(h + i * 8)
+        sea j = 7
+        mientras (j >= 0) {
+            str_agregar_byte(r, str_byte(digitos, __y_bits(__desplazar_der(x, j * 4), 15)))
+            j = j - 1
+        }
+        i = i + 1
+    }
+    mem_liberar(m)
+    mem_liberar(h)
+    mem_liberar(w)
+    retornar r
+}
+
+funcion pq_texto_menor(a, b) {
+    sea i = 0
+    mientras (i < str_largo(a) y i < str_largo(b)) {
+        si (str_byte(a, i) != str_byte(b, i)) { retornar str_byte(a, i) < str_byte(b, i) }
+        i = i + 1
+    }
+    retornar str_largo(a) < str_largo(b)
+}
+
+funcion archivos_de(dir, rel, salida) {
+    sea nombres = sys_listar(dir)
+    si (nombres == 0) { retornar 0 }
+    sea i = 0
+    mientras (i < vec_largo(nombres)) {
+        sea nombre = vec_obtener(nombres, i)
+        si (str_igual(nombre, ".") == 0 y str_igual(nombre, "..") == 0 y str_igual(nombre, ".git") == 0) {
+            sea ruta = unir_ruta(dir, nombre)
+            sea r = str_concatenar(rel, nombre)
+            si (sys_listar(ruta) != 0) {
+                archivos_de(ruta, str_concatenar(r, "/"), salida)
+            } sino {
+                vec_agregar(salida, r)
+            }
+        }
+        i = i + 1
+    }
+    retornar 0
+}
+
+// SHA-256 del árbol del paquete (sin .git): rutas ordenadas, cada una con
+// su largo y contenido. Igual en todas las plataformas.
+funcion hash_arbol(dir) {
+    sea lista = vec_nuevo()
+    archivos_de(dir, "", lista)
+    sea i = 1
+    mientras (i < vec_largo(lista)) {
+        sea x = vec_obtener(lista, i)
+        sea j = i - 1
+        sea seguir = 1
+        mientras (seguir) {
+            si (j < 0) { seguir = 0 } sino {
+                si (pq_texto_menor(x, vec_obtener(lista, j))) {
+                    vec_fijar(lista, j + 1, vec_obtener(lista, j))
+                    j = j - 1
+                } sino { seguir = 0 }
+            }
+        }
+        vec_fijar(lista, j + 1, x)
+        i = i + 1
+    }
+    sea todo = str_nuevo(4096)
+    i = 0
+    mientras (i < vec_largo(lista)) {
+        sea r = vec_obtener(lista, i)
+        sea datos = archivo_leer(unir_ruta(dir, r))
+        str_agregar(todo, r)
+        str_agregar_byte(todo, 0)
+        str_agregar(todo, str_desde_entero(str_largo(datos)))
+        str_agregar_byte(todo, 0)
+        str_agregar(todo, datos)
+        i = i + 1
+    }
+    retornar pq_sha256_hex(todo)
+}
+
+// "spec#commit#sha256:hex[#tag]" del cforge.lock → parte k (0 spec, 1
+// commit, 2 hash, 3 tag), o 0.
+funcion parte_lock(v, k) {
+    sea i = 0
+    sea inicio = 0
+    sea parte = 0
+    mientras (i <= str_largo(v)) {
+        si (i == str_largo(v) o str_byte(v, i) == 35) {
+            si (parte == k) { retornar str_rebanar(v, inicio, i) }
+            parte = parte + 1
+            inicio = i + 1
+        }
+        i = i + 1
+    }
+    retornar 0
+}
+
+funcion directorio_paquete(e) {
+    sea ref = ref_efectiva(e)
     si (ref == 0) { ref = "_" }
     retornar unir_ruta(unir_ruta(unir_ruta(unir_ruta(directorio_cforge(), "paquetes"), __cargar64(e)), __cargar64(e + 8)), ref)
 }
@@ -438,32 +783,43 @@ funcion commit_de(dir) {
 }
 
 // Descarga el paquete a la caché si falta; devuelve su directorio.
-funcion descargar(e) {
-    sea dir = directorio_paquete(e)
-    si (existe_ruta(unir_ruta(dir, ".git/HEAD"))) { retornar dir }
-    crear_directorios(directorio_de(dir))
+funcion url_paquete(e) {
     sea base = sys_variable_entorno("CFORGE_GIT_BASE")
     si (base == 0) { base = "https://github.com/" }
     sea url = str_concatenar(base, __cargar64(e))
     str_agregar(url, "/")
     str_agregar(url, __cargar64(e + 8))
     si (empieza_con(base, "https://")) { str_agregar(url, ".git") }
+    retornar url
+}
+
+funcion descargar(e) { retornar descargar_bloqueado(e, 0) }
+
+// bloqueado: tag del cforge.lock para un rango (o 0 para resolverlo).
+funcion descargar_bloqueado(e, bloqueado) {
+    sea url = url_paquete(e)
+    resolver_rango(e, url, bloqueado)
+    sea dir = directorio_paquete(e)
+    si (existe_ruta(unir_ruta(dir, ".git/HEAD"))) { retornar dir }
+    crear_directorios(directorio_de(dir))
     sea m = str_concatenar("⬇ ", __cargar64(e))
     str_agregar(m, "/")
     str_agregar(m, __cargar64(e + 8))
-    si (__cargar64(e + 16) != 0) {
+    si (ref_efectiva(e) != 0) {
         str_agregar(m, "@")
-        str_agregar(m, __cargar64(e + 16))
+        str_agregar(m, ref_efectiva(e))
     }
     mostrar(m)
     sea args = vec_nuevo()
+    vec_agregar(args, "-c")
+    vec_agregar(args, "advice.detachedHead=false")
     vec_agregar(args, "clone")
     vec_agregar(args, "-q")
     vec_agregar(args, "--depth")
     vec_agregar(args, "1")
-    si (__cargar64(e + 16) != 0) {
+    si (ref_efectiva(e) != 0) {
         vec_agregar(args, "--branch")
-        vec_agregar(args, __cargar64(e + 16))
+        vec_agregar(args, ref_efectiva(e))
     }
     vec_agregar(args, url)
     vec_agregar(args, dir)
@@ -482,16 +838,38 @@ funcion registrar_dependencias(dir_proyecto, paquetes, lock) {
         sea d = vec_obtener(deps, i)
         sea alias = __cargar64(d + 8)
         si (paquete_registrado(paquetes, alias) == 0) {
-            sea e = especificacion(__cargar64(d + 16))
-            sea dir = descargar(e)
+            sea spec = __cargar64(d + 16)
+            sea e = especificacion(spec)
+            // Entrada del cforge.lock para la misma especificación.
+            sea previo = 0
+            si (mem_global(54) != 0) {
+                previo = toml_valor(mem_global(54), "paquetes", alias)
+                si (previo != 0 y str_igual(parte_lock(previo, 0), spec) == 0) { previo = 0 }
+            }
+            sea bloqueado = 0
+            si (previo != 0) { bloqueado = parte_lock(previo, 3) }
+            sea dir = descargar_bloqueado(e, bloqueado)
+            sea hash = hash_arbol(dir)
+            si (previo != 0) {
+                sea esperado = parte_lock(previo, 2)
+                si (esperado != 0 y str_largo(esperado) == 71 y str_igual(esperado, str_concatenar("sha256:", hash)) == 0) {
+                    rt_panico(str_concatenar(str_concatenar("integridad: el paquete ", alias), " no coincide con el SHA-256 de cforge.lock (borra la caché o el lock si el cambio es esperado)"))
+                }
+            }
             sea r = mem_reservar(24)
             __guardar64(r, alias)
             __guardar64(r + 8, dir)
             __guardar64(r + 16, principal_paquete(dir, __cargar64(e + 8)))
             vec_agregar(paquetes, r)
             si (lock != 0) {
-                sea l = str_concatenar(__cargar64(d + 16), "#")
+                sea l = str_concatenar(spec, "#")
                 str_agregar(l, commit_de(dir))
+                str_agregar(l, "#sha256:")
+                str_agregar(l, hash)
+                si (__cargar64(e + 24) != 0) {
+                    str_agregar(l, "#")
+                    str_agregar(l, __cargar64(e + 24))
+                }
                 vec_agregar(lock, linea_toml(alias, l))
             }
             registrar_dependencias(dir, paquetes, lock)
@@ -516,6 +894,7 @@ funcion preparar_paquetes(ruta_archivo) {
     sea proyecto = buscar_proyecto(directorio_de(absoluta(ruta_archivo)))
     si (proyecto == 0) { retornar 0 }
     sea paquetes = vec_nuevo()
+    mem_fijar_global(54, toml_leer(unir_ruta(proyecto, "cforge.lock")))
     registrar_dependencias(proyecto, paquetes, 0)
     mem_fijar_global(36, paquetes)
     retornar proyecto
@@ -574,8 +953,9 @@ funcion orden_install() {
     sea proyecto = proyecto_requerido()
     sea paquetes = vec_nuevo()
     sea lock = vec_nuevo()
-    vec_agregar(lock, "# cforge.lock — generado por cforge: commit exacto de cada dependencia.")
+    vec_agregar(lock, "# cforge.lock — generado por cforge: especificación#commit#sha256 del árbol[#tag elegido para un rango].")
     vec_agregar(lock, "[paquetes]")
+    mem_fijar_global(54, toml_leer(unir_ruta(proyecto, "cforge.lock")))
     registrar_dependencias(proyecto, paquetes, lock)
     archivo_escribir(unir_ruta(proyecto, "cforge.lock"), unir_lineas(lock))
     mostrar(str_concatenar(str_concatenar("✓ ", str_desde_entero(vec_largo(paquetes))), " paquete(s) listos"))

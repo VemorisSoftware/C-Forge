@@ -4,6 +4,17 @@ Sitio oficial: [c-forge.org](https://c-forge.org)
 
 ## Sin publicar (5.0)
 
+- **`Ok(v)` / `Error(e)` y `Alguno(v)` / `Ninguno`** de primera clase,
+  integrados con `?`, y **`coincidir`** (`match`): expresión con patrones de
+  variante, de valor y `_`.
+- **`async funcion` / `await`** (también `asincrona` / `aguardar`) sobre las
+  tareas con hilos nativos; los errores se relanzan en el `await`.
+- **Versionado semántico en paquetes:** `@^1.2.0` y `@~1.2.0` eligen el tag
+  más alto que cumple; `cforge.lock` guarda commit, SHA-256 del árbol y tag,
+  y compilar verifica la integridad.
+- **`cforge test --coverage`** (cobertura de líneas, también si una prueba
+  falla) y **`cforge doc`** (Markdown o HTML desde los comentarios `///`).
+
 - **Seguridad:** todas las reservas de píxeles y audio (PNG, JPEG, BMP,
   lienzos, z-buffer, PCM) pasan por `md_buffer_seguro` con aritmética
   saturada. `cforge add` rechaza antes de separar la especificación
