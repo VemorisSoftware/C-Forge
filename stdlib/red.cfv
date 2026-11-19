@@ -265,9 +265,29 @@ funcion ws_enviar(conn: mapa, mensaje: texto) { ws_enviar_trama(conn, 1, mensaje
 funcion ws_enviar_binario(conn: mapa, datos: texto) { ws_enviar_trama(conn, 2, datos) }
 funcion ws_ping(conn: mapa, datos = "") { ws_enviar_trama(conn, 9, datos) }
 
+// Límites por conexión (bytes): una trama y un mensaje completo (suma de
+// fragmentos). Se cambian con ws_limites.
+funcion ws_limites(conn: mapa, max_trama = 1048576, max_mensaje = 16777216) {
+    conn["max_trama"] = max_trama
+    conn["max_mensaje"] = max_mensaje
+    retornar conn
+}
+
+funcion _ws_error(conn: mapa, codigo, mensaje) {
+    conn["codigo_cierre"] = codigo
+    ws_cerrar(conn, codigo)
+    lanzar "ws: " + mensaje
+}
+
 // Siguiente mensaje (texto o binario) o nulo si la conexión terminó.
+// Cierra con 1009 si una trama o un mensaje pasan los límites (1 MiB y
+// 16 MiB por defecto) y con 1002 ante tramas que violan RFC 6455.
 funcion ws_recibir(conn: mapa) {
+    sea max_trama = conn["max_trama"] ?? 1048576
+    sea max_mensaje = conn["max_mensaje"] ?? 16777216
     sea partes = []
+    sea total = 0
+    sea fragmentando = falso
     mientras (conn["abierto"]) {
         sea h = net_recibir_exacto(conn["sock"], 2)
         si (longitud(h) < 2) {
@@ -277,15 +297,26 @@ funcion ws_recibir(conn: mapa) {
         sea b0 = byte_en(h, 0)
         sea b1 = byte_en(h, 1)
         sea fin = b0 >= 128
+        sea rsv = piso(b0 / 16) % 8
         sea opcode = b0 % 16
         sea enmascarada = b1 >= 128
         sea n = b1 % 128
+        si (rsv != 0) { _ws_error(conn, 1002, "bits RSV sin extensión negociada") }
+        si ((opcode > 2 y opcode < 8) o opcode > 10) { _ws_error(conn, 1002, "opcode desconocido " + opcode) }
+        si (opcode >= 8 y (fin == falso o n > 125)) { _ws_error(conn, 1002, "trama de control fragmentada o de más de 125 bytes") }
         si (n == 126) { n = bytes_leer_entero(net_recibir_exacto(conn["sock"], 2), 0, 2, 0) }
-        si (n == 127) { n = bytes_leer_entero(net_recibir_exacto(conn["sock"], 8), 0, 8, 0) }
-        si (conn["cliente"] == falso y enmascarada == falso) {
-            ws_cerrar(conn, 1002)
-            lanzar "ws: el cliente envió una trama sin máscara"
+        si (n == 127) {
+            sea largo8 = net_recibir_exacto(conn["sock"], 8)
+            si (longitud(largo8) < 8 o byte_en(largo8, 0) >= 128) { _ws_error(conn, 1002, "largo de trama inválido") }
+            // 2^56 o más no entra en ningún límite (ni en un entero etiquetado).
+            si (byte_en(largo8, 0) != 0) { _ws_error(conn, 1009, "mensaje demasiado grande") }
+            n = bytes_leer_entero(largo8, 0, 8, 0)
         }
+        // Antes de reservar nada: tamaño de la trama y del mensaje.
+        si (n > max_trama o (opcode < 8 y total + n > max_mensaje)) { _ws_error(conn, 1009, "mensaje demasiado grande") }
+        si (conn["cliente"] == falso y enmascarada == falso) { _ws_error(conn, 1002, "el cliente envió una trama sin máscara") }
+        si (opcode == 0 y fragmentando == falso) { _ws_error(conn, 1002, "continuación sin mensaje iniciado") }
+        si ((opcode == 1 o opcode == 2) y fragmentando) { _ws_error(conn, 1002, "mensaje nuevo dentro de uno fragmentado") }
         sea clave = ""
         si (enmascarada) { clave = net_recibir_exacto(conn["sock"], 4) }
         sea datos = ""
@@ -308,6 +339,8 @@ funcion ws_recibir(conn: mapa) {
         } sino {
             si (opcode != 10) {
                 partes.agregar(datos)
+                total = total + n
+                fragmentando = no fin
                 si (fin) { retornar unir(partes, "") }
             }
         }

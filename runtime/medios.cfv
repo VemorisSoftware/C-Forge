@@ -21,10 +21,19 @@ funcion md_ent(v) {
 
 // Texto nuevo de n bytes en cero (con el 0 final).
 funcion md_buffer(n) {
+    si (n < 0) { dyn_error("medios: tamaño de búfer negativo") }
     sea s = str_nuevo(n)
     mem_llenar(str_datos(s), 0, n + 1)
     __guardar64(s, n)
     retornar s
+}
+
+// Imágenes: como máximo 65535 por lado y 268 megapíxeles (1 GiB en RGBA),
+// para que una cabecera falsa no haga reservar y llenar decenas de GiB.
+funcion md_validar_dimensiones(formato, ancho, alto) {
+    si (ancho <= 0 o alto <= 0 o ancho > 65535 o alto > 65535) { dyn_error(str_concatenar(formato, ": dimensiones inválidas")) }
+    si (ancho * alto > 268435456) { dyn_error(str_concatenar(formato, ": imagen demasiado grande (máx. 268 megapíxeles)")) }
+    retornar 0
 }
 
 funcion md_lista3(a, b, c) {
@@ -282,7 +291,24 @@ funcion md_tablas_deflate() {
 
 // Descomprime deflate crudo desde p (n bytes) y agrega a `salida`.
 // Devuelve los bytes consumidos.
-funcion md_inflar(p, n, salida) {
+// Límite por defecto de lo que puede producir una descompresión: 256 MiB
+// (anti "zip bomb"). Las funciones públicas aceptan otro límite.
+funcion md_limite_inflar(limite) {
+    si (limite == 0) { retornar 268435456 }
+    sea l = md_ent(limite)
+    si (l <= 0) { dyn_error("inflar: el límite debe ser positivo") }
+    retornar l
+}
+
+funcion md_inflar(p, n, salida) { retornar md_inflar_hasta(p, n, salida, 268435456) }
+
+funcion md_exceso(salida, inicio, extra, limite) {
+    si (str_largo(salida) - inicio + extra > limite) { dyn_error("inflar: los datos se expanden más que el límite permitido (posible bomba de compresión)") }
+    retornar 0
+}
+
+funcion md_inflar_hasta(p, n, salida, limite) {
+    sea inicio_salida = str_largo(salida)
     sea st = mem_reservar(48)
     __guardar64(st, p)
     __guardar64(st + 8, n)
@@ -311,6 +337,7 @@ funcion md_inflar(p, n, salida) {
             si (__xo_bits(largo, md_le16(p + pos + 2)) != 65535) { dyn_error("inflar: largo de bloque guardado inválido") }
             pos = pos + 4
             si (pos + largo > n) { dyn_error("inflar: bloque guardado truncado") }
+            md_exceso(salida, inicio_salida, largo, limite)
             sea actual = str_largo(salida)
             str_asegurar(salida, actual + largo + 1)
             mem_copiar(str_datos(salida) + actual, p + pos, largo)
@@ -376,7 +403,10 @@ funcion md_inflar(p, n, salida) {
             sea fin_bloque = 0
             mientras (fin_bloque == 0) {
                 sea s = md_huff_dec(st, lit)
-                si (s < 256) { str_agregar_byte(salida, s) } sino {
+                si (s < 256) {
+                    md_exceso(salida, inicio_salida, 1, limite)
+                    str_agregar_byte(salida, s)
+                } sino {
                     si (s == 256) { fin_bloque = 1 } sino {
                         s = s - 257
                         si (s >= 29) { dyn_error("inflar: símbolo de largo inválido") }
@@ -385,7 +415,8 @@ funcion md_inflar(p, n, salida) {
                         si (ds >= 30) { dyn_error("inflar: símbolo de distancia inválido") }
                         sea d = __cargar64(tb + (58 + ds) * 8) + md_bits(st, __cargar64(tb + (88 + ds) * 8))
                         sea actual = str_largo(salida)
-                        si (d > actual) { dyn_error("inflar: distancia fuera de la ventana") }
+                        si (d > actual - inicio_salida) { dyn_error("inflar: distancia fuera de la ventana") }
+                        md_exceso(salida, inicio_salida, largo, limite)
                         str_asegurar(salida, actual + largo + 1)
                         sea q = str_datos(salida) + actual
                         sea k = 0
@@ -410,14 +441,16 @@ funcion md_inflar(p, n, salida) {
 }
 
 // zlib (RFC 1950): cabecera, deflate y Adler-32.
-funcion md_zlib_inflar(p, n, salida) {
+funcion md_zlib_inflar(p, n, salida) { retornar md_zlib_inflar_hasta(p, n, salida, 268435456) }
+
+funcion md_zlib_inflar_hasta(p, n, salida, limite) {
     si (n < 6) { dyn_error("zlib: datos demasiado cortos") }
     sea cmf = __cargar8(p)
     sea flg = __cargar8(p + 1)
     si (__y_bits(cmf, 15) != 8 o (cmf * 256 + flg) % 31 != 0) { dyn_error("zlib: cabecera inválida") }
     si (__y_bits(flg, 32) != 0) { dyn_error("zlib: diccionario predefinido no soportado") }
     sea inicio = str_largo(salida)
-    sea usados = md_inflar(p + 2, n - 2, salida)
+    sea usados = md_inflar_hasta(p + 2, n - 2, salida, limite)
     si (2 + usados + 4 <= n) {
         sea esperado = md_be32(p + 2 + usados)
         si (md_adler(str_datos(salida) + inicio, str_largo(salida) - inicio) != esperado) { dyn_error("zlib: Adler-32 no coincide") }
@@ -425,21 +458,21 @@ funcion md_zlib_inflar(p, n, salida) {
     retornar 0
 }
 
-funcion inflar(datos) {
+funcion inflar(datos, limite) {
     sea s = dyn_a_str(datos)
     sea r = str_nuevo(str_largo(s) * 4 + 64)
-    md_inflar(str_datos(s), str_largo(s), r)
+    md_inflar_hasta(str_datos(s), str_largo(s), r, md_limite_inflar(limite))
     retornar dyn_texto(r)
 }
 
-funcion zlib_descomprimir(datos) {
+funcion zlib_descomprimir(datos, limite) {
     sea s = dyn_a_str(datos)
     sea r = str_nuevo(str_largo(s) * 4 + 64)
-    md_zlib_inflar(str_datos(s), str_largo(s), r)
+    md_zlib_inflar_hasta(str_datos(s), str_largo(s), r, md_limite_inflar(limite))
     retornar dyn_texto(r)
 }
 
-funcion gzip_descomprimir(datos) {
+funcion gzip_descomprimir(datos, limite) {
     sea s = dyn_a_str(datos)
     sea p = str_datos(s)
     sea n = str_largo(s)
@@ -458,7 +491,7 @@ funcion gzip_descomprimir(datos) {
     si (__y_bits(flg, 2) != 0) { pos = pos + 2 }
     si (pos >= n) { dyn_error("gzip: datos truncados") }
     sea r = str_nuevo(n * 4 + 64)
-    sea usados = md_inflar(p + pos, n - pos, r)
+    sea usados = md_inflar_hasta(p + pos, n - pos, r, md_limite_inflar(limite))
     si (pos + usados + 8 <= n) {
         si (md_crc(0, str_datos(r), str_largo(r)) != md_le32(p + pos + usados)) { dyn_error("gzip: CRC-32 no coincide") }
     }
@@ -1145,7 +1178,7 @@ funcion png_decodificar(datos) {
     sea alto = __cargar64(info + 8)
     sea prof = __cargar64(info + 16)
     sea ct = __cargar64(info + 24)
-    si (ancho == 0 o alto == 0 o ancho > 65535 o alto > 65535) { dyn_error("png: dimensiones inválidas") }
+    md_validar_dimensiones("png", ancho, alto)
     sea canales = 0
     si (ct == 0 o ct == 3) { canales = 1 }
     si (ct == 2) { canales = 3 }
@@ -1157,8 +1190,23 @@ funcion png_decodificar(datos) {
     sea bits_px = canales * prof
     sea bpp = bits_px / 8
     si (bpp < 1) { bpp = 1 }
-    sea crudo = str_nuevo(alto * (ancho * bits_px / 8 + 2) + 64)
-    md_zlib_inflar(str_datos(idat), str_largo(idat), crudo)
+    // Tamaño exacto de los datos filtrados (con Adam7, la suma de los pases):
+    // inflar no puede producir más.
+    sea esperado = 0
+    si (entrelazado == 1) {
+        sea a7l = "aeacabaaaeacabiieeccbiiieecc"
+        sea ps = 0
+        mientras (ps < 7) {
+            sea px0 = str_byte(a7l, ps) - 97
+            sea py0 = str_byte(a7l, 7 + ps) - 97
+            sea pdx = str_byte(a7l, 14 + ps) - 97
+            sea pdy = str_byte(a7l, 21 + ps) - 97
+            si (ancho > px0 y alto > py0) { esperado = esperado + ((alto - py0 + pdy - 1) / pdy) * (1 + (((ancho - px0 + pdx - 1) / pdx) * bits_px + 7) / 8) }
+            ps = ps + 1
+        }
+    } sino { esperado = alto * (1 + (ancho * bits_px + 7) / 8) }
+    sea crudo = str_nuevo(esperado + 64)
+    md_zlib_inflar_hasta(str_datos(idat), str_largo(idat), crudo, esperado)
     sea salida = md_buffer(ancho * alto * 4)
     sea sp = str_datos(salida)
     sea cp = str_datos(crudo)
@@ -1324,6 +1372,7 @@ funcion bmp_decodificar(datos) {
         h = 0 - h
         abajo_arriba = 0
     }
+    md_validar_dimensiones("bmp", w, h)
     sea bits = md_le16(p + 28)
     sea comp = md_le32(p + 30)
     si (comp != 0 y comp != 3) { dyn_error("bmp: compresión no soportada") }
@@ -1881,6 +1930,8 @@ funcion jpeg_decodificar(datos) {
                         ancho = md_be16(seg + 3)
                         nf = __cargar8(seg + 5)
                         si (ancho == 0 o alto == 0) { dyn_error("jpeg: dimensiones inválidas (DNL no soportado)") }
+                        md_validar_dimensiones("jpeg", ancho, alto)
+                        si (__cargar64(comps + 48) != 0) { dyn_error("jpeg: más de un SOF") }
                         si (nf != 1 y nf != 3 y nf != 4) { dyn_error("jpeg: cantidad de componentes no soportada") }
                         si (m == 194) { __guardar64(j + 40, 1) }
                         sea c = 0
@@ -1947,6 +1998,13 @@ funcion jpeg_decodificar(datos) {
                         si (__cargar64(j + 40) == 0) {
                             __guardar64(j + 8, 0)
                             __guardar64(j + 16, 63)
+                        } sino {
+                            // Progresivo: banda espectral y aproximación válidas
+                            // (si no, se leería y escribiría fuera del bloque).
+                            sea ss = __cargar64(j + 8)
+                            sea se = __cargar64(j + 16)
+                            si (ss > 63 o se > 63 o ss > se o (ss == 0 y se != 0) o (ss > 0 y ns != 1)) { dyn_error("jpeg: banda espectral inválida en SOS") }
+                            si (__cargar64(j + 24) > 13 o __cargar64(j + 32) > 13) { dyn_error("jpeg: aproximación sucesiva inválida") }
                         }
                         __guardar64(r, p)
                         __guardar64(r + 8, n)

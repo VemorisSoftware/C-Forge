@@ -224,7 +224,10 @@ stdlib-check: build
 		CFORGE_GC_ESTRES=1 CFORGE_STDLIB=./stdlib ./$(TARGET) tests/$$suite/prueba.cfv | diff -u tests/$$suite/prueba.salida - >/dev/null || { echo "  ✗ tests/$$suite (GC en estrés)"; exit 1; }; \
 	done; \
 	echo "  ✓ gráficos: PNG/JPEG/BMP, zlib, TrueType, render 2D/3D y audio idénticos bit a bit"; \
-	echo "  ✓ juego: física 2D/3D, colisiones, entrada y partículas"
+	echo "  ✓ juego: física 2D/3D, colisiones, entrada y partículas"; \
+	(cd tests/seguridad && CFORGE_STDLIB=../../stdlib ../../$(TARGET) prueba.cfv) | diff -u tests/seguridad/prueba.salida - || { echo "  ✗ tests/seguridad"; exit 1; }; \
+	(cd tests/seguridad && CFORGE_GC_ESTRES=1 CFORGE_STDLIB=../../stdlib ../../$(TARGET) prueba.cfv) | diff -u tests/seguridad/prueba.salida - >/dev/null || { echo "  ✗ tests/seguridad (GC en estrés)"; exit 1; }; \
+	echo "  ✓ seguridad: imágenes y fuentes hostiles, bombas de compresión, lecturas fuera de rango y secretos"
 
 ## Recolector de basura: memoria acotada en un programa largo y la suite
 ## completa recolectando cada 64 KiB (CFORGE_GC_ESTRES) para detectar raíces
