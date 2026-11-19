@@ -2,6 +2,26 @@
 
 Sitio oficial: [c-forge.org](https://c-forge.org)
 
+## Sin publicar (4.4)
+
+- **Criptografía estable:** ChaCha20-Poly1305, XChaCha20, AES-256-GCM,
+  X25519, Ed25519, BLAKE2b, BLAKE3, Argon2id, SHA-384/512, HKDF y RSA-OAEP en
+  C-Forge puro, con vectores oficiales en CI; API sin nonces manuales,
+  contraseñas PHC y JWT con `exp`.
+- **Bases de datos estables:** SQLite con caché de sentencias, `?N` y
+  `:nombre`, BLOB, transacciones anidadas, pool e identificadores validados;
+  MySQL 8 con `caching_sha2_password` completo (RSA).
+- **Gráficos y juegos estables:** `imagen` (PNG, JPEG, BMP, zlib), `graficos`
+  (2D con antialiasing y 3D por software), `fuente` (TrueType), `modelo`
+  (OBJ y primitivas), física 2D/3D de verdad, audio con mezclador y salida
+  SDL2, OpenGL con texturas. Igual bit a bit en todas las plataformas.
+- **WebAssembly estable:** más rápido (saltos directos y paso al código
+  optimizado de V8), validación de cada `.wasm` en CI, `nav_mostrar_lienzo` y
+  ejemplo `ejemplos/web/cubo3d`.
+- **Lenguaje:** `m["k"] ?? defecto` ya no falla con claves ausentes;
+  `__ccall`/`c_llamar` admiten hasta 10 argumentos (también en ARM64);
+  JSON guarda los números con 15 cifras.
+
 ## 4.3.0 — 2026-11-18
 
 - **WebAssembly (`cforge build --target wasm`):** nuevo backend

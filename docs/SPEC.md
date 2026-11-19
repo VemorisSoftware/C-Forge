@@ -345,21 +345,86 @@ cf.llamar("mi_funcion", 3);                                  // C-Forge desde JS
 - `cociente(a, b)` (división entera) y `bits_y/bits_o/bits_xo` se compilan
   en línea: con ellos la física en enteros no crea objetos.
 - `tarea()` corre completa al lanzarse (no hay hilos); `extern` de C no
-  existe en el navegador.
-- El código va en funciones wasm de 256 bloques unidas por un trampolín,
-  así V8 optimiza cada una por separado. Rendimiento: entre 2,5× y 4× del
-  nativo (primos + fib(30): 73 ms nativo, ~250 ms en Node.js).
+  existe en el navegador (si un módulo de la stdlib declara uno, solo falla
+  cuando se llama).
+- El código va en funciones wasm de 1024 bloques unidas por un trampolín;
+  los saltos hacia adelante dentro de la misma función van directos y cada
+  50 000 vueltas se vuelve al trampolín para que V8 cambie a la versión
+  optimizada. Rendimiento: cerca de 3× del nativo (primos + fib(30): 73 ms
+  nativo, 215 ms en Node.js).
+- `nav_mostrar_lienzo("#id", lienzo)` pinta en un `<canvas>` un lienzo de
+  `graficos.cfv` (2D, 3D por software, texto TrueType). Ejemplo:
+  `ejemplos/web/cubo3d`.
+- Estable: la suite del lenguaje (menos extern C) y las de gráficos y juego
+  dan la misma salida que en nativo, y cada `.wasm` pasa la validación de
+  WebAssembly en CI (`tests/wasm/validar.mjs`).
+
+### 10.2 Índices opcionales con `??` ✅ (4.4)
+
+`m["clave"] ?? defecto` da `defecto` si la clave no existe (o si el índice
+de una lista está fuera de rango, o el contenedor es `nulo`). Sin `??`, una
+clave ausente sigue siendo un error.
 
 ## 11. Biblioteca estándar
 
 | Módulo | Estado |
 |---|---|
 | `lista`, `mapa`, `colecciones`, `algoritmos`, `texto`, `matematica`, `numero`, `json`, `fecha`, `regex`, `base64`, `io`, `errores`, `aleatorio` | ✅ |
-| `red`, `web`, `db`, `crypto`, `auth`, `redis` | 🧪 |
-| `sdl`, `gl`, `juego`, `fisica2d`, `fisica3d`, `audio` | 🧪 |
+| `crypto` (§11.1), `db`, `sqlite`, `postgres`, `mysql` (§11.2) | ✅ |
+| `imagen`, `graficos`, `fuente`, `modelo`, `juego`, `fisica2d`, `fisica3d`, `audio`, `colision`, `input`, `particulas`, `sdl`, `gl` (§11.3) | ✅ |
+| `navegador` (§10.1) | ✅ |
+| `red`, `web`, `auth`, `redis` | 🧪 |
 
-📐 Con `extern`, `db` pasará a usar SQLite directamente y `crypto` una
-implementación auditada, en vez de envoltorios propios.
+### 11.1 Criptografía ✅ (4.4)
+
+Todo en C-Forge (`runtime/cripto.cfv`), sin OpenSSL ni libsodium, y probado
+con los vectores oficiales (`tests/cfv/30_cripto.cfv`):
+
+- Resúmenes: SHA-256/384/512, BLAKE2b, BLAKE3 (también con clave y
+  `blake3_derivar`). MAC y derivación: HMAC, HKDF, PBKDF2.
+- Cifrado autenticado: ChaCha20-Poly1305, XChaCha20-Poly1305, AES-256-GCM.
+- Curvas: X25519 (intercambio) y Ed25519 (firmas, con verificación de S < L).
+- Contraseñas: Argon2id (RFC 9106) en formato PHC; RSA-OAEP para cifrar con
+  claves públicas PEM.
+- `comparar_seguro` (tiempo constante), `borrar_texto` (borra secretos).
+- API segura (`stdlib/crypto.cfv`): `crypto_cerrar(clave, texto)` /
+  `crypto_abrir` generan el nonce solos, `crypto_hash_contrasena` /
+  `crypto_verificar_contrasena`, `crypto_firmar`, `crypto_secreto_compartido`
+  y JWT HS256 con comprobación de `exp`.
+- Falta una auditoría externa antes de usarlo para banca o datos regulados.
+
+### 11.2 Bases de datos ✅ (4.4)
+
+- SQLite: sentencias preparadas en caché, parámetros `?`, `?1` y `:nombre`,
+  BLOB (`db_blob`), `db_cada`, `db_primera`, `db_valor`, transacciones
+  anidadas (`db_transaccion_con`, con SAVEPOINT), pool (`db_pool`,
+  `db_pool_usar`), WAL y claves foráneas activas. Los nombres de tablas y
+  columnas de `db.cfv` se validan (sin inyección por identificadores).
+- PostgreSQL (SCRAM-SHA-256) y MySQL 8 / MariaDB (incluida la autenticación
+  completa de `caching_sha2_password` con RSA) sin bibliotecas de C.
+
+### 11.3 Gráficos, juegos y audio ✅ (4.4)
+
+Todo en C-Forge (`runtime/medios.cfv` y la stdlib), sin SDL_image, SDL_ttf,
+stb ni FreeType; el resultado es igual bit a bit en Linux, macOS, Windows y
+WebAssembly (`tests/graficos`, `tests/juego`):
+
+- `imagen`: PNG (todos los tipos, 1–16 bits, paleta, tRNS, Adam7; también
+  escribe), JPEG baseline y progresivo (submuestreo, gris, CMYK), BMP;
+  `zlib_comprimir`, `gzip_comprimir`, `crc32`.
+- `graficos`: lienzo RGBA con antialiasing (rectángulos, círculos, líneas,
+  polígonos), imágenes escaladas, y 3D por software: mallas, `camara3d`, luz,
+  texturas con corrección de perspectiva, z-buffer y recorte cercano.
+- `fuente`: TrueType (cmap 4 y 12, glifos compuestos, kern) y una fuente de
+  mapa de bits incorporada. `modelo`: cubo, esfera, plano, cilindro y OBJ.
+- `fisica2d`: círculos y polígonos convexos que rotan, SAT con recorte de
+  aristas, impulsos con fricción y rebote, raycast. `fisica3d`: esferas,
+  cajas alineadas y planos.
+- `audio`: WAV, tonos, mezclador (volumen, paneo, tono, bucles, fundidos) y
+  salida real por SDL2. `juego`: ventana SDL, lienzo y texto como texturas.
+- `gl`: OpenGL 3.3 con texturas y modelos iluminados (`gl_dibujar_modelo`).
+- Fuera de alcance por ahora: JPEG aritmético, fuentes OTF/CFF, GPOS,
+  OGG/MP3 y rotación de cajas en física 3D.
 
 ---
 

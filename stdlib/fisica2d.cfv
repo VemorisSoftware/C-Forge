@@ -1,5 +1,20 @@
-// stdlib/fisica2d.cfv — Motor de física 2D
-// C-Forge Standard Library v3.0
+// stdlib/fisica2d.cfv — motor de física 2D de cuerpos rígidos.
+//
+// Círculos y polígonos convexos (cajas incluidas) que rotan, detección con
+// barrido y poda + SAT con recorte de aristas (como Box2D), y un solver de
+// impulsos secuenciales con acumulación, fricción de Coulomb, rebote y
+// corrección de penetración. Cuerpos dinámicos, cinemáticos y estáticos,
+// raycast con normal y aviso de contactos (mundo["al_chocar"]).
+//
+//   importar "fisica2d"
+//   sea mundo = f2d_mundo_crear(0, -9.8)
+//   sea suelo = f2d_cuerpo_crear(0, 0, 0, "estatico")
+//   f2d_agregar_shape(suelo, shape_caja(20, 1))
+//   sea caja = f2d_cuerpo_crear(0, 5, 1)
+//   f2d_agregar_shape(caja, shape_caja(1, 1))
+//   f2d_agregar_cuerpo(mundo, suelo)
+//   f2d_agregar_cuerpo(mundo, caja)
+//   para i en rango(120) { f2d_paso(mundo, 1 / 60) }
 
 // ── Vectores 2D ────────────────────────────────────────────────────────────────
 
@@ -46,8 +61,14 @@ funcion f2d_cuerpo_crear(x, y, masa, tipo) {
         "activo": verdadero,
         "dormido": falso,
         "shapes": [],
-        "id": aleatorio_entero(100000, 999999)
+        "id": _f2d_nuevo_id()
     }
+}
+
+sea _f2d_ids = 0
+funcion _f2d_nuevo_id() {
+    _f2d_ids = _f2d_ids + 1
+    retornar _f2d_ids
 }
 
 funcion f2d_aplicar_fuerza(cuerpo, fx, fy) {
@@ -104,8 +125,129 @@ funcion shape_aabb(ancho, alto, offset_x, offset_y) {
     }
 }
 
+// Polígono convexo (lista de [x, y] en coordenadas del cuerpo).
+funcion shape_poligono(puntos) {
+    sea n = longitud(puntos)
+    si (n < 3) { lanzar "shape_poligono: hacen falta al menos 3 puntos" }
+    sea area = 0
+    sea i = 0
+    mientras (i < n) {
+        sea a = puntos[i]
+        sea b = puntos[(i + 1) % n]
+        area = area + a[0] * b[1] - b[0] * a[1]
+        i = i + 1
+    }
+    sea pts = puntos
+    si (area < 0) {
+        pts = []
+        sea k = n - 1
+        mientras (k >= 0) {
+            agregar(pts, puntos[k])
+            k = k - 1
+        }
+    }
+    sea vs = []
+    sea ns = []
+    i = 0
+    mientras (i < n) {
+        sea a = pts[i]
+        sea b = pts[(i + 1) % n]
+        agregar(vs, [a[0], a[1]])
+        sea ex = b[0] - a[0]
+        sea ey = b[1] - a[1]
+        sea l = raiz(ex * ex + ey * ey)
+        si (l == 0) { lanzar "shape_poligono: vértices repetidos" }
+        agregar(ns, [ey / l, 0 - ex / l])
+        i = i + 1
+    }
+    // Convexidad.
+    i = 0
+    mientras (i < n) {
+        sea a = vs[i]
+        sea b = vs[(i + 1) % n]
+        sea c = vs[(i + 2) % n]
+        si ((b[0] - a[0]) * (c[1] - b[1]) - (b[1] - a[1]) * (c[0] - b[0]) < 0 - 0.0000001) { lanzar "shape_poligono: el polígono no es convexo" }
+        i = i + 1
+    }
+    retornar {"tipo": "poligono", "vertices": vs, "normales": ns, "offset": vec2(0, 0)}
+}
+
+// Caja de ancho × alto centrada en (ox, oy) y girada `angulo` radianes.
+funcion shape_caja(ancho, alto, ox = 0, oy = 0, angulo = 0) {
+    sea hw = ancho / 2
+    sea hh = alto / 2
+    sea c = coseno(angulo)
+    sea s = seno(angulo)
+    sea pts = []
+    para e en [[0 - hw, 0 - hh], [hw, 0 - hh], [hw, hh], [0 - hw, hh]] { agregar(pts, [ox + e[0] * c - e[1] * s, oy + e[0] * s + e[1] * c]) }
+    retornar shape_poligono(pts)
+}
+
+funcion _f2d_area_inercia(sh) {
+    // Área y momento polar (por unidad de densidad) respecto del origen del
+    // cuerpo.
+    si (sh["tipo"] == "circulo") {
+        sea r = sh["radio"]
+        sea a = 3.141592653589793 * r * r
+        sea o = sh["offset"]
+        retornar [a, a * (r * r / 2 + o["x"] * o["x"] + o["y"] * o["y"])]
+    }
+    sea vs = _f2d_vertices_locales(sh)
+    sea area = 0
+    sea iner = 0
+    sea i = 0
+    sea n = longitud(vs)
+    mientras (i < n) {
+        sea a = vs[i]
+        sea b = vs[(i + 1) % n]
+        sea cr = a[0] * b[1] - b[0] * a[1]
+        area = area + cr / 2
+        iner = iner + cr * (a[0] * a[0] + a[0] * b[0] + b[0] * b[0] + a[1] * a[1] + a[1] * b[1] + b[1] * b[1]) / 12
+        i = i + 1
+    }
+    retornar [absoluto(area), absoluto(iner)]
+}
+
+funcion _f2d_vertices_locales(sh) {
+    si (sh["tipo"] == "aabb") {
+        sea o = sh["offset"]
+        retornar [[o["x"] - sh["hw"], o["y"] - sh["hh"]], [o["x"] + sh["hw"], o["y"] - sh["hh"]], [o["x"] + sh["hw"], o["y"] + sh["hh"]], [o["x"] - sh["hw"], o["y"] + sh["hh"]]]
+    }
+    retornar sh["vertices"]
+}
+
+funcion _f2d_normales_locales(sh) {
+    si (sh["tipo"] == "aabb") { retornar [[0, 0 - 1], [1, 0], [0, 1], [0 - 1, 0]] }
+    retornar sh["normales"]
+}
+
+// Agrega una forma y recalcula la inercia (la masa se reparte por área).
 funcion f2d_agregar_shape(cuerpo, shape) {
     agregar(cuerpo["shapes"], shape)
+    si (cuerpo["tipo"] == "dinamico" y cuerpo["masa"] > 0) {
+        sea area = 0
+        sea iner = 0
+        para sh en cuerpo["shapes"] {
+            sea ai = _f2d_area_inercia(sh)
+            area = area + ai[0]
+            iner = iner + ai[1]
+        }
+        si (area > 0) {
+            cuerpo["inercia"] = cuerpo["masa"] * iner / area
+            cuerpo["inercia_inv"] = 1 / cuerpo["inercia"]
+        }
+    } sino {
+        cuerpo["masa_inv"] = 0
+        cuerpo["inercia_inv"] = 0
+    }
+    retornar shape
+}
+
+// Impide que el cuerpo gire (personajes de plataformas).
+funcion f2d_fijar_rotacion(cuerpo) {
+    cuerpo["inercia_inv"] = 0
+    cuerpo["vel_angular"] = 0
+    retornar cuerpo
 }
 
 // ── Detección de colisión ──────────────────────────────────────────────────────
@@ -228,50 +370,456 @@ funcion f2d_eliminar_cuerpo(mundo, cuerpo_id) {
     mundo["cuerpos"] = nuevos
 }
 
-funcion f2d_paso(mundo, delta) {
-    // Integrar cuerpos
-    para cuerpo en mundo["cuerpos"] {
-        f2d_integrar(cuerpo, delta, mundo["gravedad"])
+// ── Motor ──────────────────────────────────────────────────────────────────────
+
+// Formas en coordenadas del mundo: círculos [tipo 0, cx, cy, r] y polígonos
+// [tipo 1, vértices, normales].
+funcion _f2d_formas_mundo(c) {
+    sea r = []
+    sea px = c["pos"]["x"]
+    sea py = c["pos"]["y"]
+    sea co = coseno(c["angulo"])
+    sea si_ = seno(c["angulo"])
+    para sh en c["shapes"] {
+        si (sh["tipo"] == "circulo") {
+            sea o = sh["offset"]
+            agregar(r, [0, px + o["x"] * co - o["y"] * si_, py + o["x"] * si_ + o["y"] * co, sh["radio"]])
+        } sino {
+            sea vs = []
+            para v en _f2d_vertices_locales(sh) { agregar(vs, [px + v[0] * co - v[1] * si_, py + v[0] * si_ + v[1] * co]) }
+            sea ns = []
+            para n en _f2d_normales_locales(sh) { agregar(ns, [n[0] * co - n[1] * si_, n[0] * si_ + n[1] * co]) }
+            agregar(r, [1, vs, ns])
+        }
     }
-    // Detectar y resolver colisiones (broadphase simple O(n²))
-    sea n = longitud(mundo["cuerpos"])
+    retornar r
+}
+
+funcion _f2d_caja_forma(f) {
+    si (f[0] == 0) { retornar [f[1] - f[3], f[2] - f[3], f[1] + f[3], f[2] + f[3]] }
+    sea vs = f[1]
+    sea b = [vs[0][0], vs[0][1], vs[0][0], vs[0][1]]
+    para v en vs {
+        si (v[0] < b[0]) { b[0] = v[0] }
+        si (v[1] < b[1]) { b[1] = v[1] }
+        si (v[0] > b[2]) { b[2] = v[0] }
+        si (v[1] > b[3]) { b[3] = v[1] }
+    }
+    retornar b
+}
+
+// Contacto: [nx, ny, puntos] con puntos [x, y, penetración]; normal de A a B.
+funcion _f2d_circulos(a, b) {
+    sea dx = b[1] - a[1]
+    sea dy = b[2] - a[2]
+    sea d2 = dx * dx + dy * dy
+    sea r = a[3] + b[3]
+    si (d2 >= r * r) { retornar nulo }
+    sea d = raiz(d2)
+    sea nx = 0
+    sea ny = 1
+    si (d > 0.0000001) {
+        nx = dx / d
+        ny = dy / d
+    }
+    sea pen = r - d
+    retornar [nx, ny, [[a[1] + nx * (a[3] - pen / 2), a[2] + ny * (a[3] - pen / 2), pen]]]
+}
+
+funcion _f2d_poligono_circulo(p, c) {
+    sea vs = p[1]
+    sea ns = p[2]
+    sea n = longitud(vs)
+    sea cx = c[1]
+    sea cy = c[2]
+    sea r = c[3]
+    sea mejor = 0 - 1000000000
+    sea cara = 0
     sea i = 0
     mientras (i < n) {
-        sea a = mundo["cuerpos"][i]
+        sea s = ns[i][0] * (cx - vs[i][0]) + ns[i][1] * (cy - vs[i][1])
+        si (s > r) { retornar nulo }
+        si (s > mejor) {
+            mejor = s
+            cara = i
+        }
+        i = i + 1
+    }
+    sea v1 = vs[cara]
+    sea v2 = vs[(cara + 1) % n]
+    si (mejor < 0.0000001) {
+        sea nn = ns[cara]
+        retornar [nn[0], nn[1], [[cx - nn[0] * r, cy - nn[1] * r, r - mejor]]]
+    }
+    sea u1 = (cx - v1[0]) * (v2[0] - v1[0]) + (cy - v1[1]) * (v2[1] - v1[1])
+    sea u2 = (cx - v2[0]) * (v1[0] - v2[0]) + (cy - v2[1]) * (v1[1] - v2[1])
+    si (u1 <= 0 o u2 <= 0) {
+        sea v = v1
+        si (u1 > 0) { v = v2 }
+        sea dx = cx - v[0]
+        sea dy = cy - v[1]
+        sea d2 = dx * dx + dy * dy
+        si (d2 > r * r) { retornar nulo }
+        sea d = raiz(d2)
+        si (d < 0.0000001) { retornar nulo }
+        retornar [dx / d, dy / d, [[v[0], v[1], r - d]]]
+    }
+    sea nn = ns[cara]
+    retornar [nn[0], nn[1], [[cx - nn[0] * r, cy - nn[1] * r, r - mejor]]]
+}
+
+// Máxima separación de las caras de a respecto de b: [separación, cara].
+funcion _f2d_separacion(a, b) {
+    sea mejor = 0 - 1000000000
+    sea cara = 0
+    sea i = 0
+    mientras (i < longitud(a[1])) {
+        sea n = a[2][i]
+        sea v = a[1][i]
+        sea minimo_ = 1000000000
+        para w en b[1] {
+            sea d = n[0] * (w[0] - v[0]) + n[1] * (w[1] - v[1])
+            si (d < minimo_) { minimo_ = d }
+        }
+        si (minimo_ > mejor) {
+            mejor = minimo_
+            cara = i
+        }
+        i = i + 1
+    }
+    retornar [mejor, cara]
+}
+
+funcion _f2d_recortar(pts, nx, ny, desplazamiento) {
+    sea r = []
+    sea d0 = nx * pts[0][0] + ny * pts[0][1] - desplazamiento
+    sea d1 = nx * pts[1][0] + ny * pts[1][1] - desplazamiento
+    si (d0 <= 0) { agregar(r, pts[0]) }
+    si (d1 <= 0) { agregar(r, pts[1]) }
+    si (d0 * d1 < 0) {
+        sea t = d0 / (d0 - d1)
+        agregar(r, [pts[0][0] + (pts[1][0] - pts[0][0]) * t, pts[0][1] + (pts[1][1] - pts[0][1]) * t])
+    }
+    retornar r
+}
+
+funcion _f2d_poligonos(a, b) {
+    sea sa = _f2d_separacion(a, b)
+    si (sa[0] > 0) { retornar nulo }
+    sea sb = _f2d_separacion(b, a)
+    si (sb[0] > 0) { retornar nulo }
+    sea ref = a
+    sea inc = b
+    sea cara = sa[1]
+    sea invertir = falso
+    si (sb[0] > sa[0] + 0.0005) {
+        ref = b
+        inc = a
+        cara = sb[1]
+        invertir = verdadero
+    }
+    sea n = ref[2][cara]
+    // Arista incidente: la más opuesta a la normal de referencia.
+    sea mi = 0
+    sea md = 1000000000
+    sea i = 0
+    mientras (i < longitud(inc[2])) {
+        sea d = n[0] * inc[2][i][0] + n[1] * inc[2][i][1]
+        si (d < md) {
+            md = d
+            mi = i
+        }
+        i = i + 1
+    }
+    sea ni = longitud(inc[1])
+    sea pts = [inc[1][mi], inc[1][(mi + 1) % ni]]
+    sea nr = longitud(ref[1])
+    sea v1 = ref[1][cara]
+    sea v2 = ref[1][(cara + 1) % nr]
+    sea tx = v2[0] - v1[0]
+    sea ty = v2[1] - v1[1]
+    sea tl = raiz(tx * tx + ty * ty)
+    tx = tx / tl
+    ty = ty / tl
+    pts = _f2d_recortar(pts, 0 - tx, 0 - ty, 0 - (tx * v1[0] + ty * v1[1]))
+    si (longitud(pts) < 2) { retornar nulo }
+    pts = _f2d_recortar(pts, tx, ty, tx * v2[0] + ty * v2[1])
+    si (longitud(pts) < 2) { retornar nulo }
+    sea frente = n[0] * v1[0] + n[1] * v1[1]
+    sea contactos = []
+    para p en pts {
+        sea sep = n[0] * p[0] + n[1] * p[1] - frente
+        si (sep <= 0) { agregar(contactos, [p[0] - n[0] * sep / 2, p[1] - n[1] * sep / 2, 0 - sep]) }
+    }
+    si (longitud(contactos) == 0) { retornar nulo }
+    si (invertir) { retornar [0 - n[0], 0 - n[1], contactos] }
+    retornar [n[0], n[1], contactos]
+}
+
+funcion _f2d_colisionar(fa, fb) {
+    si (fa[0] == 0 y fb[0] == 0) { retornar _f2d_circulos(fa, fb) }
+    si (fa[0] == 1 y fb[0] == 0) { retornar _f2d_poligono_circulo(fa, fb) }
+    si (fa[0] == 0 y fb[0] == 1) {
+        sea c = _f2d_poligono_circulo(fb, fa)
+        si (c == nulo) { retornar nulo }
+        retornar [0 - c[0], 0 - c[1], c[2]]
+    }
+    retornar _f2d_poligonos(fa, fb)
+}
+
+funcion _f2d_movil(c) { retornar c["activo"] y c["tipo"] != "estatico" }
+
+funcion f2d_paso(mundo, delta) {
+    si (delta <= 0) { retornar mundo }
+    sea cuerpos = mundo["cuerpos"]
+    sea g = mundo["gravedad"]
+    // 1. Velocidades.
+    para c en cuerpos {
+        si (c["activo"] y c["tipo"] == "dinamico") {
+            c["vel"]["x"] = c["vel"]["x"] + (g["x"] * c["gravedad_escala"] + c["fuerza"]["x"] * c["masa_inv"]) * delta
+            c["vel"]["y"] = c["vel"]["y"] + (g["y"] * c["gravedad_escala"] + c["fuerza"]["y"] * c["masa_inv"]) * delta
+            c["vel_angular"] = c["vel_angular"] + c["torque"] * c["inercia_inv"] * delta
+        }
+        c["fuerza"]["x"] = 0
+        c["fuerza"]["y"] = 0
+        c["torque"] = 0
+    }
+    // 2. Formas en el mundo y cajas envolventes.
+    sea info = []
+    sea i = 0
+    mientras (i < longitud(cuerpos)) {
+        sea c = cuerpos[i]
+        si (c["activo"] y longitud(c["shapes"]) > 0) {
+            sea fs = _f2d_formas_mundo(c)
+            sea caja = _f2d_caja_forma(fs[0])
+            para f en fs {
+                sea b = _f2d_caja_forma(f)
+                caja = [minimo(caja[0], b[0]), minimo(caja[1], b[1]), maximo(caja[2], b[2]), maximo(caja[3], b[3])]
+            }
+            agregar(info, [caja[0], i, fs, caja])
+        }
+        i = i + 1
+    }
+    // 3. Barrido y poda en x.
+    info = ordenar(info, funcion(a, b) {
+        si (a[0] < b[0]) { retornar 0 - 1 }
+        si (a[0] > b[0]) { retornar 1 }
+        retornar a[1] - b[1]
+    })
+    sea contactos = []
+    i = 0
+    mientras (i < longitud(info)) {
+        sea ia = info[i]
         sea j = i + 1
-        mientras (j < n) {
-            sea b = mundo["cuerpos"][j]
-            // Por ahora detección AABB vs AABB simple
-            sea info = f2d_colision_aabb_aabb(
-                a["pos"]["x"], a["pos"]["y"], 16, 16,
-                b["pos"]["x"], b["pos"]["y"], 16, 16
-            )
-            si (info != nulo) {
-                f2d_resolver_colision(a, b, info)
+        mientras (j < longitud(info) y info[j][0] <= ia[3][2]) {
+            sea ib = info[j]
+            sea a = cuerpos[ia[1]]
+            sea b = cuerpos[ib[1]]
+            si ((a["tipo"] == "dinamico" o b["tipo"] == "dinamico") y ia[3][1] <= ib[3][3] y ib[3][1] <= ia[3][3]) {
+                para fa en ia[2] {
+                    para fb en ib[2] {
+                        sea k = _f2d_colisionar(fa, fb)
+                        si (k != nulo) { agregar(contactos, _f2d_preparar(a, b, k, delta)) }
+                    }
+                }
             }
             j = j + 1
         }
         i = i + 1
     }
+    // 4. Impulsos secuenciales.
+    sea it = 0
+    mientras (it < mundo["iteraciones"]) {
+        para k en contactos { _f2d_resolver(k) }
+        it = it + 1
+    }
+    // 5. Posiciones.
+    para c en cuerpos {
+        si (_f2d_movil(c)) {
+            c["pos"]["x"] = c["pos"]["x"] + c["vel"]["x"] * delta
+            c["pos"]["y"] = c["pos"]["y"] + c["vel"]["y"] * delta
+            c["angulo"] = c["angulo"] + c["vel_angular"] * delta
+        }
+    }
+    mundo["contactos"] = []
+    para k en contactos { agregar(mundo["contactos"], {"a": k[0], "b": k[1], "normal": vec2(k[2], k[3]), "puntos": longitud(k[4])}) }
+    si (tiene_clave(mundo, "al_chocar") y mundo["al_chocar"] != nulo) {
+        para k en mundo["contactos"] { mundo["al_chocar"](k["a"], k["b"], k) }
+    }
+    retornar mundo
+}
+
+// Contacto preparado: [a, b, nx, ny, puntos, fricción]; cada punto
+// [rax, ray, rbx, rby, masa_n, masa_t, sesgo, Pn, Pt].
+funcion _f2d_preparar(a, b, k, delta) {
+    sea nx = k[0]
+    sea ny = k[1]
+    sea tx = ny
+    sea ty = 0 - nx
+    sea mia = a["masa_inv"]
+    sea mib = b["masa_inv"]
+    sea iia = a["inercia_inv"]
+    sea iib = b["inercia_inv"]
+    si (_f2d_movil(a) == falso o a["tipo"] != "dinamico") {
+        mia = 0
+        iia = 0
+    }
+    si (_f2d_movil(b) == falso o b["tipo"] != "dinamico") {
+        mib = 0
+        iib = 0
+    }
+    sea e = maximo(a["rebote"], b["rebote"])
+    sea puntos = []
+    para p en k[2] {
+        sea rax = p[0] - a["pos"]["x"]
+        sea ray = p[1] - a["pos"]["y"]
+        sea rbx = p[0] - b["pos"]["x"]
+        sea rby = p[1] - b["pos"]["y"]
+        sea rna = rax * ny - ray * nx
+        sea rnb = rbx * ny - rby * nx
+        sea kn = mia + mib + iia * rna * rna + iib * rnb * rnb
+        sea rta = rax * ty - ray * tx
+        sea rtb = rbx * ty - rby * tx
+        sea kt = mia + mib + iia * rta * rta + iib * rtb * rtb
+        sea mn = 0
+        si (kn > 0) { mn = 1 / kn }
+        sea mt = 0
+        si (kt > 0) { mt = 1 / kt }
+        // Velocidad relativa normal para el rebote.
+        sea vrx = b["vel"]["x"] - b["vel_angular"] * rby - a["vel"]["x"] + a["vel_angular"] * ray
+        sea vry = b["vel"]["y"] + b["vel_angular"] * rbx - a["vel"]["y"] - a["vel_angular"] * rax
+        sea vn = vrx * nx + vry * ny
+        sea sesgo = 0.2 / delta * maximo(0, p[2] - 0.005)
+        si (vn < 0 - 1) { sesgo = maximo(sesgo, 0 - e * vn) }
+        agregar(puntos, [rax, ray, rbx, rby, mn, mt, sesgo, 0, 0])
+    }
+    retornar [a, b, nx, ny, puntos, raiz(a["friccion"] * b["friccion"]), mia, mib, iia, iib]
+}
+
+funcion _f2d_resolver(k) {
+    sea a = k[0]
+    sea b = k[1]
+    sea nx = k[2]
+    sea ny = k[3]
+    sea tx = ny
+    sea ty = 0 - nx
+    sea mu = k[5]
+    sea mia = k[6]
+    sea mib = k[7]
+    sea iia = k[8]
+    sea iib = k[9]
+    para p en k[4] {
+        sea rax = p[0]
+        sea ray = p[1]
+        sea rbx = p[2]
+        sea rby = p[3]
+        // Normal.
+        sea vrx = b["vel"]["x"] - b["vel_angular"] * rby - a["vel"]["x"] + a["vel_angular"] * ray
+        sea vry = b["vel"]["y"] + b["vel_angular"] * rbx - a["vel"]["y"] - a["vel_angular"] * rax
+        sea vn = vrx * nx + vry * ny
+        sea dp = p[4] * (p[6] - vn)
+        sea p0 = p[7]
+        p[7] = maximo(p0 + dp, 0)
+        dp = p[7] - p0
+        _f2d_aplicar(a, b, dp * nx, dp * ny, rax, ray, rbx, rby, mia, mib, iia, iib)
+        // Fricción.
+        vrx = b["vel"]["x"] - b["vel_angular"] * rby - a["vel"]["x"] + a["vel_angular"] * ray
+        vry = b["vel"]["y"] + b["vel_angular"] * rbx - a["vel"]["y"] - a["vel_angular"] * rax
+        sea vt = vrx * tx + vry * ty
+        sea dt = p[5] * (0 - vt)
+        sea limite = mu * p[7]
+        sea t0 = p[8]
+        p[8] = maximo(0 - limite, minimo(limite, t0 + dt))
+        dt = p[8] - t0
+        _f2d_aplicar(a, b, dt * tx, dt * ty, rax, ray, rbx, rby, mia, mib, iia, iib)
+    }
+    retornar 0
+}
+
+funcion _f2d_aplicar(a, b, px, py, rax, ray, rbx, rby, mia, mib, iia, iib) {
+    a["vel"]["x"] = a["vel"]["x"] - px * mia
+    a["vel"]["y"] = a["vel"]["y"] - py * mia
+    a["vel_angular"] = a["vel_angular"] - iia * (rax * py - ray * px)
+    b["vel"]["x"] = b["vel"]["x"] + px * mib
+    b["vel"]["y"] = b["vel"]["y"] + py * mib
+    b["vel_angular"] = b["vel_angular"] + iib * (rbx * py - rby * px)
+    retornar 0
+}
+
+// Paso fijo con acumulador (para bucles de juego con delta variable).
+funcion f2d_actualizar(mundo, delta) {
+    mundo["tiempo_acumulado"] = mundo["tiempo_acumulado"] + minimo(delta, 0.25)
+    sea pasos = 0
+    mientras (mundo["tiempo_acumulado"] >= mundo["paso_fijo"]) {
+        f2d_paso(mundo, mundo["paso_fijo"])
+        mundo["tiempo_acumulado"] = mundo["tiempo_acumulado"] - mundo["paso_fijo"]
+        pasos = pasos + 1
+    }
+    retornar pasos
 }
 
 // ── Raycasting ─────────────────────────────────────────────────────────────────
 
-funcion f2d_raycast(mundo, origen, direccion, distancia_max) {
-    sea dist_max = distancia_max ?? 1000
+// Primer impacto del rayo: {"cuerpo", "distancia", "punto", "normal"} o nulo.
+funcion f2d_raycast(mundo, origen, direccion, distancia_max = 1000) {
+    sea dl = raiz(direccion["x"] * direccion["x"] + direccion["y"] * direccion["y"])
+    si (dl == 0) { retornar nulo }
+    sea dx = direccion["x"] / dl
+    sea dy = direccion["y"] / dl
+    sea ox = origen["x"]
+    sea oy = origen["y"]
     sea mejor = nulo
-    sea mejor_dist = dist_max
-    para cuerpo en mundo["cuerpos"] {
-        sea dx = cuerpo["pos"]["x"] - origen["x"]
-        sea dy = cuerpo["pos"]["y"] - origen["y"]
-        sea t = dx * direccion["x"] + dy * direccion["y"]
-        si (t < 0) { continuar }
-        sea px = origen["x"] + direccion["x"] * t
-        sea py = origen["y"] + direccion["y"] * t
-        sea dist_perp = raiz((px - cuerpo["pos"]["x"])*(px - cuerpo["pos"]["x"]) + (py - cuerpo["pos"]["y"])*(py - cuerpo["pos"]["y"]))
-        si (dist_perp < 16 y t < mejor_dist) {
-            mejor_dist = t
-            mejor = {"cuerpo": cuerpo, "distancia": t, "punto": vec2(px, py)}
+    sea mejor_t = distancia_max
+    para c en mundo["cuerpos"] {
+        si (c["activo"]) {
+            para f en _f2d_formas_mundo(c) {
+                sea t = 0 - 1
+                sea nx = 0
+                sea ny = 0
+                si (f[0] == 0) {
+                    sea mx = ox - f[1]
+                    sea my = oy - f[2]
+                    sea bb = mx * dx + my * dy
+                    sea cc = mx * mx + my * my - f[3] * f[3]
+                    sea disc = bb * bb - cc
+                    si (disc >= 0 y cc > 0) {
+                        t = 0 - bb - raiz(disc)
+                        nx = (ox + dx * t - f[1]) / f[3]
+                        ny = (oy + dy * t - f[2]) / f[3]
+                    }
+                } sino {
+                    sea bajo = 0
+                    sea alto = mejor_t
+                    sea cara = 0 - 1
+                    sea ok = verdadero
+                    sea i = 0
+                    mientras (ok y i < longitud(f[1])) {
+                        sea n = f[2][i]
+                        sea num = n[0] * (f[1][i][0] - ox) + n[1] * (f[1][i][1] - oy)
+                        sea den = n[0] * dx + n[1] * dy
+                        si (den == 0) {
+                            si (num < 0) { ok = falso }
+                        } sino {
+                            si (den < 0 y num < bajo * den) {
+                                bajo = num / den
+                                cara = i
+                            }
+                            si (den > 0 y num < alto * den) { alto = num / den }
+                        }
+                        si (alto < bajo) { ok = falso }
+                        i = i + 1
+                    }
+                    si (ok y cara >= 0) {
+                        t = bajo
+                        nx = f[2][cara][0]
+                        ny = f[2][cara][1]
+                    }
+                }
+                si (t >= 0 y t < mejor_t) {
+                    mejor_t = t
+                    mejor = {"cuerpo": c, "distancia": t, "punto": vec2(ox + dx * t, oy + dy * t), "normal": vec2(nx, ny)}
+                }
+            }
         }
     }
     retornar mejor

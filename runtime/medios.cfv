@@ -1,0 +1,2997 @@
+// runtime/medios.cfv — imágenes, compresión y rasterizado en C-Forge puro.
+//
+// Código puente (enteros crudos y memoria) para que decodificar, comprimir y
+// pintar sea rápido sin depender de zlib, libpng, libjpeg, stb ni SDL_image:
+//   · CRC-32, Adler-32, inflate (RFC 1951) y deflate con LZ77 + Huffman.
+//   · PNG: todos los tipos de color, profundidades 1–16, paleta, tRNS y
+//     entrelazado Adam7; codificador RGBA/RGB con filtros adaptativos.
+//   · JPEG: baseline y progresivo, Huffman, IDCT entera, submuestreo
+//     4:4:4 / 4:2:2 / 4:2:0, escala de grises y CMYK de Adobe.
+//   · BMP de 8, 24 y 32 bits.
+//   · Rasterizado RGBA: rectángulos con mezcla alfa, líneas, polígonos con
+//     antialiasing (regla nonzero, el mismo método sirve para fuentes TTF),
+//     copia de imágenes escaladas y triángulos 3D con z-buffer, color por
+//     vértice y texturas con corrección de perspectiva.
+// Las imágenes son RGBA de 8 bits por canal, fila por fila, de arriba abajo.
+
+funcion md_ent(v) {
+    si (__y_bits(v, 1) == 1) { retornar dyn_valor_entero(v) }
+    retornar __f64_a_entero(dyn_a_f64(v))
+}
+
+// Texto nuevo de n bytes en cero (con el 0 final).
+funcion md_buffer(n) {
+    sea s = str_nuevo(n)
+    mem_llenar(str_datos(s), 0, n + 1)
+    __guardar64(s, n)
+    retornar s
+}
+
+funcion md_lista3(a, b, c) {
+    sea v = vec_nuevo()
+    vec_agregar(v, a)
+    vec_agregar(v, b)
+    vec_agregar(v, c)
+    retornar dyn_caja(2, v)
+}
+
+funcion md_be32(p) {
+    retornar __o_bits(__o_bits(__desplazar_izq(__cargar8(p), 24), __desplazar_izq(__cargar8(p + 1), 16)), __o_bits(__desplazar_izq(__cargar8(p + 2), 8), __cargar8(p + 3)))
+}
+funcion md_be16(p) { retornar __o_bits(__desplazar_izq(__cargar8(p), 8), __cargar8(p + 1)) }
+funcion md_le16(p) { retornar __o_bits(__cargar8(p), __desplazar_izq(__cargar8(p + 1), 8)) }
+funcion md_le32(p) { retornar __o_bits(md_le16(p), __desplazar_izq(md_le16(p + 2), 16)) }
+// Agrega bytes escritos en decimal separados por comas ("1,2,255").
+funcion md_agregar_bytes(s, lista) {
+    sea v = 0
+    sea i = 0
+    mientras (i <= str_largo(lista)) {
+        sea b = 44
+        si (i < str_largo(lista)) { b = str_byte(lista, i) }
+        si (b == 44) {
+            str_agregar_byte(s, v)
+            v = 0
+        } sino { v = v * 10 + b - 48 }
+        i = i + 1
+    }
+    retornar 0
+}
+
+funcion md_agregar_be32(s, v) {
+    str_agregar_byte(s, __y_bits(__desplazar_der(v, 24), 255))
+    str_agregar_byte(s, __y_bits(__desplazar_der(v, 16), 255))
+    str_agregar_byte(s, __y_bits(__desplazar_der(v, 8), 255))
+    str_agregar_byte(s, __y_bits(v, 255))
+    retornar 0
+}
+
+// ── CRC-32 y Adler-32 ──────────────────────────────────────────────────────
+
+funcion md_tabla_crc() {
+    sea t = mem_global(30)
+    si (t != 0) { retornar t }
+    t = mem_reservar(256 * 8)
+    sea n = 0
+    mientras (n < 256) {
+        sea c = n
+        sea k = 0
+        mientras (k < 8) {
+            si (__y_bits(c, 1) != 0) { c = __xo_bits(3988292384, __desplazar_der(c, 1)) } sino { c = __desplazar_der(c, 1) }
+            k = k + 1
+        }
+        __guardar64(t + n * 8, c)
+        n = n + 1
+    }
+    mem_fijar_global(30, t)
+    retornar t
+}
+
+funcion md_crc(crc, p, n) {
+    sea t = md_tabla_crc()
+    sea c = __xo_bits(crc, 4294967295)
+    sea i = 0
+    mientras (i < n) {
+        c = __xo_bits(__cargar64(t + __y_bits(__xo_bits(c, __cargar8(p + i)), 255) * 8), __desplazar_der(c, 8))
+        i = i + 1
+    }
+    retornar __xo_bits(c, 4294967295)
+}
+
+funcion md_adler(p, n) {
+    sea a = 1
+    sea b = 0
+    sea i = 0
+    mientras (i < n) {
+        // 5552 bytes como máximo entre reducciones (igual que zlib).
+        sea fin = i + 5552
+        si (fin > n) { fin = n }
+        mientras (i < fin) {
+            a = a + __cargar8(p + i)
+            b = b + a
+            i = i + 1
+        }
+        a = a % 65521
+        b = b % 65521
+    }
+    retornar __o_bits(__desplazar_izq(b, 16), a)
+}
+
+funcion crc32(datos) {
+    sea s = dyn_a_str(datos)
+    retornar dyn_entero(md_crc(0, str_datos(s), str_largo(s)))
+}
+
+funcion adler32(datos) {
+    sea s = dyn_a_str(datos)
+    retornar dyn_entero(md_adler(str_datos(s), str_largo(s)))
+}
+
+// ── Inflate (RFC 1951) ─────────────────────────────────────────────────────
+// Estado del lector: [datos][largo][pos][bits][cantidad].
+// Tabla Huffman: 16 conteos, 320 símbolos y una tabla rápida de 9 bits.
+
+funcion md_llenar(st, n) {
+    sea buf = __cargar64(st + 24)
+    sea cnt = __cargar64(st + 32)
+    sea pos = __cargar64(st + 16)
+    sea largo = __cargar64(st + 8)
+    sea d = __cargar64(st)
+    mientras (cnt < n y pos < largo) {
+        buf = __o_bits(buf, __desplazar_izq(__cargar8(d + pos), cnt))
+        pos = pos + 1
+        cnt = cnt + 8
+    }
+    __guardar64(st + 24, buf)
+    __guardar64(st + 32, cnt)
+    __guardar64(st + 16, pos)
+    retornar cnt
+}
+
+funcion md_bits(st, n) {
+    si (n == 0) { retornar 0 }
+    si (__cargar64(st + 32) < n) {
+        si (md_llenar(st, n) < n) { dyn_error("inflar: datos comprimidos truncados") }
+    }
+    sea buf = __cargar64(st + 24)
+    __guardar64(st + 24, __desplazar_der(buf, n))
+    __guardar64(st + 32, __cargar64(st + 32) - n)
+    retornar __y_bits(buf, __desplazar_izq(1, n) - 1)
+}
+
+funcion md_huff_construir(h, longs, n) {
+    mem_llenar(h, 0, 128)
+    sea i = 0
+    mientras (i < n) {
+        sea l = __cargar64(longs + i * 8)
+        __guardar64(h + l * 8, __cargar64(h + l * 8) + 1)
+        i = i + 1
+    }
+    sea offs = mem_reservar(17 * 8)
+    __guardar64(offs + 8, 0)
+    sea l = 1
+    mientras (l < 16) {
+        __guardar64(offs + (l + 1) * 8, __cargar64(offs + l * 8) + __cargar64(h + l * 8))
+        l = l + 1
+    }
+    i = 0
+    mientras (i < n) {
+        sea li = __cargar64(longs + i * 8)
+        si (li != 0) {
+            sea ofs = __cargar64(offs + li * 8)
+            __guardar64(h + 128 + ofs * 8, i)
+            __guardar64(offs + li * 8, ofs + 1)
+        }
+        i = i + 1
+    }
+    mem_liberar(offs)
+    sea rapida = h + 2688
+    mem_llenar(rapida, 0, 4096)
+    sea codigo = 0
+    sea indice = 0
+    l = 1
+    mientras (l < 16) {
+        sea c = __cargar64(h + l * 8)
+        sea j = 0
+        mientras (j < c) {
+            si (l <= 9) {
+                // Código invertido (el flujo es LSB primero).
+                sea r = 0
+                sea b = 0
+                mientras (b < l) {
+                    r = __o_bits(__desplazar_izq(r, 1), __y_bits(__desplazar_der(codigo, b), 1))
+                    b = b + 1
+                }
+                sea entrada = __desplazar_izq(__cargar64(h + 128 + indice * 8), 4) + l
+                sea k = r
+                mientras (k < 512) {
+                    __guardar64(rapida + k * 8, entrada)
+                    k = k + __desplazar_izq(1, l)
+                }
+            }
+            codigo = codigo + 1
+            indice = indice + 1
+            j = j + 1
+        }
+        codigo = __desplazar_izq(codigo, 1)
+        l = l + 1
+    }
+    retornar 0
+}
+
+funcion md_huff_dec(st, h) {
+    sea cnt = __cargar64(st + 32)
+    si (cnt < 9) { cnt = md_llenar(st, 9) }
+    sea buf = __cargar64(st + 24)
+    sea e = __cargar64(h + 2688 + __y_bits(buf, 511) * 8)
+    si (e != 0) {
+        sea l = __y_bits(e, 15)
+        si (l <= cnt) {
+            __guardar64(st + 24, __desplazar_der(buf, l))
+            __guardar64(st + 32, cnt - l)
+            retornar __desplazar_der(e, 4)
+        }
+    }
+    // Camino lento (códigos de más de 9 bits), como puff de zlib.
+    sea codigo = 0
+    sea primero = 0
+    sea indice = 0
+    sea l = 1
+    mientras (l < 16) {
+        codigo = __o_bits(codigo, md_bits(st, 1))
+        sea c = __cargar64(h + l * 8)
+        si (codigo - c < primero) { retornar __cargar64(h + 128 + (indice + codigo - primero) * 8) }
+        indice = indice + c
+        primero = __desplazar_izq(primero + c, 1)
+        codigo = __desplazar_izq(codigo, 1)
+        l = l + 1
+    }
+    dyn_error("inflar: código Huffman inválido")
+    retornar 0
+}
+
+funcion md_tablas_deflate() {
+    sea t = mem_global(42)
+    si (t != 0) { retornar t }
+    // [base largo 29][extra largo 29][base distancia 30][extra distancia 30]
+    t = mem_reservar(118 * 8)
+    sea i = 0
+    sea base = 3
+    mientras (i < 28) {
+        sea e = 0
+        si (i >= 8) { e = (i - 4) / 4 }
+        __guardar64(t + i * 8, base)
+        __guardar64(t + (29 + i) * 8, e)
+        base = base + __desplazar_izq(1, e)
+        i = i + 1
+    }
+    __guardar64(t + 28 * 8, 258)
+    __guardar64(t + 57 * 8, 0)
+    i = 0
+    base = 1
+    mientras (i < 30) {
+        sea e = 0
+        si (i >= 4) { e = (i - 2) / 2 }
+        __guardar64(t + (58 + i) * 8, base)
+        __guardar64(t + (88 + i) * 8, e)
+        base = base + __desplazar_izq(1, e)
+        i = i + 1
+    }
+    mem_fijar_global(42, t)
+    retornar t
+}
+
+// Descomprime deflate crudo desde p (n bytes) y agrega a `salida`.
+// Devuelve los bytes consumidos.
+funcion md_inflar(p, n, salida) {
+    sea st = mem_reservar(48)
+    __guardar64(st, p)
+    __guardar64(st + 8, n)
+    __guardar64(st + 16, 0)
+    __guardar64(st + 24, 0)
+    __guardar64(st + 32, 0)
+    sea lit = mem_reservar(6784)
+    sea dist = mem_reservar(6784)
+    sea longs = mem_reservar(320 * 8)
+    sea cl = mem_reservar(6784)
+    sea tb = md_tablas_deflate()
+    sea orden = "qrsaihjgkflemdncobp"
+    sea final = 0
+    mientras (final == 0) {
+        final = md_bits(st, 1)
+        sea tipo = md_bits(st, 2)
+        si (tipo == 0) {
+            // Bloque guardado: volver al límite de byte.
+            sea cnt = __cargar64(st + 32)
+            __guardar64(st + 16, __cargar64(st + 16) - cnt / 8)
+            __guardar64(st + 24, 0)
+            __guardar64(st + 32, 0)
+            sea pos = __cargar64(st + 16)
+            si (pos + 4 > n) { dyn_error("inflar: bloque guardado truncado") }
+            sea largo = md_le16(p + pos)
+            si (__xo_bits(largo, md_le16(p + pos + 2)) != 65535) { dyn_error("inflar: largo de bloque guardado inválido") }
+            pos = pos + 4
+            si (pos + largo > n) { dyn_error("inflar: bloque guardado truncado") }
+            sea actual = str_largo(salida)
+            str_asegurar(salida, actual + largo + 1)
+            mem_copiar(str_datos(salida) + actual, p + pos, largo)
+            __guardar64(salida, actual + largo)
+            __guardar8(str_datos(salida) + actual + largo, 0)
+            __guardar64(st + 16, pos + largo)
+        } sino {
+            si (tipo == 3) { dyn_error("inflar: tipo de bloque inválido") }
+            si (tipo == 1) {
+                sea i = 0
+                mientras (i < 288) {
+                    sea l = 8
+                    si (i >= 144 y i < 256) { l = 9 }
+                    si (i >= 256 y i < 280) { l = 7 }
+                    __guardar64(longs + i * 8, l)
+                    i = i + 1
+                }
+                md_huff_construir(lit, longs, 288)
+                i = 0
+                mientras (i < 30) {
+                    __guardar64(longs + i * 8, 5)
+                    i = i + 1
+                }
+                md_huff_construir(dist, longs, 30)
+            } sino {
+                sea hlit = md_bits(st, 5) + 257
+                sea hdist = md_bits(st, 5) + 1
+                sea hclen = md_bits(st, 4) + 4
+                mem_llenar(longs, 0, 19 * 8)
+                sea i = 0
+                mientras (i < hclen) {
+                    __guardar64(longs + (str_byte(orden, i) - 97) * 8, md_bits(st, 3))
+                    i = i + 1
+                }
+                md_huff_construir(cl, longs, 19)
+                i = 0
+                mientras (i < hlit + hdist) {
+                    sea s = md_huff_dec(st, cl)
+                    si (s < 16) {
+                        __guardar64(longs + i * 8, s)
+                        i = i + 1
+                    } sino {
+                        sea rep = 0
+                        sea valor = 0
+                        si (s == 16) {
+                            si (i == 0) { dyn_error("inflar: repetición sin longitud previa") }
+                            valor = __cargar64(longs + (i - 1) * 8)
+                            rep = 3 + md_bits(st, 2)
+                        } sino {
+                            si (s == 17) { rep = 3 + md_bits(st, 3) } sino { rep = 11 + md_bits(st, 7) }
+                        }
+                        si (i + rep > hlit + hdist) { dyn_error("inflar: demasiadas longitudes") }
+                        mientras (rep > 0) {
+                            __guardar64(longs + i * 8, valor)
+                            i = i + 1
+                            rep = rep - 1
+                        }
+                    }
+                }
+                md_huff_construir(lit, longs, hlit)
+                md_huff_construir(dist, longs + hlit * 8, hdist)
+            }
+            sea fin_bloque = 0
+            mientras (fin_bloque == 0) {
+                sea s = md_huff_dec(st, lit)
+                si (s < 256) { str_agregar_byte(salida, s) } sino {
+                    si (s == 256) { fin_bloque = 1 } sino {
+                        s = s - 257
+                        si (s >= 29) { dyn_error("inflar: símbolo de largo inválido") }
+                        sea largo = __cargar64(tb + s * 8) + md_bits(st, __cargar64(tb + (29 + s) * 8))
+                        sea ds = md_huff_dec(st, dist)
+                        si (ds >= 30) { dyn_error("inflar: símbolo de distancia inválido") }
+                        sea d = __cargar64(tb + (58 + ds) * 8) + md_bits(st, __cargar64(tb + (88 + ds) * 8))
+                        sea actual = str_largo(salida)
+                        si (d > actual) { dyn_error("inflar: distancia fuera de la ventana") }
+                        str_asegurar(salida, actual + largo + 1)
+                        sea q = str_datos(salida) + actual
+                        sea k = 0
+                        mientras (k < largo) {
+                            __guardar8(q + k, __cargar8(q + k - d))
+                            k = k + 1
+                        }
+                        __guardar64(salida, actual + largo)
+                        __guardar8(q + largo, 0)
+                    }
+                }
+            }
+        }
+    }
+    sea consumidos = __cargar64(st + 16) - __cargar64(st + 32) / 8
+    mem_liberar(st)
+    mem_liberar(lit)
+    mem_liberar(dist)
+    mem_liberar(longs)
+    mem_liberar(cl)
+    retornar consumidos
+}
+
+// zlib (RFC 1950): cabecera, deflate y Adler-32.
+funcion md_zlib_inflar(p, n, salida) {
+    si (n < 6) { dyn_error("zlib: datos demasiado cortos") }
+    sea cmf = __cargar8(p)
+    sea flg = __cargar8(p + 1)
+    si (__y_bits(cmf, 15) != 8 o (cmf * 256 + flg) % 31 != 0) { dyn_error("zlib: cabecera inválida") }
+    si (__y_bits(flg, 32) != 0) { dyn_error("zlib: diccionario predefinido no soportado") }
+    sea inicio = str_largo(salida)
+    sea usados = md_inflar(p + 2, n - 2, salida)
+    si (2 + usados + 4 <= n) {
+        sea esperado = md_be32(p + 2 + usados)
+        si (md_adler(str_datos(salida) + inicio, str_largo(salida) - inicio) != esperado) { dyn_error("zlib: Adler-32 no coincide") }
+    }
+    retornar 0
+}
+
+funcion inflar(datos) {
+    sea s = dyn_a_str(datos)
+    sea r = str_nuevo(str_largo(s) * 4 + 64)
+    md_inflar(str_datos(s), str_largo(s), r)
+    retornar dyn_texto(r)
+}
+
+funcion zlib_descomprimir(datos) {
+    sea s = dyn_a_str(datos)
+    sea r = str_nuevo(str_largo(s) * 4 + 64)
+    md_zlib_inflar(str_datos(s), str_largo(s), r)
+    retornar dyn_texto(r)
+}
+
+funcion gzip_descomprimir(datos) {
+    sea s = dyn_a_str(datos)
+    sea p = str_datos(s)
+    sea n = str_largo(s)
+    si (n < 18 o __cargar8(p) != 31 o __cargar8(p + 1) != 139 o __cargar8(p + 2) != 8) { dyn_error("gzip: cabecera inválida") }
+    sea flg = __cargar8(p + 3)
+    sea pos = 10
+    si (__y_bits(flg, 4) != 0) { pos = pos + 2 + md_le16(p + pos) }
+    si (__y_bits(flg, 8) != 0) {
+        mientras (pos < n y __cargar8(p + pos) != 0) { pos = pos + 1 }
+        pos = pos + 1
+    }
+    si (__y_bits(flg, 16) != 0) {
+        mientras (pos < n y __cargar8(p + pos) != 0) { pos = pos + 1 }
+        pos = pos + 1
+    }
+    si (__y_bits(flg, 2) != 0) { pos = pos + 2 }
+    si (pos >= n) { dyn_error("gzip: datos truncados") }
+    sea r = str_nuevo(n * 4 + 64)
+    sea usados = md_inflar(p + pos, n - pos, r)
+    si (pos + usados + 8 <= n) {
+        si (md_crc(0, str_datos(r), str_largo(r)) != md_le32(p + pos + usados)) { dyn_error("gzip: CRC-32 no coincide") }
+    }
+    retornar dyn_texto(r)
+}
+
+// ── Deflate: LZ77 con cadenas hash + Huffman fijo ──────────────────────────
+// Escritor de bits: [salida][bits][cantidad].
+
+funcion md_poner(w, valor, n) {
+    sea buf = __o_bits(__cargar64(w + 8), __desplazar_izq(valor, __cargar64(w + 16)))
+    sea cnt = __cargar64(w + 16) + n
+    sea s = __cargar64(w)
+    mientras (cnt >= 8) {
+        str_agregar_byte(s, __y_bits(buf, 255))
+        buf = __desplazar_der(buf, 8)
+        cnt = cnt - 8
+    }
+    __guardar64(w + 8, buf)
+    __guardar64(w + 16, cnt)
+    retornar 0
+}
+
+// Código Huffman (MSB primero) invertido para el flujo LSB primero.
+funcion md_poner_codigo(w, codigo, n) {
+    sea r = 0
+    sea i = 0
+    mientras (i < n) {
+        r = __o_bits(__desplazar_izq(r, 1), __y_bits(__desplazar_der(codigo, i), 1))
+        i = i + 1
+    }
+    retornar md_poner(w, r, n)
+}
+
+funcion md_poner_literal(w, s) {
+    si (s < 144) { retornar md_poner_codigo(w, 48 + s, 8) }
+    si (s < 256) { retornar md_poner_codigo(w, 400 + s - 144, 9) }
+    si (s < 280) { retornar md_poner_codigo(w, s - 256, 7) }
+    retornar md_poner_codigo(w, 192 + s - 280, 8)
+}
+
+funcion md_poner_par(w, largo, d, tb) {
+    sea i = 28
+    mientras (__cargar64(tb + i * 8) > largo) { i = i - 1 }
+    md_poner_literal(w, 257 + i)
+    md_poner(w, largo - __cargar64(tb + i * 8), __cargar64(tb + (29 + i) * 8))
+    sea j = 29
+    mientras (__cargar64(tb + (58 + j) * 8) > d) { j = j - 1 }
+    md_poner_codigo(w, j, 5)
+    md_poner(w, d - __cargar64(tb + (58 + j) * 8), __cargar64(tb + (88 + j) * 8))
+    retornar 0
+}
+
+// Longitudes de Huffman (limitadas) para n frecuencias.
+funcion md_huff_longitudes(frec, n, limite, longs) {
+    sea w = mem_reservar(n * 2 * 8)
+    sea padre = mem_reservar(n * 2 * 8)
+    sea activo = mem_reservar(n * 2 * 8)
+    sea f = mem_reservar(n * 8)
+    mem_copiar(f, frec, n * 8)
+    sea listo = 0
+    mientras (listo == 0) {
+        mem_llenar(longs, 0, n * 8)
+        sea m = 0
+        sea i = 0
+        mientras (i < n) {
+            __guardar64(w + i * 8, __cargar64(f + i * 8))
+            __guardar64(padre + i * 8, 0 - 1)
+            sea act = 0
+            si (__cargar64(f + i * 8) > 0) {
+                act = 1
+                m = m + 1
+            }
+            __guardar64(activo + i * 8, act)
+            i = i + 1
+        }
+        si (m <= 1) {
+            i = 0
+            mientras (i < n) {
+                si (__cargar64(f + i * 8) > 0) { __guardar64(longs + i * 8, 1) }
+                i = i + 1
+            }
+            listo = 1
+        } sino {
+            sea nodos = n
+            sea paso = 0
+            mientras (paso < m - 1) {
+                sea a = 0 - 1
+                sea b = 0 - 1
+                i = 0
+                mientras (i < nodos) {
+                    si (__cargar64(activo + i * 8) == 1) {
+                        sea wi = __cargar64(w + i * 8)
+                        si (a < 0 o wi < __cargar64(w + a * 8)) {
+                            b = a
+                            a = i
+                        } sino {
+                            si (b < 0 o wi < __cargar64(w + b * 8)) { b = i }
+                        }
+                    }
+                    i = i + 1
+                }
+                __guardar64(activo + a * 8, 0)
+                __guardar64(activo + b * 8, 0)
+                __guardar64(w + nodos * 8, __cargar64(w + a * 8) + __cargar64(w + b * 8))
+                __guardar64(padre + nodos * 8, 0 - 1)
+                __guardar64(activo + nodos * 8, 1)
+                __guardar64(padre + a * 8, nodos)
+                __guardar64(padre + b * 8, nodos)
+                nodos = nodos + 1
+                paso = paso + 1
+            }
+            sea maximo = 0
+            i = 0
+            mientras (i < n) {
+                si (__cargar64(f + i * 8) > 0) {
+                    sea d = 0
+                    sea k = i
+                    mientras (__cargar64(padre + k * 8) >= 0) {
+                        k = __cargar64(padre + k * 8)
+                        d = d + 1
+                    }
+                    __guardar64(longs + i * 8, d)
+                    si (d > maximo) { maximo = d }
+                }
+                i = i + 1
+            }
+            si (maximo <= limite) { listo = 1 } sino {
+                // Aplanar las frecuencias y repetir.
+                i = 0
+                mientras (i < n) {
+                    sea fi = __cargar64(f + i * 8)
+                    si (fi > 0) { __guardar64(f + i * 8, fi / 2 + 1) }
+                    i = i + 1
+                }
+            }
+        }
+    }
+    mem_liberar(w)
+    mem_liberar(padre)
+    mem_liberar(activo)
+    mem_liberar(f)
+    retornar 0
+}
+
+// Códigos canónicos (MSB primero) para las longitudes dadas.
+funcion md_codigos(longs, n) {
+    sea cuenta = mem_reservar(17 * 8)
+    mem_llenar(cuenta, 0, 17 * 8)
+    sea i = 0
+    mientras (i < n) {
+        sea l = __cargar64(longs + i * 8)
+        __guardar64(cuenta + l * 8, __cargar64(cuenta + l * 8) + 1)
+        i = i + 1
+    }
+    __guardar64(cuenta, 0)
+    sea siguiente = mem_reservar(17 * 8)
+    sea codigo = 0
+    sea l = 1
+    mientras (l < 17) {
+        codigo = __desplazar_izq(codigo + __cargar64(cuenta + (l - 1) * 8), 1)
+        __guardar64(siguiente + l * 8, codigo)
+        l = l + 1
+    }
+    sea c = mem_reservar(n * 8)
+    i = 0
+    mientras (i < n) {
+        sea li = __cargar64(longs + i * 8)
+        si (li != 0) {
+            __guardar64(c + i * 8, __cargar64(siguiente + li * 8))
+            __guardar64(siguiente + li * 8, __cargar64(siguiente + li * 8) + 1)
+        }
+        i = i + 1
+    }
+    mem_liberar(cuenta)
+    mem_liberar(siguiente)
+    retornar c
+}
+
+funcion md_simbolo_largo(largo, tb) {
+    sea i = 28
+    mientras (__cargar64(tb + i * 8) > largo) { i = i - 1 }
+    retornar i
+}
+
+funcion md_simbolo_distancia(d, tb) {
+    sea j = 29
+    mientras (__cargar64(tb + (58 + j) * 8) > d) { j = j - 1 }
+    retornar j
+}
+
+// Emite un bloque con Huffman dinámico. Cada token es un literal (< 256) o
+// 2^40 + largo * 65536 + distancia.
+funcion md_bloque_dinamico(w, tok, nt, final, tb) {
+    sea flit = mem_reservar(288 * 8)
+    sea fdist = mem_reservar(30 * 8)
+    mem_llenar(flit, 0, 288 * 8)
+    mem_llenar(fdist, 0, 30 * 8)
+    sea i = 0
+    mientras (i < nt) {
+        sea t = __cargar64(tok + i * 8)
+        si (t < 256) { __guardar64(flit + t * 8, __cargar64(flit + t * 8) + 1) } sino {
+            sea li = 257 + md_simbolo_largo(__y_bits(__desplazar_der(t, 16), 65535), tb)
+            __guardar64(flit + li * 8, __cargar64(flit + li * 8) + 1)
+            sea dj = md_simbolo_distancia(__y_bits(t, 65535), tb)
+            __guardar64(fdist + dj * 8, __cargar64(fdist + dj * 8) + 1)
+        }
+        i = i + 1
+    }
+    __guardar64(flit + 256 * 8, 1)
+    sea hay_dist = 0
+    i = 0
+    mientras (i < 30) {
+        si (__cargar64(fdist + i * 8) > 0) { hay_dist = 1 }
+        i = i + 1
+    }
+    si (hay_dist == 0) { __guardar64(fdist, 1) }
+    sea llit = mem_reservar(288 * 8)
+    sea ldist = mem_reservar(30 * 8)
+    md_huff_longitudes(flit, 288, 15, llit)
+    md_huff_longitudes(fdist, 30, 15, ldist)
+    sea hlit = 286
+    mientras (hlit > 257 y __cargar64(llit + (hlit - 1) * 8) == 0) { hlit = hlit - 1 }
+    sea hdist = 30
+    mientras (hdist > 1 y __cargar64(ldist + (hdist - 1) * 8) == 0) { hdist = hdist - 1 }
+    // Longitudes concatenadas y codificadas con 16/17/18.
+    sea total = hlit + hdist
+    sea todas = mem_reservar(total * 8)
+    mem_copiar(todas, llit, hlit * 8)
+    mem_copiar(todas + hlit * 8, ldist, hdist * 8)
+    sea rs = mem_reservar(total * 16 + 16)
+    sea nr = 0
+    sea fcl = mem_reservar(19 * 8)
+    mem_llenar(fcl, 0, 19 * 8)
+    i = 0
+    mientras (i < total) {
+        sea v = __cargar64(todas + i * 8)
+        sea run = 1
+        mientras (i + run < total y __cargar64(todas + (i + run) * 8) == v) { run = run + 1 }
+        sea usado = 1
+        sea sim = v
+        sea extra = 0
+        si (v == 0 y run >= 3) {
+            si (run >= 11) {
+                usado = run
+                si (usado > 138) { usado = 138 }
+                sim = 18
+                extra = usado - 11
+            } sino {
+                usado = run
+                sim = 17
+                extra = usado - 3
+            }
+        } sino {
+            si (v != 0 y i > 0 y __cargar64(todas + (i - 1) * 8) == v y run >= 3) {
+                usado = run
+                si (usado > 6) { usado = 6 }
+                sim = 16
+                extra = usado - 3
+            }
+        }
+        __guardar64(rs + nr * 16, sim)
+        __guardar64(rs + nr * 16 + 8, extra)
+        nr = nr + 1
+        __guardar64(fcl + sim * 8, __cargar64(fcl + sim * 8) + 1)
+        i = i + usado
+    }
+    sea lcl = mem_reservar(19 * 8)
+    md_huff_longitudes(fcl, 19, 7, lcl)
+    sea orden = "qrsaihjgkflemdncobp"
+    sea hclen = 19
+    mientras (hclen > 4 y __cargar64(lcl + (str_byte(orden, hclen - 1) - 97) * 8) == 0) { hclen = hclen - 1 }
+    md_poner(w, final, 1)
+    md_poner(w, 2, 2)
+    md_poner(w, hlit - 257, 5)
+    md_poner(w, hdist - 1, 5)
+    md_poner(w, hclen - 4, 4)
+    i = 0
+    mientras (i < hclen) {
+        md_poner(w, __cargar64(lcl + (str_byte(orden, i) - 97) * 8), 3)
+        i = i + 1
+    }
+    sea ccl = md_codigos(lcl, 19)
+    i = 0
+    mientras (i < nr) {
+        sea sim = __cargar64(rs + i * 16)
+        md_poner_codigo(w, __cargar64(ccl + sim * 8), __cargar64(lcl + sim * 8))
+        si (sim == 16) { md_poner(w, __cargar64(rs + i * 16 + 8), 2) }
+        si (sim == 17) { md_poner(w, __cargar64(rs + i * 16 + 8), 3) }
+        si (sim == 18) { md_poner(w, __cargar64(rs + i * 16 + 8), 7) }
+        i = i + 1
+    }
+    sea clit = md_codigos(llit, 288)
+    sea cdist = md_codigos(ldist, 30)
+    i = 0
+    mientras (i < nt) {
+        sea t = __cargar64(tok + i * 8)
+        si (t < 256) { md_poner_codigo(w, __cargar64(clit + t * 8), __cargar64(llit + t * 8)) } sino {
+            sea largo = __y_bits(__desplazar_der(t, 16), 65535)
+            sea d = __y_bits(t, 65535)
+            sea li = md_simbolo_largo(largo, tb)
+            md_poner_codigo(w, __cargar64(clit + (257 + li) * 8), __cargar64(llit + (257 + li) * 8))
+            md_poner(w, largo - __cargar64(tb + li * 8), __cargar64(tb + (29 + li) * 8))
+            sea dj = md_simbolo_distancia(d, tb)
+            md_poner_codigo(w, __cargar64(cdist + dj * 8), __cargar64(ldist + dj * 8))
+            md_poner(w, d - __cargar64(tb + (58 + dj) * 8), __cargar64(tb + (88 + dj) * 8))
+        }
+        i = i + 1
+    }
+    md_poner_codigo(w, __cargar64(clit + 2048), __cargar64(llit + 2048))
+    mem_liberar(flit)
+    mem_liberar(fdist)
+    mem_liberar(llit)
+    mem_liberar(ldist)
+    mem_liberar(todas)
+    mem_liberar(rs)
+    mem_liberar(fcl)
+    mem_liberar(lcl)
+    mem_liberar(ccl)
+    mem_liberar(clit)
+    mem_liberar(cdist)
+    retornar 0
+}
+
+funcion md_deflar(p, n, salida, nivel) {
+    sea tb = md_tablas_deflate()
+    sea w = mem_reservar(24)
+    __guardar64(w, salida)
+    __guardar64(w + 8, 0)
+    __guardar64(w + 16, 0)
+    si (nivel == 0) {
+        // Bloques guardados (sin comprimir).
+        sea pos = 0
+        sea hecho = 0
+        mientras (hecho == 0) {
+            sea largo = n - pos
+            si (largo > 65535) { largo = 65535 }
+            sea ultimo = 0
+            si (pos + largo >= n) { ultimo = 1 }
+            md_poner(w, ultimo, 1)
+            md_poner(w, 0, 2)
+            si (__cargar64(w + 16) > 0) { md_poner(w, 0, 8 - __cargar64(w + 16)) }
+            str_agregar_byte(salida, __y_bits(largo, 255))
+            str_agregar_byte(salida, __desplazar_der(largo, 8))
+            str_agregar_byte(salida, __y_bits(__xo_bits(largo, 65535), 255))
+            str_agregar_byte(salida, __desplazar_der(__xo_bits(largo, 65535), 8))
+            sea k = 0
+            mientras (k < largo) {
+                str_agregar_byte(salida, __cargar8(p + pos + k))
+                k = k + 1
+            }
+            pos = pos + largo
+            si (ultimo == 1) { hecho = 1 }
+        }
+        mem_liberar(w)
+        retornar 0
+    }
+    sea cadena = 8
+    si (nivel >= 6) { cadena = 32 }
+    si (nivel >= 9) { cadena = 256 }
+    sea cabeza = mem_reservar(32768 * 8)
+    sea previo = mem_reservar(32768 * 8)
+    sea k = 0
+    mientras (k < 32768) {
+        __guardar64(cabeza + k * 8, 0 - 1)
+        k = k + 1
+    }
+    sea tmax = 65536
+    sea tok = mem_reservar(tmax * 8)
+    sea nt = 0
+    sea i = 0
+    mientras (i < n) {
+        sea mejor = 0
+        sea mejor_d = 0
+        si (i + 2 < n) {
+            sea h = __y_bits(__xo_bits(__xo_bits(__desplazar_izq(__cargar8(p + i), 10), __desplazar_izq(__cargar8(p + i + 1), 5)), __cargar8(p + i + 2)), 32767)
+            sea c = __cargar64(cabeza + h * 8)
+            sea intentos = cadena
+            sea maximo = n - i
+            si (maximo > 258) { maximo = 258 }
+            mientras (c >= 0 y i - c <= 32768 y intentos > 0) {
+                si (__cargar8(p + c + mejor) == __cargar8(p + i + mejor)) {
+                    sea l = 0
+                    mientras (l < maximo y __cargar8(p + c + l) == __cargar8(p + i + l)) { l = l + 1 }
+                    si (l > mejor) {
+                        mejor = l
+                        mejor_d = i - c
+                    }
+                    si (l >= maximo) { intentos = 1 }
+                }
+                sea siguiente = __cargar64(previo + __y_bits(c, 32767) * 8)
+                si (siguiente >= c) { siguiente = 0 - 1 }
+                c = siguiente
+                intentos = intentos - 1
+            }
+            __guardar64(previo + __y_bits(i, 32767) * 8, __cargar64(cabeza + h * 8))
+            __guardar64(cabeza + h * 8, i)
+        }
+        si (nt >= tmax) {
+            md_bloque_dinamico(w, tok, nt, 0, tb)
+            nt = 0
+        }
+        si (mejor >= 3) {
+            __guardar64(tok + nt * 8, 1099511627776 + mejor * 65536 + mejor_d)
+            nt = nt + 1
+            // Registrar en el hash las posiciones saltadas.
+            sea j = i + 1
+            sea fin = i + mejor
+            mientras (j < fin) {
+                si (j + 2 < n) {
+                    sea h2 = __y_bits(__xo_bits(__xo_bits(__desplazar_izq(__cargar8(p + j), 10), __desplazar_izq(__cargar8(p + j + 1), 5)), __cargar8(p + j + 2)), 32767)
+                    __guardar64(previo + __y_bits(j, 32767) * 8, __cargar64(cabeza + h2 * 8))
+                    __guardar64(cabeza + h2 * 8, j)
+                }
+                j = j + 1
+            }
+            i = fin
+        } sino {
+            __guardar64(tok + nt * 8, __cargar8(p + i))
+            nt = nt + 1
+            i = i + 1
+        }
+    }
+    md_bloque_dinamico(w, tok, nt, 1, tb)
+    mem_liberar(tok)
+    si (__cargar64(w + 16) > 0) { md_poner(w, 0, 8 - __cargar64(w + 16)) }
+    mem_liberar(cabeza)
+    mem_liberar(previo)
+    mem_liberar(w)
+    retornar 0
+}
+
+funcion md_zlib_deflar(p, n, salida, nivel) {
+    str_agregar_byte(salida, 120)
+    str_agregar_byte(salida, 156)
+    md_deflar(p, n, salida, nivel)
+    md_agregar_be32(salida, md_adler(p, n))
+    retornar 0
+}
+
+funcion md_nivel(nivel) {
+    si (nivel == 0) { retornar 6 }
+    sea n = md_ent(nivel)
+    si (n < 0 o n > 9) { dyn_error("comprimir: el nivel va de 0 a 9") }
+    retornar n
+}
+
+funcion deflar(datos, nivel) {
+    sea s = dyn_a_str(datos)
+    sea r = str_nuevo(str_largo(s) / 2 + 64)
+    md_deflar(str_datos(s), str_largo(s), r, md_nivel(nivel))
+    retornar dyn_texto(r)
+}
+
+funcion zlib_comprimir(datos, nivel) {
+    sea s = dyn_a_str(datos)
+    sea r = str_nuevo(str_largo(s) / 2 + 64)
+    md_zlib_deflar(str_datos(s), str_largo(s), r, md_nivel(nivel))
+    retornar dyn_texto(r)
+}
+
+funcion gzip_comprimir(datos, nivel) {
+    sea s = dyn_a_str(datos)
+    sea r = str_nuevo(str_largo(s) / 2 + 64)
+    md_agregar_bytes(r, "31,139,8,0,0,0,0,0,0,255")
+    md_deflar(str_datos(s), str_largo(s), r, md_nivel(nivel))
+    sea c = md_crc(0, str_datos(s), str_largo(s))
+    sea n = str_largo(s)
+    sea i = 0
+    mientras (i < 4) {
+        str_agregar_byte(r, __y_bits(__desplazar_der(c, i * 8), 255))
+        i = i + 1
+    }
+    i = 0
+    mientras (i < 4) {
+        str_agregar_byte(r, __y_bits(__desplazar_der(n, i * 8), 255))
+        i = i + 1
+    }
+    retornar dyn_texto(r)
+}
+
+// ── PNG ────────────────────────────────────────────────────────────────────
+
+funcion md_paeth(a, b, c) {
+    sea p = a + b - c
+    sea pa = p - a
+    si (pa < 0) { pa = 0 - pa }
+    sea pb = p - b
+    si (pb < 0) { pb = 0 - pb }
+    sea pc = p - c
+    si (pc < 0) { pc = 0 - pc }
+    si (pa <= pb y pa <= pc) { retornar a }
+    si (pb <= pc) { retornar b }
+    retornar c
+}
+
+// Quita el filtro de una fila (cur y prev tienen `ancho` bytes).
+funcion md_desfiltrar(tipo, cur, prev, ancho, bpp) {
+    sea i = 0
+    si (tipo == 0) { retornar 0 }
+    si (tipo == 1) {
+        i = bpp
+        mientras (i < ancho) {
+            __guardar8(cur + i, __y_bits(__cargar8(cur + i) + __cargar8(cur + i - bpp), 255))
+            i = i + 1
+        }
+        retornar 0
+    }
+    si (tipo == 2) {
+        mientras (i < ancho) {
+            __guardar8(cur + i, __y_bits(__cargar8(cur + i) + __cargar8(prev + i), 255))
+            i = i + 1
+        }
+        retornar 0
+    }
+    si (tipo == 3) {
+        mientras (i < ancho) {
+            sea a = 0
+            si (i >= bpp) { a = __cargar8(cur + i - bpp) }
+            __guardar8(cur + i, __y_bits(__cargar8(cur + i) + (a + __cargar8(prev + i)) / 2, 255))
+            i = i + 1
+        }
+        retornar 0
+    }
+    si (tipo == 4) {
+        mientras (i < ancho) {
+            sea a = 0
+            sea c = 0
+            si (i >= bpp) {
+                a = __cargar8(cur + i - bpp)
+                c = __cargar8(prev + i - bpp)
+            }
+            __guardar8(cur + i, __y_bits(__cargar8(cur + i) + md_paeth(a, __cargar8(prev + i), c), 255))
+            i = i + 1
+        }
+        retornar 0
+    }
+    dyn_error("png: filtro de fila inválido")
+    retornar 0
+}
+
+// Muestra k (0..) de una fila con la profundidad dada.
+funcion md_muestra(fila, k, prof) {
+    si (prof == 8) { retornar __cargar8(fila + k) }
+    si (prof == 16) { retornar md_be16(fila + k * 2) }
+    sea bit = k * prof
+    sea b = __cargar8(fila + bit / 8)
+    retornar __y_bits(__desplazar_der(b, 8 - prof - bit % 8), __desplazar_izq(1, prof) - 1)
+}
+
+funcion md_a8(v, prof) {
+    si (prof == 8) { retornar v }
+    si (prof == 16) { retornar __desplazar_der(v * 255 + 32895, 16) }
+    retornar v * 255 / (__desplazar_izq(1, prof) - 1)
+}
+
+// info: [ancho][alto][prof][tipo][paleta ptr][trns tipo][trns r][trns g][trns b]
+funcion md_png_fila(info, fila, pw, salida, ancho_img, fy, x0, dx) {
+    sea prof = __cargar64(info + 16)
+    sea tipo = __cargar64(info + 24)
+    sea pal = __cargar64(info + 32)
+    sea tt = __cargar64(info + 40)
+    sea i = 0
+    mientras (i < pw) {
+        sea r = 0
+        sea g = 0
+        sea b = 0
+        sea a = 255
+        si (tipo == 0) {
+            sea v = md_muestra(fila, i, prof)
+            r = md_a8(v, prof)
+            g = r
+            b = r
+            si (tt == 1 y v == __cargar64(info + 48)) { a = 0 }
+        }
+        si (tipo == 2) {
+            sea vr = md_muestra(fila, i * 3, prof)
+            sea vg = md_muestra(fila, i * 3 + 1, prof)
+            sea vb = md_muestra(fila, i * 3 + 2, prof)
+            r = md_a8(vr, prof)
+            g = md_a8(vg, prof)
+            b = md_a8(vb, prof)
+            si (tt == 1 y vr == __cargar64(info + 48) y vg == __cargar64(info + 56) y vb == __cargar64(info + 64)) { a = 0 }
+        }
+        si (tipo == 3) {
+            sea ix = md_muestra(fila, i, prof)
+            si (ix >= __cargar64(info + 72)) { dyn_error("png: índice fuera de la paleta") }
+            r = __cargar8(pal + ix * 4)
+            g = __cargar8(pal + ix * 4 + 1)
+            b = __cargar8(pal + ix * 4 + 2)
+            a = __cargar8(pal + ix * 4 + 3)
+        }
+        si (tipo == 4) {
+            r = md_a8(md_muestra(fila, i * 2, prof), prof)
+            g = r
+            b = r
+            a = md_a8(md_muestra(fila, i * 2 + 1, prof), prof)
+        }
+        si (tipo == 6) {
+            r = md_a8(md_muestra(fila, i * 4, prof), prof)
+            g = md_a8(md_muestra(fila, i * 4 + 1, prof), prof)
+            b = md_a8(md_muestra(fila, i * 4 + 2, prof), prof)
+            a = md_a8(md_muestra(fila, i * 4 + 3, prof), prof)
+        }
+        sea q = salida + (fy * ancho_img + x0 + i * dx) * 4
+        __guardar8(q, r)
+        __guardar8(q + 1, g)
+        __guardar8(q + 2, b)
+        __guardar8(q + 3, a)
+        i = i + 1
+    }
+    retornar 0
+}
+
+funcion png_decodificar(datos) {
+    sea s = dyn_a_str(datos)
+    sea p = str_datos(s)
+    sea n = str_largo(s)
+    si (n < 33 o md_be32(p) != 2303741511 o md_be32(p + 4) != 218765834) { dyn_error("png: firma inválida") }
+    sea info = mem_reservar(80)
+    mem_llenar(info, 0, 80)
+    sea pal = mem_reservar(1024)
+    mem_llenar(pal, 255, 1024)
+    __guardar64(info + 32, pal)
+    sea idat = str_nuevo(n)
+    sea pos = 8
+    sea visto_ihdr = 0
+    sea fin = 0
+    sea entrelazado = 0
+    mientras (fin == 0) {
+        si (pos + 12 > n) { dyn_error("png: archivo truncado") }
+        sea largo = md_be32(p + pos)
+        sea tipo = md_be32(p + pos + 4)
+        si (pos + 12 + largo > n) { dyn_error("png: bloque truncado") }
+        sea d = p + pos + 8
+        si (md_crc(0, p + pos + 4, largo + 4) != md_be32(d + largo)) { dyn_error("png: CRC inválido") }
+        si (tipo == 1229472850) {
+            // IHDR
+            __guardar64(info, md_be32(d))
+            __guardar64(info + 8, md_be32(d + 4))
+            __guardar64(info + 16, __cargar8(d + 8))
+            __guardar64(info + 24, __cargar8(d + 9))
+            entrelazado = __cargar8(d + 12)
+            visto_ihdr = 1
+        }
+        si (tipo == 1347179589) {
+            // PLTE
+            sea k = 0
+            mientras (k < largo / 3 y k < 256) {
+                __guardar8(pal + k * 4, __cargar8(d + k * 3))
+                __guardar8(pal + k * 4 + 1, __cargar8(d + k * 3 + 1))
+                __guardar8(pal + k * 4 + 2, __cargar8(d + k * 3 + 2))
+                k = k + 1
+            }
+            __guardar64(info + 72, k)
+        }
+        si (tipo == 1951551059) {
+            // tRNS
+            sea ct = __cargar64(info + 24)
+            si (ct == 3) {
+                sea k = 0
+                mientras (k < largo y k < 256) {
+                    __guardar8(pal + k * 4 + 3, __cargar8(d + k))
+                    k = k + 1
+                }
+            }
+            si (ct == 0 y largo >= 2) {
+                __guardar64(info + 40, 1)
+                __guardar64(info + 48, md_be16(d))
+            }
+            si (ct == 2 y largo >= 6) {
+                __guardar64(info + 40, 1)
+                __guardar64(info + 48, md_be16(d))
+                __guardar64(info + 56, md_be16(d + 2))
+                __guardar64(info + 64, md_be16(d + 4))
+            }
+        }
+        si (tipo == 1229209940) { str_agregar(idat, str_rebanar(s, pos + 8, pos + 8 + largo)) }
+        si (tipo == 1229278788) { fin = 1 }
+        pos = pos + 12 + largo
+    }
+    si (visto_ihdr == 0) { dyn_error("png: falta IHDR") }
+    sea ancho = __cargar64(info)
+    sea alto = __cargar64(info + 8)
+    sea prof = __cargar64(info + 16)
+    sea ct = __cargar64(info + 24)
+    si (ancho == 0 o alto == 0 o ancho > 65535 o alto > 65535) { dyn_error("png: dimensiones inválidas") }
+    sea canales = 0
+    si (ct == 0 o ct == 3) { canales = 1 }
+    si (ct == 2) { canales = 3 }
+    si (ct == 4) { canales = 2 }
+    si (ct == 6) { canales = 4 }
+    si (canales == 0) { dyn_error("png: tipo de color inválido") }
+    si (prof != 1 y prof != 2 y prof != 4 y prof != 8 y prof != 16) { dyn_error("png: profundidad inválida") }
+    si (ct == 3 y __cargar64(info + 72) == 0) { dyn_error("png: falta la paleta") }
+    sea bits_px = canales * prof
+    sea bpp = bits_px / 8
+    si (bpp < 1) { bpp = 1 }
+    sea crudo = str_nuevo(alto * (ancho * bits_px / 8 + 2) + 64)
+    md_zlib_inflar(str_datos(idat), str_largo(idat), crudo)
+    sea salida = md_buffer(ancho * alto * 4)
+    sea sp = str_datos(salida)
+    sea cp = str_datos(crudo)
+    sea total = str_largo(crudo)
+    sea ancho_fila_max = (ancho * bits_px + 7) / 8
+    sea prev = mem_reservar(ancho_fila_max + 8)
+    sea off = 0
+    sea pase = 0
+    sea pases = 1
+    si (entrelazado == 1) { pases = 7 }
+    // Adam7: inicio x, inicio y, paso x, paso y.
+    sea a7 = "aeacabaaaeacabiieeccbiiieecc"
+    mientras (pase < pases) {
+        sea x0 = 0
+        sea y0 = 0
+        sea dx = 1
+        sea dy = 1
+        si (entrelazado == 1) {
+            x0 = str_byte(a7, pase) - 97
+            y0 = str_byte(a7, 7 + pase) - 97
+            dx = str_byte(a7, 14 + pase) - 97
+            dy = str_byte(a7, 21 + pase) - 97
+        }
+        sea pw = 0
+        si (ancho > x0) { pw = (ancho - x0 + dx - 1) / dx }
+        sea ph = 0
+        si (alto > y0) { ph = (alto - y0 + dy - 1) / dy }
+        si (pw > 0 y ph > 0) {
+            sea fila_bytes = (pw * bits_px + 7) / 8
+            mem_llenar(prev, 0, fila_bytes)
+            sea yy = 0
+            mientras (yy < ph) {
+                si (off + 1 + fila_bytes > total) { dyn_error("png: datos de imagen incompletos") }
+                sea cur = cp + off + 1
+                md_desfiltrar(__cargar8(cp + off), cur, prev, fila_bytes, bpp)
+                md_png_fila(info, cur, pw, sp, ancho, y0 + yy * dy, x0, dx)
+                mem_copiar(prev, cur, fila_bytes)
+                off = off + 1 + fila_bytes
+                yy = yy + 1
+            }
+        }
+        pase = pase + 1
+    }
+    mem_liberar(prev)
+    mem_liberar(info)
+    mem_liberar(pal)
+    retornar md_lista3(dyn_entero(ancho), dyn_entero(alto), dyn_texto(salida))
+}
+
+funcion md_png_bloque(s, tipo, datos) {
+    md_agregar_be32(s, str_largo(datos))
+    sea inicio = str_largo(s)
+    str_agregar(s, tipo)
+    str_agregar(s, datos)
+    md_agregar_be32(s, md_crc(0, str_datos(s) + inicio, str_largo(datos) + 4))
+    retornar 0
+}
+
+// Codifica RGBA (o RGB si todo es opaco) con filtro adaptativo por fila.
+funcion png_codificar(pixeles, ancho, alto, nivel) {
+    sea px = dyn_a_str(pixeles)
+    sea w = md_ent(ancho)
+    sea h = md_ent(alto)
+    si (w <= 0 o h <= 0 o str_largo(px) < w * h * 4) { dyn_error("png_codificar: dimensiones y píxeles no coinciden") }
+    sea p = str_datos(px)
+    sea opaco = 1
+    sea i = 0
+    mientras (i < w * h y opaco == 1) {
+        si (__cargar8(p + i * 4 + 3) != 255) { opaco = 0 }
+        i = i + 1
+    }
+    sea canales = 4
+    si (opaco == 1) { canales = 3 }
+    sea fila = w * canales
+    sea crudo = md_buffer(h * (fila + 1))
+    sea cp = str_datos(crudo)
+    sea actual = mem_reservar(fila + 8)
+    sea previa = mem_reservar(fila + 8)
+    sea prueba = mem_reservar(fila + 8)
+    mem_llenar(previa, 0, fila)
+    sea yy = 0
+    mientras (yy < h) {
+        sea x = 0
+        mientras (x < w) {
+            sea c = 0
+            mientras (c < canales) {
+                __guardar8(actual + x * canales + c, __cargar8(p + (yy * w + x) * 4 + c))
+                c = c + 1
+            }
+            x = x + 1
+        }
+        // Elegir el filtro con menor suma de valores absolutos (con signo).
+        sea mejor = 0
+        sea mejor_suma = 0 - 1
+        sea f = 0
+        mientras (f < 5) {
+            sea suma = 0
+            sea k = 0
+            mientras (k < fila) {
+                sea a = 0
+                sea c = 0
+                si (k >= canales) {
+                    a = __cargar8(actual + k - canales)
+                    c = __cargar8(previa + k - canales)
+                }
+                sea b = __cargar8(previa + k)
+                sea v = __cargar8(actual + k)
+                si (f == 1) { v = v - a }
+                si (f == 2) { v = v - b }
+                si (f == 3) { v = v - (a + b) / 2 }
+                si (f == 4) { v = v - md_paeth(a, b, c) }
+                v = __y_bits(v, 255)
+                __guardar8(prueba + k, v)
+                si (v < 128) { suma = suma + v } sino { suma = suma + 256 - v }
+                k = k + 1
+            }
+            si (mejor_suma < 0 o suma < mejor_suma) {
+                mejor_suma = suma
+                mejor = f
+                mem_copiar(cp + yy * (fila + 1) + 1, prueba, fila)
+            }
+            f = f + 1
+        }
+        __guardar8(cp + yy * (fila + 1), mejor)
+        mem_copiar(previa, actual, fila)
+        yy = yy + 1
+    }
+    mem_liberar(actual)
+    mem_liberar(previa)
+    mem_liberar(prueba)
+    sea z = str_nuevo(str_largo(crudo) / 2 + 64)
+    md_zlib_deflar(cp, str_largo(crudo), z, md_nivel(nivel))
+    sea s = str_nuevo(str_largo(z) + 128)
+    md_agregar_bytes(s, "137,80,78,71,13,10,26,10")
+    sea ihdr = str_nuevo(13)
+    md_agregar_be32(ihdr, w)
+    md_agregar_be32(ihdr, h)
+    str_agregar_byte(ihdr, 8)
+    si (opaco == 1) { str_agregar_byte(ihdr, 2) } sino { str_agregar_byte(ihdr, 6) }
+    str_agregar_byte(ihdr, 0)
+    str_agregar_byte(ihdr, 0)
+    str_agregar_byte(ihdr, 0)
+    md_png_bloque(s, "IHDR", ihdr)
+    md_png_bloque(s, "IDAT", z)
+    md_png_bloque(s, "IEND", "")
+    retornar dyn_texto(s)
+}
+
+// ── BMP (8, 24 y 32 bits sin compresión) ───────────────────────────────────
+
+funcion bmp_decodificar(datos) {
+    sea s = dyn_a_str(datos)
+    sea p = str_datos(s)
+    sea n = str_largo(s)
+    si (n < 54 o __cargar8(p) != 66 o __cargar8(p + 1) != 77) { dyn_error("bmp: firma inválida") }
+    sea off = md_le32(p + 10)
+    sea cab = md_le32(p + 14)
+    sea w = md_le32(p + 18)
+    sea h = md_le32(p + 22)
+    si (h > 2147483647) { h = h - 4294967296 }
+    sea abajo_arriba = 1
+    si (h < 0) {
+        h = 0 - h
+        abajo_arriba = 0
+    }
+    sea bits = md_le16(p + 28)
+    sea comp = md_le32(p + 30)
+    si (comp != 0 y comp != 3) { dyn_error("bmp: compresión no soportada") }
+    si (bits != 8 y bits != 24 y bits != 32) { dyn_error("bmp: solo 8, 24 y 32 bits") }
+    sea fila = __y_bits(w * bits / 8 + 3, 0 - 4)
+    si (off + fila * h > n) { dyn_error("bmp: datos truncados") }
+    sea paleta = p + 14 + cab
+    sea salida = md_buffer(w * h * 4)
+    sea q = str_datos(salida)
+    sea yy = 0
+    mientras (yy < h) {
+        sea fy = yy
+        si (abajo_arriba == 1) { fy = h - 1 - yy }
+        sea r = p + off + fy * fila
+        sea x = 0
+        mientras (x < w) {
+            sea po = q + (yy * w + x) * 4
+            si (bits == 8) {
+                sea ix = __cargar8(r + x)
+                __guardar8(po, __cargar8(paleta + ix * 4 + 2))
+                __guardar8(po + 1, __cargar8(paleta + ix * 4 + 1))
+                __guardar8(po + 2, __cargar8(paleta + ix * 4))
+                __guardar8(po + 3, 255)
+            } sino {
+                sea b = bits / 8
+                __guardar8(po, __cargar8(r + x * b + 2))
+                __guardar8(po + 1, __cargar8(r + x * b + 1))
+                __guardar8(po + 2, __cargar8(r + x * b))
+                si (b == 4) { __guardar8(po + 3, __cargar8(r + x * b + 3)) } sino { __guardar8(po + 3, 255) }
+            }
+            x = x + 1
+        }
+        yy = yy + 1
+    }
+    retornar md_lista3(dyn_entero(w), dyn_entero(h), dyn_texto(salida))
+}
+
+// ── JPEG (baseline y progresivo, Huffman) ──────────────────────────────────
+
+funcion md_zigzag() {
+    sea t = mem_global(43)
+    si (t != 0) { retornar t }
+    t = mem_reservar(64 * 8)
+    sea k = 0
+    sea s = 0
+    mientras (s < 15) {
+        sea lo = 0
+        si (s > 7) { lo = s - 7 }
+        sea hi = s
+        si (hi > 7) { hi = 7 }
+        si (s % 2 == 0) {
+            sea f = hi
+            mientras (f >= lo) {
+                __guardar64(t + k * 8, f * 8 + s - f)
+                k = k + 1
+                f = f - 1
+            }
+        } sino {
+            sea f = lo
+            mientras (f <= hi) {
+                __guardar64(t + k * 8, f * 8 + s - f)
+                k = k + 1
+                f = f + 1
+            }
+        }
+        s = s + 1
+    }
+    mem_fijar_global(43, t)
+    retornar t
+}
+
+// Tabla: [maxcode 17][mincode 17][valptr 17][vals 256][rápida 512] = 6552 B.
+funcion md_jh_construir(h, conteos, vals) {
+    sea k = 0
+    sea codigo = 0
+    sea rapida = h + 2456
+    mem_llenar(rapida, 0, 4096)
+    sea i = 0
+    mientras (i < 256) {
+        __guardar64(h + 408 + i * 8, __cargar8(vals + i))
+        i = i + 1
+    }
+    sea l = 1
+    mientras (l <= 16) {
+        sea c = __cargar8(conteos + l - 1)
+        __guardar64(h + 272 + l * 8, k)
+        __guardar64(h + 136 + l * 8, codigo)
+        sea j = 0
+        mientras (j < c) {
+            si (l <= 9) {
+                sea entrada = __desplazar_izq(__cargar8(vals + k), 4) + l
+                sea base = __desplazar_izq(codigo, 9 - l)
+                sea m = 0
+                mientras (m < __desplazar_izq(1, 9 - l)) {
+                    __guardar64(rapida + (base + m) * 8, entrada)
+                    m = m + 1
+                }
+            }
+            codigo = codigo + 1
+            k = k + 1
+            j = j + 1
+        }
+        si (c > 0) { __guardar64(h + l * 8, codigo - 1) } sino { __guardar64(h + l * 8, 0 - 1) }
+        codigo = __desplazar_izq(codigo, 1)
+        l = l + 1
+    }
+    retornar 0
+}
+
+// Lector de bits: [p][n][pos][buf][cnt][marcador]
+funcion md_jl_llenar(r) {
+    sea buf = __cargar64(r + 24)
+    sea cnt = __cargar64(r + 32)
+    sea pos = __cargar64(r + 16)
+    sea n = __cargar64(r + 8)
+    sea p = __cargar64(r)
+    mientras (cnt <= 48) {
+        sea b = 0
+        si (__cargar64(r + 40) == 0 y pos < n) {
+            b = __cargar8(p + pos)
+            si (b == 255) {
+                sea sig = 0
+                si (pos + 1 < n) { sig = __cargar8(p + pos + 1) }
+                si (sig == 0) { pos = pos + 2 } sino {
+                    __guardar64(r + 40, sig)
+                    b = 0
+                }
+            } sino { pos = pos + 1 }
+        }
+        buf = __o_bits(__desplazar_izq(buf, 8), b)
+        cnt = cnt + 8
+    }
+    __guardar64(r + 24, buf)
+    __guardar64(r + 32, cnt)
+    __guardar64(r + 16, pos)
+    retornar 0
+}
+
+funcion md_jl_bits(r, n) {
+    si (n == 0) { retornar 0 }
+    si (__cargar64(r + 32) < n) { md_jl_llenar(r) }
+    sea cnt = __cargar64(r + 32) - n
+    sea buf = __cargar64(r + 24)
+    sea v = __y_bits(__desplazar_der(buf, cnt), __desplazar_izq(1, n) - 1)
+    __guardar64(r + 24, __y_bits(buf, __desplazar_izq(1, cnt) - 1))
+    __guardar64(r + 32, cnt)
+    retornar v
+}
+
+funcion md_jl_dec(r, h) {
+    si (__cargar64(r + 32) < 16) { md_jl_llenar(r) }
+    sea cnt = __cargar64(r + 32)
+    sea buf = __cargar64(r + 24)
+    sea e = __cargar64(h + 2456 + __y_bits(__desplazar_der(buf, cnt - 9), 511) * 8)
+    si (e != 0) {
+        sea l = __y_bits(e, 15)
+        __guardar64(r + 32, cnt - l)
+        __guardar64(r + 24, __y_bits(buf, __desplazar_izq(1, cnt - l) - 1))
+        retornar __desplazar_der(e, 4)
+    }
+    sea l = 10
+    mientras (l <= 16) {
+        sea codigo = __desplazar_der(buf, cnt - l)
+        si (codigo <= __cargar64(h + l * 8)) {
+            __guardar64(r + 32, cnt - l)
+            __guardar64(r + 24, __y_bits(buf, __desplazar_izq(1, cnt - l) - 1))
+            retornar __cargar64(h + 408 + (__cargar64(h + 272 + l * 8) + codigo - __cargar64(h + 136 + l * 8)) * 8)
+        }
+        l = l + 1
+    }
+    dyn_error("jpeg: código Huffman inválido")
+    retornar 0
+}
+
+funcion md_extender(v, s) {
+    si (s == 0) { retornar 0 }
+    si (v < __desplazar_izq(1, s - 1)) { retornar v - __desplazar_izq(1, s) + 1 }
+    retornar v
+}
+
+funcion md_c16(p) {
+    sea v = __o_bits(__cargar8(p), __desplazar_izq(__cargar8(p + 1), 8))
+    si (v >= 32768) { retornar v - 65536 }
+    retornar v
+}
+
+funcion md_g16(p, v) {
+    __guardar8(p, __y_bits(v, 255))
+    __guardar8(p + 1, __y_bits(__desplazar_der(v, 8), 255))
+    retornar 0
+}
+
+// Estado j: [eobrun][ss][se][ah][al][progresivo][tablas dc][tablas ac][zigzag]
+// Componente: [id][h][v][tq][bw][bh][coef][pred][td][ta][cw][ch][plano]
+funcion md_jpeg_bloque(r, j, comp, blk) {
+    sea zz = __cargar64(j + 64)
+    sea ss = __cargar64(j + 8)
+    sea se = __cargar64(j + 16)
+    sea ah = __cargar64(j + 24)
+    sea al = __cargar64(j + 32)
+    sea hdc = __cargar64(j + 48) + __cargar64(comp + 64) * 6552
+    sea hac = __cargar64(j + 56) + __cargar64(comp + 72) * 6552
+    si (__cargar64(j + 40) == 0) {
+        // Secuencial: DC y AC completos.
+        sea t = md_jl_dec(r, hdc)
+        sea pred = __cargar64(comp + 56) + md_extender(md_jl_bits(r, t), t)
+        __guardar64(comp + 56, pred)
+        md_g16(blk, pred)
+        sea k = 1
+        mientras (k < 64) {
+            sea rs = md_jl_dec(r, hac)
+            sea rr = __desplazar_der(rs, 4)
+            sea s = __y_bits(rs, 15)
+            si (s == 0) {
+                si (rr == 15) { k = k + 16 } sino { k = 64 }
+            } sino {
+                k = k + rr
+                si (k > 63) { dyn_error("jpeg: coeficiente fuera del bloque") }
+                md_g16(blk + __cargar64(zz + k * 8) * 2, md_extender(md_jl_bits(r, s), s))
+                k = k + 1
+            }
+        }
+        retornar 0
+    }
+    si (ss == 0) {
+        // DC progresivo.
+        si (ah == 0) {
+            sea t = md_jl_dec(r, hdc)
+            sea pred = __cargar64(comp + 56) + md_extender(md_jl_bits(r, t), t)
+            __guardar64(comp + 56, pred)
+            md_g16(blk, pred * __desplazar_izq(1, al))
+        } sino {
+            si (md_jl_bits(r, 1) == 1) { md_g16(blk, __o_bits(md_c16(blk), __desplazar_izq(1, al))) }
+        }
+        retornar 0
+    }
+    sea bit = __desplazar_izq(1, al)
+    si (ah == 0) {
+        // AC progresivo, primera pasada.
+        si (__cargar64(j) > 0) {
+            __guardar64(j, __cargar64(j) - 1)
+            retornar 0
+        }
+        sea k = ss
+        mientras (k <= se) {
+            sea rs = md_jl_dec(r, hac)
+            sea rr = __desplazar_der(rs, 4)
+            sea s = __y_bits(rs, 15)
+            si (s == 0) {
+                si (rr < 15) {
+                    sea eob = __desplazar_izq(1, rr) - 1
+                    si (rr > 0) { eob = eob + md_jl_bits(r, rr) }
+                    __guardar64(j, eob)
+                    k = 64
+                } sino { k = k + 16 }
+            } sino {
+                k = k + rr
+                si (k > 63) { dyn_error("jpeg: coeficiente fuera del bloque") }
+                md_g16(blk + __cargar64(zz + k * 8) * 2, md_extender(md_jl_bits(r, s), s) * bit)
+                k = k + 1
+            }
+        }
+        retornar 0
+    }
+    // AC progresivo, refinamiento.
+    si (__cargar64(j) > 0) {
+        __guardar64(j, __cargar64(j) - 1)
+        sea k = ss
+        mientras (k <= se) {
+            sea q = blk + __cargar64(zz + k * 8) * 2
+            sea c = md_c16(q)
+            si (c != 0) {
+                si (md_jl_bits(r, 1) == 1) {
+                    si (__y_bits(c, bit) == 0) {
+                        si (c > 0) { md_g16(q, c + bit) } sino { md_g16(q, c - bit) }
+                    }
+                }
+            }
+            k = k + 1
+        }
+        retornar 0
+    }
+    sea k = ss
+    mientras (k <= se) {
+        sea rs = md_jl_dec(r, hac)
+        sea s = __y_bits(rs, 15)
+        sea rr = __desplazar_der(rs, 4)
+        sea valor = 0
+        si (s == 0) {
+            si (rr < 15) {
+                sea eob = __desplazar_izq(1, rr) - 1
+                si (rr > 0) { eob = eob + md_jl_bits(r, rr) }
+                __guardar64(j, eob)
+                rr = 64
+            }
+        } sino {
+            si (md_jl_bits(r, 1) == 1) { valor = bit } sino { valor = 0 - bit }
+        }
+        sea sigue = 1
+        mientras (k <= se y sigue == 1) {
+            sea q = blk + __cargar64(zz + k * 8) * 2
+            k = k + 1
+            sea c = md_c16(q)
+            si (c != 0) {
+                si (md_jl_bits(r, 1) == 1) {
+                    si (__y_bits(c, bit) == 0) {
+                        si (c > 0) { md_g16(q, c + bit) } sino { md_g16(q, c - bit) }
+                    }
+                }
+            } sino {
+                si (rr == 0) {
+                    md_g16(q, valor)
+                    sigue = 0
+                } sino { rr = rr - 1 }
+            }
+        }
+    }
+    retornar 0
+}
+
+funcion md_reiniciar(r) {
+    sea p = __cargar64(r)
+    sea n = __cargar64(r + 8)
+    sea pos = __cargar64(r + 16)
+    sea m = __cargar64(r + 40)
+    si (m >= 208 y m <= 215) { pos = pos + 2 } sino {
+        // Buscar el marcador RSTn.
+        sea hecho = 0
+        mientras (hecho == 0 y pos + 1 < n) {
+            si (__cargar8(p + pos) == 255 y __cargar8(p + pos + 1) >= 208 y __cargar8(p + pos + 1) <= 215) {
+                pos = pos + 2
+                hecho = 1
+            } sino { pos = pos + 1 }
+        }
+    }
+    __guardar64(r + 16, pos)
+    __guardar64(r + 24, 0)
+    __guardar64(r + 32, 0)
+    __guardar64(r + 40, 0)
+    retornar 0
+}
+
+funcion md_idct_1d(v, a, paso, salida, sp, fase) {
+    // Mismo núcleo entero que stb_image (constantes escaladas por 4096).
+    sea s0 = __cargar64(v + a * 8)
+    sea s1 = __cargar64(v + (a + paso) * 8)
+    sea s2 = __cargar64(v + (a + paso * 2) * 8)
+    sea s3 = __cargar64(v + (a + paso * 3) * 8)
+    sea s4 = __cargar64(v + (a + paso * 4) * 8)
+    sea s5 = __cargar64(v + (a + paso * 5) * 8)
+    sea s6 = __cargar64(v + (a + paso * 6) * 8)
+    sea s7 = __cargar64(v + (a + paso * 7) * 8)
+    si (fase == 0 y s1 == 0 y s2 == 0 y s3 == 0 y s4 == 0 y s5 == 0 y s6 == 0 y s7 == 0) {
+        sea dc = s0 * 4
+        sea i = 0
+        mientras (i < 8) {
+            __guardar64(salida + (a + paso * i) * 8, dc)
+            i = i + 1
+        }
+        retornar 0
+    }
+    sea p2 = s2
+    sea p3 = s6
+    sea p1 = (p2 + p3) * 2217
+    sea t2 = p1 + p3 * (0 - 7567)
+    sea t3 = p1 + p2 * 3135
+    sea t0 = (s0 + s4) * 4096
+    sea t1 = (s0 - s4) * 4096
+    sea x0 = t0 + t3
+    sea x3 = t0 - t3
+    sea x1 = t1 + t2
+    sea x2 = t1 - t2
+    t0 = s7
+    t1 = s5
+    t2 = s3
+    t3 = s1
+    p3 = t0 + t2
+    sea p4 = t1 + t3
+    p1 = t0 + t3
+    p2 = t1 + t2
+    sea p5 = (p3 + p4) * 4816
+    t0 = t0 * 1223
+    t1 = t1 * 8410
+    t2 = t2 * 12586
+    t3 = t3 * 6149
+    p1 = p5 + p1 * (0 - 3685)
+    p2 = p5 + p2 * (0 - 10497)
+    p3 = p3 * (0 - 8034)
+    p4 = p4 * (0 - 1597)
+    t3 = t3 + p1 + p4
+    t2 = t2 + p2 + p3
+    t1 = t1 + p2 + p4
+    t0 = t0 + p1 + p3
+    si (fase == 0) {
+        x0 = x0 + 512
+        x1 = x1 + 512
+        x2 = x2 + 512
+        x3 = x3 + 512
+        __guardar64(salida + a * 8, __desplazar_aritmetico(x0 + t3, 10))
+        __guardar64(salida + (a + paso * 7) * 8, __desplazar_aritmetico(x0 - t3, 10))
+        __guardar64(salida + (a + paso) * 8, __desplazar_aritmetico(x1 + t2, 10))
+        __guardar64(salida + (a + paso * 6) * 8, __desplazar_aritmetico(x1 - t2, 10))
+        __guardar64(salida + (a + paso * 2) * 8, __desplazar_aritmetico(x2 + t1, 10))
+        __guardar64(salida + (a + paso * 5) * 8, __desplazar_aritmetico(x2 - t1, 10))
+        __guardar64(salida + (a + paso * 3) * 8, __desplazar_aritmetico(x3 + t0, 10))
+        __guardar64(salida + (a + paso * 4) * 8, __desplazar_aritmetico(x3 - t0, 10))
+        retornar 0
+    }
+    sea k = 65536 + 16777216
+    x0 = x0 + k
+    x1 = x1 + k
+    x2 = x2 + k
+    x3 = x3 + k
+    __guardar8(sp, md_acotar8(__desplazar_aritmetico(x0 + t3, 17)))
+    __guardar8(sp + 7, md_acotar8(__desplazar_aritmetico(x0 - t3, 17)))
+    __guardar8(sp + 1, md_acotar8(__desplazar_aritmetico(x1 + t2, 17)))
+    __guardar8(sp + 6, md_acotar8(__desplazar_aritmetico(x1 - t2, 17)))
+    __guardar8(sp + 2, md_acotar8(__desplazar_aritmetico(x2 + t1, 17)))
+    __guardar8(sp + 5, md_acotar8(__desplazar_aritmetico(x2 - t1, 17)))
+    __guardar8(sp + 3, md_acotar8(__desplazar_aritmetico(x3 + t0, 17)))
+    __guardar8(sp + 4, md_acotar8(__desplazar_aritmetico(x3 - t0, 17)))
+    retornar 0
+}
+
+funcion md_acotar8(v) {
+    si (v < 0) { retornar 0 }
+    si (v > 255) { retornar 255 }
+    retornar v
+}
+
+// Muestra del plano de un componente para el píxel (x, y) de la imagen.
+funcion md_muestra_comp(comp, x, y, hmax, vmax) {
+    sea h = __cargar64(comp + 8)
+    sea v = __cargar64(comp + 16)
+    sea plano = __cargar64(comp + 96)
+    sea paso = __cargar64(comp + 32) * 8
+    si (h == hmax y v == vmax) { retornar __cargar8(plano + y * paso + x) }
+    sea cw = __cargar64(comp + 80)
+    sea ch = __cargar64(comp + 88)
+    sea fx = (2 * x + 1) * h * 128 / hmax - 128
+    sea fy = (2 * y + 1) * v * 128 / vmax - 128
+    sea x0 = __desplazar_aritmetico(fx, 8)
+    sea wx = __y_bits(fx, 255)
+    sea y0 = __desplazar_aritmetico(fy, 8)
+    sea wy = __y_bits(fy, 255)
+    si (x0 < 0) {
+        x0 = 0
+        wx = 0
+    }
+    si (y0 < 0) {
+        y0 = 0
+        wy = 0
+    }
+    sea x1 = x0 + 1
+    sea y1 = y0 + 1
+    si (x1 >= cw) { x1 = cw - 1 }
+    si (y1 >= ch) { y1 = ch - 1 }
+    si (x0 >= cw) { x0 = cw - 1 }
+    si (y0 >= ch) { y0 = ch - 1 }
+    sea a = __cargar8(plano + y0 * paso + x0) * (256 - wx) + __cargar8(plano + y0 * paso + x1) * wx
+    sea b = __cargar8(plano + y1 * paso + x0) * (256 - wx) + __cargar8(plano + y1 * paso + x1) * wx
+    retornar __desplazar_der(a * (256 - wy) + b * wy + 32768, 16)
+}
+
+funcion jpeg_decodificar(datos) {
+    sea s = dyn_a_str(datos)
+    sea p = str_datos(s)
+    sea n = str_largo(s)
+    si (n < 4 o __cargar8(p) != 255 o __cargar8(p + 1) != 216) { dyn_error("jpeg: firma inválida") }
+    sea zz = md_zigzag()
+    sea qt = mem_reservar(4 * 64 * 8)
+    mem_llenar(qt, 0, 4 * 64 * 8)
+    sea tdc = mem_reservar(4 * 6552)
+    sea tac = mem_reservar(4 * 6552)
+    mem_llenar(tdc, 0, 4 * 6552)
+    mem_llenar(tac, 0, 4 * 6552)
+    sea comps = mem_reservar(4 * 104)
+    mem_llenar(comps, 0, 4 * 104)
+    sea j = mem_reservar(80)
+    mem_llenar(j, 0, 80)
+    __guardar64(j + 48, tdc)
+    __guardar64(j + 56, tac)
+    __guardar64(j + 64, zz)
+    sea r = mem_reservar(48)
+    sea ancho = 0
+    sea alto = 0
+    sea nf = 0
+    sea hmax = 1
+    sea vmax = 1
+    sea mcux = 0
+    sea mcuy = 0
+    sea ri = 0
+    sea adobe = 0 - 1
+    sea pos = 2
+    sea fin = 0
+    mientras (fin == 0) {
+        mientras (pos < n y __cargar8(p + pos) != 255) { pos = pos + 1 }
+        mientras (pos < n y __cargar8(p + pos) == 255) { pos = pos + 1 }
+        si (pos >= n) { fin = 1 } sino {
+            sea m = __cargar8(p + pos)
+            pos = pos + 1
+            si (m == 217) { fin = 1 } sino {
+                si (m != 216 y m != 1 y (m < 208 o m > 215)) {
+                    si (pos + 2 > n) { dyn_error("jpeg: segmento truncado") }
+                    sea largo = md_be16(p + pos)
+                    sea seg = p + pos + 2
+                    sea sl = largo - 2
+                    si (pos + largo > n) { dyn_error("jpeg: segmento truncado") }
+                    si (m == 219) {
+                        sea off = 0
+                        mientras (off < sl) {
+                            sea pq = __desplazar_der(__cargar8(seg + off), 4)
+                            sea tq = __y_bits(__cargar8(seg + off), 3)
+                            off = off + 1
+                            sea k = 0
+                            mientras (k < 64) {
+                                sea q = 0
+                                si (pq == 0) {
+                                    q = __cargar8(seg + off)
+                                    off = off + 1
+                                } sino {
+                                    q = md_be16(seg + off)
+                                    off = off + 2
+                                }
+                                __guardar64(qt + (tq * 64 + __cargar64(zz + k * 8)) * 8, q)
+                                k = k + 1
+                            }
+                        }
+                    }
+                    si (m == 196) {
+                        sea off = 0
+                        mientras (off < sl) {
+                            sea tc = __desplazar_der(__cargar8(seg + off), 4)
+                            sea th = __y_bits(__cargar8(seg + off), 3)
+                            sea total = 0
+                            sea k = 0
+                            mientras (k < 16) {
+                                total = total + __cargar8(seg + off + 1 + k)
+                                k = k + 1
+                            }
+                            si (total > 256) { dyn_error("jpeg: tabla Huffman inválida") }
+                            sea vals = mem_reservar(256)
+                            mem_llenar(vals, 0, 256)
+                            mem_copiar(vals, seg + off + 17, total)
+                            sea destino = tdc
+                            si (tc == 1) { destino = tac }
+                            md_jh_construir(destino + th * 6552, seg + off + 1, vals)
+                            mem_liberar(vals)
+                            off = off + 17 + total
+                        }
+                    }
+                    si (m == 192 o m == 193 o m == 194) {
+                        si (__cargar8(seg) != 8) { dyn_error("jpeg: solo 8 bits por muestra") }
+                        alto = md_be16(seg + 1)
+                        ancho = md_be16(seg + 3)
+                        nf = __cargar8(seg + 5)
+                        si (ancho == 0 o alto == 0) { dyn_error("jpeg: dimensiones inválidas (DNL no soportado)") }
+                        si (nf != 1 y nf != 3 y nf != 4) { dyn_error("jpeg: cantidad de componentes no soportada") }
+                        si (m == 194) { __guardar64(j + 40, 1) }
+                        sea c = 0
+                        mientras (c < nf) {
+                            sea comp = comps + c * 104
+                            __guardar64(comp, __cargar8(seg + 6 + c * 3))
+                            __guardar64(comp + 8, __desplazar_der(__cargar8(seg + 7 + c * 3), 4))
+                            __guardar64(comp + 16, __y_bits(__cargar8(seg + 7 + c * 3), 15))
+                            __guardar64(comp + 24, __y_bits(__cargar8(seg + 8 + c * 3), 3))
+                            si (__cargar64(comp + 8) == 0 o __cargar64(comp + 16) == 0 o __cargar64(comp + 8) > 4 o __cargar64(comp + 16) > 4) { dyn_error("jpeg: muestreo inválido") }
+                            si (__cargar64(comp + 8) > hmax) { hmax = __cargar64(comp + 8) }
+                            si (__cargar64(comp + 16) > vmax) { vmax = __cargar64(comp + 16) }
+                            c = c + 1
+                        }
+                        mcux = (ancho + 8 * hmax - 1) / (8 * hmax)
+                        mcuy = (alto + 8 * vmax - 1) / (8 * vmax)
+                        c = 0
+                        mientras (c < nf) {
+                            sea comp = comps + c * 104
+                            sea bw = mcux * __cargar64(comp + 8)
+                            sea bh = mcuy * __cargar64(comp + 16)
+                            __guardar64(comp + 32, bw)
+                            __guardar64(comp + 40, bh)
+                            __guardar64(comp + 80, (ancho * __cargar64(comp + 8) + hmax - 1) / hmax)
+                            __guardar64(comp + 88, (alto * __cargar64(comp + 16) + vmax - 1) / vmax)
+                            sea coef = mem_reservar(bw * bh * 128)
+                            mem_llenar(coef, 0, bw * bh * 128)
+                            __guardar64(comp + 48, coef)
+                            c = c + 1
+                        }
+                    }
+                    si (m == 195 o (m >= 197 y m <= 207 y m != 200 y m != 204)) { dyn_error("jpeg: formato no soportado (sin pérdidas, jerárquico o aritmético)") }
+                    si (m == 221) { ri = md_be16(seg) }
+                    si (m == 238 y sl >= 12) {
+                        si (__cargar8(seg) == 65 y __cargar8(seg + 1) == 100 y __cargar8(seg + 2) == 111 y __cargar8(seg + 3) == 98 y __cargar8(seg + 4) == 101) { adobe = __cargar8(seg + 11) }
+                    }
+                    si (m == 218) {
+                        si (nf == 0) { dyn_error("jpeg: SOS antes de SOF") }
+                        sea ns = __cargar8(seg)
+                        sea lista = mem_reservar(4 * 8)
+                        sea k = 0
+                        mientras (k < ns) {
+                            sea cid = __cargar8(seg + 1 + k * 2)
+                            sea tabla = __cargar8(seg + 2 + k * 2)
+                            sea c = 0
+                            sea hallado = 0 - 1
+                            mientras (c < nf) {
+                                si (__cargar64(comps + c * 104) == cid) { hallado = c }
+                                c = c + 1
+                            }
+                            si (hallado < 0) { dyn_error("jpeg: componente desconocido en SOS") }
+                            sea comp = comps + hallado * 104
+                            __guardar64(comp + 64, __y_bits(__desplazar_der(tabla, 4), 3))
+                            __guardar64(comp + 72, __y_bits(tabla, 3))
+                            __guardar64(comp + 56, 0)
+                            __guardar64(lista + k * 8, comp)
+                            k = k + 1
+                        }
+                        __guardar64(j + 8, __cargar8(seg + 1 + ns * 2))
+                        __guardar64(j + 16, __cargar8(seg + 2 + ns * 2))
+                        __guardar64(j + 24, __desplazar_der(__cargar8(seg + 3 + ns * 2), 4))
+                        __guardar64(j + 32, __y_bits(__cargar8(seg + 3 + ns * 2), 15))
+                        __guardar64(j, 0)
+                        si (__cargar64(j + 40) == 0) {
+                            __guardar64(j + 8, 0)
+                            __guardar64(j + 16, 63)
+                        }
+                        __guardar64(r, p)
+                        __guardar64(r + 8, n)
+                        __guardar64(r + 16, pos + largo)
+                        __guardar64(r + 24, 0)
+                        __guardar64(r + 32, 0)
+                        __guardar64(r + 40, 0)
+                        sea unidades = 0
+                        sea total_u = 0
+                        si (ns == 1) {
+                            sea comp = __cargar64(lista)
+                            sea bwc = (__cargar64(comp + 80) + 7) / 8
+                            sea bhc = (__cargar64(comp + 88) + 7) / 8
+                            total_u = bwc * bhc
+                            sea by = 0
+                            mientras (by < bhc) {
+                                sea bx = 0
+                                mientras (bx < bwc) {
+                                    md_jpeg_bloque(r, j, comp, __cargar64(comp + 48) + (by * __cargar64(comp + 32) + bx) * 128)
+                                    unidades = unidades + 1
+                                    si (ri > 0 y unidades % ri == 0 y unidades < total_u) {
+                                        md_reiniciar(r)
+                                        __guardar64(comp + 56, 0)
+                                        __guardar64(j, 0)
+                                    }
+                                    bx = bx + 1
+                                }
+                                by = by + 1
+                            }
+                        } sino {
+                            total_u = mcux * mcuy
+                            sea my = 0
+                            mientras (my < mcuy) {
+                                sea mx = 0
+                                mientras (mx < mcux) {
+                                    k = 0
+                                    mientras (k < ns) {
+                                        sea comp = __cargar64(lista + k * 8)
+                                        sea h = __cargar64(comp + 8)
+                                        sea v = __cargar64(comp + 16)
+                                        sea yy = 0
+                                        mientras (yy < v) {
+                                            sea xx = 0
+                                            mientras (xx < h) {
+                                                md_jpeg_bloque(r, j, comp, __cargar64(comp + 48) + ((my * v + yy) * __cargar64(comp + 32) + mx * h + xx) * 128)
+                                                xx = xx + 1
+                                            }
+                                            yy = yy + 1
+                                        }
+                                        k = k + 1
+                                    }
+                                    unidades = unidades + 1
+                                    si (ri > 0 y unidades % ri == 0 y unidades < total_u) {
+                                        md_reiniciar(r)
+                                        k = 0
+                                        mientras (k < ns) {
+                                            __guardar64(__cargar64(lista + k * 8) + 56, 0)
+                                            k = k + 1
+                                        }
+                                        __guardar64(j, 0)
+                                    }
+                                    mx = mx + 1
+                                }
+                                my = my + 1
+                            }
+                        }
+                        mem_liberar(lista)
+                        // Continuar en el siguiente marcador (no RST ni relleno).
+                        pos = __cargar64(r + 16)
+                        sea buscando = 1
+                        mientras (buscando == 1 y pos + 1 < n) {
+                            si (__cargar8(p + pos) == 255 y __cargar8(p + pos + 1) != 0 y (__cargar8(p + pos + 1) < 208 o __cargar8(p + pos + 1) > 215)) { buscando = 0 } sino { pos = pos + 1 }
+                        }
+                        largo = 0
+                    }
+                    pos = pos + largo
+                }
+            }
+        }
+    }
+    si (nf == 0) { dyn_error("jpeg: no se encontró la imagen (SOF)") }
+    // IDCT de todos los bloques a planos de 8 bits.
+    sea tmp = mem_reservar(64 * 8)
+    sea val = mem_reservar(64 * 8)
+    sea c = 0
+    mientras (c < nf) {
+        sea comp = comps + c * 104
+        sea bw = __cargar64(comp + 32)
+        sea bh = __cargar64(comp + 40)
+        sea paso = bw * 8
+        sea plano = mem_reservar(bw * bh * 64)
+        __guardar64(comp + 96, plano)
+        sea q = qt + __cargar64(comp + 24) * 64 * 8
+        sea coef = __cargar64(comp + 48)
+        sea by = 0
+        mientras (by < bh) {
+            sea bx = 0
+            mientras (bx < bw) {
+                sea blk = coef + (by * bw + bx) * 128
+                sea k = 0
+                mientras (k < 64) {
+                    __guardar64(tmp + k * 8, md_c16(blk + k * 2) * __cargar64(q + k * 8))
+                    k = k + 1
+                }
+                k = 0
+                mientras (k < 8) {
+                    md_idct_1d(tmp, k, 8, val, 0, 0)
+                    k = k + 1
+                }
+                k = 0
+                mientras (k < 8) {
+                    md_idct_1d(val, k * 8, 1, 0, plano + (by * 8 + k) * paso + bx * 8, 1)
+                    k = k + 1
+                }
+                bx = bx + 1
+            }
+            by = by + 1
+        }
+        mem_liberar(coef)
+        c = c + 1
+    }
+    mem_liberar(tmp)
+    mem_liberar(val)
+    // Color: YCbCr (o RGB / YCCK / CMYK de Adobe) a RGBA.
+    sea salida = md_buffer(ancho * alto * 4)
+    sea sp = str_datos(salida)
+    sea transformar = 1
+    si (nf == 3) {
+        si (adobe == 0) { transformar = 0 }
+        si (__cargar64(comps) == 82 y __cargar64(comps + 104) == 71 y __cargar64(comps + 208) == 66) { transformar = 0 }
+    }
+    si (nf == 4) {
+        transformar = 0
+        si (adobe == 2) { transformar = 1 }
+    }
+    sea yy = 0
+    mientras (yy < alto) {
+        sea xx = 0
+        mientras (xx < ancho) {
+            sea po = sp + (yy * ancho + xx) * 4
+            sea a0 = md_muestra_comp(comps, xx, yy, hmax, vmax)
+            sea rr = a0
+            sea gg = a0
+            sea bb = a0
+            si (nf >= 3) {
+                sea a1 = md_muestra_comp(comps + 104, xx, yy, hmax, vmax)
+                sea a2 = md_muestra_comp(comps + 208, xx, yy, hmax, vmax)
+                si (transformar == 1) {
+                    sea yf = __desplazar_izq(a0, 20) + 524288
+                    sea cr = a2 - 128
+                    sea cb = a1 - 128
+                    rr = md_acotar8(__desplazar_aritmetico(yf + cr * 1470208, 20))
+                    gg = md_acotar8(__desplazar_aritmetico(yf - cr * 748800 - cb * 360960, 20))
+                    bb = md_acotar8(__desplazar_aritmetico(yf + cb * 1858048, 20))
+                } sino {
+                    rr = a0
+                    gg = a1
+                    bb = a2
+                }
+                si (nf == 4) {
+                    sea kk = md_muestra_comp(comps + 312, xx, yy, hmax, vmax)
+                    si (transformar == 1) {
+                        rr = 255 - rr
+                        gg = 255 - gg
+                        bb = 255 - bb
+                    }
+                    rr = (rr * kk + 127) / 255
+                    gg = (gg * kk + 127) / 255
+                    bb = (bb * kk + 127) / 255
+                }
+            }
+            __guardar8(po, rr)
+            __guardar8(po + 1, gg)
+            __guardar8(po + 2, bb)
+            __guardar8(po + 3, 255)
+            xx = xx + 1
+        }
+        yy = yy + 1
+    }
+    c = 0
+    mientras (c < nf) {
+        mem_liberar(__cargar64(comps + c * 104 + 96))
+        c = c + 1
+    }
+    mem_liberar(qt)
+    mem_liberar(tdc)
+    mem_liberar(tac)
+    mem_liberar(comps)
+    mem_liberar(j)
+    mem_liberar(r)
+    retornar md_lista3(dyn_entero(ancho), dyn_entero(alto), dyn_texto(salida))
+}
+
+// ── Rasterizado RGBA ───────────────────────────────────────────────────────
+
+// Mezcla "src over" de un píxel RGBA sin premultiplicar.
+funcion md_mezclar(q, r, g, b, a) {
+    si (a <= 0) { retornar 0 }
+    si (a >= 255) {
+        __guardar8(q, r)
+        __guardar8(q + 1, g)
+        __guardar8(q + 2, b)
+        __guardar8(q + 3, 255)
+        retornar 0
+    }
+    sea da = __cargar8(q + 3)
+    sea t = da * (255 - a)
+    sea oa = a * 255 + t
+    sea mitad = oa / 2
+    __guardar8(q, (r * a * 255 + __cargar8(q) * t + mitad) / oa)
+    __guardar8(q + 1, (g * a * 255 + __cargar8(q + 1) * t + mitad) / oa)
+    __guardar8(q + 2, (b * a * 255 + __cargar8(q + 2) * t + mitad) / oa)
+    __guardar8(q + 3, (oa + 127) / 255)
+    retornar 0
+}
+
+funcion md_pixeles(pix, w, h) {
+    sea s = dyn_a_str(pix)
+    si (str_largo(s) < w * h * 4) { dyn_error("lienzo: el búfer de píxeles es más chico que ancho × alto × 4") }
+    si (__cargar64(s + 24) != 1) { dyn_error("lienzo: los píxeles deben ser un búfer propio") }
+    retornar str_datos(s)
+}
+
+funcion lienzo_llenar(pix, ancho, alto, r, g, b, a) {
+    sea w = md_ent(ancho)
+    sea h = md_ent(alto)
+    sea p = md_pixeles(pix, w, h)
+    sea vr = md_ent(r)
+    sea vg = md_ent(g)
+    sea vb = md_ent(b)
+    sea va = md_ent(a)
+    __guardar8(p, vr)
+    __guardar8(p + 1, vg)
+    __guardar8(p + 2, vb)
+    __guardar8(p + 3, va)
+    md_duplicar(p, 4, w * h * 4)
+    retornar 0
+}
+
+// Repite los primeros `hecho` bytes hasta llenar `total` (copias que doblan).
+funcion md_duplicar(p, hecho, total) {
+    mientras (hecho < total) {
+        sea n = hecho
+        si (hecho + n > total) { n = total - hecho }
+        mem_copiar(p + hecho, p, n)
+        hecho = hecho + n
+    }
+    retornar 0
+}
+
+// Devuelve el z-buffer al fondo sin crear uno nuevo.
+funcion lienzo_zlimpiar(zbuf, ancho, alto) {
+    sea w = md_ent(ancho)
+    sea h = md_ent(alto)
+    sea zp = md_zbuf(zbuf, w, h)
+    __guardar64(zp, 4611686018427387904)
+    md_duplicar(zp, 8, w * h * 8)
+    retornar 0
+}
+
+funcion lienzo_rect(pix, ancho, alto, x, y, rw, rh, r, g, b, a) {
+    sea w = md_ent(ancho)
+    sea h = md_ent(alto)
+    sea p = md_pixeles(pix, w, h)
+    sea x0 = md_ent(x)
+    sea y0 = md_ent(y)
+    sea x1 = x0 + md_ent(rw)
+    sea y1 = y0 + md_ent(rh)
+    si (x0 < 0) { x0 = 0 }
+    si (y0 < 0) { y0 = 0 }
+    si (x1 > w) { x1 = w }
+    si (y1 > h) { y1 = h }
+    sea vr = md_ent(r)
+    sea vg = md_ent(g)
+    sea vb = md_ent(b)
+    sea va = md_ent(a)
+    sea fy = y0
+    mientras (fy < y1) {
+        sea fx = x0
+        mientras (fx < x1) {
+            md_mezclar(p + (fy * w + fx) * 4, vr, vg, vb, va)
+            fx = fx + 1
+        }
+        fy = fy + 1
+    }
+    retornar 0
+}
+
+// Polígono con antialiasing (8 subfilas, cobertura horizontal exacta).
+// contornos: lista de listas [x0, y0, x1, y1, ...] en 1/256 de píxel.
+// regla: 0 = nonzero (TrueType), 1 = par-impar.
+funcion lienzo_poligono(pix, ancho, alto, contornos, r, g, b, a, regla) {
+    sea w = md_ent(ancho)
+    sea h = md_ent(alto)
+    sea p = md_pixeles(pix, w, h)
+    sea vr = md_ent(r)
+    sea vg = md_ent(g)
+    sea vb = md_ent(b)
+    sea va = md_ent(a)
+    sea par_impar = 0
+    si (regla != 0) { par_impar = md_ent(regla) }
+    // Aristas: [xa][ya][xb][yb][dir] con ya < yb.
+    sea lista = dyn_dato(contornos)
+    sea total = 0
+    sea c = 0
+    mientras (c < vec_largo(lista)) {
+        total = total + vec_largo(dyn_dato(vec_obtener(lista, c))) / 2
+        c = c + 1
+    }
+    si (total == 0) { retornar 0 }
+    sea aristas = mem_reservar(total * 40 + 40)
+    sea na = 0
+    sea ymin = 2147483647
+    sea ymax = 0 - 2147483647
+    sea xmin = 2147483647
+    sea xmax = 0 - 2147483647
+    c = 0
+    mientras (c < vec_largo(lista)) {
+        sea pts = dyn_dato(vec_obtener(lista, c))
+        sea np = vec_largo(pts) / 2
+        sea i = 0
+        mientras (i < np) {
+            sea ax = md_ent(vec_obtener(pts, i * 2))
+            sea ay = md_ent(vec_obtener(pts, i * 2 + 1))
+            sea k = i + 1
+            si (k == np) { k = 0 }
+            sea bx = md_ent(vec_obtener(pts, k * 2))
+            sea by = md_ent(vec_obtener(pts, k * 2 + 1))
+            si (ax < xmin) { xmin = ax }
+            si (ax > xmax) { xmax = ax }
+            si (ay < ymin) { ymin = ay }
+            si (ay > ymax) { ymax = ay }
+            si (ay != by) {
+                sea e = aristas + na * 40
+                si (ay < by) {
+                    __guardar64(e, ax)
+                    __guardar64(e + 8, ay)
+                    __guardar64(e + 16, bx)
+                    __guardar64(e + 24, by)
+                    __guardar64(e + 32, 1)
+                } sino {
+                    __guardar64(e, bx)
+                    __guardar64(e + 8, by)
+                    __guardar64(e + 16, ax)
+                    __guardar64(e + 24, ay)
+                    __guardar64(e + 32, 0 - 1)
+                }
+                na = na + 1
+            }
+            i = i + 1
+        }
+        c = c + 1
+    }
+    sea py0 = __desplazar_aritmetico(ymin, 8)
+    sea py1 = __desplazar_aritmetico(ymax + 255, 8)
+    si (py0 < 0) { py0 = 0 }
+    si (py1 > h) { py1 = h }
+    sea px0 = __desplazar_aritmetico(xmin, 8)
+    sea px1 = __desplazar_aritmetico(xmax + 255, 8) + 1
+    si (px0 < 0) { px0 = 0 }
+    si (px1 > w) { px1 = w }
+    si (na == 0 o py0 >= py1 o px0 >= px1) {
+        mem_liberar(aristas)
+        retornar 0
+    }
+    sea acc = mem_reservar((w + 2) * 8)
+    sea cx = mem_reservar(na * 16 + 16)
+    sea limite = w * 256
+    sea fy = py0
+    mientras (fy < py1) {
+        mem_llenar(acc + px0 * 8, 0, (px1 - px0 + 1) * 8)
+        sea sub = 0
+        mientras (sub < 8) {
+            sea sy = fy * 256 + sub * 32 + 16
+            // Cruces de esta subfila, ordenados por x (inserción).
+            sea nc = 0
+            sea i = 0
+            mientras (i < na) {
+                sea e = aristas + i * 40
+                sea ya = __cargar64(e + 8)
+                sea yb = __cargar64(e + 24)
+                si (ya <= sy y sy < yb) {
+                    sea xa = __cargar64(e)
+                    sea xx = xa + (sy - ya) * (__cargar64(e + 16) - xa) / (yb - ya)
+                    sea d = __cargar64(e + 32)
+                    sea k = nc
+                    mientras (k > 0 y __cargar64(cx + (k - 1) * 16) > xx) {
+                        __guardar64(cx + k * 16, __cargar64(cx + (k - 1) * 16))
+                        __guardar64(cx + k * 16 + 8, __cargar64(cx + (k - 1) * 16 + 8))
+                        k = k - 1
+                    }
+                    __guardar64(cx + k * 16, xx)
+                    __guardar64(cx + k * 16 + 8, d)
+                    nc = nc + 1
+                }
+                i = i + 1
+            }
+            sea giro = 0
+            i = 0
+            mientras (i + 1 < nc) {
+                giro = giro + __cargar64(cx + i * 16 + 8)
+                sea dentro = 0
+                si (par_impar == 1) { dentro = __y_bits(i + 1, 1) } sino { si (giro != 0) { dentro = 1 } }
+                si (dentro == 1) {
+                    sea xa = __cargar64(cx + i * 16)
+                    sea xb = __cargar64(cx + (i + 1) * 16)
+                    si (xa < 0) { xa = 0 }
+                    si (xb > limite) { xb = limite }
+                    si (xa < xb) {
+                        sea pa = __desplazar_der(xa, 8)
+                        sea pb = __desplazar_der(xb, 8)
+                        si (pa == pb) { __guardar64(acc + pa * 8, __cargar64(acc + pa * 8) + xb - xa) } sino {
+                            __guardar64(acc + pa * 8, __cargar64(acc + pa * 8) + 256 - __y_bits(xa, 255))
+                            sea q = pa + 1
+                            mientras (q < pb) {
+                                __guardar64(acc + q * 8, __cargar64(acc + q * 8) + 256)
+                                q = q + 1
+                            }
+                            si (pb < w) { __guardar64(acc + pb * 8, __cargar64(acc + pb * 8) + __y_bits(xb, 255)) }
+                        }
+                    }
+                }
+                i = i + 1
+            }
+            sub = sub + 1
+        }
+        sea fx = px0
+        mientras (fx < px1) {
+            sea cob = __cargar64(acc + fx * 8)
+            si (cob > 0) {
+                si (cob > 2048) { cob = 2048 }
+                md_mezclar(p + (fy * w + fx) * 4, vr, vg, vb, (cob * va + 1024) / 2048)
+            }
+            fx = fx + 1
+        }
+        fy = fy + 1
+    }
+    mem_liberar(acc)
+    mem_liberar(cx)
+    mem_liberar(aristas)
+    retornar 0
+}
+
+funcion md_texel(t, tw, th, u, v, bilineal, salida) {
+    // u, v en 16.16 sobre el tamaño de la textura; repite en los bordes.
+    si (bilineal == 0) { retornar md_texel_crudo(t, tw, th, __desplazar_aritmetico(u, 16), __desplazar_aritmetico(v, 16), salida) }
+    u = u - 32768
+    v = v - 32768
+    sea x0 = __desplazar_aritmetico(u, 16)
+    sea y0 = __desplazar_aritmetico(v, 16)
+    sea fx = __desplazar_der(__y_bits(u, 65535), 8)
+    sea fy = __desplazar_der(__y_bits(v, 65535), 8)
+    sea k = 0
+    mientras (k < 4) {
+        sea a = md_canal(t, tw, th, x0, y0, k) * (256 - fx) + md_canal(t, tw, th, x0 + 1, y0, k) * fx
+        sea b = md_canal(t, tw, th, x0, y0 + 1, k) * (256 - fx) + md_canal(t, tw, th, x0 + 1, y0 + 1, k) * fx
+        __guardar64(salida + k * 8, __desplazar_der(a * (256 - fy) + b * fy + 32768, 16))
+        k = k + 1
+    }
+    retornar 0
+}
+
+funcion md_canal(t, tw, th, x, y, k) {
+    x = x % tw
+    si (x < 0) { x = x + tw }
+    y = y % th
+    si (y < 0) { y = y + th }
+    retornar __cargar8(t + (y * tw + x) * 4 + k)
+}
+
+funcion md_texel_crudo(t, tw, th, x, y, salida) {
+    x = x % tw
+    si (x < 0) { x = x + tw }
+    y = y % th
+    si (y < 0) { y = y + th }
+    sea q = t + (y * tw + x) * 4
+    __guardar64(salida, __cargar8(q))
+    __guardar64(salida + 8, __cargar8(q + 1))
+    __guardar64(salida + 16, __cargar8(q + 2))
+    __guardar64(salida + 24, __cargar8(q + 3))
+    retornar 0
+}
+
+// Copia (escalada) de una imagen RGBA sobre el lienzo con mezcla alfa.
+// params: [dx, dy, dw, dh, sx, sy, sw, sh, alfa, bilineal, tinte r, g, b]
+funcion lienzo_copiar(pix, ancho, alto, src, sancho, salto, params) {
+    sea w = md_ent(ancho)
+    sea h = md_ent(alto)
+    sea p = md_pixeles(pix, w, h)
+    sea tw = md_ent(sancho)
+    sea th = md_ent(salto)
+    sea ss = dyn_a_str(src)
+    si (str_largo(ss) < tw * th * 4) { dyn_error("lienzo_copiar: imagen de origen incompleta") }
+    sea t = str_datos(ss)
+    sea v = dyn_dato(params)
+    sea dx = md_ent(vec_obtener(v, 0))
+    sea dy = md_ent(vec_obtener(v, 1))
+    sea dw = md_ent(vec_obtener(v, 2))
+    sea dh = md_ent(vec_obtener(v, 3))
+    sea sx = md_ent(vec_obtener(v, 4))
+    sea sy = md_ent(vec_obtener(v, 5))
+    sea sw = md_ent(vec_obtener(v, 6))
+    sea sh = md_ent(vec_obtener(v, 7))
+    sea alfa = md_ent(vec_obtener(v, 8))
+    sea bil = md_ent(vec_obtener(v, 9))
+    sea tr = md_ent(vec_obtener(v, 10))
+    sea tg = md_ent(vec_obtener(v, 11))
+    sea tb = md_ent(vec_obtener(v, 12))
+    si (dw <= 0 o dh <= 0 o sw == 0 o sh == 0) { retornar 0 }
+    sea x0 = dx
+    sea y0 = dy
+    sea x1 = dx + dw
+    sea y1 = dy + dh
+    si (x0 < 0) { x0 = 0 }
+    si (y0 < 0) { y0 = 0 }
+    si (x1 > w) { x1 = w }
+    si (y1 > h) { y1 = h }
+    sea tx = mem_reservar(32)
+    sea exacto = 0
+    si (sw == dw y sh == dh y bil == 0 y sx >= 0 y sy >= 0 y sx + sw <= tw y sy + sh <= th) { exacto = 1 }
+    sea fy = y0
+    mientras (fy < y1) {
+        sea fx = x0
+        mientras (fx < x1) {
+            sea cr = 0
+            sea cg = 0
+            sea cb = 0
+            sea ca = 0
+            si (exacto == 1) {
+                sea q = t + ((sy + fy - dy) * tw + sx + fx - dx) * 4
+                cr = __cargar8(q)
+                cg = __cargar8(q + 1)
+                cb = __cargar8(q + 2)
+                ca = __cargar8(q + 3)
+            } sino {
+                // Centro del píxel destino llevado al origen (16.16).
+                sea u = sx * 65536 + ((fx - dx) * 2 + 1) * sw * 32768 / dw
+                sea vv = sy * 65536 + ((fy - dy) * 2 + 1) * sh * 32768 / dh
+                si (bil == 1) { md_texel(t, tw, th, u, vv, 1, tx) } sino { md_texel_crudo(t, tw, th, __desplazar_aritmetico(u, 16), __desplazar_aritmetico(vv, 16), tx) }
+                cr = __cargar64(tx)
+                cg = __cargar64(tx + 8)
+                cb = __cargar64(tx + 16)
+                ca = __cargar64(tx + 24)
+            }
+            si (tr != 255) { cr = (cr * tr + 127) / 255 }
+            si (tg != 255) { cg = (cg * tg + 127) / 255 }
+            si (tb != 255) { cb = (cb * tb + 127) / 255 }
+            si (alfa != 255) { ca = (ca * alfa + 127) / 255 }
+            md_mezclar(p + (fy * w + fx) * 4, cr, cg, cb, ca)
+            fx = fx + 1
+        }
+        fy = fy + 1
+    }
+    mem_liberar(tx)
+    retornar 0
+}
+
+// Triángulo 3D con z-buffer, color por vértice y textura con corrección de
+// perspectiva. vertices: 30 enteros, por vértice [x, y] en 1/16 de píxel,
+// z (0..2^24, menor = más cerca), iw (1/w normalizado a 0..65536),
+// r, g, b, a (0..255) y u, v (16.16 sobre la textura).
+// opciones: 1 descartar caras traseras, 2 prueba z, 4 escribir z,
+// 8 textura bilineal, 16 mezcla alfa.
+funcion lienzo_triangulo(pix, zbuf, ancho, alto, vertices, textura, tancho, talto, opciones) {
+    sea w = md_ent(ancho)
+    sea h = md_ent(alto)
+    sea p = md_pixeles(pix, w, h)
+    sea op = md_ent(opciones)
+    sea zp = md_zbuf(zbuf, w, h)
+    sea t = 0
+    sea tw = 0
+    sea th = 0
+    si (textura != 0) {
+        tw = md_ent(tancho)
+        th = md_ent(talto)
+        t = md_textura(textura, tw, th)
+    }
+    sea vs = dyn_dato(vertices)
+    sea vt = mem_reservar(30 * 8)
+    sea i = 0
+    mientras (i < 30) {
+        __guardar64(vt + i * 8, md_ent(vec_obtener(vs, i)))
+        i = i + 1
+    }
+    md_tri(p, zp, w, h, vt, t, tw, th, op)
+    mem_liberar(vt)
+    retornar 0
+}
+
+funcion md_zbuf(zbuf, w, h) {
+    si (zbuf == 0) { retornar 0 }
+    sea zs = dyn_a_str(zbuf)
+    si (str_largo(zs) < w * h * 8) { dyn_error("lienzo: z-buffer incompleto") }
+    retornar str_datos(zs)
+}
+
+funcion md_textura(textura, tw, th) {
+    sea ts = dyn_a_str(textura)
+    si (str_largo(ts) < tw * th * 4) { dyn_error("lienzo: textura incompleta") }
+    retornar str_datos(ts)
+}
+
+// Todos los triángulos de una malla. tabla: 11 enteros por vértice
+// [x, y, z, iw, r, g, b, a, u, v, recortar]; los triángulos con algún
+// vértice marcado para recortar se saltan (los recorta graficos.cfv).
+// Dibuja (i0, i2, i1) para pasar de antihorario en el mundo a pantalla.
+funcion lienzo_triangulos(pix, zbuf, ancho, alto, tabla, indices, textura, tancho, talto, opciones) {
+    sea w = md_ent(ancho)
+    sea h = md_ent(alto)
+    sea p = md_pixeles(pix, w, h)
+    sea op = md_ent(opciones)
+    sea zp = md_zbuf(zbuf, w, h)
+    sea t = 0
+    sea tw = 0
+    sea th = 0
+    si (textura != 0) {
+        tw = md_ent(tancho)
+        th = md_ent(talto)
+        t = md_textura(textura, tw, th)
+    }
+    sea tv = dyn_dato(tabla)
+    sea nv = vec_largo(tv) / 11
+    // Copia cruda de la tabla para no convertir en cada triángulo.
+    sea crudo = mem_reservar(nv * 88 + 8)
+    sea i = 0
+    mientras (i < nv * 11) {
+        __guardar64(crudo + i * 8, md_ent(vec_obtener(tv, i)))
+        i = i + 1
+    }
+    sea ix = dyn_dato(indices)
+    sea vt = mem_reservar(30 * 8)
+    sea dibujados = 0
+    sea k = 0
+    mientras (k + 2 < vec_largo(ix)) {
+        sea a = md_ent(vec_obtener(ix, k))
+        sea b = md_ent(vec_obtener(ix, k + 2))
+        sea c = md_ent(vec_obtener(ix, k + 1))
+        si (a >= 0 y b >= 0 y c >= 0 y a < nv y b < nv y c < nv) {
+            si (__cargar64(crudo + a * 88 + 80) == 0 y __cargar64(crudo + b * 88 + 80) == 0 y __cargar64(crudo + c * 88 + 80) == 0) {
+                mem_copiar(vt, crudo + a * 88, 80)
+                mem_copiar(vt + 80, crudo + b * 88, 80)
+                mem_copiar(vt + 160, crudo + c * 88, 80)
+                md_tri(p, zp, w, h, vt, t, tw, th, op)
+                dibujados = dibujados + 1
+            }
+        }
+        k = k + 3
+    }
+    mem_liberar(vt)
+    mem_liberar(crudo)
+    retornar dyn_entero(dibujados)
+}
+
+funcion md_tri(p, zp, w, h, vt, t, tw, th, op) {
+    // 1/w relativo: el mayor de los tres pasa a 65536.
+    sea mx = __cargar64(vt + 24)
+    si (__cargar64(vt + 104) > mx) { mx = __cargar64(vt + 104) }
+    si (__cargar64(vt + 184) > mx) { mx = __cargar64(vt + 184) }
+    si (mx > 65536) {
+        __guardar64(vt + 24, __cargar64(vt + 24) * 65536 / mx)
+        __guardar64(vt + 104, __cargar64(vt + 104) * 65536 / mx)
+        __guardar64(vt + 184, __cargar64(vt + 184) * 65536 / mx)
+    }
+    sea area = (__cargar64(vt + 80) - __cargar64(vt)) * (__cargar64(vt + 168) - __cargar64(vt + 8)) - (__cargar64(vt + 88) - __cargar64(vt + 8)) * (__cargar64(vt + 160) - __cargar64(vt))
+    si (area == 0 o (__y_bits(op, 1) != 0 y area < 0)) { retornar 0 }
+    si (area < 0) {
+        // Ordenar en sentido positivo intercambiando v1 y v2.
+        sea k = 0
+        mientras (k < 10) {
+            sea a1 = __cargar64(vt + (10 + k) * 8)
+            __guardar64(vt + (10 + k) * 8, __cargar64(vt + (20 + k) * 8))
+            __guardar64(vt + (20 + k) * 8, a1)
+            k = k + 1
+        }
+        area = 0 - area
+    }
+    sea x0 = __cargar64(vt)
+    sea y0 = __cargar64(vt + 8)
+    sea x1 = __cargar64(vt + 80)
+    sea y1 = __cargar64(vt + 88)
+    sea x2 = __cargar64(vt + 160)
+    sea y2 = __cargar64(vt + 168)
+    sea minx = x0
+    si (x1 < minx) { minx = x1 }
+    si (x2 < minx) { minx = x2 }
+    sea maxx = x0
+    si (x1 > maxx) { maxx = x1 }
+    si (x2 > maxx) { maxx = x2 }
+    sea miny = y0
+    si (y1 < miny) { miny = y1 }
+    si (y2 < miny) { miny = y2 }
+    sea maxy = y0
+    si (y1 > maxy) { maxy = y1 }
+    si (y2 > maxy) { maxy = y2 }
+    sea bx0 = __desplazar_aritmetico(minx, 4)
+    sea bx1 = __desplazar_aritmetico(maxx + 15, 4)
+    sea by0 = __desplazar_aritmetico(miny, 4)
+    sea by1 = __desplazar_aritmetico(maxy + 15, 4)
+    si (bx0 < 0) { bx0 = 0 }
+    si (by0 < 0) { by0 = 0 }
+    si (bx1 > w) { bx1 = w }
+    si (by1 > h) { by1 = h }
+    // Regla arriba-izquierda: las aristas que no lo son excluyen el borde.
+    sea s0 = md_sesgo(x1, y1, x2, y2)
+    sea s1 = md_sesgo(x2, y2, x0, y0)
+    sea s2 = md_sesgo(x0, y0, x1, y1)
+    sea a01 = y0 - y1
+    sea b01 = x1 - x0
+    sea a12 = y1 - y2
+    sea b12 = x2 - x1
+    sea a20 = y2 - y0
+    sea b20 = x0 - x2
+    sea px = bx0 * 16 + 8
+    sea py = by0 * 16 + 8
+    sea w0f = (x2 - x1) * (py - y1) - (y2 - y1) * (px - x1)
+    sea w1f = (x0 - x2) * (py - y2) - (y0 - y2) * (px - x2)
+    sea w2f = (x1 - x0) * (py - y0) - (y1 - y0) * (px - x0)
+    sea iw0 = __cargar64(vt + 24)
+    sea iw1 = __cargar64(vt + 104)
+    sea iw2 = __cargar64(vt + 184)
+    sea z0 = __cargar64(vt + 16)
+    sea z1 = __cargar64(vt + 96)
+    sea z2 = __cargar64(vt + 176)
+    sea tx = mem_reservar(32)
+    sea fy = by0
+    mientras (fy < by1) {
+        sea e0 = w0f
+        sea e1 = w1f
+        sea e2 = w2f
+        sea fx = bx0
+        mientras (fx < bx1) {
+            si (e0 + s0 >= 0 y e1 + s1 >= 0 y e2 + s2 >= 0) {
+                sea z = (e0 * z0 + e1 * z1 + e2 * z2) / area
+                sea idx = fy * w + fx
+                sea pasa = 1
+                si (zp != 0 y __y_bits(op, 2) != 0) { si (z >= __cargar64(zp + idx * 8)) { pasa = 0 } }
+                si (pasa == 1) {
+                    sea q0 = __desplazar_aritmetico(e0 * iw0, 16)
+                    sea q1 = __desplazar_aritmetico(e1 * iw1, 16)
+                    sea q2 = __desplazar_aritmetico(e2 * iw2, 16)
+                    sea qs = q0 + q1 + q2
+                    si (qs <= 0) {
+                        q0 = e0
+                        q1 = e1
+                        q2 = e2
+                        qs = area
+                    }
+                    sea cr = (q0 * __cargar64(vt + 32) + q1 * __cargar64(vt + 112) + q2 * __cargar64(vt + 192)) / qs
+                    sea cg = (q0 * __cargar64(vt + 40) + q1 * __cargar64(vt + 120) + q2 * __cargar64(vt + 200)) / qs
+                    sea cb = (q0 * __cargar64(vt + 48) + q1 * __cargar64(vt + 128) + q2 * __cargar64(vt + 208)) / qs
+                    sea ca = (q0 * __cargar64(vt + 56) + q1 * __cargar64(vt + 136) + q2 * __cargar64(vt + 216)) / qs
+                    si (t != 0) {
+                        sea u = (q0 * __cargar64(vt + 64) + q1 * __cargar64(vt + 144) + q2 * __cargar64(vt + 224)) / qs
+                        sea vv = (q0 * __cargar64(vt + 72) + q1 * __cargar64(vt + 152) + q2 * __cargar64(vt + 232)) / qs
+                        si (__y_bits(op, 8) != 0) { md_texel(t, tw, th, u, vv, 1, tx) } sino { md_texel_crudo(t, tw, th, __desplazar_aritmetico(u, 16), __desplazar_aritmetico(vv, 16), tx) }
+                        cr = (cr * __cargar64(tx) + 127) / 255
+                        cg = (cg * __cargar64(tx + 8) + 127) / 255
+                        cb = (cb * __cargar64(tx + 16) + 127) / 255
+                        ca = (ca * __cargar64(tx + 24) + 127) / 255
+                    }
+                    sea q = p + idx * 4
+                    si (__y_bits(op, 16) != 0) { md_mezclar(q, cr, cg, cb, ca) } sino {
+                        __guardar8(q, md_acotar8(cr))
+                        __guardar8(q + 1, md_acotar8(cg))
+                        __guardar8(q + 2, md_acotar8(cb))
+                        __guardar8(q + 3, 255)
+                    }
+                    si (zp != 0 y __y_bits(op, 4) != 0) { __guardar64(zp + idx * 8, z) }
+                }
+            }
+            e0 = e0 - (y2 - y1) * 16
+            e1 = e1 - (y0 - y2) * 16
+            e2 = e2 - (y1 - y0) * 16
+            fx = fx + 1
+        }
+        w0f = w0f + (x2 - x1) * 16
+        w1f = w1f + (x0 - x2) * 16
+        w2f = w2f + (x1 - x0) * 16
+        fy = fy + 1
+    }
+    mem_liberar(tx)
+    retornar 0
+}
+
+// 0 para aristas superiores o izquierdas (incluyen el borde), -1 si no.
+funcion md_sesgo(ax, ay, bx, by) {
+    si (ay == by y bx < ax) { retornar 0 }
+    si (by < ay) { retornar 0 }
+    retornar 0 - 1
+}
+
+// Z-buffer nuevo (8 bytes por píxel, todo al fondo).
+funcion lienzo_zbuffer(ancho, alto) {
+    sea n = md_ent(ancho) * md_ent(alto)
+    sea s = md_buffer(n * 8)
+    sea p = str_datos(s)
+    __guardar64(p, 4611686018427387904)
+    md_duplicar(p, 8, n * 8)
+    retornar dyn_texto(s)
+}
+
+funcion lienzo_nuevo_buffer(ancho, alto) {
+    retornar dyn_texto(md_buffer(md_ent(ancho) * md_ent(alto) * 4))
+}
+
+funcion lienzo_fijar_pixel(pix, ancho, alto, x, y, r, g, b, a) {
+    sea w = md_ent(ancho)
+    sea h = md_ent(alto)
+    sea p = md_pixeles(pix, w, h)
+    sea fx = md_ent(x)
+    sea fy = md_ent(y)
+    si (fx < 0 o fy < 0 o fx >= w o fy >= h) { retornar 0 }
+    sea q = p + (fy * w + fx) * 4
+    __guardar8(q, md_ent(r))
+    __guardar8(q + 1, md_ent(g))
+    __guardar8(q + 2, md_ent(b))
+    __guardar8(q + 3, md_ent(a))
+    retornar 0
+}
+
+// Puntos de código de un texto UTF-8 (los bytes inválidos dan U+FFFD).
+funcion texto_codigos(t) {
+    sea s = dyn_a_str(t)
+    sea p = str_datos(s)
+    sea n = str_largo(s)
+    sea v = vec_nuevo()
+    sea i = 0
+    mientras (i < n) {
+        sea b = __cargar8(p + i)
+        sea cp = 65533
+        sea largo = 1
+        si (b < 128) { cp = b } sino {
+            si (b >= 194 y b < 224 y i + 1 < n) {
+                cp = __o_bits(__desplazar_izq(__y_bits(b, 31), 6), __y_bits(__cargar8(p + i + 1), 63))
+                largo = 2
+            } sino {
+                si (b >= 224 y b < 240 y i + 2 < n) {
+                    cp = __o_bits(__o_bits(__desplazar_izq(__y_bits(b, 15), 12), __desplazar_izq(__y_bits(__cargar8(p + i + 1), 63), 6)), __y_bits(__cargar8(p + i + 2), 63))
+                    largo = 3
+                } sino {
+                    si (b >= 240 y b < 245 y i + 3 < n) {
+                        cp = __o_bits(__o_bits(__desplazar_izq(__y_bits(b, 7), 18), __desplazar_izq(__y_bits(__cargar8(p + i + 1), 63), 12)), __o_bits(__desplazar_izq(__y_bits(__cargar8(p + i + 2), 63), 6), __y_bits(__cargar8(p + i + 3), 63)))
+                        largo = 4
+                    }
+                }
+            }
+        }
+        vec_agregar(v, dyn_entero(cp))
+        i = i + largo
+    }
+    retornar dyn_caja(2, v)
+}
+
+// ── Audio PCM ──────────────────────────────────────────────────────────────
+
+// WAV (PCM 8/16/24/32 bits y flotante de 32 bits) → [tasa, canales, pcm s16].
+funcion wav_decodificar(datos) {
+    sea s = dyn_a_str(datos)
+    sea p = str_datos(s)
+    sea n = str_largo(s)
+    si (n < 12 o md_be32(p) != 1380533830 o md_be32(p + 8) != 1463899717) { dyn_error("wav: no es un archivo RIFF/WAVE") }
+    sea pos = 12
+    sea formato = 0
+    sea canales = 0
+    sea tasa = 0
+    sea bits = 0
+    sea dp = 0
+    sea dn = 0
+    mientras (pos + 8 <= n) {
+        sea id = md_be32(p + pos)
+        sea largo = md_le32(p + pos + 4)
+        sea d = p + pos + 8
+        si (id == 1718449184) {
+            formato = md_le16(d)
+            canales = md_le16(d + 2)
+            tasa = md_le32(d + 4)
+            bits = md_le16(d + 14)
+            si (formato == 65534 y largo >= 26) { formato = md_le16(d + 24) }
+        }
+        si (id == 1684108385) {
+            dp = d
+            dn = largo
+            si (pos + 8 + dn > n) { dn = n - pos - 8 }
+        }
+        pos = pos + 8 + largo + __y_bits(largo, 1)
+    }
+    si (canales == 0 o dp == 0) { dyn_error("wav: faltan los bloques fmt o data") }
+    si (formato != 1 y formato != 3) { dyn_error("wav: solo PCM entero o flotante (sin compresión)") }
+    sea bpm = bits / 8
+    sea total = dn / bpm
+    sea r = md_buffer(total * 2)
+    sea q = str_datos(r)
+    sea i = 0
+    mientras (i < total) {
+        sea a = dp + i * bpm
+        sea v = 0
+        si (formato == 3) {
+            si (bits != 32) { dyn_error("wav: flotante solo de 32 bits") }
+            // f32 → s16 sin coma flotante: exponente y mantisa.
+            sea b = md_le32(a)
+            sea e = __y_bits(__desplazar_der(b, 23), 255)
+            sea m = __o_bits(__y_bits(b, 8388607), 8388608)
+            si (e == 0) { v = 0 } sino {
+                // valor = m * 2^(e - 150); escalar por 32767.
+                sea k = e - 150
+                v = m * 32767
+                si (k >= 0) { v = __desplazar_izq(v, k) } sino {
+                    si (k > 0 - 63) { v = __desplazar_der(v, 0 - k) } sino { v = 0 }
+                }
+                si (v > 32767) { v = 32767 }
+                si (__y_bits(b, 2147483648) != 0) { v = 0 - v }
+            }
+        } sino {
+            si (bits == 8) { v = (__cargar8(a) - 128) * 256 }
+            si (bits == 16) { v = md_c16(a) }
+            si (bits == 24) { v = md_c16(a + 1) }
+            si (bits == 32) { v = md_c16(a + 2) }
+        }
+        md_g16(q + i * 2, v)
+        i = i + 1
+    }
+    retornar md_lista3(dyn_entero(tasa), dyn_entero(canales), dyn_texto(r))
+}
+
+funcion wav_codificar(pcm, tasa, canales) {
+    sea s = dyn_a_str(pcm)
+    sea n = str_largo(s)
+    sea c = md_ent(canales)
+    sea t = md_ent(tasa)
+    sea r = str_nuevo(n + 44)
+    md_agregar_bytes(r, "82,73,70,70")
+    md_agregar_le32(r, n + 36)
+    md_agregar_bytes(r, "87,65,86,69,102,109,116,32,16,0,0,0,1,0")
+    str_agregar_byte(r, c)
+    str_agregar_byte(r, 0)
+    md_agregar_le32(r, t)
+    md_agregar_le32(r, t * c * 2)
+    str_agregar_byte(r, c * 2)
+    md_agregar_bytes(r, "0,16,0,100,97,116,97")
+    md_agregar_le32(r, n)
+    str_agregar(r, s)
+    retornar dyn_texto(r)
+}
+
+funcion md_agregar_le32(s, v) {
+    str_agregar_byte(s, __y_bits(v, 255))
+    str_agregar_byte(s, __y_bits(__desplazar_der(v, 8), 255))
+    str_agregar_byte(s, __y_bits(__desplazar_der(v, 16), 255))
+    str_agregar_byte(s, __y_bits(__desplazar_der(v, 24), 255))
+    retornar 0
+}
+
+// Lista de enteros (−32768..32767) → PCM s16.
+funcion pcm_de_lista(lista) {
+    sea v = dyn_dato(lista)
+    sea n = vec_largo(v)
+    sea r = md_buffer(n * 2)
+    sea q = str_datos(r)
+    sea i = 0
+    mientras (i < n) {
+        sea x = md_ent(vec_obtener(v, i))
+        si (x > 32767) { x = 32767 }
+        si (x < 0 - 32768) { x = 0 - 32768 }
+        md_g16(q + i * 2, x)
+        i = i + 1
+    }
+    retornar dyn_texto(r)
+}
+
+funcion pcm_muestra(pcm, i) { retornar dyn_entero(md_c16(str_datos(dyn_a_str(pcm)) + md_ent(i) * 2)) }
+
+// Mezcla una voz en un búfer estéreo s16 de `cuadros` cuadros.
+// params: [posición 16.16, paso 16.16, volumen izq, volumen der (0..65536),
+// bucle 0/1]. Devuelve la nueva posición o -1 si terminó.
+funcion pcm_mezclar(destino, cuadros, fuente, canales, params) {
+    sea dp = md_pixeles_audio(destino, md_ent(cuadros))
+    sea nc = md_ent(cuadros)
+    sea fs = dyn_a_str(fuente)
+    sea fp = str_datos(fs)
+    sea ch = md_ent(canales)
+    sea total = str_largo(fs) / 2 / ch
+    sea v = dyn_dato(params)
+    sea pos = md_ent(vec_obtener(v, 0))
+    sea paso = md_ent(vec_obtener(v, 1))
+    sea vi = md_ent(vec_obtener(v, 2))
+    sea vd = md_ent(vec_obtener(v, 3))
+    sea bucle = md_ent(vec_obtener(v, 4))
+    si (total == 0) { retornar dyn_entero(0 - 1) }
+    sea i = 0
+    mientras (i < nc) {
+        sea k = __desplazar_der(pos, 16)
+        si (k >= total) {
+            si (bucle == 1) {
+                pos = pos - __desplazar_izq(total, 16)
+                k = __desplazar_der(pos, 16)
+            } sino { retornar dyn_entero(0 - 1) }
+        }
+        sea fr = __y_bits(pos, 65535)
+        sea k2 = k + 1
+        si (k2 >= total) {
+            si (bucle == 1) { k2 = 0 } sino { k2 = k }
+        }
+        sea l = 0
+        sea r = 0
+        sea a0 = md_c16(fp + k * ch * 2)
+        sea a1 = md_c16(fp + k2 * ch * 2)
+        l = a0 + __desplazar_aritmetico((a1 - a0) * fr, 16)
+        si (ch >= 2) {
+            sea b0 = md_c16(fp + (k * ch + 1) * 2)
+            sea b1 = md_c16(fp + (k2 * ch + 1) * 2)
+            r = b0 + __desplazar_aritmetico((b1 - b0) * fr, 16)
+        } sino { r = l }
+        sea q = dp + i * 4
+        sea ml = md_c16(q) + __desplazar_aritmetico(l * vi, 16)
+        sea mr = md_c16(q + 2) + __desplazar_aritmetico(r * vd, 16)
+        si (ml > 32767) { ml = 32767 }
+        si (ml < 0 - 32768) { ml = 0 - 32768 }
+        si (mr > 32767) { mr = 32767 }
+        si (mr < 0 - 32768) { mr = 0 - 32768 }
+        md_g16(q, ml)
+        md_g16(q + 2, mr)
+        pos = pos + paso
+        i = i + 1
+    }
+    retornar dyn_entero(pos)
+}
+
+funcion md_pixeles_audio(destino, cuadros) {
+    sea s = dyn_a_str(destino)
+    si (str_largo(s) < cuadros * 4) { dyn_error("pcm_mezclar: el destino es más chico que cuadros × 4 bytes") }
+    si (__cargar64(s + 24) != 1) { dyn_error("pcm_mezclar: el destino debe ser un búfer propio") }
+    retornar str_datos(s)
+}
+
+funcion pcm_silencio(bytes) { retornar dyn_texto(md_buffer(md_ent(bytes))) }
+
+// Copia rápida de bytes a memoria C (para pasar píxeles a OpenGL o SDL).
+funcion c_desde_bytes(t) {
+    sea s = dyn_a_str(t)
+    sea p = mem_reservar(str_largo(s) + 1)
+    mem_copiar(p, str_datos(s), str_largo(s))
+    __guardar8(p + str_largo(s), 0)
+    retornar dyn_caja(11, p)
+}
+
+// Dirección de los datos de un texto (sin copiar). Válida mientras el texto
+// siga vivo y no cambie de tamaño.
+funcion bytes_direccion(t) { retornar dyn_caja(11, str_datos(dyn_a_str(t))) }

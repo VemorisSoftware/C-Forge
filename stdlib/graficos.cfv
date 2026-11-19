@@ -1,0 +1,472 @@
+// stdlib/graficos.cfv — gráficos 2D y 3D por software, en C-Forge puro.
+//
+// Un lienzo es una imagen RGBA con z-buffer opcional. Todo el rasterizado
+// (antialiasing, mezcla alfa, texturas, z-buffer) está escrito en C-Forge y
+// da el mismo resultado, píxel a píxel, en Linux, macOS, Windows y
+// WebAssembly. Para ventanas usa juego.cfv (SDL2) o navegador.cfv.
+//
+//   importar "graficos"
+//   sea l = lienzo_crear(320, 200)
+//   lienzo_limpiar(l, [20, 20, 40])
+//   lienzo_circulo(l, 160, 100, 50, [255, 120, 0])
+//   lienzo_guardar(l, "dibujo.png")
+//
+// 3D: mallas (modelo.cfv), cámara en perspectiva, luz direccional, texturas
+// con corrección de perspectiva y recorte contra el plano cercano.
+
+importar "imagen"
+
+// ── Lienzo ──────────────────────────────────────────────────────────────────
+
+funcion lienzo_crear(ancho, alto) {
+    sea img = imagen_nueva(ancho, alto)
+    img["z"] = nulo
+    retornar img
+}
+
+funcion lienzo_de_imagen(img) {
+    sea l = imagen_copiar(img)
+    l["z"] = nulo
+    retornar l
+}
+
+// Opción de un mapa con valor por defecto.
+funcion _op(m, k, defecto) {
+    si (m != nulo y tiene_clave(m, k)) { retornar m[k] }
+    retornar defecto
+}
+
+funcion _alfa(color) {
+    si (longitud(color) > 3) { retornar color[3] }
+    retornar 255
+}
+
+funcion lienzo_limpiar(l, color = [0, 0, 0, 255]) {
+    lienzo_llenar(l["pixeles"], l["ancho"], l["alto"], color[0], color[1], color[2], _alfa(color))
+    si (l["z"] != nulo) { lienzo_zlimpiar(l["z"], l["ancho"], l["alto"]) }
+    retornar l
+}
+
+funcion lienzo_guardar(l, ruta) { retornar imagen_guardar(l, ruta) }
+
+// Color desde "#rrggbb" o "#rrggbbaa".
+funcion color_hex(t) {
+    sea h = t
+    si (texto_empieza_con(h, "#")) { h = subtexto(h, 1, longitud(h)) }
+    sea b = bytes_de_hex(h)
+    si (longitud(b) == 3) { retornar [byte_en(b, 0), byte_en(b, 1), byte_en(b, 2), 255] }
+    si (longitud(b) == 4) { retornar [byte_en(b, 0), byte_en(b, 1), byte_en(b, 2), byte_en(b, 3)] }
+    lanzar "color_hex: se espera #rrggbb o #rrggbbaa"
+}
+
+// ── Formas 2D con antialiasing ─────────────────────────────────────────────
+
+funcion _fijo(v) { retornar piso(v * 256 + 0.5) }
+
+funcion _contorno(puntos) {
+    sea c = []
+    para p en puntos {
+        agregar(c, _fijo(p[0]))
+        agregar(c, _fijo(p[1]))
+    }
+    retornar c
+}
+
+funcion lienzo_poligono_relleno(l, puntos, color, par_impar = falso) {
+    sea regla = 0
+    si (par_impar) { regla = 1 }
+    lienzo_poligono(l["pixeles"], l["ancho"], l["alto"], [_contorno(puntos)], color[0], color[1], color[2], _alfa(color), regla)
+    retornar l
+}
+
+// Varios contornos a la vez (agujeros con sentido contrario o par-impar).
+funcion lienzo_contornos(l, contornos, color, par_impar = falso) {
+    sea cs = []
+    para c en contornos { agregar(cs, _contorno(c)) }
+    sea regla = 0
+    si (par_impar) { regla = 1 }
+    lienzo_poligono(l["pixeles"], l["ancho"], l["alto"], cs, color[0], color[1], color[2], _alfa(color), regla)
+    retornar l
+}
+
+funcion lienzo_rectangulo(l, x, y, ancho, alto, color) {
+    si (piso(x) == x y piso(y) == y y piso(ancho) == ancho y piso(alto) == alto) {
+        lienzo_rect(l["pixeles"], l["ancho"], l["alto"], x, y, ancho, alto, color[0], color[1], color[2], _alfa(color))
+        retornar l
+    }
+    retornar lienzo_poligono_relleno(l, [[x, y], [x + ancho, y], [x + ancho, y + alto], [x, y + alto]], color)
+}
+
+funcion _segmentos(radio) {
+    sea n = piso(radio * 1.5) + 12
+    si (n > 360) { n = 360 }
+    retornar n
+}
+
+funcion _puntos_elipse(cx, cy, rx, ry, desde, hasta, n) {
+    sea pts = []
+    sea i = 0
+    mientras (i <= n) {
+        sea a = desde + (hasta - desde) * i / n
+        agregar(pts, [cx + coseno(a) * rx, cy + seno(a) * ry])
+        i = i + 1
+    }
+    retornar pts
+}
+
+funcion lienzo_elipse(l, cx, cy, rx, ry, color) {
+    sea n = _segmentos(maximo(rx, ry))
+    sea pts = _puntos_elipse(cx, cy, rx, ry, 0, 6.283185307179586, n)
+    quitar_ultimo(pts)
+    retornar lienzo_poligono_relleno(l, pts, color)
+}
+
+funcion lienzo_circulo(l, cx, cy, radio, color) { retornar lienzo_elipse(l, cx, cy, radio, radio, color) }
+
+// Aro (borde de círculo) de grosor dado.
+funcion lienzo_circulo_borde(l, cx, cy, radio, grosor, color) {
+    sea n = _segmentos(radio)
+    sea fuera = _puntos_elipse(cx, cy, radio + grosor / 2, radio + grosor / 2, 0, 6.283185307179586, n)
+    sea dentro = _puntos_elipse(cx, cy, radio - grosor / 2, radio - grosor / 2, 6.283185307179586, 0, n)
+    quitar_ultimo(fuera)
+    quitar_ultimo(dentro)
+    retornar lienzo_contornos(l, [fuera, dentro], color)
+}
+
+// Línea de grosor dado con extremos redondeados.
+funcion lienzo_linea(l, x0, y0, x1, y1, color, grosor = 1) {
+    sea dx = x1 - x0
+    sea dy = y1 - y0
+    sea largo = raiz(dx * dx + dy * dy)
+    si (largo == 0) { retornar lienzo_circulo(l, x0, y0, grosor / 2, color) }
+    sea r = grosor / 2
+    sea ang = _angulo(dx, dy)
+    sea n = piso(_segmentos(r) / 2) + 2
+    sea pts = _puntos_elipse(x1, y1, r, r, ang - 1.5707963267948966, ang + 1.5707963267948966, n)
+    para p en _puntos_elipse(x0, y0, r, r, ang + 1.5707963267948966, ang + 4.71238898038469, n) { agregar(pts, p) }
+    retornar lienzo_poligono_relleno(l, pts, color)
+}
+
+funcion _angulo(dx, dy) {
+    si (dx == 0) {
+        si (dy > 0) { retornar 1.5707963267948966 }
+        retornar 0 - 1.5707963267948966
+    }
+    sea a = arcotangente(dy / dx)
+    si (dx < 0) { a = a + 3.141592653589793 }
+    retornar a
+}
+
+funcion lienzo_polilinea(l, puntos, color, grosor = 1) {
+    sea i = 0
+    mientras (i + 1 < longitud(puntos)) {
+        lienzo_linea(l, puntos[i][0], puntos[i][1], puntos[i + 1][0], puntos[i + 1][1], color, grosor)
+        i = i + 1
+    }
+    retornar l
+}
+
+funcion lienzo_rectangulo_redondeado(l, x, y, ancho, alto, radio, color) {
+    sea r = minimo(radio, minimo(ancho, alto) / 2)
+    sea n = piso(_segmentos(r) / 4) + 2
+    sea pi = 3.141592653589793
+    sea pts = _puntos_elipse(x + ancho - r, y + r, r, r, 0 - pi / 2, 0, n)
+    para p en _puntos_elipse(x + ancho - r, y + alto - r, r, r, 0, pi / 2, n) { agregar(pts, p) }
+    para p en _puntos_elipse(x + r, y + alto - r, r, r, pi / 2, pi, n) { agregar(pts, p) }
+    para p en _puntos_elipse(x + r, y + r, r, r, pi, pi * 1.5, n) { agregar(pts, p) }
+    retornar lienzo_poligono_relleno(l, pts, color)
+}
+
+funcion lienzo_triangulo2d(l, x0, y0, x1, y1, x2, y2, color) {
+    retornar lienzo_poligono_relleno(l, [[x0, y0], [x1, y1], [x2, y2]], color)
+}
+
+// Dibuja una imagen. opciones: ancho, alto, alfa (0–255), suave (bilineal),
+// recorte [x, y, ancho, alto] y tinte [r, g, b].
+funcion lienzo_imagen(l, img, x, y, opciones = {}) {
+    sea rec = _op(opciones, "recorte", [0, 0, img["ancho"], img["alto"]])
+    sea ancho = _op(opciones, "ancho", rec[2])
+    sea alto = _op(opciones, "alto", rec[3])
+    sea tinte = _op(opciones, "tinte", [255, 255, 255])
+    sea bil = 0
+    si (_op(opciones, "suave", falso)) { bil = 1 }
+    lienzo_copiar(l["pixeles"], l["ancho"], l["alto"], img["pixeles"], img["ancho"], img["alto"], [piso(x), piso(y), piso(ancho), piso(alto), rec[0], rec[1], rec[2], rec[3], _op(opciones, "alfa", 255), bil, tinte[0], tinte[1], tinte[2]])
+    retornar l
+}
+
+// ── Álgebra 3D (matrices 4×4 por filas, vectores columna) ──────────────────
+
+funcion v3_resta(a, b) { retornar [a[0] - b[0], a[1] - b[1], a[2] - b[2]] }
+funcion v3_suma(a, b) { retornar [a[0] + b[0], a[1] + b[1], a[2] + b[2]] }
+funcion v3_escalar(a, k) { retornar [a[0] * k, a[1] * k, a[2] * k] }
+funcion v3_punto(a, b) { retornar a[0] * b[0] + a[1] * b[1] + a[2] * b[2] }
+funcion v3_cruz(a, b) { retornar [a[1] * b[2] - a[2] * b[1], a[2] * b[0] - a[0] * b[2], a[0] * b[1] - a[1] * b[0]] }
+funcion v3_largo(a) { retornar raiz(v3_punto(a, a)) }
+funcion v3_normalizar(a) {
+    sea n = v3_largo(a)
+    si (n == 0) { retornar [0, 0, 0] }
+    retornar [a[0] / n, a[1] / n, a[2] / n]
+}
+
+funcion m4_identidad() { retornar [1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1] }
+
+funcion m4_mul(a, b) {
+    sea r = []
+    sea i = 0
+    mientras (i < 4) {
+        sea j = 0
+        mientras (j < 4) {
+            agregar(r, a[i * 4] * b[j] + a[i * 4 + 1] * b[4 + j] + a[i * 4 + 2] * b[8 + j] + a[i * 4 + 3] * b[12 + j])
+            j = j + 1
+        }
+        i = i + 1
+    }
+    retornar r
+}
+
+funcion m4_traslacion(x, y, z) { retornar [1, 0, 0, x, 0, 1, 0, y, 0, 0, 1, z, 0, 0, 0, 1] }
+funcion m4_escala(x, y, z) { retornar [x, 0, 0, 0, 0, y, 0, 0, 0, 0, z, 0, 0, 0, 0, 1] }
+
+funcion m4_rotacion_x(grados) {
+    sea a = grados * 0.017453292519943295
+    sea c = coseno(a)
+    sea s = seno(a)
+    retornar [1, 0, 0, 0, 0, c, 0 - s, 0, 0, s, c, 0, 0, 0, 0, 1]
+}
+
+funcion m4_rotacion_y(grados) {
+    sea a = grados * 0.017453292519943295
+    sea c = coseno(a)
+    sea s = seno(a)
+    retornar [c, 0, s, 0, 0, 1, 0, 0, 0 - s, 0, c, 0, 0, 0, 0, 1]
+}
+
+funcion m4_rotacion_z(grados) {
+    sea a = grados * 0.017453292519943295
+    sea c = coseno(a)
+    sea s = seno(a)
+    retornar [c, 0 - s, 0, 0, s, c, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1]
+}
+
+// Proyección en perspectiva estilo OpenGL (z de -1 a 1).
+funcion m4_perspectiva(fov_grados, aspecto, cerca, lejos) {
+    sea f = 1 / tangente(fov_grados * 0.008726646259971648)
+    retornar [f / aspecto, 0, 0, 0, 0, f, 0, 0, 0, 0, (lejos + cerca) / (cerca - lejos), 2 * lejos * cerca / (cerca - lejos), 0, 0, 0 - 1, 0]
+}
+
+funcion m4_mirar(ojo, objetivo, arriba = [0, 1, 0]) {
+    sea f = v3_normalizar(v3_resta(objetivo, ojo))
+    sea s = v3_normalizar(v3_cruz(f, arriba))
+    sea u = v3_cruz(s, f)
+    retornar [s[0], s[1], s[2], 0 - v3_punto(s, ojo), u[0], u[1], u[2], 0 - v3_punto(u, ojo), 0 - f[0], 0 - f[1], 0 - f[2], v3_punto(f, ojo), 0, 0, 0, 1]
+}
+
+funcion m4_aplicar(m, v) {
+    sea w = 1
+    si (longitud(v) > 3) { w = v[3] }
+    retornar [m[0] * v[0] + m[1] * v[1] + m[2] * v[2] + m[3] * w, m[4] * v[0] + m[5] * v[1] + m[6] * v[2] + m[7] * w, m[8] * v[0] + m[9] * v[1] + m[10] * v[2] + m[11] * w, m[12] * v[0] + m[13] * v[1] + m[14] * v[2] + m[15] * w]
+}
+
+// ── Cámara ─────────────────────────────────────────────────────────────────
+
+funcion camara3d(posicion, objetivo, fov = 60, cerca = 0.1, lejos = 100) {
+    retornar {"posicion": posicion, "objetivo": objetivo, "arriba": [0, 1, 0], "fov": fov, "cerca": cerca, "lejos": lejos}
+}
+
+funcion camara_vista(cam) { retornar m4_mirar(cam["posicion"], cam["objetivo"], cam["arriba"]) }
+
+funcion camara_matriz(cam, aspecto) {
+    retornar m4_mul(m4_perspectiva(cam["fov"], aspecto, cam["cerca"], cam["lejos"]), camara_vista(cam))
+}
+
+// Gira la cámara alrededor de su objetivo (grados en horizontal y vertical).
+funcion camara_orbitar(cam, horizontal, vertical = 0) {
+    sea d = v3_resta(cam["posicion"], cam["objetivo"])
+    sea r = v3_largo(d)
+    sea az = _angulo(d[2], d[0]) + horizontal * 0.017453292519943295
+    sea el = arcoseno(d[1] / r) + vertical * 0.017453292519943295
+    si (el > 1.55) { el = 1.55 }
+    si (el < 0 - 1.55) { el = 0 - 1.55 }
+    cam["posicion"] = [cam["objetivo"][0] + r * coseno(el) * seno(az), cam["objetivo"][1] + r * seno(el), cam["objetivo"][2] + r * coseno(el) * coseno(az)]
+    retornar cam
+}
+
+// ── Mallas en el lienzo ────────────────────────────────────────────────────
+
+funcion _recortar_cerca(vs) {
+    // Sutherland–Hodgman contra z >= -w en espacio de recorte.
+    sea fuera = []
+    sea n = longitud(vs)
+    sea i = 0
+    mientras (i < n) {
+        sea a = vs[i]
+        sea b = vs[(i + 1) % n]
+        sea da = a[2] + a[3]
+        sea db = b[2] + b[3]
+        si (da >= 0) { agregar(fuera, a) }
+        si ((da >= 0) != (db >= 0)) {
+            sea t = da / (da - db)
+            sea v = []
+            sea k = 0
+            mientras (k < longitud(a)) {
+                agregar(v, a[k] + (b[k] - a[k]) * t)
+                k = k + 1
+            }
+            agregar(fuera, v)
+        }
+        i = i + 1
+    }
+    retornar fuera
+}
+
+funcion _vertice_pantalla(v, ancho, alto, wmin, tw, th) {
+    sea w = v[3]
+    sea x = (v[0] / w + 1) * 0.5 * ancho
+    sea y = (1 - v[1] / w) * 0.5 * alto
+    sea z = (v[2] / w + 1) * 0.5
+    si (z < 0) { z = 0 }
+    si (z > 1) { z = 1 }
+    retornar [piso(x * 16), piso(y * 16), piso(z * 16777215), piso(65536 * wmin / w), _byte(v[4]), _byte(v[5]), _byte(v[6]), _byte(v[7]), piso(v[8] * tw * 65536), piso(v[9] * th * 65536)]
+}
+
+funcion _byte(v) {
+    si (v < 0) { retornar 0 }
+    si (v > 255) { retornar 255 }
+    retornar piso(v + 0.5)
+}
+
+// Dibuja una malla. opciones: color [r,g,b,a], textura (imagen), luz
+// (dirección), ambiente (0–1), cara_doble, suave (textura bilineal),
+// alambre (color de aristas) y transparente (mezcla alfa).
+funcion lienzo_malla(l, malla, modelo, cam, opciones = {}) {
+    si (l["z"] == nulo) { l["z"] = lienzo_zbuffer(l["ancho"], l["alto"]) }
+    sea mvp = m4_mul(camara_matriz(cam, l["ancho"] / l["alto"]), modelo)
+    sea base = _op(opciones, "color", [255, 255, 255, 255])
+    sea ba = _alfa(base)
+    sea luz = v3_normalizar(_op(opciones, "luz", [0 - 0.4, 0 - 1, 0 - 0.6]))
+    sea ambiente = _op(opciones, "ambiente", 0.25)
+    sea textura = _op(opciones, "textura", nulo)
+    sea tw = 1
+    sea th = 1
+    sea tpix = nulo
+    si (textura != nulo) {
+        tw = textura["ancho"]
+        th = textura["alto"]
+        tpix = textura["pixeles"]
+    }
+    sea op = 2 + 4
+    si (_op(opciones, "cara_doble", falso) == falso) { op = op + 1 }
+    si (_op(opciones, "suave", verdadero)) { op = op + 8 }
+    si (_op(opciones, "transparente", falso)) { op = op + 16 }
+    sea pos = malla["posiciones"]
+    sea nor = _op(malla, "normales", nulo)
+    sea uvs = _op(malla, "uvs", nulo)
+    sea ind = malla["indices"]
+    // Vértices transformados: [cx, cy, cz, cw, r, g, b, a, u, v] y la tabla
+    // de pantalla para el runtime (11 enteros por vértice).
+    sea nv = longitud(pos) / 3
+    sea tv = []
+    sea tabla = []
+    sea ancho = l["ancho"]
+    sea alto = l["alto"]
+    sea m = mvp
+    sea md = modelo
+    sea lx = luz[0]
+    sea ly = luz[1]
+    sea lz = luz[2]
+    sea i = 0
+    mientras (i < nv) {
+        sea px = pos[i * 3]
+        sea py = pos[i * 3 + 1]
+        sea pz = pos[i * 3 + 2]
+        sea cx = m[0] * px + m[1] * py + m[2] * pz + m[3]
+        sea cy = m[4] * px + m[5] * py + m[6] * pz + m[7]
+        sea cz = m[8] * px + m[9] * py + m[10] * pz + m[11]
+        sea cw = m[12] * px + m[13] * py + m[14] * pz + m[15]
+        sea k = 1
+        si (nor != nulo) {
+            sea nx = nor[i * 3]
+            sea ny = nor[i * 3 + 1]
+            sea nz = nor[i * 3 + 2]
+            sea wx = md[0] * nx + md[1] * ny + md[2] * nz
+            sea wy = md[4] * nx + md[5] * ny + md[6] * nz
+            sea wz = md[8] * nx + md[9] * ny + md[10] * nz
+            sea largo = raiz(wx * wx + wy * wy + wz * wz)
+            si (largo > 0) {
+                sea d = 0 - (wx * lx + wy * ly + wz * lz) / largo
+                si (d < 0) { d = 0 }
+                k = ambiente + (1 - ambiente) * d
+            } sino { k = ambiente }
+        }
+        sea u = 0
+        sea vv = 0
+        si (uvs != nulo) {
+            u = uvs[i * 2]
+            vv = 1 - uvs[i * 2 + 1]
+        }
+        sea vert = [cx, cy, cz, cw, base[0] * k, base[1] * k, base[2] * k, ba, u, vv]
+        agregar(tv, vert)
+        si (cz + cw >= 0 y cw > 0) {
+            sea iw = 1 / cw
+            agregar(tabla, piso((cx * iw + 1) * 0.5 * ancho * 16))
+            agregar(tabla, piso((1 - cy * iw) * 0.5 * alto * 16))
+            sea z = (cz * iw + 1) * 0.5
+            si (z > 1) { z = 1 }
+            agregar(tabla, piso(z * 16777215))
+            agregar(tabla, piso(iw * 1073741824))
+            agregar(tabla, _byte(vert[4]))
+            agregar(tabla, _byte(vert[5]))
+            agregar(tabla, _byte(vert[6]))
+            agregar(tabla, _byte(ba))
+            agregar(tabla, piso(u * tw * 65536))
+            agregar(tabla, piso(vv * th * 65536))
+            agregar(tabla, 0)
+        } sino {
+            para x en [0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1] { agregar(tabla, x) }
+        }
+        i = i + 1
+    }
+    sea dibujados = lienzo_triangulos(l["pixeles"], l["z"], ancho, alto, tabla, ind, tpix, tw, th, op)
+    // Triángulos que cruzan el plano cercano: recorte y dibujo uno a uno.
+    sea t = 0
+    mientras (t + 2 < longitud(ind)) {
+        sea a = ind[t]
+        sea b = ind[t + 1]
+        sea c = ind[t + 2]
+        si (tabla[a * 11 + 10] == 1 o tabla[b * 11 + 10] == 1 o tabla[c * 11 + 10] == 1) {
+            sea poli = _recortar_cerca([tv[a], tv[b], tv[c]])
+            sea j = 1
+            mientras (j + 1 < longitud(poli)) {
+                sea va = poli[0]
+                sea vb = poli[j + 1]
+                sea vc = poli[j]
+                sea wmin = minimo(va[3], minimo(vb[3], vc[3]))
+                sea verts = []
+                para v en [va, vb, vc] {
+                    para x en _vertice_pantalla(v, ancho, alto, wmin, tw, th) { agregar(verts, x) }
+                }
+                lienzo_triangulo(l["pixeles"], l["z"], ancho, alto, verts, tpix, tw, th, op)
+                dibujados = dibujados + 1
+                j = j + 1
+            }
+        }
+        t = t + 3
+    }
+    si (_op(opciones, "alambre", nulo) != nulo) {
+        sea ca = opciones["alambre"]
+        t = 0
+        mientras (t + 2 < longitud(ind)) {
+            sea pts = []
+            para k en [0, 1, 2] {
+                sea v = tv[ind[t + k]]
+                si (v[3] > 0) { agregar(pts, [(v[0] / v[3] + 1) * 0.5 * l["ancho"], (1 - v[1] / v[3]) * 0.5 * l["alto"]]) }
+            }
+            si (longitud(pts) == 3) {
+                agregar(pts, pts[0])
+                lienzo_polilinea(l, pts, ca, 1)
+            }
+            t = t + 3
+        }
+    }
+    retornar dibujados
+}

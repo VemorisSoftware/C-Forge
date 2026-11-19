@@ -1,5 +1,18 @@
-// stdlib/fisica3d.cfv — Motor de física 3D
-// C-Forge Standard Library v3.0
+// stdlib/fisica3d.cfv — motor de física 3D.
+//
+// Esferas, cajas alineadas a los ejes y planos estáticos, con contactos
+// esfera–esfera, esfera–caja, caja–caja, esfera–plano y caja–plano, y un
+// solver de impulsos secuenciales con fricción, rebote y corrección de
+// penetración. Las cajas no rotan (colisión AABB); la orientación del
+// transform se integra desde vel_angular para la parte visual. Raycast
+// contra todas las formas.
+//
+//   importar "fisica3d"
+//   sea mundo = f3d_mundo_crear()
+//   sea piso_ = f3d_cuerpo_crear(0, 0, 0, 0)
+//   f3d_agregar_forma(piso_, forma_plano(0, 1, 0, 0))
+//   sea bola = f3d_cuerpo_crear(0, 5, 0, 1)
+//   f3d_agregar_forma(bola, forma_esfera(0.5))
 
 // ── Vectores 3D ────────────────────────────────────────────────────────────────
 
@@ -187,8 +200,33 @@ funcion f3d_cuerpo_crear(pos_x, pos_y, pos_z, masa) {
         "tipo": "dinamico",
         "friccion": 0.3,
         "rebote": 0.2,
-        "id": aleatorio_entero(100000, 999999)
+        "formas": [],
+        "activo": verdadero,
+        "id": _f3d_nuevo_id()
     }
+}
+
+sea _f3d_ids = 0
+funcion _f3d_nuevo_id() {
+    _f3d_ids = _f3d_ids + 1
+    retornar _f3d_ids
+}
+
+funcion forma_esfera(radio) { retornar {"tipo": "esfera", "radio": radio} }
+funcion forma_caja(ancho, alto, profundo) { retornar {"tipo": "caja", "media": [ancho / 2, alto / 2, profundo / 2]} }
+// Plano estático: normal (nx, ny, nz) y distancia d (n · p = d).
+funcion forma_plano(nx, ny, nz, d) {
+    sea l = raiz(nx * nx + ny * ny + nz * nz)
+    retornar {"tipo": "plano", "normal": [nx / l, ny / l, nz / l], "d": d / l}
+}
+
+funcion f3d_agregar_forma(cuerpo, forma) {
+    agregar(cuerpo["formas"], forma)
+    si (forma["tipo"] == "plano" o cuerpo["masa"] == 0) {
+        cuerpo["tipo"] = "estatico"
+        cuerpo["masa_inv"] = 0
+    }
+    retornar forma
 }
 
 funcion f3d_aplicar_fuerza(cuerpo, fx, fy, fz) {
@@ -250,7 +288,7 @@ funcion f3d_mundo_crear() {
     retornar {
         "cuerpos": [],
         "gravedad": vec3(0, -9.8, 0),
-        "iteraciones": 6
+        "iteraciones": 10
     }
 }
 
@@ -259,32 +297,323 @@ funcion f3d_agregar_cuerpo(mundo, cuerpo) {
     retornar cuerpo
 }
 
-funcion f3d_paso(mundo, delta) {
-    para cuerpo en mundo["cuerpos"] {
-        f3d_integrar(cuerpo, delta, mundo["gravedad"])
+funcion _f3d_pos(c) {
+    sea p = c["transform"]["pos"]
+    retornar [p["x"], p["y"], p["z"]]
+}
+
+// Contacto: [n (de A a B), punto, penetración] o nulo.
+funcion _f3d_colisionar(fa, pa, fb, pb) {
+    sea ta = fa["tipo"]
+    sea tb = fb["tipo"]
+    si (ta == "plano" y tb == "plano") { retornar nulo }
+    si (tb == "plano") { retornar _f3d_contra_plano(fa, pa, fb, 1) }
+    si (ta == "plano") { retornar _f3d_contra_plano(fb, pb, fa, 0 - 1) }
+    si (ta == "esfera" y tb == "esfera") {
+        sea d = [pb[0] - pa[0], pb[1] - pa[1], pb[2] - pa[2]]
+        sea l = raiz(d[0] * d[0] + d[1] * d[1] + d[2] * d[2])
+        sea r = fa["radio"] + fb["radio"]
+        si (l >= r) { retornar nulo }
+        sea n = [0, 1, 0]
+        si (l > 0.0000001) { n = [d[0] / l, d[1] / l, d[2] / l] }
+        retornar [n, [pa[0] + n[0] * fa["radio"], pa[1] + n[1] * fa["radio"], pa[2] + n[2] * fa["radio"]], r - l]
     }
+    si (ta == "caja" y tb == "esfera") { retornar _f3d_caja_esfera(fa, pa, fb, pb, 1) }
+    si (ta == "esfera" y tb == "caja") { retornar _f3d_caja_esfera(fb, pb, fa, pa, 0 - 1) }
+    // Caja–caja: eje de menor penetración.
+    sea ha = fa["media"]
+    sea hb = fb["media"]
+    sea mejor = 1000000000
+    sea eje = 0
+    sea signo = 1
+    sea k = 0
+    mientras (k < 3) {
+        sea d = pb[k] - pa[k]
+        sea o = ha[k] + hb[k] - absoluto(d)
+        si (o <= 0) { retornar nulo }
+        si (o < mejor) {
+            mejor = o
+            eje = k
+            si (d < 0) { signo = 0 - 1 } sino { signo = 1 }
+        }
+        k = k + 1
+    }
+    sea n = [0, 0, 0]
+    n[eje] = signo
+    // Punto: centro de la zona solapada.
+    sea punto = []
+    k = 0
+    mientras (k < 3) {
+        sea lo = maximo(pa[k] - ha[k], pb[k] - hb[k])
+        sea hi = minimo(pa[k] + ha[k], pb[k] + hb[k])
+        agregar(punto, (lo + hi) / 2)
+        k = k + 1
+    }
+    retornar [n, punto, mejor]
+}
+
+funcion _f3d_caja_esfera(caja, pc, esfera, pe, signo) {
+    sea h = caja["media"]
+    sea q = []
+    sea dentro = verdadero
+    sea k = 0
+    mientras (k < 3) {
+        sea v = maximo(pc[k] - h[k], minimo(pe[k], pc[k] + h[k]))
+        si (v != pe[k]) { dentro = falso }
+        agregar(q, v)
+        k = k + 1
+    }
+    sea r = esfera["radio"]
+    si (dentro) {
+        // Centro dentro de la caja: salir por la cara más cercana.
+        sea mejor = 1000000000
+        sea n = [0, 1, 0]
+        k = 0
+        mientras (k < 3) {
+            sea d1 = pc[k] + h[k] - pe[k]
+            sea d2 = pe[k] - (pc[k] - h[k])
+            si (d1 < mejor) {
+                mejor = d1
+                n = [0, 0, 0]
+                n[k] = 1
+            }
+            si (d2 < mejor) {
+                mejor = d2
+                n = [0, 0, 0]
+                n[k] = 0 - 1
+            }
+            k = k + 1
+        }
+        retornar [[n[0] * signo, n[1] * signo, n[2] * signo], pe, mejor + r]
+    }
+    sea d = [pe[0] - q[0], pe[1] - q[1], pe[2] - q[2]]
+    sea l = raiz(d[0] * d[0] + d[1] * d[1] + d[2] * d[2])
+    si (l >= r) { retornar nulo }
+    retornar [[d[0] / l * signo, d[1] / l * signo, d[2] / l * signo], q, r - l]
+}
+
+funcion _f3d_contra_plano(f, p, plano, signo) {
+    // signo 1: f es A y el plano es B (normal de A a B = -n del plano).
+    sea n = plano["normal"]
+    sea d = plano["d"]
+    si (f["tipo"] == "esfera") {
+        sea dist = n[0] * p[0] + n[1] * p[1] + n[2] * p[2] - d
+        si (dist >= f["radio"]) { retornar nulo }
+        sea punto = [p[0] - n[0] * dist, p[1] - n[1] * dist, p[2] - n[2] * dist]
+        retornar [[0 - n[0] * signo, 0 - n[1] * signo, 0 - n[2] * signo], punto, f["radio"] - dist]
+    }
+    // Caja: vértice más hundido.
+    sea h = f["media"]
+    sea peor = 1000000000
+    sea punto = nulo
+    para sx en [0 - 1, 1] {
+        para sy en [0 - 1, 1] {
+            para sz en [0 - 1, 1] {
+                sea v = [p[0] + sx * h[0], p[1] + sy * h[1], p[2] + sz * h[2]]
+                sea dist = n[0] * v[0] + n[1] * v[1] + n[2] * v[2] - d
+                si (dist < peor) {
+                    peor = dist
+                    punto = v
+                }
+            }
+        }
+    }
+    si (peor >= 0) { retornar nulo }
+    retornar [[0 - n[0] * signo, 0 - n[1] * signo, 0 - n[2] * signo], punto, 0 - peor]
+}
+
+funcion _f3d_dinamico(c) { retornar c["activo"] y c["tipo"] == "dinamico" }
+
+funcion f3d_paso(mundo, delta) {
+    si (delta <= 0) { retornar mundo }
+    sea cuerpos = mundo["cuerpos"]
+    sea g = mundo["gravedad"]
+    para c en cuerpos {
+        si (_f3d_dinamico(c)) {
+            c["vel"]["x"] = c["vel"]["x"] + (c["fuerza"]["x"] * c["masa_inv"] + g["x"]) * delta
+            c["vel"]["y"] = c["vel"]["y"] + (c["fuerza"]["y"] * c["masa_inv"] + g["y"]) * delta
+            c["vel"]["z"] = c["vel"]["z"] + (c["fuerza"]["z"] * c["masa_inv"] + g["z"]) * delta
+        }
+        c["fuerza"] = vec3(0, 0, 0)
+    }
+    // Contactos (todos contra todos, con descarte por cajas envolventes).
+    sea contactos = []
+    sea n = longitud(cuerpos)
+    sea i = 0
+    mientras (i < n) {
+        sea a = cuerpos[i]
+        sea j = i + 1
+        mientras (j < n) {
+            sea b = cuerpos[j]
+            si (a["activo"] y b["activo"] y (_f3d_dinamico(a) o _f3d_dinamico(b))) {
+                sea pa = _f3d_pos(a)
+                sea pb = _f3d_pos(b)
+                para fa en a["formas"] {
+                    para fb en b["formas"] {
+                        sea k = _f3d_colisionar(fa, pa, fb, pb)
+                        si (k != nulo) { agregar(contactos, _f3d_preparar(a, b, k, delta)) }
+                    }
+                }
+            }
+            j = j + 1
+        }
+        i = i + 1
+    }
+    sea it = 0
+    mientras (it < mundo["iteraciones"]) {
+        para k en contactos { _f3d_resolver(k) }
+        it = it + 1
+    }
+    para c en cuerpos {
+        si (_f3d_dinamico(c)) {
+            sea p = c["transform"]["pos"]
+            p["x"] = p["x"] + c["vel"]["x"] * delta
+            p["y"] = p["y"] + c["vel"]["y"] * delta
+            p["z"] = p["z"] + c["vel"]["z"] * delta
+            sea w = c["vel_angular"]
+            sea wl = vec3_magnitud(w)
+            si (wl > 0) { transform3d_rotar(c["transform"], wl * delta, vec3_escalar(w, 1 / wl)) }
+        }
+    }
+    mundo["contactos"] = []
+    para k en contactos { agregar(mundo["contactos"], {"a": k[0], "b": k[1], "normal": vec3(k[2][0], k[2][1], k[2][2])}) }
+    si (tiene_clave(mundo, "al_chocar") y mundo["al_chocar"] != nulo) {
+        para k en mundo["contactos"] { mundo["al_chocar"](k["a"], k["b"], k) }
+    }
+    retornar mundo
+}
+
+funcion _f3d_preparar(a, b, k, delta) {
+    sea mia = 0
+    sea mib = 0
+    si (_f3d_dinamico(a)) { mia = a["masa_inv"] }
+    si (_f3d_dinamico(b)) { mib = b["masa_inv"] }
+    sea masa = 0
+    si (mia + mib > 0) { masa = 1 / (mia + mib) }
+    sea n = k[0]
+    sea vr = [b["vel"]["x"] - a["vel"]["x"], b["vel"]["y"] - a["vel"]["y"], b["vel"]["z"] - a["vel"]["z"]]
+    sea vn = vr[0] * n[0] + vr[1] * n[1] + vr[2] * n[2]
+    sea e = maximo(a["rebote"], b["rebote"])
+    sea sesgo = 0.2 / delta * maximo(0, k[2] - 0.005)
+    si (vn < 0 - 1) { sesgo = maximo(sesgo, 0 - e * vn) }
+    // [a, b, n, masa, sesgo, Pn, mu, mia, mib, Pt (vector)]
+    retornar [a, b, n, masa, sesgo, 0, raiz(a["friccion"] * b["friccion"]), mia, mib, [0, 0, 0]]
+}
+
+funcion _f3d_resolver(k) {
+    sea a = k[0]
+    sea b = k[1]
+    sea n = k[2]
+    sea mia = k[7]
+    sea mib = k[8]
+    sea vr = [b["vel"]["x"] - a["vel"]["x"], b["vel"]["y"] - a["vel"]["y"], b["vel"]["z"] - a["vel"]["z"]]
+    sea vn = vr[0] * n[0] + vr[1] * n[1] + vr[2] * n[2]
+    sea dp = k[3] * (k[4] - vn)
+    sea p0 = k[5]
+    k[5] = maximo(p0 + dp, 0)
+    dp = k[5] - p0
+    _f3d_aplicar(a, b, [n[0] * dp, n[1] * dp, n[2] * dp], mia, mib)
+    // Fricción en el plano tangente (impulso acumulado acotado por mu·Pn).
+    vr = [b["vel"]["x"] - a["vel"]["x"], b["vel"]["y"] - a["vel"]["y"], b["vel"]["z"] - a["vel"]["z"]]
+    vn = vr[0] * n[0] + vr[1] * n[1] + vr[2] * n[2]
+    sea vt = [vr[0] - n[0] * vn, vr[1] - n[1] * vn, vr[2] - n[2] * vn]
+    sea pt = k[9]
+    sea nuevo = [pt[0] - vt[0] * k[3], pt[1] - vt[1] * k[3], pt[2] - vt[2] * k[3]]
+    sea l = raiz(nuevo[0] * nuevo[0] + nuevo[1] * nuevo[1] + nuevo[2] * nuevo[2])
+    sea limite = k[6] * k[5]
+    si (l > limite y l > 0) { nuevo = [nuevo[0] * limite / l, nuevo[1] * limite / l, nuevo[2] * limite / l] }
+    _f3d_aplicar(a, b, [nuevo[0] - pt[0], nuevo[1] - pt[1], nuevo[2] - pt[2]], mia, mib)
+    k[9] = nuevo
+    retornar 0
+}
+
+funcion _f3d_aplicar(a, b, p, mia, mib) {
+    a["vel"]["x"] = a["vel"]["x"] - p[0] * mia
+    a["vel"]["y"] = a["vel"]["y"] - p[1] * mia
+    a["vel"]["z"] = a["vel"]["z"] - p[2] * mia
+    b["vel"]["x"] = b["vel"]["x"] + p[0] * mib
+    b["vel"]["y"] = b["vel"]["y"] + p[1] * mib
+    b["vel"]["z"] = b["vel"]["z"] + p[2] * mib
+    retornar 0
 }
 
 // ── Raycast 3D ─────────────────────────────────────────────────────────────────
 
-funcion f3d_raycast(origen, direccion, cuerpos, dist_max) {
+// Primer impacto contra las formas de los cuerpos (o una esfera de radio 4
+// para cuerpos sin formas): {"cuerpo", "distancia", "punto", "normal"}.
+funcion f3d_raycast(origen, direccion, cuerpos, dist_max = 10000) {
+    sea dl = vec3_magnitud(direccion)
+    si (dl == 0) { retornar nulo }
+    sea d = [direccion["x"] / dl, direccion["y"] / dl, direccion["z"] / dl]
+    sea o = [origen["x"], origen["y"], origen["z"]]
     sea mejor = nulo
-    sea mejor_dist = dist_max ?? 10000
-    para cuerpo en cuerpos {
-        sea p = cuerpo["transform"]["pos"]
-        sea oc = vec3_resta(origen, p)
-        sea a = vec3_punto(direccion, direccion)
-        sea b = 2 * vec3_punto(oc, direccion)
-        sea c = vec3_punto(oc, oc) - 16  // radio 4 por defecto
-        sea discriminante = b*b - 4*a*c
-        si (discriminante >= 0) {
-            sea t = (-b - raiz(discriminante)) / (2*a)
-            si (t > 0 y t < mejor_dist) {
-                mejor_dist = t
-                sea punto = vec3(origen["x"]+direccion["x"]*t, origen["y"]+direccion["y"]*t, origen["z"]+direccion["z"]*t)
-                mejor = {"cuerpo": cuerpo, "distancia": t, "punto": punto}
+    sea mejor_t = dist_max
+    para c en cuerpos {
+        sea p = _f3d_pos(c)
+        sea formas = c["formas"] ?? []
+        si (longitud(formas) == 0) { formas = [forma_esfera(4)] }
+        para f en formas {
+            sea r = _f3d_rayo_forma(o, d, f, p)
+            si (r != nulo y r[0] >= 0 y r[0] < mejor_t) {
+                mejor_t = r[0]
+                sea t = r[0]
+                mejor = {"cuerpo": c, "distancia": t, "punto": vec3(o[0] + d[0] * t, o[1] + d[1] * t, o[2] + d[2] * t), "normal": vec3(r[1][0], r[1][1], r[1][2])}
             }
         }
     }
     retornar mejor
+}
+
+funcion _f3d_rayo_forma(o, d, f, p) {
+    si (f["tipo"] == "esfera") {
+        sea m = [o[0] - p[0], o[1] - p[1], o[2] - p[2]]
+        sea b = m[0] * d[0] + m[1] * d[1] + m[2] * d[2]
+        sea c = m[0] * m[0] + m[1] * m[1] + m[2] * m[2] - f["radio"] * f["radio"]
+        si (c > 0 y b > 0) { retornar nulo }
+        sea disc = b * b - c
+        si (disc < 0) { retornar nulo }
+        sea t = maximo(0, 0 - b - raiz(disc))
+        sea q = [o[0] + d[0] * t - p[0], o[1] + d[1] * t - p[1], o[2] + d[2] * t - p[2]]
+        retornar [t, [q[0] / f["radio"], q[1] / f["radio"], q[2] / f["radio"]]]
+    }
+    si (f["tipo"] == "plano") {
+        sea n = f["normal"]
+        sea den = n[0] * d[0] + n[1] * d[1] + n[2] * d[2]
+        si (den == 0) { retornar nulo }
+        sea t = (f["d"] - (n[0] * o[0] + n[1] * o[1] + n[2] * o[2])) / den
+        si (t < 0) { retornar nulo }
+        retornar [t, n]
+    }
+    // Caja: método de las placas.
+    sea h = f["media"]
+    sea tmin = 0
+    sea tmax = 1000000000
+    sea normal = [0, 0, 0]
+    sea k = 0
+    mientras (k < 3) {
+        sea lo = p[k] - h[k]
+        sea hi = p[k] + h[k]
+        si (absoluto(d[k]) < 0.0000000001) {
+            si (o[k] < lo o o[k] > hi) { retornar nulo }
+        } sino {
+            sea t1 = (lo - o[k]) / d[k]
+            sea t2 = (hi - o[k]) / d[k]
+            sea s = 0 - 1
+            si (t1 > t2) {
+                sea x = t1
+                t1 = t2
+                t2 = x
+                s = 1
+            }
+            si (t1 > tmin) {
+                tmin = t1
+                normal = [0, 0, 0]
+                normal[k] = s
+            }
+            si (t2 < tmax) { tmax = t2 }
+            si (tmin > tmax) { retornar nulo }
+        }
+        k = k + 1
+    }
+    retornar [tmin, normal]
 }

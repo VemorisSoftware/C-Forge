@@ -1,0 +1,524 @@
+// stdlib/fuente.cfv — texto con fuentes TrueType (.ttf) en C-Forge puro, sin
+// FreeType, stb_truetype ni SDL_ttf.
+//
+// Lee las tablas cmap (formatos 4 y 12), glyf/loca (glifos simples y
+// compuestos), hmtx, hhea y kern; aplana las curvas cuadráticas y rellena
+// con el rasterizador antialiasing del runtime (regla nonzero). Los glifos se
+// guardan en caché por tamaño. Incluye una fuente de mapa de bits 6×12
+// (ASCII, derivada de DejaVu Sans Mono) para cuando no hay archivos .ttf.
+// Las fuentes OpenType con contornos CFF (.otf) no están soportadas.
+//
+//   importar "fuente"
+//   sea f = fuente_sistema()
+//   lienzo_texto(lienzo, f, "¡Hola, C-Forge!", 10, 10, 24, [255, 255, 255])
+
+importar "graficos"
+
+funcion _u8(d, i) { retornar byte_en(d, i) }
+funcion _u16(d, i) { retornar byte_en(d, i) * 256 + byte_en(d, i + 1) }
+funcion _i16(d, i) {
+    sea v = _u16(d, i)
+    si (v >= 32768) { retornar v - 65536 }
+    retornar v
+}
+funcion _u32(d, i) { retornar _u16(d, i) * 65536 + _u16(d, i + 2) }
+
+funcion fuente_desde_bytes(datos) {
+    si (longitud(datos) < 12) { lanzar "fuente: archivo demasiado corto" }
+    sea version = _u32(datos, 0)
+    si (version == 1330926671) { lanzar "fuente: OpenType con contornos CFF (.otf) no soportado; usa una fuente TrueType (.ttf)" }
+    si (version != 65536 y version != 1953658213) { lanzar "fuente: no es una fuente TrueType" }
+    sea tablas = {}
+    sea n = _u16(datos, 4)
+    sea i = 0
+    mientras (i < n) {
+        sea r = 12 + i * 16
+        tablas[subtexto(datos, r, r + 4)] = _u32(datos, r + 8)
+        i = i + 1
+    }
+    para t en ["head", "maxp", "cmap", "hhea", "hmtx", "loca", "glyf"] {
+        si (tiene_clave(tablas, t) == falso) { lanzar "fuente: falta la tabla " + t }
+    }
+    sea head = tablas["head"]
+    sea hhea = tablas["hhea"]
+    sea f = {
+        "tipo": "ttf",
+        "datos": datos,
+        "tablas": tablas,
+        "unidades": _u16(datos, head + 18),
+        "loca_larga": _i16(datos, head + 50) == 1,
+        "glifos": _u16(datos, tablas["maxp"] + 4),
+        "ascenso": _i16(datos, hhea + 4),
+        "descenso": _i16(datos, hhea + 6),
+        "interlineado": _i16(datos, hhea + 8),
+        "metricas": _u16(datos, hhea + 34),
+        "cmap": _fuente_cmap(datos, tablas["cmap"]),
+        "codigos": {},
+        "kern": _fuente_kern(datos, tablas),
+        "cache": {}
+    }
+    retornar f
+}
+
+funcion fuente_cargar(ruta) {
+    si (existe_archivo(ruta) == falso) { lanzar "fuente_cargar: no existe " + ruta }
+    sea f = fuente_desde_bytes(leer_archivo(ruta))
+    f["ruta"] = ruta
+    retornar f
+}
+
+// Primera fuente TrueType del sistema (Linux, macOS o Windows).
+funcion fuente_sistema(negrita = falso) {
+    sea normales = ["/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf", "/usr/share/fonts/TTF/DejaVuSans.ttf", "/usr/share/fonts/dejavu/DejaVuSans.ttf", "/usr/share/fonts/truetype/liberation/LiberationSans-Regular.ttf", "/usr/share/fonts/liberation-sans/LiberationSans-Regular.ttf", "/usr/share/fonts/truetype/noto/NotoSans-Regular.ttf", "/System/Library/Fonts/Supplemental/Arial.ttf", "/Library/Fonts/Arial.ttf", "/System/Library/Fonts/Supplemental/Verdana.ttf", "C:/Windows/Fonts/arial.ttf", "C:/Windows/Fonts/segoeui.ttf", "C:/Windows/Fonts/verdana.ttf"]
+    sea negritas = ["/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf", "/usr/share/fonts/TTF/DejaVuSans-Bold.ttf", "/usr/share/fonts/truetype/liberation/LiberationSans-Bold.ttf", "/System/Library/Fonts/Supplemental/Arial Bold.ttf", "C:/Windows/Fonts/arialbd.ttf", "C:/Windows/Fonts/segoeuib.ttf"]
+    sea lista = normales
+    si (negrita) { lista = negritas + normales }
+    para r en lista {
+        si (existe_archivo(r)) {
+            intentar { retornar fuente_cargar(r) } capturar (e) { }
+        }
+    }
+    retornar fuente_basica()
+}
+
+funcion fuente_basica() { retornar {"tipo": "bits", "ancho": 6, "alto": 12, "datos": bytes_de_hex("00000000000000000000000000000404040404040004000000000a0a0a00000000000000000005091f0a0a3f141400000000040f14140e05051e040400001824190208170507000000000e1018181423331f0000000004040400000000000000000204040c08080c040402000008040404040404040c0800000004150e0e1504000000000000000004043f04040000000000000000000000040408000000000000000e000000000000000000000000000404000000000302020404080810100000000e1b111115111b0e000000001c0404040404041f000000001e130302040c181f000000000e13030e0301131e0000000006060a12123f0202000000001e10101e0301031e000000000e18101e1311130e000000001f02020204040c08000000000e13130e1311130e000000000e1311130f01021e000000000000040400000404000000000000040400000404080000000000010e300e0100000000000000003f003f0000000000000000300e030e3000000000001e03020404040004000000000e11112729292710180e00000c0c0a0a121f1131000000001e13131e1111111e000000000e1910101010190e000000001c1211111111121c000000001f10101f1010101f000000001f10101f10101010000000000e1910101311190e000000001111111f11111111000000001f0404040404041f000000000e0202020202021c000000001112141c1412131100000000101010101010101f00000000333b3b3d35313131000000001119191515171313000000000e1311111111130e000000001e1111131e101010000000000e1311111111130e020000001e1313131e121111000000000e1010180601130e000000003f0404040404040400000000111111111111130e00000000311113120a0a0c0c000000002121253d191b1b1300000000111a0a040c0a13310000000031130a0c04040404000000001f0102040408101f0000000e0c0c0c0c0c0c0c0c0e00000010100808040402020300000c04040404040404040c0000000c0a1100000000000000000000000000000000000000000804000000000000000000000000001e031f11131f0000001010101e1b11111b1e0000000000000f181010180f0000000101010f131313130f0000000000000e111f10100f0000000704041f04040404040000000000000f131313130f021e001010101e1b111111110000000400001c040404041f0000000400001c0404040404041c0010101013161c1e12110000001c0c0c0c0c0c0c0c070000000000001f15151515150000000000001e1b111111110000000000000e131111130e0000000000001e1b11111b1e1010000000000f131111130f0101000000000f0c080808080000000000000e101c06031e0000000008081f0808080c0700000000000011111111130f0000000000001113120a0e0c0000000000002121151d1b1a000000000000130a0c0c1a1100000000000011110a0a0c040c18000000001f020408081f00000007040404180c04040407000004040404040404040404040018040404070404040418000000000000001c0700000000")} }
+
+funcion _fuente_cmap(d, base) {
+    sea n = _u16(d, base + 2)
+    sea mejor = -1
+    sea puntaje = -1
+    sea i = 0
+    mientras (i < n) {
+        sea r = base + 4 + i * 8
+        sea plat = _u16(d, r)
+        sea enc = _u16(d, r + 2)
+        sea off = base + _u32(d, r + 4)
+        sea fmt = _u16(d, off)
+        sea p = -1
+        si (fmt == 12 y (plat == 3 o plat == 0)) { p = 3 }
+        si (fmt == 4 y plat == 3 y enc == 1) { p = 2 }
+        si (fmt == 4 y plat == 0) { p = 1 }
+        si (p > puntaje) {
+            puntaje = p
+            mejor = off
+        }
+        i = i + 1
+    }
+    si (mejor < 0) { lanzar "fuente: cmap sin subtabla Unicode compatible (formato 4 o 12)" }
+    retornar mejor
+}
+
+// Índice de glifo para un punto de código (0 = .notdef).
+funcion fuente_glifo(f, cp) {
+    sea clave = a_texto(cp)
+    si (tiene_clave(f["codigos"], clave)) { retornar f["codigos"][clave] }
+    sea d = f["datos"]
+    sea t = f["cmap"]
+    sea g = 0
+    si (_u16(d, t) == 12) {
+        sea n = _u32(d, t + 12)
+        sea lo = 0
+        sea hi = n - 1
+        mientras (lo <= hi) {
+            sea m = piso((lo + hi) / 2)
+            sea r = t + 16 + m * 12
+            si (cp < _u32(d, r)) { hi = m - 1 } sino {
+                si (cp > _u32(d, r + 4)) { lo = m + 1 } sino {
+                    g = _u32(d, r + 8) + cp - _u32(d, r)
+                    lo = hi + 1
+                }
+            }
+        }
+    } sino {
+        si (cp <= 65535) {
+            sea segs = _u16(d, t + 6) / 2
+            sea fin = t + 14
+            sea ini = fin + segs * 2 + 2
+            sea delta = ini + segs * 2
+            sea rango_off = delta + segs * 2
+            sea lo = 0
+            sea hi = segs - 1
+            mientras (lo <= hi) {
+                sea m = piso((lo + hi) / 2)
+                si (cp > _u16(d, fin + m * 2)) { lo = m + 1 } sino {
+                    si (m > 0 y cp <= _u16(d, fin + (m - 1) * 2)) { hi = m - 1 } sino {
+                        sea s = _u16(d, ini + m * 2)
+                        si (cp >= s) {
+                            sea ro = _u16(d, rango_off + m * 2)
+                            si (ro == 0) { g = (cp + _u16(d, delta + m * 2)) % 65536 } sino {
+                                sea gi = _u16(d, rango_off + m * 2 + ro + (cp - s) * 2)
+                                si (gi != 0) { g = (gi + _u16(d, delta + m * 2)) % 65536 }
+                            }
+                        }
+                        lo = hi + 1
+                    }
+                }
+            }
+        }
+    }
+    f["codigos"][clave] = g
+    retornar g
+}
+
+funcion _fuente_kern(d, tablas) {
+    sea pares = {}
+    si (tiene_clave(tablas, "kern") == falso) { retornar pares }
+    sea k = tablas["kern"]
+    si (_u16(d, k) != 0) { retornar pares }
+    sea n = _u16(d, k + 2)
+    sea off = k + 4
+    sea i = 0
+    mientras (i < n) {
+        sea largo = _u16(d, off + 2)
+        sea cobertura = _u16(d, off + 4)
+        si (cobertura / 256 == 0 y cobertura % 2 == 1) {
+            sea np = _u16(d, off + 6)
+            sea j = 0
+            mientras (j < np) {
+                sea r = off + 14 + j * 6
+                pares[_u16(d, r) + "," + _u16(d, r + 2)] = _i16(d, r + 4)
+                j = j + 1
+            }
+        }
+        off = off + largo
+        i = i + 1
+    }
+    retornar pares
+}
+
+funcion _fuente_avance(f, g) {
+    sea d = f["datos"]
+    sea h = f["tablas"]["hmtx"]
+    sea n = f["metricas"]
+    si (g < n) { retornar _u16(d, h + g * 4) }
+    retornar _u16(d, h + (n - 1) * 4)
+}
+
+funcion _fuente_ubicacion(f, g) {
+    sea d = f["datos"]
+    sea loca = f["tablas"]["loca"]
+    si (f["loca_larga"]) { retornar [_u32(d, loca + g * 4), _u32(d, loca + g * 4 + 4)] }
+    retornar [_u16(d, loca + g * 2) * 2, _u16(d, loca + g * 2 + 2) * 2]
+}
+
+// Contornos del glifo en unidades de la fuente: lista de listas de
+// [x, y, sobre_curva].
+funcion fuente_contornos(f, g, profundidad = 0) {
+    si (profundidad > 8) { retornar [] }
+    sea d = f["datos"]
+    sea u = _fuente_ubicacion(f, g)
+    si (u[1] <= u[0]) { retornar [] }
+    sea p = f["tablas"]["glyf"] + u[0]
+    sea nc = _i16(d, p)
+    si (nc >= 0) { retornar _fuente_simple(d, p, nc) }
+    // Compuesto: suma de componentes transformados.
+    sea r = []
+    sea q = p + 10
+    sea mas = verdadero
+    mientras (mas) {
+        sea banderas = _u16(d, q)
+        sea gi = _u16(d, q + 2)
+        q = q + 4
+        sea dx = 0
+        sea dy = 0
+        si (banderas % 2 == 1) {
+            dx = _i16(d, q)
+            dy = _i16(d, q + 2)
+            q = q + 4
+        } sino {
+            dx = _u8(d, q)
+            dy = _u8(d, q + 1)
+            si (dx >= 128) { dx = dx - 256 }
+            si (dy >= 128) { dy = dy - 256 }
+            q = q + 2
+        }
+        si (piso(banderas / 2) % 2 == 0) {
+            dx = 0
+            dy = 0
+        }
+        sea a = 1
+        sea b = 0
+        sea c = 0
+        sea e = 1
+        si (piso(banderas / 8) % 2 == 1) {
+            a = _i16(d, q) / 16384
+            e = a
+            q = q + 2
+        } sino {
+            si (piso(banderas / 64) % 2 == 1) {
+                a = _i16(d, q) / 16384
+                e = _i16(d, q + 2) / 16384
+                q = q + 4
+            } sino {
+                si (piso(banderas / 128) % 2 == 1) {
+                    a = _i16(d, q) / 16384
+                    b = _i16(d, q + 2) / 16384
+                    c = _i16(d, q + 4) / 16384
+                    e = _i16(d, q + 6) / 16384
+                    q = q + 8
+                }
+            }
+        }
+        para contorno en fuente_contornos(f, gi, profundidad + 1) {
+            sea nuevo = []
+            para pt en contorno { agregar(nuevo, [pt[0] * a + pt[1] * c + dx, pt[0] * b + pt[1] * e + dy, pt[2]]) }
+            agregar(r, nuevo)
+        }
+        mas = piso(banderas / 32) % 2 == 1
+    }
+    retornar r
+}
+
+funcion _fuente_simple(d, p, nc) {
+    sea finales = []
+    sea i = 0
+    mientras (i < nc) {
+        agregar(finales, _u16(d, p + 10 + i * 2))
+        i = i + 1
+    }
+    si (nc == 0) { retornar [] }
+    sea npts = finales[nc - 1] + 1
+    sea q = p + 10 + nc * 2
+    q = q + 2 + _u16(d, q)
+    sea banderas = []
+    mientras (longitud(banderas) < npts) {
+        sea b = _u8(d, q)
+        q = q + 1
+        agregar(banderas, b)
+        si (piso(b / 8) % 2 == 1) {
+            sea rep = _u8(d, q)
+            q = q + 1
+            mientras (rep > 0) {
+                agregar(banderas, b)
+                rep = rep - 1
+            }
+        }
+    }
+    sea xs = []
+    sea v = 0
+    para b en banderas {
+        si (piso(b / 2) % 2 == 1) {
+            sea dx = _u8(d, q)
+            q = q + 1
+            si (piso(b / 16) % 2 == 1) { v = v + dx } sino { v = v - dx }
+        } sino {
+            si (piso(b / 16) % 2 == 0) {
+                v = v + _i16(d, q)
+                q = q + 2
+            }
+        }
+        agregar(xs, v)
+    }
+    sea ys = []
+    v = 0
+    para b en banderas {
+        si (piso(b / 4) % 2 == 1) {
+            sea dy = _u8(d, q)
+            q = q + 1
+            si (piso(b / 32) % 2 == 1) { v = v + dy } sino { v = v - dy }
+        } sino {
+            si (piso(b / 32) % 2 == 0) {
+                v = v + _i16(d, q)
+                q = q + 2
+            }
+        }
+        agregar(ys, v)
+    }
+    sea r = []
+    sea inicio = 0
+    para fin en finales {
+        sea c = []
+        sea k = inicio
+        mientras (k <= fin) {
+            agregar(c, [xs[k], ys[k], banderas[k] % 2 == 1])
+            k = k + 1
+        }
+        agregar(r, c)
+        inicio = fin + 1
+    }
+    retornar r
+}
+
+// Aplana un contorno cuadrático a puntos de pantalla.
+funcion _fuente_aplanar(contorno, escala, ox, oy) {
+    sea n = longitud(contorno)
+    si (n < 2) { retornar [] }
+    // Empezar en un punto sobre la curva (o en el punto medio implícito).
+    sea pts = []
+    sea primero = -1
+    sea i = 0
+    mientras (i < n y primero < 0) {
+        si (contorno[i][2]) { primero = i }
+        i = i + 1
+    }
+    sea inicio = nulo
+    si (primero < 0) {
+        inicio = [(contorno[0][0] + contorno[1][0]) / 2, (contorno[0][1] + contorno[1][1]) / 2]
+        primero = 0
+    } sino { inicio = [contorno[primero][0], contorno[primero][1]] }
+    sea salida = [[ox + inicio[0] * escala, oy - inicio[1] * escala]]
+    sea actual = inicio
+    sea control = nulo
+    sea k = 1
+    mientras (k <= n) {
+        sea pt = contorno[(primero + k) % n]
+        si (k == n y contorno[primero][2] == falso) { pt = [inicio[0], inicio[1], verdadero] }
+        si (pt[2]) {
+            si (control == nulo) { agregar(salida, [ox + pt[0] * escala, oy - pt[1] * escala]) } sino {
+                _fuente_curva(salida, actual, control, pt, escala, ox, oy)
+                control = nulo
+            }
+            actual = pt
+        } sino {
+            si (control != nulo) {
+                sea medio = [(control[0] + pt[0]) / 2, (control[1] + pt[1]) / 2]
+                _fuente_curva(salida, actual, control, medio, escala, ox, oy)
+                actual = medio
+            }
+            control = pt
+        }
+        k = k + 1
+    }
+    si (control != nulo) { _fuente_curva(salida, actual, control, inicio, escala, ox, oy) }
+    retornar salida
+}
+
+funcion _fuente_curva(salida, a, c, b, escala, ox, oy) {
+    sea largo = (absoluto(c[0] - a[0]) + absoluto(c[1] - a[1]) + absoluto(b[0] - c[0]) + absoluto(b[1] - c[1])) * escala
+    sea pasos = piso(largo / 3) + 2
+    si (pasos > 16) { pasos = 16 }
+    sea i = 1
+    mientras (i <= pasos) {
+        sea t = i / pasos
+        sea u = 1 - t
+        sea x = u * u * a[0] + 2 * u * t * c[0] + t * t * b[0]
+        sea y = u * u * a[1] + 2 * u * t * c[1] + t * t * b[1]
+        agregar(salida, [ox + x * escala, oy - y * escala])
+        i = i + 1
+    }
+    retornar 0
+}
+
+// Imagen (blanca con alfa) del glifo g a ese tamaño, con su desplazamiento.
+funcion _fuente_bitmap(f, g, tam) {
+    sea clave = g + "|" + tam
+    si (tiene_clave(f["cache"], clave)) { retornar f["cache"][clave] }
+    sea escala = tam / f["unidades"]
+    sea contornos = fuente_contornos(f, g)
+    sea r = nulo
+    si (longitud(contornos) == 0) { r = {"img": nulo, "x": 0, "y": 0} } sino {
+        sea minx = 1000000
+        sea miny = 1000000
+        sea maxx = -1000000
+        sea maxy = -1000000
+        para c en contornos {
+            para p en c {
+                minx = minimo(minx, p[0])
+                maxx = maximo(maxx, p[0])
+                miny = minimo(miny, p[1])
+                maxy = maximo(maxy, p[1])
+            }
+        }
+        sea x0 = piso(minx * escala) - 1
+        sea y0 = piso(0 - maxy * escala) - 1
+        sea ancho = techo(maxx * escala) - x0 + 2
+        sea alto = techo(0 - miny * escala) - y0 + 2
+        sea img = imagen_nueva(ancho, alto)
+        sea pts = []
+        para c en contornos { agregar(pts, _fuente_aplanar(c, escala, 0 - x0, 0 - y0)) }
+        lienzo_contornos(img, pts, [255, 255, 255, 255])
+        r = {"img": img, "x": x0, "y": y0}
+    }
+    f["cache"][clave] = r
+    retornar r
+}
+
+funcion _fuente_kern_valor(f, a, b) {
+    sea k = a + "," + b
+    si (tiene_clave(f["kern"], k)) { retornar f["kern"][k] }
+    retornar 0
+}
+
+// Medidas de un texto: {"ancho", "alto", "ascenso", "descenso", "lineas"}.
+funcion texto_medir(f, texto, tam) {
+    si (f["tipo"] == "bits") {
+        sea k = tam / f["alto"]
+        sea maximo_cols = 0
+        sea lineas = separar(texto, "\n")
+        para l en lineas { maximo_cols = maximo(maximo_cols, longitud(texto_codigos(l))) }
+        retornar {"ancho": maximo_cols * f["ancho"] * k, "alto": longitud(lineas) * tam, "ascenso": tam * 0.8, "descenso": tam * 0.2, "lineas": longitud(lineas)}
+    }
+    sea escala = tam / f["unidades"]
+    sea linea = (f["ascenso"] - f["descenso"] + f["interlineado"]) * escala
+    sea ancho = 0
+    sea lineas = separar(texto, "\n")
+    para l en lineas {
+        sea x = 0
+        sea previo = -1
+        para cp en texto_codigos(l) {
+            sea g = fuente_glifo(f, cp)
+            si (previo >= 0) { x = x + _fuente_kern_valor(f, previo, g) * escala }
+            x = x + _fuente_avance(f, g) * escala
+            previo = g
+        }
+        ancho = maximo(ancho, x)
+    }
+    retornar {"ancho": ancho, "alto": linea * longitud(lineas), "ascenso": f["ascenso"] * escala, "descenso": 0 - f["descenso"] * escala, "lineas": longitud(lineas)}
+}
+
+// Dibuja texto con la esquina superior izquierda en (x, y). Devuelve el
+// ancho dibujado. Admite saltos de línea.
+funcion lienzo_texto(l, f, texto, x, y, tam, color) {
+    si (f == nulo) { f = fuente_basica() }
+    si (f["tipo"] == "bits") { retornar _texto_bits(l, f, texto, x, y, tam, color) }
+    sea escala = tam / f["unidades"]
+    sea alto_linea = (f["ascenso"] - f["descenso"] + f["interlineado"]) * escala
+    sea base = y + f["ascenso"] * escala
+    sea ancho = 0
+    sea tinte = [color[0], color[1], color[2]]
+    sea alfa = 255
+    si (longitud(color) > 3) { alfa = color[3] }
+    para linea en separar(texto, "\n") {
+        sea pluma = x
+        sea previo = -1
+        para cp en texto_codigos(linea) {
+            sea g = fuente_glifo(f, cp)
+            si (previo >= 0) { pluma = pluma + _fuente_kern_valor(f, previo, g) * escala }
+            sea bm = _fuente_bitmap(f, g, tam)
+            si (bm["img"] != nulo) { lienzo_imagen(l, bm["img"], piso(pluma + 0.5) + bm["x"], piso(base + 0.5) + bm["y"], {"tinte": tinte, "alfa": alfa}) }
+            pluma = pluma + _fuente_avance(f, g) * escala
+            previo = g
+        }
+        ancho = maximo(ancho, pluma - x)
+        base = base + alto_linea
+    }
+    retornar ancho
+}
+
+funcion _texto_bits(l, f, texto, x, y, tam, color) {
+    sea k = maximo(1, piso(tam / f["alto"] + 0.5))
+    sea fy = y
+    sea ancho = 0
+    para linea en separar(texto, "\n") {
+        sea fx = x
+        para cp en texto_codigos(linea) {
+            sea c = cp
+            si (c < 32 o c > 126) { c = 63 }
+            sea base = (c - 32) * f["alto"]
+            sea fila = 0
+            mientras (fila < f["alto"]) {
+                sea bits = byte_en(f["datos"], base + fila)
+                sea col = 0
+                mientras (col < f["ancho"]) {
+                    si (piso(bits / potencia(2, f["ancho"] - 1 - col)) % 2 == 1) { lienzo_rectangulo(l, fx + col * k, fy + fila * k, k, k, color) }
+                    col = col + 1
+                }
+                fila = fila + 1
+            }
+            fx = fx + f["ancho"] * k
+        }
+        ancho = maximo(ancho, fx - x)
+        fy = fy + f["alto"] * k
+    }
+    retornar ancho
+}
