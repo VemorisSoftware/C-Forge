@@ -2,6 +2,15 @@
 
 Sitio oficial: [c-forge.org](https://c-forge.org)
 
+## Sin publicar (5.0)
+
+- **Seguridad:** todas las reservas de píxeles y audio (PNG, JPEG, BMP,
+  lienzos, z-buffer, PCM) pasan por `md_buffer_seguro` con aritmética
+  saturada. `cforge add` rechaza antes de separar la especificación
+  cualquier carácter fuera de `[A-Za-z0-9._/-]` y una `@` (secuencias
+  `%2e`/`%2f`/`%5c`, `\u002e`, barras invertidas, bytes nulos) y valida el
+  alias de `--como`. Vectores nuevos en `tests/seguridad`.
+
 ## 4.5.0 — 2026-11-19
 
 - **Seguridad:** endurecimiento contra entradas hostiles tras una auditoría
