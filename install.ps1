@@ -4,7 +4,7 @@
 #   irm https://c-forge.org/install.ps1 | iex
 #
 # Variables opcionales:
-#   $env:CFORGE_VERSION = "4.4.0"   instala una versión concreta
+#   $env:CFORGE_VERSION = "4.5.0"   instala una versión concreta
 # ============================================================================
 $ErrorActionPreference = 'Stop'
 $ProgressPreference = 'SilentlyContinue'

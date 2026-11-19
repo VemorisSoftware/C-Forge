@@ -6,7 +6,7 @@
 
 C-Forge es un lenguaje de programación creado por Vemoris Group. Su objetivo es ofrecer una sintaxis clara, ejecución nativa y una biblioteca estándar escrita en el propio lenguaje.
 
-> **C-Forge 4.4.0** — Lenguaje **100 % autoalojado** (compilador, runtime y biblioteca estándar escritos en C-Forge, sin C ni C++), verificado en cada cambio con **fuzzing y pruebas ofensivas** (entradas hostiles, bombas de compresión, ataques a HTTP/WebSocket y al gestor de paquetes) y **listo para producción**: el gate reproducible `make release-check` pasa en macOS (ARM64 e Intel), Linux (x64 y ARM64) y Windows x64. La criptografía está probada contra vectores oficiales, pero aún no tiene una auditoría externa independiente.
+> **C-Forge 4.5.0** — Lenguaje **100 % autoalojado** (compilador, runtime y biblioteca estándar escritos en C-Forge, sin C ni C++), verificado en cada cambio con **fuzzing y pruebas ofensivas** (entradas hostiles, bombas de compresión, ataques a HTTP/WebSocket y al gestor de paquetes) y **listo para producción**: el gate reproducible `make release-check` pasa en macOS (ARM64 e Intel), Linux (x64 y ARM64) y Windows x64. La criptografía está probada contra vectores oficiales, pero aún no tiene una auditoría externa independiente.
 
 ---
 
@@ -29,7 +29,7 @@ y Windows x64. Todos los compila C-Forge mismo: no hay C++ en el proyecto.
 Opciones:
 
 ```sh
-curl -fsSL https://c-forge.org/install.sh | CFORGE_VERSION=4.4.0 sh   # versión fija
+curl -fsSL https://c-forge.org/install.sh | CFORGE_VERSION=4.5.0 sh   # versión fija
 curl -fsSL https://c-forge.org/install.sh | CFORGE_PREFIX=$HOME/.local sh   # sin sudo
 ```
 
@@ -39,13 +39,13 @@ curl -fsSL https://c-forge.org/install.sh | CFORGE_PREFIX=$HOME/.local sh   # si
 ### Linux x64 (.deb)
 
 ```sh
-wget https://github.com/VemorisSoftware/C-Forge/releases/download/v4.4.0/cforge_4.4.0_amd64.deb
-sudo dpkg -i cforge_4.4.0_amd64.deb
+wget https://github.com/VemorisSoftware/C-Forge/releases/download/v4.5.0/cforge_4.5.0_amd64.deb
+sudo dpkg -i cforge_4.5.0_amd64.deb
 ```
 
 ### Windows x64
 
-1. Descarga `cforge-4.4.0-windows-x64.zip` desde [Releases](https://github.com/VemorisSoftware/C-Forge/releases/latest).
+1. Descarga `cforge-4.5.0-windows-x64.zip` desde [Releases](https://github.com/VemorisSoftware/C-Forge/releases/latest).
 2. Extrae el ZIP en una carpeta fija, por ejemplo `C:\cforge`.
 3. Añade esa carpeta al `PATH`. La `stdlib` incluida junto a `cforge.exe` se detecta sola.
 4. Abre una nueva terminal y ejecuta `cforge --version`.
@@ -65,7 +65,7 @@ Con `.deb`: `sudo dpkg -r cforge`.
 
 ```sh
 cforge --version
-# → C-Forge 4.4.0
+# → C-Forge 4.5.0
 
 cforge --help
 # → muestra todos los comandos disponibles
@@ -144,7 +144,7 @@ s.decir()                     // Hola desde C-Forge
 
 ## Extensión de Visual Studio Code
 
-1. Descarga `c-forge-4.4.0.vsix` desde [Releases](https://github.com/VemorisSoftware/C-Forge/releases/tag/v4.4.0).
+1. Descarga `c-forge-4.5.0.vsix` desde [Releases](https://github.com/VemorisSoftware/C-Forge/releases/tag/v4.5.0).
 2. En VS Code: **Extensions** (⇧⌘X) → **···** → **Install from VSIX…** → selecciona el archivo.
 3. Los archivos `.cfv` tendrán resaltado de sintaxis, snippets y diagnósticos automáticos al guardar.
 
@@ -212,7 +212,7 @@ por byte a los compilados en cada sistema: `make windows-cruzado`,
 
 ---
 
-## Plataformas verificadas en 4.4.0
+## Plataformas verificadas en 4.5.0
 
 | Plataforma | Build CI | Tests | Distribuible |
 |-----------|----------|-------|-------------|
