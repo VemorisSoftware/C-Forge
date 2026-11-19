@@ -51,11 +51,12 @@
 // literal a la derecha del operador · 384/392 tipos de los dos operandos
 // --release (eliminación de código muerto): 400 función que se compila (-1
 // arriba) · 408 referencias [función][...] de la primera pasada · 416
-// funciones alcanzables (segunda pasada; 0 = compilar todo)
+// funciones alcanzables (segunda pasada; 0 = compilar todo) · wasm: 432
+// bloques · 440 importaciones · 448 tipo del resultado de la externa actual
 
 funcion ctx_nuevo(tokens) {
-    sea c = mem_reservar(432)
-    mem_llenar(c, 0, 432)
+    sea c = mem_reservar(456)
+    mem_llenar(c, 0, 456)
     __guardar64(c + 400, 0 - 1)
     __guardar64(c, tokens)
     __guardar64(c + 8, 0)
@@ -111,7 +112,7 @@ funcion es_windows(c) { retornar __cargar64(c + 296) == 1 }
 funcion es_macos(c) { retornar es_darwin_numero(__cargar64(c + 296)) }
 funcion es_darwin_numero(t) { retornar t == 2 o t == 3 o t == 5 o t == 6 }
 funcion es_ios(c) { retornar __cargar64(c + 296) == 5 o __cargar64(c + 296) == 6 }
-funcion es_arm64(c) { retornar __cargar64(c + 296) >= 3 }                // 3, 4, 5 y 6
+funcion es_arm64(c) { retornar __cargar64(c + 296) >= 3 y __cargar64(c + 296) <= 6 }   // 3, 4, 5 y 6 (7: wasm)
 funcion ctx_modo(c) { retornar __cargar64(c + 104) }
 // 2: programa del usuario · 3: biblioteca del lenguaje (también dinámica)
 funcion dinamico(c) { retornar __cargar64(c + 104) >= 2 }
@@ -730,6 +731,12 @@ funcion nueva_etiqueta(c) {
 }
 
 funcion definir_etiqueta(c, etiqueta) {
+    // WebAssembly: cada etiqueta empieza un bloque y su "dirección" es el
+    // número del bloque (ver gen_wasm.cfv).
+    si (es_wasm(c)) {
+        vec_fijar(__cargar64(c + 40), etiqueta, w_nuevo_bloque(c))
+        retornar 0
+    }
     vec_fijar(__cargar64(c + 40), etiqueta, posicion_codigo(c))
     retornar 0
 }
@@ -1017,6 +1024,8 @@ funcion casillas_dl(c) {
 
 // rax ← dirección de la función externa e (se resuelve en el primer uso).
 funcion asegurar_externa(c, e) {
+    // WebAssembly: las externas son importaciones del módulo (no hay dlopen).
+    si (es_wasm(c)) { retornar 0 }
     sea listo = nueva_etiqueta(c)
     op_cargar_dato(c, __cargar64(e + 24))
     op_saltar_si_no_cero(c, listo)
@@ -1153,6 +1162,7 @@ funcion declaracion_externa(c) {
         vec_agregar(convertidos, d)
         i = i + 1
     }
+    __guardar64(c + 448, resultado)
     op_llamada_externa(c, casilla, tipos, convertidos)
     si (resultado == 1) {
         op_resultado_flotante(c)
@@ -1876,6 +1886,115 @@ funcion emitir_llamada(c, f, n) {
 }
 
 // Llamada del compilador a una función del runtime con n argumentos apilados.
+// lista[i] con la lista en [pila + 8] y el índice en [pila]: si es una
+// lista y un entero dentro del rango, se lee en línea; si no, dyn_indice.
+// Comprueba en a: d ← contenedor; deja d = datos de la lista y b = n.
+funcion comprobar_lista_en_linea(c, desp_contenedor, desp_indice, lento) {
+    op_cargar(c, 0, 4, desp_indice)
+    op_y_uno(c)
+    op_saltar_si_cero(c, lento)                                // índice no entero
+    op_cargar(c, 0, 4, desp_contenedor)
+    op_mov(c, 2, 0)
+    op_y_uno(c)
+    op_saltar_si_no_cero(c, lento)                             // entero, no caja
+    sea caja = nueva_etiqueta(c)
+    op_mov(c, 0, 2)
+    op_constante_rcx(c, 8)
+    op_saltar_si_mayor_igual(c, caja)
+    op_saltar(c, lento)                                        // nulo o booleano
+    definir_etiqueta(c, caja)
+    op_cargar(c, 0, 2, 0)
+    op_constante_rcx(c, 2)
+    op_comparar(c, 148)
+    op_saltar_si_cero(c, lento)                                // no es lista
+    op_cargar(c, 2, 2, 8)                                      // d ← vec
+    op_cargar(c, 0, 4, desp_indice)
+    op_sar_constante(c, 1)                                     // a ← n
+    op_cargar(c, 1, 2, 0)                                      // b ← largo
+    op_saltar_si_mayor_igual(c, lento)                         // n >= largo
+    op_mov(c, 1, 0)                                            // b ← n
+    op_inmediato(c, 0 - 1)
+    op_saltar_si_mayor_igual(c, lento)                         // n < 0
+    op_cargar(c, 2, 2, 16)                                     // d ← datos
+    retornar 0
+}
+
+funcion indice_rapido(c) {
+    sea lento = nueva_etiqueta(c)
+    sea fin = nueva_etiqueta(c)
+    comprobar_lista_en_linea(c, 8, 0, lento)
+    op_mov(c, 0, 2)
+    op_cargar_indexado(c, 0)                                   // a ← datos[n]
+    op_liberar_pila(c, 16)
+    op_saltar(c, fin)
+    definir_etiqueta(c, lento)
+    llamar_runtime(c, "dyn_indice", 2)
+    definir_etiqueta(c, fin)
+    retornar 0
+}
+
+// lista[i] = v con [pila + 16] lista, [pila + 8] índice y [pila] valor.
+funcion fijar_indice_rapido(c) {
+    sea lento = nueva_etiqueta(c)
+    sea fin = nueva_etiqueta(c)
+    comprobar_lista_en_linea(c, 16, 8, lento)
+    op_mov(c, 0, 1)
+    op_constante_rcx(c, 3)
+    op_aritmetica(c, 9)                                        // a ← n · 8
+    op_mov(c, 1, 2)
+    op_aritmetica(c, 1)                                        // a ← datos + 8n
+    op_cargar(c, 1, 4, 0)                                      // b ← valor
+    op_guardar(c, 0, 0, 1)
+    op_inmediato(c, 0)
+    op_liberar_pila(c, 24)
+    op_saltar(c, fin)
+    definir_etiqueta(c, lento)
+    llamar_runtime(c, "dyn_fijar_indice", 3)
+    definir_etiqueta(c, fin)
+    retornar 0
+}
+
+// cociente(expr, N) con N literal potencia de 2 (2..2^30): devuelve log2(N)
+// o 0. Mira los tokens sin consumirlos: "(" … "," N ")" al mismo nivel.
+funcion cociente_potencia_de_2(c) {
+    sea tokens = __cargar64(c)
+    sea j = __cargar64(c + 8)
+    si (es_simbolo(vec_obtener(tokens, j), "(") == 0) { retornar 0 }
+    sea nivel = 0
+    mientras (j < vec_largo(tokens)) {
+        sea t = vec_obtener(tokens, j)
+        si (__cargar64(t) == 5) { retornar 0 }
+        si (es_simbolo(t, "(") o es_simbolo(t, "[") o es_simbolo(t, "{")) { nivel = nivel + 1 }
+        si (es_simbolo(t, ")") o es_simbolo(t, "]") o es_simbolo(t, "}")) {
+            nivel = nivel - 1
+            si (nivel == 0) { retornar 0 }
+        }
+        si (nivel == 1 y es_simbolo(t, ",")) {
+            si (j + 2 >= vec_largo(tokens)) { retornar 0 }
+            sea lit = vec_obtener(tokens, j + 1)
+            si (__cargar64(lit) != 2 o es_simbolo(vec_obtener(tokens, j + 2), ")") == 0) { retornar 0 }
+            sea lexema = __cargar64(lit + 8)
+            sea k = 0
+            mientras (k < str_largo(lexema)) {
+                sea b = str_byte(lexema, k)
+                si (b < 48 o b > 57) { retornar 0 }
+                k = k + 1
+            }
+            sea n = numero_literal(lexema)
+            sea log = 0
+            sea p = 1
+            mientras (p < n y log < 31) {
+                p = p * 2
+                log = log + 1
+            }
+            si (p == n y log >= 1 y log <= 30) { retornar log }
+            retornar 0
+        }
+        j = j + 1
+    }
+    retornar 0
+}
+
 funcion llamar_runtime(c, nombre, n) {
     sea f = buscar_funcion(c, nombre)
     si (f == 0) {
@@ -1887,6 +2006,63 @@ funcion llamar_runtime(c, nombre, n) {
 
 funcion llamada(c, nombre) {
     si (intrinseco(c, nombre)) {
+        fijar_tipo(c, 0)
+        retornar 0
+    }
+    // bits_y / bits_o / bits_xo entre enteros: una instrucción.
+    si (dinamico(c) y (str_igual(nombre, "bits_y") o str_igual(nombre, "bits_o") o str_igual(nombre, "bits_xo")) y buscar_funcion(c, nombre) != 0 y __cargar64(buscar_funcion(c, nombre) + 24) != 2) {
+        requerir(c, "(")
+        expresion(c)
+        empujar(c)
+        requerir(c, ",")
+        expresion(c)
+        requerir(c, ")")
+        operador_rapido(c, nombre, nombre)
+        fijar_tipo(c, 0)
+        retornar 0
+    }
+    // cociente(x, 2^k) con una potencia de 2 literal: desplazamiento.
+    si (dinamico(c) y str_igual(nombre, "cociente") y buscar_funcion(c, "cociente") != 0 y __cargar64(buscar_funcion(c, "cociente") + 24) != 2 y cociente_potencia_de_2(c) > 0) {
+        sea k = cociente_potencia_de_2(c)
+        requerir(c, "(")
+        expresion(c)
+        requerir(c, ",")
+        sea divisor = numero_literal(__cargar64(avanzar(c) + 8))
+        requerir(c, ")")
+        sea lento = nueva_etiqueta(c)
+        sea fin = nueva_etiqueta(c)
+        sea positivo = nueva_etiqueta(c)
+        empujar(c)
+        op_y_uno(c)
+        op_saltar_si_cero(c, lento)
+        op_cargar(c, 0, 4, 0)
+        op_sar_constante(c, 1)
+        op_constante_rcx(c, 0)
+        op_saltar_si_mayor_igual(c, positivo)
+        op_constante_rcx(c, divisor - 1)                       // truncar hacia cero
+        op_aritmetica(c, 1)
+        definir_etiqueta(c, positivo)
+        op_sar_constante(c, k)
+        op_etiquetar(c, 1)
+        op_liberar_pila(c, 8)
+        op_saltar(c, fin)
+        definir_etiqueta(c, lento)
+        cargar_inmediato(c, divisor * 2 + 1)
+        empujar(c)
+        llamar_runtime(c, "cociente", 2)
+        definir_etiqueta(c, fin)
+        fijar_tipo(c, 0)
+        retornar 0
+    }
+    // cociente(a, b): división entera en línea (el runtime si no son enteros).
+    si (dinamico(c) y str_igual(nombre, "cociente") y buscar_funcion(c, "cociente") != 0 y __cargar64(buscar_funcion(c, "cociente") + 24) != 2) {
+        requerir(c, "(")
+        expresion(c)
+        empujar(c)
+        requerir(c, ",")
+        expresion(c)
+        requerir(c, ")")
+        operador_rapido(c, "cociente", "cociente")
         fijar_tipo(c, 0)
         retornar 0
     }
@@ -2151,7 +2327,7 @@ funcion mapa_literal(c) {
             requerir(c, ":")
             expresion(c)
             empujar(c)
-            llamar_runtime(c, "dyn_fijar_indice", 3)
+            fijar_indice_rapido(c)
             seguir = tomar(c, ",")
             si (ver(c, "}")) { seguir = 0 }
         }
@@ -2236,7 +2412,7 @@ funcion sufijos(c) {
             expresion(c)
             empujar(c)
             requerir(c, "]")
-            llamar_runtime(c, "dyn_indice", 2)
+            indice_rapido(c)
             hecho = 1
         }
         si (hecho == 0 y ver(c, ".") y tok_tipo_en(c, 1) == 1) {
@@ -2567,7 +2743,7 @@ funcion campo_texto(c, clave, lexema) {
     empujar(c)
     op_direccion(c, 1, literal_caja(c, lexema))
     empujar(c)
-    llamar_runtime(c, "dyn_fijar_indice", 3)
+    fijar_indice_rapido(c)
     retornar 0
 }
 
@@ -2751,6 +2927,34 @@ funcion operador_rapido(c, lex, nombre) {
         op_cargar(c, 0, 4, 8)
         op_sar_constante(c, 1)
         op_aritmetica(c, 3)
+        op_sumar_constante(c, 1)
+    }
+    si (str_igual(lex, "bits_y")) {                                 // (2x+1) & (2y+1) = 2(x&y)+1
+        op_cargar(c, 0, 4, 8)
+        op_cargar(c, 1, 4, 0)
+        op_aritmetica(c, 6)
+    }
+    si (str_igual(lex, "bits_o")) {
+        op_cargar(c, 0, 4, 8)
+        op_cargar(c, 1, 4, 0)
+        op_aritmetica(c, 7)
+    }
+    si (str_igual(lex, "bits_xo")) {                                // 2(x^y) + 1
+        op_cargar(c, 0, 4, 8)
+        op_cargar(c, 1, 4, 0)
+        op_aritmetica(c, 8)
+        op_sumar_constante(c, 1)
+    }
+    si (str_igual(lex, "cociente")) {                               // (a' / b')·2 + 1, b' ≠ 0
+        op_cargar(c, 0, 4, 0)
+        op_sar_constante(c, 1)
+        op_saltar_si_cero(c, lento)
+        op_mov(c, 1, 0)
+        op_cargar(c, 0, 4, 8)
+        op_sar_constante(c, 1)
+        op_aritmetica(c, 4)
+        op_mov(c, 1, 0)
+        op_aritmetica(c, 1)
         op_sumar_constante(c, 1)
     }
     si (str_largo(lex) == 1 y op == 37) {                           // (a' % b')·2 + 1, b' ≠ 0
@@ -3347,7 +3551,7 @@ funcion asignacion_indice(c) {
         }
         empujar(c)
         si (ver(c, "[") o ver(c, ".")) {
-            llamar_runtime(c, "dyn_indice", 2)
+            indice_rapido(c)
         } sino {
             seguir = 0
         }
@@ -3359,13 +3563,13 @@ funcion asignacion_indice(c) {
         requerir(c, "=")
         op_empujar_pila(c, 8)                                  // índice y objeto otra vez
         op_empujar_pila(c, 8)
-        llamar_runtime(c, "dyn_indice", 2)
+        indice_rapido(c)
         empujar(c)
         expresion(c)
         aplicar_operador(c, lex)
     }
     empujar(c)
-    llamar_runtime(c, "dyn_fijar_indice", 3)
+    fijar_indice_rapido(c)
     tomar(c, ";")
     retornar 0
 }
@@ -3937,7 +4141,7 @@ funcion inicializador_campo(c, k, nombre, con_valor) {
     empujar(c)
     si (con_valor) { expresion(c) } sino { cargar_inmediato(c, 0) }
     empujar(c)
-    llamar_runtime(c, "dyn_fijar_indice", 3)
+    fijar_indice_rapido(c)
     cerrar_funcion(c, estado)
     retornar 0
 }
@@ -4039,7 +4243,7 @@ funcion definicion_clase(c) {
     empujar(c)
     cargar_caja(c, nombre)
     empujar(c)
-    llamar_runtime(c, "dyn_fijar_indice", 3)
+    fijar_indice_rapido(c)
     cargar_local(c, objeto)
     empujar(c)
     llamar_etiqueta(c, __cargar64(k + 40), 1)
@@ -4064,7 +4268,7 @@ funcion definicion_clase(c) {
             empujar(c)
             cargar_local(c, 16 + (n - 1 - i) * 8)
             empujar(c)
-            llamar_runtime(c, "dyn_fijar_indice", 3)
+            fijar_indice_rapido(c)
             i = i + 1
         }
     }
@@ -4309,6 +4513,7 @@ funcion empaquetar(c) {
     }
     si (es_windows(c)) { retornar empaquetar_pe(c) }
     si (es_macos(c)) { retornar empaquetar_macho(c) }
+    si (es_wasm(c)) { retornar empaquetar_wasm(c) }
     sea base = 4194304
     sea codigo = ctx_codigo(c)
     sea datos = ctx_datos(c)
@@ -5362,6 +5567,15 @@ funcion funciones_alcanzables(c) {
     mem_llenar(marca, 0, n + 1)
     sea refs = __cargar64(c + 408)
     sea pendientes = vec_nuevo()
+    // WebAssembly: las funciones del programa se pueden llamar desde
+    // JavaScript (cforge.llamar), así que todas son raíces.
+    si (es_wasm(c)) {
+        sea k = 0
+        mientras (k < n) {
+            si (__cargar64(vec_obtener(__cargar64(c + 144), k) + 24) == 2) { vec_agregar(pendientes, k) }
+            k = k + 1
+        }
+    }
     sea raiz = vec_obtener(refs, 0)
     sea i = 0
     mientras (i < vec_largo(raiz)) {
@@ -5449,6 +5663,7 @@ funcion numero_plataforma(nombre) {
     si (str_igual(nombre, "ios-arm64") o str_igual(nombre, "ios")) { retornar 5 }
     si (str_igual(nombre, "ios-sim-arm64") o str_igual(nombre, "ios-simulator")) { retornar 6 }
     si (str_igual(nombre, "linux") o str_igual(nombre, "linux-x64")) { retornar 0 }
+    si (str_igual(nombre, "wasm") o str_igual(nombre, "wasm32") o str_igual(nombre, "web")) { retornar 7 }
     rt_panico(str_concatenar("plataforma desconocida: ", str_concatenar(nombre, " (linux, linux-arm64, windows, macos, macos-arm64, ios-arm64, ios-sim-arm64)")))
     retornar 0
 }

@@ -1,0 +1,1009 @@
+// bootstrap/nativo/gen_wasm.cfv — backend WebAssembly (--target wasm).
+//
+// La máquina de gen.cfv se emula con funciones wasm de hasta 256 bloques
+// ("trozos"), unidas por un trampolín:
+//   · los registros virtuales 0-15 son locales i64 dentro de cada trozo y
+//     globales al pasar de uno a otro;
+//   · la pila y los marcos viven en la memoria lineal (como en x86-64), así
+//     el recolector de basura y los saltos de intentar/capturar funcionan sin
+//     cambios;
+//   · cada etiqueta empieza un bloque básico; una dirección de código es el
+//     número de su bloque y un salto es "pc ← bloque; br despacho": un
+//     loop + br_table elige el bloque dentro del trozo; si es de otro trozo,
+//     el trozo devuelve pc y el trampolín llama al que corresponde. Así V8
+//     compila y optimiza cada trozo por separado.
+// El runtime usa los módulos de Linux x86-64: el cargador JavaScript
+// (generado junto al .wasm) atiende sus llamadas al sistema (write, mmap,
+// exit, clock_gettime, getrandom…).
+
+// Locales de un trozo: 0 pc (i32, parámetro) · 1-16 registros · 17-18
+// auxiliares i64. Globales: 0-15 registros · 16 fin de datos (exportada).
+funcion w_reg(r) { retornar 1 + r }
+funcion w_pc() { retornar 0 }
+funcion w_t1() { retornar 17 }
+funcion w_t2() { retornar 18 }
+funcion w_bloques_por_trozo() { retornar 256 }
+
+funcion es_wasm(c) { retornar __cargar64(c + 296) == 7 }
+
+// ── Codificación ──
+
+funcion w_uleb(c, v) {
+    mientras (v >= 128) {
+        e1(c, v % 128 + 128)
+        v = v / 128
+    }
+    e1(c, v)
+    retornar 0
+}
+
+funcion w_sleb(c, v) {
+    sea seguir = 1
+    mientras (seguir) {
+        sea b = (v % 128 + 128) % 128
+        v = (v - b) / 128
+        si ((v == 0 y b < 64) o (v == 0 - 1 y b >= 64)) {
+            e1(c, b)
+            seguir = 0
+        } sino {
+            e1(c, b + 128)
+        }
+    }
+    retornar 0
+}
+
+// Cinco bytes para parchear después (LEB128 con relleno).
+funcion w_hueco(c, tipo, valor) {
+    sea a = mem_reservar(24)
+    __guardar64(a, posicion_codigo(c))
+    __guardar64(a + 8, tipo)
+    __guardar64(a + 16, valor)
+    vec_agregar(__cargar64(c + 32), a)
+    e5(c, 128, 128, 128, 128, 0)
+    retornar 0
+}
+
+funcion w_parchear5(s, posicion, v) {
+    sea d = str_datos(s) + posicion
+    sea k = 0
+    mientras (k < 4) {
+        __guardar8(d + k, __o_bits(__y_bits(__desplazar_der(v, 7 * k), 127), 128))
+        k = k + 1
+    }
+    __guardar8(d + 4, __y_bits(__desplazar_der(v, 28), 127))
+    retornar 0
+}
+
+funcion w_get(c, l) { e1(c, 32) w_uleb(c, l) retornar 0 }
+funcion w_set(c, l) { e1(c, 33) w_uleb(c, l) retornar 0 }
+funcion w_const(c, v) { e1(c, 66) w_sleb(c, v) retornar 0 }
+funcion w_dir(c) { e1(c, 167) retornar 0 }                     // i32.wrap_i64
+funcion w_load(c, desp) { e2(c, 41, 3) w_uleb(c, desp) retornar 0 }
+funcion w_store(c, desp) { e2(c, 55, 3) w_uleb(c, desp) retornar 0 }
+
+// ── Bloques básicos ──
+
+funcion w_bloques(c) {
+    sea b = __cargar64(c + 432)
+    si (b == 0) {
+        b = vec_nuevo()
+        vec_agregar(b, 0)
+        __guardar64(c + 432, b)
+    }
+    retornar b
+}
+
+funcion w_bloque_actual(c) { retornar vec_largo(w_bloques(c)) - 1 }
+
+// Empieza un bloque nuevo en la posición actual y devuelve su número.
+funcion w_nuevo_bloque(c) {
+    sea b = w_bloques(c)
+    vec_agregar(b, posicion_codigo(c))
+    retornar vec_largo(b) - 1
+}
+
+// Termina la llamada desde JavaScript: pc = -1 y salir del trozo.
+funcion w_volver_a_js(c) {
+    e1(c, 65) w_sleb(c, 0 - 1)
+    w_set(c, w_pc())
+    e1(c, 12)
+    w_hueco(c, 36, w_bloque_actual(c) * 8)
+    retornar 0
+}
+
+// br al despacho (la profundidad depende del bloque; extra = ifs abiertos).
+funcion w_br_despacho(c, extra) {
+    e1(c, 12)
+    w_hueco(c, 34, w_bloque_actual(c) * 8 + extra)
+    retornar 0
+}
+
+// pc ← bloque de la etiqueta; br despacho.
+funcion w_ir(c, etiqueta, extra) {
+    e1(c, 65)
+    w_hueco(c, 30, etiqueta)
+    w_set(c, w_pc())
+    w_br_despacho(c, extra)
+    retornar 0
+}
+
+// pc ← registro (dirección de código = número de bloque); br despacho.
+funcion w_ir_reg(c, r) {
+    w_get(c, w_reg(r))
+    w_dir(c)
+    w_set(c, w_pc())
+    w_br_despacho(c, 0)
+    retornar 0
+}
+
+funcion w_mov(c, destino, origen) { w_get(c, w_reg(origen)) w_set(c, w_reg(destino)) retornar 0 }
+funcion w_inmediato(c, v) { w_const(c, v) w_set(c, w_reg(0)) retornar 0 }
+funcion w_constante_rcx(c, v) { w_const(c, v) w_set(c, w_reg(1)) retornar 0 }
+funcion w_negar(c) { w_const(c, 0) w_get(c, w_reg(0)) e1(c, 125) w_set(c, w_reg(0)) retornar 0 }
+funcion w_cargar8(c) { w_get(c, w_reg(0)) w_dir(c) e3(c, 49, 0, 0) w_set(c, w_reg(0)) retornar 0 }
+funcion w_guardar8(c) { w_get(c, w_reg(0)) w_dir(c) w_get(c, w_reg(1)) e3(c, 60, 0, 0) retornar 0 }
+
+// ── Pila ──
+
+funcion w_empujar_valor(c) {
+    // El valor está en t1.
+    w_get(c, w_reg(4)) w_const(c, 8) e1(c, 125) w_set(c, w_reg(4))
+    w_get(c, w_reg(4)) w_dir(c) w_get(c, w_t1()) w_store(c, 0)
+    retornar 0
+}
+
+funcion w_empujar_reg(c, r) {
+    w_get(c, w_reg(r)) w_set(c, w_t1())
+    retornar w_empujar_valor(c)
+}
+
+funcion w_sacar(c, r) {
+    w_get(c, w_reg(4)) w_dir(c) w_load(c, 0) w_set(c, w_reg(r))
+    w_get(c, w_reg(4)) w_const(c, 8) e1(c, 124) w_set(c, w_reg(4))
+    retornar 0
+}
+
+// Dirección base + d en la pila de wasm (i32).
+funcion w_direccion(c, base, d) {
+    w_get(c, w_reg(base))
+    si (d < 0) {
+        w_const(c, d)
+        e1(c, 124)
+        w_dir(c)
+        retornar 0
+    }
+    w_dir(c)
+    retornar d
+}
+
+funcion w_cargar(c, destino, base, d) {
+    sea desp = w_direccion(c, base, d)
+    w_load(c, desp)
+    w_set(c, w_reg(destino))
+    retornar 0
+}
+
+funcion w_guardar(c, base, d, origen) {
+    sea desp = w_direccion(c, base, d)
+    w_get(c, w_reg(origen))
+    w_store(c, desp)
+    retornar 0
+}
+
+// a ← dirección (1 dato, 2 global, 3 tabla de clases, 4 etiqueta)
+funcion w_constante_direccion(c, tipo, valor) {
+    e1(c, 66)
+    si (tipo == 1) { w_hueco(c, 31, valor) }
+    si (tipo == 2) { w_hueco(c, 32, valor) }
+    si (tipo == 3) { w_hueco(c, 33, valor) }
+    si (tipo == 4) { w_hueco(c, 30, valor) }
+    retornar 0
+}
+
+funcion w_direccion_op(c, tipo, valor) {
+    w_constante_direccion(c, tipo, valor)
+    w_set(c, w_reg(0))
+    retornar 0
+}
+
+funcion w_cargar_absoluto(c, tipo, valor) {
+    w_constante_direccion(c, tipo, valor)
+    w_dir(c)
+    w_load(c, 0)
+    w_set(c, w_reg(0))
+    retornar 0
+}
+
+funcion w_guardar_absoluto(c, tipo, valor) {
+    w_constante_direccion(c, tipo, valor)
+    w_dir(c)
+    w_get(c, w_reg(0))
+    w_store(c, 0)
+    retornar 0
+}
+
+// a ← [a + b·8 + d]
+funcion w_cargar_indexado(c, d) {
+    w_get(c, w_reg(0)) w_get(c, w_reg(1)) w_const(c, 3) e1(c, 134) e1(c, 124)
+    w_dir(c)
+    w_load(c, d)
+    w_set(c, w_reg(0))
+    retornar 0
+}
+
+// Apila una copia de [pila + d].
+funcion w_empujar_pila(c, d) {
+    w_get(c, w_reg(4)) w_dir(c) w_load(c, d) w_set(c, w_t1())
+    retornar w_empujar_valor(c)
+}
+
+funcion w_sumar_pila(c, n) {
+    w_get(c, w_reg(4)) w_const(c, n) e1(c, 124) w_set(c, w_reg(4))
+    retornar 0
+}
+
+// ── Aritmética ──
+
+// a ← a (op) b: 1 suma · 2 resta · 3 producto · 4 división · 5 resto ·
+// 6 y · 7 o · 8 o exclusivo · 9 izq · 10 der lógico · 11 der aritmético
+funcion w_aritmetica(c, op) {
+    w_get(c, w_reg(0))
+    w_get(c, w_reg(1))
+    si (op == 1) { e1(c, 124) }
+    si (op == 2) { e1(c, 125) }
+    si (op == 3) { e1(c, 126) }
+    si (op == 4) { e1(c, 127) }
+    si (op == 5) { e1(c, 129) }
+    si (op == 6) { e1(c, 131) }
+    si (op == 7) { e1(c, 132) }
+    si (op == 8) { e1(c, 133) }
+    si (op == 9) { e1(c, 134) }
+    si (op == 10) { e1(c, 136) }
+    si (op == 11) { e1(c, 135) }
+    w_set(c, w_reg(0))
+    retornar 0
+}
+
+funcion w_unaria(c, codigo) {
+    w_get(c, w_reg(0)) e1(c, codigo) w_set(c, w_reg(0))
+    retornar 0
+}
+
+funcion w_sumar_k(c, k) {
+    w_get(c, w_reg(0)) w_const(c, k) e1(c, 124) w_set(c, w_reg(0))
+    retornar 0
+}
+
+// a ← a (k) constante: 131 y · 135 desplazamiento aritmético
+funcion w_con_constante(c, codigo, k) {
+    w_get(c, w_reg(0)) w_const(c, k) e1(c, codigo) w_set(c, w_reg(0))
+    retornar 0
+}
+
+// a ← a + a + k
+funcion w_etiquetar(c, k) {
+    w_get(c, w_reg(0)) w_get(c, w_reg(0)) e1(c, 124) w_const(c, k) e1(c, 124) w_set(c, w_reg(0))
+    retornar 0
+}
+
+// a ← [a] y [a] ← b (b queda con el valor anterior).
+funcion w_intercambiar(c) {
+    w_get(c, w_reg(0)) w_dir(c) w_load(c, 0) w_set(c, w_t1())
+    w_get(c, w_reg(0)) w_dir(c) w_get(c, w_reg(1)) w_store(c, 0)
+    w_get(c, w_t1()) w_set(c, w_reg(1))
+    w_get(c, w_t1()) w_set(c, w_reg(0))
+    retornar 0
+}
+
+// Código setcc de x86 → comparación i64 de wasm.
+funcion w_codigo_comparacion(codigo) {
+    si (codigo == 156) { retornar 83 }                         // <  lt_s
+    si (codigo == 158) { retornar 87 }                         // <= le_s
+    si (codigo == 159) { retornar 85 }                         // >  gt_s
+    si (codigo == 157) { retornar 89 }                         // >= ge_s
+    si (codigo == 148) { retornar 81 }                         // == eq
+    si (codigo == 149) { retornar 82 }                         // != ne
+    si (codigo == 146) { retornar 84 }                         // <  lt_u
+    si (codigo == 147) { retornar 90 }                         // >= ge_u
+    si (codigo == 150) { retornar 88 }                         // <= le_u
+    si (codigo == 151) { retornar 86 }                         // >  gt_u
+    rt_panico("wasm: comparación desconocida")
+    retornar 0
+}
+
+funcion w_comparar(c, codigo) {
+    w_get(c, w_reg(0)) w_get(c, w_reg(1)) e1(c, w_codigo_comparacion(codigo))
+    e1(c, 173)                                                 // i64.extend_i32_u
+    w_set(c, w_reg(0))
+    retornar 0
+}
+
+funcion w_cero(c, es_cero) {
+    w_get(c, w_reg(0)) e1(c, 80)                               // i64.eqz
+    si (es_cero == 0) { e1(c, 69) }                            // i32.eqz
+    e1(c, 173)
+    w_set(c, w_reg(0))
+    retornar 0
+}
+
+// ── Saltos y llamadas ──
+
+funcion w_saltar_si(c, cero, etiqueta) {
+    w_get(c, w_reg(0)) e1(c, 80)
+    si (cero == 0) { e1(c, 69) }
+    e2(c, 4, 64)                                               // if
+    w_ir(c, etiqueta, 1)
+    e1(c, 11)                                                  // end
+    retornar 0
+}
+
+funcion w_saltar_si_mayor_igual(c, etiqueta) {
+    w_get(c, w_reg(0)) w_get(c, w_reg(1)) e1(c, 89)
+    e2(c, 4, 64)
+    w_ir(c, etiqueta, 1)
+    e1(c, 11)
+    retornar 0
+}
+
+// Llamada: apila el bloque de retorno, salta y sigue en un bloque nuevo.
+funcion w_llamar(c, etiqueta) {
+    sea vuelta = nueva_etiqueta(c)
+    e1(c, 66)
+    w_hueco(c, 30, vuelta)
+    w_set(c, w_t1())
+    w_empujar_valor(c)
+    w_ir(c, etiqueta, 0)
+    definir_etiqueta(c, vuelta)
+    retornar 0
+}
+
+funcion w_llamar_reg(c, r) {
+    sea vuelta = nueva_etiqueta(c)
+    w_get(c, w_reg(r)) w_set(c, w_t2())
+    e1(c, 66)
+    w_hueco(c, 30, vuelta)
+    w_set(c, w_t1())
+    w_empujar_valor(c)
+    w_get(c, w_t2()) w_dir(c) w_set(c, w_pc())
+    w_br_despacho(c, 0)
+    definir_etiqueta(c, vuelta)
+    retornar 0
+}
+
+funcion w_prologo(c) {
+    w_empujar_reg(c, 5)
+    w_get(c, w_reg(4)) w_set(c, w_reg(5))
+    w_get(c, w_reg(4))
+    e1(c, 66)
+    sea posicion = posicion_codigo(c)
+    e5(c, 128, 128, 128, 128, 0)
+    e1(c, 125)
+    w_set(c, w_reg(4))
+    retornar posicion
+}
+
+funcion w_fijar_marco(c, posicion, tamano) {
+    w_parchear5(ctx_codigo(c), posicion, tamano)
+    retornar 0
+}
+
+// pila ← marco; marco ← pop; pc ← pop.
+funcion w_epilogo(c) {
+    w_get(c, w_reg(5)) w_set(c, w_reg(4))
+    w_sacar(c, 5)
+    w_sacar(c, 15)
+    w_ir_reg(c, 15)
+    retornar 0
+}
+
+// ── Flotantes ──
+
+funcion w_f64_de(c, r) { w_get(c, w_reg(r)) e1(c, 191) retornar 0 }      // f64.reinterpret_i64
+
+funcion w_f64(c, operacion) {
+    w_f64_de(c, 0)
+    w_f64_de(c, 1)
+    si (operacion == 88) { e1(c, 160) }                        // add
+    si (operacion == 92) { e1(c, 161) }                        // sub
+    si (operacion == 89) { e1(c, 162) }                        // mul
+    si (operacion == 94) { e1(c, 163) }                        // div
+    si (operacion == 93) { e1(c, 164) }                        // min
+    si (operacion == 95) { e1(c, 165) }                        // max
+    e1(c, 189)                                                 // i64.reinterpret_f64
+    w_set(c, w_reg(0))
+    retornar 0
+}
+
+funcion w_f64_desde_entero(c) {
+    w_get(c, w_reg(0)) e1(c, 185) e1(c, 189) w_set(c, w_reg(0))
+    retornar 0
+}
+
+funcion w_f64_a_entero(c) {
+    w_f64_de(c, 0) e2(c, 252, 6) w_set(c, w_reg(0))             // i64.trunc_sat_f64_s
+    retornar 0
+}
+
+funcion w_f64_raiz(c) {
+    w_f64_de(c, 0) e1(c, 159) e1(c, 189) w_set(c, w_reg(0))
+    retornar 0
+}
+
+funcion w_f64_menor(c) {
+    w_f64_de(c, 0) w_f64_de(c, 1) e1(c, 99) e1(c, 173) w_set(c, w_reg(0))
+    retornar 0
+}
+
+// ── Sistema ──
+
+// Importación 0: cf.sys(nr, a1..a6) con la numeración de Linux x86-64.
+funcion w_llamar_sys(c) {
+    e1(c, 16)
+    w_uleb(c, 0)
+    w_set(c, w_reg(0))
+    retornar 0
+}
+
+// __syscall(n, a1..a6) con los argumentos apilados (n el más profundo).
+funcion w_syscall(c, n) {
+    sea k = 0
+    mientras (k < 7) {
+        si (k < n) {
+            w_get(c, w_reg(4)) w_dir(c) w_load(c, 8 * (n - 1 - k))
+        } sino {
+            w_const(c, 0)
+        }
+        k = k + 1
+    }
+    w_sumar_pila(c, 8 * n)
+    w_llamar_sys(c)
+    retornar 0
+}
+
+// Operación que WebAssembly no tiene (hilos, llamadas C): el cargador avisa.
+funcion w_no_disponible(c, codigo, n) {
+    si (n > 0) { w_sumar_pila(c, 8 * n) }
+    w_const(c, codigo)
+    sea k = 0
+    mientras (k < 6) {
+        w_const(c, 0)
+        k = k + 1
+    }
+    w_llamar_sys(c)
+    retornar 0
+}
+
+// __hilo(pila, funcion, arg, tid): WebAssembly no tiene hilos; la tarea
+// corre completa en ese momento (sobre la pila actual) y su tid queda en 0,
+// así esperar() la ve terminada.
+funcion w_hilo(c) {
+    w_sacar(c, 10)
+    w_sacar(c, 0)
+    w_sacar(c, 1)
+    w_sacar(c, 6)
+    w_empujar_reg(c, 10)
+    w_empujar_reg(c, 0)
+    w_llamar_reg(c, 1)
+    w_sumar_pila(c, 8)
+    w_sacar(c, 10)
+    w_get(c, w_reg(10)) w_dir(c) w_const(c, 0) w_store(c, 0)
+    w_inmediato(c, 1)
+    retornar 0
+}
+
+// Entrada: guarda la pila inicial (global 504), llama al programa y termina.
+funcion w_inicio(c, principal) {
+    w_guardar_absoluto(c, 2, 504)                              // a = pila (ver ejecutar)
+    w_llamar(c, principal)
+    w_const(c, 1000)
+    w_get(c, w_reg(0))
+    sea k = 0
+    mientras (k < 5) {
+        w_const(c, 0)
+        k = k + 1
+    }
+    w_llamar_sys(c)
+    w_volver_a_js(c)
+    retornar 0
+}
+
+// ── extern "js" ──
+// Cada externa es una importación (módulo = la biblioteca del extern,
+// nombre = el símbolo) con n parámetros i64 → i64. El cargador convierte
+// según las clases de tipo (0 entero · 1 número · 2 texto · 3 booleano ·
+// 4 nulo · 5 entero de 32 bits).
+// Registro: [símbolo][biblioteca][tipos][resultado][casilla]
+
+funcion w_importaciones(c) {
+    sea v = __cargar64(c + 440)
+    si (v == 0) {
+        v = vec_nuevo()
+        __guardar64(c + 440, v)
+    }
+    retornar v
+}
+
+funcion w_externa_de_casilla(c, casilla) {
+    sea externas = __cargar64(c + 256)
+    sea i = 0
+    mientras (i < vec_largo(externas)) {
+        sea e = vec_obtener(externas, i)
+        si (__cargar64(e + 24) == casilla) { retornar e }
+        i = i + 1
+    }
+    rt_panico("wasm: externa desconocida")
+    retornar 0
+}
+
+funcion w_llamada_externa(c, casilla, tipos, convertidos) {
+    sea imps = w_importaciones(c)
+    sea indice = 0 - 1
+    sea i = 0
+    mientras (i < vec_largo(imps)) {
+        si (__cargar64(vec_obtener(imps, i) + 32) == casilla) { indice = i }
+        i = i + 1
+    }
+    si (indice < 0) {
+        sea e = w_externa_de_casilla(c, casilla)
+        sea r = mem_reservar(40)
+        __guardar64(r, __cargar64(e))
+        __guardar64(r + 8, __cargar64(e + 8))
+        __guardar64(r + 16, tipos)
+        __guardar64(r + 24, __cargar64(c + 448))
+        __guardar64(r + 32, casilla)
+        vec_agregar(imps, r)
+        indice = vec_largo(imps) - 1
+    }
+    i = 0
+    mientras (i < vec_largo(tipos)) {
+        cargar_local(c, vec_obtener(convertidos, i))
+        w_get(c, w_reg(0))
+        i = i + 1
+    }
+    e1(c, 16)
+    w_uleb(c, 1 + indice)
+    w_set(c, w_reg(0))
+    retornar 0
+}
+
+// ── Módulo ──
+
+funcion w_seccion(m, id, contenido) {
+    str_agregar_byte(m, id)
+    w_uleb_str(m, str_largo(contenido))
+    str_agregar(m, contenido)
+    retornar 0
+}
+
+funcion w_uleb_str(s, v) {
+    mientras (v >= 128) {
+        str_agregar_byte(s, v % 128 + 128)
+        v = v / 128
+    }
+    str_agregar_byte(s, v)
+    retornar 0
+}
+
+funcion w_sleb_str(s, v) {
+    sea seguir = 1
+    mientras (seguir) {
+        sea b = (v % 128 + 128) % 128
+        v = (v - b) / 128
+        si ((v == 0 y b < 64) o (v == 0 - 1 y b >= 64)) {
+            str_agregar_byte(s, b)
+            seguir = 0
+        } sino {
+            str_agregar_byte(s, b + 128)
+        }
+    }
+    retornar 0
+}
+
+funcion w_nombre(s, nombre) {
+    w_uleb_str(s, str_largo(nombre))
+    str_agregar(s, nombre)
+    retornar 0
+}
+
+// Tipo de función (n parámetros i64) → i64.
+funcion w_tipo_i64(s, n) {
+    str_agregar_byte(s, 96)
+    w_uleb_str(s, n)
+    sea k = 0
+    mientras (k < n) {
+        str_agregar_byte(s, 126)
+        k = k + 1
+    }
+    str_agregar_byte(s, 1)
+    str_agregar_byte(s, 126)
+    retornar 0
+}
+
+// ld/st de los registros entre locales y globales.
+funcion w_cargar_registros(s) {
+    sea r = 0
+    mientras (r < 16) {
+        str_agregar_byte(s, 35) w_uleb_str(s, r)               // global.get
+        str_agregar_byte(s, 33) w_uleb_str(s, w_reg(r))        // local.set
+        r = r + 1
+    }
+    retornar 0
+}
+
+funcion w_guardar_registros(s) {
+    sea r = 0
+    mientras (r < 16) {
+        str_agregar_byte(s, 32) w_uleb_str(s, w_reg(r))        // local.get
+        str_agregar_byte(s, 36) w_uleb_str(s, r)               // global.set
+        r = r + 1
+    }
+    retornar 0
+}
+
+funcion empaquetar_wasm(c) {
+    sea codigo = ctx_codigo(c)
+    sea datos = ctx_datos(c)
+    sea etiquetas = __cargar64(c + 40)
+    sea bloques = w_bloques(c)
+    // Bloque de regreso a JavaScript (llamadas desde el anfitrión).
+    sea volver = w_nuevo_bloque(c)
+    w_sumar_pila(c, 8)
+    w_volver_a_js(c)
+    sea n = vec_largo(bloques)
+    sea k_trozo = w_bloques_por_trozo()
+    sea trozos = (n + k_trozo - 1) / k_trozo
+    sea va_datos = 65536
+    sea va_globales = alinear(va_datos + str_largo(datos), 16)
+    sea fin = alinear(va_globales + 512 + vec_largo(__cargar64(c + 224)) * 8, 16)
+    // Parches del código (las profundidades dependen del trozo del bloque).
+    sea arreglos = __cargar64(c + 32)
+    sea i = 0
+    mientras (i < vec_largo(arreglos)) {
+        sea a = vec_obtener(arreglos, i)
+        sea posicion = __cargar64(a)
+        sea tipo = __cargar64(a + 8)
+        sea valor = __cargar64(a + 16)
+        si (tipo == 30) {
+            sea destino = vec_obtener(etiquetas, valor)
+            si (destino < 0) { rt_panico("wasm: etiqueta sin definir") }
+            w_parchear5(codigo, posicion, destino)
+        }
+        si (tipo == 31) { w_parchear5(codigo, posicion, va_datos + valor) }
+        si (tipo == 32) { w_parchear5(codigo, posicion, va_globales + valor) }
+        si (tipo == 33) { w_parchear5(codigo, posicion, va_datos + __cargar64(c + 192)) }
+        si (tipo == 34 o tipo == 36) {
+            sea bloque = valor / 8
+            sea fin_trozo = minimo_entero((bloque / k_trozo + 1) * k_trozo, n)
+            // Desde el código del bloque: bloques siguientes del trozo, luego
+            // "salir" y luego el loop de despacho.
+            sea hasta_salir = fin_trozo - 1 - bloque + valor % 8
+            si (tipo == 34) { w_parchear5(codigo, posicion, hasta_salir + 1) } sino { w_parchear5(codigo, posicion, hasta_salir) }
+        }
+        i = i + 1
+    }
+    // Datos: punteros a datos y direcciones de código (números de bloque).
+    sea reubicaciones = __cargar64(c + 80)
+    i = 0
+    mientras (i < vec_largo(reubicaciones)) {
+        sea campo = vec_obtener(reubicaciones, i)
+        parchear64(datos, campo, va_datos + campo + 16)
+        i = i + 1
+    }
+    sea a_codigo = __cargar64(c + 176)
+    i = 0
+    mientras (i < vec_largo(a_codigo)) {
+        sea p = vec_obtener(a_codigo, i)
+        parchear64(datos, __cargar64(p), vec_obtener(etiquetas, __cargar64(p + 8)))
+        i = i + 1
+    }
+    sea punteros = __cargar64(c + 112)
+    i = 0
+    mientras (i < vec_largo(punteros)) {
+        sea p = vec_obtener(punteros, i)
+        parchear64(datos, __cargar64(p), va_datos + __cargar64(p + 8))
+        i = i + 1
+    }
+    sea imps = w_importaciones(c)
+    sea primera_funcion = 1 + vec_largo(imps)                  // el trampolín
+    // Trozo k: (pc) → pc siguiente (-1: volver a JavaScript).
+    sea cuerpos = vec_nuevo()
+    sea k = 0
+    mientras (k < trozos) {
+        sea a = k * k_trozo
+        sea b = minimo_entero(a + k_trozo, n)
+        sea m = b - a
+        sea cuerpo = str_nuevo(4096)
+        w_uleb_str(cuerpo, 1)
+        w_uleb_str(cuerpo, 18) str_agregar_byte(cuerpo, 126)
+        w_cargar_registros(cuerpo)
+        str_agregar_byte(cuerpo, 3) str_agregar_byte(cuerpo, 64)       // loop
+        str_agregar_byte(cuerpo, 2) str_agregar_byte(cuerpo, 64)       // salir
+        sea j = 0
+        mientras (j < m) {
+            str_agregar_byte(cuerpo, 2) str_agregar_byte(cuerpo, 64)
+            j = j + 1
+        }
+        str_agregar_byte(cuerpo, 32) w_uleb_str(cuerpo, w_pc())
+        str_agregar_byte(cuerpo, 65) w_sleb_str(cuerpo, a)
+        str_agregar_byte(cuerpo, 107)                                  // i32.sub
+        str_agregar_byte(cuerpo, 14)
+        w_uleb_str(cuerpo, m)
+        j = 0
+        mientras (j < m) {
+            w_uleb_str(cuerpo, j)
+            j = j + 1
+        }
+        w_uleb_str(cuerpo, m)                                          // fuera del trozo: salir
+        j = a
+        mientras (j < b) {
+            str_agregar_byte(cuerpo, 11)
+            sea desde = vec_obtener(bloques, j)
+            sea hasta = str_largo(codigo)
+            si (j + 1 < n) { hasta = vec_obtener(bloques, j + 1) }
+            str_agregar(cuerpo, str_rebanar(codigo, desde, hasta))
+            j = j + 1
+        }
+        // Sigue al primer bloque del trozo siguiente.
+        str_agregar_byte(cuerpo, 65) w_sleb_str(cuerpo, b)
+        str_agregar_byte(cuerpo, 33) w_uleb_str(cuerpo, w_pc())
+        str_agregar_byte(cuerpo, 11)                                   // fin de salir
+        w_guardar_registros(cuerpo)
+        str_agregar_byte(cuerpo, 32) w_uleb_str(cuerpo, w_pc())
+        str_agregar_byte(cuerpo, 15)                                   // return
+        str_agregar_byte(cuerpo, 11)                                   // fin del loop
+        str_agregar_byte(cuerpo, 0)
+        str_agregar_byte(cuerpo, 11)
+        vec_agregar(cuerpos, cuerpo)
+        k = k + 1
+    }
+    // Trampolín ejecutar(f, arg, pila): prepara la pila y llama a los trozos
+    // hasta que uno devuelve -1; devuelve el registro a.
+    sea t = str_nuevo(1024)
+    w_uleb_str(t, 1)
+    w_uleb_str(t, 1) str_agregar_byte(t, 127)                          // local 3: pc
+    // pila ← parámetro 2
+    str_agregar_byte(t, 32) w_uleb_str(t, 2)
+    str_agregar_byte(t, 36) w_uleb_str(t, 4)
+    str_agregar_byte(t, 32) w_uleb_str(t, 0)
+    str_agregar_byte(t, 80)
+    str_agregar_byte(t, 4) str_agregar_byte(t, 64)
+    // f = 0: a ← pila; pc ← 0 (inicio)
+    str_agregar_byte(t, 32) w_uleb_str(t, 2)
+    str_agregar_byte(t, 36) w_uleb_str(t, 0)
+    str_agregar_byte(t, 65) w_sleb_str(t, 0)
+    str_agregar_byte(t, 33) w_uleb_str(t, 3)
+    str_agregar_byte(t, 5)
+    // si no: pila -= 16; [pila + 8] = arg; [pila] = volver; pc = f
+    str_agregar_byte(t, 35) w_uleb_str(t, 4)
+    str_agregar_byte(t, 66) w_sleb_str(t, 16)
+    str_agregar_byte(t, 125)
+    str_agregar_byte(t, 36) w_uleb_str(t, 4)
+    str_agregar_byte(t, 35) w_uleb_str(t, 4)
+    str_agregar_byte(t, 167)
+    str_agregar_byte(t, 32) w_uleb_str(t, 1)
+    str_agregar_byte(t, 55) str_agregar_byte(t, 3) w_uleb_str(t, 8)
+    str_agregar_byte(t, 35) w_uleb_str(t, 4)
+    str_agregar_byte(t, 167)
+    str_agregar_byte(t, 66) w_sleb_str(t, volver)
+    str_agregar_byte(t, 55) str_agregar_byte(t, 3) w_uleb_str(t, 0)
+    str_agregar_byte(t, 32) w_uleb_str(t, 0)
+    str_agregar_byte(t, 167)
+    str_agregar_byte(t, 33) w_uleb_str(t, 3)
+    str_agregar_byte(t, 11)
+    // loop { si pc < 0: devolver a; pc ← trozo[pc / 256](pc) }
+    str_agregar_byte(t, 3) str_agregar_byte(t, 64)
+    str_agregar_byte(t, 32) w_uleb_str(t, 3)
+    str_agregar_byte(t, 65) w_sleb_str(t, 0)
+    str_agregar_byte(t, 72)                                            // i32.lt_s
+    str_agregar_byte(t, 4) str_agregar_byte(t, 64)
+    str_agregar_byte(t, 35) w_uleb_str(t, 0)
+    str_agregar_byte(t, 15)
+    str_agregar_byte(t, 11)
+    k = 0
+    mientras (k < trozos) {
+        str_agregar_byte(t, 2) str_agregar_byte(t, 64)
+        k = k + 1
+    }
+    str_agregar_byte(t, 32) w_uleb_str(t, 3)
+    str_agregar_byte(t, 65) w_sleb_str(t, k_trozo)
+    str_agregar_byte(t, 110)                                           // i32.div_u
+    str_agregar_byte(t, 14)
+    w_uleb_str(t, trozos)
+    k = 0
+    mientras (k < trozos) {
+        w_uleb_str(t, k)
+        k = k + 1
+    }
+    w_uleb_str(t, trozos - 1)
+    k = 0
+    mientras (k < trozos) {
+        str_agregar_byte(t, 11)
+        str_agregar_byte(t, 32) w_uleb_str(t, 3)
+        str_agregar_byte(t, 16) w_uleb_str(t, primera_funcion + 1 + k)
+        str_agregar_byte(t, 33) w_uleb_str(t, 3)
+        str_agregar_byte(t, 12) w_uleb_str(t, trozos - 1 - k)          // al loop
+        k = k + 1
+    }
+    str_agregar_byte(t, 11)                                            // fin del loop
+    str_agregar_byte(t, 0)
+    str_agregar_byte(t, 11)
+    // Módulo.
+    sea m = str_nuevo(str_largo(codigo) + str_largo(datos) + 4096)
+    str_agregar_byte(m, 0)
+    str_agregar(m, "asm")
+    bytes_le(m, 1, 4)
+    // Tipos: 0 ejecutar (3 → 1) · 1 sys (7 → 1) · 2 + k: k parámetros → 1 ·
+    // 12 trozo (i32 → i32).
+    sea tipos = str_nuevo(256)
+    w_uleb_str(tipos, 13)
+    w_tipo_i64(tipos, 3)
+    w_tipo_i64(tipos, 7)
+    k = 0
+    mientras (k < 10) {
+        w_tipo_i64(tipos, k)
+        k = k + 1
+    }
+    str_agregar_byte(tipos, 96)
+    w_uleb_str(tipos, 1) str_agregar_byte(tipos, 127)
+    w_uleb_str(tipos, 1) str_agregar_byte(tipos, 127)
+    w_seccion(m, 1, tipos)
+    sea imports = str_nuevo(256)
+    w_uleb_str(imports, 1 + vec_largo(imps))
+    w_nombre(imports, "cf")
+    w_nombre(imports, "sys")
+    str_agregar_byte(imports, 0)
+    w_uleb_str(imports, 1)
+    k = 0
+    mientras (k < vec_largo(imps)) {
+        sea r = vec_obtener(imps, k)
+        si (vec_largo(__cargar64(r + 16)) > 9) { rt_panico("wasm: una externa admite hasta 9 parámetros") }
+        w_nombre(imports, __cargar64(r + 8))
+        w_nombre(imports, __cargar64(r))
+        str_agregar_byte(imports, 0)
+        w_uleb_str(imports, 2 + vec_largo(__cargar64(r + 16)))
+        k = k + 1
+    }
+    w_seccion(m, 2, imports)
+    sea funciones = str_nuevo(64)
+    w_uleb_str(funciones, 1 + trozos)
+    w_uleb_str(funciones, 0)
+    k = 0
+    mientras (k < trozos) {
+        w_uleb_str(funciones, 12)
+        k = k + 1
+    }
+    w_seccion(m, 3, funciones)
+    sea memoria = str_nuevo(16)
+    w_uleb_str(memoria, 1)
+    str_agregar_byte(memoria, 0)
+    w_uleb_str(memoria, (fin + 65535) / 65536)
+    w_seccion(m, 5, memoria)
+    // Globales: 16 registros (mutables) y el fin de datos y globales (el
+    // cargador pone la pila y el montículo después).
+    sea globales = str_nuevo(256)
+    w_uleb_str(globales, 17)
+    k = 0
+    mientras (k < 16) {
+        str_agregar_byte(globales, 126)
+        str_agregar_byte(globales, 1)
+        str_agregar_byte(globales, 66)
+        w_sleb_str(globales, 0)
+        str_agregar_byte(globales, 11)
+        k = k + 1
+    }
+    str_agregar_byte(globales, 127)
+    str_agregar_byte(globales, 0)
+    str_agregar_byte(globales, 65)
+    w_sleb_str(globales, fin)
+    str_agregar_byte(globales, 11)
+    w_seccion(m, 6, globales)
+    sea exportaciones = str_nuevo(64)
+    w_uleb_str(exportaciones, 3)
+    w_nombre(exportaciones, "memory")
+    str_agregar_byte(exportaciones, 2)
+    w_uleb_str(exportaciones, 0)
+    w_nombre(exportaciones, "ejecutar")
+    str_agregar_byte(exportaciones, 0)
+    w_uleb_str(exportaciones, primera_funcion)
+    w_nombre(exportaciones, "cf_fin")
+    str_agregar_byte(exportaciones, 3)
+    w_uleb_str(exportaciones, 16)
+    w_seccion(m, 7, exportaciones)
+    sea seccion_codigo = str_nuevo(str_largo(codigo) + 4096)
+    w_uleb_str(seccion_codigo, 1 + trozos)
+    w_uleb_str(seccion_codigo, str_largo(t))
+    str_agregar(seccion_codigo, t)
+    k = 0
+    mientras (k < trozos) {
+        sea cuerpo = vec_obtener(cuerpos, k)
+        w_uleb_str(seccion_codigo, str_largo(cuerpo))
+        str_agregar(seccion_codigo, cuerpo)
+        k = k + 1
+    }
+    w_seccion(m, 10, seccion_codigo)
+    sea seccion_datos = str_nuevo(str_largo(datos) + 16)
+    w_uleb_str(seccion_datos, 1)
+    str_agregar_byte(seccion_datos, 0)
+    str_agregar_byte(seccion_datos, 65)
+    w_sleb_str(seccion_datos, va_datos)
+    str_agregar_byte(seccion_datos, 11)
+    w_uleb_str(seccion_datos, str_largo(datos))
+    str_agregar(seccion_datos, datos)
+    w_seccion(m, 11, seccion_datos)
+    mem_fijar_global(41, w_cargador(c, imps))
+    retornar m
+}
+
+funcion minimo_entero(a, b) {
+    si (a < b) { retornar a }
+    retornar b
+}
+
+// Funciones del programa (modo 2) con su dirección: el anfitrión puede
+// llamarlas por nombre (cforge.llamar("nombre", entero)).
+funcion w_tabla_funciones(c) {
+    sea r = str_nuevo(1024)
+    str_agregar(r, "{")
+    sea funciones = __cargar64(c + 48)
+    sea etiquetas = __cargar64(c + 40)
+    sea primero = 1
+    sea i = 0
+    mientras (i < vec_largo(funciones)) {
+        sea f = vec_obtener(funciones, i)
+        si (__cargar64(f + 24) == 2 y __cargar64(f + 8) >= 0) {
+            sea b = vec_obtener(etiquetas, __cargar64(f + 8))
+            si (b > 0) {
+                si (primero == 0) { str_agregar(r, ", ") }
+                primero = 0
+                str_agregar(r, comillas(__cargar64(f)))
+                str_agregar(r, ": ")
+                str_agregar(r, str_desde_entero(b))
+            }
+        }
+        i = i + 1
+    }
+    str_agregar(r, "}")
+    retornar r
+}
+
+funcion w_tabla_externas(imps) {
+    sea r = str_nuevo(256)
+    str_agregar(r, "[")
+    sea i = 0
+    mientras (i < vec_largo(imps)) {
+        sea e = vec_obtener(imps, i)
+        si (i > 0) { str_agregar(r, ", ") }
+        str_agregar(r, "[")
+        str_agregar(r, comillas(__cargar64(e + 8)))
+        str_agregar(r, ", ")
+        str_agregar(r, comillas(__cargar64(e)))
+        str_agregar(r, ", [")
+        sea tipos = __cargar64(e + 16)
+        sea k = 0
+        mientras (k < vec_largo(tipos)) {
+            si (k > 0) { str_agregar(r, ", ") }
+            str_agregar(r, str_desde_entero(vec_obtener(tipos, k)))
+            k = k + 1
+        }
+        str_agregar(r, "], ")
+        str_agregar(r, str_desde_entero(__cargar64(e + 24)))
+        str_agregar(r, "]")
+        i = i + 1
+    }
+    str_agregar(r, "]")
+    retornar r
+}
+
+// Cargador ES module (navegador y Node.js): instancia el .wasm, atiende las
+// llamadas al sistema, conecta las externas "js" y permite llamar funciones
+// de C-Forge desde JavaScript.
+funcion w_cargador(c, imps) {
+    sea g = str_nuevo(16384)
+    str_agregar(g, "// Generado por cforge build --target wasm. No editar.\n")
+    str_agregar(g, "const FUNCIONES = ")
+    str_agregar(g, w_tabla_funciones(c))
+    str_agregar(g, ";\nconst EXTERNAS = ")
+    str_agregar(g, w_tabla_externas(imps))
+    str_agregar(g, ";\n")
+    retornar g
+}
