@@ -18,11 +18,11 @@ ARCH     := $(shell uname -m)
 # ── Fuentes ────────────────────────────────────────────────────────────────────
 RUNTIME_NATIVO := runtime/sys_linux.cfv runtime/mem.cfv runtime/str.cfv \
 	runtime/vec.cfv runtime/io.cfv runtime/f64.cfv
-RUNTIME_LENGUAJE := $(RUNTIME_NATIVO) runtime/sys_linux_ext.cfv runtime/map.cfv --puente runtime/dyn.cfv runtime/biblioteca.cfv --lenguaje runtime/lenguaje.cfv
+RUNTIME_LENGUAJE := $(RUNTIME_NATIVO) runtime/sys_linux_ext.cfv runtime/map.cfv --puente runtime/dyn.cfv runtime/biblioteca.cfv runtime/cripto.cfv runtime/medios.cfv --lenguaje runtime/lenguaje.cfv
 PRUEBAS_LENGUAJE_NATIVAS := $(basename $(notdir $(wildcard tests/cfv/*.cfv)))
 FUENTES_COMPILADOR := $(RUNTIME_NATIVO) bootstrap/nativo/lexer.cfv bootstrap/nativo/cforge_self.cfv bootstrap/nativo/gen.cfv bootstrap/nativo/gen_x64.cfv bootstrap/nativo/gen_a64.cfv bootstrap/nativo/gen_wasm.cfv bootstrap/nativo/biblioteca_c.cfv
 FUENTES_CFORGE := $(FUENTES_COMPILADOR) bootstrap/nativo/embebido.cfv bootstrap/nativo/paquetes.cfv bootstrap/nativo/formato.cfv bootstrap/nativo/lsp.cfv bootstrap/nativo/xcode.cfv bootstrap/nativo/cforge_cli.cfv
-EMBEBIDO_ARGS := --nativo $(RUNTIME_NATIVO) runtime/sys_linux_ext.cfv runtime/sys_linux_arm64.cfv runtime/sys_linux_arm64_ext.cfv runtime/sys_windows.cfv runtime/sys_windows_ext.cfv runtime/sys_macos.cfv runtime/sys_macos_ext.cfv runtime/map.cfv --puente runtime/dyn.cfv runtime/biblioteca.cfv --lenguaje runtime/lenguaje.cfv --opcional runtime/sdl.cfv runtime/gl3d.cfv --recurso runtime/wasm_cargador.js
+EMBEBIDO_ARGS := --nativo $(RUNTIME_NATIVO) runtime/sys_linux_ext.cfv runtime/sys_linux_arm64.cfv runtime/sys_linux_arm64_ext.cfv runtime/sys_windows.cfv runtime/sys_windows_ext.cfv runtime/sys_macos.cfv runtime/sys_macos_ext.cfv runtime/map.cfv --puente runtime/dyn.cfv runtime/biblioteca.cfv runtime/cripto.cfv runtime/medios.cfv --lenguaje runtime/lenguaje.cfv --opcional runtime/sdl.cfv runtime/gl3d.cfv --recurso runtime/wasm_cargador.js
 SEMILLA := bootstrap/semilla/cforge-linux-x64
 
 
@@ -214,8 +214,17 @@ stdlib-load-check: build
 stdlib-check: build
 	@set -e; dir=$$(mktemp -d /tmp/cforge-db.XXXXXX); \
 	(cd $$dir && CFORGE_STDLIB=$(CURDIR)/stdlib $(CURDIR)/$(TARGET) $(CURDIR)/tests/db/prueba.cfv) | diff -u tests/db/prueba.salida - || { echo "  ✗ tests/db"; exit 1; }; \
+	(cd $$dir && CFORGE_STDLIB=$(CURDIR)/stdlib $(CURDIR)/$(TARGET) $(CURDIR)/tests/db/completa.cfv) | grep -q '^\[OK\]' || { echo "  ✗ tests/db/completa"; exit 1; }; \
 	rm -rf $$dir; \
-	echo "  ✓ db: SQLite (CRUD, parámetros, transacciones, archivo)"
+	echo "  ✓ db: SQLite (CRUD, ?N y :nombre, BLOB, transacciones anidadas, pool, inyección bloqueada)"; \
+	for suite in graficos juego; do \
+		CFORGE_STDLIB=./stdlib ./$(TARGET) tests/$$suite/prueba.cfv | diff -u tests/$$suite/prueba.salida - || { echo "  ✗ tests/$$suite"; exit 1; }; \
+		CFORGE_STDLIB=./stdlib ./$(TARGET) build tests/$$suite/prueba.cfv --release -o /tmp/cforge-$$suite >/dev/null; \
+		(cd tests/$$suite && /tmp/cforge-$$suite) | diff -u tests/$$suite/prueba.salida - || { echo "  ✗ tests/$$suite (--release)"; exit 1; }; \
+		CFORGE_GC_ESTRES=1 CFORGE_STDLIB=./stdlib ./$(TARGET) tests/$$suite/prueba.cfv | diff -u tests/$$suite/prueba.salida - >/dev/null || { echo "  ✗ tests/$$suite (GC en estrés)"; exit 1; }; \
+	done; \
+	echo "  ✓ gráficos: PNG/JPEG/BMP, zlib, TrueType, render 2D/3D y audio idénticos bit a bit"; \
+	echo "  ✓ juego: física 2D/3D, colisiones, entrada y partículas"
 
 ## Recolector de basura: memoria acotada en un programa largo y la suite
 ## completa recolectando cada 64 KiB (CFORGE_GC_ESTRES) para detectar raíces
@@ -244,8 +253,14 @@ wasm-check: build
 	for file in tests/cfv/*.cfv; do \
 		case "$$file" in *24_extern_c*) continue ;; esac; \
 		CFORGE_STDLIB=./stdlib ./$(TARGET) build "$$file" --target wasm --release -o $$dir/p >/dev/null; \
+		node tests/wasm/validar.mjs $$dir/p.wasm || { echo "  ✗ $$file: módulo .wasm inválido"; exit 1; }; \
 		(cd tests/cfv && node $$dir/p.mjs) | grep -q '^\[OK\]' || { echo "  ✗ $$file en WebAssembly"; exit 1; }; \
 		n=$$((n + 1)); \
+	done; \
+	for suite in graficos juego; do \
+		CFORGE_STDLIB=./stdlib ./$(TARGET) build tests/$$suite/prueba.cfv --target wasm --release -o $$dir/s >/dev/null; \
+		node tests/wasm/validar.mjs $$dir/s.wasm; \
+		(cd tests/$$suite && node $$dir/s.mjs) | diff -u tests/$$suite/prueba.salida - >/dev/null || { echo "  ✗ tests/$$suite en WebAssembly"; exit 1; }; \
 	done; \
 	mkdir -p tests/wasm/salida; \
 	CFORGE_STDLIB=./stdlib ./$(TARGET) build tests/wasm/interop.cfv --target wasm -o tests/wasm/salida/interop >/dev/null; \
@@ -253,8 +268,10 @@ wasm-check: build
 	./$(TARGET) build site/forja/forja.cfv --target wasm --release -o $$dir/forja >/dev/null; \
 	cmp -s $$dir/forja.wasm site/assets/forja/forja.wasm && cmp -s $$dir/forja.mjs site/assets/forja/forja.mjs || { echo "  ✗ site/assets/forja desactualizado (cforge build site/forja/forja.cfv --target wasm --release -o site/assets/forja/forja)"; exit 1; }; \
 	CFORGE_STDLIB=./stdlib ./$(TARGET) build ejemplos/web/particulas/particulas.cfv --target wasm --release -o $$dir/particulas >/dev/null; \
+	CFORGE_STDLIB=./stdlib ./$(TARGET) build ejemplos/web/cubo3d/cubo3d.cfv --target wasm --release -o $$dir/cubo3d >/dev/null; \
+	node tests/wasm/validar.mjs $$dir/particulas.wasm $$dir/cubo3d.wasm $$dir/forja.wasm; \
 	rm -rf $$dir; \
-	echo "  ✓ wasm: $$n suites del lenguaje en Node.js, interop con JavaScript y la forja del sitio"
+	echo "  ✓ wasm: $$n suites del lenguaje + gráficos y juego en Node.js (módulos validados), interop con JavaScript y la forja del sitio"
 
 ## --release: "hola" < 60 KB, la suite completa sin el código muerto y el
 ## benchmark de enteros (holgura para máquinas lentas del CI).

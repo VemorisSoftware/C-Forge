@@ -161,6 +161,13 @@ export async function iniciar(opciones = {}) {
     nav_linea: (x1, y1, x2, y2, g, color) => { lienzo2d.strokeStyle = color; lienzo2d.lineWidth = g; lienzo2d.beginPath(); lienzo2d.moveTo(x1, y1); lienzo2d.lineTo(x2, y2); lienzo2d.stroke(); },
     nav_escribir: (x, y, t, tam, color) => { lienzo2d.fillStyle = color; lienzo2d.font = tam + "px system-ui, sans-serif"; lienzo2d.fillText(t, x, y); },
     nav_particulas_crudo: (s, x, y, z, c, n) => particulas(s, [x, y, z, c], n),
+    // Lienzo RGBA de graficos.cfv (renderizado en C-Forge) → <canvas>.
+    nav_lienzo_pintar: (s, dir, w, h) => {
+      const c = $(s);
+      if (c.width !== w || c.height !== h) { c.width = w; c.height = h; }
+      const px = new Uint8ClampedArray(memoria.buffer, Number(dir), w * h * 4).slice();
+      c.getContext("2d").putImageData(new ImageData(px, w, h), 0, 0);
+    },
   };
   // Partículas: listas de enteros etiquetados (2v + 1) en milésimas, leídas
   // directo de la memoria del módulo y dibujadas como puntos aditivos.
@@ -197,7 +204,12 @@ export async function iniciar(opciones = {}) {
   for (const [modulo, nombre, tipos, resultado] of EXTERNAS) {
     const fuente = modulo === "js" ? js : modulo === "navegador" ? NAVEGADOR : (opciones.modulos || {})[modulo] || {};
     const f = fuente[nombre] !== undefined ? fuente[nombre] : globalThis[nombre];
-    if (typeof f !== "function") throw new Error(`C-Forge: falta la función externa ${modulo}.${nombre}`);
+    if (typeof f !== "function") {
+      // Biblioteca nativa (SDL2, sqlite3…) que no existe en la web: solo
+      // falla si el programa la llama de verdad.
+      (importaciones[modulo] ||= {})[nombre] = () => { throw new Error(`C-Forge: la función externa ${modulo}.${nombre} no está disponible en WebAssembly`); };
+      continue;
+    }
     (importaciones[modulo] ||= {})[nombre] = (...args) => {
       const valores = args.map((v, k) => {
         const t = tipos[k];

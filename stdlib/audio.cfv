@@ -1,5 +1,16 @@
-// stdlib/audio.cfv — Sistema de audio para videojuegos
-// C-Forge Standard Library v3.0
+// stdlib/audio.cfv — audio para videojuegos, en C-Forge puro.
+//
+// Sonidos WAV (PCM 8/16/24/32 bits y flotante), tonos generados, un
+// mezclador de voces con volumen, paneo, tono (remuestreo lineal), bucles y
+// fundidos, y salida real por SDL2 (SDL_QueueAudio). La mezcla está escrita
+// en C-Forge (runtime/medios.cfv) y es determinista: se puede probar sin
+// tarjeta de sonido con mezclador_generar.
+//
+//   importar "audio"
+//   audio_iniciar()
+//   audio_registrar_sonido("pip", sonido_tono(880, 120), "sfx")
+//   audio_reproducir("pip", {"volumen": 0.8, "pan": -0.5})
+//   mientras (jugando) { audio_actualizar(delta) }
 
 // ── Contexto de audio ──────────────────────────────────────────────────────────
 
@@ -12,20 +23,36 @@ sea _audio_ctx = {
     "musica_actual": nulo,
     "canales": {},
     "buffers": {},
-    "grupos": {}
+    "grupos": {},
+    "tasa": 44100,
+    "salida": nulo,
+    "secuencia": 0
 }
 
 // ── Gestión de buffers/clips ───────────────────────────────────────────────────
 
 /// @doc Registrar un clip de audio
-funcion audio_registrar(nombre, ruta, tipo) {
+funcion audio_registrar(nombre, ruta, tipo = "sfx") {
+    // "sfx", "musica", "ui" o "ambiente". Los .wav se cargan de verdad.
+    sea sonido = nulo
+    si (ruta != nulo y existe_archivo(ruta)) { sonido = sonido_cargar(ruta) }
     _audio_ctx["buffers"][nombre] = {
         "nombre": nombre,
         "ruta": ruta,
-        "tipo": tipo ?? "sfx",  // "sfx", "musica", "ui", "ambiente"
-        "cargado": verdadero,
-        "duracion": 0
+        "tipo": tipo ?? "sfx",
+        "cargado": sonido != nulo,
+        "sonido": sonido,
+        "duracion": _audio_duracion(sonido)
     }
+}
+
+funcion audio_registrar_sonido(nombre, sonido, tipo = "sfx") {
+    _audio_ctx["buffers"][nombre] = {"nombre": nombre, "ruta": nulo, "tipo": tipo, "cargado": verdadero, "sonido": sonido, "duracion": _audio_duracion(sonido)}
+}
+
+funcion _audio_duracion(sonido) {
+    si (sonido == nulo) { retornar 0 }
+    retornar longitud(sonido["pcm"]) / 2 / sonido["canales"] / sonido["tasa"]
 }
 
 /// @doc Registrar múltiples sonidos
@@ -50,8 +77,12 @@ funcion audio_reproducir(nombre, config) {
         retornar {"error": "Audio no encontrado: " + nombre}
     }
     sea c = config ?? {}
+    para k en ["volumen", "pan", "pitch", "loop", "fade_in", "3d", "pos_x", "pos_y", "pos_z", "distancia_max"] {
+        si (tiene_clave(c, k) == falso) { c[k] = nulo }
+    }
     sea clip = _audio_ctx["buffers"][nombre]
-    sea canal_id = nombre + "_" + a_texto(aleatorio_entero(10000, 99999))
+    _audio_ctx["secuencia"] = _audio_ctx["secuencia"] + 1
+    sea canal_id = nombre + "_" + _audio_ctx["secuencia"]
     sea canal = {
         "id": canal_id,
         "nombre": nombre,
@@ -69,7 +100,10 @@ funcion audio_reproducir(nombre, config) {
         "pos_x": c["pos_x"] ?? 0,
         "pos_y": c["pos_y"] ?? 0,
         "pos_z": c["pos_z"] ?? 0,
-        "distancia_max": c["distancia_max"] ?? 500
+        "distancia_max": c["distancia_max"] ?? 500,
+        "sonido": clip["sonido"],
+        "pos": 0,
+        "fade_out": falso
     }
     _audio_ctx["canales"][canal_id] = canal
     retornar canal_id
@@ -122,7 +156,7 @@ funcion audio_fade_out(canal_id, duracion) {
 
 /// @doc Parar todos los canales de un grupo
 funcion audio_parar_grupo(grupo) {
-    para id en mapa_claves(_audio_ctx["canales"]) {
+    para id en claves(_audio_ctx["canales"]) {
         si (_audio_ctx["canales"][id]["grupo"] == grupo) {
             audio_parar(id)
         }
@@ -185,19 +219,165 @@ funcion audio_calcular_pan(canal_id, oyente_x, oyente_y) {
 
 funcion audio_actualizar(delta) {
     sea a_eliminar = []
-    para id en mapa_claves(_audio_ctx["canales"]) {
+    para id en claves(_audio_ctx["canales"]) {
         sea canal = _audio_ctx["canales"][id]
-        si (canal["pausado"]) { continuar }
-        canal["tiempo"] = canal["tiempo"] + delta
-        // Fade out
-        si (canal["fade_out"] ?? falso) {
-            canal["fade_tiempo"] = canal["fade_tiempo"] + delta
-            si (canal["fade_tiempo"] >= canal["fade_duracion"]) {
-                agregar(a_eliminar, id)
+        si (canal["pausado"] == falso) {
+            canal["tiempo"] = canal["tiempo"] + delta
+            si (canal["fade_duracion"] > 0 y canal["fade_out"] == falso) { canal["fade_tiempo"] = canal["fade_tiempo"] + delta }
+            si (canal["fade_out"]) {
+                canal["fade_tiempo"] = canal["fade_tiempo"] + delta
+                si (canal["fade_tiempo"] >= canal["fade_duracion"]) { agregar(a_eliminar, id) }
             }
         }
     }
     para id en a_eliminar { audio_parar(id) }
+    si (_audio_ctx["salida"] != nulo) { audio_bombear() }
+}
+
+// ── Sonidos ────────────────────────────────────────────────────────────────────
+// Un sonido es {"tasa", "canales", "pcm"} con PCM de 16 bits intercalado.
+
+funcion sonido_desde_wav(datos) {
+    sea r = wav_decodificar(datos)
+    retornar {"tasa": r[0], "canales": r[1], "pcm": r[2]}
+}
+
+funcion sonido_cargar(ruta) { retornar sonido_desde_wav(leer_archivo(ruta)) }
+
+funcion sonido_a_wav(sonido) { retornar wav_codificar(sonido["pcm"], sonido["tasa"], sonido["canales"]) }
+
+funcion sonido_guardar(sonido, ruta) {
+    escribir_archivo(ruta, sonido_a_wav(sonido))
+    retornar ruta
+}
+
+funcion sonido_cuadros(sonido) { retornar longitud(sonido["pcm"]) / 2 / sonido["canales"] }
+
+// Tono de prueba: forma "seno", "cuadrada", "sierra" o "triangulo", con
+// ataque y caída cortos para que no haga clic.
+funcion sonido_tono(frecuencia, ms, tasa = 44100, forma = "seno", volumen = 0.5) {
+    sea n = piso(tasa * ms / 1000)
+    sea muestras = []
+    sea rampa = minimo(piso(tasa / 200), piso(n / 4))
+    sea i = 0
+    mientras (i < n) {
+        sea fase = (i * frecuencia / tasa) % 1
+        sea v = 0
+        si (forma == "seno") { v = seno(fase * 6.283185307179586) }
+        si (forma == "cuadrada") { si (fase < 0.5) { v = 1 } sino { v = 0 - 1 } }
+        si (forma == "sierra") { v = fase * 2 - 1 }
+        si (forma == "triangulo") { v = 1 - 4 * absoluto(fase - 0.5) }
+        sea env = 1
+        si (rampa > 0 y i < rampa) { env = i / rampa }
+        si (rampa > 0 y n - i < rampa) { env = (n - i) / rampa }
+        agregar(muestras, piso(v * env * volumen * 32767))
+        i = i + 1
+    }
+    retornar {"tasa": tasa, "canales": 1, "pcm": pcm_de_lista(muestras)}
+}
+
+// ── Mezclador ──────────────────────────────────────────────────────────────────
+
+funcion _audio_ganancia(canal) {
+    sea v = canal["volumen"]
+    si (canal["fade_duracion"] > 0) {
+        sea t = minimo(1, canal["fade_tiempo"] / canal["fade_duracion"])
+        si (canal["fade_out"]) { v = v * (1 - t) } sino { v = v * t }
+    }
+    retornar maximo(0, minimo(1, v))
+}
+
+// Mezcla `cuadros` cuadros estéreo de todos los canales activos a la tasa del
+// mezclador y devuelve PCM s16 intercalado (4 bytes por cuadro).
+funcion mezclador_generar(cuadros) {
+    sea destino = pcm_silencio(cuadros * 4)
+    si (_audio_ctx["activo"] == falso) { retornar destino }
+    sea terminados = []
+    para id en claves(_audio_ctx["canales"]) {
+        sea c = _audio_ctx["canales"][id]
+        si (c["sonido"] != nulo y c["pausado"] == falso) {
+            sea g = _audio_ganancia(c)
+            sea pan = maximo(0 - 1, minimo(1, c["pan"]))
+            sea izq = piso(g * minimo(1, 1 - pan) * 65536)
+            sea der = piso(g * minimo(1, 1 + pan) * 65536)
+            sea son = c["sonido"]
+            sea paso = piso(son["tasa"] * c["pitch"] / _audio_ctx["tasa"] * 65536)
+            sea bucle = 0
+            si (c["loop"]) { bucle = 1 }
+            sea pos = pcm_mezclar(destino, cuadros, son["pcm"], son["canales"], [c["pos"], paso, izq, der, bucle])
+            si (pos < 0) { agregar(terminados, id) } sino { c["pos"] = pos }
+        }
+    }
+    para id en terminados { audio_parar(id) }
+    retornar destino
+}
+
+funcion audio_canales_activos() { retornar longitud(claves(_audio_ctx["canales"])) }
+
+// ── Salida real (SDL2) ─────────────────────────────────────────────────────────
+
+funcion _audio_sdl() {
+    extern "SDL2" funcion SDL_InitSubSystem(banderas: entero): entero
+    extern "SDL2" funcion SDL_OpenAudioDevice(dispositivo: puntero, captura: entero, deseado: puntero, obtenido: puntero, cambios: entero): entero
+    extern "SDL2" funcion SDL_PauseAudioDevice(dispositivo: entero, pausa: entero): nulo
+    extern "SDL2" funcion SDL_QueueAudio(dispositivo: entero, datos: texto, largo: entero): entero
+    extern "SDL2" funcion SDL_GetQueuedAudioSize(dispositivo: entero): entero
+    extern "SDL2" funcion SDL_CloseAudioDevice(dispositivo: entero): nulo
+    extern "SDL2" funcion SDL_GetError(): texto
+}
+
+// Abre la salida de audio (estéreo, 16 bits). Lanza un error si no hay SDL2
+// o dispositivo de sonido.
+funcion audio_iniciar(tasa = 44100, latencia_ms = 60) {
+    si (_audio_ctx["salida"] != nulo) { retornar _audio_ctx["salida"] }
+    si (SDL_InitSubSystem(16) != 0) { lanzar "audio_iniciar: " + SDL_GetError() }
+    sea spec = c_reservar(32)
+    c_escribir32(spec, 0, tasa)
+    c_escribir32(spec, 4, 32784 + 2 * 65536)
+    c_escribir32(spec, 8, 1024)
+    c_escribir32(spec, 12, 0)
+    c_escribir64(spec, 16, 0)
+    c_escribir64(spec, 24, 0)
+    sea dev = SDL_OpenAudioDevice(nulo, 0, spec, nulo, 0)
+    c_liberar(spec)
+    si (dev <= 0) { lanzar "audio_iniciar: " + SDL_GetError() }
+    SDL_PauseAudioDevice(dev, 0)
+    _audio_ctx["tasa"] = tasa
+    _audio_ctx["salida"] = {"dispositivo": dev, "latencia": latencia_ms}
+    retornar _audio_ctx["salida"]
+}
+
+// Mantiene la cola del dispositivo llena hasta la latencia pedida.
+funcion audio_bombear() {
+    sea s = _audio_ctx["salida"]
+    si (s == nulo) { retornar 0 }
+    sea objetivo = piso(_audio_ctx["tasa"] * s["latencia"] / 1000) * 4
+    sea pendiente = SDL_GetQueuedAudioSize(s["dispositivo"])
+    si (pendiente >= objetivo) { retornar 0 }
+    sea cuadros = piso((objetivo - pendiente) / 4)
+    sea pcm = mezclador_generar(cuadros)
+    SDL_QueueAudio(s["dispositivo"], pcm, longitud(pcm))
+    retornar cuadros
+}
+
+funcion audio_enviar(pcm) {
+    sea s = _audio_ctx["salida"]
+    si (s == nulo) { lanzar "audio_enviar: llama primero a audio_iniciar()" }
+    SDL_QueueAudio(s["dispositivo"], pcm, longitud(pcm))
+}
+
+funcion audio_pendiente_ms() {
+    sea s = _audio_ctx["salida"]
+    si (s == nulo) { retornar 0 }
+    retornar SDL_GetQueuedAudioSize(s["dispositivo"]) / 4 * 1000 / _audio_ctx["tasa"]
+}
+
+funcion audio_cerrar() {
+    sea s = _audio_ctx["salida"]
+    si (s != nulo) {
+        SDL_CloseAudioDevice(s["dispositivo"])
+        _audio_ctx["salida"] = nulo
+    }
 }
 
 // ── Efectos de audio ───────────────────────────────────────────────────────────
