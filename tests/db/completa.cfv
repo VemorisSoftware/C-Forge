@@ -1,0 +1,91 @@
+// tests/db/completa — SQLite estable: parámetros ?N y :nombre, BLOB con bytes
+// 0, iteración, transacciones anidadas (SAVEPOINT), claves foráneas,
+// inyección SQL bloqueada, caché de sentencias, pool de conexiones y archivo.
+importar "db"
+funcion igual(a, b, que) { afirmar(a == b, que + ": " + a + " != " + b) }
+
+sea db = db_abrir(":memory:")
+db_ejecutar(db, "CREATE TABLE autores (id INTEGER PRIMARY KEY, nombre TEXT NOT NULL UNIQUE)")
+db_ejecutar(db, "CREATE TABLE libros (id INTEGER PRIMARY KEY, autor INTEGER NOT NULL REFERENCES autores(id), titulo TEXT, precio REAL, portada BLOB)")
+db_consulta_p(db, "INSERT INTO autores (nombre) VALUES (?1)", ["Gabriela Mistral"])
+db_consulta_p(db, "INSERT INTO autores (nombre) VALUES (:n)", {"n": "Pablo Neruda"})
+igual(db_valor(db, "SELECT COUNT(*) FROM autores", nulo), 2, "insertar con ?1 y :nombre")
+sea bytes = char_de(0) + char_de(255) + "PNG" + char_de(0) + char_de(7)
+db_consulta_p(db, "INSERT INTO libros (autor, titulo, precio, portada) VALUES (?, ?, ?, ?)", [1, "Desolación", 12.5, db_blob(bytes)])
+db_consulta_p(db, "INSERT INTO libros (autor, titulo, precio, portada) VALUES (?, ?, ?, ?)", [2, "Veinte poemas", 9.99, nulo])
+sea libro = db_primera(db, "SELECT * FROM libros WHERE titulo = ?", ["Desolación"])
+igual(longitud(libro["portada"]), 7, "BLOB con bytes 0")
+igual(libro["portada"], bytes, "BLOB idéntico")
+igual(libro["precio"], 12.5, "REAL")
+igual(db_primera(db, "SELECT portada FROM libros WHERE id = 2", nulo)["portada"], nulo, "NULL")
+sea texto_con_cero = "a" + char_de(0) + "b"
+db_consulta_p(db, "INSERT INTO autores (nombre) VALUES (?)", [texto_con_cero])
+igual(db_valor(db, "SELECT nombre FROM autores WHERE id = 3", nulo), texto_con_cero, "texto con byte 0")
+
+// Claves foráneas activas por defecto.
+sea rechazado = falso
+intentar { db_consulta_p(db, "INSERT INTO libros (autor, titulo) VALUES (?, ?)", [99, "x"]) } capturar (e) { rechazado = verdadero }
+afirmar(rechazado, "clave foránea")
+
+// Inyección: el valor va como parámetro; los nombres se validan.
+sea malicioso = "x'); DROP TABLE autores; --"
+db_consulta_p(db, "SELECT * FROM autores WHERE nombre = ?", [malicioso])
+igual(db_valor(db, "SELECT COUNT(*) FROM autores", nulo), 3, "la tabla sigue")
+sea bloqueado = falso
+intentar { db_insertar(db, "autores; DROP TABLE autores", {"nombre": "z"}) } capturar (e) { bloqueado = verdadero }
+afirmar(bloqueado, "nombre de tabla inválido")
+sea faltan = falso
+intentar { db_consulta_p(db, "SELECT ? + ?", [1]) } capturar (e) { faltan = verdadero }
+afirmar(faltan, "cantidad de parámetros")
+
+// Iteración y la misma consulta dentro de su recorrido.
+sea total = 0
+db_cada(db, "SELECT id FROM autores", nulo, funcion(fila) {
+    total = total + fila["id"]
+    total = total + db_valor(db, "SELECT COUNT(*) FROM autores", nulo) * 0
+})
+igual(total, 6, "db_cada")
+
+// Transacciones anidadas: la interna revierte sola, la externa confirma.
+db_transaccion_con(db, funcion() {
+    db_consulta_p(db, "INSERT INTO autores (nombre) VALUES (?)", ["Vicente Huidobro"])
+    intentar {
+        db_transaccion_con(db, funcion() {
+            db_consulta_p(db, "INSERT INTO autores (nombre) VALUES (?)", ["Nicanor Parra"])
+            lanzar "falla interna"
+        })
+    } capturar (e) { }
+})
+igual(db_valor(db, "SELECT COUNT(*) FROM autores WHERE nombre = ?", ["Vicente Huidobro"]), 1, "externa confirmada")
+igual(db_valor(db, "SELECT COUNT(*) FROM autores WHERE nombre = ?", ["Nicanor Parra"]), 0, "interna revertida")
+intentar {
+    db_transaccion_con(db, funcion() {
+        db_consulta_p(db, "DELETE FROM libros", nulo)
+        lanzar "todo atrás"
+    })
+} capturar (e) { }
+igual(db_valor(db, "SELECT COUNT(*) FROM libros", nulo), 2, "transacción revertida")
+
+// Muchas filas con la sentencia en caché.
+db_ejecutar(db, "CREATE TABLE numeros (n INTEGER)")
+db_transaccion_con(db, funcion() {
+    para i en rango(20000) { db_consulta_p(db, "INSERT INTO numeros (n) VALUES (?)", [i]) }
+})
+igual(db_valor(db, "SELECT SUM(n) FROM numeros", nulo), 199990000, "20 000 inserciones")
+db_cerrar(db)
+
+// Archivo, pool de conexiones y reapertura.
+sea ruta = "cforge-prueba-completa.sqlite"
+intentar { eliminar_archivo(ruta) } capturar (e) { }
+sea pool = db_pool(ruta, 3)
+db_pool_usar(pool, funcion(c) { db_ejecutar(c, "CREATE TABLE IF NOT EXISTS notas (texto TEXT)") })
+para i en rango(5) { db_pool_usar(pool, funcion(c) { db_consulta_p(c, "INSERT INTO notas VALUES (?)", ["nota " + i]) }) }
+igual(db_pool_usar(pool, funcion(c) { retornar db_valor(c, "SELECT COUNT(*) FROM notas", nulo) }), 5, "pool")
+db_pool_cerrar(pool)
+sea otra = db_abrir(ruta)
+igual(db_valor(otra, "SELECT COUNT(*) FROM notas", nulo), 5, "persistencia en archivo")
+db_cerrar(otra)
+intentar { eliminar_archivo(ruta) } capturar (e) { }
+intentar { eliminar_archivo(ruta + "-wal") } capturar (e) { }
+intentar { eliminar_archivo(ruta + "-shm") } capturar (e) { }
+mostrar("[OK] sqlite: parámetros, BLOB, transacciones anidadas, seguridad, caché y pool")
