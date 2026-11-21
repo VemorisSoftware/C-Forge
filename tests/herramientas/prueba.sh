@@ -21,7 +21,7 @@ grep -q '^## `async funcion doble(x)`' "$T/doc.md"
 grep -q '<h2><code>funcion db_abrir(ruta)</code></h2>' "$T/doc.html"
 # cforge bindgen: cabecera con macros, extern "C", enum, typedef, include
 # local, variádica, float e inline.
-CFORGE_STDLIB=stdlib "$C" bindgen "$D/ejemplo.h" --lib c -o "$T/ej.cfv" | grep -q '6 funciones, 7 constantes; 2 omitidas'
+CFORGE_STDLIB=stdlib "$C" bindgen "$D/ejemplo.cabecera" --lib c -o "$T/ej.cfv" | grep -q '6 funciones, 7 constantes; 2 omitidas'
 grep -q 'extern "c" funcion strlen(s_: texto): largo' "$T/ej.cfv"
 grep -q 'extern "c" funcion ej_media(v_: puntero, n_: largo): numero' "$T/ej.cfv"
 grep -q 'extern "c" funcion ej_registrar(ctx_: puntero, cb_: puntero, dato_: puntero): entero' "$T/ej.cfv"
