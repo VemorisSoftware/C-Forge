@@ -212,6 +212,13 @@ C# que devuelven `double`; C++ sin interfaz C (clases, plantillas) no se
 puede llamar directamente. Todo está probado en el CI (`tests/herramientas`,
 `tests/npm`, `tests/interop`).
 
+## Ecosistema de bibliotecas
+
+[`docs/BIBLIOTECAS.md`](docs/BIBLIOTECAS.md) define las 251 bibliotecas del
+ecosistema con nombres propios de C-Forge: cuáles ya existen, cuáles se usan
+hoy vía interoperabilidad y cuáles están por construir (una por PR, con
+pruebas en el CI).
+
 ## Construir desde el código fuente
 
 C-Forge se compila a sí mismo: la semilla `bootstrap/semilla/cforge-linux-x64`
