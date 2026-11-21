@@ -2,7 +2,7 @@
 
 Sitio oficial: [c-forge.org](https://c-forge.org)
 
-## Sin publicar (5.0)
+## 4.7.0 — 2026-11-21
 
 - **Web sin JavaScript ni CSS aparte** (`importar "navegador"`):
   `nav_evento("tecla" | "id" | "origen" | "destino" | "x" | "y" | "valor")`
