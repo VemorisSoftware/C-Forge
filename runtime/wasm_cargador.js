@@ -253,10 +253,27 @@ export async function iniciar(opciones = {}) {
     gl.drawArrays(gl.POINTS, 0, n);
   }
 
+  // Paquetes npm: extern "npm:paquete" funcion f(...) los importa solos.
+  // Node.js: desde node_modules (npm install paquete). Navegador: el
+  // empaquetador o el import map si lo resuelven; si no, desde esm.sh.
+  const npm = {};
+  for (const [modulo] of EXTERNAS) {
+    if (!modulo.startsWith("npm:") || npm[modulo] || (opciones.modulos || {})[modulo]) continue;
+    const paquete = modulo.slice(4);
+    try {
+      npm[modulo] = await import(paquete);
+    } catch (e) {
+      if (ES_NODE) throw new Error(`C-Forge: falta el paquete npm "${paquete}" (npm install ${paquete})`);
+      npm[modulo] = await import("https://esm.sh/" + paquete);
+    }
+  }
+
   // Externas: módulo (biblioteca del extern) → nombre → función de JavaScript.
   const importaciones = { cf: { sys } };
   for (const [modulo, nombre, tipos, resultado] of EXTERNAS) {
-    const fuente = modulo === "js" ? js : modulo === "navegador" ? NAVEGADOR : (opciones.modulos || {})[modulo] || {};
+    let fuente = modulo === "js" ? js : modulo === "navegador" ? NAVEGADOR : (opciones.modulos || {})[modulo] || npm[modulo] || {};
+    // Paquetes CommonJS (lodash…): las funciones viven en default.
+    if (fuente[nombre] === undefined && fuente.default && typeof fuente.default[nombre] === "function") fuente = fuente.default;
     const f = fuente[nombre] !== undefined ? fuente[nombre] : globalThis[nombre];
     if (typeof f !== "function") {
       // Biblioteca nativa (SDL2, sqlite3…) que no existe en la web: solo
