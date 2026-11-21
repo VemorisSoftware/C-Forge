@@ -2,6 +2,17 @@
 
 Sitio oficial: [c-forge.org](https://c-forge.org)
 
+## Sin publicar
+
+- **`cforge bindgen cabecera.h [--lib nombre] [-o modulo.cfv]`**: genera un
+  módulo C-Forge con las funciones (`extern`), constantes (`#define`
+  numéricos y de texto, `enum`) y tipos de una cabecera C, siguiendo los
+  `#include "…"` locales y desenvolviendo macros como `ZEXPORT` u
+  `OF((…))`. Sirve para C y para Rust, C++ o Zig con interfaz C. Probado con
+  zlib (86 funciones) y SQLite (329). Lo que `extern` no puede declarar
+  (float de 32 bits, structs por valor, `...`, más de 6 enteros) se omite
+  con un comentario. También como biblioteca: `importar "bindgen"`.
+
 ## 4.7.0 — 2026-11-21
 
 - **Web sin JavaScript ni CSS aparte** (`importar "navegador"`):

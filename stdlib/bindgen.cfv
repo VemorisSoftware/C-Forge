@@ -1,0 +1,541 @@
+// stdlib/bindgen.cfv — de una cabecera C (.h) a un módulo C-Forge con sus
+// funciones (extern), constantes (#define y enum) y tipos opacos.
+//
+//   cforge bindgen /usr/include/zlib.h --lib z -o zlib.cfv
+//   importar "zlib"          // y luego: mostrar(c_texto(zlibVersion()))
+//
+// Desde código: bindgen_generar(texto_h, "z", "zlib.h") devuelve el módulo.
+//
+// Sirve para C y también para Rust, C++ o Zig cuando la librería expone una
+// interfaz en C. Tipos: int/short/char/enum → entero, long/size_t/int64 →
+// largo, double → numero, const char* → texto, otros punteros → puntero,
+// bool → booleano, void → nulo. Se omiten (con un comentario que explica por
+// qué) las funciones con float de 32 bits, structs por valor o argumentos
+// variables (...), que extern no puede declarar.
+
+sea _BG_ENTEROS = ["int", "short", "char", "signed", "unsigned", "int8_t", "int16_t", "int32_t", "uint8_t", "uint16_t", "uint32_t", "wchar_t", "char16_t", "char32_t"]
+sea _BG_LARGOS = ["long", "size_t", "ssize_t", "int64_t", "uint64_t", "intptr_t", "uintptr_t", "ptrdiff_t", "off_t", "off64_t", "time_t", "intmax_t", "uintmax_t"]
+sea _BG_IGNORAR = ["const", "volatile", "extern", "inline", "__inline", "__inline__", "restrict", "__restrict", "__restrict__", "register", "__extension__", "struct", "enum", "union", "__cdecl", "__stdcall", "__declspec", "__attribute__", "WINAPI", "CALLBACK", "APIENTRY"]
+sea _BG_LIB = ""
+sea _BG_CLAVES = ["si", "sino", "mientras", "para", "en", "sea", "funcion", "retornar", "clase", "verdadero", "falso", "nulo", "importar", "lanzar", "intentar", "capturar", "y", "o", "no", "texto", "entero", "numero", "lista", "mapa"]
+
+funcion _bg_es_letra(c) { retornar (c >= "a" y c <= "z") o (c >= "A" y c <= "Z") o c == "_" }
+funcion _bg_es_cifra(c) { retornar c >= "0" y c <= "9" }
+
+// Quita comentarios y une las líneas terminadas en barra invertida.
+funcion _bg_limpiar(t) {
+    sea r = []
+    sea i = 0
+    sea n = longitud(t)
+    sea inicio = 0
+    mientras (i < n) {
+        sea c = subcadena(t, i, i + 1)
+        si (c == "\"" o c == "'") {
+            sea j = i + 1
+            mientras (j < n y subcadena(t, j, j + 1) != c) {
+                si (subcadena(t, j, j + 1) == "\\") { j = j + 1 }
+                j = j + 1
+            }
+            i = j + 1
+        } sino {
+            si (c == "/" y i + 1 < n y subcadena(t, i + 1, i + 2) == "*") {
+                r.agregar(subcadena(t, inicio, i))
+                sea fin = _bg_buscar_desde(t, "*/", i + 2)
+                si (fin < 0) { fin = n - 2 }
+                r.agregar(" ")
+                i = fin + 2
+                inicio = i
+            } sino {
+                si (c == "/" y i + 1 < n y subcadena(t, i + 1, i + 2) == "/") {
+                    r.agregar(subcadena(t, inicio, i))
+                    sea fin = _bg_buscar_desde(t, "\n", i)
+                    si (fin < 0) { fin = n }
+                    i = fin
+                    inicio = i
+                } sino { i = i + 1 }
+            }
+        }
+    }
+    r.agregar(subcadena(t, inicio, n))
+    retornar texto_reemplazar(unir(r, ""), "\\\n", " ")
+}
+
+funcion _bg_buscar_desde(t, que, desde) {
+    sea p = texto_indice(subcadena(t, desde, longitud(t)), que)
+    si (p < 0) { retornar 0 - 1 }
+    retornar p + desde
+}
+
+// "0x1F", "12UL", "-3", "(1 << 4)" → número, o nulo si no es una constante simple.
+funcion _bg_numero(v) {
+    sea s = texto_recortar(v)
+    mientras (longitud(s) > 1 y subcadena(s, 0, 1) == "(" y subcadena(s, longitud(s) - 1, longitud(s)) == ")") { s = texto_recortar(subcadena(s, 1, longitud(s) - 1)) }
+    si (texto_indice(s, "<<") > 0) {
+        sea p = texto_indice(s, "<<")
+        sea a = _bg_numero(subcadena(s, 0, p))
+        sea b = _bg_numero(subcadena(s, p + 2, longitud(s)))
+        si (a == nulo o b == nulo o b > 52) { retornar nulo }
+        retornar a * potencia(2, b)
+    }
+    sea signo = 1
+    si (subcadena(s, 0, 1) == "-") {
+        signo = 0 - 1
+        s = texto_recortar(subcadena(s, 1, longitud(s)))
+    }
+    mientras (longitud(s) > 0 y texto_indice("uUlL", subcadena(s, longitud(s) - 1, longitud(s))) >= 0) { s = subcadena(s, 0, longitud(s) - 1) }
+    si (longitud(s) == 0) { retornar nulo }
+    sea base = 10
+    sea i = 0
+    si (longitud(s) > 2 y (subcadena(s, 0, 2) == "0x" o subcadena(s, 0, 2) == "0X")) {
+        base = 16
+        i = 2
+    }
+    sea v = 0
+    mientras (i < longitud(s)) {
+        sea c = texto_minusculas(subcadena(s, i, i + 1))
+        sea d = texto_indice("0123456789abcdef", c)
+        si (d < 0 o d >= base) { retornar nulo }
+        v = v * base + d
+        i = i + 1
+    }
+    si (v > 9007199254740991) { retornar nulo }
+    retornar signo * v
+}
+
+funcion _bg_fichas(t) {
+    sea r = []
+    sea i = 0
+    sea n = longitud(t)
+    mientras (i < n) {
+        sea c = subcadena(t, i, i + 1)
+        si (_bg_es_letra(c)) {
+            sea j = i
+            mientras (j < n y (_bg_es_letra(subcadena(t, j, j + 1)) o _bg_es_cifra(subcadena(t, j, j + 1)))) { j = j + 1 }
+            r.agregar(subcadena(t, i, j))
+            i = j
+        } sino {
+            si (_bg_es_cifra(c)) {
+                sea j = i
+                mientras (j < n y (_bg_es_letra(subcadena(t, j, j + 1)) o _bg_es_cifra(subcadena(t, j, j + 1)))) { j = j + 1 }
+                r.agregar(subcadena(t, i, j))
+                i = j
+            } sino {
+                si (c == "\"") {
+                    sea j = i + 1
+                    mientras (j < n y subcadena(t, j, j + 1) != "\"") {
+                        si (subcadena(t, j, j + 1) == "\\") { j = j + 1 }
+                        j = j + 1
+                    }
+                    r.agregar(subcadena(t, i, j + 1))
+                    i = j + 1
+                } sino {
+                    si (c == "." y subcadena(t, i, i + 3) == "...") {
+                        r.agregar("...")
+                        i = i + 3
+                    } sino {
+                        si (c != " " y c != "\t" y c != "\n" y c != "\r") { r.agregar(c) }
+                        i = i + 1
+                    }
+                }
+            }
+        }
+    }
+    retornar r
+}
+
+// Tipo C (fichas) → tipo de extern, o nulo si no se puede declarar.
+funcion _bg_tipo(fichas, alias, ignorar, como_retorno) {
+    sea punteros = 0
+    sea base = []
+    sea constante = falso
+    sea saltar = 0
+    para f en fichas {
+        si (saltar > 0) {
+            si (f == "(") { saltar = saltar + 1 }
+            si (f == ")") { saltar = saltar - 1 }
+        } sino {
+            si (f == "*" o f == "[") { punteros = punteros + 1 } sino {
+                si (f == "const") { constante = verdadero }
+                si (f == "__attribute__" o f == "__declspec") { saltar = 0 - 1 }
+                si (saltar == 0 - 1 y f == "(") { saltar = 1 } sino {
+                    si (saltar == 0 - 1) { saltar = 0 }
+                    si (contiene(_BG_IGNORAR, f) == falso y tiene_clave(ignorar, f) == falso y f != "]" y _bg_es_letra(subcadena(f, 0, 1))) { base.agregar(f) }
+                }
+            }
+        }
+    }
+    // Typedefs: se resuelven (con tope para no girar en círculo).
+    sea vueltas = 0
+    mientras (longitud(base) == 1 y tiene_clave(alias, base[0]) y vueltas < 20) {
+        sea a = alias[base[0]]
+        punteros = punteros + a["punteros"]
+        base = a["base"]
+        vueltas = vueltas + 1
+    }
+    si (punteros > 0) {
+        si (punteros == 1 y constante y longitud(base) > 0 y contiene(base, "char") y como_retorno == falso) { retornar "texto" }
+        retornar "puntero"
+    }
+    si (longitud(base) == 0) { retornar nulo }
+    si (base[0] == "void" y longitud(base) == 1) { retornar "nulo" }
+    si (base[0] == "puntero_bg") { retornar "puntero" }
+    si (base[0] == "bool" o base[0] == "_Bool") { retornar "booleano" }
+    si (contiene(base, "double")) { si (contiene(base, "long")) { retornar nulo } retornar "numero" }
+    si (contiene(base, "float")) { retornar nulo }
+    para b en base { si (contiene(_BG_LARGOS, b)) { retornar "largo" } }
+    sea todos = verdadero
+    para b en base { si (contiene(_BG_ENTEROS, b) == falso y b != "enum_bg") { todos = falso } }
+    si (todos) { retornar "entero" }
+    retornar nulo
+}
+
+funcion _bg_nombre_seguro(n) {
+    si (contiene(_BG_CLAVES, n)) { retornar n + "_" }
+    retornar n
+}
+
+// Separa "tipo nombre" / "tipo *nombre[...]" en [fichas del tipo, nombre].
+funcion _bg_partir_param(fichas) {
+    sea k = longitud(fichas) - 1
+    mientras (k >= 0 y (fichas[k] == "]" o fichas[k] == "[" o _bg_es_cifra(subcadena(fichas[k], 0, 1)))) { k = k - 1 }
+    si (k >= 1 y _bg_es_letra(subcadena(fichas[k], 0, 1)) y contiene(_BG_ENTEROS, fichas[k]) == falso y contiene(_BG_LARGOS, fichas[k]) == falso y fichas[k] != "void" y fichas[k] != "double" y fichas[k] != "float" y fichas[k] != "const" y fichas[k] != "char") {
+        sea tipo = []
+        sea i = 0
+        mientras (i < longitud(fichas)) {
+            si (i != k) { tipo.agregar(fichas[i]) }
+            i = i + 1
+        }
+        retornar [tipo, fichas[k]]
+    }
+    retornar [fichas, ""]
+}
+
+funcion bindgen_generar(fuente, lib, nombre_h) {
+    _BG_LIB = lib
+    sea t = _bg_limpiar(fuente)
+    sea constantes = []
+    sea vistas = {}
+    sea ignorar = {}
+    sea alias_define = {}
+    sea cuerpo = []
+    // Preprocesador: #define con número, #define vacío (macro a ignorar).
+    para linea en texto_dividir(t, "\n") {
+        sea l = texto_recortar(linea)
+        si (subcadena(l, 0, 1) == "#") {
+            sea d = texto_recortar(subcadena(l, 1, longitud(l)))
+            si (subcadena(d, 0, 6) == "define") {
+                sea resto = texto_recortar(subcadena(d, 6, longitud(d)))
+                sea fichas = _bg_fichas(resto)
+                si (longitud(fichas) > 0 y _bg_es_letra(subcadena(fichas[0], 0, 1))) {
+                    sea nombre = fichas[0]
+                    sea tras = texto_recortar(subcadena(resto, longitud(nombre), longitud(resto)))
+                    // Macro con argumentos: NOMBRE( pegado; esas no son constantes.
+                    sea con_argumentos = subcadena(resto, longitud(nombre), longitud(nombre) + 1) == "("
+                    si (con_argumentos == falso) {
+                        sea ft = _bg_fichas(tras)
+                        si (longitud(ft) >= 1 y longitud(ft) <= 3 y _bg_es_letra(subcadena(ft[0], 0, 1)) y _bg_mayusculas(nombre) == falso) {
+                            alias_define[nombre] = ft
+                        }
+                        si (longitud(tras) == 0) { ignorar[nombre] = verdadero } sino {
+                            sea v = _bg_numero(tras)
+                            si (v != nulo y tiene_clave(vistas, nombre) == falso) {
+                                vistas[nombre] = verdadero
+                                constantes.agregar("sea " + _bg_nombre_seguro(nombre) + " = " + v)
+                            } sino {
+                                si (subcadena(tras, 0, 1) == "\"" y subcadena(tras, longitud(tras) - 1, longitud(tras)) == "\"" y tiene_clave(vistas, nombre) == falso) {
+                                    vistas[nombre] = verdadero
+                                    constantes.agregar("sea " + _bg_nombre_seguro(nombre) + " = " + tras)
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        } sino { cuerpo.agregar(linea) }
+    }
+    sea f = _bg_fichas(unir(cuerpo, "\n"))
+    sea alias = {}
+    para nombre en claves(alias_define) {
+        sea ft = alias_define[nombre]
+        sea pts = 0
+        sea base = []
+        para x en ft { si (x == "*") { pts = pts + 1 } sino { base.agregar(x) } }
+        alias[nombre] = {"base": base, "punteros": pts}
+    }
+    sea funciones = []
+    sea omitidas = []
+    sea declaradas = {}
+    sea i = 0
+    sea n = longitud(f)
+    sea sentencia = []
+    sea profundidad = 0
+    sea transparentes = 0                                     // extern "C" { … }
+    mientras (i < n) {
+        sea x = f[i]
+        si (x == "{" y profundidad == 0 y longitud(sentencia) == 2 y sentencia[0] == "extern" y sentencia[1] == "\"C\"") {
+            transparentes = transparentes + 1
+            sentencia = []
+        } sino {
+        si (x == "}" y profundidad == 0 y transparentes > 0) {
+            transparentes = transparentes - 1
+            sentencia = []
+        } sino {
+        si (x == "{" ) {
+            // enum { A, B = 3 }: constantes.
+            si (profundidad == 0 y contiene(sentencia, "enum")) {
+                sea j = i + 1
+                sea valor = 0
+                mientras (j < n y f[j] != "}") {
+                    si (_bg_es_letra(subcadena(f[j], 0, 1))) {
+                        sea nombre = f[j]
+                        si (j + 1 < n y f[j + 1] == "=") {
+                            sea expr = []
+                            sea k = j + 2
+                            mientras (k < n y f[k] != "," y f[k] != "}") {
+                                expr.agregar(f[k])
+                                k = k + 1
+                            }
+                            sea v = _bg_numero(unir(expr, " "))
+                            si (v == nulo y longitud(expr) == 1 y tiene_clave(vistas, expr[0])) { v = nulo }
+                            si (v != nulo) { valor = v }
+                            j = k - 1
+                        }
+                        si (tiene_clave(vistas, nombre) == falso) {
+                            vistas[nombre] = verdadero
+                            constantes.agregar("sea " + _bg_nombre_seguro(nombre) + " = " + valor)
+                        }
+                        valor = valor + 1
+                    }
+                    j = j + 1
+                }
+            }
+            profundidad = profundidad + 1
+            si (profundidad == 1) { sentencia.agregar("{}") }
+        } sino {
+            si (x == "}") {
+                profundidad = profundidad - 1
+                // Cuerpo de función en línea: la sentencia termina aquí.
+                si (profundidad == 0 y contiene(sentencia, "(") y contiene(sentencia, "typedef") == falso y contiene(sentencia, "=") == falso) { sentencia = [] }
+            } sino {
+                si (profundidad == 0) {
+                    si (x == ";") {
+                        _bg_sentencia(sentencia, alias, ignorar, funciones, omitidas, declaradas)
+                        sentencia = []
+                    } sino { sentencia.agregar(x) }
+                }
+            }
+        }
+        }
+        }
+        i = i + 1
+    }
+    sea r = []
+    r.agregar("// Generado por cforge bindgen desde " + nombre_h + " (librería \"" + lib + "\").")
+    r.agregar("// " + longitud(funciones) + " funciones, " + longitud(constantes) + " constantes; " + longitud(omitidas) + " omitidas.")
+    r.agregar("// Para leer un char* devuelto como texto: c_texto(puntero).")
+    r.agregar("")
+    para c en constantes { r.agregar(c) }
+    r.agregar("")
+    r.agregar("// Cada función se resuelve (dlopen + dlsym) la primera vez que se llama.")
+    r.agregar("funcion __bindgen_" + texto_reemplazar(texto_reemplazar(lib, "-", "_"), ".", "_") + "() {")
+    para d en funciones { r.agregar("    " + d) }
+    r.agregar("}")
+    si (longitud(omitidas) > 0) {
+        r.agregar("")
+        r.agregar("// Omitidas (extern no puede declararlas):")
+        para o en omitidas { r.agregar("//   " + o) }
+    }
+    retornar unir(r, "\n") + "\n"
+}
+
+funcion _bg_mayusculas(x) {
+    si (longitud(x) < 2 o _bg_es_letra(subcadena(x, 0, 1)) == falso) { retornar falso }
+    sea i = 0
+    mientras (i < longitud(x)) {
+        sea c = subcadena(x, i, i + 1)
+        si ((c >= "A" y c <= "Z") o _bg_es_cifra(c) o c == "_") { i = i + 1 } sino { retornar falso }
+    }
+    retornar verdadero
+}
+
+// MACRO((a, b)) → (a, b) (estilo OF de zlib) y fuera los decoradores en
+// mayúsculas que no son tipos conocidos (ZEXPORT, SQLITE_API, DECLSPEC…).
+funcion _bg_desmacrar(s, alias) {
+    sea r = []
+    sea i = 0
+    mientras (i < longitud(s)) {
+        sea x = s[i]
+        si (_bg_mayusculas(x) y i + 2 < longitud(s) y s[i + 1] == "(" y s[i + 2] == "(") {
+            // Quita X y el paréntesis externo (y su cierre).
+            sea nivel = 0
+            sea j = i + 1
+            sea fin = 0 - 1
+            mientras (j < longitud(s) y fin < 0) {
+                si (s[j] == "(") { nivel = nivel + 1 }
+                si (s[j] == ")") {
+                    nivel = nivel - 1
+                    si (nivel == 0) { fin = j }
+                }
+                j = j + 1
+            }
+            sea k = i + 2
+            mientras (k < fin) {
+                r.agregar(s[k])
+                k = k + 1
+            }
+            i = fin + 1
+        } sino {
+            si (_bg_mayusculas(x) y tiene_clave(alias, x) == falso y (i + 1 >= longitud(s) o s[i + 1] != "(") y x != "FILE") { } sino { r.agregar(x) }
+            i = i + 1
+        }
+    }
+    retornar r
+}
+
+funcion _bg_sentencia(s0, alias, ignorar, funciones, omitidas, declaradas) {
+    si (longitud(s0) == 0) { retornar nulo }
+    sea s = s0
+    s = _bg_desmacrar(s0, alias)
+    si (longitud(s) == 0) { retornar nulo }
+    si (s[0] == "static" o s[0] == "template" o s[0] == "namespace" o s[0] == "using" o contiene(s, "operator")) { retornar nulo }
+    // typedef: alias de tipo (los punteros a función y structs opacos son punteros).
+    si (s[0] == "typedef") {
+        sea resto = subcadena_lista(s, 1, longitud(s))
+        si (contiene(resto, "(")) {
+            // typedef int (*cb)(...)  →  cb es un puntero.
+            sea k = 0
+            mientras (k < longitud(resto)) {
+                si (resto[k] == "*" y k + 1 < longitud(resto) y _bg_es_letra(subcadena(resto[k + 1], 0, 1))) { alias[resto[k + 1]] = {"base": ["puntero_bg"], "punteros": 0} }
+                k = k + 1
+            }
+            retornar nulo
+        }
+        si (longitud(resto) < 2) { retornar nulo }
+        sea nombre = resto[longitud(resto) - 1]
+        sea base = subcadena_lista(resto, 0, longitud(resto) - 1)
+        si (contiene(base, "{}")) {
+            si (contiene(base, "enum")) { alias[nombre] = {"base": ["enum_bg"], "punteros": 0} } sino { alias[nombre] = {"base": ["struct_bg"], "punteros": 0} }
+            retornar nulo
+        }
+        sea punteros = 0
+        sea limpia = []
+        para b en base {
+            si (b == "*") { punteros = punteros + 1 } sino { limpia.agregar(b) }
+        }
+        si (contiene(limpia, "enum")) { limpia = ["enum_bg"] }
+        si ((contiene(limpia, "struct") o contiene(limpia, "union")) y punteros == 0) { limpia = ["struct_bg"] }
+        alias[nombre] = {"base": limpia, "punteros": punteros}
+        retornar nulo
+    }
+    // Prototipo: tipo nombre ( parámetros ) [atributos]
+    sea p = 0 - 1
+    sea k = 0
+    mientras (k < longitud(s) y p < 0) {
+        si (s[k] == "(" y k > 0 y _bg_es_letra(subcadena(s[k - 1], 0, 1)) y tiene_clave(ignorar, s[k - 1]) == falso y s[k - 1] != "__attribute__" y s[k - 1] != "__declspec") { p = k }
+        k = k + 1
+    }
+    si (p < 1 o contiene(s, "{}") o contiene(s, "=")) { retornar nulo }
+    sea nombre = s[p - 1]
+    si (tiene_clave(declaradas, nombre)) { retornar nulo }
+    declaradas[nombre] = verdadero                            // también si se omite: una sola vez
+    sea tipo_ret = subcadena_lista(s, 0, p - 1)
+    // Parámetros hasta el ")" que cierra.
+    sea params = []
+    sea actual = []
+    sea nivel = 0
+    sea j = p + 1
+    mientras (j < longitud(s) y (nivel > 0 o s[j] != ")")) {
+        si (s[j] == "(") { nivel = nivel + 1 }
+        si (s[j] == ")") { nivel = nivel - 1 }
+        si (nivel == 0 y s[j] == ",") {
+            params.agregar(actual)
+            actual = []
+        } sino { actual.agregar(s[j]) }
+        j = j + 1
+    }
+    si (longitud(actual) > 0) { params.agregar(actual) }
+    sea ret = _bg_tipo(tipo_ret, alias, ignorar, verdadero)
+    si (ret == nulo) {
+        omitidas.agregar(nombre + ": tipo de retorno no soportado (" + unir(tipo_ret, " ") + ")")
+        retornar nulo
+    }
+    sea partes = []
+    sea indice = 0
+    para prm en params {
+        si (longitud(prm) == 1 y prm[0] == "void") { } sino {
+            si (contiene(prm, "...")) {
+                omitidas.agregar(nombre + ": argumentos variables (...)")
+                retornar nulo
+            }
+            sea tp = nulo
+            sea nombre_p = ""
+            si (contiene(prm, "(")) {
+                tp = "puntero"                                   // puntero a función
+            } sino {
+                sea dividido = _bg_partir_param(prm)
+                tp = _bg_tipo(dividido[0], alias, ignorar, falso)
+                nombre_p = dividido[1]
+            }
+            si (tp == nulo o tp == "nulo") {
+                omitidas.agregar(nombre + ": parámetro no soportado (" + unir(prm, " ") + ")")
+                retornar nulo
+            }
+            si (nombre_p == "") { nombre_p = "a" + indice }
+            partes.agregar(_bg_nombre_seguro(nombre_p) + "_: " + tp)
+            indice = indice + 1
+        }
+    }
+    sea en_registros = 0
+    sea flotantes = 0
+    para pt en partes { si (texto_termina_con(pt, ": numero")) { flotantes = flotantes + 1 } sino { en_registros = en_registros + 1 } }
+    si (en_registros > 6 o flotantes > 8) {
+        omitidas.agregar(nombre + ": más de 6 argumentos enteros (extern los pasa solo en registros)")
+        retornar nulo
+    }
+    sea d = "extern \"" + _BG_LIB + "\" funcion " + nombre + "(" + unir(partes, ", ") + ")"
+    si (ret != "nulo") { d = d + ": " + ret }
+    funciones.agregar(d)
+    retornar nulo
+}
+
+// Lee la cabecera e incorpora los #include "…" que estén en la misma
+// carpeta (una vez cada uno); los <…> del sistema no se siguen.
+funcion bindgen_leer(ruta, vistos) {
+    si (tiene_clave(vistos, ruta)) { retornar "" }
+    vistos[ruta] = verdadero
+    sea dir = ""
+    sea k = longitud(ruta) - 1
+    mientras (k >= 0 y subcadena(ruta, k, k + 1) != "/" y subcadena(ruta, k, k + 1) != "\\") { k = k - 1 }
+    si (k >= 0) { dir = subcadena(ruta, 0, k + 1) }
+    sea r = []
+    para linea en texto_dividir(leer_archivo(ruta), "\n") {
+        sea l = texto_recortar(linea)
+        sea p = texto_indice(l, "include")
+        sea comillas = texto_indice(l, "\"")
+        si (subcadena(l, 0, 1) == "#" y p > 0 y p < 4 y comillas > p) {
+            sea fin = texto_indice(subcadena(l, comillas + 1, longitud(l)), "\"")
+            sea otro = dir + subcadena(l, comillas + 1, comillas + 1 + fin)
+            si (fin > 0 y existe_archivo(otro)) { r.agregar(bindgen_leer(otro, vistos)) }
+        } sino { r.agregar(linea) }
+    }
+    retornar texto_unir(r, "\n")
+}
+
+funcion bindgen_archivo(ruta, lib) {
+    sea nombre = ruta
+    sea k = longitud(ruta) - 1
+    mientras (k >= 0 y subcadena(ruta, k, k + 1) != "/" y subcadena(ruta, k, k + 1) != "\\") { k = k - 1 }
+    si (k >= 0) { nombre = subcadena(ruta, k + 1, longitud(ruta)) }
+    retornar bindgen_generar(bindgen_leer(ruta, {}), lib, nombre)
+}
+
+funcion subcadena_lista(l, a, b) {
+    sea r = []
+    sea i = a
+    mientras (i < b y i < longitud(l)) {
+        r.agregar(l[i])
+        i = i + 1
+    }
+    retornar r
+}
+
