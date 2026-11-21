@@ -29,6 +29,15 @@ grep -q '^sea EJ_AZUL = 6' "$T/ej.cfv"
 grep -q '^sea EJ_DESPLAZADO = 16' "$T/ej.cfv"
 grep -q 'ej_imprimir: argumentos variables' "$T/ej.cfv"
 ! grep -q 'ej_doble' "$T/ej.cfv"
+# TypeScript (.d.ts) → extern "npm:…".
+CFORGE_STDLIB=stdlib "$C" bindgen "$D/ejemplo.tipos.d.ts" --lib demo -o "$T/demo.cfv" | grep -q '6 funciones; 3 omitidas'
+grep -q 'extern "npm:demo" funcion saludar(nombre_: texto, veces_: numero): texto' "$T/demo.cfv"
+grep -q 'extern "npm:demo" funcion activo(): booleano' "$T/demo.cfv"
+grep -q 'extern "npm:demo" funcion registrar(mensaje_: texto)$' "$T/demo.cfv"
+grep -q 'extern "npm:demo" funcion opcional(texto__: texto): texto' "$T/demo.cfv"
+grep -q 'extern "npm:demo" funcion principal(x_: texto): texto como "default"' "$T/demo.cfv"
+grep -q 'identidad: función genérica' "$T/demo.cfv"
+grep -q 'juntar: parámetro variable' "$T/demo.cfv"
 if [ "$(uname -s)" = Linux ]; then
     printf 'importar "ej"\nmostrar(strlen("hola mundo"))\nmostrar(abs(0 - 42))\n' > "$T/uso.cfv"
     [ "$(cd "$T" && CFORGE_STDLIB="$OLDPWD/stdlib" "$OLDPWD/$C" uso.cfv | tr '\n' ' ')" = "10 42 " ]
