@@ -193,6 +193,25 @@ db_consulta_p(db, "INSERT INTO notas (texto) VALUES (?)", ["hola"])
 
 ---
 
+## Interoperabilidad con otros lenguajes
+
+C-Forge usa librerías de otros lenguajes sin escribir código puente:
+
+| Lenguaje | Cómo | Ejemplo |
+|---|---|---|
+| **C** | `cforge bindgen cabecera.h --lib nombre` genera el módulo desde la cabecera | `cforge bindgen /usr/include/zlib.h --lib z` |
+| **Rust, C++, Zig** | Igual que C, si la librería expone una interfaz C (`extern "C"`) | — |
+| **JavaScript / npm** | `extern "npm:paquete" funcion f(...)` con `--target wasm` | `extern "npm:lodash" funcion kebabCase(t: texto): texto` |
+| **TypeScript** | `cforge bindgen paquete/index.d.ts --lib paquete` | `cforge bindgen node_modules/camelcase/index.d.ts --lib camelcase` |
+| **Java** | `importar "java"`: la JVM corre dentro del programa (JNI) | `java_estatico("java.lang.Math", "max", "(II)I", [3, 9])` |
+| **C# / .NET** | `importar "dotnet"`: métodos `[UnmanagedCallersOnly]` (hostfxr) | `dotnet_llamar(dotnet_funcion("Calc.dll", "Calc, Calc", "Sumar"), [40, 2])` |
+| **HTML / CSS** | `importar "navegador"`: DOM, eventos, `nav_css`, `--html` | `nav_al_soltar(".tarjeta", ".columna", f)` |
+
+Límites actuales: `float` de 32 bits, structs por valor y métodos de Java o
+C# que devuelven `double`; C++ sin interfaz C (clases, plantillas) no se
+puede llamar directamente. Todo está probado en el CI (`tests/herramientas`,
+`tests/npm`, `tests/interop`).
+
 ## Construir desde el código fuente
 
 C-Forge se compila a sí mismo: la semilla `bootstrap/semilla/cforge-linux-x64`

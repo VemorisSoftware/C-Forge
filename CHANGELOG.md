@@ -4,6 +4,17 @@ Sitio oficial: [c-forge.org](https://c-forge.org)
 
 ## Sin publicar
 
+- **Java dentro de C-Forge** (`importar "java"`, JNI): `java_iniciar`,
+  `java_estatico`, `java_nuevo`, `java_metodo`, `java_soltar`; las
+  excepciones de Java llegan como errores capturables con su mensaje.
+- **C# / .NET dentro de C-Forge** (`importar "dotnet"`, hostfxr):
+  `dotnet_iniciar`, `dotnet_funcion` (métodos `[UnmanagedCallersOnly]`),
+  `dotnet_llamar` y `dotnet_llamar_texto`.
+- **TypeScript:** `cforge bindgen archivo.d.ts --lib paquete` genera las
+  declaraciones `extern "npm:…"` (uniones, opcionales, `export default`).
+- Interoperabilidad documentada en el README, `capabilities.json` y
+  `c-forge.org/llms.txt`; prueba `tests/interop` (Java y C#) en el CI.
+
 - **Paquetes npm** en `--target wasm`: `extern "npm:lodash" funcion
   kebabCase(t: texto): texto` importa el paquete solo (Node.js desde
   `node_modules`; en el navegador, el empaquetador o esm.sh). Funciona con

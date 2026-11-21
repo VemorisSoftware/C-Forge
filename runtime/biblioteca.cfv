@@ -3013,3 +3013,482 @@ funcion eliminar_archivo(ruta) {
     sys_borrar(str_c(dyn_texto_de(ruta, "eliminar_archivo")))
     retornar dyn_bool(existe_archivo(ruta) == 2)
 }
+
+// ── Java (JNI): la JVM dentro del programa ────────────────────────────────
+// java_iniciar(classpath) arranca la JVM (JAVA_HOME o rutas habituales).
+// java_estatico("java.lang.Math", "max", "(II)I", [3, 9]) llama un método
+// estático; java_nuevo(clase, firma_constructor, args) crea un objeto y
+// java_metodo(obj, metodo, firma, args) llama sus métodos. Firmas JNI:
+// I/S/B/C enteros, J largo, Z booleano, D decimal (solo argumentos),
+// Ljava/lang/String; texto, otros L…; objetos (los devuelve java_nuevo o un
+// método), V sin valor. Una excepción de Java llega como error capturable.
+// Globales del programa: 50 = JNIEnv*, 51 = JavaVM*.
+
+funcion java_env() {
+    sea e = mem_global(50)
+    si (e == 0) { dyn_error("java: llama primero a java_iniciar()") }
+    retornar e
+}
+
+funcion java_fn(i) { retornar __cargar64(__cargar64(java_env()) + i * 8) }
+
+funcion java_comprobar(que) {
+    sea env = java_env()
+    si (__y_bits(__ccall(java_fn(228), env), 255) != 0) {
+        // El mensaje es el toString() de la excepción ("java.lang.X: …").
+        sea ex = __ccall(java_fn(15), env)
+        __ccall(java_fn(17), env)
+        sea m = str_concatenar(str_concatenar("java: ", que), ": ")
+        si (ex != 0) {
+            sea k = __ccall(java_fn(31), env, ex)
+            sea ts = __ccall(java_fn(33), env, k, str_c("toString"), str_c("()Ljava/lang/String;"))
+            sea vacio = mem_reservar(8)
+            sea j = __ccall(java_fn(36), env, ex, ts, vacio)
+            si (__y_bits(__ccall(java_fn(228), env), 255) != 0) { __ccall(java_fn(17), env) }
+            si (j != 0) {
+                sea p = __ccall(java_fn(169), env, j, 0)
+                str_agregar(m, str_desde_c(p))
+                __ccall(java_fn(170), env, j, p)
+            }
+        }
+        dyn_error(m)
+    }
+    retornar 0
+}
+
+funcion java_probar_jvm(candidatos, ruta) {
+    vec_agregar(candidatos, str_concatenar(ruta, "/lib/server/libjvm.so"))
+    vec_agregar(candidatos, str_concatenar(ruta, "/lib/server/libjvm.dylib"))
+    vec_agregar(candidatos, str_concatenar(ruta, "/Contents/Home/lib/server/libjvm.dylib"))
+    vec_agregar(candidatos, str_concatenar(ruta, "\\bin\\server\\jvm.dll"))
+    retornar 0
+}
+
+funcion java_libjvm() {
+    sea candidatos = vec_nuevo()
+    sea casa = sys_variable_entorno("JAVA_HOME")
+    si (casa != 0) { java_probar_jvm(candidatos, casa) }
+    sea dirs = vec_nuevo()
+    vec_agregar(dirs, "/usr/lib/jvm")
+    vec_agregar(dirs, "/Library/Java/JavaVirtualMachines")
+    vec_agregar(dirs, "/opt/homebrew/opt/openjdk/libexec/openjdk.jdk")
+    vec_agregar(dirs, "C:\\Program Files\\Java")
+    sea d = 0
+    mientras (d < vec_largo(dirs)) {
+        sea nombres = sys_listar(vec_obtener(dirs, d))
+        si (nombres != 0) {
+            sea i = 0
+            mientras (i < vec_largo(nombres)) {
+                sea n = vec_obtener(nombres, i)
+                si (str_igual(n, ".") == 0 y str_igual(n, "..") == 0) {
+                    sea base = str_concatenar(vec_obtener(dirs, d), "/")
+                    si (__plataforma() == 1) { base = str_concatenar(vec_obtener(dirs, d), "\\") }
+                    java_probar_jvm(candidatos, str_concatenar(base, n))
+                }
+                i = i + 1
+            }
+        }
+        java_probar_jvm(candidatos, vec_obtener(dirs, d))
+        d = d + 1
+    }
+    sea h = 0
+    sea i = 0
+    mientras (i < vec_largo(candidatos) y h == 0) {
+        h = dyn_abrir_biblioteca(vec_obtener(candidatos, i))
+        i = i + 1
+    }
+    retornar h
+}
+
+funcion java_iniciar(ruta_clases) {
+    si (mem_global(50) != 0) { retornar 4 }
+    si (sys_dl_disponible() == 0) { dyn_error("java: este programa no puede cargar bibliotecas dinámicas") }
+    sea h = java_libjvm()
+    si (h == 0) { dyn_error("java: no encontré la JVM (instala un JDK o define JAVA_HOME)") }
+    sea crear = sys_simbolo(h, "JNI_CreateJavaVM")
+    si (crear == 0) { dyn_error("java: libjvm sin JNI_CreateJavaVM") }
+    sea opciones = mem_reservar(48)
+    mem_llenar(opciones, 0, 48)
+    sea n = 0
+    __guardar64(opciones, str_c("-Xrs"))                       // sin manejar SIGINT/SIGTERM
+    n = 1
+    si (ruta_clases != 0) {
+        __guardar64(opciones + 16, str_c(str_concatenar("-Djava.class.path=", dyn_texto_de(ruta_clases, "java_iniciar"))))
+        n = 2
+    }
+    sea args = mem_reservar(24)
+    mem_llenar(args, 0, 24)
+    __guardar64(args, __o_bits(65544, __desplazar_izq(n, 32)))  // JNI_VERSION_1_8 y cantidad de opciones
+    __guardar64(args + 8, opciones)
+    __guardar8(args + 16, 1)                                   // ignoreUnrecognized
+    sea pvm = mem_reservar(8)
+    sea penv = mem_reservar(8)
+    __guardar64(pvm, 0)
+    __guardar64(penv, 0)
+    sea r = __y_bits(__ccall(crear, pvm, penv, args), 4294967295)
+    si (r != 0) { dyn_error("java: JNI_CreateJavaVM falló (¿ya hay una JVM en este proceso?)") }
+    mem_fijar_global(50, __cargar64(penv))
+    mem_fijar_global(51, __cargar64(pvm))
+    retornar 4
+}
+
+// "java.util.ArrayList" → "java/util/ArrayList".
+funcion java_ruta_clase(c) {
+    sea s = dyn_texto_de(c, "java")
+    sea r = str_nuevo(str_largo(s) + 1)
+    sea i = 0
+    mientras (i < str_largo(s)) {
+        si (str_byte(s, i) == 46) { str_agregar_byte(r, 47) } sino { str_agregar_byte(r, str_byte(s, i)) }
+        i = i + 1
+    }
+    retornar r
+}
+
+funcion java_clase(c) {
+    sea k = __ccall(java_fn(6), java_env(), str_c(java_ruta_clase(c)))
+    java_comprobar(str_concatenar("FindClass ", dyn_texto_de(c, "java")))
+    si (k == 0) { dyn_error(str_concatenar("java: no existe la clase ", dyn_texto_de(c, "java"))) }
+    retornar k
+}
+
+// Tipos de una firma JNI: vec de letras (L = objeto, T = String, A = arreglo)
+// para los parámetros y, al final, la del retorno.
+funcion java_tipos(firma) {
+    sea r = vec_nuevo()
+    sea i = 1
+    mientras (i < str_largo(firma)) {
+        sea c = str_byte(firma, i)
+        si (c == 41) { i = i + 1 } sino {
+            si (c == 91) {
+                mientras (i < str_largo(firma) y str_byte(firma, i) == 91) { i = i + 1 }
+                si (i < str_largo(firma) y str_byte(firma, i) == 76) { mientras (i < str_largo(firma) y str_byte(firma, i) != 59) { i = i + 1 } }
+                vec_agregar(r, 65)
+                i = i + 1
+            } sino {
+                si (c == 76) {
+                    sea fin = i
+                    mientras (fin < str_largo(firma) y str_byte(firma, fin) != 59) { fin = fin + 1 }
+                    si (str_igual(str_rebanar(firma, i, fin + 1), "Ljava/lang/String;")) { vec_agregar(r, 84) } sino { vec_agregar(r, 76) }
+                    i = fin + 1
+                } sino {
+                    vec_agregar(r, c)
+                    i = i + 1
+                }
+            }
+        }
+    }
+    retornar r
+}
+
+funcion java_argumentos(tipos, args, que) {
+    sea n = vec_largo(tipos) - 1
+    sea lista = vec_nuevo()
+    si (args != 0) {
+        si (dyn_tipo(args) != 2) { dyn_error("java: los argumentos van en una lista") }
+        lista = dyn_dato(args)
+    }
+    si (vec_largo(lista) != n) { dyn_error(str_concatenar("java: cantidad de argumentos distinta de la firma en ", que)) }
+    sea v = mem_reservar(n * 8 + 8)
+    sea i = 0
+    mientras (i < n) {
+        sea t = vec_obtener(tipos, i)
+        sea a = vec_obtener(lista, i)
+        sea x = 0
+        si (t == 73 o t == 83 o t == 66 o t == 67 o t == 74) { x = dyn_valor_entero(a) }
+        si (t == 90) { x = dyn_verdad(a) }
+        si (t == 68) { x = dyn_a_f64(a) }
+        si (t == 70) { dyn_error("java: los float (F) no están soportados; usa double (D)") }
+        si (t == 84) {
+            si (a != 0) { x = __ccall(java_fn(167), java_env(), str_c(dyn_texto_de(a, "java"))) }
+        }
+        si (t == 76 o t == 65) {
+            si (a != 0) {
+                si (dyn_tipo(a) == 1) { x = __ccall(java_fn(167), java_env(), str_c(dyn_texto_de(a, "java"))) } sino { x = dyn_valor_entero(a) }
+            }
+        }
+        __guardar64(v + i * 8, x)
+        i = i + 1
+    }
+    retornar v
+}
+
+funcion java_resultado(t, r) {
+    sea env = java_env()
+    si (t == 86) { retornar 0 }
+    si (t == 90) { retornar dyn_bool(__y_bits(r, 255) != 0) }
+    si (t == 73 o t == 83 o t == 66 o t == 67) {
+        sea x = __y_bits(r, 4294967295)
+        si (x >= 2147483648) { x = x - 4294967296 }
+        retornar dyn_entero(x)
+    }
+    si (t == 74) { retornar dyn_entero(r) }
+    si (r == 0) { retornar 0 }
+    si (t == 84) {
+        sea p = __ccall(java_fn(169), env, r, 0)
+        sea s = str_desde_c(p)
+        __ccall(java_fn(170), env, r, p)
+        __ccall(java_fn(23), env, r)
+        retornar dyn_texto(s)
+    }
+    // Objeto: referencia global (vive hasta java_soltar).
+    sea g = __ccall(java_fn(21), env, r)
+    __ccall(java_fn(23), env, r)
+    retornar dyn_entero(g)
+}
+
+// Índices JNI: Object, Boolean, Int, Long, Void (variantes …A) para
+// estáticos y de instancia; los demás enteros usan Int.
+funcion java_llamada(t, estatico) {
+    si (estatico) {
+        si (t == 90) { retornar 119 }
+        si (t == 73 o t == 83 o t == 66 o t == 67) { retornar 131 }
+        si (t == 74) { retornar 134 }
+        si (t == 86) { retornar 143 }
+        si (t == 68 o t == 70) { dyn_error("java: un método que devuelve decimal (D/F) todavía no se puede llamar; envuélvelo en String.valueOf") }
+        retornar 116
+    }
+    si (t == 90) { retornar 39 }
+    si (t == 73 o t == 83 o t == 66 o t == 67) { retornar 51 }
+    si (t == 74) { retornar 54 }
+    si (t == 86) { retornar 63 }
+    si (t == 68 o t == 70) { dyn_error("java: un método que devuelve decimal (D/F) todavía no se puede llamar; envuélvelo en String.valueOf") }
+    retornar 36
+}
+
+funcion java_estatico(clase, metodo, firma, args) {
+    sea env = java_env()
+    sea f = dyn_texto_de(firma, "java_estatico")
+    sea que = str_concatenar(str_concatenar(dyn_texto_de(clase, "java_estatico"), "."), dyn_texto_de(metodo, "java_estatico"))
+    sea k = java_clase(clase)
+    sea m = __ccall(java_fn(113), env, k, str_c(dyn_texto_de(metodo, "java_estatico")), str_c(f))
+    java_comprobar(que)
+    sea tipos = java_tipos(f)
+    sea v = java_argumentos(tipos, args, que)
+    sea t = vec_obtener(tipos, vec_largo(tipos) - 1)
+    sea r = __ccall(java_fn(java_llamada(t, 1)), env, k, m, v)
+    java_comprobar(que)
+    retornar java_resultado(t, r)
+}
+
+funcion java_nuevo(clase, firma, args) {
+    sea env = java_env()
+    sea f = dyn_texto_de(firma, "java_nuevo")
+    sea que = str_concatenar("new ", dyn_texto_de(clase, "java_nuevo"))
+    sea k = java_clase(clase)
+    sea m = __ccall(java_fn(33), env, k, str_c("<init>"), str_c(f))
+    java_comprobar(que)
+    sea v = java_argumentos(java_tipos(f), args, que)
+    sea o = __ccall(java_fn(30), env, k, m, v)
+    java_comprobar(que)
+    retornar java_resultado(76, o)
+}
+
+funcion java_metodo(obj, metodo, firma, args) {
+    sea env = java_env()
+    sea f = dyn_texto_de(firma, "java_metodo")
+    sea que = dyn_texto_de(metodo, "java_metodo")
+    sea o = dyn_valor_entero(obj)
+    sea k = __ccall(java_fn(31), env, o)
+    sea m = __ccall(java_fn(33), env, k, str_c(que), str_c(f))
+    java_comprobar(que)
+    sea tipos = java_tipos(f)
+    sea v = java_argumentos(tipos, args, que)
+    sea t = vec_obtener(tipos, vec_largo(tipos) - 1)
+    sea r = __ccall(java_fn(java_llamada(t, 0)), env, o, m, v)
+    java_comprobar(que)
+    retornar java_resultado(t, r)
+}
+
+funcion java_soltar(obj) {
+    si (obj != 0) { __ccall(java_fn(22), java_env(), dyn_valor_entero(obj)) }
+    retornar 0
+}
+
+// ── C# / .NET (hostfxr): el runtime de .NET dentro del programa ───────────
+// dotnet_iniciar() carga .NET (DOTNET_ROOT o rutas habituales);
+// dotnet_funcion(dll, "Espacio.Clase, Ensamblado", "Metodo") devuelve el
+// puntero de un método static marcado [UnmanagedCallersOnly] y
+// dotnet_llamar(f, args) lo llama con hasta 6 argumentos enteros, largos o
+// punteros (un texto se pasa como char* UTF-8) y devuelve un entero;
+// dotnet_llamar_texto(f, args) hace lo mismo y lee el IntPtr devuelto como
+// texto UTF-8 (Marshal.StringToCoTaskMemUTF8). Globales 52 = función para
+// cargar ensamblados, 53 = handle de hostfxr.
+
+funcion dotnet_ruta_nativa(s) {
+    // char_t: UTF-16 en Windows (ASCII ampliado byte a byte), UTF-8 en el resto.
+    si (__plataforma() != 1) { retornar str_c(s) }
+    sea n = str_largo(s)
+    sea r = mem_reservar(n * 2 + 2)
+    sea i = 0
+    mientras (i < n) {
+        __guardar8(r + i * 2, str_byte(s, i))
+        __guardar8(r + i * 2 + 1, 0)
+        i = i + 1
+    }
+    __guardar8(r + n * 2, 0)
+    __guardar8(r + n * 2 + 1, 0)
+    retornar r
+}
+
+funcion dotnet_separador() { si (__plataforma() == 1) { retornar "\\" } retornar "/" }
+
+// ¿"10.0.1" > "8.0.34"? Compara número a número.
+funcion dotnet_version_mayor(a, b) {
+    sea i = 0
+    sea j = 0
+    mientras (i < str_largo(a) o j < str_largo(b)) {
+        sea x = 0
+        mientras (i < str_largo(a) y str_byte(a, i) >= 48 y str_byte(a, i) <= 57) {
+            x = x * 10 + str_byte(a, i) - 48
+            i = i + 1
+        }
+        sea y = 0
+        mientras (j < str_largo(b) y str_byte(b, j) >= 48 y str_byte(b, j) <= 57) {
+            y = y * 10 + str_byte(b, j) - 48
+            j = j + 1
+        }
+        si (x != y) { retornar x > y }
+        // Salta el separador (o cualquier otro carácter).
+        si (i < str_largo(a)) { i = i + 1 }
+        si (j < str_largo(b)) { j = j + 1 }
+    }
+    retornar 0
+}
+
+// Primera carpeta (orden alfabético inverso: la versión más nueva) dentro de dir.
+funcion dotnet_ultima(dir) {
+    sea nombres = sys_listar(dir)
+    si (nombres == 0) { retornar 0 }
+    sea mejor = 0
+    sea i = 0
+    mientras (i < vec_largo(nombres)) {
+        sea n = vec_obtener(nombres, i)
+        si (str_igual(n, ".") == 0 y str_igual(n, "..") == 0) {
+            si (mejor == 0 o dotnet_version_mayor(n, mejor)) { mejor = n }
+        }
+        i = i + 1
+    }
+    retornar mejor
+}
+
+funcion dotnet_raiz() {
+    sea candidatos = vec_nuevo()
+    sea e = sys_variable_entorno("DOTNET_ROOT")
+    si (e != 0) { vec_agregar(candidatos, e) }
+    vec_agregar(candidatos, "/usr/lib/dotnet")
+    vec_agregar(candidatos, "/usr/share/dotnet")
+    vec_agregar(candidatos, "/usr/local/share/dotnet")
+    vec_agregar(candidatos, "/opt/homebrew/opt/dotnet/libexec")
+    vec_agregar(candidatos, "C:\\Program Files\\dotnet")
+    sea casa = sys_variable_entorno("HOME")
+    si (casa != 0) { vec_agregar(candidatos, str_concatenar(casa, "/.dotnet")) }
+    sea i = 0
+    mientras (i < vec_largo(candidatos)) {
+        sea r = vec_obtener(candidatos, i)
+        si (dotnet_ultima(str_concatenar(r, str_concatenar(dotnet_separador(), str_concatenar("host", str_concatenar(dotnet_separador(), "fxr"))))) != 0) { retornar r }
+        i = i + 1
+    }
+    retornar 0
+}
+
+funcion dotnet_iniciar() {
+    si (mem_global(52) != 0) { retornar 4 }
+    si (sys_dl_disponible() == 0) { dyn_error("dotnet: este programa no puede cargar bibliotecas dinámicas") }
+    sea raiz = dotnet_raiz()
+    si (raiz == 0) { dyn_error("dotnet: no encontré .NET (instala el SDK o el runtime, o define DOTNET_ROOT)") }
+    sea sep = dotnet_separador()
+    sea fxr = str_concatenar(raiz, str_concatenar(sep, str_concatenar("host", str_concatenar(sep, "fxr"))))
+    sea version_fxr = dotnet_ultima(fxr)
+    sea lib = "libhostfxr.so"
+    si (__plataforma() == 2 o __plataforma() == 3) { lib = "libhostfxr.dylib" }
+    si (__plataforma() == 1) { lib = "hostfxr.dll" }
+    sea h = dyn_abrir_biblioteca(str_concatenar(fxr, str_concatenar(sep, str_concatenar(version_fxr, str_concatenar(sep, lib)))))
+    si (h == 0) { dyn_error("dotnet: no se pudo cargar hostfxr") }
+    // runtimeconfig.json con la versión instalada de Microsoft.NETCore.App.
+    sea compartido = str_concatenar(raiz, str_concatenar(sep, str_concatenar("shared", str_concatenar(sep, "Microsoft.NETCore.App"))))
+    sea version = dotnet_ultima(compartido)
+    si (version == 0) { dyn_error("dotnet: falta Microsoft.NETCore.App") }
+    sea mayor = str_nuevo(8)
+    sea k = 0
+    mientras (k < str_largo(version) y str_byte(version, k) != 46) {
+        str_agregar_byte(mayor, str_byte(version, k))
+        k = k + 1
+    }
+    sea json = str_concatenar("{\"runtimeOptions\":{\"tfm\":\"net", mayor)
+    str_agregar(json, ".0\",\"framework\":{\"name\":\"Microsoft.NETCore.App\",\"version\":\"")
+    str_agregar(json, version)
+    str_agregar(json, "\"}}}")
+    sea config = str_concatenar(sys_ruta_temporal(), str_concatenar("cforge-dotnet-", str_concatenar(str_desde_entero(sys_proceso_id()), ".runtimeconfig.json")))
+    archivo_escribir(config, json)
+    sea iniciar = sys_simbolo(h, "hostfxr_initialize_for_runtime_config")
+    sea delegado = sys_simbolo(h, "hostfxr_get_runtime_delegate")
+    si (iniciar == 0 o delegado == 0) { dyn_error("dotnet: hostfxr sin las funciones de hospedaje") }
+    sea manija = mem_reservar(8)
+    __guardar64(manija, 0)
+    sea rc = __y_bits(__ccall(iniciar, dotnet_ruta_nativa(config), 0, manija), 4294967295)
+    sys_borrar(str_c(config))
+    si (rc > 2) { dyn_error("dotnet: no se pudo iniciar el runtime de .NET") }
+    sea f = mem_reservar(8)
+    __guardar64(f, 0)
+    rc = __y_bits(__ccall(delegado, __cargar64(manija), 5, f), 4294967295)   // hdt_load_assembly_and_get_function_pointer
+    si (rc != 0 o __cargar64(f) == 0) { dyn_error("dotnet: no se pudo obtener el cargador de ensamblados") }
+    mem_fijar_global(52, __cargar64(f))
+    mem_fijar_global(53, h)
+    retornar 4
+}
+
+funcion dotnet_funcion(dll, tipo, metodo) {
+    sea cargar = mem_global(52)
+    si (cargar == 0) { dyn_error("dotnet: llama primero a dotnet_iniciar()") }
+    sea ruta = dyn_texto_de(dll, "dotnet_funcion")
+    si (dyn_verdad(existe_archivo(dll)) == 0) { dyn_error(str_concatenar("dotnet: no existe ", ruta)) }
+    sea p = mem_reservar(8)
+    __guardar64(p, 0)
+    sea rc = __y_bits(__ccall(cargar, dotnet_ruta_nativa(ruta), dotnet_ruta_nativa(dyn_texto_de(tipo, "dotnet_funcion")), dotnet_ruta_nativa(dyn_texto_de(metodo, "dotnet_funcion")), 0 - 1, 0, p), 4294967295)
+    si (rc != 0 o __cargar64(p) == 0) {
+        sea m = str_concatenar("dotnet: no se encontró ", dyn_texto_de(tipo, "dotnet_funcion"))
+        str_agregar(m, ".")
+        str_agregar(m, dyn_texto_de(metodo, "dotnet_funcion"))
+        str_agregar(m, " (¿es static y [UnmanagedCallersOnly]?)")
+        dyn_error(m)
+    }
+    retornar dyn_entero(__cargar64(p))
+}
+
+funcion dotnet_argumentos(args) {
+    sea v = mem_reservar(56)
+    mem_llenar(v, 0, 56)
+    si (args == 0) { retornar v }
+    si (dyn_tipo(args) != 2) { dyn_error("dotnet: los argumentos van en una lista") }
+    sea l = dyn_dato(args)
+    si (vec_largo(l) > 6) { dyn_error("dotnet: como máximo 6 argumentos") }
+    sea i = 0
+    mientras (i < vec_largo(l)) {
+        sea a = vec_obtener(l, i)
+        sea x = 0
+        si (a != 0) {
+            si (dyn_tipo(a) == 1) { x = str_c(dyn_texto_de(a, "dotnet")) } sino {
+                si (a == 2 o a == 4) { x = dyn_verdad(a) } sino { x = dyn_valor_entero(a) }
+            }
+        }
+        __guardar64(v + i * 8, x)
+        i = i + 1
+    }
+    retornar v
+}
+
+funcion dotnet_crudo(f, args) {
+    sea v = dotnet_argumentos(args)
+    retornar __ccall(dyn_valor_entero(f), __cargar64(v), __cargar64(v + 8), __cargar64(v + 16), __cargar64(v + 24), __cargar64(v + 32), __cargar64(v + 40))
+}
+
+funcion dotnet_llamar(f, args) {
+    sea r = dotnet_crudo(f, args)
+    retornar dyn_entero(r)
+}
+
+funcion dotnet_llamar_texto(f, args) {
+    sea r = dotnet_crudo(f, args)
+    si (r == 0) { retornar 0 }
+    retornar dyn_texto(str_desde_c(r))
+}

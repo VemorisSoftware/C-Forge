@@ -7,7 +7,7 @@ set -eu
 cd "$(dirname "$0")"
 rm -rf dist
 mkdir -p dist
-cp -R index.html aprende.html 404.html en favicon.png _headers _redirects assets data dist/
+cp -R index.html aprende.html 404.html llms.txt en favicon.png _headers _redirects assets data dist/
 # Los instaladores viven en la raíz del repo: una sola fuente de verdad.
 cp ../install.sh ../install.ps1 dist/
 echo "c-forge.org listo en site/dist"

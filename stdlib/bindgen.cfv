@@ -2,6 +2,7 @@
 // funciones (extern), constantes (#define y enum) y tipos opacos.
 //
 //   cforge bindgen /usr/include/zlib.h --lib z -o zlib.cfv
+//   cforge bindgen node_modules/camelcase/index.d.ts --lib camelcase -o camel.cfv
 //   importar "zlib"          // y luego: mostrar(c_texto(zlibVersion()))
 //
 // Desde código: bindgen_generar(texto_h, "z", "zlib.h") devuelve el módulo.
@@ -526,7 +527,143 @@ funcion bindgen_archivo(ruta, lib) {
     sea k = longitud(ruta) - 1
     mientras (k >= 0 y subcadena(ruta, k, k + 1) != "/" y subcadena(ruta, k, k + 1) != "\\") { k = k - 1 }
     si (k >= 0) { nombre = subcadena(ruta, k + 1, longitud(ruta)) }
+    si (texto_termina_con(ruta, ".d.ts") o texto_termina_con(ruta, ".d.mts") o texto_termina_con(ruta, ".d.cts")) {
+        sea paquete = lib
+        si (texto_empieza_con(paquete, "npm:")) { paquete = subcadena(paquete, 4, longitud(paquete)) }
+        retornar bindgen_ts(leer_archivo(ruta), paquete, nombre)
+    }
     retornar bindgen_generar(bindgen_leer(ruta, {}), lib, nombre)
+}
+
+// ── TypeScript (.d.ts) → extern "npm:paquete" ─────────────────────────────
+// Lee "export [declare] function", "declare function" y "export default
+// function". Tipos: string → texto, number → numero, boolean → booleano,
+// void/undefined → nulo; en una unión se toma el primer tipo soportado. Un
+// parámetro opcional con tipo no soportado (objetos de opciones) se deja
+// fuera; si es obligatorio, la función se omite con un comentario.
+
+funcion _bg_tipo_ts(fichas) {
+    sea partes = []
+    sea actual = []
+    sea nivel = 0
+    para f en fichas {
+        si (f == "<" o f == "(" o f == "[" o f == "{") { nivel = nivel + 1 }
+        si (f == ">" o f == ")" o f == "]" o f == "}") { nivel = nivel - 1 }
+        si (f == "|" y nivel == 0) {
+            partes.agregar(actual)
+            actual = []
+        } sino { actual.agregar(f) }
+    }
+    partes.agregar(actual)
+    para p en partes {
+        si (longitud(p) == 1) {
+            si (p[0] == "string") { retornar "texto" }
+            si (p[0] == "number") { retornar "numero" }
+            si (p[0] == "boolean") { retornar "booleano" }
+            si (p[0] == "void" o p[0] == "undefined") { retornar "nulo" }
+        }
+    }
+    retornar nulo
+}
+
+funcion bindgen_ts(fuente, paquete, nombre_d) {
+    sea f = _bg_fichas(_bg_limpiar(fuente))
+    sea funciones = []
+    sea omitidas = []
+    sea vistas = {}
+    sea n = longitud(f)
+    sea i = 0
+    mientras (i < n) {
+        sea por_defecto = falso
+        sea es = falso
+        si (f[i] == "function" y i > 0) {
+            si (f[i - 1] == "declare" o f[i - 1] == "export" o f[i - 1] == "default") {
+                es = verdadero
+                por_defecto = f[i - 1] == "default"
+            }
+        }
+        si (es y i + 1 < n) {
+            sea nombre = f[i + 1]
+            sea j = i + 2
+            sea generica = falso
+            si (j < n y f[j] == "<") {
+                generica = verdadero
+                sea nv = 0
+                sea sigue = verdadero
+                mientras (j < n y sigue) {
+                    si (f[j] == "<") { nv = nv + 1 }
+                    si (f[j] == ">") { nv = nv - 1 }
+                    j = j + 1
+                    si (nv == 0) { sigue = falso }
+                }
+            }
+            sea params = []
+            sea actual = []
+            sea nivel = 0
+            j = j + 1
+            sea sigue2 = verdadero
+            mientras (j < n y sigue2) {
+                si (nivel == 0 y f[j] == ")") { sigue2 = falso } sino {
+                    si (f[j] == "(" o f[j] == "<" o f[j] == "[" o f[j] == "{") { nivel = nivel + 1 }
+                    si (f[j] == ")" o f[j] == ">" o f[j] == "]" o f[j] == "}") { nivel = nivel - 1 }
+                    si (nivel == 0 y f[j] == ",") {
+                        si (longitud(actual) > 0) { params.agregar(actual) }
+                        actual = []
+                    } sino { actual.agregar(f[j]) }
+                    j = j + 1
+                }
+            }
+            si (longitud(actual) > 0) { params.agregar(actual) }
+            sea ret = []
+            j = j + 1
+            si (j < n y f[j] == ":") {
+                j = j + 1
+                mientras (j < n y f[j] != ";" y f[j] != "export" y f[j] != "declare") {
+                    ret.agregar(f[j])
+                    j = j + 1
+                }
+            }
+            si (tiene_clave(vistas, nombre) == falso) {
+                vistas[nombre] = verdadero
+                sea motivo = ""
+                sea tr = _bg_tipo_ts(ret)
+                si (generica) { motivo = "función genérica" }
+                si (motivo == "" y tr == nulo) { motivo = "tipo de retorno no soportado (" + texto_unir(ret, " ") + ")" }
+                sea partes = []
+                para p en params {
+                    si (motivo == "") {
+                        sea opcional = longitud(p) > 1 y p[1] == "?"
+                        sea k = 0
+                        mientras (k < longitud(p) y p[k] != ":") { k = k + 1 }
+                        sea t = _bg_tipo_ts(subcadena_lista(p, k + 1, longitud(p)))
+                        si (p[0] == "...") { motivo = "parámetro variable (...)" } sino {
+                            si (t == nulo o t == "nulo") {
+                                si (opcional == falso) { motivo = "parámetro no soportado (" + texto_unir(p, " ") + ")" }
+                            } sino { partes.agregar(_bg_nombre_seguro(p[0]) + "_: " + t) }
+                        }
+                    }
+                }
+                si (motivo != "") { omitidas.agregar(nombre + ": " + motivo) } sino {
+                    sea d = "extern \"npm:" + paquete + "\" funcion " + nombre + "(" + texto_unir(partes, ", ") + ")"
+                    si (tr != "nulo") { d = d + ": " + tr }
+                    si (por_defecto) { d = d + " como \"default\"" }
+                    funciones.agregar(d)
+                }
+            }
+            i = j
+        } sino { i = i + 1 }
+    }
+    sea r = []
+    r.agregar("// Generado por cforge bindgen desde " + nombre_d + " (paquete npm \"" + paquete + "\").")
+    r.agregar("// " + longitud(funciones) + " funciones; " + longitud(omitidas) + " omitidas. Solo --target wasm (Node.js: npm install " + paquete + ").")
+    r.agregar("")
+    para d en funciones { r.agregar(d) }
+    si (longitud(omitidas) > 0) {
+        r.agregar("")
+        r.agregar("// Omitidas (extern no puede declararlas):")
+        para o en omitidas { r.agregar("//   " + o) }
+    }
+    retornar texto_unir(r, "\n") + "\n"
 }
 
 funcion subcadena_lista(l, a, b) {
