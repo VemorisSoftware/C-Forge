@@ -1,6 +1,6 @@
 # C-Forge — Especificación del lenguaje
 
-Versión del documento: 4.8.0 · Extensión de archivos: **`.cfv`** · CLI: **`cforge`**
+Versión del documento: 4.9.0 · Extensión de archivos: **`.cfv`** · CLI: **`cforge`**
 
 Este documento fija la sintaxis oficial de C-Forge y el estado real de cada
 pieza. Cada sección lleva una etiqueta:

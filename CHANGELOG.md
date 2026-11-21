@@ -2,7 +2,7 @@
 
 Sitio oficial: [c-forge.org](https://c-forge.org)
 
-## Sin publicar
+## 4.9.0 — 2026-11-21
 
 - **Java dentro de C-Forge** (`importar "java"`, JNI): `java_iniciar`,
   `java_estatico`, `java_nuevo`, `java_metodo`, `java_soltar`; las
