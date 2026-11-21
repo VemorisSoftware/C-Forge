@@ -4,6 +4,16 @@ Sitio oficial: [c-forge.org](https://c-forge.org)
 
 ## Sin publicar (5.0)
 
+- **Web sin JavaScript ni CSS aparte** (`importar "navegador"`):
+  `nav_evento("tecla" | "id" | "origen" | "destino" | "x" | "y" | "valor")`
+  con los datos del evento, `nav_al_tecla("Escape", f)`,
+  `nav_al_soltar(origenes, destinos, f)` (arrastrar y soltar con
+  delegación, también para elementos creados después) y `nav_css(…)`.
+  `cforge build --target wasm --html` genera la página. Ejemplo
+  `ejemplos/web/tablero` y prueba en Chromium real en el CI.
+- WebAssembly: las funciones de la biblioteca estándar y del runtime ya no
+  son raíces (solo las del usuario): módulos algo más chicos.
+
 - **Parámetros `entero` probados:** se comprueban una sola vez al entrar a
   la función (error de tipos claro y capturable si llega otra cosa) y, si el
   cuerpo solo les reasigna enteros, sus operaciones y comparaciones se

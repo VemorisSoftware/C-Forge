@@ -130,7 +130,7 @@ export async function iniciar(opciones = {}) {
   }
 
   // ── stdlib/navegador.cfv: DOM, eventos, animación, lienzo 2D y partículas ──
-  let programa = null, dato = 0;
+  let programa = null, dato = 0, evento = null, arrastre = { origen: "", destino: "" };
   const raton = { x: 0, y: 0, activo: false };
   if (typeof window !== "undefined") {
     window.addEventListener("pointermove", (e) => { raton.x = e.clientX; raton.y = e.clientY; raton.activo = true; }, { passive: true });
@@ -153,7 +153,61 @@ export async function iniciar(opciones = {}) {
     nav_mouse_x: () => Math.round(raton.x), nav_mouse_y: () => Math.round(raton.y), nav_mouse_activo: () => raton.activo,
     nav_tiempo: () => performance.now(), nav_dato: () => dato,
     nav_registrar_animacion: (id) => { const cuadro = (t) => { despachar(id, t); requestAnimationFrame(cuadro); }; requestAnimationFrame(cuadro); },
-    nav_registrar_evento: (s, ev, id) => { (s === "window" ? window : s === "document" ? document : $(s)).addEventListener(ev, () => despachar(id, 0)); },
+    nav_registrar_evento: (s, ev, id) => { (s === "window" ? window : s === "document" ? document : $(s)).addEventListener(ev, (e) => { evento = e; despachar(id, 0); }); },
+    // Datos del último evento: "tecla", "id" (elemento con id más cercano),
+    // "origen"/"destino" (arrastrar y soltar), "x", "y", "valor", "tipo".
+    nav_evento: (campo) => {
+      const e = evento;
+      if (campo === "origen") return arrastre.origen;
+      if (campo === "destino") return arrastre.destino;
+      if (!e) return "";
+      switch (campo) {
+        case "tecla": return e.key ?? "";
+        case "id": { const t = e.target && e.target.closest ? e.target.closest("[id]") : null; return t ? t.id : ""; }
+        case "x": return String(Math.round(e.clientX ?? 0));
+        case "y": return String(Math.round(e.clientY ?? 0));
+        case "valor": return e.target && e.target.value !== undefined ? String(e.target.value) : "";
+        case "tipo": return e.type ?? "";
+        default: return "";
+      }
+    },
+    // Atajo de teclado en todo el documento ("Escape", "Enter", "ArrowLeft"…).
+    nav_registrar_tecla: (tecla, id) => {
+      document.addEventListener("keydown", (e) => {
+        if (e.key !== tecla) return;
+        evento = e;
+        despachar(id, 0);
+      });
+    },
+    // Arrastrar y soltar con delegación: sirve también para elementos que se
+    // crean después (nav_html). Clases: "arrastrando" en el origen y
+    // "sobre" en el destino mientras pasa por encima.
+    nav_registrar_arrastre: (origenes, destinos, id) => {
+      const marcar = () => document.querySelectorAll(origenes).forEach((el) => { el.draggable = true; });
+      marcar();
+      new MutationObserver(marcar).observe(document.body, { childList: true, subtree: true });
+      const de = (e, s) => (e.target && e.target.closest ? e.target.closest(s) : null);
+      document.addEventListener("dragstart", (e) => {
+        const el = de(e, origenes); if (!el) return;
+        arrastre.origen = el.id || "";
+        e.dataTransfer.setData("text/plain", el.id || "");
+        e.dataTransfer.effectAllowed = "move";
+        el.classList.add("arrastrando");
+      });
+      document.addEventListener("dragend", (e) => { const el = de(e, origenes); if (el) el.classList.remove("arrastrando"); });
+      document.addEventListener("dragover", (e) => { const d = de(e, destinos); if (!d) return; e.preventDefault(); e.dataTransfer.dropEffect = "move"; d.classList.add("sobre"); });
+      document.addEventListener("dragleave", (e) => { const d = de(e, destinos); if (d && !d.contains(e.relatedTarget)) d.classList.remove("sobre"); });
+      document.addEventListener("drop", (e) => {
+        const d = de(e, destinos); if (!d) return;
+        e.preventDefault();
+        d.classList.remove("sobre");
+        arrastre.destino = d.id || "";
+        evento = e;
+        despachar(id, 0);
+      });
+    },
+    // Estilos desde C-Forge (sin archivo .css aparte).
+    nav_css: (css) => { const st = document.createElement("style"); st.textContent = css; document.head.appendChild(st); },
     nav_lienzo: (s) => { const c = $(s); const d = Math.min(devicePixelRatio || 1, 2); c.width = c.clientWidth * d; c.height = c.clientHeight * d; lienzo2d = c.getContext("2d"); lienzo2d.setTransform(d, 0, 0, d, 0, 0); return c.clientWidth; },
     nav_limpiar: (color) => { const c = lienzo2d.canvas; lienzo2d.save(); lienzo2d.setTransform(1, 0, 0, 1, 0, 0); lienzo2d.fillStyle = color; lienzo2d.fillRect(0, 0, c.width, c.height); lienzo2d.restore(); },
     nav_rect: (x, y, w, h, color) => { lienzo2d.fillStyle = color; lienzo2d.fillRect(x, y, w, h); },
