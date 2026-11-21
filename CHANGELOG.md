@@ -2,6 +2,14 @@
 
 Sitio oficial: [c-forge.org](https://c-forge.org)
 
+## Sin publicar
+
+- **Paquetes npm** en `--target wasm`: `extern "npm:lodash" funcion
+  kebabCase(t: texto): texto` importa el paquete solo (Node.js desde
+  `node_modules`; en el navegador, el empaquetador o esm.sh). Funciona con
+  paquetes CommonJS y ESM (`como "default"` para la exportación por
+  defecto); si falta el paquete, el error dice qué instalar.
+
 ## 4.8.0 — 2026-11-21
 
 - **`cforge bindgen cabecera.h [--lib nombre] [-o modulo.cfv]`**: genera un
