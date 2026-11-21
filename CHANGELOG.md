@@ -2,7 +2,7 @@
 
 Sitio oficial: [c-forge.org](https://c-forge.org)
 
-## Sin publicar
+## 4.8.0 — 2026-11-21
 
 - **`cforge bindgen cabecera.h [--lib nombre] [-o modulo.cfv]`**: genera un
   módulo C-Forge con las funciones (`extern`), constantes (`#define`
