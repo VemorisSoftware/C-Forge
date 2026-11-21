@@ -368,6 +368,9 @@ cf.llamar("mi_funcion", 3);                                  // C-Forge desde JS
   lineal, un bloque por etiqueta). El recolector de
   basura, `intentar`/`capturar` y los punteros a funciones funcionan igual.
 - `extern "js" funcion f(x: numero): texto` importa funciones de JavaScript
+- `extern "npm:paquete" funcion f(...)` importa la función de un paquete npm
+  (Node.js: `node_modules`; navegador: empaquetador o esm.sh); `como
+  "default"` toma la exportación por defecto.
   (números, enteros, booleanos y textos se convierten solos).
 - `importar "navegador"`: DOM, eventos, `nav_animar` (requestAnimationFrame),
   lienzo 2D y `nav_particulas` (miles de partículas con WebGL2).
