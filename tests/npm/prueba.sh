@@ -14,5 +14,10 @@ grep -q 'falta el paquete npm "lodash" (npm install lodash)' sin.txt
 npm init -y >/dev/null 2>&1
 npm install --silent --no-audit --no-fund lodash@4 camelcase@8 >/dev/null 2>&1
 [ "$(node app.mjs | tr '\n' ' ')" = "hola-mundo-desde-c-forge Vemoris fooBarBaz " ]
+# TypeScript: bindgen lee el .d.ts del paquete y genera el módulo.
+CFORGE_STDLIB="$RAIZ/stdlib" "$C" bindgen node_modules/camelcase/index.d.ts --lib camelcase -o camel.cfv >/dev/null
+printf 'importar "camel"\nmostrar(camelcase("hola-mundo_desde c-forge"))\n' > ts.cfv
+CFORGE_STDLIB="$RAIZ/stdlib" "$C" build ts.cfv --target wasm --release -o ts >/dev/null
+[ "$(node ts.mjs)" = "holaMundoDesdeCForge" ]
 cd /; rm -rf "$T"
-echo "  ✓ npm: extern \"npm:…\" con lodash (CommonJS) y camelcase (ESM)"
+echo "  ✓ npm: extern \"npm:…\" con lodash (CommonJS), camelcase (ESM) y su .d.ts con bindgen"
