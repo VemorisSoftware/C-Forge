@@ -19,5 +19,19 @@ grep -q '^## `async funcion doble(x)`' "$T/doc.md"
 ! grep -q '_privada' "$T/doc.md"
 "$C" doc stdlib -o "$T/doc.html" >/dev/null
 grep -q '<h2><code>funcion db_abrir(ruta)</code></h2>' "$T/doc.html"
+# cforge bindgen: cabecera con macros, extern "C", enum, typedef, include
+# local, variádica, float e inline.
+CFORGE_STDLIB=stdlib "$C" bindgen "$D/ejemplo.cabecera" --lib c -o "$T/ej.cfv" | grep -q '6 funciones, 7 constantes; 2 omitidas'
+grep -q 'extern "c" funcion strlen(s_: texto): largo' "$T/ej.cfv"
+grep -q 'extern "c" funcion ej_media(v_: puntero, n_: largo): numero' "$T/ej.cfv"
+grep -q 'extern "c" funcion ej_registrar(ctx_: puntero, cb_: puntero, dato_: puntero): entero' "$T/ej.cfv"
+grep -q '^sea EJ_AZUL = 6' "$T/ej.cfv"
+grep -q '^sea EJ_DESPLAZADO = 16' "$T/ej.cfv"
+grep -q 'ej_imprimir: argumentos variables' "$T/ej.cfv"
+! grep -q 'ej_doble' "$T/ej.cfv"
+if [ "$(uname -s)" = Linux ]; then
+    printf 'importar "ej"\nmostrar(strlen("hola mundo"))\nmostrar(abs(0 - 42))\n' > "$T/uso.cfv"
+    [ "$(cd "$T" && CFORGE_STDLIB="$OLDPWD/stdlib" "$OLDPWD/$C" uso.cfv | tr '\n' ' ')" = "10 42 " ]
+fi
 rm -rf "$T"
-echo "  ✓ herramientas: cforge test --coverage (también si falla) y cforge doc (Markdown y HTML)"
+echo "  ✓ herramientas: cforge test --coverage (también si falla) y cforge doc (Markdown y HTML) y cforge bindgen"
