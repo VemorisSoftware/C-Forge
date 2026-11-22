@@ -65,6 +65,20 @@ Sitio oficial: [c-forge.org](https://c-forge.org)
   `llamada`/`protobuf` (.proto, binario como protoc, marcos gRPC),
   `recolecta`/`crawler` (cookies RFC 6265, formularios, robots.txt,
   rastreo) y `sensor`/`mqtt` (paquetes MQTT, QoS 2, mini broker).
+- Lote 14 de bibliotecas (con alias en inglés y pruebas en ambos idiomas):
+  `clave`/`password` (bcrypt y scrypt propios, más Argon2id y PBKDF2 con
+  una sola interfaz), `ajustes`/`config` (TOML 1.0 y YAML 1.2 estrictos,
+  idénticos a tomllib y ruamel en 350 archivos reales), `caja`/`cache`
+  (cachés LRU/LFU con vencimiento, carga y estadísticas; multimapa,
+  bimapa, multiconjunto, tabla, rangos, Bloom y limitador de tasa),
+  `grafos`/`graph` (Dijkstra, A*, Bellman-Ford, Floyd-Warshall, Yen, Tarjan,
+  Kruskal, Dinic, Hopcroft-Karp, PageRank, intermediación y más, igual que
+  NetworkX), `navegacion`/`navmesh` (A*, JPS, mapas de flujo y NavMesh con
+  embudo), `fichas`/`tokenizers` (BPE y WordPiece compatibles con
+  tokenizer.json de Hugging Face), `algebra`/`linalg` (LU, QR, Cholesky,
+  valores propios, SVD, pseudoinversa y exponencial, igual que NumPy) y
+  `cuaternion`/`quaternion` (Euler en 24 secuencias, slerp y matrices 4×4,
+  igual que SciPy).
 - Lote 13 de bibliotecas (con alias en inglés y pruebas en ambos idiomas):
   `grafo_api`/`graphql` (servidor GraphQL con SDL, variables, fragmentos,
   directivas e introspección), `api_rapida`/`fastapi` (rutas tipadas,

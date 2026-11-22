@@ -1,0 +1,761 @@
+// stdlib/fichas.cfv — tokenización para modelos de lenguaje: BPE (también
+// a nivel de bytes, como GPT-2) y WordPiece (como BERT), con normalizadores,
+// pre-tokenizadores, tokens especiales, plantillas [CLS] … [SEP] y
+// decodificación. Lee y escribe el formato tokenizer.json de Hugging Face
+// (los resultados coinciden con la librería tokenizers) y entrena
+// vocabularios BPE propios. Inspirada en Hugging Face Tokenizers (Apache).
+// En inglés: importar "tokenizers".
+//
+//   importar "fichas"
+//   sea t = fichas_cargar(leer_archivo("tokenizer.json"))
+//   sea r = fichas_codificar(t, "Hola mundo")    // {"ids", "fichas", "palabras"}
+//   fichas_decodificar(t, r["ids"])              // "Hola mundo"
+//   sea propio = fichas_bpe_entrenar(textos, {"vocabulario": 8000})
+
+importar "json"
+importar "unicode"
+
+// ══ Clases de caracteres (aproximación de las categorías Unicode) ═══════════
+
+funcion _fc_espacio(c) {
+    retornar (c >= 9 y c <= 13) o c == 32 o c == 133 o c == 160 o c == 5760 o (c >= 8192 y c <= 8202) o c == 8232 o c == 8233 o c == 8239 o c == 8287 o c == 12288
+}
+
+funcion _fc_numero(c) {
+    retornar (c >= 48 y c <= 57) o c == 178 o c == 179 o c == 185 o (c >= 188 y c <= 190) o (c >= 1632 y c <= 1641) o (c >= 1776 y c <= 1785) o (c >= 2406 y c <= 2415) o (c >= 8304 y c <= 8329) o (c >= 8528 y c <= 8585) o (c >= 9312 y c <= 9371) o (c >= 65296 y c <= 65305)
+}
+
+// Puntuación según BERT: ASCII no alfanumérico o categoría P*.
+funcion _fc_puntuacion(c) {
+    si ((c >= 33 y c <= 47) o (c >= 58 y c <= 64) o (c >= 91 y c <= 96) o (c >= 123 y c <= 126)) { retornar verdadero }
+    retornar c == 161 o c == 167 o c == 171 o c == 182 o c == 183 o c == 187 o c == 191 o c == 894 o c == 903 o (c >= 1370 y c <= 1375) o c == 1417 o c == 1470 o c == 1472 o c == 1475 o c == 1478 o c == 1523 o c == 1524 o (c >= 1545 y c <= 1546) o c == 1548 o c == 1549 o c == 1563 o (c >= 1566 y c <= 1567) o (c >= 1642 y c <= 1645) o c == 1748 o (c >= 2404 y c <= 2405) o c == 2416 o (c >= 8208 y c <= 8231) o (c >= 8240 y c <= 8259) o (c >= 8261 y c <= 8273) o (c >= 8275 y c <= 8286) o (c >= 12289 y c <= 12291) o (c >= 12296 y c <= 12305) o (c >= 12308 y c <= 12319) o c == 12336 o c == 12349 o c == 12448 o c == 12539 o (c >= 65040 y c <= 65049) o (c >= 65072 y c <= 65106) o (c >= 65108 y c <= 65121) o c == 65123 o c == 65128 o c == 65130 o c == 65131 o (c >= 65281 y c <= 65283) o (c >= 65285 y c <= 65290) o (c >= 65292 y c <= 65295) o c == 65306 o c == 65307 o c == 65311 o c == 65312 o (c >= 65339 y c <= 65341) o c == 65343 o c == 65371 o c == 65373 o (c >= 65375 y c <= 65381)
+}
+
+// Símbolos y marcas (no son letras para \p{L}).
+funcion _fc_simbolo(c) {
+    retornar (c >= 162 y c <= 166) o c == 168 o c == 169 o c == 172 o (c >= 174 y c <= 177) o c == 180 o c == 184 o c == 215 o c == 247 o (c >= 706 y c <= 709) o (c >= 722 y c <= 735) o (c >= 741 y c <= 747) o c == 749 o (c >= 751 y c <= 767) o (c >= 768 y c <= 879) o c == 885 o c == 900 o c == 901 o (c >= 8352 y c <= 8399) o (c >= 8400 y c <= 8447) o (c >= 8448 y c <= 8449) o (c >= 8451 y c <= 8454) o (c >= 8456 y c <= 8457) o c == 8468 o (c >= 8470 y c <= 8472) o (c >= 8478 y c <= 8483) o c == 8485 o c == 8487 o c == 8489 o c == 8494 o (c >= 8592 y c <= 9215) o (c >= 9216 y c <= 9311) o (c >= 9372 y c <= 9449) o (c >= 9472 y c <= 10101) o (c >= 10132 y c <= 10175) o (c >= 10176 y c <= 11263) o (c >= 11904 y c <= 12255) o c == 12292 o c == 12306 o c == 12307 o c == 12320 o (c >= 12342 y c <= 12343) o (c >= 12443 y c <= 12444) o (c >= 12688 y c <= 12703) o (c >= 12736 y c <= 12771) o (c >= 12800 y c <= 13311) o (c >= 19904 y c <= 19967) o (c >= 42752 y c <= 42774) o (c >= 65024 y c <= 65039) o (c >= 126976 y c <= 129791) o (c >= 917504 y c <= 917631) o c == 65284 o c == 65291 o (c >= 65308 y c <= 65310) o c == 65342 o c == 65344 o c == 65372 o c == 65374 o (c >= 65504 y c <= 65518) o (c >= 65532 y c <= 65533)
+}
+
+funcion _fc_letra(c) {
+    si ((c >= 65 y c <= 90) o (c >= 97 y c <= 122)) { retornar verdadero }
+    si (c < 128) { retornar falso }
+    si (c == 170 o c == 181 o c == 186) { retornar verdadero }
+    retornar _fc_espacio(c) == falso y _fc_numero(c) == falso y _fc_puntuacion(c) == falso y _fc_simbolo(c) == falso y c > 191
+}
+
+funcion _fc_cjk(c) {
+    retornar (c >= 19968 y c <= 40959) o (c >= 13312 y c <= 19903) o (c >= 131072 y c <= 173791) o (c >= 173824 y c <= 177983) o (c >= 177984 y c <= 178207) o (c >= 178208 y c <= 183983) o (c >= 63744 y c <= 64255) o (c >= 194560 y c <= 195103)
+}
+
+// ══ Bytes ↔ unicode de GPT-2 ═══════════════════════════════════════════════
+
+sea _FC_B2U = nulo
+sea _FC_U2B = nulo
+
+funcion _fc_tabla_bytes() {
+    si (_FC_B2U != nulo) { retornar nulo }
+    sea b2u = {}
+    sea u2b = {}
+    sea n = 0
+    sea b = 0
+    mientras (b < 256) {
+        sea directo = (b >= 33 y b <= 126) o (b >= 161 y b <= 172) o (b >= 174 y b <= 255)
+        sea cp = b
+        si (directo == falso) {
+            cp = 256 + n
+            n = n + 1
+        }
+        b2u["" + b] = caracter(cp)
+        u2b[caracter(cp)] = b
+        b = b + 1
+    }
+    _FC_B2U = b2u
+    _FC_U2B = u2b
+}
+
+funcion _fc_a_bytes_unicode(t) {
+    _fc_tabla_bytes()
+    sea r = ""
+    sea i = 0
+    mientras (i < longitud(t)) {
+        r = r + _FC_B2U["" + byte_en(t, i)]
+        i = i + 1
+    }
+    retornar r
+}
+
+funcion _fc_de_bytes_unicode(t) {
+    _fc_tabla_bytes()
+    sea r = ""
+    para p en unicode_puntos(t) {
+        sea ch = caracter(p)
+        si (tiene_clave(_FC_U2B, ch)) { r = r + bytes_entero(_FC_U2B[ch], 1, 0) } sino { r = r + ch }
+    }
+    retornar r
+}
+
+// ══ Normalizadores ═════════════════════════════════════════════════════════
+
+funcion _fc_normalizar(n, t) {
+    si (n == nulo) { retornar t }
+    sea tp = n["type"]
+    si (tp == "Sequence") {
+        para x en n["normalizers"] { t = _fc_normalizar(x, t) }
+        retornar t
+    }
+    si (tp == "Lowercase") { retornar unicode_minusculas(t) }
+    si (tp == "NFD") { retornar unicode_nfd(t) }
+    si (tp == "NFC") { retornar unicode_nfc(t) }
+    si (tp == "NFKD" o tp == "NFKC") { retornar unicode_nfc(t) }
+    si (tp == "StripAccents") { retornar _fc_sin_marcas(t) }
+    si (tp == "Strip") {
+        si (n["left"] ?? verdadero) { mientras (longitud(t) > 0 y _fc_espacio(byte_en(t, 0))) { t = subcadena(t, 1, longitud(t)) } }
+        si (n["right"] ?? verdadero) { mientras (longitud(t) > 0 y _fc_espacio(byte_en(t, longitud(t) - 1))) { t = subcadena(t, 0, longitud(t) - 1) } }
+        retornar t
+    }
+    si (tp == "Replace") {
+        sea patron = n["pattern"]["String"] ?? nulo
+        si (patron != nulo) { retornar texto_reemplazar(t, patron, n["content"]) }
+        retornar t
+    }
+    si (tp == "Prepend") { retornar n["prepend"] + t }
+    si (tp == "BertNormalizer") {
+        sea puntos = []
+        para c en unicode_puntos(t) {
+            sea omitir = falso
+            si (n["clean_text"] ?? verdadero) {
+                si (c == 0 o c == 65533 o ((c < 32 o (c >= 127 y c < 160)) y c != 9 y c != 10 y c != 13)) { omitir = verdadero }
+                si (c >= 8203 y c <= 8207) { omitir = verdadero }
+            }
+            si (omitir == falso) {
+                si ((n["clean_text"] ?? verdadero) y _fc_espacio(c)) { c = 32 }
+                si ((n["handle_chinese_chars"] ?? verdadero) y _fc_cjk(c)) {
+                    puntos.agregar(32)
+                    puntos.agregar(c)
+                    puntos.agregar(32)
+                } sino { puntos.agregar(c) }
+            }
+        }
+        sea r = unicode_texto(puntos)
+        sea quitar = n["strip_accents"] ?? nulo
+        si (quitar == nulo) { quitar = n["lowercase"] ?? verdadero }
+        si (quitar) { r = _fc_sin_marcas(unicode_nfd(r)) }
+        si (n["lowercase"] ?? verdadero) { r = unicode_minusculas(r) }
+        retornar r
+    }
+    retornar t
+}
+
+funcion _fc_sin_marcas(t) {
+    sea r = []
+    para c en unicode_puntos(t) { si ((c >= 768 y c <= 879) == falso y (c >= 6832 y c <= 6911) == falso y (c >= 7616 y c <= 7679) == falso y (c >= 8400 y c <= 8447) == falso y (c >= 65056 y c <= 65071) == falso) { r.agregar(c) } }
+    retornar unicode_texto(r)
+}
+
+// ══ Pre-tokenizadores ══════════════════════════════════════════════════════
+// Devuelven una lista de palabras (texto).
+
+funcion _fc_grupos(t, clase) {
+    // Corta en tramos según la clase de cada punto de código.
+    sea r = []
+    sea actual = []
+    sea clase_act = nulo
+    para c en unicode_puntos(t) {
+        sea k = clase(c)
+        si (k != clase_act y longitud(actual) > 0) {
+            r.agregar([clase_act, unicode_texto(actual)])
+            actual = []
+        }
+        clase_act = k
+        actual.agregar(c)
+    }
+    si (longitud(actual) > 0) { r.agregar([clase_act, unicode_texto(actual)]) }
+    retornar r
+}
+
+// Regex de GPT-2: 's|'t|'re|'ve|'m|'ll|'d| ?\p{L}+| ?\p{N}+| ?[^\s\p{L}\p{N}]+|\s+(?!\S)|\s+
+funcion _fc_gpt2(t) {
+    sea p = unicode_puntos(t)
+    sea n = longitud(p)
+    sea r = []
+    sea i = 0
+    mientras (i < n) {
+        sea c = p[i]
+        sea hecho = falso
+        si (c == 39 y i + 1 < n) {
+            para suf en [[115], [116], [114, 101], [118, 101], [109], [108, 108], [100]] {
+                si (hecho == falso y i + longitud(suf) < n + 0) {
+                    sea ok = verdadero
+                    sea k = 0
+                    mientras (k < longitud(suf)) {
+                        si (i + 1 + k >= n o p[i + 1 + k] != suf[k]) { ok = falso }
+                        k = k + 1
+                    }
+                    si (ok) {
+                        sea pts = [39]
+                        para x en suf { pts.agregar(x) }
+                        r.agregar(unicode_texto(pts))
+                        i = i + 1 + longitud(suf)
+                        hecho = verdadero
+                    }
+                }
+            }
+        }
+        si (hecho == falso) {
+            sea j = i
+            sea con_espacio = falso
+            si (c == 32 y i + 1 < n y _fc_espacio(p[i + 1]) == falso) {
+                j = i + 1
+                con_espacio = verdadero
+            }
+            sea d = p[j]
+            si (_fc_espacio(d) y con_espacio == falso) {
+                // \s+(?!\S): deja el último espacio para la palabra siguiente.
+                sea k = i
+                mientras (k < n y _fc_espacio(p[k])) { k = k + 1 }
+                si (k < n y k - i > 1) { k = k - 1 }
+                r.agregar(unicode_texto(_fc_rebanar(p, i, k)))
+                i = k
+            } sino {
+                sea k = j + 1
+                si (_fc_letra(d)) { mientras (k < n y _fc_letra(p[k])) { k = k + 1 } } sino {
+                    si (_fc_numero(d)) { mientras (k < n y _fc_numero(p[k])) { k = k + 1 } } sino {
+                        mientras (k < n y _fc_letra(p[k]) == falso y _fc_numero(p[k]) == falso y _fc_espacio(p[k]) == falso) { k = k + 1 }
+                    }
+                }
+                r.agregar(unicode_texto(_fc_rebanar(p, i, k)))
+                i = k
+            }
+        }
+    }
+    retornar r
+}
+
+funcion _fc_rebanar(l, a, b) {
+    sea r = []
+    sea i = a
+    mientras (i < b) { r.agregar(l[i])  i = i + 1 }
+    retornar r
+}
+
+funcion _fc_pretok(pt, palabras) {
+    si (pt == nulo) { retornar palabras }
+    sea tp = pt["type"]
+    si (tp == "Sequence") {
+        para x en pt["pretokenizers"] { palabras = _fc_pretok(x, palabras) }
+        retornar palabras
+    }
+    sea r = []
+    para w en palabras {
+        si (tp == "Whitespace") {
+            // \w+|[^\w\s]+
+            para g en _fc_grupos(w, funcion(c) {
+                si (_fc_espacio(c)) { retornar 0 }
+                si (_fc_letra(c) o _fc_numero(c) o c == 95) { retornar 1 }
+                retornar 2
+            }) { si (g[0] != 0) { r.agregar(g[1]) } }
+        }
+        si (tp == "WhitespaceSplit") {
+            para g en _fc_grupos(w, funcion(c) { si (_fc_espacio(c)) { retornar 0 }  retornar 1 }) { si (g[0] != 0) { r.agregar(g[1]) } }
+        }
+        si (tp == "BertPreTokenizer" o tp == "Punctuation") {
+            para c2 en _fc_grupos(w, funcion(c) { si (_fc_espacio(c)) { retornar 0 }  retornar 1 }) {
+                si (c2[0] == 1 o tp == "Punctuation") {
+                    // Cada signo de puntuación es una palabra aparte.
+                    sea actual = []
+                    para c en unicode_puntos(c2[1]) {
+                        si (_fc_puntuacion(c)) {
+                            si (longitud(actual) > 0) { r.agregar(unicode_texto(actual))  actual = [] }
+                            r.agregar(caracter(c))
+                        } sino { actual.agregar(c) }
+                    }
+                    si (longitud(actual) > 0) { r.agregar(unicode_texto(actual)) }
+                }
+            }
+        }
+        si (tp == "Digits") {
+            si (pt["individual_digits"] ?? falso) {
+                sea actual = []
+                para c en unicode_puntos(w) {
+                    si (_fc_numero(c)) {
+                        si (longitud(actual) > 0) { r.agregar(unicode_texto(actual))  actual = [] }
+                        r.agregar(caracter(c))
+                    } sino { actual.agregar(c) }
+                }
+                si (longitud(actual) > 0) { r.agregar(unicode_texto(actual)) }
+            } sino { para g en _fc_grupos(w, funcion(c) { si (_fc_numero(c)) { retornar 1 }  retornar 0 }) { r.agregar(g[1]) } }
+        }
+        si (tp == "Metaspace") {
+            sea rep = pt["replacement"] ?? "▁"
+            sea s = texto_reemplazar(w, " ", rep)
+            si ((pt["prepend_scheme"] ?? "always") != "never" y texto_empieza_con(s, rep) == falso) { s = rep + s }
+            sea actual = ""
+            para trozo en texto_dividir(s, rep) {
+                si (trozo != "" o actual != "") { r.agregar(rep + trozo) }
+            }
+        }
+        si (tp == "ByteLevel") {
+            sea s = w
+            si ((pt["add_prefix_space"] ?? verdadero) y texto_empieza_con(s, " ") == falso) { s = " " + s }
+            sea partes = [s]
+            si (pt["use_regex"] ?? verdadero) { partes = _fc_gpt2(s) }
+            para x en partes { r.agregar(_fc_a_bytes_unicode(x)) }
+        }
+        si (tp != "Whitespace" y tp != "WhitespaceSplit" y tp != "BertPreTokenizer" y tp != "Punctuation" y tp != "Digits" y tp != "Metaspace" y tp != "ByteLevel") { r.agregar(w) }
+    }
+    retornar r
+}
+
+// ══ Modelos ════════════════════════════════════════════════════════════════
+
+funcion _fc_bpe_palabra(m, w) {
+    si (tiene_clave(m["cache"], w)) { retornar m["cache"][w] }
+    sea partes = []
+    para c en unicode_puntos(w) { partes.agregar(caracter(c)) }
+    si (m["prefijo"] != nulo y longitud(partes) > 0) {
+        sea i = 1
+        mientras (i < longitud(partes)) { partes[i] = m["prefijo"] + partes[i]  i = i + 1 }
+    }
+    si (m["sufijo"] != nulo y longitud(partes) > 0) { partes[longitud(partes) - 1] = partes[longitud(partes) - 1] + m["sufijo"] }
+    si ((m["ignorar_fusiones"] ?? falso) y tiene_clave(m["vocab"], w)) {
+        m["cache"][w] = [w]
+        retornar [w]
+    }
+    mientras (longitud(partes) > 1) {
+        sea mejor = -1
+        sea pos = -1
+        sea i = 0
+        mientras (i < longitud(partes) - 1) {
+            sea k = partes[i] + " " + partes[i + 1]
+            sea r = m["rangos"][k] ?? -1
+            si (r >= 0 y (mejor < 0 o r < mejor)) { mejor = r  pos = i }
+            i = i + 1
+        }
+        si (pos < 0) { romper }
+        // Une todas las apariciones del par en una pasada (izquierda a derecha).
+        sea a = partes[pos]
+        sea b = partes[pos + 1]
+        sea nuevas = []
+        i = 0
+        mientras (i < longitud(partes)) {
+            si (i < longitud(partes) - 1 y partes[i] == a y partes[i + 1] == b) {
+                sea unido = a + b
+                si (m["prefijo"] != nulo y texto_empieza_con(b, m["prefijo"])) { unido = a + subcadena(b, longitud(m["prefijo"]), longitud(b)) }
+                nuevas.agregar(unido)
+                i = i + 2
+            } sino {
+                nuevas.agregar(partes[i])
+                i = i + 1
+            }
+        }
+        partes = nuevas
+    }
+    m["cache"][w] = partes
+    retornar partes
+}
+
+funcion _fc_modelo_fichas(m, w) {
+    si (m["tipo"] == "BPE") {
+        sea r = []
+        sea pendiente_unk = falso
+        para p en _fc_bpe_palabra(m, w) {
+            si (tiene_clave(m["vocab"], p)) {
+                r.agregar(p)
+                pendiente_unk = falso
+            } sino {
+                si (m["byte_fallback"] ?? falso) {
+                    sea i = 0
+                    mientras (i < longitud(p)) {
+                        r.agregar("<0x" + texto_mayusculas(hex_de_bytes(subcadena(p, i, i + 1))) + ">")
+                        i = i + 1
+                    }
+                } sino {
+                    si (m["unk"] != nulo) {
+                        si ((m["fusionar_unk"] ?? falso) == falso o pendiente_unk == falso) { r.agregar(m["unk"]) }
+                        pendiente_unk = verdadero
+                    }
+                }
+            }
+        }
+        retornar r
+    }
+    // WordPiece: el prefijo más largo que esté en el vocabulario.
+    sea puntos = unicode_puntos(w)
+    si (longitud(puntos) > (m["max_letras"] ?? 100)) { retornar [m["unk"]] }
+    sea r = []
+    sea ini = 0
+    mientras (ini < longitud(puntos)) {
+        sea fin = longitud(puntos)
+        sea hallado = nulo
+        mientras (fin > ini y hallado == nulo) {
+            sea s = unicode_texto(_fc_rebanar(puntos, ini, fin))
+            si (ini > 0) { s = m["prefijo"] + s }
+            si (tiene_clave(m["vocab"], s)) { hallado = s } sino { fin = fin - 1 }
+        }
+        si (hallado == nulo) { retornar [m["unk"]] }
+        r.agregar(hallado)
+        ini = fin
+    }
+    retornar r
+}
+
+// ══ Tokenizador ════════════════════════════════════════════════════════════
+
+/// Lee un tokenizer.json de Hugging Face (modelos BPE y WordPiece).
+funcion fichas_cargar(texto_json) {
+    sea j = texto_json
+    si (tipo(j) == "texto") { j = json_parsear(j) }
+    sea md = j["model"]
+    sea tipo_ = md["type"] ?? nulo
+    si (tipo_ == nulo) {
+        si (tiene_clave(md, "merges")) { tipo_ = "BPE" } sino { tipo_ = "WordPiece" }
+    }
+    si (tipo_ != "BPE" y tipo_ != "WordPiece") { lanzar "fichas: modelo no soportado " + tipo_ }
+    sea m = {"tipo": tipo_, "vocab": md["vocab"], "unk": md["unk_token"] ?? nulo, "cache": {}, "rangos": {}, "prefijo": md["continuing_subword_prefix"] ?? nulo, "sufijo": md["end_of_word_suffix"] ?? nulo, "byte_fallback": md["byte_fallback"] ?? falso, "fusionar_unk": md["fuse_unk"] ?? falso, "ignorar_fusiones": md["ignore_merges"] ?? falso, "max_letras": md["max_input_chars_per_word"] ?? 100}
+    si (tipo_ == "WordPiece") { m["prefijo"] = md["continuing_subword_prefix"] ?? "##" }
+    si (tipo_ == "BPE") {
+        sea i = 0
+        para f en md["merges"] ?? [] {
+            sea k = f
+            si (tipo(f) == "lista") { k = f[0] + " " + f[1] }
+            m["rangos"][k] = i
+            i = i + 1
+        }
+    }
+    sea inv = {}
+    para k en claves(m["vocab"]) { inv["" + m["vocab"][k]] = k }
+    sea especiales = []
+    para a en j["added_tokens"] ?? [] {
+        especiales.agregar({"contenido": a["content"], "id": a["id"], "especial": a["special"] ?? falso, "normalizado": a["normalized"] ?? falso})
+        inv["" + a["id"]] = a["content"]
+    }
+    // Los más largos primero, para cortar bien.
+    especiales = ordenar(especiales, funcion(a, b) { retornar longitud(b["contenido"]) - longitud(a["contenido"]) })
+    retornar {"modelo": m, "inverso": inv, "normalizador": j["normalizer"] ?? nulo, "pretok": j["pre_tokenizer"] ?? nulo, "post": j["post_processor"] ?? nulo, "decodificador": j["decoder"] ?? nulo, "agregados": especiales, "json": j}
+}
+
+funcion _fc_cortar_especiales(t, texto) {
+    // [[es_especial, texto o ficha]]
+    sea r = []
+    si (longitud(t["agregados"]) == 0) { retornar [[falso, texto]] }
+    sea actual = ""
+    sea i = 0
+    mientras (i < longitud(texto)) {
+        sea hallado = nulo
+        para a en t["agregados"] {
+            si (hallado == nulo y subcadena(texto, i, minimo(longitud(texto), i + longitud(a["contenido"]))) == a["contenido"]) { hallado = a }
+        }
+        si (hallado != nulo) {
+            si (actual != "") { r.agregar([falso, actual])  actual = "" }
+            r.agregar([verdadero, hallado])
+            i = i + longitud(hallado["contenido"])
+        } sino {
+            actual = actual + subcadena(texto, i, i + 1)
+            i = i + 1
+        }
+    }
+    si (actual != "") { r.agregar([falso, actual]) }
+    retornar r
+}
+
+funcion _fc_id(t, ficha) {
+    sea v = t["modelo"]["vocab"][ficha] ?? nulo
+    si (v != nulo) { retornar v }
+    para a en t["agregados"] { si (a["contenido"] == ficha) { retornar a["id"] } }
+    retornar nulo
+}
+
+funcion _fc_codificar_uno(t, texto) {
+    sea fichas_ = []
+    sea palabras = []
+    sea nw = 0
+    para trozo en _fc_cortar_especiales(t, texto) {
+        si (trozo[0]) {
+            fichas_.agregar(trozo[1]["contenido"])
+            palabras.agregar(nulo)
+        } sino {
+            sea norm = _fc_normalizar(t["normalizador"], trozo[1])
+            para w en _fc_pretok(t["pretok"], [norm]) {
+                para f en _fc_modelo_fichas(t["modelo"], w) {
+                    fichas_.agregar(f)
+                    palabras.agregar(nw)
+                }
+                nw = nw + 1
+            }
+        }
+    }
+    retornar [fichas_, palabras]
+}
+
+funcion _fc_plantilla(t, a, b) {
+    sea p = t["post"]
+    sea fichas_ = []
+    sea palabras = []
+    sea tipos = []
+    si (p == nulo) {
+        para x en a[0] { fichas_.agregar(x)  tipos.agregar(0) }
+        para x en a[1] { palabras.agregar(x) }
+        si (b != nulo) {
+            para x en b[0] { fichas_.agregar(x)  tipos.agregar(1) }
+            para x en b[1] { palabras.agregar(x) }
+        }
+        retornar [fichas_, palabras, tipos]
+    }
+    si (p["type"] == "Sequence") {
+        sea elegido = nulo
+        para x en p["processors"] { si (x["type"] == "TemplateProcessing" o x["type"] == "BertProcessing" o x["type"] == "RobertaProcessing") { elegido = x } }
+        p = elegido
+        si (p == nulo) { retornar _fc_plantilla({"post": nulo}, a, b) }
+    }
+    sea tp = p["type"]
+    sea plantilla = nulo
+    si (tp == "TemplateProcessing") {
+        plantilla = p["single"]
+        si (b != nulo) { plantilla = p["pair"] }
+    }
+    si (tp == "BertProcessing" o tp == "RobertaProcessing") {
+        sea cls = p["cls"][0]
+        sea sep = p["sep"][0]
+        plantilla = [{"SpecialToken": {"id": cls, "type_id": 0}}, {"Sequence": {"id": "A", "type_id": 0}}, {"SpecialToken": {"id": sep, "type_id": 0}}]
+        si (b != nulo) {
+            si (tp == "RobertaProcessing") { plantilla.agregar({"SpecialToken": {"id": sep, "type_id": 0}}) }
+            plantilla.agregar({"Sequence": {"id": "B", "type_id": 1}})
+            plantilla.agregar({"SpecialToken": {"id": sep, "type_id": 1}})
+        }
+    }
+    si (plantilla == nulo) { retornar _fc_plantilla({"post": nulo}, a, b) }
+    para pieza en plantilla {
+        si (tiene_clave(pieza, "SpecialToken")) {
+            fichas_.agregar(pieza["SpecialToken"]["id"])
+            palabras.agregar(nulo)
+            tipos.agregar(pieza["SpecialToken"]["type_id"])
+        } sino {
+            sea s = a
+            si (pieza["Sequence"]["id"] == "B") { s = b }
+            para x en s[0] { fichas_.agregar(x)  tipos.agregar(pieza["Sequence"]["type_id"]) }
+            para x en s[1] { palabras.agregar(x) }
+        }
+    }
+    retornar [fichas_, palabras, tipos]
+}
+
+/// Codifica un texto (y opcionalmente un segundo, para pares).
+/// opciones: especiales (verdadero: aplica la plantilla [CLS] … [SEP]),
+/// largo_maximo (trunca), rellenar_hasta (agrega [PAD]).
+/// Devuelve {"ids", "fichas", "palabras", "tipos", "atencion"}.
+funcion fichas_codificar(t, texto, par, opciones) {
+    sea o = opciones ?? {}
+    sea a = _fc_codificar_uno(t, "" + texto)
+    sea b = nulo
+    si (par != nulo) { b = _fc_codificar_uno(t, "" + par) }
+    sea r = [a[0], a[1], []]
+    si (o["especiales"] ?? verdadero) { r = _fc_plantilla(t, a, b) } sino {
+        r = _fc_plantilla({"post": nulo}, a, b)
+    }
+    sea fichas_ = r[0]
+    sea palabras = r[1]
+    sea tipos = r[2]
+    sea max = o["largo_maximo"] ?? nulo
+    si (max != nulo y longitud(fichas_) > max) {
+        fichas_ = _fc_rebanar(fichas_, 0, max)
+        palabras = _fc_rebanar(palabras, 0, max)
+        tipos = _fc_rebanar(tipos, 0, max)
+    }
+    sea ids = []
+    para f en fichas_ { ids.agregar(_fc_id(t, f)) }
+    sea atencion = []
+    para f en fichas_ { atencion.agregar(1) }
+    sea relleno = o["rellenar_hasta"] ?? nulo
+    si (relleno != nulo) {
+        sea pad = o["ficha_relleno"] ?? "[PAD]"
+        mientras (longitud(fichas_) < relleno) {
+            fichas_.agregar(pad)
+            ids.agregar(_fc_id(t, pad) ?? 0)
+            palabras.agregar(nulo)
+            tipos.agregar(0)
+            atencion.agregar(0)
+        }
+    }
+    retornar {"ids": ids, "fichas": fichas_, "palabras": palabras, "tipos": tipos, "atencion": atencion}
+}
+
+/// Codifica varios textos; con rellenar: verdadero, todos al largo del mayor.
+funcion fichas_codificar_lote(t, textos, opciones) {
+    sea o = opciones ?? {}
+    sea r = []
+    para x en textos { r.agregar(fichas_codificar(t, x, nulo, o)) }
+    si (o["rellenar"] ?? falso) {
+        sea max = 0
+        para e en r { max = maximo(max, longitud(e["ids"])) }
+        sea o2 = {}
+        para k en claves(o) { o2[k] = o[k] }
+        o2["rellenar_hasta"] = max
+        sea r2 = []
+        para x en textos { r2.agregar(fichas_codificar(t, x, nulo, o2)) }
+        retornar r2
+    }
+    retornar r
+}
+
+/// Ficha ↔ id.
+funcion fichas_id(t, ficha) { retornar _fc_id(t, ficha) }
+funcion fichas_ficha(t, id) { retornar t["inverso"]["" + id] ?? nulo }
+funcion fichas_tamano_vocabulario(t) { retornar longitud(claves(t["inverso"])) }
+
+/// Decodifica ids a texto. saltar_especiales (verdadero).
+funcion fichas_decodificar(t, ids, saltar_especiales) {
+    sea saltar = saltar_especiales ?? verdadero
+    sea esp = {}
+    para a en t["agregados"] { si (a["especial"]) { esp[a["contenido"]] = verdadero } }
+    sea fichas_ = []
+    para i en ids {
+        sea f = fichas_ficha(t, i)
+        si (f != nulo y (saltar == falso o tiene_clave(esp, f) == falso)) { fichas_.agregar(f) }
+    }
+    retornar _fc_decodificar(t["decodificador"], fichas_, t)
+}
+
+funcion _fc_decodificar(d, fichas_, t) {
+    si (d == nulo) { retornar unir(fichas_, " ") }
+    sea tp = d["type"]
+    si (tp == "ByteLevel") { retornar _fc_de_bytes_unicode(unir(fichas_, "")) }
+    si (tp == "WordPiece") {
+        sea pre = d["prefix"] ?? "##"
+        sea r = ""
+        sea i = 0
+        mientras (i < longitud(fichas_)) {
+            sea f = fichas_[i]
+            si (texto_empieza_con(f, pre)) { r = r + subcadena(f, longitud(pre), longitud(f)) } sino {
+                si (i > 0) { r = r + " " }
+                r = r + f
+            }
+            i = i + 1
+        }
+        si (d["cleanup"] ?? verdadero) {
+            para par en [[" .", "."], [" ?", "?"], [" !", "!"], [" ,", ","], [" ' ", "'"], [" n't", "n't"], [" 'm", "'m"], [" do not", " don't"], [" 's", "'s"], [" 've", "'ve"], [" 're", "'re"]] { r = texto_reemplazar(r, par[0], par[1]) }
+        }
+        retornar r
+    }
+    si (tp == "Metaspace") {
+        sea rep = d["replacement"] ?? "▁"
+        sea r = texto_reemplazar(unir(fichas_, ""), rep, " ")
+        si (texto_empieza_con(r, " ")) { r = subcadena(r, 1, longitud(r)) }
+        retornar r
+    }
+    si (tp == "BPEDecoder") { retornar texto_recortar(texto_reemplazar(unir(fichas_, ""), d["suffix"] ?? "</w>", " ")) }
+    si (tp == "Sequence") {
+        // Caso común (Llama): Replace ▁→espacio, ByteFallback, Fuse, Strip.
+        sea r = unir(fichas_, "")
+        para x en d["decoders"] {
+            si (x["type"] == "Replace") { r = texto_reemplazar(r, x["pattern"]["String"] ?? "", x["content"]) }
+            si (x["type"] == "Strip") {
+                sea k = 0
+                mientras (k < (x["start"] ?? 0) y texto_empieza_con(r, x["content"] ?? " ")) { r = subcadena(r, 1, longitud(r))  k = k + 1 }
+            }
+            si (x["type"] == "ByteFallback") { r = _fc_bytes_respaldo(r) }
+        }
+        retornar r
+    }
+    retornar unir(fichas_, " ")
+}
+
+funcion _fc_bytes_respaldo(r) {
+    sea s = ""
+    sea i = 0
+    mientras (i < longitud(r)) {
+        si (subcadena(r, i, minimo(longitud(r), i + 3)) == "<0x" y subcadena(r, i + 5, minimo(longitud(r), i + 6)) == ">") {
+            s = s + bytes_de_hex(subcadena(r, i + 3, i + 5))
+            i = i + 6
+        } sino {
+            s = s + subcadena(r, i, i + 1)
+            i = i + 1
+        }
+    }
+    retornar s
+}
+
+// ══ Entrenamiento BPE ══════════════════════════════════════════════════════
+
+/// Entrena un BPE. opciones: vocabulario (tamaño, 1000), min_frecuencia
+/// (2), nivel_bytes (verdadero: estilo GPT-2, nunca hay desconocidos),
+/// minusculas (falso), especiales (["<|endoftext|>"]).
+funcion fichas_bpe_entrenar(textos, opciones) {
+    sea o = opciones ?? {}
+    sea objetivo = o["vocabulario"] ?? 1000
+    sea minf = o["min_frecuencia"] ?? 2
+    sea bytes_ = o["nivel_bytes"] ?? verdadero
+    sea norm = nulo
+    si (o["minusculas"] ?? falso) { norm = {"type": "Lowercase"} }
+    sea pt = {"type": "Whitespace"}
+    si (bytes_) { pt = {"type": "ByteLevel", "add_prefix_space": falso, "trim_offsets": verdadero, "use_regex": verdadero} }
+    // Frecuencia de palabras.
+    sea frec = {}
+    para x en textos {
+        para w en _fc_pretok(pt, [_fc_normalizar(norm, "" + x)]) { frec[w] = (frec[w] ?? 0) + 1 }
+    }
+    sea vocab = {}
+    sea orden = []
+    sea especiales = o["especiales"] ?? ["<|endoftext|>"]
+    para e en especiales { vocab[e] = longitud(orden)  orden.agregar(e) }
+    si (bytes_) {
+        _fc_tabla_bytes()
+        sea alf = []
+        para k en claves(_FC_U2B) { alf.agregar(k) }
+        alf = ordenar(alf, funcion(a, b) { si (a < b) { retornar -1 }  retornar 1 })
+        para c en alf { vocab[c] = longitud(orden)  orden.agregar(c) }
+    }
+    sea palabras = []
+    para w en claves(frec) {
+        sea ps = []
+        para c en unicode_puntos(w) {
+            sea ch = caracter(c)
+            ps.agregar(ch)
+            si (tiene_clave(vocab, ch) == falso) { vocab[ch] = longitud(orden)  orden.agregar(ch) }
+        }
+        palabras.agregar([ps, frec[w]])
+    }
+    sea fusiones = []
+    mientras (longitud(orden) < objetivo) {
+        sea pares = {}
+        para pw en palabras {
+            sea ps = pw[0]
+            sea i = 0
+            mientras (i < longitud(ps) - 1) {
+                sea k = ps[i] + " " + ps[i + 1]
+                pares[k] = (pares[k] ?? 0) + pw[1]
+                i = i + 1
+            }
+        }
+        sea mejor = nulo
+        sea mf = 0
+        para k en claves(pares) { si (pares[k] > mf) { mf = pares[k]  mejor = k } }
+        si (mejor == nulo o mf < minf) { romper }
+        sea sp = texto_indice(mejor, " ")
+        sea a = subcadena(mejor, 0, sp)
+        sea b = subcadena(mejor, sp + 1, longitud(mejor))
+        fusiones.agregar(mejor)
+        si (tiene_clave(vocab, a + b) == falso) { vocab[a + b] = longitud(orden)  orden.agregar(a + b) }
+        para pw en palabras {
+            sea ps = pw[0]
+            si (longitud(ps) > 1) {
+                sea nuevas = []
+                sea i = 0
+                mientras (i < longitud(ps)) {
+                    si (i < longitud(ps) - 1 y ps[i] == a y ps[i + 1] == b) { nuevas.agregar(a + b)  i = i + 2 } sino { nuevas.agregar(ps[i])  i = i + 1 }
+                }
+                pw[0] = nuevas
+            }
+        }
+    }
+    sea agregados = []
+    sea i = 0
+    para e en especiales { agregados.agregar({"id": i, "content": e, "single_word": falso, "lstrip": falso, "rstrip": falso, "normalized": falso, "special": verdadero})  i = i + 1 }
+    sea dec = nulo
+    si (bytes_) { dec = {"type": "ByteLevel", "add_prefix_space": verdadero, "trim_offsets": verdadero, "use_regex": verdadero} }
+    sea unk = nulo
+    si (bytes_ == falso) { unk = o["desconocida"] ?? nulo }
+    retornar fichas_cargar({"version": "1.0", "truncation": nulo, "padding": nulo, "added_tokens": agregados, "normalizer": norm, "pre_tokenizer": pt, "post_processor": nulo, "decoder": dec, "model": {"type": "BPE", "dropout": nulo, "unk_token": unk, "continuing_subword_prefix": nulo, "end_of_word_suffix": nulo, "fuse_unk": falso, "byte_fallback": falso, "ignore_merges": falso, "vocab": vocab, "merges": fusiones}})
+}
+
+/// Texto tokenizer.json (compatible con Hugging Face).
+funcion fichas_guardar(t) { retornar json_texto(t["json"]) }
