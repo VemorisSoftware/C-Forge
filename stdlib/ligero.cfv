@@ -1,0 +1,351 @@
+// stdlib/ligero.cfv — micro-ORM al estilo Dapper: escribes el SQL y
+// ligero pone los parámetros con nombre (@id o :id, también listas para
+// IN @ids), convierte las filas en mapas con los nombres que quieras
+// (snake_case → camelCase), mapea filas a varios objetos con splitOn
+// (pedido + cliente), lee varias consultas de una vez, ejecuta lotes en
+// una transacción y trae ayudas tipo Dapper.Contrib (insertar, actualizar,
+// borrar y obtener por clave). Sobre SQLite. Inspirada en Dapper (Apache).
+// En inglés: importar "dapper".
+//
+//   importar "ligero"
+//   sea db = db_abrir("app.db")
+//   ligero_consultar(db, "SELECT * FROM usuarios WHERE edad > @min AND id IN @ids",
+//                    {"min": 18, "ids": [1, 2, 3]})
+//   ligero_escalar(db, "SELECT count(*) FROM usuarios")
+
+importar "sqlite"
+importar "json"
+
+sea _LG_CACHE = {}
+
+funcion _lg_es_nombre(b) { retornar (b >= 65 y b <= 90) o (b >= 97 y b <= 122) o (b >= 48 y b <= 57) o b == 95 }
+
+// Separa el SQL en trozos de texto y parámetros: [["sql", "..."], ["param", "nombre"]].
+funcion _lg_partes(sql) {
+    si (tiene_clave(_LG_CACHE, sql)) { retornar _LG_CACHE[sql] }
+    sea r = []
+    sea actual = ""
+    sea i = 0
+    sea n = longitud(sql)
+    mientras (i < n) {
+        sea c = subcadena(sql, i, i + 1)
+        si (c == "'" o c == "\"" o c == "`") {
+            // Textos e identificadores entre comillas (con comilla doble escapada).
+            sea j = i + 1
+            mientras (j < n) {
+                si (subcadena(sql, j, j + 1) == c) {
+                    si (subcadena(sql, j + 1, j + 2) == c) { j = j + 2 } sino { romper }
+                } sino { j = j + 1 }
+            }
+            actual = actual + subcadena(sql, i, minimo(n, j + 1))
+            i = j + 1
+        } sino {
+            si (subcadena(sql, i, i + 2) == "--") {
+                sea j = i
+                mientras (j < n y subcadena(sql, j, j + 1) != "\n") { j = j + 1 }
+                actual = actual + subcadena(sql, i, j)
+                i = j
+            } sino {
+                si (subcadena(sql, i, i + 2) == "/*") {
+                    sea f = texto_indice(subcadena(sql, i + 2, n), "*/")
+                    sea j = n
+                    si (f >= 0) { j = i + 2 + f + 2 }
+                    actual = actual + subcadena(sql, i, j)
+                    i = j
+                } sino {
+                    sea es_param = (c == "@" o c == ":") y i + 1 < n y _lg_es_nombre(byte_en(sql, i + 1)) y (byte_en(sql, i + 1) < 48 o byte_en(sql, i + 1) > 57)
+                    // "::" es una conversión de tipos (Postgres), no un parámetro.
+                    si (c == ":" y i > 0 y subcadena(sql, i - 1, i) == ":") { es_param = falso }
+                    si (es_param) {
+                        sea j = i + 1
+                        mientras (j < n y _lg_es_nombre(byte_en(sql, j))) { j = j + 1 }
+                        r.agregar(["sql", actual])
+                        actual = ""
+                        r.agregar(["param", subcadena(sql, i + 1, j)])
+                        i = j
+                    } sino {
+                        actual = actual + c
+                        i = i + 1
+                    }
+                }
+            }
+        }
+    }
+    r.agregar(["sql", actual])
+    _LG_CACHE[sql] = r
+    retornar r
+}
+
+/// SQL con parámetros con nombre → {"sql" (con ?), "params" (lista)}.
+/// Una lista se expande: "IN @ids" con [1, 2] queda "IN (?, ?)".
+funcion ligero_preparar(sql, parametros) {
+    sea p = parametros ?? {}
+    si (tipo(p) == "lista") { retornar {"sql": sql, "params": p} }
+    sea texto = ""
+    sea valores = []
+    para parte en _lg_partes(sql) {
+        si (parte[0] == "sql") { texto = texto + parte[1] } sino {
+            sea nombre = parte[1]
+            si (tiene_clave(p, nombre) == falso) { lanzar "ligero: falta el parámetro @" + nombre }
+            sea v = p[nombre]
+            si (tipo(v) == "lista") {
+                si (longitud(v) == 0) {
+                    // IN () no es SQL válido: se usa un IN que nunca coincide.
+                    texto = texto + "(SELECT NULL WHERE 0)"
+                } sino {
+                    sea qs = []
+                    para x en v {
+                        qs.agregar("?")
+                        valores.agregar(_lg_valor(x))
+                    }
+                    texto = texto + "(" + unir(qs, ", ") + ")"
+                }
+            } sino {
+                texto = texto + "?"
+                valores.agregar(_lg_valor(v))
+            }
+        }
+    }
+    retornar {"sql": texto, "params": valores}
+}
+
+funcion _lg_valor(v) {
+    si (v == verdadero) { retornar 1 }
+    si (v == falso) { retornar 0 }
+    si (tipo(v) == "mapa" y tiene_clave(v, "__blob") == falso) { retornar json_texto(v) }
+    retornar v
+}
+
+funcion _lg_camel(t) {
+    sea r = ""
+    sea mayus = falso
+    sea i = 0
+    mientras (i < longitud(t)) {
+        sea c = subcadena(t, i, i + 1)
+        si (c == "_" y i > 0) { mayus = verdadero } sino {
+            si (mayus) { r = r + texto_mayusculas(c) } sino { r = r + c }
+            mayus = falso
+        }
+        i = i + 1
+    }
+    retornar r
+}
+
+funcion _lg_fila(f, o) {
+    sea nombres = o["nombres"] ?? nulo
+    sea tipos = o["tipos"] ?? {}
+    si (nombres == nulo y longitud(claves(tipos)) == 0) { retornar f }
+    sea r = {}
+    para k en claves(f) {
+        sea v = f[k]
+        sea t = tipos[k] ?? nulo
+        si (t == "booleano" y v != nulo) { v = v != 0 }
+        si (t == "json" y v != nulo) { v = json_parsear(v) }
+        sea kk = k
+        si (nombres == "camel") { kk = _lg_camel(k) }
+        r[kk] = v
+    }
+    retornar r
+}
+
+/// Filas como mapas. opciones: nombres ("camel"), tipos ({col: "booleano" | "json"}).
+funcion ligero_consultar(db, sql, parametros, opciones) {
+    sea o = opciones ?? {}
+    sea q = ligero_preparar(sql, parametros)
+    sea r = []
+    para f en db_consulta_p(db, q["sql"], q["params"]) { r.agregar(_lg_fila(f, o)) }
+    retornar r
+}
+
+/// La primera fila o nulo.
+funcion ligero_primero(db, sql, parametros, opciones) {
+    sea r = ligero_consultar(db, sql, parametros, opciones)
+    si (longitud(r) == 0) { retornar nulo }
+    retornar r[0]
+}
+
+/// Exactamente una fila (lanza si hay 0 o más de 1).
+funcion ligero_unico(db, sql, parametros, opciones) {
+    sea r = ligero_consultar(db, sql, parametros, opciones)
+    si (longitud(r) != 1) { lanzar "ligero: se esperaba una fila y hubo " + longitud(r) }
+    retornar r[0]
+}
+
+/// Primer valor de la primera fila.
+funcion ligero_escalar(db, sql, parametros) {
+    sea q = ligero_preparar(sql, parametros)
+    retornar db_valor(db, q["sql"], q["params"])
+}
+
+/// Ejecuta (INSERT, UPDATE, DELETE…). Devuelve {"cambios", "ultimo_id"}.
+funcion ligero_ejecutar(db, sql, parametros) {
+    sea q = ligero_preparar(sql, parametros)
+    db_consulta_p(db, q["sql"], q["params"])
+    retornar {"cambios": db_cambios(db), "ultimo_id": db_ultimo_id(db)}
+}
+
+/// Ejecuta el mismo SQL con cada mapa de la lista, en una transacción
+/// (si uno falla no queda ninguno). Devuelve la suma de cambios.
+funcion ligero_ejecutar_lote(db, sql, lista_parametros) {
+    sea total = 0
+    db_transaccion(db)
+    intentar {
+        para p en lista_parametros {
+            sea q = ligero_preparar(sql, p)
+            db_consulta_p(db, q["sql"], q["params"])
+            total = total + db_cambios(db)
+        }
+        db_confirmar(db)
+    } capturar (e) {
+        db_revertir(db)
+        lanzar e
+    }
+    retornar total
+}
+
+/// Varias consultas separadas por ";" con los mismos parámetros: una lista
+/// de resultados por consulta (QueryMultiple).
+funcion ligero_varias(db, sql, parametros, opciones) {
+    sea r = []
+    para parte en _lg_sentencias(sql) {
+        si (texto_recortar(parte) != "") { r.agregar(ligero_consultar(db, parte, parametros, opciones)) }
+    }
+    retornar r
+}
+
+funcion _lg_sentencias(sql) {
+    sea r = []
+    sea actual = ""
+    para parte en _lg_partes(sql) {
+        si (parte[0] == "param") { actual = actual + "@" + parte[1] } sino {
+            sea t = parte[1]
+            // Corta en ";" fuera de comillas: _lg_partes ya dejó las comillas enteras.
+            sea i = 0
+            sea dentro = ""
+            mientras (i < longitud(t)) {
+                sea c = subcadena(t, i, i + 1)
+                si (dentro != "") {
+                    actual = actual + c
+                    si (c == dentro) { dentro = "" }
+                } sino {
+                    si (c == "'" o c == "\"") { dentro = c  actual = actual + c } sino {
+                        si (c == ";") { r.agregar(actual)  actual = "" } sino { actual = actual + c }
+                    }
+                }
+                i = i + 1
+            }
+        }
+    }
+    r.agregar(actual)
+    retornar r
+}
+
+/// Mapeo múltiple: cada fila se parte en objetos donde aparece de nuevo la
+/// columna dividir (por defecto "id"), en orden; f(objeto1, objeto2, …)
+/// arma el resultado. Con agrupar: verdadero, los objetos repetidos del
+/// primer nivel (mismo id) se reutilizan, para armar relaciones 1-a-N.
+funcion ligero_multi(db, sql, parametros, dividir, f, opciones) {
+    sea o = opciones ?? {}
+    sea q = ligero_preparar(sql, parametros)
+    sea cols = nulo
+    sea divs = dividir ?? "id"
+    si (tipo(divs) == "texto") { divs = texto_dividir(divs, ",") }
+    sea r = []
+    sea vistos = {}
+    para fila en _lg_filas_cols(db, q["sql"], q["params"]) {
+        sea objetos = []
+        sea actual = {}
+        sea vacio = verdadero
+        sea k = 0
+        sea siguiente_div = 0
+        para par en fila {
+            sea nombre = par[0]
+            si (k > 0 y siguiente_div < longitud(divs) y texto_minusculas(nombre) == texto_minusculas(texto_recortar(divs[siguiente_div]))) {
+                si (vacio) { objetos.agregar(nulo) } sino { objetos.agregar(_lg_fila(actual, o)) }
+                actual = {}
+                vacio = verdadero
+                si (longitud(divs) > 1) { siguiente_div = siguiente_div + 1 }
+            }
+            actual[nombre] = par[1]
+            si (par[1] != nulo) { vacio = falso }
+            k = k + 1
+        }
+        si (vacio) { objetos.agregar(nulo) } sino { objetos.agregar(_lg_fila(actual, o)) }
+        si (o["agrupar"] ?? falso) {
+            sea clave = json_texto(objetos[0])
+            si (tiene_clave(vistos, clave)) { objetos[0] = vistos[clave] } sino { vistos[clave] = objetos[0] }
+        }
+        sea res = f(objetos)
+        si (res != nulo y (o["agrupar"] ?? falso) == falso) { r.agregar(res) }
+    }
+    si (o["agrupar"] ?? falso) {
+        sea u = []
+        para k en claves(vistos) { u.agregar(vistos[k]) }
+        retornar u
+    }
+    retornar r
+}
+
+// Filas como listas de [columna, valor] en el orden del SELECT (las
+// columnas repetidas se conservan, cosa que un mapa no permite).
+funcion _lg_filas_cols(db, sql, parametros) {
+    sea r = []
+    db_cada_cols(db, sql, parametros, funcion(fila) { r.agregar(fila) })
+    retornar r
+}
+
+// ── Ayudas tipo Dapper.Contrib ────────────────────────────────────────────
+
+funcion _lg_ident(n) {
+    si (longitud(n) == 0) { lanzar "ligero: nombre vacío" }
+    sea i = 0
+    mientras (i < longitud(n)) {
+        sea b = byte_en(n, i)
+        si (_lg_es_nombre(b) == falso o (i == 0 y b >= 48 y b <= 57)) { lanzar "ligero: nombre inválido: " + n }
+        i = i + 1
+    }
+    retornar "\"" + n + "\""
+}
+
+/// INSERT con las claves del mapa. Devuelve el id nuevo.
+funcion ligero_insertar(db, tabla, objeto) {
+    sea cols = []
+    sea qs = []
+    sea vals = []
+    para k en claves(objeto) {
+        cols.agregar(_lg_ident(k))
+        qs.agregar("?")
+        vals.agregar(_lg_valor(objeto[k]))
+    }
+    db_consulta_p(db, "INSERT INTO " + _lg_ident(tabla) + " (" + unir(cols, ", ") + ") VALUES (" + unir(qs, ", ") + ")", vals)
+    retornar db_ultimo_id(db)
+}
+
+/// UPDATE de todas las columnas del objeto salvo la clave. Devuelve verdadero
+/// si cambió una fila.
+funcion ligero_actualizar(db, tabla, objeto, clave) {
+    sea kc = clave ?? "id"
+    si (tiene_clave(objeto, kc) == falso) { lanzar "ligero: el objeto no tiene la clave " + kc }
+    sea sets = []
+    sea vals = []
+    para k en claves(objeto) {
+        si (k != kc) {
+            sets.agregar(_lg_ident(k) + " = ?")
+            vals.agregar(_lg_valor(objeto[k]))
+        }
+    }
+    vals.agregar(objeto[kc])
+    db_consulta_p(db, "UPDATE " + _lg_ident(tabla) + " SET " + unir(sets, ", ") + " WHERE " + _lg_ident(kc) + " = ?", vals)
+    retornar db_cambios(db) > 0
+}
+
+funcion ligero_borrar(db, tabla, id, clave) {
+    db_consulta_p(db, "DELETE FROM " + _lg_ident(tabla) + " WHERE " + _lg_ident(clave ?? "id") + " = ?", [id])
+    retornar db_cambios(db) > 0
+}
+
+funcion ligero_obtener(db, tabla, id, clave, opciones) {
+    retornar ligero_primero(db, "SELECT * FROM " + _lg_ident(tabla) + " WHERE " + _lg_ident(clave ?? "id") + " = @id", {"id": id}, opciones)
+}
+
+funcion ligero_todos(db, tabla, opciones) { retornar ligero_consultar(db, "SELECT * FROM " + _lg_ident(tabla), {}, opciones) }

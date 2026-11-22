@@ -65,6 +65,21 @@ Sitio oficial: [c-forge.org](https://c-forge.org)
   `llamada`/`protobuf` (.proto, binario como protoc, marcos gRPC),
   `recolecta`/`crawler` (cookies RFC 6265, formularios, robots.txt,
   rastreo) y `sensor`/`mqtt` (paquetes MQTT, QoS 2, mini broker).
+- Lote 15 de bibliotecas (con alias en inglés y pruebas en ambos idiomas):
+  `correo`/`mailer` (SMTP con AUTH y TLS implícito, firma y verificación
+  DKIM rsa-sha256 y ed25519-sha256 compatibles con dkimpy), `formatos`/
+  `dataformat` (conversión JSON/YAML/TOML/XML/CSV, JSON Pointer, Patch,
+  Merge Patch, JSONPath del RFC 9535 y JSON Schema 2020-12 igual que
+  jsonschema), `ligero`/`dapper` (micro-ORM con @parámetros, listas en IN,
+  mapeo múltiple y lotes), `ensayo`/`vitest` (describir/prueba, ganchos,
+  mocks, espías, reloj falso e instantáneas), `estilos`/`tailwind` (CSS de
+  utilidades idéntico a Tailwind v4 en 198 reglas y unión como
+  tailwind-merge), `extremo`/`trpc` (protocolo de tRPC v11, probado con
+  @trpc/client, y tipos de TypeScript), `sistema`/`sysinfo` (CPU, memoria,
+  discos, red, procesos y sensores, igual que psutil) y `vigia`/`notify`
+  (inotify en Linux y sondeo en el resto).
+- `sqlite`: `db_cada_cols` entrega cada fila como lista de [columna, valor]
+  en el orden del SELECT (sirve con columnas repetidas).
 - Lote 14 de bibliotecas (con alias en inglés y pruebas en ambos idiomas):
   `clave`/`password` (bcrypt y scrypt propios, más Argon2id y PBKDF2 con
   una sola interfaz), `ajustes`/`config` (TOML 1.0 y YAML 1.2 estrictos,

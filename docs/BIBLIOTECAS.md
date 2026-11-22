@@ -38,7 +38,7 @@ Estado: ✅ ya existe en C-Forge · 🔗 se usa hoy vía `cforge bindgen`,
 | 19 | `blindaje` | TLS y cripto puras | Ring, Rustls | ✅ `crypto` · 🛠 TLS propio |
 | 20 | `patron` | Expresiones regulares sin ReDoS | regex (Rust) | ✅ `regex` |
 | 21 | `consulta` | Consultas perezosas sobre colecciones | LINQ | ✅ `colecciones` (parcial) |
-| 22 | `ligero` | Micro-ORM | Dapper | 🛠 |
+| 22 | `ligero` / `dapper` | Micro-ORM | Dapper | ✅ `ligero` |
 | 23 | `mapeador` | ORM con migraciones | EF Core | ✅ `db` (migraciones) · 🛠 ORM |
 | 24 | `senal` | Tiempo real con reconexión | SignalR | 🛠 |
 | 25 | `arbol_json` | JSON tipado y dinámico | System.Text.Json | ✅ `json` |
@@ -48,7 +48,7 @@ Estado: ✅ ya existe en C-Forge · 🔗 se usa hoy vía `cforge bindgen`,
 | 29 | `bitacora` / `logger` | Logs estructurados | Serilog | ✅ `bitacora` |
 | 30 | `torrente` | Red asíncrona de alto tráfico | Netty | 🛠 |
 | 31 | `caja` / `cache` | Colecciones avanzadas y cachés | Guava | ✅ `caja` |
-| 32 | `formatos` | JSON, XML, CSV y YAML | Jackson | ✅ JSON · 🛠 resto |
+| 32 | `formatos` / `dataformat` | JSON, XML, CSV y YAML | Jackson | ✅ `formatos` |
 | 33 | `registro` / `logging` | Registro de eventos desacoplado | SLF4J, Logback | ✅ `registro` |
 | 34 | `reloj` / `cron` | Tareas programadas (cron) | Quartz | ✅ `reloj` |
 | 35 | `indice` / `search` | Búsqueda de texto completo | Lucene | ✅ `indice` |
@@ -106,7 +106,7 @@ Estado: ✅ ya existe en C-Forge · 🔗 se usa hoy vía `cforge bindgen`,
 | 75 | `gpu` | Vulkan, Metal y DirectX | bgfx, wgpu | 🛠 |
 | 76 | `pizarra` | Objetos interactivos en lienzo | Fabric.js | 🛠 |
 | 77 | `animacion` | Animaciones vectoriales | Lottie | 🛠 |
-| 78 | `estilos` | Utilidades de estilo y temas | Tailwind | 🛠 |
+| 78 | `estilos` / `tailwind` | Utilidades de estilo y temas | Tailwind | ✅ `estilos` |
 | 79 | `retoque` | Procesamiento de imágenes | ImageSharp | ✅ `imagen` (básico) |
 | 80 | `trazo` | Vectores en GPU | Vello | 🛠 |
 | 81 | `mini_gui` | GUI embebible mínima | Nuklear | 🛠 |
@@ -161,7 +161,7 @@ Estado: ✅ ya existe en C-Forge · 🔗 se usa hoy vía `cforge bindgen`,
 | 115 | `atributo` | Interactividad por atributos HTML | htmx | 🛠 |
 | 116 | `css` | Parser y minificador CSS | LightningCSS | ✅ `css` |
 | 117 | `empaca` | Empaquetador web | esbuild | 🛠 |
-| 118 | `ensayo` | Mocks y snapshots | Vitest | ✅ `cforge test --coverage` · 🛠 mocks |
+| 118 | `ensayo` / `vitest` | Mocks y snapshots | Vitest | ✅ `ensayo` |
 | 119 | `ficticio` / `faker` | Datos falsos realistas | Faker | ✅ `ficticio` |
 | 120 | `contrato` / `openapi` | Documentación OpenAPI | Swagger | ✅ `contrato` |
 | 121 | `subida` / `multipart` | Subida de archivos multipart | busboy | ✅ `subida` |
@@ -169,7 +169,7 @@ Estado: ✅ ya existe en C-Forge · 🔗 se usa hoy vía `cforge bindgen`,
 | 123 | `acceso` | Autenticación modular | Passport, Lucia | ✅ `auth` (básico) |
 | 124 | `cola` / `queue` | Trabajos en segundo plano | BullMQ | ✅ `cola` |
 | 125 | `idiomas` / `i18n` | Internacionalización | i18next | ✅ `idiomas` |
-| 126 | `extremo` | APIs con tipos compartidos | tRPC | 🛠 |
+| 126 | `extremo` / `trpc` | APIs con tipos compartidos | tRPC | ✅ `extremo` |
 
 ### F. Audio, juegos y hardware
 
@@ -193,9 +193,9 @@ Estado: ✅ ya existe en C-Forge · 🔗 se usa hoy vía `cforge bindgen`,
 | 137 | `terminal` | Apps de interfaz en terminal | Ratatui | 🛠 |
 | 138 | `progreso` / `progress` | Barras de progreso | Indicatif | ✅ `progreso` |
 | 139 | `pregunta` / `prompt` | Prompts interactivos | Dialoguer | ✅ `pregunta` |
-| 140 | `vigia` | Vigilar cambios en archivos | Notify | 🛠 |
+| 140 | `vigia` / `notify` | Vigilar cambios en archivos | Notify | ✅ `vigia` |
 | 141 | `rastreo` / `glob` | Búsqueda recursiva con comodines | Walkdir, Glob | ✅ `rastreo` |
-| 142 | `sistema` | CPU, RAM y procesos | sysinfo | 🛠 |
+| 142 | `sistema` / `sysinfo` | CPU, RAM y procesos | sysinfo | ✅ `sistema` |
 | 143 | `historia` | Repositorios Git nativos | libgit2 | 🔗 |
 | 144 | `contenedor` | Controlar Docker | Bollard | 🛠 |
 | 145 | `version` | Versionado semántico | semver | ✅ gestor de paquetes |
@@ -331,7 +331,7 @@ Estado: ✅ ya existe en C-Forge · 🔗 se usa hoy vía `cforge bindgen`,
 | 243 | `buscador` / `fulltext` | Búsqueda full-text | Tantivy | ✅ `buscador` |
 | 244 | `consulta_archivos` / `sqlfiles` | SQL sobre CSV, JSON y Parquet | DataFusion | ✅ `consulta_archivos` |
 | 245 | `socket_web` | WebSocket RFC 6455 | Tungstenite | ✅ `red` |
-| 246 | `correo` | Enviar correos con DKIM | Lettre | 🛠 |
+| 246 | `correo` / `mailer` | Enviar correos con DKIM | Lettre | ✅ `correo` |
 | 247 | `bandeja` / `mailbox` | Leer correo IMAP/POP3 | IMAP | ✅ `bandeja` |
 | 248 | `vecinos` | Descubrimiento mDNS | Zeroconf | 🛠 |
 | 249 | `puertos` | Abrir puertos en el router | UPnP | 🛠 |

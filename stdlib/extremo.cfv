@@ -1,0 +1,410 @@
+// stdlib/extremo.cfv — APIs con tipos compartidos al estilo tRPC:
+// defines procedimientos (consultas y mutaciones) con moldes de entrada y
+// salida, los agrupas en enrutadores anidados ("usuario.obtener"), agregas
+// middlewares con contexto (autenticación, registro) y sirves por HTTP con
+// el mismo protocolo que tRPC v11 (GET/POST, lotes ?batch=1, errores con
+// códigos JSON-RPC), así que el cliente oficial @trpc/client funciona tal
+// cual. Trae un cliente propio y genera los tipos de TypeScript del
+// enrutador. Inspirada en tRPC (MIT). En inglés: importar "trpc".
+//
+//   importar "extremo"
+//   sea app = extremo_enrutador({
+//       "saludar": extremo_consulta(molde_registro({"nombre": "texto"}), funcion(e, ctx) {
+//           retornar "Hola " + e["nombre"]
+//       }),
+//       "usuarios": extremo_enrutador({"crear": extremo_mutacion(Nuevo, crear_usuario)})
+//   })
+//   extremo_servir(app, 3000, {"prefijo": "/trpc"})
+
+importar "molde"
+importar "json"
+
+sea _EX_CODIGOS = {
+    "PARSE_ERROR": [-32700, 400], "BAD_REQUEST": [-32600, 400], "INTERNAL_SERVER_ERROR": [-32603, 500], "NOT_IMPLEMENTED": [-32603, 501],
+    "BAD_GATEWAY": [-32603, 502], "SERVICE_UNAVAILABLE": [-32603, 503], "GATEWAY_TIMEOUT": [-32603, 504],
+    "UNAUTHORIZED": [-32001, 401], "PAYMENT_REQUIRED": [-32002, 402], "FORBIDDEN": [-32003, 403], "NOT_FOUND": [-32004, 404], "METHOD_NOT_SUPPORTED": [-32005, 405],
+    "TIMEOUT": [-32008, 408], "CONFLICT": [-32009, 409], "PRECONDITION_FAILED": [-32012, 412], "PAYLOAD_TOO_LARGE": [-32013, 413],
+    "UNSUPPORTED_MEDIA_TYPE": [-32015, 415], "UNPROCESSABLE_CONTENT": [-32022, 422], "PRECONDITION_REQUIRED": [-32028, 428], "TOO_MANY_REQUESTS": [-32029, 429], "CLIENT_CLOSED_REQUEST": [-32099, 499]
+}
+
+// ── Definición ────────────────────────────────────────────────────────────
+
+funcion _ex_proc(tipo_, entrada, f, opciones) {
+    sea o = opciones ?? {}
+    sea e = nulo
+    si (entrada != nulo) { e = _md_norm(entrada) }
+    sea s = nulo
+    si ((o["salida"] ?? nulo) != nulo) { s = _md_norm(o["salida"]) }
+    retornar {"$procedimiento": verdadero, "tipo": tipo_, "entrada": e, "salida": s, "f": f, "middlewares": o["middlewares"] ?? [], "meta": o["meta"] ?? nulo}
+}
+
+/// Consulta (GET): f(entrada, ctx) → valor. opciones: salida (molde),
+/// middlewares ([m]), meta.
+funcion extremo_consulta(entrada, f, opciones) { retornar _ex_proc("query", entrada, f, opciones) }
+
+/// Mutación (POST).
+funcion extremo_mutacion(entrada, f, opciones) { retornar _ex_proc("mutation", entrada, f, opciones) }
+
+/// Enrutador: {nombre: procedimiento o enrutador}. middlewares se aplican a
+/// todo lo de adentro.
+funcion extremo_enrutador(procs, middlewares) {
+    sea planos = {}
+    para k en claves(procs) {
+        sea v = procs[k]
+        si (tipo(v) == "mapa" y tiene_clave(v, "$enrutador")) {
+            para k2 en claves(v["planos"]) {
+                sea p = v["planos"][k2]
+                planos[k + "." + k2] = p
+            }
+        } sino {
+            si (tipo(v) != "mapa" o tiene_clave(v, "$procedimiento") == falso) { lanzar "extremo: '" + k + "' no es un procedimiento ni un enrutador" }
+            planos[k] = v
+        }
+    }
+    si (middlewares != nulo) {
+        para k en claves(planos) {
+            sea p = planos[k]
+            sea copia = {}
+            para c en claves(p) { copia[c] = p[c] }
+            sea ms = []
+            para m en middlewares { ms.agregar(m) }
+            para m en p["middlewares"] { ms.agregar(m) }
+            copia["middlewares"] = ms
+            planos[k] = copia
+        }
+    }
+    retornar {"$enrutador": verdadero, "planos": planos}
+}
+
+/// Middleware: f(ctx, siguiente) donde siguiente(ctx_nuevo) sigue la cadena
+/// (devuelve el resultado). Puede lanzar extremo_error.
+funcion extremo_middleware(f) { retornar f }
+
+/// Error con código tRPC ("BAD_REQUEST", "UNAUTHORIZED", "NOT_FOUND"…).
+funcion extremo_error(codigo, mensaje, datos) {
+    si (tiene_clave(_EX_CODIGOS, codigo) == falso) { lanzar "extremo: código de error desconocido " + codigo }
+    retornar {"$extremo_error": verdadero, "codigo": codigo, "mensaje": mensaje ?? codigo, "datos": datos}
+}
+
+funcion _ex_es_error(e) { retornar tipo(e) == "mapa" y tiene_clave(e, "$extremo_error") }
+
+// ── Ejecución ─────────────────────────────────────────────────────────────
+
+funcion _ex_cadena(p, i, ctx, entrada) {
+    si (i >= longitud(p["middlewares"])) { retornar p["f"](entrada, ctx) }
+    sea m = p["middlewares"][i]
+    retornar m(ctx, funcion(ctx2) {
+        sea c = ctx2
+        si (c == nulo) { c = ctx }
+        retornar _ex_cadena(p, i + 1, c, entrada)
+    })
+}
+
+/// Llama un procedimiento directamente (sin HTTP). Lanza extremo_error.
+funcion extremo_llamar(enrutador, ruta, entrada, ctx) {
+    sea p = enrutador["planos"][ruta] ?? nulo
+    si (p == nulo) { lanzar extremo_error("NOT_FOUND", "No procedure found on path \"" + ruta + "\"") }
+    retornar _ex_ejecutar(p, ruta, entrada, ctx)
+}
+
+funcion _ex_ejecutar(p, ruta, entrada, ctx) {
+    sea e = entrada
+    si (p["entrada"] != nulo) {
+        sea ok = verdadero
+        sea msg = ""
+        intentar { e = molde_desde_dato(p["entrada"], entrada) } capturar (err) {
+            ok = falso
+            msg = "" + err
+        }
+        si (ok == falso) { lanzar extremo_error("BAD_REQUEST", msg) }
+    }
+    sea r = _ex_cadena(p, 0, ctx ?? {}, e)
+    si (p["salida"] != nulo) {
+        sea ok2 = verdadero
+        intentar { r = molde_a_dato(p["salida"], r) } capturar (err) { ok2 = falso }
+        si (ok2 == falso) { lanzar extremo_error("INTERNAL_SERVER_ERROR", "Output validation failed") }
+    }
+    retornar r
+}
+
+funcion _ex_forma_error(e, ruta) {
+    sea codigo = "INTERNAL_SERVER_ERROR"
+    sea mensaje = "" + e
+    si (_ex_es_error(e)) {
+        codigo = e["codigo"]
+        mensaje = e["mensaje"]
+    }
+    sea c = _EX_CODIGOS[codigo]
+    sea datos = {"code": codigo, "httpStatus": c[1]}
+    si (ruta != nulo) { datos["path"] = ruta }
+    retornar {"error": {"message": mensaje, "code": c[0], "data": datos}}
+}
+
+funcion _ex_url_dec(s) {
+    sea r = ""
+    sea i = 0
+    mientras (i < longitud(s)) {
+        sea c = subcadena(s, i, i + 1)
+        si (c == "%" y i + 2 < longitud(s) + 1) {
+            r = r + bytes_de_hex(subcadena(s, i + 1, i + 3))
+            i = i + 3
+        } sino {
+            si (c == "+") { r = r + " " } sino { r = r + c }
+            i = i + 1
+        }
+    }
+    retornar r
+}
+
+funcion _ex_consulta(q) {
+    sea r = {}
+    si (q == nulo o q == "") { retornar r }
+    para par en texto_dividir(q, "&") {
+        sea e = texto_indice(par, "=")
+        si (e < 0) { r[_ex_url_dec(par)] = "" } sino { r[_ex_url_dec(subcadena(par, 0, e))] = _ex_url_dec(subcadena(par, e + 1, longitud(par))) }
+    }
+    retornar r
+}
+
+funcion _ex_resp(estado, cuerpo) {
+    retornar {"estado": estado, "tipo": "application/json", "cabeceras": {"Content-Type": "application/json"}, "cuerpo": json_texto(cuerpo)}
+}
+
+/// Atiende una solicitud HTTP: {"metodo", "ruta" (con ?consulta), "cuerpo",
+/// "cabeceras"}. opciones: prefijo ("/trpc"), contexto (f(solicitud) → ctx).
+/// Devuelve {"estado", "tipo", "cabeceras", "cuerpo"}.
+funcion extremo_manejar(enrutador, solicitud, opciones) {
+    sea o = opciones ?? {}
+    sea metodo = texto_mayusculas(solicitud["metodo"] ?? "GET")
+    sea ruta = "" + (solicitud["ruta"] ?? "/")
+    sea q = ""
+    sea qi = texto_indice(ruta, "?")
+    si (qi >= 0) {
+        q = subcadena(ruta, qi + 1, longitud(ruta))
+        ruta = subcadena(ruta, 0, qi)
+    }
+    sea consulta = _ex_consulta(q)
+    sea prefijo = o["prefijo"] ?? "/trpc"
+    si (texto_empieza_con(ruta, prefijo)) { ruta = subcadena(ruta, longitud(prefijo), longitud(ruta)) }
+    si (texto_empieza_con(ruta, "/")) { ruta = subcadena(ruta, 1, longitud(ruta)) }
+    ruta = _ex_url_dec(ruta)
+    sea lote = (consulta["batch"] ?? "") == "1" o (consulta["batch"] ?? "") == "true"
+    sea rutas = [ruta]
+    si (lote) { rutas = texto_dividir(ruta, ",") }
+    // Entradas.
+    sea crudo = nulo
+    sea error_parse = nulo
+    intentar {
+        si (metodo == "GET") {
+            si (tiene_clave(consulta, "input")) { crudo = json_parsear(consulta["input"]) }
+        } sino {
+            sea cuerpo = solicitud["cuerpo"] ?? ""
+            si (cuerpo != "") { crudo = json_parsear(cuerpo) }
+        }
+    } capturar (e) { error_parse = e }
+    sea ctx = {}
+    si ((o["contexto"] ?? nulo) != nulo) { ctx = o["contexto"](solicitud) }
+    sea respuestas = []
+    sea estados = []
+    sea i = 0
+    mientras (i < longitud(rutas)) {
+        sea r = rutas[i]
+        sea entrada = crudo
+        si (lote) {
+            entrada = nulo
+            si (tipo(crudo) == "mapa") { entrada = crudo["" + i] ?? nulo }
+        }
+        sea res = nulo
+        intentar {
+            si (error_parse != nulo) { lanzar extremo_error("PARSE_ERROR", "Unable to parse input") }
+            sea p = enrutador["planos"][r] ?? nulo
+            si (p == nulo) { lanzar extremo_error("NOT_FOUND", "No procedure found on path \"" + r + "\"") }
+            si (p["tipo"] == "query" y metodo != "GET") { lanzar extremo_error("METHOD_NOT_SUPPORTED", "Unsupported POST-request to query procedure at path \"" + r + "\"") }
+            si (p["tipo"] == "mutation" y metodo != "POST") { lanzar extremo_error("METHOD_NOT_SUPPORTED", "Unsupported GET-request to mutation procedure at path \"" + r + "\"") }
+            sea dato = _ex_ejecutar(p, r, entrada, ctx)
+            res = {"result": {"data": dato}}
+            estados.agregar(200)
+        } capturar (e) {
+            res = _ex_forma_error(e, r)
+            estados.agregar(res["error"]["data"]["httpStatus"])
+        }
+        respuestas.agregar(res)
+        i = i + 1
+    }
+    si (lote) {
+        // Todos iguales: ese estado; mezclados: 207 (como tRPC).
+        sea est = estados[0]
+        para s en estados { si (s != est) { est = 207 } }
+        retornar _ex_resp(est, respuestas)
+    }
+    retornar _ex_resp(estados[0], respuestas[0])
+}
+
+/// Servidor HTTP (bloquea). opciones como en extremo_manejar, más cors.
+funcion extremo_servir(enrutador, puerto, opciones) {
+    sea o = opciones ?? {}
+    sea srv = servidor_http_escuchar(puerto)
+    mientras (verdadero) {
+        sea s = servidor_http_solicitud(srv)
+        si (s != nulo) {
+            sea ruta = "" + s["ruta"]
+            sea q = s["query"] ?? nulo
+            si (tipo(q) == "texto" y q != "" y texto_indice(ruta, "?") < 0) { ruta = ruta + "?" + q }
+            si (tipo(q) == "mapa" y longitud(claves(q)) > 0 y texto_indice(ruta, "?") < 0) {
+                sea partes = []
+                para k en claves(q) { partes.agregar(_ex_url_cod(k) + "=" + _ex_url_cod("" + q[k])) }
+                ruta = ruta + "?" + unir(partes, "&")
+            }
+            sea sol = {"metodo": s["metodo"], "ruta": ruta, "cuerpo": s["cuerpo"] ?? "", "cabeceras": s["cabeceras"] ?? {}}
+            sea r = nulo
+            intentar { r = extremo_manejar(enrutador, sol, o) } capturar (e) { r = _ex_resp(500, _ex_forma_error(e, nulo)) }
+            servidor_http_responder(s["_srv_id"], r["estado"], r["cuerpo"], r["tipo"])
+        }
+    }
+}
+
+// ── Cliente ───────────────────────────────────────────────────────────────
+
+/// Cliente para un servidor tRPC (de C-Forge o de Node). opciones:
+/// cabeceras.
+funcion extremo_cliente(url, opciones) {
+    sea u = url
+    si (texto_termina_con(u, "/")) { u = subcadena(u, 0, longitud(u) - 1) }
+    retornar {"url": u, "o": opciones ?? {}}
+}
+
+funcion _ex_url_cod(s) {
+    sea r = ""
+    sea i = 0
+    mientras (i < longitud(s)) {
+        sea b = byte_en(s, i)
+        si ((b >= 48 y b <= 57) o (b >= 65 y b <= 90) o (b >= 97 y b <= 122) o b == 45 o b == 95 o b == 46 o b == 126) { r = r + subcadena(s, i, i + 1) } sino { r = r + "%" + texto_mayusculas(hex_de_bytes(subcadena(s, i, i + 1))) }
+        i = i + 1
+    }
+    retornar r
+}
+
+funcion _ex_respuesta_cliente(r) {
+    sea d = json_parsear(r["cuerpo"])
+    si (tiene_clave(d, "error")) {
+        sea c = d["error"]["data"]["code"] ?? "INTERNAL_SERVER_ERROR"
+        si (tiene_clave(_EX_CODIGOS, c) == falso) { c = "INTERNAL_SERVER_ERROR" }
+        lanzar extremo_error(c, d["error"]["message"], d["error"]["data"])
+    }
+    retornar d["result"]["data"]
+}
+
+funcion extremo_consultar(cliente, ruta, entrada) {
+    sea url = cliente["url"] + "/" + ruta
+    si (entrada != nulo) { url = url + "?input=" + _ex_url_cod(json_texto(entrada)) }
+    retornar _ex_respuesta_cliente(http_solicitud("GET", url, {"cabeceras": cliente["o"]["cabeceras"] ?? {}}))
+}
+
+funcion extremo_mutar(cliente, ruta, entrada) {
+    sea cab = {"Content-Type": "application/json"}
+    para k en claves(cliente["o"]["cabeceras"] ?? {}) { cab[k] = cliente["o"]["cabeceras"][k] }
+    retornar _ex_respuesta_cliente(http_solicitud("POST", cliente["url"] + "/" + ruta, {"cabeceras": cab, "cuerpo": json_texto(entrada)}))
+}
+
+/// Mensaje de un error recibido (de extremo_error o de otro tipo).
+funcion extremo_mensaje(e) {
+    si (_ex_es_error(e)) { retornar e["codigo"] + ": " + e["mensaje"] }
+    retornar "" + e
+}
+
+// ── Tipos de TypeScript ───────────────────────────────────────────────────
+
+funcion _ex_ts(m) {
+    si (m == nulo) { retornar "void" }
+    sea t = m["molde"]
+    sea base = "unknown"
+    si (t == "texto" o t == "fecha") { base = "string" }
+    si (t == "entero" o t == "numero") { base = "number" }
+    si (t == "booleano") { base = "boolean" }
+    si (t == "cualquiera") { base = "unknown" }
+    si (t == "lista") { base = _ex_ts_grupo(_ex_ts(m["elemento"])) + "[]" }
+    si (t == "mapa") { base = "Record<string, " + _ex_ts(m["valor"]) + ">" }
+    si (t == "enum") {
+        sea vs = []
+        para v en m["valores"] { vs.agregar(json_texto(v)) }
+        base = unir(vs, " | ")
+    }
+    si (t == "union") {
+        sea vs = []
+        para k en claves(m["variantes"]) {
+            sea interno = _ex_ts(m["variantes"][k])
+            sea etq = "{ " + m["etiqueta"] + ": " + json_texto(k) + " }"
+            si (texto_empieza_con(interno, caracter(123))) { vs.agregar(etq + " & " + interno) } sino { vs.agregar(etq) }
+        }
+        base = unir(vs, " | ")
+    }
+    si (t == "registro") {
+        sea ps = []
+        para c en m["campos"] {
+            sea nombre = c["opc"]["nombre"] ?? c["nombre"]
+            si (m["renombrar"] != nulo y (c["opc"]["nombre"] ?? nulo) == nulo) { nombre = molde_renombrar(c["nombre"], m["renombrar"]) }
+            sea opc = ""
+            si (c["molde"]["opcional"] ?? falso) { opc = "?" }
+            ps.agregar(_ex_ts_clave(nombre) + opc + ": " + _ex_ts(c["molde"]))
+        }
+        base = caracter(123) + " " + unir(ps, "; ") + " " + caracter(125)
+        si (longitud(ps) == 0) { base = "Record<string, never>" }
+    }
+    si (t == "propio") { base = "unknown" }
+    si ((m["opcional"] ?? falso) y (m["tiene_defecto"] ?? falso) == falso) { base = base + " | null" }
+    retornar base
+}
+
+funcion _ex_ts_grupo(t) {
+    si (texto_indice(t, " | ") >= 0) { retornar "(" + t + ")" }
+    retornar t
+}
+
+funcion _ex_ts_clave(k) {
+    sea ok = longitud(k) > 0
+    sea i = 0
+    mientras (i < longitud(k)) {
+        sea b = byte_en(k, i)
+        si ((b >= 65 y b <= 90) o (b >= 97 y b <= 122) o b == 95 o b == 36 o (i > 0 y b >= 48 y b <= 57)) { } sino { ok = falso }
+        i = i + 1
+    }
+    si (ok) { retornar k }
+    retornar json_texto(k)
+}
+
+/// Declaraciones de TypeScript del enrutador, para compartir los tipos con
+/// el frontend: `export type <nombre> = { … }` con input, output y type de
+/// cada procedimiento, anidados igual que las rutas.
+funcion extremo_tipos_ts(enrutador, nombre) {
+    sea arbol = {}
+    para ruta en claves(enrutador["planos"]) {
+        sea partes = texto_dividir(ruta, ".")
+        sea nodo = arbol
+        sea i = 0
+        mientras (i < longitud(partes) - 1) {
+            si (tiene_clave(nodo, partes[i]) == falso) { nodo[partes[i]] = {} }
+            nodo = nodo[partes[i]]
+            i = i + 1
+        }
+        nodo[partes[longitud(partes) - 1]] = {"$proc": enrutador["planos"][ruta]}
+    }
+    retornar "export type " + (nombre ?? "AppRouter") + " = " + _ex_ts_arbol(arbol, "") + ";\n"
+}
+
+funcion _ex_ts_arbol(n, sangria) {
+    sea l = [caracter(123)]
+    para k en claves(n) {
+        sea v = n[k]
+        si (tiene_clave(v, "$proc")) {
+            sea p = v["$proc"]
+            l.agregar(sangria + "  " + _ex_ts_clave(k) + ": " + caracter(123) + " type: \"" + p["tipo"] + "\"; input: " + _ex_ts(p["entrada"]) + "; output: " + _ex_ts_salida(p["salida"]) + " " + caracter(125) + ";")
+        } sino { l.agregar(sangria + "  " + _ex_ts_clave(k) + ": " + _ex_ts_arbol(v, sangria + "  ") + ";") }
+    }
+    l.agregar(sangria + caracter(125))
+    retornar unir(l, "\n")
+}
+
+funcion _ex_ts_salida(m) {
+    si (m == nulo) { retornar "unknown" }
+    retornar _ex_ts(m)
+}

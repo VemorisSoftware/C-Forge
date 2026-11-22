@@ -1,0 +1,736 @@
+// stdlib/correo.cfv — enviar correo: armado del mensaje (con fecha e id),
+// firma DKIM (rsa-sha256 y ed25519-sha256, canonicalización simple o
+// relaxed, RFC 6376 y 8463) y verificación con la clave pública, cliente
+// SMTP con AUTH PLAIN/LOGIN, varios destinatarios, punto inicial escapado
+// y TLS implícito (puerto 465) o sin TLS (relés locales). Inspirada en
+// Lettre (MIT). En inglés: importar "mailer".
+//
+//   importar "correo"
+//   sea m = correo_mensaje({"de": "ventas@vemoris.cl", "para": ["ana@x.cl"],
+//                           "asunto": "Hola", "texto": "¿Cómo estás?"})
+//   m = correo_dkim_firmar(m, {"dominio": "vemoris.cl", "selector": "s1", "clave": pem})
+//   correo_enviar({"servidor": "smtp.vemoris.cl", "puerto": 465, "usuario": "…",
+//                  "clave": "…"}, m)
+
+importar "bandeja"
+importar "base64"
+importar "tls"
+
+// ══ Enteros grandes (base 2^24, sin signo) ═════════════════════════════════
+// Sólo lo que hace falta para RSA: multiplicar, reducir y elevar con
+// Montgomery.
+
+sea _CO_B = 16777216
+
+funcion _co_bn_de_bytes(b) {
+    sea r = []
+    sea i = longitud(b)
+    mientras (i > 0) {
+        sea v = 0
+        sea k = maximo(0, i - 3)
+        sea j = k
+        mientras (j < i) { v = v * 256 + byte_en(b, j)  j = j + 1 }
+        r.agregar(v)
+        i = k
+    }
+    mientras (longitud(r) > 1 y r[longitud(r) - 1] == 0) { quitar_ultimo(r) }
+    retornar r
+}
+
+funcion _co_bn_a_bytes(x, n) {
+    sea s = ""
+    sea i = longitud(x) - 1
+    mientras (i >= 0) { s = s + bytes_entero(x[i], 3, 0)  i = i - 1 }
+    mientras (longitud(s) > n y byte_en(s, 0) == 0) { s = subcadena(s, 1, longitud(s)) }
+    mientras (longitud(s) < n) { s = caracter(0) + s }
+    retornar s
+}
+
+funcion _co_bn_cmp(a, b) {
+    sea la = longitud(a)
+    sea lb = longitud(b)
+    mientras (la > 1 y a[la - 1] == 0) { la = la - 1 }
+    mientras (lb > 1 y b[lb - 1] == 0) { lb = lb - 1 }
+    si (la != lb) { retornar la - lb }
+    sea i = la - 1
+    mientras (i >= 0) {
+        si (a[i] != b[i]) { retornar a[i] - b[i] }
+        i = i - 1
+    }
+    retornar 0
+}
+
+funcion _co_bn_restar(a, b) {
+    sea r = []
+    sea prestamo = 0
+    sea i = 0
+    mientras (i < longitud(a)) {
+        sea v = a[i] - prestamo
+        si (i < longitud(b)) { v = v - b[i] }
+        si (v < 0) { v = v + _CO_B  prestamo = 1 } sino { prestamo = 0 }
+        r.agregar(v)
+        i = i + 1
+    }
+    retornar r
+}
+
+// Inverso de -n0 módulo 2^24 (para Montgomery).
+funcion _co_ninv(n0) {
+    sea x = 1
+    sea i = 0
+    mientras (i < 5) {
+        x = (x * (2 - (n0 * x) % _CO_B)) % _CO_B
+        si (x < 0) { x = x + _CO_B }
+        i = i + 1
+    }
+    retornar (_CO_B - x) % _CO_B
+}
+
+// Producto de Montgomery: a·b·R⁻¹ mod n (a, b < n, k limbs).
+funcion _co_mont(a, b, n, k, ninv) {
+    sea t = []
+    sea i = 0
+    mientras (i < k + 2) { t.agregar(0)  i = i + 1 }
+    i = 0
+    mientras (i < k) {
+        sea ai = a[i]
+        // t += ai · b
+        sea acarreo = 0
+        sea j = 0
+        mientras (j < k) {
+            sea v = t[j] + ai * b[j] + acarreo
+            t[j] = v % _CO_B
+            acarreo = cociente(v, _CO_B)
+            j = j + 1
+        }
+        sea v2 = t[k] + acarreo
+        t[k] = v2 % _CO_B
+        t[k + 1] = t[k + 1] + cociente(v2, _CO_B)
+        // m = t0 · ninv mod B ; t = (t + m·n) / B
+        sea m = (t[0] * ninv) % _CO_B
+        acarreo = cociente(t[0] + m * n[0], _CO_B)
+        j = 1
+        mientras (j < k) {
+            sea w = t[j] + m * n[j] + acarreo
+            t[j - 1] = w % _CO_B
+            acarreo = cociente(w, _CO_B)
+            j = j + 1
+        }
+        sea w2 = t[k] + acarreo
+        t[k - 1] = w2 % _CO_B
+        t[k] = t[k + 1] + cociente(w2, _CO_B)
+        t[k + 1] = 0
+        i = i + 1
+    }
+    sea r = []
+    i = 0
+    mientras (i < k) { r.agregar(t[i])  i = i + 1 }
+    si (t[k] > 0 o _co_bn_cmp(r, n) >= 0) {
+        r.agregar(t[k])
+        sea nn = []
+        para x en n { nn.agregar(x) }
+        nn.agregar(0)
+        r = _co_bn_restar(r, nn)
+        quitar_ultimo(r)
+    }
+    retornar r
+}
+
+// x mod n con divisiones cortas por la potencia (lento pero sólo se usa
+// para preparar R² mod n una vez).
+funcion _co_bn_mod_r2(n, k) {
+    // R² mod n calculado duplicando 1 (2·k·24 veces) con resta condicional.
+    sea x = [1]
+    mientras (longitud(x) < k + 1) { x.agregar(0) }
+    sea nn = []
+    para v en n { nn.agregar(v) }
+    nn.agregar(0)
+    sea i = 0
+    mientras (i < 2 * k * 24) {
+        // x = 2x
+        sea acarreo = 0
+        sea j = 0
+        mientras (j < k + 1) {
+            sea v = x[j] * 2 + acarreo
+            x[j] = v % _CO_B
+            acarreo = cociente(v, _CO_B)
+            j = j + 1
+        }
+        si (_co_bn_cmp(x, nn) >= 0) { x = _co_bn_restar(x, nn) }
+        i = i + 1
+    }
+    quitar_ultimo(x)
+    retornar x
+}
+
+/// base^exp mod n con textos de bytes (big-endian). Devuelve bytes del
+/// largo del módulo.
+funcion correo_rsa_potencia(base, exp, modulo) {
+    sea n = _co_bn_de_bytes(modulo)
+    sea k = longitud(n)
+    si (n[0] % 2 == 0) { lanzar "correo: el módulo RSA debe ser impar" }
+    sea ninv = _co_ninv(n[0])
+    sea r2 = _co_bn_mod_r2(n, k)
+    sea b = _co_bn_de_bytes(base)
+    mientras (longitud(b) < k) { b.agregar(0) }
+    si (_co_bn_cmp(b, n) >= 0) { lanzar "correo: la base RSA es mayor que el módulo" }
+    sea uno = [1]
+    mientras (longitud(uno) < k) { uno.agregar(0) }
+    sea bm = _co_mont(b, r2, n, k, ninv)
+    sea x = _co_mont(uno, r2, n, k, ninv)
+    // Ventana de 4 bits.
+    sea tabla = [x, bm]
+    sea t = 2
+    mientras (t < 16) { tabla.agregar(_co_mont(tabla[t - 1], bm, n, k, ninv))  t = t + 1 }
+    sea i = 0
+    mientras (i < longitud(exp)) {
+        sea byte = byte_en(exp, i)
+        para nib en [cociente(byte, 16), byte % 16] {
+            sea s = 0
+            mientras (s < 4) { x = _co_mont(x, x, n, k, ninv)  s = s + 1 }
+            si (nib > 0) { x = _co_mont(x, tabla[nib], n, k, ninv) }
+        }
+        i = i + 1
+    }
+    x = _co_mont(x, uno, n, k, ninv)
+    retornar _co_bn_a_bytes(x, longitud(modulo) - _co_ceros(modulo))
+}
+
+funcion _co_ceros(b) {
+    sea i = 0
+    mientras (i < longitud(b) y byte_en(b, i) == 0) { i = i + 1 }
+    retornar i
+}
+
+// ══ Claves (PEM / DER) ═════════════════════════════════════════════════════
+
+funcion _co_der(b, i) {
+    // [etiqueta, inicio del contenido, largo]
+    sea tag = byte_en(b, i)
+    sea l = byte_en(b, i + 1)
+    sea p = i + 2
+    si (l >= 128) {
+        sea nb = l - 128
+        l = 0
+        sea k = 0
+        mientras (k < nb) { l = l * 256 + byte_en(b, p + k)  k = k + 1 }
+        p = p + nb
+    }
+    retornar [tag, p, l]
+}
+
+funcion _co_der_hijos(b, ini, largo) {
+    sea r = []
+    sea i = ini
+    mientras (i < ini + largo) {
+        sea e = _co_der(b, i)
+        r.agregar(e)
+        i = e[1] + e[2]
+    }
+    retornar r
+}
+
+funcion _co_entero(b, e) {
+    sea v = subcadena(b, e[1], e[1] + e[2])
+    mientras (longitud(v) > 1 y byte_en(v, 0) == 0) { v = subcadena(v, 1, longitud(v)) }
+    retornar v
+}
+
+funcion _co_pem(pem) {
+    sea lineas = []
+    sea dentro = falso
+    sea tipo_ = ""
+    para l en texto_dividir(texto_reemplazar("" + pem, "\r", ""), "\n") {
+        si (texto_empieza_con(l, "-----BEGIN ")) { dentro = verdadero  tipo_ = subcadena(l, 11, longitud(l) - 5) } sino {
+            si (texto_empieza_con(l, "-----END ")) { dentro = falso } sino { si (dentro) { lineas.agregar(texto_recortar(l)) } }
+        }
+    }
+    si (longitud(lineas) == 0) { retornar [nulo, base64_decodificar(texto_reemplazar(texto_reemplazar("" + pem, "\n", ""), " ", ""))] }
+    retornar [tipo_, base64_decodificar(unir(lineas, ""))]
+}
+
+sea _CO_OID_RSA = "2a864886f70d010101"
+sea _CO_OID_ED25519 = "2b6570"
+
+/// Lee una clave PEM: privada RSA (PKCS#1 o PKCS#8), privada Ed25519
+/// (PKCS#8), o pública (SubjectPublicKeyInfo o la del registro DNS de
+/// DKIM). Devuelve {"tipo": "rsa"|"ed25519", "n", "e", "d" | "privada", "publica"}.
+funcion correo_clave(pem) {
+    sea x = _co_pem(pem)
+    sea b = x[1]
+    sea raiz_ = _co_der(b, 0)
+    sea h = _co_der_hijos(b, raiz_[1], raiz_[2])
+    si (x[0] == "RSA PRIVATE KEY") { retornar {"tipo": "rsa", "n": _co_entero(b, h[1]), "e": _co_entero(b, h[2]), "d": _co_entero(b, h[3])} }
+    si (x[0] == "RSA PUBLIC KEY") { retornar {"tipo": "rsa", "n": _co_entero(b, h[0]), "e": _co_entero(b, h[1])} }
+    // PKCS#8: [versión, algoritmo, clave en OCTET STRING]
+    si (h[0][0] == 2 y longitud(h) >= 3 y h[1][0] == 48) {
+        sea alg = _co_der_hijos(b, h[1][1], h[1][2])
+        sea oid = hex_de_bytes(subcadena(b, alg[0][1], alg[0][1] + alg[0][2]))
+        sea dentro = subcadena(b, h[2][1], h[2][1] + h[2][2])
+        si (oid == _CO_OID_RSA) {
+            sea r2 = _co_der(dentro, 0)
+            sea hh = _co_der_hijos(dentro, r2[1], r2[2])
+            retornar {"tipo": "rsa", "n": _co_entero(dentro, hh[1]), "e": _co_entero(dentro, hh[2]), "d": _co_entero(dentro, hh[3])}
+        }
+        si (oid == _CO_OID_ED25519) {
+            sea o = _co_der(dentro, 0)
+            sea priv = subcadena(dentro, o[1], o[1] + o[2])
+            retornar {"tipo": "ed25519", "privada": priv, "publica": ed25519_publica(priv)}
+        }
+        lanzar "correo: algoritmo de clave no soportado"
+    }
+    // SubjectPublicKeyInfo: [algoritmo, BIT STRING]
+    si (h[0][0] == 48 y h[1][0] == 3) {
+        sea alg = _co_der_hijos(b, h[0][1], h[0][2])
+        sea oid = hex_de_bytes(subcadena(b, alg[0][1], alg[0][1] + alg[0][2]))
+        sea bits = subcadena(b, h[1][1] + 1, h[1][1] + h[1][2])
+        si (oid == _CO_OID_ED25519) { retornar {"tipo": "ed25519", "publica": bits} }
+        sea r3 = _co_der(bits, 0)
+        sea hh = _co_der_hijos(bits, r3[1], r3[2])
+        retornar {"tipo": "rsa", "n": _co_entero(bits, hh[0]), "e": _co_entero(bits, hh[1])}
+    }
+    lanzar "correo: no se reconoce la clave"
+}
+
+sea _CO_SHA256_INFO = "3031300d060960864801650304020105000420"
+
+funcion _co_rsa_firmar(k, resumen) {
+    sea n = longitud(k["n"])
+    sea t = bytes_de_hex(_CO_SHA256_INFO) + resumen
+    sea relleno = ""
+    sea i = 0
+    mientras (i < n - longitud(t) - 3) { relleno = relleno + bytes_entero(255, 1, 0)  i = i + 1 }
+    sea em = caracter(0) + bytes_entero(1, 1, 0) + relleno + caracter(0) + t
+    retornar correo_rsa_potencia(em, k["d"], k["n"])
+}
+
+funcion _co_rsa_verificar(k, resumen, firma) {
+    sea n = longitud(k["n"])
+    si (longitud(firma) != n) { retornar falso }
+    sea em = correo_rsa_potencia(firma, k["e"], k["n"])
+    sea t = bytes_de_hex(_CO_SHA256_INFO) + resumen
+    retornar texto_termina_con(em, caracter(0) + t) y texto_empieza_con(em, caracter(0) + bytes_entero(1, 1, 0))
+}
+
+// ══ Mensaje ════════════════════════════════════════════════════════════════
+
+funcion _co_fecha(ms) {
+    sea dias = ["Thu", "Fri", "Sat", "Sun", "Mon", "Tue", "Wed"]
+    sea meses = ["Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec"]
+    sea s = piso(ms / 1000)
+    sea d = piso(s / 86400)
+    sea rs = s - d * 86400
+    // Días desde 1970 → fecha civil (Howard Hinnant).
+    sea z = d + 719468
+    sea era = piso(z / 146097)
+    sea doe = z - era * 146097
+    sea yoe = piso((doe - piso(doe / 1460) + piso(doe / 36524) - piso(doe / 146096)) / 365)
+    sea anio = yoe + era * 400
+    sea doy = doe - (365 * yoe + piso(yoe / 4) - piso(yoe / 100))
+    sea mp = piso((5 * doy + 2) / 153)
+    sea dia = doy - piso((153 * mp + 2) / 5) + 1
+    sea mes = mp + 3
+    si (mes > 12) { mes = mes - 12 }
+    si (mes <= 2) { anio = anio + 1 }
+    retornar dias[d % 7] + ", " + _co_dos(dia) + " " + meses[mes - 1] + " " + anio + " " + _co_dos(piso(rs / 3600)) + ":" + _co_dos(piso((rs % 3600) / 60)) + ":" + _co_dos(rs % 60) + " +0000"
+}
+
+funcion _co_dos(n) {
+    si (n < 10) { retornar "0" + n }
+    retornar "" + n
+}
+
+/// Arma un mensaje listo para enviar. m: de, para, cc, cco (no va en las
+/// cabeceras, sólo en el sobre), asunto, texto, html, adjuntos, cabeceras,
+/// responder_a, fecha_ms, id. Devuelve {"datos": texto RFC 5322, "de",
+/// "destinatarios"}.
+funcion correo_mensaje(m) {
+    sea x = {}
+    para k en claves(m) { x[k] = m[k] }
+    sea ahora = m["fecha_ms"] ?? tiempo_ms()
+    si ((x["fecha"] ?? nulo) == nulo) { x["fecha"] = _co_fecha(ahora) }
+    sea dom = "localhost"
+    sea de = bandeja_direcciones(_co_dir_texto(m["de"]))
+    si (longitud(de) > 0 y texto_indice(de[0]["correo"], "@") > 0) { dom = subcadena(de[0]["correo"], texto_indice(de[0]["correo"], "@") + 1, longitud(de[0]["correo"])) }
+    si ((x["id"] ?? nulo) == nulo) { x["id"] = "<" + hex_de_bytes(bytes_aleatorios(12)) + "." + ahora + "@" + dom + ">" }
+    sea dest = []
+    para campo en ["para", "cc", "cco"] {
+        sea v = m[campo] ?? nulo
+        si (v != nulo) {
+            para d en bandeja_direcciones(_co_dir_texto(v)) { dest.agregar(d["correo"]) }
+        }
+    }
+    quitar_clave(x, "cco")
+    retornar {"datos": bandeja_armar(x), "de": de[0]["correo"] ?? "", "destinatarios": dest}
+}
+
+funcion _co_dir_texto(v) {
+    si (tipo(v) == "texto") { retornar v }
+    si (tipo(v) == "mapa") {
+        si ((v["nombre"] ?? "") != "") { retornar "\"" + v["nombre"] + "\" <" + v["correo"] + ">" }
+        retornar v["correo"]
+    }
+    sea r = []
+    para x en v { r.agregar(_co_dir_texto(x)) }
+    retornar unir(r, ", ")
+}
+
+// ══ DKIM ═══════════════════════════════════════════════════════════════════
+
+funcion _co_partir(datos) {
+    sea t = texto_reemplazar(texto_reemplazar("" + datos, "\r\n", "\n"), "\n", "\r\n")
+    sea p = texto_indice(t, "\r\n\r\n")
+    si (p < 0) { retornar [t + "\r\n", ""] }
+    retornar [subcadena(t, 0, p + 2), subcadena(t, p + 4, longitud(t))]
+}
+
+// Cabeceras como [[nombre, línea completa con plegados]].
+funcion _co_cabeceras(cab) {
+    sea r = []
+    para l en texto_dividir(cab, "\r\n") {
+        si (l != "") {
+            si ((texto_empieza_con(l, " ") o texto_empieza_con(l, "\t")) y longitud(r) > 0) { r[longitud(r) - 1][1] = r[longitud(r) - 1][1] + "\r\n" + l } sino {
+                sea dp = texto_indice(l, ":")
+                r.agregar([subcadena(l, 0, maximo(0, dp)), l])
+            }
+        }
+    }
+    retornar r
+}
+
+funcion _co_espacios(t) {
+    // Une espacios y tabuladores seguidos en uno.
+    sea r = ""
+    sea prev = falso
+    sea i = 0
+    mientras (i < longitud(t)) {
+        sea c = subcadena(t, i, i + 1)
+        si (c == " " o c == "\t") {
+            si (prev == falso) { r = r + " " }
+            prev = verdadero
+        } sino { r = r + c  prev = falso }
+        i = i + 1
+    }
+    retornar r
+}
+
+funcion _co_canon_cab(linea, modo) {
+    si (modo == "simple") { retornar linea + "\r\n" }
+    sea dp = texto_indice(linea, ":")
+    sea nombre = texto_minusculas(texto_recortar(subcadena(linea, 0, dp)))
+    sea valor = texto_reemplazar(subcadena(linea, dp + 1, longitud(linea)), "\r\n", "")
+    valor = texto_recortar(_co_espacios(valor))
+    retornar nombre + ":" + valor + "\r\n"
+}
+
+funcion _co_canon_cuerpo(cuerpo, modo) {
+    sea lineas = texto_dividir(cuerpo, "\r\n")
+    si (modo == "relaxed") {
+        sea r = []
+        para l en lineas {
+            sea x = _co_espacios(l)
+            mientras (texto_termina_con(x, " ")) { x = subcadena(x, 0, longitud(x) - 1) }
+            r.agregar(x)
+        }
+        lineas = r
+    }
+    mientras (longitud(lineas) > 0 y lineas[longitud(lineas) - 1] == "") { quitar_ultimo(lineas) }
+    si (longitud(lineas) == 0) {
+        si (modo == "relaxed") { retornar "" }
+        retornar "\r\n"
+    }
+    retornar unir(lineas, "\r\n") + "\r\n"
+}
+
+funcion _co_plegar_b64(t) {
+    retornar t
+}
+
+/// Firma DKIM. opciones: dominio, selector, clave (PEM RSA o Ed25519),
+/// cabeceras (["from", "to", "subject", "date", "message-id", …]),
+/// canonicalizacion ("relaxed/relaxed"), tiempo_ms. Acepta el mensaje de
+/// correo_mensaje o el texto crudo; devuelve lo mismo con la cabecera
+/// DKIM-Signature al principio.
+funcion correo_dkim_firmar(mensaje, opciones) {
+    sea o = opciones ?? {}
+    sea datos = mensaje
+    si (tipo(mensaje) == "mapa") { datos = mensaje["datos"] }
+    sea k = o["clave"]
+    si (tipo(k) == "texto") { k = correo_clave(k) }
+    sea partes = _co_partir(datos)
+    sea canon = texto_dividir(o["canonicalizacion"] ?? "relaxed/relaxed", "/")
+    sea cc = canon[0]
+    sea cb = canon[1] ?? "simple"
+    sea bh = base64_codificar(sha256_bytes(_co_canon_cuerpo(partes[1], cb)))
+    sea cabs = _co_cabeceras(partes[0])
+    sea pedidas = o["cabeceras"] ?? ["from", "to", "cc", "subject", "date", "message-id", "reply-to", "mime-version", "content-type", "in-reply-to", "references"]
+    // Cada aparición se firma de abajo hacia arriba.
+    sea usadas = {}
+    sea firmadas = []
+    sea lineas = []
+    para h en pedidas {
+        sea i = longitud(cabs) - 1 - (usadas[texto_minusculas(h)] ?? 0)
+        sea hallada = falso
+        mientras (i >= 0 y hallada == falso) {
+            si (texto_minusculas(cabs[i][0]) == texto_minusculas(h)) {
+                hallada = verdadero
+                lineas.agregar(_co_canon_cab(cabs[i][1], cc))
+                firmadas.agregar(texto_minusculas(h))
+                usadas[texto_minusculas(h)] = (usadas[texto_minusculas(h)] ?? 0) + 1
+            }
+            i = i - 1
+        }
+    }
+    sea alg = "rsa-sha256"
+    si (k["tipo"] == "ed25519") { alg = "ed25519-sha256" }
+    sea t = piso((o["tiempo_ms"] ?? tiempo_ms()) / 1000)
+    sea valor = "v=1; a=" + alg + "; c=" + cc + "/" + cb + "; d=" + o["dominio"] + "; s=" + o["selector"] + "; t=" + t + "; h=" + unir(firmadas, ":") + "; bh=" + bh + "; b="
+    sea cab_dkim = "DKIM-Signature: " + valor
+    sea entrada = unir(lineas, "") + texto_reemplazar(_co_canon_cab(cab_dkim, cc), "\r\n", "")
+    si (cc == "simple") { entrada = unir(lineas, "") + cab_dkim }
+    sea resumen = sha256_bytes(entrada)
+    sea firma = ""
+    si (k["tipo"] == "ed25519") { firma = ed25519_firmar(k["privada"], resumen) } sino { firma = _co_rsa_firmar(k, resumen) }
+    sea b64 = base64_codificar(firma)
+    // Plegado a 76 columnas para que las líneas no sean enormes.
+    sea plegado = ""
+    sea i2 = 0
+    mientras (i2 < longitud(b64)) {
+        si (i2 > 0) { plegado = plegado + "\r\n\t" }
+        plegado = plegado + subcadena(b64, i2, minimo(longitud(b64), i2 + 72))
+        i2 = i2 + 72
+    }
+    sea nuevo = cab_dkim + plegado + "\r\n" + partes[0] + "\r\n" + partes[1]
+    si (tipo(mensaje) == "mapa") {
+        sea r = {}
+        para kk en claves(mensaje) { r[kk] = mensaje[kk] }
+        r["datos"] = nuevo
+        retornar r
+    }
+    retornar nuevo
+}
+
+funcion _co_etiquetas(v) {
+    sea r = {}
+    para par en texto_dividir(texto_reemplazar(texto_reemplazar(texto_reemplazar(v, "\r\n", ""), "\t", ""), " ", ""), ";") {
+        sea e = texto_indice(par, "=")
+        si (e > 0) { r[subcadena(par, 0, e)] = subcadena(par, e + 1, longitud(par)) }
+    }
+    retornar r
+}
+
+/// Verifica la primera firma DKIM con la clave pública dada (PEM, el valor
+/// p= del registro DNS, o el registro TXT completo "v=DKIM1; k=…; p=…").
+/// Devuelve {"valida", "dominio", "selector", "motivo"}.
+funcion correo_dkim_verificar(mensaje, clave_publica) {
+    sea datos = mensaje
+    si (tipo(mensaje) == "mapa") { datos = mensaje["datos"] }
+    sea partes = _co_partir(datos)
+    sea cabs = _co_cabeceras(partes[0])
+    sea dk = nulo
+    para c en cabs { si (dk == nulo y texto_minusculas(c[0]) == "dkim-signature") { dk = c } }
+    si (dk == nulo) { retornar {"valida": falso, "motivo": "no hay firma DKIM"} }
+    sea tags = _co_etiquetas(subcadena(dk[1], texto_indice(dk[1], ":") + 1, longitud(dk[1])))
+    sea canon = texto_dividir(tags["c"] ?? "simple/simple", "/")
+    sea cc = canon[0]
+    sea cb = canon[1] ?? "simple"
+    sea r = {"valida": falso, "dominio": tags["d"] ?? nulo, "selector": tags["s"] ?? nulo, "motivo": ""}
+    sea cuerpo = _co_canon_cuerpo(partes[1], cb)
+    si ((tags["l"] ?? nulo) != nulo) { cuerpo = subcadena(cuerpo, 0, a_numero(tags["l"])) }
+    si (base64_codificar(sha256_bytes(cuerpo)) != tags["bh"]) {
+        r["motivo"] = "el cuerpo cambió (bh no coincide)"
+        retornar r
+    }
+    sea usadas = {}
+    sea entrada = ""
+    para h en texto_dividir(tags["h"], ":") {
+        sea hh = texto_minusculas(texto_recortar(h))
+        sea i = longitud(cabs) - 1
+        sea saltar = usadas[hh] ?? 0
+        mientras (i >= 0) {
+            si (texto_minusculas(cabs[i][0]) == hh y cabs[i] != dk) {
+                si (saltar == 0) {
+                    entrada = entrada + _co_canon_cab(cabs[i][1], cc)
+                    i = -1
+                } sino { saltar = saltar - 1 }
+            }
+            i = i - 1
+        }
+        usadas[hh] = (usadas[hh] ?? 0) + 1
+    }
+    // La propia cabecera DKIM con b= vacío.
+    sea linea = dk[1]
+    sea bpos = texto_indice(linea, "b=")
+    mientras (bpos > 0 y texto_indice(" \t;\n", subcadena(linea, bpos - 1, bpos)) < 0) {
+        sea sig = texto_indice(subcadena(linea, bpos + 1, longitud(linea)), "b=")
+        si (sig < 0) { bpos = -1 } sino { bpos = bpos + 1 + sig }
+    }
+    sea fin = texto_indice(subcadena(linea, bpos, longitud(linea)), ";")
+    sea sin_b = subcadena(linea, 0, bpos + 2)
+    si (fin >= 0) { sin_b = sin_b + subcadena(linea, bpos + fin, longitud(linea)) }
+    sea canon_dk = _co_canon_cab(sin_b, cc)
+    entrada = entrada + subcadena(canon_dk, 0, longitud(canon_dk) - 2)
+    sea resumen = sha256_bytes(entrada)
+    sea firma = base64_decodificar(tags["b"])
+    sea k = clave_publica
+    si (tipo(k) == "texto") {
+        si (texto_indice(k, "p=") >= 0 y texto_indice(k, "-----BEGIN") < 0) {
+            sea t2 = _co_etiquetas(k)
+            sea tipo_k = t2["k"] ?? "rsa"
+            si (tipo_k == "ed25519") { k = {"tipo": "ed25519", "publica": base64_decodificar(t2["p"])} } sino { k = correo_clave(t2["p"]) }
+        } sino { k = correo_clave(k) }
+    }
+    sea ok = falso
+    si (k["tipo"] == "ed25519") { ok = ed25519_verificar(k["publica"], resumen, firma) } sino { ok = _co_rsa_verificar(k, resumen, firma) }
+    r["valida"] = ok
+    si (ok == falso) { r["motivo"] = "la firma no coincide" }
+    retornar r
+}
+
+/// Valor del registro TXT de DNS para publicar la clave pública
+/// ("v=DKIM1; k=rsa; p=…").
+funcion correo_dkim_registro(clave) {
+    sea k = clave
+    si (tipo(k) == "texto") { k = correo_clave(k) }
+    si (k["tipo"] == "ed25519") { retornar "v=DKIM1; k=ed25519; p=" + base64_codificar(k["publica"]) }
+    // SubjectPublicKeyInfo DER de la clave RSA.
+    sea ent = _co_der_entero(k["n"]) + _co_der_entero(k["e"])
+    sea rsa_pub = _co_der_tlv(48, ent)
+    sea alg = _co_der_tlv(48, _co_der_tlv(6, bytes_de_hex(_CO_OID_RSA)) + bytes_de_hex("0500"))
+    sea spki = _co_der_tlv(48, alg + _co_der_tlv(3, caracter(0) + rsa_pub))
+    retornar "v=DKIM1; k=rsa; p=" + base64_codificar(spki)
+}
+
+funcion _co_der_tlv(tag, contenido) {
+    sea n = longitud(contenido)
+    sea l = ""
+    si (n < 128) { l = bytes_entero(n, 1, 0) } sino {
+        si (n < 256) { l = bytes_entero(129, 1, 0) + bytes_entero(n, 1, 0) } sino { l = bytes_entero(130, 1, 0) + bytes_entero(n, 2, 0) }
+    }
+    retornar bytes_entero(tag, 1, 0) + l + contenido
+}
+
+funcion _co_der_entero(b) {
+    sea v = b
+    si (byte_en(v, 0) >= 128) { v = caracter(0) + v }
+    retornar _co_der_tlv(2, v)
+}
+
+// ══ SMTP ═══════════════════════════════════════════════════════════════════
+
+/// Escapa los puntos al inicio de línea y asegura CRLF y el final ".".
+funcion correo_smtp_datos(datos) {
+    sea t = texto_reemplazar(texto_reemplazar("" + datos, "\r\n", "\n"), "\n", "\r\n")
+    si (texto_empieza_con(t, ".")) { t = "." + t }
+    t = texto_reemplazar(t, "\r\n.", "\r\n..")
+    si (texto_termina_con(t, "\r\n") == falso) { t = t + "\r\n" }
+    retornar t + ".\r\n"
+}
+
+/// Lee respuestas SMTP ("250-…" multilínea) de un texto: [{"codigo", "lineas"}].
+funcion correo_smtp_respuestas(texto) {
+    sea r = []
+    sea actual = nulo
+    para l en texto_dividir(texto_reemplazar("" + texto, "\r\n", "\n"), "\n") {
+        si (longitud(l) >= 3) {
+            sea codigo = a_numero(subcadena(l, 0, 3))
+            si (actual == nulo) { actual = {"codigo": codigo, "lineas": []} }
+            actual["lineas"].agregar(subcadena(l, minimo(4, longitud(l)), longitud(l)))
+            si (subcadena(l, 3, 4) != "-") {
+                r.agregar(actual)
+                actual = nulo
+            }
+        }
+    }
+    retornar r
+}
+
+/// Comandos de una sesión SMTP completa (para registro, pruebas o envío en
+/// tubería).
+funcion correo_smtp_comandos(cuenta, mensaje) {
+    sea c = ["EHLO " + (cuenta["nombre"] ?? "localhost") + "\r\n"]
+    si ((cuenta["usuario"] ?? nulo) != nulo) {
+        si ((cuenta["auth"] ?? "plain") == "login") {
+            c.agregar("AUTH LOGIN\r\n")
+            c.agregar(base64_codificar(cuenta["usuario"]) + "\r\n")
+            c.agregar(base64_codificar(cuenta["clave"]) + "\r\n")
+        } sino { c.agregar("AUTH PLAIN " + base64_codificar(caracter(0) + cuenta["usuario"] + caracter(0) + cuenta["clave"]) + "\r\n") }
+    }
+    c.agregar("MAIL FROM:<" + mensaje["de"] + ">\r\n")
+    para d en mensaje["destinatarios"] { c.agregar("RCPT TO:<" + d + ">\r\n") }
+    c.agregar("DATA\r\n")
+    c.agregar(correo_smtp_datos(mensaje["datos"]))
+    c.agregar("QUIT\r\n")
+    retornar c
+}
+
+funcion _co_leer_respuesta(sock) {
+    sea texto = ""
+    mientras (verdadero) {
+        sea linea = ""
+        mientras (texto_termina_con(linea, "\n") == falso) {
+            sea b = net_recibir_exacto(sock, 1)
+            si (b == nulo o b == "") { lanzar "correo: el servidor cerró la conexión" }
+            linea = linea + b
+        }
+        texto = texto + linea
+        si (longitud(linea) < 4 o subcadena(linea, 3, 4) != "-") { retornar correo_smtp_respuestas(texto)[0] }
+    }
+}
+
+funcion _co_esperar(r, codigos, que) {
+    para c en codigos { si (r["codigo"] == c) { retornar r } }
+    lanzar "correo: " + que + " falló: " + r["codigo"] + " " + unir(r["lineas"], " ")
+}
+
+/// Envía un mensaje (de correo_mensaje). cuenta: servidor, puerto (25),
+/// usuario, clave, auth ("plain" | "login"), tls ("implicito" en el puerto
+/// 465; "no" para relés locales), nombre (para EHLO). Con TLS los comandos
+/// van en tubería (PIPELINING) y se leen todas las respuestas al final.
+/// Devuelve {"aceptado", "respuestas"}.
+funcion correo_enviar(cuenta, mensaje) {
+    sea puerto = cuenta["puerto"] ?? 25
+    sea modo = cuenta["tls"] ?? "no"
+    si (puerto == 465 y (cuenta["tls"] ?? nulo) == nulo) { modo = "implicito" }
+    sea sock = net_conectar(cuenta["servidor"], puerto)
+    si (modo == "implicito") {
+        sea t = tls_abrir(sock, cuenta["servidor"])
+        para c en correo_smtp_comandos(cuenta, mensaje) { tls_enviar(t, c) }
+        sea rs = correo_smtp_respuestas(tls_recibir_todo(t))
+        tls_cerrar(t)
+        sea ok = falso
+        para r en rs { si (r["codigo"] == 250 y longitud(rs) > 0) { ok = verdadero } }
+        // La respuesta al DATA final es la penúltima (antes del 221 del QUIT).
+        si (longitud(rs) >= 2) { ok = rs[longitud(rs) - 2]["codigo"] == 250 }
+        retornar {"aceptado": ok, "respuestas": rs}
+    }
+    sea rs = []
+    rs.agregar(_co_esperar(_co_leer_respuesta(sock), [220], "saludo"))
+    net_enviar(sock, "EHLO " + (cuenta["nombre"] ?? "localhost") + "\r\n")
+    rs.agregar(_co_esperar(_co_leer_respuesta(sock), [250], "EHLO"))
+    si ((cuenta["usuario"] ?? nulo) != nulo) {
+        si ((cuenta["auth"] ?? "plain") == "login") {
+            net_enviar(sock, "AUTH LOGIN\r\n")
+            _co_esperar(_co_leer_respuesta(sock), [334], "AUTH")
+            net_enviar(sock, base64_codificar(cuenta["usuario"]) + "\r\n")
+            _co_esperar(_co_leer_respuesta(sock), [334], "AUTH")
+            net_enviar(sock, base64_codificar(cuenta["clave"]) + "\r\n")
+        } sino { net_enviar(sock, "AUTH PLAIN " + base64_codificar(caracter(0) + cuenta["usuario"] + caracter(0) + cuenta["clave"]) + "\r\n") }
+        rs.agregar(_co_esperar(_co_leer_respuesta(sock), [235], "AUTH"))
+    }
+    net_enviar(sock, "MAIL FROM:<" + mensaje["de"] + ">\r\n")
+    rs.agregar(_co_esperar(_co_leer_respuesta(sock), [250], "MAIL FROM"))
+    para d en mensaje["destinatarios"] {
+        net_enviar(sock, "RCPT TO:<" + d + ">\r\n")
+        rs.agregar(_co_esperar(_co_leer_respuesta(sock), [250, 251], "RCPT TO " + d))
+    }
+    net_enviar(sock, "DATA\r\n")
+    rs.agregar(_co_esperar(_co_leer_respuesta(sock), [354], "DATA"))
+    net_enviar(sock, correo_smtp_datos(mensaje["datos"]))
+    sea fin = _co_leer_respuesta(sock)
+    rs.agregar(fin)
+    net_enviar(sock, "QUIT\r\n")
+    intentar { _co_leer_respuesta(sock) } capturar (e) { }
+    net_cerrar(sock)
+    retornar {"aceptado": fin["codigo"] == 250, "respuestas": rs}
+}
