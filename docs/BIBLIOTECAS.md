@@ -50,10 +50,10 @@ Estado: ✅ ya existe en C-Forge · 🔗 se usa hoy vía `cforge bindgen`,
 | 31 | `caja` | Colecciones avanzadas y cachés | Guava | ✅ `colecciones` · 🛠 cachés |
 | 32 | `formatos` | JSON, XML, CSV y YAML | Jackson | ✅ JSON · 🛠 resto |
 | 33 | `registro` | Registro de eventos desacoplado | SLF4J, Logback | 🛠 |
-| 34 | `reloj` | Tareas programadas (cron) | Quartz | 🛠 |
+| 34 | `reloj` / `cron` | Tareas programadas (cron) | Quartz | ✅ `reloj` |
 | 35 | `indice` | Búsqueda de texto completo | Lucene | 🛠 |
 | 36 | `prueba` | Pruebas y aserciones | JUnit | ✅ `cforge test` + `afirmar` |
-| 37 | `esquema` | Validación de esquemas | Zod | 🛠 |
+| 37 | `esquema` / `schema` | Validación de esquemas | Zod | ✅ `esquema` |
 | 38 | `ruta` | Framework web con middlewares | Express, Hono | ✅ `web` (básico) |
 | 39 | `navaja` | Utilidades funcionales | Lodash | ✅ `lista` / `algoritmos` · 🔗 npm |
 | 40 | `calendario` | Fechas y zonas horarias | Day.js, Luxon | ✅ `fecha` |
@@ -66,7 +66,7 @@ Estado: ✅ ya existe en C-Forge · 🔗 se usa hoy vía `cforge bindgen`,
 | 47 | `matriz` | Arreglos multidimensionales | NumPy | 🛠 |
 | 48 | `planilla` | Análisis de datos tabulares | Pandas | 🛠 |
 | 49 | `api_rapida` | APIs con documentación automática | FastAPI | 🛠 |
-| 50 | `vitrina` | Interfaces ricas en terminal | Rich | 🛠 |
+| 50 | `vitrina` / `rich` | Interfaces ricas en terminal | Rich | ✅ `vitrina` |
 | 51 | `gradiente` | Tensores con autodiferenciación | PyTorch | 🛠 |
 
 ## Bloque 2 — Áreas
@@ -128,7 +128,7 @@ Estado: ✅ ya existe en C-Forge · 🔗 se usa hoy vía `cforge bindgen`,
 | 92 | `sensor` | Mensajería IoT | MQTT | 🛠 |
 | 93 | `directo` | Audio/video P2P | WebRTC | 🛠 |
 | 94 | `transporte` | Transferencia multiprotocolo | libcurl | ✅ HTTP en `red` · 🔗 |
-| 95 | `freno` | Límite de peticiones | Governor | 🛠 |
+| 95 | `freno` / `ratelimit` | Límite de peticiones | Governor | ✅ `freno` |
 | 96 | `consola_remota` | SSH y SFTP | libssh2 | 🔗 |
 
 ### D. Bases de datos y formatos
@@ -147,7 +147,7 @@ Estado: ✅ ya existe en C-Forge · 🔗 se usa hoy vía `cforge bindgen`,
 | 106 | `ajustes` | TOML y YAML estrictos | toml, yaml-rust | ✅ TOML (cforge.toml) · 🛠 |
 | 107 | `marcado` / `markdown` | Markdown a HTML | pulldown-cmark | ✅ `marcado` |
 | 108 | `sintaxis` | Parser incremental | tree-sitter | 🔗 |
-| 109 | `xml` | XML rápido | quick-xml | 🛠 |
+| 109 | `xml` | XML rápido | quick-xml | ✅ `xml` |
 | 110 | `csv` | CSV gigantes (RFC 4180) | csv-rs | ✅ `csv` |
 | 111 | `memoria_rapida` | Cliente Redis con clústeres | fred | ✅ `redis` · 🛠 clústeres |
 
@@ -162,13 +162,13 @@ Estado: ✅ ya existe en C-Forge · 🔗 se usa hoy vía `cforge bindgen`,
 | 116 | `css` | Parser y minificador CSS | LightningCSS | 🛠 |
 | 117 | `empaca` | Empaquetador web | esbuild | 🛠 |
 | 118 | `ensayo` | Mocks y snapshots | Vitest | ✅ `cforge test --coverage` · 🛠 mocks |
-| 119 | `ficticio` | Datos falsos realistas | Faker | 🛠 |
+| 119 | `ficticio` / `faker` | Datos falsos realistas | Faker | ✅ `ficticio` |
 | 120 | `contrato` | Documentación OpenAPI | Swagger | 🛠 |
 | 121 | `subida` | Subida de archivos multipart | busboy | 🛠 |
-| 122 | `casco` | Cabeceras de seguridad HTTP | Helmet | 🛠 |
+| 122 | `casco` / `helmet` | Cabeceras de seguridad HTTP | Helmet | ✅ `casco` |
 | 123 | `acceso` | Autenticación modular | Passport, Lucia | ✅ `auth` (básico) |
 | 124 | `cola` | Trabajos en segundo plano | BullMQ | 🛠 |
-| 125 | `idiomas` | Internacionalización | i18next | 🛠 |
+| 125 | `idiomas` / `i18n` | Internacionalización | i18next | ✅ `idiomas` |
 | 126 | `extremo` | APIs con tipos compartidos | tRPC | 🛠 |
 
 ### F. Audio, juegos y hardware
