@@ -1,0 +1,150 @@
+// stdlib/calco.cfv — mapear estructuras: de un mapa (p. ej. una fila de la
+// base o una respuesta de API) a otro con reglas declarativas. Inspirada en
+// AutoMapper (MIT). En inglés: importar "mapper".
+//
+//   importar "calco"
+//   sea dto = calco_mapear(fila, {
+//       "nombre": "cliente.nombre",                         // ruta con puntos
+//       "total": {"de": "monto", "convertir": funcion(v) { retornar v / 100 }},
+//       "pais": {"de": "direccion.pais", "defecto": "CL"},
+//       "resumen": funcion(o) { retornar o["id"] + ": " + o["estado"] }
+//   })
+//
+// Una ruta puede tener índices: "items.0.sku" (y -1 para el último). Las
+// claves de regla también valen en inglés: from, convert, default, list, object.
+
+funcion calco_obtener(origen, ruta) {
+    sea v = origen
+    para parte en texto_dividir("" + ruta, ".") {
+        si (v == nulo) { retornar nulo }
+        sea t = tipo(v)
+        si (t == "mapa") {
+            si (tiene_clave(v, parte)) { v = v[parte] } sino { retornar nulo }
+        } sino {
+            si (t == "lista") {
+                sea i = a_numero(parte)
+                si (i == nulo) { retornar nulo }
+                si (i < 0) { i = longitud(v) + i }
+                si (i < 0 o i >= longitud(v)) { retornar nulo }
+                v = v[i]
+            } sino { retornar nulo }
+        }
+    }
+    retornar v
+}
+
+/// Escribe en una ruta creando los mapas intermedios.
+funcion calco_poner(destino, ruta, valor) {
+    sea partes = texto_dividir("" + ruta, ".")
+    sea m = destino
+    sea i = 0
+    mientras (i < longitud(partes) - 1) {
+        si (tiene_clave(m, partes[i]) == falso o tipo(m[partes[i]]) != "mapa") { m[partes[i]] = {} }
+        m = m[partes[i]]
+        i = i + 1
+    }
+    m[partes[longitud(partes) - 1]] = valor
+    retornar destino
+}
+
+funcion _ca_clave(m, es, en) {
+    si (tiene_clave(m, es)) { retornar es }
+    si (tiene_clave(m, en)) { retornar en }
+    retornar nulo
+}
+
+funcion _ca_regla(origen, regla) {
+    sea t = tipo(regla)
+    si (t == "texto") { retornar calco_obtener(origen, regla) }
+    si (t == "funcion") { retornar regla(origen) }
+    si (t == "mapa") {
+        sea de = _ca_clave(regla, "de", "from")
+        sea lista_r = _ca_clave(regla, "lista", "list")
+        sea objeto_r = _ca_clave(regla, "objeto", "object")
+        sea convertir = _ca_clave(regla, "convertir", "convert")
+        sea v = nulo
+        si (de != nulo) { v = calco_obtener(origen, regla[de]) }
+        si (lista_r != nulo y v != nulo) {
+            sea r = []
+            para x en v { r.agregar(calco_mapear(x, regla[lista_r])) }
+            v = r
+        }
+        si (objeto_r != nulo y v != nulo) { v = calco_mapear(v, regla[objeto_r]) }
+        si (convertir != nulo y v != nulo) { v = regla[convertir](v) }
+        sea defecto = _ca_clave(regla, "defecto", "default")
+        si (v == nulo y defecto != nulo) { v = regla[defecto] }
+        retornar v
+    }
+    lanzar "calco: regla inválida (" + t + ")"
+}
+
+/// Mapea según reglas destino → regla. Las claves del destino pueden ser
+/// rutas ("cliente.nombre") y se crean anidadas. Los nulos se omiten salvo
+/// que la regla tenga "defecto".
+funcion calco_mapear(origen, reglas) {
+    sea r = {}
+    para k en claves(reglas) {
+        sea v = _ca_regla(origen, reglas[k])
+        si (v != nulo) { calco_poner(r, k, v) }
+    }
+    retornar r
+}
+
+funcion calco_lista(lista, reglas) {
+    sea r = []
+    para x en lista { r.agregar(calco_mapear(x, reglas)) }
+    retornar r
+}
+
+/// Copia solo esas claves (o rutas).
+funcion calco_elegir(origen, rutas) {
+    sea r = {}
+    para k en rutas {
+        sea v = calco_obtener(origen, k)
+        si (v != nulo) { calco_poner(r, k, v) }
+    }
+    retornar r
+}
+
+/// Copia todo menos esas claves (primer nivel).
+funcion calco_omitir(origen, quitar) {
+    sea fuera = {}
+    para k en quitar { fuera[k] = verdadero }
+    sea r = {}
+    para k en claves(origen) { si (tiene_clave(fuera, k) == falso) { r[k] = origen[k] } }
+    retornar r
+}
+
+funcion _ca_aplanar(v, prefijo, r) {
+    si (tipo(v) == "mapa" y longitud(claves(v)) > 0) {
+        para k en claves(v) {
+            sea p = k
+            si (prefijo != "") { p = prefijo + "." + k }
+            _ca_aplanar(v[k], p, r)
+        }
+    } sino { r[prefijo] = v }
+}
+
+/// {"a": {"b": 1}} → {"a.b": 1}
+funcion calco_aplanar(mapa) {
+    sea r = {}
+    _ca_aplanar(mapa, "", r)
+    retornar r
+}
+
+/// {"a.b": 1} → {"a": {"b": 1}}
+funcion calco_desaplanar(mapa) {
+    sea r = {}
+    para k en claves(mapa) { calco_poner(r, k, mapa[k]) }
+    retornar r
+}
+
+/// Mezcla profunda: b gana; los mapas se combinan, las listas se reemplazan.
+funcion calco_mezclar(a, b) {
+    sea r = {}
+    para k en claves(a) { r[k] = a[k] }
+    para k en claves(b) {
+        si (tiene_clave(r, k) y tipo(r[k]) == "mapa" y tipo(b[k]) == "mapa") { r[k] = calco_mezclar(r[k], b[k]) } sino { r[k] = b[k] }
+    }
+    retornar r
+}

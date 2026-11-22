@@ -1,0 +1,210 @@
+// stdlib/paquete_bin.cfv — MessagePack: serialización binaria compacta e
+// interoperable (Python, JS, Go, Rust…). Inspirada en msgpack (MIT/Apache).
+// En inglés: importar "msgpack".
+//
+//   importar "paquete_bin"
+//   sea b = paquete_codificar({"id": 7, "tags": ["a", "b"], "precio": 9.5})
+//   paquete_decodificar(b)            // el mismo mapa
+//
+// Al decodificar valida largos y profundidad: un mensaje hostil no puede
+// pedir gigas de memoria ni desbordar la pila.
+
+funcion _pb_u(n, ancho) { retornar bytes_entero(n, ancho, 0) }
+funcion _pb_b(n) { retornar bytes_entero(n, 1, 0) }
+
+// float64 IEEE 754 armado a mano (big endian).
+funcion _pb_f64(v) {
+    si (v == 0) { retornar _pb_b(203) + _pb_u(0, 8) }
+    sea s = 0
+    sea m = v
+    si (v < 0) { s = 1  m = 0 - v }
+    si (m > 1.7976931348623157e308) { retornar _pb_b(203) + _pb_b(s * 128 + 127) + _pb_b(240) + _pb_u(0, 6) }
+    sea e = 0
+    mientras (m >= 2) { m = m / 2  e = e + 1 }
+    mientras (m < 1 y e > -1022) { m = m * 2  e = e - 1 }
+    sea exp = e + 1023
+    sea frac = m - 1
+    si (m < 1) { exp = 0  frac = m }
+    sea mant = piso(frac * 4503599627370496)
+    si (mant >= 4503599627370496) { mant = 0  exp = exp + 1 }
+    sea alto = cociente(mant, 281474976710656)
+    sea bajo = mant - alto * 281474976710656
+    retornar _pb_b(203) + _pb_b(s * 128 + cociente(exp, 16)) + _pb_b((exp % 16) * 16 + alto) + _pb_u(bajo, 6)
+}
+
+funcion _pb_largo(n, corto, base8, base16, base32) {
+    si (corto != nulo y n < 16) { retornar _pb_b(corto + n) }
+    si (base8 != nulo y n < 256) { retornar _pb_b(base8) + _pb_b(n) }
+    si (n < 65536) { retornar _pb_b(base16) + _pb_u(n, 2) }
+    retornar _pb_b(base32) + _pb_u(n, 4)
+}
+
+funcion _pb_cod(v, prof) {
+    si (prof > 100) { lanzar "paquete_bin: anidamiento excesivo" }
+    si (v == nulo) { retornar _pb_b(192) }
+    si (v == falso) { retornar _pb_b(194) }
+    si (v == verdadero) { retornar _pb_b(195) }
+    sea t = tipo(v)
+    si (t == "numero") {
+        si (piso(v) == v y v < 4611686018427387903 y v > -4611686018427387903) {
+            v = piso(v)
+            si (v >= 0) {
+                si (v < 128) { retornar _pb_b(v) }
+                si (v < 256) { retornar _pb_b(204) + _pb_b(v) }
+                si (v < 65536) { retornar _pb_b(205) + _pb_u(v, 2) }
+                si (v < 4294967296) { retornar _pb_b(206) + _pb_u(v, 4) }
+                retornar _pb_b(207) + _pb_u(v, 8)
+            }
+            si (v >= -32) { retornar _pb_b(256 + v) }
+            si (v >= -128) { retornar _pb_b(208) + _pb_b(256 + v) }
+            si (v >= -32768) { retornar _pb_b(209) + _pb_u(65536 + v, 2) }
+            si (v >= -2147483648) { retornar _pb_b(210) + _pb_u(4294967296 + v, 4) }
+            retornar _pb_b(211) + _pb_u(v, 8)
+        }
+        retornar _pb_f64(v)
+    }
+    si (t == "texto") {
+        sea n = longitud(v)
+        si (n < 32) { retornar _pb_b(160 + n) + v }
+        retornar _pb_largo(n, nulo, 217, 218, 219) + v
+    }
+    si (t == "lista") {
+        sea partes = [_pb_largo(longitud(v), 144, nulo, 220, 221)]
+        para x en v { partes.agregar(_pb_cod(x, prof + 1)) }
+        retornar unir(partes, "")
+    }
+    si (t == "mapa") {
+        sea ks = claves(v)
+        sea partes = [_pb_largo(longitud(ks), 128, nulo, 222, 223)]
+        para k en ks {
+            partes.agregar(_pb_cod("" + k, prof + 1))
+            partes.agregar(_pb_cod(v[k], prof + 1))
+        }
+        retornar unir(partes, "")
+    }
+    lanzar "paquete_bin: no se puede codificar " + t
+}
+
+/// Valor → bytes MessagePack.
+funcion paquete_codificar(v) { retornar _pb_cod(v, 0) }
+
+funcion _pb_falta(st, n) {
+    si (st["i"] + n > longitud(st["b"])) { lanzar "paquete_bin: datos truncados (posición " + st["i"] + ")" }
+}
+
+funcion _pb_leer(st, ancho) {
+    _pb_falta(st, ancho)
+    sea r = bytes_leer_entero(st["b"], st["i"], ancho, 0)
+    st["i"] = st["i"] + ancho
+    retornar r
+}
+
+funcion _pb_con_signo(n, ancho) {
+    sea tope = potencia(2, ancho * 8 - 1)
+    si (ancho == 8) { retornar n }
+    si (n >= tope) { retornar n - tope * 2 }
+    retornar n
+}
+
+funcion _pb_bytes(st, n) {
+    _pb_falta(st, n)
+    sea r = subcadena(st["b"], st["i"], st["i"] + n)
+    st["i"] = st["i"] + n
+    retornar r
+}
+
+funcion _pb_float(st, ancho) {
+    _pb_falta(st, ancho)
+    sea b0 = byte_en(st["b"], st["i"])
+    sea b1 = byte_en(st["b"], st["i"] + 1)
+    sea s = 1
+    si (b0 >= 128) { s = -1 }
+    sea e = 0
+    sea m = 0
+    sea sesgo = 1023
+    sea bits = 52
+    si (ancho == 8) {
+        e = (b0 % 128) * 16 + cociente(b1, 16)
+        m = (b1 % 16) * 281474976710656 + bytes_leer_entero(st["b"], st["i"] + 2, 6, 0)
+        si (e == 2047) { st["i"] = st["i"] + 8  si (m == 0) { retornar s * 1e308 * 10 }  retornar 0 - 0 }
+    } sino {
+        sesgo = 127
+        bits = 23
+        e = (b0 % 128) * 2 + cociente(b1, 128)
+        m = (b1 % 128) * 65536 + bytes_leer_entero(st["b"], st["i"] + 2, 2, 0)
+        si (e == 255) { st["i"] = st["i"] + 4  si (m == 0) { retornar s * 1e308 * 10 }  retornar 0 - 0 }
+    }
+    st["i"] = st["i"] + ancho
+    si (e == 0) { retornar s * m * potencia(2, 1 - sesgo - bits) }
+    retornar s * (1 + m / potencia(2, bits)) * potencia(2, e - sesgo)
+}
+
+funcion _pb_cont(st, n, prof, es_mapa) {
+    // Cada elemento ocupa al menos un byte: un largo mayor es mentira.
+    sea minimo_bytes = n
+    si (es_mapa) { minimo_bytes = n * 2 }
+    _pb_falta(st, minimo_bytes)
+    si (es_mapa) {
+        sea r = {}
+        sea i = 0
+        mientras (i < n) {
+            sea k = _pb_dec(st, prof + 1)
+            r["" + k] = _pb_dec(st, prof + 1)
+            i = i + 1
+        }
+        retornar r
+    }
+    sea l = []
+    sea j = 0
+    mientras (j < n) { l.agregar(_pb_dec(st, prof + 1))  j = j + 1 }
+    retornar l
+}
+
+funcion _pb_dec(st, prof) {
+    si (prof > 100) { lanzar "paquete_bin: anidamiento excesivo" }
+    sea c = _pb_leer(st, 1)
+    si (c < 128) { retornar c }
+    si (c < 144) { retornar _pb_cont(st, c - 128, prof, verdadero) }
+    si (c < 160) { retornar _pb_cont(st, c - 144, prof, falso) }
+    si (c < 192) { retornar _pb_bytes(st, c - 160) }
+    si (c >= 224) { retornar c - 256 }
+    si (c == 192) { retornar nulo }
+    si (c == 194) { retornar falso }
+    si (c == 195) { retornar verdadero }
+    si (c == 196 o c == 217) { retornar _pb_bytes(st, _pb_leer(st, 1)) }
+    si (c == 197 o c == 218) { retornar _pb_bytes(st, _pb_leer(st, 2)) }
+    si (c == 198 o c == 219) { retornar _pb_bytes(st, _pb_leer(st, 4)) }
+    si (c == 202) { retornar _pb_float(st, 4) }
+    si (c == 203) { retornar _pb_float(st, 8) }
+    si (c == 204) { retornar _pb_leer(st, 1) }
+    si (c == 205) { retornar _pb_leer(st, 2) }
+    si (c == 206) { retornar _pb_leer(st, 4) }
+    si (c == 207) {
+        sea alto = _pb_leer(st, 4)
+        sea bajo = _pb_leer(st, 4)
+        si (alto >= 1073741824) { retornar alto * 4294967296.0 + bajo }
+        retornar alto * 4294967296 + bajo
+    }
+    si (c == 208) { retornar _pb_con_signo(_pb_leer(st, 1), 1) }
+    si (c == 209) { retornar _pb_con_signo(_pb_leer(st, 2), 2) }
+    si (c == 210) { retornar _pb_con_signo(_pb_leer(st, 4), 4) }
+    si (c == 211) {
+        sea alto = _pb_leer(st, 4)
+        sea bajo = _pb_leer(st, 4)
+        si (alto >= 2147483648) { alto = alto - 4294967296 }
+        retornar alto * 4294967296 + bajo
+    }
+    si (c == 220) { retornar _pb_cont(st, _pb_leer(st, 2), prof, falso) }
+    si (c == 221) { retornar _pb_cont(st, _pb_leer(st, 4), prof, falso) }
+    si (c == 222) { retornar _pb_cont(st, _pb_leer(st, 2), prof, verdadero) }
+    si (c == 223) { retornar _pb_cont(st, _pb_leer(st, 4), prof, verdadero) }
+    lanzar "paquete_bin: tipo no soportado 0x" + hex_de_bytes(_pb_b(c)) + " (posición " + (st["i"] - 1) + ")"
+}
+
+/// Bytes MessagePack → valor. Lanza si sobran o faltan bytes.
+funcion paquete_decodificar(b) {
+    sea st = {"b": b, "i": 0}
+    sea v = _pb_dec(st, 0)
+    si (st["i"] != longitud(b)) { lanzar "paquete_bin: sobran " + (longitud(b) - st["i"]) + " bytes" }
+    retornar v
+}

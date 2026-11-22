@@ -1,0 +1,206 @@
+// stdlib/subida.cfv — formularios multipart/form-data: leer subidas de
+// archivos con límites y nombres seguros, y armar cuerpos para enviar.
+// Inspirada en busboy (MIT). En inglés: importar "multipart".
+//
+//   importar "subida"
+//   sea partes = subida_analizar(cuerpo, cabeceras["Content-Type"])
+//   para p en partes {
+//       si (p["archivo"] != nulo) { escribir_archivo("subidas/" + subida_nombre_seguro(p["archivo"]), p["datos"]) }
+//   }
+//
+// Límites por defecto: 100 partes, 10 MB por parte, 20 MB en total
+// (opciones {"max_partes", "max_parte", "max_total"}). Cada parte:
+// {"nombre", "archivo" (o nulo), "tipo", "datos", "cabeceras"}, también con
+// claves en inglés: "name", "filename", "type", "data", "headers".
+
+/// Saca la frontera de "multipart/form-data; boundary=…".
+funcion subida_frontera(tipo_contenido) {
+    sea t = "" + tipo_contenido
+    si (texto_empieza_con(texto_minusculas(texto_recortar(t)), "multipart/") == falso) { lanzar "subida: no es multipart" }
+    para parte en texto_dividir(t, ";") {
+        sea p = texto_recortar(parte)
+        si (texto_empieza_con(texto_minusculas(p), "boundary=")) {
+            sea f = subcadena(p, 9, longitud(p))
+            si (texto_empieza_con(f, "\"") y texto_termina_con(f, "\"") y longitud(f) >= 2) { f = subcadena(f, 1, longitud(f) - 1) }
+            si (longitud(f) == 0 o longitud(f) > 70) { lanzar "subida: frontera inválida" }
+            retornar f
+        }
+    }
+    lanzar "subida: falta boundary"
+}
+
+// Parámetro name="x" o filename="x" (también filename*=UTF-8''x%20y).
+funcion _sb_param(linea, clave) {
+    sea l = linea
+    sea bajo = texto_minusculas(l)
+    sea estrella = texto_indice(bajo, "; " + clave + "*=")
+    si (estrella >= 0) {
+        sea v = subcadena(l, estrella + longitud(clave) + 4, longitud(l))
+        sea pc = texto_indice(v, ";")
+        si (pc >= 0) { v = subcadena(v, 0, pc) }
+        sea comillas = texto_indice(v, "''")
+        si (comillas >= 0) { v = subcadena(v, comillas + 2, longitud(v)) }
+        retornar _sb_porcentaje(texto_recortar(v))
+    }
+    sea marcas = ["; " + clave + "=\"", ";" + clave + "=\""]
+    para m en marcas {
+        sea i = texto_indice(bajo, m)
+        si (i >= 0) {
+            sea resto = subcadena(l, i + longitud(m), longitud(l))
+            sea r = ""
+            sea k = 0
+            mientras (k < longitud(resto) y subcadena(resto, k, k + 1) != "\"") {
+                // Solo \" es escape (los navegadores mandan "C:\x\y.png" tal cual).
+                si (subcadena(resto, k, k + 2) == "\\\"") { k = k + 1 }
+                r = r + subcadena(resto, k, k + 1)
+                k = k + 1
+            }
+            retornar r
+        }
+    }
+    sea sin = texto_indice(bajo, "; " + clave + "=")
+    si (sin >= 0) {
+        sea v = subcadena(l, sin + longitud(clave) + 3, longitud(l))
+        sea pc = texto_indice(v, ";")
+        si (pc >= 0) { v = subcadena(v, 0, pc) }
+        retornar texto_recortar(v)
+    }
+    retornar nulo
+}
+
+funcion _sb_porcentaje(t) {
+    sea r = ""
+    sea i = 0
+    mientras (i < longitud(t)) {
+        sea c = subcadena(t, i, i + 1)
+        si (c == "%" y i + 2 < longitud(t) + 1) {
+            r = r + bytes_de_hex(subcadena(t, i + 1, i + 3))
+            i = i + 3
+        } sino { r = r + c  i = i + 1 }
+    }
+    retornar r
+}
+
+funcion _sb_op(o, k, d) {
+    si (o != nulo) { si (tiene_clave(o, k)) { retornar o[k] } }
+    retornar d
+}
+
+/// Analiza el cuerpo completo. Lanza ante cuerpos mal formados o límites.
+funcion subida_analizar(cuerpo, tipo_contenido, opciones) {
+    sea f = "--" + subida_frontera(tipo_contenido)
+    sea max_partes = _sb_op(opciones, "max_partes", 100)
+    sea max_parte = _sb_op(opciones, "max_parte", 10485760)
+    sea max_total = _sb_op(opciones, "max_total", 20971520)
+    si (longitud(cuerpo) > max_total) { lanzar "subida: el cuerpo supera " + max_total + " bytes" }
+    sea inicio = bytes_buscar(cuerpo, f, 0)
+    si (inicio < 0) { lanzar "subida: no aparece la frontera" }
+    sea partes = []
+    sea pos = inicio + longitud(f)
+    sea seguir = verdadero
+    mientras (seguir) {
+        si (subcadena(cuerpo, pos, pos + 2) == "--") { seguir = falso } sino {
+            si (subcadena(cuerpo, pos, pos + 2) != "\r\n") { lanzar "subida: falta CRLF tras la frontera" }
+            pos = pos + 2
+            sea fin_cab = bytes_buscar(cuerpo, "\r\n\r\n", pos)
+            si (fin_cab < 0 o fin_cab - pos > 8192) { lanzar "subida: cabeceras de parte inválidas" }
+            sea siguiente = bytes_buscar(cuerpo, "\r\n" + f, fin_cab + 4)
+            si (siguiente < 0) { lanzar "subida: parte sin cerrar" }
+            si (longitud(partes) >= max_partes) { lanzar "subida: más de " + max_partes + " partes" }
+            sea datos = subcadena(cuerpo, fin_cab + 4, siguiente)
+            si (longitud(datos) > max_parte) { lanzar "subida: una parte supera " + max_parte + " bytes" }
+            sea p = {"nombre": nulo, "archivo": nulo, "tipo": "text/plain", "datos": datos, "cabeceras": {}}
+            para linea en texto_dividir(subcadena(cuerpo, pos, fin_cab), "\r\n") {
+                sea dos = texto_indice(linea, ":")
+                si (dos > 0) {
+                    sea k = texto_minusculas(texto_recortar(subcadena(linea, 0, dos)))
+                    sea v = texto_recortar(subcadena(linea, dos + 1, longitud(linea)))
+                    p["cabeceras"][k] = v
+                    si (k == "content-disposition") {
+                        p["nombre"] = _sb_param(v, "name")
+                        p["archivo"] = _sb_param(v, "filename")
+                    }
+                    si (k == "content-type") { p["tipo"] = v }
+                }
+            }
+            si (p["archivo"] != nulo y tiene_clave(p["cabeceras"], "content-type") == falso) { p["tipo"] = "application/octet-stream" }
+            p["name"] = p["nombre"]
+            p["filename"] = p["archivo"]
+            p["type"] = p["tipo"]
+            p["data"] = p["datos"]
+            p["headers"] = p["cabeceras"]
+            partes.agregar(p)
+            pos = siguiente + 2 + longitud(f)
+        }
+    }
+    retornar partes
+}
+
+/// Campos de texto (sin archivo) como mapa nombre → valor.
+funcion subida_campos(partes) {
+    sea r = {}
+    para p en partes { si (p["archivo"] == nulo y p["nombre"] != nulo) { r[p["nombre"]] = p["datos"] } }
+    retornar r
+}
+
+/// Solo las partes con archivo.
+funcion subida_archivos(partes) {
+    sea r = []
+    para p en partes { si (p["archivo"] != nulo) { r.agregar(p) } }
+    retornar r
+}
+
+/// Nombre de archivo sin rutas, sin "..", sin controles ni caracteres
+/// reservados de Windows; nunca vacío ni oculto.
+funcion subida_nombre_seguro(nombre) {
+    sea n = "" + nombre
+    n = texto_reemplazar(n, "\\", "/")
+    sea barra = 0 - 1
+    sea i = 0
+    mientras (i < longitud(n)) { si (subcadena(n, i, i + 1) == "/") { barra = i }  i = i + 1 }
+    n = subcadena(n, barra + 1, longitud(n))
+    sea r = ""
+    i = 0
+    mientras (i < longitud(n)) {
+        sea b = byte_en(n, i)
+        sea c = subcadena(n, i, i + 1)
+        si (b < 32 o b == 127 o texto_indice("<>:\"|?*", c) >= 0) { r = r + "_" } sino { r = r + c }
+        i = i + 1
+    }
+    mientras (texto_empieza_con(r, ".")) { r = subcadena(r, 1, longitud(r)) }
+    r = texto_recortar(r)
+    mientras (texto_termina_con(r, ".")) { r = subcadena(r, 0, longitud(r) - 1) }
+    sea base = texto_mayusculas(r)
+    sea punto = texto_indice(base, ".")
+    si (punto >= 0) { base = subcadena(base, 0, punto) }
+    para reservado en ["CON", "PRN", "AUX", "NUL", "COM1", "COM2", "COM3", "COM4", "LPT1", "LPT2", "LPT3"] { si (base == reservado) { r = "_" + r } }
+    si (longitud(r) > 200) { r = subcadena(r, longitud(r) - 200, longitud(r)) }
+    si (r == "") { r = "archivo" }
+    retornar r
+}
+
+funcion _sb_cita(t) { retornar texto_reemplazar(texto_reemplazar(texto_reemplazar("" + t, "\"", "\\\""), "\r", ""), "\n", "") }
+
+/// Arma un cuerpo: partes = [{"nombre", "datos", "archivo"?, "tipo"?}].
+/// Devuelve {"cuerpo", "tipo"} (tipo va en Content-Type).
+funcion subida_crear(partes) {
+    sea f = "cforge-" + hex_de_bytes(bytes_aleatorios(12))
+    sea l = []
+    para p0 en partes {
+        sea p = {"nombre": _sb_op(p0, "nombre", _sb_op(p0, "name", nulo)), "datos": _sb_op(p0, "datos", _sb_op(p0, "data", "")), "archivo": _sb_op(p0, "archivo", _sb_op(p0, "filename", nulo)), "tipo": _sb_op(p0, "tipo", _sb_op(p0, "type", nulo))}
+        si (p["nombre"] == nulo) { lanzar "subida: cada parte necesita nombre" }
+        sea cab = "Content-Disposition: form-data; name=\"" + _sb_cita(p["nombre"]) + "\""
+        sea archivo = p["archivo"]
+        si (archivo != nulo) { cab = cab + "; filename=\"" + _sb_cita(archivo) + "\"" }
+        sea tipo_p = p["tipo"]
+        si (tipo_p == nulo y archivo != nulo) { tipo_p = "application/octet-stream" }
+        si (tipo_p != nulo) { cab = cab + "\r\nContent-Type: " + _sb_cita(tipo_p) }
+        sea datos = "" + p["datos"]
+        si (bytes_buscar(datos, "--" + f, 0) >= 0) { lanzar "subida: los datos contienen la frontera" }
+        l.agregar("--" + f + "\r\n" + cab + "\r\n\r\n" + datos + "\r\n")
+    }
+    l.agregar("--" + f + "--\r\n")
+    sea cuerpo = unir(l, "")
+    sea tipo_c = "multipart/form-data; boundary=" + f
+    retornar {"cuerpo": cuerpo, "tipo": tipo_c, "body": cuerpo, "content_type": tipo_c}
+}

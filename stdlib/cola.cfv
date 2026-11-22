@@ -1,0 +1,167 @@
+// stdlib/cola.cfv — cola de trabajos en segundo plano: prioridades,
+// retrasos, reintentos con espera exponencial, trabajos fallidos y
+// guardado en disco (JSON). Inspirada en BullMQ (MIT). En inglés:
+// importar "queue".
+//
+//   importar "cola"
+//   sea c = cola_nueva()
+//   cola_agregar(c, "correo", {"para": "ana@ejemplo.cl"}, {"intentos": 3, "retraso_ms": 1000})
+//   cola_procesar(c, {"correo": funcion(datos) { enviar(datos) }})   // ejecuta los listos
+//   cola_trabajar(c, manejadores)                                    // bucle (bloquea)
+//
+// Opciones de cada trabajo: prioridad (mayor primero), retraso_ms,
+// intentos (3), espera_ms (1000, se duplica en cada fallo), id (evita
+// duplicados mientras esté pendiente).
+
+importar "json"
+
+funcion cola_nueva() {
+    retornar {"pendientes": [], "fallidos": [], "hechos": 0, "siguiente_id": 1, "reloj": nulo}
+}
+
+/// Reloj de pruebas (función que devuelve ms).
+funcion cola_con_reloj(c, reloj) { c["reloj"] = reloj  retornar c }
+
+funcion _cl_ahora(c) {
+    si (c["reloj"] != nulo) { retornar c["reloj"]() }
+    retornar cfv_fecha_ahora_ms()
+}
+
+sea _CL_EN = {"id": "id", "prioridad": "priority", "retraso_ms": "delay_ms", "intentos": "attempts", "espera_ms": "backoff_ms"}
+
+funcion _cl_op(o, k, d) {
+    si (o != nulo) {
+        si (tiene_clave(o, k)) { retornar o[k] }
+        si (tiene_clave(o, _CL_EN[k])) { retornar o[_CL_EN[k]] }
+    }
+    retornar d
+}
+
+/// Agrega un trabajo y devuelve su id (o el del pendiente con el mismo id).
+funcion cola_agregar(c, tipo_t, datos, opciones) {
+    sea id = _cl_op(opciones, "id", nulo)
+    si (id != nulo) {
+        para t en c["pendientes"] { si (t["id"] == id) { retornar id } }
+    } sino {
+        id = "" + c["siguiente_id"]
+        c["siguiente_id"] = c["siguiente_id"] + 1
+    }
+    c["pendientes"].agregar({
+        "id": id, "tipo": tipo_t, "datos": datos,
+        "prioridad": _cl_op(opciones, "prioridad", 0),
+        "listo_en": _cl_ahora(c) + _cl_op(opciones, "retraso_ms", 0),
+        "intentos": _cl_op(opciones, "intentos", 3),
+        "espera_ms": _cl_op(opciones, "espera_ms", 1000),
+        "hechos": 0, "error": nulo
+    })
+    retornar id
+}
+
+// Índice del próximo trabajo listo (mayor prioridad, luego el más antiguo).
+funcion _cl_proximo(c, ahora) {
+    sea mejor = 0 - 1
+    sea i = 0
+    mientras (i < longitud(c["pendientes"])) {
+        sea t = c["pendientes"][i]
+        si (t["listo_en"] <= ahora) {
+            si (mejor < 0) { mejor = i } sino {
+                sea m = c["pendientes"][mejor]
+                si (t["prioridad"] > m["prioridad"]) { mejor = i }
+            }
+        }
+        i = i + 1
+    }
+    retornar mejor
+}
+
+funcion _cl_quitar(lista, i) {
+    sea r = []
+    sea k = 0
+    mientras (k < longitud(lista)) { si (k != i) { r.agregar(lista[k]) }  k = k + 1 }
+    retornar r
+}
+
+/// Ejecuta los trabajos listos (como mucho "limite"). Devuelve cuántos corrió.
+/// Un manejador que lanza programa un reintento; al agotar intentos el
+/// trabajo pasa a "fallidos" con su último error.
+funcion cola_procesar(c, manejadores, limite) {
+    sea corridos = 0
+    sea tope = limite ?? 1000000
+    sea seguir = verdadero
+    mientras (seguir y corridos < tope) {
+        sea ahora = _cl_ahora(c)
+        sea i = _cl_proximo(c, ahora)
+        si (i < 0) { seguir = falso } sino {
+            sea t = c["pendientes"][i]
+            c["pendientes"] = _cl_quitar(c["pendientes"], i)
+            t["hechos"] = t["hechos"] + 1
+            corridos = corridos + 1
+            si (tiene_clave(manejadores, t["tipo"]) == falso) {
+                t["error"] = "sin manejador para " + t["tipo"]
+                c["fallidos"].agregar(t)
+            } sino {
+                sea ok = verdadero
+                intentar { manejadores[t["tipo"]](t["datos"]) } capturar (e) { ok = falso  t["error"] = "" + e }
+                si (ok) { c["hechos"] = c["hechos"] + 1 } sino {
+                    si (t["hechos"] >= t["intentos"]) { c["fallidos"].agregar(t) } sino {
+                        t["listo_en"] = ahora + t["espera_ms"] * potencia(2, t["hechos"] - 1)
+                        c["pendientes"].agregar(t)
+                    }
+                }
+            }
+        }
+    }
+    retornar corridos
+}
+
+/// Bucle que procesa y duerme hasta el próximo trabajo. Termina cuando la
+/// cola queda vacía si "hasta_vaciar" es verdadero.
+funcion cola_trabajar(c, manejadores, hasta_vaciar) {
+    sea seguir = verdadero
+    mientras (seguir) {
+        cola_procesar(c, manejadores)
+        si (longitud(c["pendientes"]) == 0 y hasta_vaciar == verdadero) { seguir = falso } sino {
+            sea espera = 1000
+            sea ahora = _cl_ahora(c)
+            para t en c["pendientes"] { si (t["listo_en"] - ahora < espera) { espera = t["listo_en"] - ahora } }
+            si (espera > 0) { dormir(espera) }
+        }
+    }
+}
+
+/// Cuenta por estado: {"pendientes", "listos", "fallidos", "hechos"}.
+funcion cola_estado(c) {
+    sea ahora = _cl_ahora(c)
+    sea listos = 0
+    para t en c["pendientes"] { si (t["listo_en"] <= ahora) { listos = listos + 1 } }
+    retornar {"pendientes": longitud(c["pendientes"]), "listos": listos, "fallidos": longitud(c["fallidos"]), "hechos": c["hechos"]}
+}
+
+/// Devuelve los fallidos a la cola con sus intentos reiniciados.
+funcion cola_reintentar_fallidos(c) {
+    sea n = longitud(c["fallidos"])
+    para t en c["fallidos"] {
+        t["hechos"] = 0
+        t["listo_en"] = _cl_ahora(c)
+        c["pendientes"].agregar(t)
+    }
+    c["fallidos"] = []
+    retornar n
+}
+
+/// Guarda pendientes y fallidos (los datos deben ser JSON).
+funcion cola_guardar(c, ruta) {
+    escribir_archivo(ruta, json_texto({"pendientes": c["pendientes"], "fallidos": c["fallidos"], "hechos": c["hechos"], "siguiente_id": c["siguiente_id"]}))
+}
+
+funcion cola_cargar(ruta) {
+    sea c = cola_nueva()
+    si (existe_archivo(ruta)) {
+        sea d = json_parsear(leer_archivo(ruta))
+        c["pendientes"] = d["pendientes"]
+        c["fallidos"] = d["fallidos"]
+        c["hechos"] = d["hechos"]
+        c["siguiente_id"] = d["siguiente_id"]
+    }
+    retornar c
+}

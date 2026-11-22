@@ -18,6 +18,21 @@ Sitio oficial: [c-forge.org](https://c-forge.org)
   JSON, sin inyección de líneas), `resiste`/`resilience` (reintentos con
   espera exponencial y cortacircuitos) y `plantilla`/`template` (`{{ }}`
   escapado, `#si`/`#if`, `#cada`/`#each`). Pruebas en español e inglés.
+- **Lote 4 (bilingüe):** `paquete_bin`/`msgpack` (MessagePack con vectores
+  de la especificación y límites contra mensajes hostiles), `css`
+  (minificador y analizador), `subida`/`multipart` (formularios con
+  archivos, nombres seguros, límites), `cola`/`queue` (trabajos con
+  prioridad, retrasos, reintentos y guardado), `calco`/`mapper` (mapeo
+  declarativo), `contrato`/`openapi` (OpenAPI 3.1 desde los esquemas),
+  `cosecha`/`scrape` (HTML real con selectores CSS) y `matriz`/`ndarray`
+  (N dimensiones, difusión, producto matricial).
+- **Números decimales:** los literales se redondean una sola vez (antes
+  `123.456` o `1e300` podían quedar a 1 ulp); mostrar un subnormal como
+  `5e-324` ya no falla, y `bytes_entero` acepta decimales enteros como `2^53`.
+- **Textos:** una llave con `:` o `;` dentro no interpola, así CSS
+  (`"a{color:red}"`) y objetos de JS (`"{a: 1}"`) se escriben tal cual.
+- Las pruebas de bibliotecas se llaman `prueba_*.cfv` para que nunca tapen
+  a un módulo al importarlo.
 - **Lote 3 (bilingüe):** `esquema`/`schema` (validación con rutas de error y
   mensajes en ambos idiomas), `freno`/`ratelimit` (cubeta de fichas por
   clave, cabeceras RateLimit-*), `casco`/`helmet` (CSP, HSTS, nosniff,
