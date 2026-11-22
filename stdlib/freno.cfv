@@ -1,0 +1,78 @@
+// stdlib/freno.cfv — límite de peticiones por clave (cubeta de fichas):
+// ráfagas hasta "capacidad" y recarga continua de "por_segundo".
+// Inspirada en Governor (MIT/Apache). En inglés: importar "ratelimit".
+//
+//   importar "freno"
+//   sea f = freno_nuevo(10, 2)                    // 10 de ráfaga, 2 por segundo
+//   si (freno_permitir(f, ip) == falso) { responder 429 con freno_espera_ms(f, ip) }
+//
+// Las claves inactivas que ya volvieron a llenarse se olvidan solas, así
+// que un atacante que rota claves no hace crecer la memoria sin límite.
+
+funcion freno_nuevo(capacidad, por_segundo) {
+    si (capacidad < 1 o por_segundo <= 0) { lanzar "freno: capacidad >= 1 y por_segundo > 0" }
+    retornar {"capacidad": capacidad, "tasa": por_segundo, "cubetas": {}, "reloj": nulo, "llamadas": 0}
+}
+
+/// Reemplaza el reloj (una función que devuelve milisegundos), para pruebas.
+funcion freno_con_reloj(f, reloj) { f["reloj"] = reloj  retornar f }
+
+funcion _fr_ahora(f) {
+    si (f["reloj"] != nulo) { retornar f["reloj"]() }
+    retornar cfv_fecha_ahora_ms()
+}
+
+funcion _fr_cubeta(f, clave) {
+    sea ahora = _fr_ahora(f)
+    sea k = "" + clave
+    f["llamadas"] = f["llamadas"] + 1
+    si (f["llamadas"] % 1000 == 0) { _fr_limpiar(f, ahora) }
+    si (tiene_clave(f["cubetas"], k) == falso) {
+        f["cubetas"][k] = {"fichas": f["capacidad"], "en": ahora}
+    }
+    sea c = f["cubetas"][k]
+    sea pasado = ahora - c["en"]
+    si (pasado > 0) {
+        c["fichas"] = minimo(f["capacidad"], c["fichas"] + pasado * f["tasa"] / 1000)
+        c["en"] = ahora
+    }
+    retornar c
+}
+
+funcion _fr_limpiar(f, ahora) {
+    sea nuevas = {}
+    para k en claves(f["cubetas"]) {
+        sea c = f["cubetas"][k]
+        si (c["fichas"] + (ahora - c["en"]) * f["tasa"] / 1000 < f["capacidad"]) { nuevas[k] = c }
+    }
+    f["cubetas"] = nuevas
+}
+
+/// Gasta "costo" fichas (1 por defecto) si alcanzan.
+funcion freno_permitir(f, clave, costo) {
+    sea n = costo ?? 1
+    sea c = _fr_cubeta(f, clave)
+    si (c["fichas"] >= n) {
+        c["fichas"] = c["fichas"] - n
+        retornar verdadero
+    }
+    retornar falso
+}
+
+/// Fichas enteras que quedan.
+funcion freno_restante(f, clave) { retornar piso(_fr_cubeta(f, clave)["fichas"]) }
+
+/// Milisegundos hasta que haya una ficha (0 si ya hay).
+funcion freno_espera_ms(f, clave) {
+    sea c = _fr_cubeta(f, clave)
+    si (c["fichas"] >= 1) { retornar 0 }
+    retornar piso((1 - c["fichas"]) * 1000 / f["tasa"]) + 1
+}
+
+/// Cabeceras estándar (RateLimit-*) y Retry-After para la respuesta.
+funcion freno_cabeceras(f, clave) {
+    sea h = {"RateLimit-Limit": "" + f["capacidad"], "RateLimit-Remaining": "" + freno_restante(f, clave)}
+    sea espera = freno_espera_ms(f, clave)
+    si (espera > 0) { h["Retry-After"] = "" + cociente(espera + 999, 1000) }
+    retornar h
+}

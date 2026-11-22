@@ -1,0 +1,245 @@
+// stdlib/xml.cfv — XML seguro: analiza a un árbol simple y lo vuelve a
+// escribir. Rechaza DOCTYPE/ENTITY, así que no hay XXE ni "billion laughs".
+// Inspirada en quick-xml (MIT). Nombres en español e inglés en el mismo
+// módulo (xml_parse, xml_stringify, xml_find, xml_child, xml_text).
+//
+//   importar "xml"
+//   sea raiz = xml_analizar("<libro id=\"7\"><titulo>Hola &amp; adiós</titulo></libro>")
+//   raiz["nombre"]                       // "libro"
+//   raiz["atributos"]["id"]              // "7"
+//   xml_contenido(xml_hijo(raiz, "titulo"))   // "Hola & adiós"
+//
+// Nodo: {"nombre", "atributos": mapa, "hijos": [nodo o texto]}.
+
+funcion xml_escapar(t) {
+    sea s = texto_reemplazar("" + t, "&", "&amp;")
+    s = texto_reemplazar(s, "<", "&lt;")
+    s = texto_reemplazar(s, ">", "&gt;")
+    s = texto_reemplazar(s, "\"", "&quot;")
+    retornar texto_reemplazar(s, "'", "&apos;")
+}
+
+funcion _xml_fallo(st, msg) { lanzar "xml: " + msg + " (posición " + st["i"] + ")" }
+
+funcion _xml_entidades(st, t) {
+    si (texto_indice(t, "&") < 0) { retornar t }
+    sea r = []
+    sea i = 0
+    mientras (i < longitud(t)) {
+        sea c = subcadena(t, i, i + 1)
+        si (c != "&") { r.agregar(c)  i = i + 1 } sino {
+            sea fin = texto_indice(subcadena(t, i, longitud(t)), ";")
+            si (fin < 0 o fin > 12) { _xml_fallo(st, "entidad sin cerrar") }
+            sea e = subcadena(t, i + 1, i + fin)
+            sea v = nulo
+            si (e == "amp") { v = "&" }
+            si (e == "lt") { v = "<" }
+            si (e == "gt") { v = ">" }
+            si (e == "quot") { v = "\"" }
+            si (e == "apos") { v = "'" }
+            si (v == nulo y texto_empieza_con(e, "#x")) { v = caracter(_xml_hex(st, subcadena(e, 2, longitud(e)))) }
+            si (v == nulo y texto_empieza_con(e, "#")) { v = caracter(_xml_dec(st, subcadena(e, 1, longitud(e)))) }
+            si (v == nulo) { _xml_fallo(st, "entidad desconocida &" + e + ";") }
+            r.agregar(v)
+            i = i + fin + 1
+        }
+    }
+    retornar unir(r, "")
+}
+
+funcion _xml_hex(st, h) {
+    sea n = 0
+    si (longitud(h) == 0 o longitud(h) > 6) { _xml_fallo(st, "código inválido") }
+    para k en texto_dividir(texto_minusculas(h), "") {
+        sea d = texto_indice("0123456789abcdef", k)
+        si (d < 0) { _xml_fallo(st, "código inválido") }
+        n = n * 16 + d
+    }
+    si (n == 0 o n > 1114111) { _xml_fallo(st, "código inválido") }
+    retornar n
+}
+
+funcion _xml_dec(st, h) {
+    sea n = 0
+    si (longitud(h) == 0 o longitud(h) > 7) { _xml_fallo(st, "código inválido") }
+    para k en texto_dividir(h, "") {
+        sea d = texto_indice("0123456789", k)
+        si (d < 0) { _xml_fallo(st, "código inválido") }
+        n = n * 10 + d
+    }
+    si (n == 0 o n > 1114111) { _xml_fallo(st, "código inválido") }
+    retornar n
+}
+
+funcion _xml_ve(st, s) { retornar subcadena(st["t"], st["i"], st["i"] + longitud(s)) == s }
+
+funcion _xml_hasta(st, s, que) {
+    sea p = texto_indice(subcadena(st["t"], st["i"], longitud(st["t"])), s)
+    si (p < 0) { _xml_fallo(st, "falta " + s + " de " + que) }
+    sea r = subcadena(st["t"], st["i"], st["i"] + p)
+    st["i"] = st["i"] + p + longitud(s)
+    retornar r
+}
+
+funcion _xml_blanco(b) { retornar b == 32 o b == 9 o b == 10 o b == 13 }
+
+funcion _xml_espacios(st) {
+    mientras (st["i"] < longitud(st["t"]) y _xml_blanco(byte_en(st["t"], st["i"]))) { st["i"] = st["i"] + 1 }
+}
+
+funcion _xml_es_nombre(b) {
+    retornar (b >= 97 y b <= 122) o (b >= 65 y b <= 90) o (b >= 48 y b <= 57) o b == 95 o b == 45 o b == 46 o b == 58 o b >= 128
+}
+
+funcion _xml_nombre(st) {
+    sea ini = st["i"]
+    mientras (st["i"] < longitud(st["t"]) y _xml_es_nombre(byte_en(st["t"], st["i"]))) { st["i"] = st["i"] + 1 }
+    si (st["i"] == ini) { _xml_fallo(st, "se esperaba un nombre") }
+    retornar subcadena(st["t"], ini, st["i"])
+}
+
+// Salta comentarios, instrucciones <?…?> y rechaza DOCTYPE.
+funcion _xml_saltar(st) {
+    sea seguir = verdadero
+    mientras (seguir) {
+        _xml_espacios(st)
+        seguir = falso
+        si (_xml_ve(st, "<!--")) { st["i"] = st["i"] + 4  _xml_hasta(st, "-->", "comentario")  seguir = verdadero }
+        si (_xml_ve(st, "<?")) { st["i"] = st["i"] + 2  _xml_hasta(st, "?>", "instrucción")  seguir = verdadero }
+        si (_xml_ve(st, "<!DOCTYPE") o _xml_ve(st, "<!ENTITY")) { _xml_fallo(st, "DOCTYPE/ENTITY no permitidos") }
+    }
+}
+
+funcion _xml_elemento(st, prof) {
+    si (prof > 256) { _xml_fallo(st, "anidamiento excesivo") }
+    si (_xml_ve(st, "<") == falso) { _xml_fallo(st, "se esperaba <") }
+    st["i"] = st["i"] + 1
+    sea nodo = {"nombre": _xml_nombre(st), "atributos": {}, "hijos": []}
+    sea abierto = verdadero
+    sea en_etiqueta = verdadero
+    mientras (en_etiqueta) {
+        _xml_espacios(st)
+        si (st["i"] >= longitud(st["t"])) { _xml_fallo(st, "etiqueta sin cerrar") }
+        si (_xml_ve(st, "/>")) { st["i"] = st["i"] + 2  abierto = falso  en_etiqueta = falso } sino {
+            si (_xml_ve(st, ">")) { st["i"] = st["i"] + 1  en_etiqueta = falso } sino {
+                sea k = _xml_nombre(st)
+                _xml_espacios(st)
+                si (_xml_ve(st, "=") == falso) { _xml_fallo(st, "falta = en el atributo " + k) }
+                st["i"] = st["i"] + 1
+                _xml_espacios(st)
+                sea q = subcadena(st["t"], st["i"], st["i"] + 1)
+                si (q != "\"" y q != "'") { _xml_fallo(st, "el atributo " + k + " va entre comillas") }
+                st["i"] = st["i"] + 1
+                sea v = _xml_hasta(st, q, "atributo")
+                si (texto_indice(v, "<") >= 0) { _xml_fallo(st, "< dentro de un atributo") }
+                si (tiene_clave(nodo["atributos"], k)) { _xml_fallo(st, "atributo repetido " + k) }
+                nodo["atributos"][k] = _xml_entidades(st, v)
+            }
+        }
+    }
+    si (abierto == falso) { retornar nodo }
+    mientras (abierto) {
+        si (st["i"] >= longitud(st["t"])) { _xml_fallo(st, "falta </" + nodo["nombre"] + ">") }
+        si (_xml_ve(st, "</")) {
+            st["i"] = st["i"] + 2
+            sea n = _xml_nombre(st)
+            si (n != nodo["nombre"]) { _xml_fallo(st, "se cerró " + n + " pero estaba abierto " + nodo["nombre"]) }
+            _xml_espacios(st)
+            si (_xml_ve(st, ">") == falso) { _xml_fallo(st, "se esperaba >") }
+            st["i"] = st["i"] + 1
+            abierto = falso
+        } sino {
+            si (_xml_ve(st, "<![CDATA[")) {
+                st["i"] = st["i"] + 9
+                nodo["hijos"].agregar(_xml_hasta(st, "]]>", "CDATA"))
+            } sino {
+                si (_xml_ve(st, "<!--") o _xml_ve(st, "<?") o _xml_ve(st, "<!")) { _xml_saltar(st) } sino {
+                    si (_xml_ve(st, "<")) { nodo["hijos"].agregar(_xml_elemento(st, prof + 1)) } sino {
+                        sea p = texto_indice(subcadena(st["t"], st["i"], longitud(st["t"])), "<")
+                        si (p < 0) { p = longitud(st["t"]) - st["i"] }
+                        sea txt = subcadena(st["t"], st["i"], st["i"] + p)
+                        st["i"] = st["i"] + p
+                        si (texto_recortar(txt) != "") { nodo["hijos"].agregar(_xml_entidades(st, txt)) }
+                    }
+                }
+            }
+        }
+    }
+    retornar nodo
+}
+
+/// Analiza un documento y devuelve el elemento raíz.
+funcion xml_analizar(texto) {
+    sea st = {"t": "" + texto, "i": 0}
+    si (texto_empieza_con(st["t"], caracter(65279))) { st["i"] = 3 }
+    _xml_saltar(st)
+    sea raiz = _xml_elemento(st, 0)
+    _xml_saltar(st)
+    si (st["i"] < longitud(st["t"])) { _xml_fallo(st, "contenido después de la raíz") }
+    retornar raiz
+}
+
+/// Escribe el nodo como XML (con sangría si sangria > 0).
+funcion xml_texto(nodo, sangria) { retornar _xml_escribir(nodo, sangria ?? 0, 0) }
+
+funcion _xml_escribir(n, s, nivel) {
+    si (tipo(n) == "texto") { retornar xml_escapar(n) }
+    sea r = "<" + n["nombre"]
+    para k en claves(n["atributos"]) { r = r + " " + k + "=\"" + xml_escapar(n["atributos"][k]) + "\"" }
+    si (longitud(n["hijos"]) == 0) { retornar r + "/>" }
+    r = r + ">"
+    sea solo_texto = verdadero
+    para h en n["hijos"] { si (tipo(h) != "texto") { solo_texto = falso } }
+    para h en n["hijos"] {
+        si (s > 0 y solo_texto == falso) { r = r + "\n" + texto_repetir(" ", s * (nivel + 1)) }
+        r = r + _xml_escribir(h, s, nivel + 1)
+    }
+    si (s > 0 y solo_texto == falso) { r = r + "\n" + texto_repetir(" ", s * nivel) }
+    retornar r + "</" + n["nombre"] + ">"
+}
+
+/// Primer hijo directo con ese nombre (o nulo).
+funcion xml_hijo(nodo, nombre) {
+    para h en nodo["hijos"] { si (tipo(h) == "mapa") { si (h["nombre"] == nombre) { retornar h } } }
+    retornar nulo
+}
+
+/// Todos los descendientes con ese nombre, en orden del documento.
+funcion xml_buscar(nodo, nombre) {
+    sea r = []
+    _xml_buscar_en(nodo, nombre, r)
+    retornar r
+}
+funcion _xml_buscar_en(n, nombre, r) {
+    para h en n["hijos"] {
+        si (tipo(h) == "mapa") {
+            si (h["nombre"] == nombre) { r.agregar(h) }
+            _xml_buscar_en(h, nombre, r)
+        }
+    }
+}
+
+/// Texto de todo el contenido (concatenado, sin etiquetas).
+funcion xml_contenido(nodo) {
+    si (nodo == nulo) { retornar nulo }
+    si (tipo(nodo) == "texto") { retornar nodo }
+    sea r = []
+    para h en nodo["hijos"] { r.agregar(xml_contenido(h)) }
+    retornar unir(r, "")
+}
+
+/// Crea un nodo: xml_nodo("item", {"id": 1}, ["texto", otro_nodo]).
+funcion xml_nodo(nombre, atributos, hijos) {
+    sea a = {}
+    si (atributos != nulo) { para k en claves(atributos) { a[k] = "" + atributos[k] } }
+    retornar {"nombre": nombre, "atributos": a, "hijos": hijos ?? []}
+}
+
+// English names.
+funcion xml_parse(texto) { retornar xml_analizar(texto) }
+funcion xml_stringify(nodo, sangria) { retornar xml_texto(nodo, sangria) }
+funcion xml_escape(t) { retornar xml_escapar(t) }
+funcion xml_child(nodo, nombre) { retornar xml_hijo(nodo, nombre) }
+funcion xml_find(nodo, nombre) { retornar xml_buscar(nodo, nombre) }
+funcion xml_text(nodo) { retornar xml_contenido(nodo) }
+funcion xml_node(nombre, atributos, hijos) { retornar xml_nodo(nombre, atributos, hijos) }

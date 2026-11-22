@@ -1,0 +1,204 @@
+// stdlib/reloj.cfv — expresiones cron: valida, dice si un instante
+// coincide y calcula la próxima ejecución. Inspirada en Quartz (Apache).
+// En inglés: importar "cron".
+//
+//   importar "reloj"
+//   sea c = reloj_cron("*/15 9-18 * * lun-vie")     // cada 15 min, horario de oficina
+//   reloj_siguiente(c, cfv_fecha_ahora_ms())         // ms de la próxima vez
+//   reloj_programar(c, funcion() { respaldar() })    // bucle que la ejecuta
+//
+// Campos: minuto hora día-del-mes mes día-de-semana. Admite *, a-b, a-b/n,
+// */n, listas con coma, nombres (ene/jan…, dom/sun…, 7 = domingo) y
+// @hora/@hourly, @diario/@daily, @semanal/@weekly, @mensual/@monthly,
+// @anual/@yearly. Como en cron, si día del mes y de semana están
+// restringidos, basta que se cumpla uno. Horas en UTC (o con desfase_min).
+
+sea _RJ_MESES = {"ene": 1, "feb": 2, "mar": 3, "abr": 4, "may": 5, "jun": 6, "jul": 7, "ago": 8, "sep": 9, "oct": 10, "nov": 11, "dic": 12,
+    "jan": 1, "apr": 4, "aug": 8, "dec": 12}
+sea _RJ_DIAS = {"dom": 0, "lun": 1, "mar": 2, "mie": 3, "mié": 3, "jue": 4, "vie": 5, "sab": 6, "sáb": 6,
+    "sun": 0, "mon": 1, "tue": 2, "wed": 3, "thu": 4, "fri": 5, "sat": 6}
+sea _RJ_MACROS = {"@hora": "0 * * * *", "@hourly": "0 * * * *", "@diario": "0 0 * * *", "@daily": "0 0 * * *", "@midnight": "0 0 * * *",
+    "@semanal": "0 0 * * 0", "@weekly": "0 0 * * 0", "@mensual": "0 0 1 * *", "@monthly": "0 0 1 * *",
+    "@anual": "0 0 1 1 *", "@yearly": "0 0 1 1 *", "@annually": "0 0 1 1 *"}
+
+funcion _rj_num(t, nombres, campo) {
+    sea x = texto_minusculas(texto_recortar(t))
+    si (nombres != nulo y tiene_clave(nombres, x)) { retornar nombres[x] }
+    si (longitud(x) == 0 o longitud(x) > 4) { lanzar "reloj: valor inválido en " + campo + ": " + t }
+    sea n = 0
+    para k en texto_dividir(x, "") {
+        sea d = texto_indice("0123456789", k)
+        si (d < 0) { lanzar "reloj: valor inválido en " + campo + ": " + t }
+        n = n * 10 + d
+    }
+    retornar n
+}
+
+// Devuelve una lista de 0/1 de largo max+1 y si el campo era "*".
+funcion _rj_campo(t, min, max, nombres, campo) {
+    sea marcas = []
+    sea i = 0
+    mientras (i <= max) { marcas.agregar(falso)  i = i + 1 }
+    para parte en texto_dividir(t, ",") {
+        sea paso = 1
+        sea rango = parte
+        sea barra = texto_indice(parte, "/")
+        si (barra >= 0) {
+            paso = _rj_num(subcadena(parte, barra + 1, longitud(parte)), nulo, campo)
+            rango = subcadena(parte, 0, barra)
+            si (paso < 1) { lanzar "reloj: paso 0 en " + campo }
+        }
+        sea a = min
+        sea b = max
+        si (rango != "*") {
+            sea guion = texto_indice(rango, "-")
+            si (guion > 0) {
+                a = _rj_num(subcadena(rango, 0, guion), nombres, campo)
+                b = _rj_num(subcadena(rango, guion + 1, longitud(rango)), nombres, campo)
+            } sino {
+                a = _rj_num(rango, nombres, campo)
+                b = a
+                si (barra >= 0) { b = max }
+            }
+        }
+        si (campo == "día de semana") {
+            si (a == 7) { a = 0  si (b == 7) { b = 0 } }
+            si (b == 7) { b = 6  marcas[0] = verdadero }
+        }
+        si (a < min o b > max o a > b) { lanzar "reloj: fuera de rango en " + campo + ": " + parte }
+        sea v = a
+        mientras (v <= b) { marcas[v] = verdadero  v = v + paso }
+    }
+    retornar marcas
+}
+
+/// Analiza la expresión; lanza un error claro si no es válida.
+funcion reloj_cron(expr, desfase_min) {
+    sea e = texto_recortar("" + expr)
+    si (tiene_clave(_RJ_MACROS, texto_minusculas(e))) { e = _RJ_MACROS[texto_minusculas(e)] }
+    sea campos = []
+    para p en texto_dividir(e, " ") { si (p != "") { campos.agregar(p) } }
+    si (longitud(campos) != 5) { lanzar "reloj: se esperaban 5 campos (minuto hora día mes día-semana)" }
+    retornar {
+        "expr": expr, "desfase": desfase_min ?? 0,
+        "min": _rj_campo(campos[0], 0, 59, nulo, "minuto"),
+        "hora": _rj_campo(campos[1], 0, 23, nulo, "hora"),
+        "dia": _rj_campo(campos[2], 1, 31, nulo, "día del mes"),
+        "mes": _rj_campo(campos[3], 1, 12, _RJ_MESES, "mes"),
+        "sem": _rj_campo(campos[4], 0, 6, _RJ_DIAS, "día de semana"),
+        "dia_libre": campos[2] == "*", "sem_libre": campos[4] == "*"
+    }
+}
+
+// Días desde 1970-01-01 a fecha civil y al revés (H. Hinnant).
+funcion _rj_civil(dias) {
+    sea z = dias + 719468
+    sea era = cociente(z, 146097)
+    si (z < 0 y z % 146097 != 0) { era = era - 1 }
+    sea doe = z - era * 146097
+    sea yoe = cociente(doe - cociente(doe, 1460) + cociente(doe, 36524) - cociente(doe, 146096), 365)
+    sea doy = doe - (365 * yoe + cociente(yoe, 4) - cociente(yoe, 100))
+    sea mp = cociente(5 * doy + 2, 153)
+    sea d = doy - cociente(153 * mp + 2, 5) + 1
+    sea m = mp + 3
+    si (m > 12) { m = m - 12 }
+    sea a = yoe + era * 400
+    si (m <= 2) { a = a + 1 }
+    retornar [a, m, d]
+}
+
+funcion _rj_dias(a, m, d) {
+    sea y = a
+    si (m <= 2) { y = y - 1 }
+    sea era = cociente(y, 400)
+    si (y < 0 y y % 400 != 0) { era = era - 1 }
+    sea yoe = y - era * 400
+    sea mm = m - 3
+    si (m <= 2) { mm = m + 9 }
+    sea doy = cociente(153 * mm + 2, 5) + d - 1
+    sea doe = yoe * 365 + cociente(yoe, 4) - cociente(yoe, 100) + doy
+    retornar era * 146097 + doe - 719468
+}
+
+funcion _rj_dia_ok(c, dias, d) {
+    sea s = (dias % 7 + 11) % 7
+    si (c["dia_libre"]) { retornar c["sem"][s] }
+    si (c["sem_libre"]) { retornar c["dia"][d] }
+    retornar c["dia"][d] o c["sem"][s]
+}
+
+/// ¿El minuto que contiene ms coincide con la expresión?
+funcion reloj_coincide(c, ms) {
+    sea minutos = cociente(ms, 60000) + c["desfase"]
+    si (ms < 0 y ms % 60000 != 0) { minutos = minutos - 1 }
+    sea dias = cociente(minutos, 1440)
+    si (minutos < 0 y minutos % 1440 != 0) { dias = dias - 1 }
+    sea resto = minutos - dias * 1440
+    sea f = _rj_civil(dias)
+    retornar c["mes"][f[1]] y _rj_dia_ok(c, dias, f[2]) y c["hora"][cociente(resto, 60)] y c["min"][resto % 60]
+}
+
+/// Próximo instante (ms, inicio de minuto) estrictamente después de ms.
+/// Salta por días y horas, así que nunca recorre años minuto a minuto.
+funcion reloj_siguiente(c, ms) {
+    sea minutos = cociente(ms, 60000) + 1 + c["desfase"]
+    sea dias = cociente(minutos, 1440)
+    sea resto = minutos - dias * 1440
+    sea limite = dias + 366 * 8
+    mientras (dias <= limite) {
+        sea f = _rj_civil(dias)
+        si (c["mes"][f[1]] y _rj_dia_ok(c, dias, f[2])) {
+            sea h = cociente(resto, 60)
+            sea m = resto % 60
+            mientras (h < 24) {
+                si (c["hora"][h]) {
+                    mientras (m < 60) {
+                        si (c["min"][m]) { retornar ((dias * 1440 + h * 60 + m) - c["desfase"]) * 60000 }
+                        m = m + 1
+                    }
+                }
+                h = h + 1
+                m = 0
+            }
+        }
+        dias = dias + 1
+        resto = 0
+    }
+    lanzar "reloj: la expresión nunca ocurre (p. ej. 31 de febrero)"
+}
+
+/// Las próximas n ejecuciones.
+funcion reloj_proximas(c, ms, n) {
+    sea r = []
+    sea t = ms
+    mientras (longitud(r) < n) {
+        t = reloj_siguiente(c, t)
+        r.agregar(t)
+    }
+    retornar r
+}
+
+/// ms → "AAAA-MM-DD HH:MM" (UTC, o con el desfase de la expresión).
+funcion reloj_formato(c, ms) {
+    sea minutos = cociente(ms, 60000) + c["desfase"]
+    sea dias = cociente(minutos, 1440)
+    sea resto = minutos - dias * 1440
+    sea f = _rj_civil(dias)
+    sea dos = funcion(n) {
+        si (n < 10) { retornar "0" + n }
+        retornar "" + n
+    }
+    retornar f[0] + "-" + dos(f[1]) + "-" + dos(f[2]) + " " + dos(cociente(resto, 60)) + ":" + dos(resto % 60)
+}
+
+/// Ejecuta f cada vez que toca (bloquea; "veces" limita las ejecuciones).
+funcion reloj_programar(c, f, veces) {
+    sea hechas = 0
+    mientras (veces == nulo o hechas < veces) {
+        sea ahora = cfv_fecha_ahora_ms()
+        sea t = reloj_siguiente(c, ahora)
+        dormir(t - ahora)
+        f()
+        hechas = hechas + 1
+    }
+}
