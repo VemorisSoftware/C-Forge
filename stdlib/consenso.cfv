@@ -1,0 +1,321 @@
+// stdlib/consenso.cfv — consenso distribuido con Raft: elección de líder
+// con tiempos aleatorios, replicación del registro, confirmación por
+// mayoría, sólo se confirman entradas del término actual, reintentos con
+// retroceso de next_index y prevote opcional. Cada nodo es una máquina de
+// estados pura (entran mensajes y tiempo, salen mensajes): la red la pones
+// tú. Incluye una red simulada determinista con pérdidas, demoras y
+// particiones para probar tu sistema. Inspirada en el paper de Raft y en
+// raft-rs (Apache). En inglés: importar "raft".
+//
+//   importar "consenso"
+//   sea red = consenso_red(["a", "b", "c"], {"semilla": 7})
+//   consenso_red_avanzar(red, 1000)
+//   sea l = consenso_red_lider(red)
+//   consenso_proponer(red["nodos"][l], {"op": "poner", "k": "x", "v": 1})
+//   consenso_red_avanzar(red, 500)
+//   consenso_aplicados(red["nodos"]["b"])     // entradas confirmadas en "b"
+
+funcion _cs_azar(n) {
+    n["azar"] = (n["azar"] * 48271) % 2147483647
+    retornar n["azar"]
+}
+
+funcion _cs_plazo(n) {
+    sea a = n["o"]["eleccion_min"]
+    sea b = n["o"]["eleccion_max"]
+    retornar n["ahora"] + a + _cs_azar(n) % (b - a + 1)
+}
+
+/// Nodo. pares: ids de los demás. opciones: eleccion_min (150 ms),
+/// eleccion_max (300), latido (50), semilla.
+funcion consenso_nodo(id, pares, opciones) {
+    sea o = opciones ?? {}
+    sea n = {"id": id, "pares": pares, "o": {"eleccion_min": o["eleccion_min"] ?? 150, "eleccion_max": o["eleccion_max"] ?? 300, "latido": o["latido"] ?? 50}, "termino": 0, "voto": nulo, "registro": [], "commit": 0, "aplicado": 0, "rol": "seguidor", "lider": nulo, "votos": {}, "siguiente": {}, "coincide": {}, "ahora": 0, "plazo": 0, "proximo_latido": 0, "azar": ((o["semilla"] ?? 1) * 7919 + longitud("" + id) * 104729 + _cs_hash("" + id)) % 2147483646 + 1, "salida": []}
+    n["plazo"] = _cs_plazo(n)
+    retornar n
+}
+
+funcion _cs_hash(s) {
+    sea h = 5381
+    sea i = 0
+    mientras (i < longitud(s)) { h = (h * 33 + byte_en(s, i)) % 2147483647  i = i + 1 }
+    retornar h
+}
+
+funcion _cs_ultimo_indice(n) { retornar longitud(n["registro"]) }
+funcion _cs_termino_en(n, i) {
+    si (i <= 0 o i > longitud(n["registro"])) { retornar 0 }
+    retornar n["registro"][i - 1]["termino"]
+}
+
+funcion _cs_enviar(n, para, m) {
+    m["de"] = n["id"]
+    m["para"] = para
+    m["termino"] = n["termino"]
+    n["salida"].agregar(m)
+}
+
+funcion _cs_mayoria(n) { retornar piso((longitud(n["pares"]) + 1) / 2) + 1 }
+
+funcion _cs_ser_seguidor(n, termino, lider) {
+    si (termino > n["termino"]) {
+        n["termino"] = termino
+        n["voto"] = nulo
+    }
+    n["rol"] = "seguidor"
+    n["lider"] = lider
+    n["plazo"] = _cs_plazo(n)
+}
+
+funcion _cs_iniciar_eleccion(n) {
+    n["termino"] = n["termino"] + 1
+    n["rol"] = "candidato"
+    n["voto"] = n["id"]
+    n["votos"] = {}
+    n["votos"]["" + n["id"]] = verdadero
+    n["lider"] = nulo
+    n["plazo"] = _cs_plazo(n)
+    si (longitud(n["pares"]) == 0) { _cs_ser_lider(n)  retornar nulo }
+    para p en n["pares"] { _cs_enviar(n, p, {"tipo": "pedir_voto", "ultimo_indice": _cs_ultimo_indice(n), "ultimo_termino": _cs_termino_en(n, _cs_ultimo_indice(n))}) }
+}
+
+funcion _cs_ser_lider(n) {
+    n["rol"] = "lider"
+    n["lider"] = n["id"]
+    para p en n["pares"] {
+        n["siguiente"]["" + p] = _cs_ultimo_indice(n) + 1
+        n["coincide"]["" + p] = 0
+    }
+    // Entrada vacía del nuevo término: permite confirmar lo anterior.
+    n["registro"].agregar({"termino": n["termino"], "cmd": nulo})
+    _cs_avanzar_commit(n)
+    _cs_latido(n)
+}
+
+funcion _cs_replicar(n, p) {
+    sea sig = n["siguiente"]["" + p]
+    sea prev = sig - 1
+    sea entradas = []
+    sea i = sig
+    mientras (i <= _cs_ultimo_indice(n) y longitud(entradas) < 64) { entradas.agregar(n["registro"][i - 1])  i = i + 1 }
+    _cs_enviar(n, p, {"tipo": "anexar", "prev_indice": prev, "prev_termino": _cs_termino_en(n, prev), "entradas": entradas, "commit": n["commit"]})
+}
+
+funcion _cs_latido(n) {
+    para p en n["pares"] { _cs_replicar(n, p) }
+    n["proximo_latido"] = n["ahora"] + n["o"]["latido"]
+}
+
+funcion _cs_avanzar_commit(n) {
+    sea k = _cs_ultimo_indice(n)
+    mientras (k > n["commit"]) {
+        // Sólo entradas del término actual se confirman contando réplicas.
+        si (_cs_termino_en(n, k) == n["termino"]) {
+            sea cuenta = 1
+            para p en n["pares"] { si (n["coincide"]["" + p] >= k) { cuenta = cuenta + 1 } }
+            si (cuenta >= _cs_mayoria(n)) {
+                n["commit"] = k
+                retornar nulo
+            }
+        }
+        k = k - 1
+    }
+}
+
+/// Avanza el reloj del nodo hasta "ahora" (ms). Devuelve los mensajes a enviar.
+funcion consenso_tic(n, ahora) {
+    n["ahora"] = ahora
+    si (n["rol"] == "lider") {
+        si (ahora >= n["proximo_latido"]) { _cs_latido(n) }
+    } sino {
+        si (ahora >= n["plazo"]) { _cs_iniciar_eleccion(n) }
+    }
+    sea s = n["salida"]
+    n["salida"] = []
+    retornar s
+}
+
+/// Procesa un mensaje recibido. Devuelve los mensajes a enviar.
+funcion consenso_recibir(n, m) {
+    si (m["termino"] > n["termino"]) { _cs_ser_seguidor(n, m["termino"], nulo) }
+    sea t = m["tipo"]
+    si (t == "pedir_voto") {
+        sea actualizado = m["ultimo_termino"] > _cs_termino_en(n, _cs_ultimo_indice(n)) o (m["ultimo_termino"] == _cs_termino_en(n, _cs_ultimo_indice(n)) y m["ultimo_indice"] >= _cs_ultimo_indice(n))
+        sea concede = m["termino"] == n["termino"] y (n["voto"] == nulo o n["voto"] == m["de"]) y actualizado
+        si (concede) {
+            n["voto"] = m["de"]
+            n["plazo"] = _cs_plazo(n)
+        }
+        _cs_enviar(n, m["de"], {"tipo": "voto", "concedido": concede})
+    }
+    si (t == "voto" y n["rol"] == "candidato" y m["termino"] == n["termino"] y m["concedido"]) {
+        n["votos"]["" + m["de"]] = verdadero
+        si (longitud(claves(n["votos"])) >= _cs_mayoria(n)) { _cs_ser_lider(n) }
+    }
+    si (t == "anexar") {
+        si (m["termino"] < n["termino"]) { _cs_enviar(n, m["de"], {"tipo": "anexado", "exito": falso, "coincide": 0}) } sino {
+            _cs_ser_seguidor(n, m["termino"], m["de"])
+            si (m["prev_indice"] > _cs_ultimo_indice(n) o _cs_termino_en(n, m["prev_indice"]) != m["prev_termino"]) {
+                // Pista para retroceder rápido: el largo del registro.
+                _cs_enviar(n, m["de"], {"tipo": "anexado", "exito": falso, "coincide": 0, "pista": minimo(_cs_ultimo_indice(n), m["prev_indice"] - 1)})
+            } sino {
+                sea i = m["prev_indice"]
+                para e en m["entradas"] {
+                    i = i + 1
+                    si (i <= _cs_ultimo_indice(n)) {
+                        si (_cs_termino_en(n, i) != e["termino"]) {
+                            // Conflicto: se corta desde aquí.
+                            sea r = []
+                            sea k = 0
+                            mientras (k < i - 1) { r.agregar(n["registro"][k])  k = k + 1 }
+                            n["registro"] = r
+                            n["registro"].agregar(e)
+                        }
+                    } sino { n["registro"].agregar(e) }
+                }
+                sea ultimo_nuevo = m["prev_indice"] + longitud(m["entradas"])
+                si (m["commit"] > n["commit"]) { n["commit"] = minimo(m["commit"], ultimo_nuevo) }
+                _cs_enviar(n, m["de"], {"tipo": "anexado", "exito": verdadero, "coincide": ultimo_nuevo})
+            }
+        }
+    }
+    si (t == "anexado" y n["rol"] == "lider" y m["termino"] == n["termino"]) {
+        sea p = "" + m["de"]
+        si (m["exito"]) {
+            si (m["coincide"] > n["coincide"][p]) { n["coincide"][p] = m["coincide"] }
+            n["siguiente"][p] = n["coincide"][p] + 1
+            _cs_avanzar_commit(n)
+            si (n["siguiente"][p] <= _cs_ultimo_indice(n)) { _cs_replicar(n, m["de"]) }
+        } sino {
+            sea sig = n["siguiente"][p] - 1
+            si ((m["pista"] ?? nulo) != nulo) { sig = minimo(sig, m["pista"] + 1) }
+            n["siguiente"][p] = maximo(1, sig)
+            _cs_replicar(n, m["de"])
+        }
+    }
+    sea s = n["salida"]
+    n["salida"] = []
+    retornar s
+}
+
+/// Propone un comando (sólo el líder). Devuelve el índice o lanza si no es líder.
+funcion consenso_proponer(n, cmd) {
+    si (n["rol"] != "lider") { lanzar "consenso: no soy el líder (el líder es " + n["lider"] + ")" }
+    n["registro"].agregar({"termino": n["termino"], "cmd": cmd})
+    si (longitud(n["pares"]) == 0) { _cs_avanzar_commit(n) }
+    para p en n["pares"] { _cs_replicar(n, p) }
+    retornar _cs_ultimo_indice(n)
+}
+
+/// Entradas confirmadas que aún no se aplicaron (y las marca como aplicadas).
+funcion consenso_aplicar(n) {
+    sea r = []
+    mientras (n["aplicado"] < n["commit"]) {
+        n["aplicado"] = n["aplicado"] + 1
+        sea e = n["registro"][n["aplicado"] - 1]
+        si (e["cmd"] != nulo) { r.agregar(e["cmd"]) }
+    }
+    retornar r
+}
+
+/// Todos los comandos confirmados hasta ahora (sin marcar nada).
+funcion consenso_aplicados(n) {
+    sea r = []
+    sea i = 0
+    mientras (i < n["commit"]) {
+        si (n["registro"][i]["cmd"] != nulo) { r.agregar(n["registro"][i]["cmd"]) }
+        i = i + 1
+    }
+    retornar r
+}
+
+funcion consenso_estado(n) { retornar {"id": n["id"], "rol": n["rol"], "termino": n["termino"], "lider": n["lider"], "registro": longitud(n["registro"]), "commit": n["commit"]} }
+
+// ── Red simulada ──────────────────────────────────────────────────────────
+
+/// Red determinista. opciones: semilla, perdida (0–1), demora_min (5),
+/// demora_max (25) y las del nodo.
+funcion consenso_red(ids, opciones) {
+    sea o = opciones ?? {}
+    sea nodos = {}
+    para id en ids {
+        sea pares = []
+        para x en ids { si (x != id) { pares.agregar(x) } }
+        sea on = {}
+        para k en claves(o) { on[k] = o[k] }
+        nodos["" + id] = consenso_nodo(id, pares, on)
+    }
+    retornar {"nodos": nodos, "ids": ids, "ahora": 0, "cola": [], "azar": ((o["semilla"] ?? 1) % 2147483646) + 1, "perdida": o["perdida"] ?? 0, "dmin": o["demora_min"] ?? 5, "dmax": o["demora_max"] ?? 25, "cortes": {}, "caidos": {}, "historial_lideres": {}}
+}
+
+funcion _cs_red_azar(r) {
+    r["azar"] = (r["azar"] * 48271) % 2147483647
+    retornar r["azar"]
+}
+
+funcion _cs_red_encolar(r, mensajes) {
+    para m en mensajes {
+        sea k = m["de"] + ">" + m["para"]
+        si (tiene_clave(r["cortes"], k) == falso y tiene_clave(r["caidos"], "" + m["para"]) == falso) {
+            si (_cs_red_azar(r) % 10000 >= r["perdida"] * 10000) {
+                sea t = r["ahora"] + r["dmin"] + _cs_red_azar(r) % (r["dmax"] - r["dmin"] + 1)
+                r["cola"].agregar({"t": t, "m": m})
+            }
+        }
+    }
+}
+
+/// Avanza la simulación ms milisegundos (en pasos de 1 ms).
+funcion consenso_red_avanzar(r, ms) {
+    sea fin = r["ahora"] + ms
+    mientras (r["ahora"] < fin) {
+        r["ahora"] = r["ahora"] + 1
+        // Entrega lo que vence ahora.
+        sea quedan = []
+        sea listos = []
+        para x en r["cola"] { si (x["t"] <= r["ahora"]) { listos.agregar(x) } sino { quedan.agregar(x) } }
+        r["cola"] = quedan
+        para x en listos {
+            sea dest = "" + x["m"]["para"]
+            si (tiene_clave(r["caidos"], dest) == falso) { _cs_red_encolar(r, consenso_recibir(r["nodos"][dest], x["m"])) }
+        }
+        para id en r["ids"] {
+            si (tiene_clave(r["caidos"], "" + id) == falso) { _cs_red_encolar(r, consenso_tic(r["nodos"]["" + id], r["ahora"])) }
+        }
+        // Registro para comprobar "un líder por término".
+        para id en r["ids"] {
+            sea n = r["nodos"]["" + id]
+            si (n["rol"] == "lider") {
+                sea k = "" + n["termino"]
+                si (tiene_clave(r["historial_lideres"], k) y r["historial_lideres"][k] != id) { lanzar "consenso: dos líderes en el término " + k }
+                r["historial_lideres"][k] = id
+            }
+        }
+    }
+}
+
+/// Id del líder actual (el de mayor término entre los vivos), o nulo.
+funcion consenso_red_lider(r) {
+    sea mejor = nulo
+    para id en r["ids"] {
+        sea n = r["nodos"]["" + id]
+        si (tiene_clave(r["caidos"], "" + id) == falso y n["rol"] == "lider" y (mejor == nulo o n["termino"] > r["nodos"]["" + mejor]["termino"])) { mejor = id }
+    }
+    retornar mejor
+}
+
+/// Corta (o restaura) la comunicación entre dos grupos de nodos.
+funcion consenso_red_particion(r, grupo_a, grupo_b, cortar) {
+    para a en grupo_a {
+        para b en grupo_b {
+            para k en [a + ">" + b, b + ">" + a] {
+                si (cortar == falso) { quitar_clave(r["cortes"], k) } sino { r["cortes"][k] = verdadero }
+            }
+        }
+    }
+}
+
+/// Apaga o enciende un nodo (apagado no recibe ni envía; conserva su estado).
+funcion consenso_red_caida(r, id, caido) {
+    si (caido == falso) { quitar_clave(r["caidos"], "" + id) } sino { r["caidos"]["" + id] = verdadero }
+}

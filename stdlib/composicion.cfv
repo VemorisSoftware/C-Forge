@@ -1,0 +1,540 @@
+// stdlib/composicion.cfv — composición tipográfica de PDFs: escribes
+// títulos, párrafos (con **negrita**, *cursiva* y `código`), listas,
+// citas, tablas, código, imágenes y reglas, o directamente Markdown, y el
+// módulo hace el resto: corta líneas, justifica, pasa de página sin dejar
+// títulos huérfanos, repite la cabecera de las tablas y agrega encabezado
+// y pie con "Página 3 de 10". Usa "documento". Inspirada en Typst
+// (Apache, solo la idea). En inglés: importar "typeset".
+//
+//   importar "composicion"
+//   sea c = composicion_nueva({"tamano": "A4", "pie": "Página %p de %t"})
+//   composicion_markdown(c, leer_archivo("informe.md"))
+//   escribir_archivo("informe.pdf", composicion_pdf(c))
+
+importar "documento"
+
+/// opciones: tamano, margenes (número o [arriba, der, abajo, izq], 56),
+/// fuente ("Helvetica" | "Times"), tamano_texto (11), interlineado (1.4),
+/// color, encabezado / pie (texto con %p = página y %t = total), titulo,
+/// autor, color_acento ("#1f4e79").
+funcion composicion_nueva(opciones) {
+    sea o = opciones ?? {}
+    sea d = documento_nuevo({"tamano": o["tamano"] ?? "A4", "titulo": o["titulo"] ?? nulo, "autor": o["autor"] ?? nulo, "horizontal": o["horizontal"] ?? falso})
+    sea m = o["margenes"] ?? 56
+    si (tipo(m) == "numero") { m = [m, m, m, m] }
+    sea c = {"d": d, "m": m, "fuente": o["fuente"] ?? "Helvetica", "tam": o["tamano_texto"] ?? 11, "inter": o["interlineado"] ?? 1.4, "color": o["color"] ?? "#222222", "acento": o["color_acento"] ?? "#1f4e79", "encabezado": o["encabezado"] ?? nulo, "pie": o["pie"] ?? nulo, "y": 0, "pagina": 0}
+    _cp_nueva_pagina(c)
+    retornar c
+}
+
+funcion _cp_nueva_pagina(c) {
+    documento_pagina(c["d"])
+    c["pagina"] = c["pagina"] + 1
+    c["y"] = c["m"][0]
+}
+
+funcion _cp_ancho_util(c) { retornar documento_ancho_pagina(c["d"]) - c["m"][1] - c["m"][3] }
+funcion _cp_fondo(c) { retornar documento_alto(c["d"]) - c["m"][2] }
+
+// Asegura alto libre; si no hay, pasa de página.
+funcion _cp_espacio(c, alto) {
+    si (c["y"] + alto > _cp_fondo(c) y c["y"] > c["m"][0] + 0.5) { _cp_nueva_pagina(c) }
+}
+
+// "**negrita** y *cursiva* con `código`" → trozos [{"t", "b", "i", "m"}].
+funcion _cp_trozos(texto) {
+    sea r = []
+    sea b = falso
+    sea i_ = falso
+    sea m = falso
+    sea actual = ""
+    sea s = "" + texto
+    sea k = 0
+    sea cerrar = funcion() {
+        si (actual != "") { r.agregar({"t": actual, "b": b, "i": i_, "m": m}) }
+        actual = ""
+    }
+    mientras (k < longitud(s)) {
+        sea c = subcadena(s, k, k + 1)
+        si (c == "`") {
+            cerrar()
+            m = m == falso
+            k = k + 1
+        } sino {
+            si (m == falso y subcadena(s, k, k + 2) == "**") {
+                cerrar()
+                b = b == falso
+                k = k + 2
+            } sino {
+                si (m == falso y (c == "*" o c == "_") y (k == 0 o subcadena(s, k - 1, k) == " " o i_ ) ) {
+                    cerrar()
+                    i_ = i_ == falso
+                    k = k + 1
+                } sino {
+                    si (m == falso y c == "\\" y k + 1 < longitud(s)) {
+                        actual = actual + subcadena(s, k + 1, k + 2)
+                        k = k + 2
+                    } sino {
+                        actual = actual + c
+                        k = k + 1
+                    }
+                }
+            }
+        }
+    }
+    cerrar()
+    retornar r
+}
+
+funcion _cp_fuente(c, tr) {
+    si (tr["m"]) { retornar documento_fuente("Courier", tr["b"], tr["i"]) }
+    retornar documento_fuente(c["fuente"], tr["b"], tr["i"])
+}
+
+// Palabras con su estilo, para cortar líneas.
+funcion _cp_palabras(c, trozos, tam) {
+    sea r = []
+    para tr en trozos {
+        sea f = _cp_fuente(c, tr)
+        sea partes = texto_dividir(tr["t"], " ")
+        sea i = 0
+        mientras (i < longitud(partes)) {
+            sea p = partes[i]
+            si (p != "") {
+                // Si la palabra anterior no terminó en espacio, se pega (p. ej. "**hola**,").
+                sea pegada = i == 0 y longitud(r) > 0 y texto_empieza_con(tr["t"], " ") == falso y r[longitud(r) - 1]["fin_espacio"] == falso
+                r.agregar({"t": p, "f": f, "w": documento_ancho(p, f, tam), "pegada": pegada, "fin_espacio": i < longitud(partes) - 1 o texto_termina_con(tr["t"], " ")})
+            }
+            i = i + 1
+        }
+    }
+    retornar r
+}
+
+funcion _cp_lineas(c, palabras, ancho, tam) {
+    sea lineas = []
+    sea actual = []
+    sea w = 0
+    sea esp = documento_ancho(" ", c["fuente"], tam)
+    para p en palabras {
+        sea extra = p["w"]
+        si (longitud(actual) > 0 y p["pegada"] == falso) { extra = extra + esp }
+        si (longitud(actual) > 0 y w + extra > ancho + 0.01 y p["pegada"] == falso) {
+            lineas.agregar(actual)
+            actual = []
+            w = 0
+            extra = p["w"]
+        }
+        actual.agregar(p)
+        w = w + extra
+    }
+    si (longitud(actual) > 0) { lineas.agregar(actual) }
+    retornar lineas
+}
+
+funcion _cp_ancho_linea(l, esp) {
+    sea w = 0
+    sea i = 0
+    mientras (i < longitud(l)) {
+        si (i > 0 y l[i]["pegada"] == falso) { w = w + esp }
+        w = w + l[i]["w"]
+        i = i + 1
+    }
+    retornar w
+}
+
+funcion _cp_huecos(l) {
+    sea n = 0
+    sea i = 1
+    mientras (i < longitud(l)) { si (l[i]["pegada"] == falso) { n = n + 1 }  i = i + 1 }
+    retornar n
+}
+
+// Dibuja una línea de palabras en (x, y) con espacio extra por hueco.
+funcion _cp_dibujar_linea(c, l, x, y, tam, extra, color) {
+    sea d = c["d"]
+    sea p = d["actual"]
+    sea esp = documento_ancho(" ", c["fuente"], tam)
+    sea cx = x
+    sea i = 0
+    mientras (i < longitud(l)) {
+        si (i > 0 y l[i]["pegada"] == falso) { cx = cx + esp + extra }
+        documento_texto(d, cx, y, l[i]["t"], {"fuente": l[i]["f"], "tamano": tam, "color": color})
+        cx = cx + l[i]["w"]
+        i = i + 1
+    }
+}
+
+funcion _cp_bloque_texto(c, texto, opciones) {
+    sea o = opciones ?? {}
+    sea tam = o["tamano"] ?? c["tam"]
+    sea x = c["m"][3] + (o["sangria"] ?? 0)
+    sea ancho = _cp_ancho_util(c) - (o["sangria"] ?? 0)
+    sea al = o["alinear"] ?? "justificado"
+    sea color = o["color"] ?? c["color"]
+    sea alto_l = tam * c["inter"]
+    sea trozos = _cp_trozos(texto)
+    si (o["negrita"] ?? falso) { para tr en trozos { tr["b"] = verdadero } }
+    sea lineas = _cp_lineas(c, _cp_palabras(c, trozos, tam), ancho, tam)
+    sea esp = documento_ancho(" ", c["fuente"], tam)
+    sea i = 0
+    mientras (i < longitud(lineas)) {
+        _cp_espacio(c, alto_l)
+        sea l = lineas[i]
+        sea w = _cp_ancho_linea(l, esp)
+        sea extra = 0
+        sea x0 = x
+        si (al == "justificado" y i < longitud(lineas) - 1 y _cp_huecos(l) > 0) { extra = (ancho - w) / _cp_huecos(l) }
+        si (al == "centro") { x0 = x + (ancho - w) / 2 }
+        si (al == "der") { x0 = x + ancho - w }
+        _cp_dibujar_linea(c, l, x0, c["y"], tam, extra, color)
+        c["y"] = c["y"] + alto_l
+        i = i + 1
+    }
+}
+
+/// Párrafo. opciones: alinear ("justificado" | "izq" | "centro" | "der"), tamano, color, sangria.
+funcion composicion_parrafo(c, texto, opciones) {
+    _cp_bloque_texto(c, texto, opciones)
+    c["y"] = c["y"] + c["tam"] * 0.6
+}
+
+sea _CP_TAMANOS_TITULO = [0, 22, 17, 14, 12.5, 11.5, 11]
+
+/// Título de nivel 1 a 6 (no queda solo al final de una página).
+funcion composicion_titulo(c, texto, nivel) {
+    sea n = minimo(maximo(nivel ?? 1, 1), 6)
+    sea tam = _CP_TAMANOS_TITULO[n]
+    // Necesita lugar para el título y al menos dos líneas más.
+    _cp_espacio(c, tam * 1.3 + c["tam"] * c["inter"] * 3)
+    si (c["y"] > c["m"][0] + 1) { c["y"] = c["y"] + tam * 0.5 }
+    _cp_bloque_texto(c, texto, {"tamano": tam, "alinear": "izq", "negrita": verdadero, "color": c["acento"]})
+    si (n <= 2) {
+        documento_linea(c["d"], c["m"][3], c["y"] + 1, c["m"][3] + _cp_ancho_util(c), c["y"] + 1, {"color": "#cccccc", "grosor": 0.6})
+        c["y"] = c["y"] + 6
+    }
+    c["y"] = c["y"] + tam * 0.3
+}
+
+/// Lista de elementos (texto con estilos). numerada = verdadero para 1. 2. 3.
+funcion composicion_lista(c, elementos, numerada) {
+    sea k = 1
+    para e en elementos {
+        sea marca = "•"
+        si (numerada == verdadero) { marca = k + "." }
+        _cp_espacio(c, c["tam"] * c["inter"])
+        documento_texto(c["d"], c["m"][3] + 6, c["y"], marca, {"fuente": c["fuente"], "tamano": c["tam"], "color": c["color"]})
+        _cp_bloque_texto(c, e, {"sangria": 22, "alinear": "izq"})
+        c["y"] = c["y"] + c["tam"] * 0.2
+        k = k + 1
+    }
+    c["y"] = c["y"] + c["tam"] * 0.4
+}
+
+/// Cita con barra lateral.
+funcion composicion_cita(c, texto) {
+    sea y0 = c["y"]
+    sea pag = c["pagina"]
+    _cp_bloque_texto(c, texto, {"sangria": 16, "alinear": "izq", "color": "#555555"})
+    si (c["pagina"] == pag) { documento_rect(c["d"], c["m"][3] + 4, y0, 3, c["y"] - y0, {"relleno": "#bbbbbb"}) }
+    c["y"] = c["y"] + c["tam"] * 0.6
+}
+
+/// Bloque de código en Courier con fondo gris (sin cortar líneas).
+funcion composicion_codigo(c, texto) {
+    sea tam = c["tam"] - 1.5
+    sea alto_l = tam * 1.3
+    sea lineas = texto_dividir(texto_reemplazar("" + texto, "\t", "    "), "\n")
+    sea i = 0
+    mientras (i < longitud(lineas)) {
+        // Cuántas líneas caben en esta página.
+        sea caben = piso((_cp_fondo(c) - c["y"] - 8) / alto_l)
+        si (caben < 1) {
+            _cp_nueva_pagina(c)
+            caben = piso((_cp_fondo(c) - c["y"] - 8) / alto_l)
+        }
+        sea n = minimo(caben, longitud(lineas) - i)
+        documento_rect(c["d"], c["m"][3], c["y"], _cp_ancho_util(c), n * alto_l + 8, {"relleno": "#f3f3f3"})
+        sea k = 0
+        mientras (k < n) {
+            documento_texto(c["d"], c["m"][3] + 6, c["y"] + 4 + k * alto_l, lineas[i + k], {"fuente": "Courier", "tamano": tam, "color": "#333333"})
+            k = k + 1
+        }
+        c["y"] = c["y"] + n * alto_l + 8
+        i = i + n
+    }
+    c["y"] = c["y"] + c["tam"] * 0.6
+}
+
+/// Línea horizontal.
+funcion composicion_regla(c) {
+    _cp_espacio(c, 12)
+    documento_linea(c["d"], c["m"][3], c["y"] + 4, c["m"][3] + _cp_ancho_util(c), c["y"] + 4, {"color": "#bbbbbb", "grosor": 0.7})
+    c["y"] = c["y"] + 12
+}
+
+funcion composicion_espacio(c, puntos) { c["y"] = c["y"] + puntos }
+funcion composicion_salto(c) { _cp_nueva_pagina(c) }
+
+/// Imagen (JPEG o PNG) al ancho dado (por defecto el ancho útil), centrada.
+funcion composicion_imagen(c, datos, ancho, pie_) {
+    sea w = minimo(ancho ?? _cp_ancho_util(c), _cp_ancho_util(c))
+    sea x = c["m"][3] + (_cp_ancho_util(c) - w) / 2
+    // Calcula el alto sin dibujar: ancho/alto del archivo.
+    sea d2 = documento_nuevo({})
+    sea dim = documento_imagen(d2, datos, 0, 0, w)
+    _cp_espacio(c, dim[1] + 6)
+    documento_imagen(c["d"], datos, x, c["y"], w)
+    c["y"] = c["y"] + dim[1] + 6
+    si (pie_ != nulo) { _cp_bloque_texto(c, pie_, {"tamano": c["tam"] - 1.5, "alinear": "centro", "color": "#666666"}) }
+    c["y"] = c["y"] + c["tam"] * 0.5
+}
+
+/// Tabla. filas: lista de listas de textos (la primera es la cabecera si
+/// opciones.cabecera no es falso). opciones: anchos (proporciones),
+/// alinear (["izq", "der", …]), cebra (verdadero).
+funcion composicion_tabla(c, filas, opciones) {
+    sea o = opciones ?? {}
+    si (longitud(filas) == 0) { retornar nulo }
+    sea n = longitud(filas[0])
+    sea util = _cp_ancho_util(c)
+    sea props = o["anchos"] ?? nulo
+    sea anchos = []
+    sea total = 0
+    sea j = 0
+    mientras (j < n) {
+        sea p_ = 1
+        si (props != nulo) { p_ = props[j] }
+        anchos.agregar(p_)
+        total = total + p_
+        j = j + 1
+    }
+    j = 0
+    mientras (j < n) { anchos[j] = anchos[j] / total * util  j = j + 1 }
+    sea con_cab = o["cabecera"] ?? verdadero
+    sea tam = c["tam"] - 1
+    sea alto_l = tam * 1.3
+    sea pad = 4
+    sea cebra = o["cebra"] ?? verdadero
+    sea medir = funcion(fila, negrita) {
+        sea maxl = 1
+        sea celdas = []
+        sea k = 0
+        mientras (k < n) {
+            sea t = "" + (fila[k] ?? "")
+            sea tr = _cp_trozos(t)
+            si (negrita) { para x en tr { x["b"] = verdadero } }
+            sea ls = _cp_lineas(c, _cp_palabras(c, tr, tam), anchos[k] - pad * 2, tam)
+            si (longitud(ls) == 0) { ls = [[]] }
+            celdas.agregar(ls)
+            maxl = maximo(maxl, longitud(ls))
+            k = k + 1
+        }
+        retornar {"celdas": celdas, "alto": maxl * alto_l + pad * 2}
+    }
+    sea dibujar = funcion(m, fondo, negrita) {
+        sea x = c["m"][3]
+        si (fondo != nulo) { documento_rect(c["d"], x, c["y"], util, m["alto"], {"relleno": fondo}) }
+        sea k = 0
+        mientras (k < n) {
+            sea al = "izq"
+            si ((o["alinear"] ?? nulo) != nulo) { al = o["alinear"][k] ?? "izq" }
+            sea ls = m["celdas"][k]
+            sea li = 0
+            mientras (li < longitud(ls)) {
+                sea esp = documento_ancho(" ", c["fuente"], tam)
+                sea w = _cp_ancho_linea(ls[li], esp)
+                sea x0 = x + pad
+                si (al == "der") { x0 = x + anchos[k] - pad - w }
+                si (al == "centro") { x0 = x + (anchos[k] - w) / 2 }
+                _cp_dibujar_linea(c, ls[li], x0, c["y"] + pad + li * alto_l, tam, 0, c["color"])
+                li = li + 1
+            }
+            x = x + anchos[k]
+            k = k + 1
+        }
+        documento_linea(c["d"], c["m"][3], c["y"] + m["alto"], c["m"][3] + util, c["y"] + m["alto"], {"color": "#d0d0d0", "grosor": 0.5})
+        c["y"] = c["y"] + m["alto"]
+    }
+    sea cab = nulo
+    sea ini = 0
+    si (con_cab) {
+        cab = medir(filas[0], verdadero)
+        ini = 1
+    }
+    sea dibujar_cab = funcion() {
+        si (cab != nulo) {
+            dibujar(cab, "#e8eef5", verdadero)
+            documento_linea(c["d"], c["m"][3], c["y"], c["m"][3] + util, c["y"], {"color": c["acento"], "grosor": 0.9})
+        }
+    }
+    sea primera = verdadero
+    sea i = ini
+    mientras (i < longitud(filas)) {
+        sea m = medir(filas[i], falso)
+        sea necesita = m["alto"]
+        si (primera y cab != nulo) { necesita = necesita + cab["alto"] }
+        si (c["y"] + necesita > _cp_fondo(c)) {
+            _cp_nueva_pagina(c)
+            dibujar_cab()
+        } sino { si (primera) { dibujar_cab() } }
+        primera = falso
+        sea fondo = nulo
+        si (cebra y (i - ini) % 2 == 1) { fondo = "#f7f7f7" }
+        dibujar(m, fondo, falso)
+        i = i + 1
+    }
+    si (primera) { dibujar_cab() }
+    c["y"] = c["y"] + c["tam"] * 0.8
+}
+
+// ── Markdown ──────────────────────────────────────────────────────────────
+
+funcion _cp_celdas(linea) {
+    sea t = texto_recortar(linea)
+    si (texto_empieza_con(t, "|")) { t = subcadena(t, 1, longitud(t)) }
+    si (texto_termina_con(t, "|")) { t = subcadena(t, 0, longitud(t) - 1) }
+    sea r = []
+    para x en texto_dividir(t, "|") { r.agregar(texto_recortar(x)) }
+    retornar r
+}
+
+funcion _cp_es_separador(linea) {
+    sea t = texto_reemplazar(texto_reemplazar(texto_reemplazar(texto_reemplazar(texto_recortar(linea), "|", ""), "-", ""), ":", ""), " ", "")
+    retornar t == "" y texto_indice(linea, "-") >= 0 y texto_indice(linea, "|") >= 0
+}
+
+/// Agrega Markdown: # títulos, párrafos, **negrita**, *cursiva*, `código`,
+/// listas (- y 1.), > citas, ``` bloques, tablas | a | b | y ---.
+funcion composicion_markdown(c, md) {
+    sea lineas = texto_dividir(texto_reemplazar("" + md, "\r\n", "\n"), "\n")
+    sea i = 0
+    sea parrafo = []
+    sea cerrar_parrafo = funcion() {
+        si (longitud(parrafo) > 0) { composicion_parrafo(c, unir(parrafo, " ")) }
+        parrafo = []
+    }
+    mientras (i < longitud(lineas)) {
+        sea l = lineas[i]
+        sea t = texto_recortar(l)
+        si (t == "") {
+            cerrar_parrafo()
+            i = i + 1
+        } sino {
+            si (texto_empieza_con(t, "```")) {
+                cerrar_parrafo()
+                sea cod = []
+                i = i + 1
+                mientras (i < longitud(lineas) y texto_empieza_con(texto_recortar(lineas[i]), "```") == falso) { cod.agregar(lineas[i])  i = i + 1 }
+                composicion_codigo(c, unir(cod, "\n"))
+                i = i + 1
+            } sino {
+                si (texto_empieza_con(t, "#")) {
+                    cerrar_parrafo()
+                    sea n = 0
+                    mientras (n < longitud(t) y subcadena(t, n, n + 1) == "#") { n = n + 1 }
+                    composicion_titulo(c, texto_recortar(subcadena(t, n, longitud(t))), n)
+                    i = i + 1
+                } sino {
+                    si (t == "---" o t == "***" o t == "___") {
+                        cerrar_parrafo()
+                        composicion_regla(c)
+                        i = i + 1
+                    } sino {
+                        si (texto_empieza_con(t, "> ") o t == ">") {
+                            cerrar_parrafo()
+                            sea q = []
+                            mientras (i < longitud(lineas) y texto_empieza_con(texto_recortar(lineas[i]), ">")) {
+                                q.agregar(texto_recortar(subcadena(texto_recortar(lineas[i]), 1, longitud(texto_recortar(lineas[i])))))
+                                i = i + 1
+                            }
+                            composicion_cita(c, unir(q, " "))
+                        } sino {
+                            sea es_vineta = texto_empieza_con(t, "- ") o texto_empieza_con(t, "* ") o texto_empieza_con(t, "+ ")
+                            sea p_ = texto_indice(t, ". ")
+                            sea es_num = falso
+                            si (p_ > 0 y p_ <= 3) {
+                                sea nn = nulo
+                                intentar { nn = a_numero(subcadena(t, 0, p_)) } capturar (e) { nn = nulo }
+                                es_num = nn != nulo
+                            }
+                            si (es_vineta o es_num) {
+                                cerrar_parrafo()
+                                sea items = []
+                                mientras (i < longitud(lineas)) {
+                                    sea x = texto_recortar(lineas[i])
+                                    sea q2 = texto_indice(x, ". ")
+                                    si (es_vineta y (texto_empieza_con(x, "- ") o texto_empieza_con(x, "* ") o texto_empieza_con(x, "+ "))) { items.agregar(subcadena(x, 2, longitud(x)))  i = i + 1 } sino {
+                                        si (es_num y q2 > 0 y q2 <= 3) { items.agregar(subcadena(x, q2 + 2, longitud(x)))  i = i + 1 } sino {
+                                            si (x != "" y longitud(items) > 0 y texto_empieza_con(lineas[i], " ")) {
+                                                items[longitud(items) - 1] = items[longitud(items) - 1] + " " + x
+                                                i = i + 1
+                                            } sino { i = longitud(lineas) + 1 }
+                                        }
+                                    }
+                                }
+                                si (i == longitud(lineas) + 1) {
+                                    // Recupera la posición: busca la primera línea que no es de la lista.
+                                    i = 0
+                                }
+                                composicion_lista(c, items, es_num)
+                                // Avanza hasta después de la lista.
+                                si (i == 0) {
+                                    i = _cp_fin_lista(lineas, l)
+                                }
+                            } sino {
+                                si (texto_empieza_con(t, "|") y i + 1 < longitud(lineas) y _cp_es_separador(lineas[i + 1])) {
+                                    cerrar_parrafo()
+                                    sea filas = [_cp_celdas(t)]
+                                    sea al = []
+                                    para s en _cp_celdas(lineas[i + 1]) {
+                                        si (texto_termina_con(s, ":") y texto_empieza_con(s, ":")) { al.agregar("centro") } sino {
+                                            si (texto_termina_con(s, ":")) { al.agregar("der") } sino { al.agregar("izq") }
+                                        }
+                                    }
+                                    i = i + 2
+                                    mientras (i < longitud(lineas) y texto_empieza_con(texto_recortar(lineas[i]), "|")) { filas.agregar(_cp_celdas(lineas[i]))  i = i + 1 }
+                                    composicion_tabla(c, filas, {"alinear": al})
+                                } sino {
+                                    parrafo.agregar(t)
+                                    i = i + 1
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+    cerrar_parrafo()
+}
+
+funcion _cp_fin_lista(lineas, primera) {
+    // Ubica la línea "primera" y salta los elementos de la lista.
+    sea i = 0
+    mientras (i < longitud(lineas) y lineas[i] != primera) { i = i + 1 }
+    mientras (i < longitud(lineas)) {
+        sea x = texto_recortar(lineas[i])
+        sea q = texto_indice(x, ". ")
+        si (texto_empieza_con(x, "- ") o texto_empieza_con(x, "* ") o texto_empieza_con(x, "+ ") o (q > 0 y q <= 3) o (x != "" y texto_empieza_con(lineas[i], " "))) { i = i + 1 } sino { retornar i }
+    }
+    retornar i
+}
+
+/// Termina: agrega encabezado y pie a cada página y devuelve el PDF.
+funcion composicion_pdf(c) {
+    sea d = c["d"]
+    sea total = longitud(d["paginas"])
+    sea k = 0
+    para p en d["paginas"] {
+        k = k + 1
+        d["actual"] = p
+        para par en [[c["encabezado"], c["m"][0] / 2 - 4], [c["pie"], documento_alto(d) - c["m"][2] / 2 - 4]] {
+            si (par[0] != nulo) {
+                sea t = texto_reemplazar(texto_reemplazar("" + par[0], "%p", "" + k), "%t", "" + total)
+                documento_texto(d, documento_ancho_pagina(d) / 2, par[1], t, {"fuente": c["fuente"], "tamano": 8.5, "color": "#888888", "alinear": "centro"})
+            }
+        }
+    }
+    retornar documento_bytes(d)
+}
