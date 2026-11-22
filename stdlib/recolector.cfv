@@ -1,0 +1,919 @@
+// stdlib/recolector.cfv — recolección y transformación de registros al
+// estilo Vector: fuentes (archivos que se siguen con punto de control,
+// listas, entrada estándar), transformaciones (parse_json, parse_logfmt,
+// parse_syslog, parse_patron con %{campo}, filtro, remap con un lenguaje
+// pequeño parecido a VRL, muestreo, deduplicar, limitar, enrutar y
+// métricas por ventana) y destinos (consola, archivo con plantilla,
+// memoria, HTTP en NDJSON, bulk de Elasticsearch y Loki), conectados por
+// "inputs" como en vector.toml. Inspirada en Vector (MPL: sólo la idea).
+// En inglés: importar "logpipe".
+//
+//   importar "recolector"
+//   sea p = recolector_nuevo({
+//       "sources": {"app": {"type": "archivo", "include": ["app.log"]}},
+//       "transforms": {"json": {"type": "parse_json", "inputs": ["app"]},
+//                      "errores": {"type": "filtro", "inputs": ["json"], "condition": ".nivel == \"error\""}},
+//       "sinks": {"salida": {"type": "consola", "inputs": ["errores"], "encoding": "json"}}})
+//   recolector_ejecutar(p, {"una_vez": verdadero})
+
+importar "json"
+importar "ajustes"
+
+funcion __recolector_declaraciones() {
+    extern "libc" funcion read(fd: entero, buf: puntero, n: entero): largo
+}
+
+sea _RC_LL = caracter(123)
+sea _RC_RR = caracter(125)
+
+// ══ Eventos ════════════════════════════════════════════════════════════════
+
+funcion _rc_ahora_iso() {
+    sea ms = tiempo_ms()
+    sea s = piso(ms / 1000)
+    sea d = piso(s / 86400)
+    sea rs = s - d * 86400
+    sea z = d + 719468
+    sea era = piso(z / 146097)
+    sea doe = z - era * 146097
+    sea yoe = piso((doe - piso(doe / 1460) + piso(doe / 36524) - piso(doe / 146096)) / 365)
+    sea anio = yoe + era * 400
+    sea doy = doe - (365 * yoe + piso(yoe / 4) - piso(yoe / 100))
+    sea mp = piso((5 * doy + 2) / 153)
+    sea dia = doy - piso((153 * mp + 2) / 5) + 1
+    sea mes = mp + 3
+    si (mes > 12) { mes = mes - 12 }
+    si (mes <= 2) { anio = anio + 1 }
+    retornar anio + "-" + _rc_dos(mes) + "-" + _rc_dos(dia) + "T" + _rc_dos(piso(rs / 3600)) + ":" + _rc_dos(piso((rs % 3600) / 60)) + ":" + _rc_dos(rs % 60) + "." + _rc_tres(ms % 1000) + "Z"
+}
+
+funcion _rc_dos(n) {
+    si (n < 10) { retornar "0" + n }
+    retornar "" + n
+}
+
+funcion _rc_tres(n) {
+    si (n < 10) { retornar "00" + n }
+    si (n < 100) { retornar "0" + n }
+    retornar "" + n
+}
+
+funcion _rc_evento(mensaje, fuente, tipo_) {
+    retornar {"message": mensaje, "timestamp": _rc_ahora_iso(), "source_type": tipo_, "fuente": fuente}
+}
+
+funcion _rc_copia(v) {
+    si (tipo(v) == "mapa") {
+        sea r = {}
+        para k en claves(v) { r[k] = _rc_copia(v[k]) }
+        retornar r
+    }
+    si (tipo(v) == "lista") {
+        sea r = []
+        para x en v { r.agregar(_rc_copia(x)) }
+        retornar r
+    }
+    retornar v
+}
+
+// Rutas de campo: ".a.b" o "a.b".
+funcion recolector_campo(e, ruta) {
+    sea r = ruta
+    si (texto_empieza_con(r, ".")) { r = subcadena(r, 1, longitud(r)) }
+    si (r == "") { retornar e }
+    sea v = e
+    para p en texto_dividir(r, ".") {
+        si (tipo(v) != "mapa" o tiene_clave(v, p) == falso) { retornar nulo }
+        v = v[p]
+    }
+    retornar v
+}
+
+funcion _rc_poner(e, ruta, valor) {
+    sea r = ruta
+    si (texto_empieza_con(r, ".")) { r = subcadena(r, 1, longitud(r)) }
+    sea partes = texto_dividir(r, ".")
+    sea v = e
+    sea i = 0
+    mientras (i < longitud(partes) - 1) {
+        si (tipo(v[partes[i]] ?? nulo) != "mapa") { v[partes[i]] = {} }
+        v = v[partes[i]]
+        i = i + 1
+    }
+    v[partes[longitud(partes) - 1]] = valor
+}
+
+funcion _rc_borrar(e, ruta) {
+    sea r = ruta
+    si (texto_empieza_con(r, ".")) { r = subcadena(r, 1, longitud(r)) }
+    sea partes = texto_dividir(r, ".")
+    sea v = e
+    sea i = 0
+    mientras (i < longitud(partes) - 1) {
+        si (tipo(v[partes[i]] ?? nulo) != "mapa") { retornar nulo }
+        v = v[partes[i]]
+        i = i + 1
+    }
+    si (tiene_clave(v, partes[longitud(partes) - 1])) { quitar_clave(v, partes[longitud(partes) - 1]) }
+}
+
+/// Reemplaza "{{ campo }}" por el valor del evento (para rutas y claves).
+funcion recolector_plantilla(t, e) {
+    sea r = ""
+    sea i = 0
+    sea abre = _RC_LL + _RC_LL
+    sea cierra = _RC_RR + _RC_RR
+    mientras (i < longitud(t)) {
+        si (subcadena(t, i, i + 2) == abre) {
+            sea f = texto_indice(subcadena(t, i + 2, longitud(t)), cierra)
+            si (f < 0) { r = r + subcadena(t, i, longitud(t))  i = longitud(t) } sino {
+                sea campo = texto_recortar(subcadena(t, i + 2, i + 2 + f))
+                sea v = recolector_campo(e, campo)
+                si (v != nulo) { r = r + v }
+                i = i + 2 + f + 2
+            }
+        } sino {
+            r = r + subcadena(t, i, i + 1)
+            i = i + 1
+        }
+    }
+    retornar r
+}
+
+// ══ Analizadores ═══════════════════════════════════════════════════════════
+
+/// logfmt: clave=valor clave2="con espacios".
+funcion recolector_logfmt(t) {
+    sea r = {}
+    sea i = 0
+    sea n = longitud(t)
+    mientras (i < n) {
+        mientras (i < n y subcadena(t, i, i + 1) == " ") { i = i + 1 }
+        sea ini = i
+        mientras (i < n y subcadena(t, i, i + 1) != "=" y subcadena(t, i, i + 1) != " ") { i = i + 1 }
+        sea k = subcadena(t, ini, i)
+        si (k == "") { romper }
+        si (i < n y subcadena(t, i, i + 1) == "=") {
+            i = i + 1
+            sea v = ""
+            si (subcadena(t, i, i + 1) == "\"") {
+                i = i + 1
+                mientras (i < n y subcadena(t, i, i + 1) != "\"") {
+                    si (subcadena(t, i, i + 1) == "\\" y i + 1 < n) { i = i + 1 }
+                    v = v + subcadena(t, i, i + 1)
+                    i = i + 1
+                }
+                i = i + 1
+            } sino {
+                sea vi = i
+                mientras (i < n y subcadena(t, i, i + 1) != " ") { i = i + 1 }
+                v = subcadena(t, vi, i)
+            }
+            r[k] = v
+        } sino { r[k] = verdadero }
+    }
+    retornar r
+}
+
+sea _RC_MESES = {"Jan": 1, "Feb": 2, "Mar": 3, "Apr": 4, "May": 5, "Jun": 6, "Jul": 7, "Aug": 8, "Sep": 9, "Oct": 10, "Nov": 11, "Dec": 12}
+sea _RC_SEVERIDAD = ["emerg", "alert", "crit", "err", "warning", "notice", "info", "debug"]
+sea _RC_FACILIDAD = ["kern", "user", "mail", "daemon", "auth", "syslog", "lpr", "news", "uucp", "cron", "authpriv", "ftp", "ntp", "security", "console", "solaris-cron", "local0", "local1", "local2", "local3", "local4", "local5", "local6", "local7"]
+
+/// syslog RFC 5424 o RFC 3164: {"severity", "facility", "timestamp",
+/// "hostname", "appname", "procid", "msgid", "message", "version"}.
+funcion recolector_syslog(t) {
+    si (texto_empieza_con(t, "<") == falso) { lanzar "recolector: no es syslog" }
+    sea f = texto_indice(t, ">")
+    sea pri = a_numero(subcadena(t, 1, f))
+    sea r = {"severity": _RC_SEVERIDAD[pri % 8], "facility": _RC_FACILIDAD[cociente(pri, 8)] ?? ("" + cociente(pri, 8))}
+    sea resto = subcadena(t, f + 1, longitud(t))
+    si (texto_empieza_con(resto, "1 ")) {
+        sea p = texto_dividir(resto, " ")
+        r["version"] = 1
+        r["timestamp"] = p[1]
+        r["hostname"] = p[2]
+        r["appname"] = p[3]
+        r["procid"] = p[4]
+        r["msgid"] = p[5]
+        // Datos estructurados: "-" o [id clave="valor"...].
+        sea pos = 0
+        sea k = 0
+        mientras (k < 6) {
+            pos = pos + longitud(p[k]) + 1
+            k = k + 1
+        }
+        sea sd = subcadena(resto, pos, longitud(resto))
+        si (texto_empieza_con(sd, "-")) { sd = subcadena(sd, 1, longitud(sd)) } sino {
+            sea datos = {}
+            mientras (texto_empieza_con(sd, "[")) {
+                sea fin_ = texto_indice(sd, "]")
+                sea dentro = subcadena(sd, 1, fin_)
+                sea esp = texto_indice(dentro, " ")
+                sea id = dentro
+                sea params = {}
+                si (esp > 0) {
+                    id = subcadena(dentro, 0, esp)
+                    params = recolector_logfmt(subcadena(dentro, esp + 1, longitud(dentro)))
+                }
+                datos[id] = params
+                sd = subcadena(sd, fin_ + 1, longitud(sd))
+            }
+            r["structured_data"] = datos
+        }
+        si (texto_empieza_con(sd, " ")) { sd = subcadena(sd, 1, longitud(sd)) }
+        // BOM de UTF-8 al inicio del mensaje.
+        si (texto_empieza_con(sd, caracter(65279))) { sd = subcadena(sd, 3, longitud(sd)) }
+        r["message"] = sd
+        para c en ["procid", "msgid", "appname", "hostname"] { si (r[c] == "-") { r[c] = nulo } }
+        retornar r
+    }
+    // RFC 3164: "Oct 11 22:14:15 maquina app[123]: mensaje"
+    sea mes = subcadena(resto, 0, 3)
+    sea dia = a_numero(texto_recortar(subcadena(resto, 4, 6)))
+    sea hora = subcadena(resto, 7, 15)
+    r["timestamp"] = _rc_dos(_RC_MESES[mes] ?? 1) + "-" + _rc_dos(dia) + "T" + hora
+    sea s2 = subcadena(resto, 16, longitud(resto))
+    sea e = texto_indice(s2, " ")
+    r["hostname"] = subcadena(s2, 0, e)
+    s2 = subcadena(s2, e + 1, longitud(s2))
+    sea dp = texto_indice(s2, ": ")
+    si (dp > 0) {
+        sea tag = subcadena(s2, 0, dp)
+        sea cor = texto_indice(tag, "[")
+        si (cor > 0) {
+            r["appname"] = subcadena(tag, 0, cor)
+            r["procid"] = subcadena(tag, cor + 1, longitud(tag) - 1)
+        } sino { r["appname"] = tag }
+        r["message"] = subcadena(s2, dp + 2, longitud(s2))
+    } sino { r["message"] = s2 }
+    retornar r
+}
+
+/// Patrón con %{campo} (como grok sencillo): "%{ip} - - [%{fecha}] \"%{metodo} %{ruta}\"".
+/// %{campo:int} convierte a número. Devuelve el mapa o nulo si no calza.
+funcion recolector_patron(patron, texto) {
+    sea r = {}
+    sea i = 0
+    sea j = 0
+    mientras (i < longitud(patron)) {
+        si (subcadena(patron, i, i + 2) == "%" + _RC_LL) {
+            sea f = texto_indice(subcadena(patron, i, longitud(patron)), _RC_RR)
+            sea nombre = subcadena(patron, i + 2, i + f)
+            sea conv = nulo
+            sea dp = texto_indice(nombre, ":")
+            si (dp > 0) {
+                conv = subcadena(nombre, dp + 1, longitud(nombre))
+                nombre = subcadena(nombre, 0, dp)
+            }
+            i = i + f + 1
+            // El valor llega hasta el siguiente literal del patrón.
+            sea sig = ""
+            sea k = i
+            mientras (k < longitud(patron) y subcadena(patron, k, k + 2) != "%" + _RC_LL) { sig = sig + subcadena(patron, k, k + 1)  k = k + 1 }
+            sea valor = ""
+            si (sig == "") {
+                valor = subcadena(texto, j, longitud(texto))
+                j = longitud(texto)
+            } sino {
+                sea pos = texto_indice(subcadena(texto, j, longitud(texto)), sig)
+                si (pos < 0) { retornar nulo }
+                valor = subcadena(texto, j, j + pos)
+                j = j + pos
+            }
+            si (conv == "int" o conv == "float") { valor = a_numero(valor) }
+            si (nombre != "" y nombre != "_") { r[nombre] = valor }
+        } sino {
+            si (subcadena(patron, i, i + 1) != subcadena(texto, j, j + 1)) { retornar nulo }
+            i = i + 1
+            j = j + 1
+        }
+    }
+    si (j != longitud(texto)) { retornar nulo }
+    retornar r
+}
+
+// ══ Expresiones (condiciones y remap) ══════════════════════════════════════
+// Un lenguaje pequeño: .campo, "texto", números, true/false/null,
+// == != < > <= >= && || !, + (suma o concatenación), funciones
+// (upcase, downcase, to_int, to_float, to_string, length, contains,
+// starts_with, ends_with, exists, now, parse_json, split, join, strip).
+
+funcion _rc_lex(t) {
+    sea r = []
+    sea i = 0
+    mientras (i < longitud(t)) {
+        sea c = subcadena(t, i, i + 1)
+        si (c == " " o c == "\t" o c == "\n") { i = i + 1 } sino {
+            si (c == "\"") {
+                sea j = i + 1
+                sea s = ""
+                mientras (j < longitud(t) y subcadena(t, j, j + 1) != "\"") {
+                    si (subcadena(t, j, j + 1) == "\\" y j + 1 < longitud(t)) {
+                        j = j + 1
+                        sea e = subcadena(t, j, j + 1)
+                        si (e == "n") { s = s + "\n" } sino { s = s + e }
+                    } sino { s = s + subcadena(t, j, j + 1) }
+                    j = j + 1
+                }
+                r.agregar(["texto", s])
+                i = j + 1
+            } sino {
+                sea dos = subcadena(t, i, i + 2)
+                si (dos == "==" o dos == "!=" o dos == "<=" o dos == ">=" o dos == "&&" o dos == "||" o dos == "??") {
+                    r.agregar(["op", dos])
+                    i = i + 2
+                } sino {
+                    si (texto_indice("()<>!+-*/,=", c) >= 0) {
+                        r.agregar(["op", c])
+                        i = i + 1
+                    } sino {
+                        sea j = i
+                        mientras (j < longitud(t) y texto_indice(" \t\n()<>!=+-*/,\"&|?", subcadena(t, j, j + 1)) < 0) { j = j + 1 }
+                        // "!" pegado al final de una función (to_int!) se ignora.
+                        sea pal = subcadena(t, i, j)
+                        si (j < longitud(t) y subcadena(t, j, j + 1) == "!" y j + 1 < longitud(t) y subcadena(t, j + 1, j + 2) == "(") { j = j + 1 }
+                        si (pal == "") { lanzar "recolector: carácter inesperado '" + c + "'" }
+                        r.agregar(["pal", pal])
+                        i = j
+                    }
+                }
+            }
+        }
+    }
+    retornar r
+}
+
+funcion _rc_expr(p) { retornar _rc_o(p) }
+
+funcion _rc_ver(p) {
+    si (p["i"] < longitud(p["t"])) { retornar p["t"][p["i"]] }
+    retornar ["fin", ""]
+}
+
+funcion _rc_o(p) {
+    sea a = _rc_y(p)
+    mientras (_rc_ver(p)[1] == "||" o _rc_ver(p)[1] == "??") {
+        sea op = _rc_ver(p)[1]
+        p["i"] = p["i"] + 1
+        a = [op, a, _rc_y(p)]
+    }
+    retornar a
+}
+
+funcion _rc_y(p) {
+    sea a = _rc_cmp(p)
+    mientras (_rc_ver(p)[1] == "&&") {
+        p["i"] = p["i"] + 1
+        a = ["&&", a, _rc_cmp(p)]
+    }
+    retornar a
+}
+
+funcion _rc_cmp(p) {
+    sea a = _rc_suma(p)
+    sea op = _rc_ver(p)
+    si (op[0] == "op" y (op[1] == "==" o op[1] == "!=" o op[1] == "<" o op[1] == ">" o op[1] == "<=" o op[1] == ">=")) {
+        p["i"] = p["i"] + 1
+        retornar [op[1], a, _rc_suma(p)]
+    }
+    retornar a
+}
+
+funcion _rc_suma(p) {
+    sea a = _rc_unario(p)
+    mientras (_rc_ver(p)[1] == "+" o _rc_ver(p)[1] == "-" o _rc_ver(p)[1] == "*" o _rc_ver(p)[1] == "/") {
+        sea op = _rc_ver(p)[1]
+        p["i"] = p["i"] + 1
+        a = [op, a, _rc_unario(p)]
+    }
+    retornar a
+}
+
+funcion _rc_unario(p) {
+    sea t = _rc_ver(p)
+    si (t[1] == "!" y t[0] == "op") {
+        p["i"] = p["i"] + 1
+        retornar ["!", _rc_unario(p)]
+    }
+    si (t[1] == "(") {
+        p["i"] = p["i"] + 1
+        sea e = _rc_expr(p)
+        p["i"] = p["i"] + 1
+        retornar e
+    }
+    p["i"] = p["i"] + 1
+    si (t[0] == "texto") { retornar ["lit", t[1]] }
+    si (t[0] == "pal") {
+        sea w = t[1]
+        si (w == "true") { retornar ["lit", verdadero] }
+        si (w == "false") { retornar ["lit", falso] }
+        si (w == "null") { retornar ["lit", nulo] }
+        si (texto_empieza_con(w, ".")) { retornar ["campo", w] }
+        si (texto_indice("0123456789", subcadena(w, 0, 1)) >= 0) { retornar ["lit", a_numero(w)] }
+        si (_rc_ver(p)[1] == "(") {
+            p["i"] = p["i"] + 1
+            sea args = []
+            mientras (_rc_ver(p)[1] != ")") {
+                args.agregar(_rc_expr(p))
+                si (_rc_ver(p)[1] == ",") { p["i"] = p["i"] + 1 }
+                si (_rc_ver(p)[0] == "fin") { lanzar "recolector: falta ')'" }
+            }
+            p["i"] = p["i"] + 1
+            retornar ["llamar", w, args]
+        }
+    }
+    lanzar "recolector: expresión inválida cerca de '" + t[1] + "'"
+}
+
+funcion recolector_compilar(texto) {
+    sea p = {"t": _rc_lex(texto), "i": 0}
+    sea e = _rc_expr(p)
+    si (p["i"] < longitud(p["t"])) { lanzar "recolector: sobra texto en la expresión" }
+    retornar e
+}
+
+funcion _rc_eval(n, e) {
+    sea op = n[0]
+    si (op == "lit") { retornar n[1] }
+    si (op == "campo") { retornar recolector_campo(e, n[1]) }
+    si (op == "!") { retornar _rc_eval(n[1], e) != verdadero }
+    si (op == "&&") { retornar _rc_eval(n[1], e) == verdadero y _rc_eval(n[2], e) == verdadero }
+    si (op == "||") { retornar _rc_eval(n[1], e) == verdadero o _rc_eval(n[2], e) == verdadero }
+    si (op == "??") {
+        sea a = _rc_eval(n[1], e)
+        si (a == nulo) { retornar _rc_eval(n[2], e) }
+        retornar a
+    }
+    si (op == "llamar") {
+        sea f = n[1]
+        sea a = []
+        para x en n[2] { a.agregar(_rc_eval(x, e)) }
+        si (f == "upcase") { retornar texto_mayusculas("" + a[0]) }
+        si (f == "downcase") { retornar texto_minusculas("" + a[0]) }
+        si (f == "to_int") { retornar piso(a_numero("" + a[0])) }
+        si (f == "to_float") { retornar a_numero("" + a[0]) }
+        si (f == "to_string") { retornar "" + a[0] }
+        si (f == "length") { retornar longitud(a[0]) }
+        si (f == "contains") { retornar texto_indice("" + a[0], "" + a[1]) >= 0 }
+        si (f == "starts_with") { retornar texto_empieza_con("" + a[0], "" + a[1]) }
+        si (f == "ends_with") { retornar texto_termina_con("" + a[0], "" + a[1]) }
+        si (f == "exists") { retornar a[0] != nulo }
+        si (f == "now") { retornar _rc_ahora_iso() }
+        si (f == "parse_json") { retornar json_parsear("" + a[0]) }
+        si (f == "split") { retornar texto_dividir("" + a[0], "" + a[1]) }
+        si (f == "join") { retornar unir(a[0], "" + a[1]) }
+        si (f == "strip") { retornar texto_recortar("" + a[0]) }
+        si (f == "replace") { retornar texto_reemplazar("" + a[0], "" + a[1], "" + a[2]) }
+        lanzar "recolector: función desconocida " + f
+    }
+    sea x = _rc_eval(n[1], e)
+    sea y2 = _rc_eval(n[2], e)
+    si (op == "==") { retornar x == y2 }
+    si (op == "!=") { retornar x != y2 }
+    si (x == nulo o y2 == nulo) { retornar falso }
+    si (op == "<") { retornar x < y2 }
+    si (op == ">") { retornar x > y2 }
+    si (op == "<=") { retornar x <= y2 }
+    si (op == ">=") { retornar x >= y2 }
+    si (op == "+") {
+        si (tipo(x) == "numero" y tipo(y2) == "numero") { retornar x + y2 }
+        retornar "" + x + y2
+    }
+    si (op == "-") { retornar x - y2 }
+    si (op == "*") { retornar x * y2 }
+    si (op == "/") { retornar x / y2 }
+    lanzar "recolector: operador desconocido " + op
+}
+
+/// Evalúa una expresión sobre un evento.
+funcion recolector_evaluar(expr, e) {
+    sea n = expr
+    si (tipo(expr) == "texto") { n = recolector_compilar(expr) }
+    retornar _rc_eval(n, e)
+}
+
+// remap: una instrucción por línea: ".campo = expr", "del(.campo)",
+// "abort" (descarta el evento), "if cond { … }" no: se usa ".x = cond ?? …".
+funcion _rc_remap_compilar(fuente) {
+    sea r = []
+    para l0 en texto_dividir(fuente, "\n") {
+        para l1 en texto_dividir(l0, ";") {
+            sea l = texto_recortar(l1)
+            si (l != "" y texto_empieza_con(l, "#") == falso) {
+                si (texto_empieza_con(l, "del(")) { r.agregar(["del", texto_recortar(subcadena(l, 4, texto_indice(l, ")")))]) } sino {
+                    si (l == "abort") { r.agregar(["abort"]) } sino {
+                        // ". = parse_json!(.message)" reemplaza todo el evento.
+                        sea igual_ = -1
+                        sea i = 0
+                        mientras (i < longitud(l) y igual_ < 0) {
+                            si (subcadena(l, i, i + 1) == "=" y subcadena(l, i + 1, i + 2) != "=" y (i == 0 o texto_indice("!<>=", subcadena(l, i - 1, i)) < 0)) { igual_ = i }
+                            i = i + 1
+                        }
+                        si (igual_ < 0) { lanzar "recolector: instrucción remap inválida: " + l }
+                        sea destino = texto_recortar(subcadena(l, 0, igual_))
+                        r.agregar(["poner", destino, recolector_compilar(subcadena(l, igual_ + 1, longitud(l)))])
+                    }
+                }
+            }
+        }
+    }
+    retornar r
+}
+
+funcion _rc_remap(prog, e) {
+    para ins en prog {
+        si (ins[0] == "abort") { retornar nulo }
+        si (ins[0] == "del") { _rc_borrar(e, ins[1]) }
+        si (ins[0] == "poner") {
+            sea v = _rc_eval(ins[2], e)
+            si (ins[1] == ".") {
+                si (tipo(v) != "mapa") { lanzar "recolector: . debe ser un mapa" }
+                para k en claves(e) { quitar_clave(e, k) }
+                para k en claves(v) { e[k] = v[k] }
+            } sino { _rc_poner(e, ins[1], v) }
+        }
+    }
+    retornar e
+}
+
+// ══ Tubería ════════════════════════════════════════════════════════════════
+
+/// Crea la tubería desde un mapa (o texto TOML/YAML como vector.toml) con
+/// "sources", "transforms" y "sinks". Cada componente tiene "type" y los
+/// transformadores y destinos "inputs".
+funcion recolector_nuevo(config) {
+    sea c = config
+    si (tipo(config) == "texto") {
+        si (texto_indice(config, "[sources") >= 0 o texto_indice(config, "[sinks") >= 0) { c = ajustes_toml(config) } sino { c = ajustes_yaml(config) }
+    }
+    sea p = {"fuentes": c["sources"] ?? {}, "transformaciones": c["transforms"] ?? {}, "destinos": c["sinks"] ?? {}, "estado": {}, "salidas": {}, "metricas": {"eventos": {}, "errores": {}}}
+    // Prepara cada transformación.
+    para k en claves(p["transformaciones"]) {
+        sea t = p["transformaciones"][k]
+        sea st = {}
+        si (t["type"] == "filtro" o t["type"] == "filter") { st["cond"] = recolector_compilar(t["condition"]) }
+        si (t["type"] == "remap") { st["prog"] = _rc_remap_compilar(t["source"]) }
+        si (t["type"] == "enrutar" o t["type"] == "route") {
+            st["rutas"] = {}
+            para r en claves(t["route"]) { st["rutas"][r] = recolector_compilar(t["route"][r]) }
+        }
+        p["estado"][k] = st
+    }
+    // Orden topológico de transformaciones.
+    sea orden = []
+    sea hecho = {}
+    sea pendientes = claves(p["transformaciones"])
+    sea vueltas = 0
+    mientras (longitud(pendientes) > 0) {
+        sea resto = []
+        para k en pendientes {
+            sea listo = verdadero
+            para i en p["transformaciones"][k]["inputs"] ?? [] {
+                sea base = texto_dividir(i, ".")[0]
+                si (tiene_clave(p["transformaciones"], base) y tiene_clave(hecho, base) == falso) { listo = falso }
+            }
+            si (listo) {
+                orden.agregar(k)
+                hecho[k] = verdadero
+            } sino { resto.agregar(k) }
+        }
+        si (longitud(resto) == longitud(pendientes)) { lanzar "recolector: hay un ciclo entre transformaciones" }
+        pendientes = resto
+        vueltas = vueltas + 1
+    }
+    p["orden"] = orden
+    retornar p
+}
+
+funcion _rc_leer_fuente(p, nombre, f) {
+    sea t = f["type"]
+    sea ev = []
+    si (t == "lista" o t == "memoria") {
+        sea st = p["estado"]["$" + nombre] ?? {"i": 0}
+        p["estado"]["$" + nombre] = st
+        sea l = f["eventos"] ?? (f["lines"] ?? [])
+        mientras (st["i"] < longitud(l)) {
+            sea x = l[st["i"]]
+            si (tipo(x) == "texto") { ev.agregar(_rc_evento(x, nombre, "lista")) } sino { ev.agregar(_rc_copia(x)) }
+            st["i"] = st["i"] + 1
+        }
+    }
+    si (t == "archivo" o t == "file") {
+        sea st = p["estado"]["$" + nombre] ?? {"pos": {}, "resto": {}}
+        p["estado"]["$" + nombre] = st
+        para ruta en f["include"] ?? [] {
+            si (existe_archivo(ruta)) {
+                sea contenido = leer_archivo(ruta)
+                sea pos = st["pos"][ruta] ?? nulo
+                si (pos == nulo) {
+                    pos = 0
+                    si ((f["read_from"] ?? "beginning") == "end") { pos = longitud(contenido) }
+                }
+                // Archivo rotado o truncado: se empieza de nuevo.
+                si (pos > longitud(contenido)) { pos = 0 }
+                sea nuevo = subcadena(contenido, pos, longitud(contenido))
+                sea ult = _rc_ultimo(nuevo, "\n")
+                si (ult >= 0) {
+                    para l en texto_dividir(subcadena(nuevo, 0, ult), "\n") {
+                        sea linea = texto_reemplazar(l, "\r", "")
+                        si (linea != "") {
+                            sea e = _rc_evento(linea, nombre, "file")
+                            e["file"] = ruta
+                            ev.agregar(e)
+                        }
+                    }
+                    st["pos"][ruta] = pos + ult + 1
+                } sino { st["pos"][ruta] = pos }
+            }
+        }
+        si ((f["checkpoint"] ?? nulo) != nulo) { escribir_archivo(f["checkpoint"], json_texto(st["pos"])) }
+    }
+    si (t == "stdin") {
+        // Lee lo que haya en la entrada estándar hasta su fin.
+        sea buf = c_reservar(65536)
+        sea todo = ""
+        mientras (verdadero) {
+            sea n = read(0, buf, 65536)
+            si (n <= 0) { romper }
+            todo = todo + c_bytes(buf, n)
+        }
+        c_liberar(buf)
+        para l en texto_dividir(todo, "\n") { si (l != "") { ev.agregar(_rc_evento(texto_reemplazar(l, "\r", ""), nombre, "stdin")) } }
+    }
+    retornar ev
+}
+
+funcion _rc_ultimo(t, s) {
+    sea i = longitud(t) - longitud(s)
+    mientras (i >= 0) {
+        si (subcadena(t, i, i + longitud(s)) == s) { retornar i }
+        i = i - 1
+    }
+    retornar -1
+}
+
+funcion _rc_transformar(p, nombre, t, evs) {
+    sea st = p["estado"][nombre]
+    sea tipo_ = t["type"]
+    sea r = []
+    si (tipo_ == "parse_json") {
+        para e en evs {
+            sea campo = t["field"] ?? "message"
+            sea ok = verdadero
+            sea v = nulo
+            intentar { v = json_parsear("" + recolector_campo(e, campo)) } capturar (err) { ok = falso }
+            si (ok y tipo(v) == "mapa") {
+                si ((t["target"] ?? nulo) != nulo) { _rc_poner(e, t["target"], v) } sino { para k en claves(v) { e[k] = v[k] } }
+                si (t["drop_field"] ?? falso) { _rc_borrar(e, campo) }
+                r.agregar(e)
+            } sino { si ((t["drop_invalid"] ?? falso) == falso) { r.agregar(e) } sino { _rc_error(p, nombre) } }
+        }
+        retornar r
+    }
+    si (tipo_ == "parse_logfmt") {
+        para e en evs {
+            sea v = recolector_logfmt("" + recolector_campo(e, t["field"] ?? "message"))
+            para k en claves(v) { e[k] = v[k] }
+            r.agregar(e)
+        }
+        retornar r
+    }
+    si (tipo_ == "parse_syslog") {
+        para e en evs {
+            sea ok = verdadero
+            intentar {
+                sea v = recolector_syslog("" + recolector_campo(e, t["field"] ?? "message"))
+                para k en claves(v) { e[k] = v[k] }
+            } capturar (err) { ok = falso }
+            si (ok o (t["drop_invalid"] ?? falso) == falso) { r.agregar(e) } sino { _rc_error(p, nombre) }
+        }
+        retornar r
+    }
+    si (tipo_ == "parse_patron" o tipo_ == "parse_grok") {
+        para e en evs {
+            sea v = nulo
+            para pat en t["patterns"] ?? [t["pattern"]] { si (v == nulo) { v = recolector_patron(pat, "" + recolector_campo(e, t["field"] ?? "message")) } }
+            si (v != nulo) {
+                para k en claves(v) { e[k] = v[k] }
+                r.agregar(e)
+            } sino { si ((t["drop_invalid"] ?? falso) == falso) { r.agregar(e) } sino { _rc_error(p, nombre) } }
+        }
+        retornar r
+    }
+    si (tipo_ == "filtro" o tipo_ == "filter") {
+        para e en evs { si (_rc_eval(st["cond"], e) == verdadero) { r.agregar(e) } }
+        retornar r
+    }
+    si (tipo_ == "remap") {
+        para e en evs {
+            sea x = nulo
+            sea ok = verdadero
+            intentar { x = _rc_remap(st["prog"], e) } capturar (err) { ok = falso }
+            si (ok == falso) {
+                _rc_error(p, nombre)
+                si ((t["drop_on_error"] ?? falso) == falso) { r.agregar(e) }
+            } sino { si (x != nulo) { r.agregar(x) } }
+        }
+        retornar r
+    }
+    si (tipo_ == "muestreo" o tipo_ == "sample") {
+        sea tasa = t["rate"] ?? 10
+        st["n"] = st["n"] ?? 0
+        para e en evs {
+            si (st["n"] % tasa == 0) { r.agregar(e) }
+            st["n"] = st["n"] + 1
+        }
+        retornar r
+    }
+    si (tipo_ == "deduplicar" o tipo_ == "dedupe") {
+        sea campos = (t["fields"] ?? {})["match"] ?? ["message"]
+        st["vistos"] = st["vistos"] ?? {}
+        st["orden"] = st["orden"] ?? []
+        sea cap = (t["cache"] ?? {})["num_events"] ?? 5000
+        para e en evs {
+            sea clave = []
+            para c en campos { clave.agregar(json_texto(recolector_campo(e, c))) }
+            sea k = unir(clave, caracter(1))
+            si (tiene_clave(st["vistos"], k) == falso) {
+                st["vistos"][k] = verdadero
+                st["orden"].agregar(k)
+                si (longitud(st["orden"]) > cap) {
+                    quitar_clave(st["vistos"], st["orden"][0])
+                    sea resto = []
+                    sea i = 1
+                    mientras (i < longitud(st["orden"])) { resto.agregar(st["orden"][i])  i = i + 1 }
+                    st["orden"] = resto
+                }
+                r.agregar(e)
+            }
+        }
+        retornar r
+    }
+    si (tipo_ == "limitar" o tipo_ == "throttle") {
+        sea umbral = t["threshold"] ?? 100
+        sea ventana = (t["window_secs"] ?? 1) * 1000
+        sea ahora = tiempo_ms()
+        si ((st["inicio"] ?? 0) + ventana <= ahora) {
+            st["inicio"] = ahora
+            st["cuentas"] = {}
+        }
+        para e en evs {
+            sea clave = "_"
+            si ((t["key_field"] ?? nulo) != nulo) { clave = "" + recolector_campo(e, t["key_field"]) }
+            sea c = st["cuentas"][clave] ?? 0
+            si (c < umbral) {
+                st["cuentas"][clave] = c + 1
+                r.agregar(e)
+            }
+        }
+        retornar r
+    }
+    si (tipo_ == "metricas" o tipo_ == "log_to_metric") {
+        // Cuenta eventos por los campos dados: un evento métrico por grupo.
+        sea grupos = {}
+        sea orden = []
+        para e en evs {
+            sea etiquetas = {}
+            para c en t["tags"] ?? [] { etiquetas[c] = recolector_campo(e, c) }
+            sea k = json_texto(etiquetas)
+            si (tiene_clave(grupos, k) == falso) {
+                grupos[k] = {"name": t["name"] ?? "eventos", "tags": etiquetas, "count": 0, "sum": 0}
+                orden.agregar(k)
+            }
+            grupos[k]["count"] = grupos[k]["count"] + 1
+            si ((t["field"] ?? nulo) != nulo) { grupos[k]["sum"] = grupos[k]["sum"] + a_numero("" + (recolector_campo(e, t["field"]) ?? 0)) }
+        }
+        para k en orden { r.agregar(grupos[k]) }
+        retornar r
+    }
+    lanzar "recolector: transformación desconocida " + tipo_
+}
+
+funcion _rc_error(p, nombre) { p["metricas"]["errores"][nombre] = (p["metricas"]["errores"][nombre] ?? 0) + 1 }
+
+funcion _rc_codificar(d, e) {
+    sea enc = d["encoding"] ?? "json"
+    si (tipo(enc) == "mapa") { enc = enc["codec"] ?? "json" }
+    si (enc == "text") { retornar "" + (e["message"] ?? json_texto(e)) }
+    si (enc == "logfmt") {
+        sea partes = []
+        para k en claves(e) {
+            sea v = "" + e[k]
+            si (texto_indice(v, " ") >= 0 o texto_indice(v, "\"") >= 0) { v = "\"" + texto_reemplazar(v, "\"", "\\\"") + "\"" }
+            partes.agregar(k + "=" + v)
+        }
+        retornar unir(partes, " ")
+    }
+    retornar json_texto(e)
+}
+
+funcion _rc_enviar(p, nombre, d, evs) {
+    si (longitud(evs) == 0) { retornar nulo }
+    sea t = d["type"]
+    si (t == "memoria" o t == "memory") {
+        si (tiene_clave(p["salidas"], nombre) == falso) { p["salidas"][nombre] = [] }
+        para e en evs { p["salidas"][nombre].agregar(e) }
+    }
+    si (t == "consola" o t == "console") { para e en evs { mostrar(_rc_codificar(d, e)) } }
+    si (t == "archivo" o t == "file") {
+        sea por = {}
+        sea orden = []
+        para e en evs {
+            sea ruta = recolector_plantilla(d["path"], e)
+            si (tiene_clave(por, ruta) == falso) { por[ruta] = []  orden.agregar(ruta) }
+            por[ruta].agregar(_rc_codificar(d, e))
+        }
+        para ruta en orden {
+            sea previo = ""
+            si (existe_archivo(ruta)) { previo = leer_archivo(ruta) }
+            escribir_archivo(ruta, previo + unir(por[ruta], "\n") + "\n")
+        }
+    }
+    si (t == "http") {
+        sea cuerpo = []
+        para e en evs { cuerpo.agregar(_rc_codificar(d, e)) }
+        http_solicitud(d["method"] ?? "POST", d["uri"], {"cabeceras": {"Content-Type": "application/x-ndjson"}, "cuerpo": unir(cuerpo, "\n") + "\n"})
+    }
+    si (t == "elasticsearch") { http_solicitud("POST", d["endpoint"] + "/_bulk", {"cabeceras": {"Content-Type": "application/x-ndjson"}, "cuerpo": recolector_bulk(evs, d["index"] ?? "vector-%Y.%m.%d")}) }
+    si (t == "loki") { http_solicitud("POST", d["endpoint"] + "/loki/api/v1/push", {"cabeceras": {"Content-Type": "application/json"}, "cuerpo": json_texto(recolector_loki(evs, d["labels"] ?? {}))}) }
+    p["metricas"]["eventos"][nombre] = (p["metricas"]["eventos"][nombre] ?? 0) + longitud(evs)
+}
+
+/// Cuerpo de la API bulk de Elasticsearch (NDJSON).
+funcion recolector_bulk(evs, indice) {
+    sea l = []
+    para e en evs {
+        sea idx = recolector_plantilla(indice, e)
+        l.agregar(json_texto({"index": {"_index": idx}}))
+        l.agregar(json_texto(e))
+    }
+    retornar unir(l, "\n") + "\n"
+}
+
+/// Cuerpo de push de Loki: un stream por combinación de etiquetas.
+funcion recolector_loki(evs, etiquetas) {
+    sea streams = {}
+    sea orden = []
+    para e en evs {
+        sea et = {}
+        para k en claves(etiquetas) { et[k] = recolector_plantilla(etiquetas[k], e) }
+        sea k = json_texto(et)
+        si (tiene_clave(streams, k) == falso) {
+            streams[k] = {"stream": et, "values": []}
+            orden.agregar(k)
+        }
+        streams[k]["values"].agregar(["" + (tiempo_ms() * 1000000), "" + (e["message"] ?? json_texto(e))])
+    }
+    sea r = []
+    para k en orden { r.agregar(streams[k]) }
+    retornar {"streams": r}
+}
+
+/// Procesa lo disponible en las fuentes y lo lleva a los destinos.
+/// opciones: una_vez (verdadero: una pasada; falso: sigue cada
+/// intervalo_ms). Devuelve las métricas {"eventos": {destino: n}, "errores"}.
+funcion recolector_ejecutar(p, opciones) {
+    sea o = opciones ?? {}
+    mientras (verdadero) {
+        sea flujos = {}
+        para f en claves(p["fuentes"]) { flujos[f] = _rc_leer_fuente(p, f, p["fuentes"][f]) }
+        para k en p["orden"] {
+            sea t = p["transformaciones"][k]
+            sea entrada = []
+            para i en t["inputs"] ?? [] { para e en flujos[i] ?? [] { entrada.agregar(_rc_copia(e)) } }
+            si (t["type"] == "enrutar" o t["type"] == "route") {
+                sea st = p["estado"][k]
+                para r en claves(st["rutas"]) { flujos[k + "." + r] = [] }
+                flujos[k + "._unmatched"] = []
+                para e en entrada {
+                    sea alguna = falso
+                    para r en claves(st["rutas"]) {
+                        si (_rc_eval(st["rutas"][r], e) == verdadero) {
+                            flujos[k + "." + r].agregar(e)
+                            alguna = verdadero
+                        }
+                    }
+                    si (alguna == falso) { flujos[k + "._unmatched"].agregar(e) }
+                }
+            } sino { flujos[k] = _rc_transformar(p, k, t, entrada) }
+        }
+        para d en claves(p["destinos"]) {
+            sea entrada = []
+            para i en p["destinos"][d]["inputs"] ?? [] { para e en flujos[i] ?? [] { entrada.agregar(e) } }
+            _rc_enviar(p, d, p["destinos"][d], entrada)
+        }
+        si (o["una_vez"] ?? verdadero) { retornar p["metricas"] }
+        dormir(o["intervalo_ms"] ?? 500)
+    }
+}
+
+/// Eventos que llegaron a un destino de tipo "memoria".
+funcion recolector_salida(p, destino) { retornar p["salidas"][destino] ?? [] }
+
+/// Agrega eventos a una fuente de tipo "lista" (para pruebas o envío desde
+/// el mismo programa).
+funcion recolector_enviar(p, fuente, eventos) {
+    sea f = p["fuentes"][fuente]
+    si (tiene_clave(f, "eventos") == falso) { f["eventos"] = [] }
+    para e en eventos { f["eventos"].agregar(e) }
+}

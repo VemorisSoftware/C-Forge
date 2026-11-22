@@ -17,7 +17,7 @@ Estado: ✅ ya existe en C-Forge · 🔗 se usa hoy vía `cforge bindgen`,
 
 | # | Nombre | Para qué | Inspiración | Estado |
 |---|---|---|---|---|
-| 1 | `compacta` | Compresión rápida | zlib, zstd | ✅ zlib nativo · 🛠 zstd |
+| 1 | `compacta` / `compress` | Compresión rápida | zlib, zstd | ✅ zlib nativo · `compacta` (zstd, lz4, snappy, gzip) |
 | 2 | `bodega` | SQL embebido en un archivo | SQLite | ✅ `sqlite` / `db` |
 | 3 | `rayo_json` | JSON ultrarrápido | cJSON, simdjson | ✅ `json` · 🛠 SIMD |
 | 4 | `ventana` | Ventanas, audio y entrada | SDL2, Raylib | ✅ `juego` / `sdl` |
@@ -190,7 +190,7 @@ Estado: ✅ ya existe en C-Forge · 🔗 se usa hoy vía `cforge bindgen`,
 
 | # | Nombre | Para qué | Inspiración | Estado |
 |---|---|---|---|---|
-| 137 | `terminal` | Apps de interfaz en terminal | Ratatui | 🛠 |
+| 137 | `terminal` / `tui` | Apps de interfaz en terminal | Ratatui | ✅ `terminal` |
 | 138 | `progreso` / `progress` | Barras de progreso | Indicatif | ✅ `progreso` |
 | 139 | `pregunta` / `prompt` | Prompts interactivos | Dialoguer | ✅ `pregunta` |
 | 140 | `vigia` / `notify` | Vigilar cambios en archivos | Notify | ✅ `vigia` |
@@ -277,7 +277,7 @@ Estado: ✅ ya existe en C-Forge · 🔗 se usa hoy vía `cforge bindgen`,
 | 199 | `escaner` | Documentos escaneados | Leptonica | 🔗 |
 | 200 | `codigo_qr` / `qrcode` | QR y códigos de barras | ZXing | ✅ `codigo_qr` |
 | 201 | `composicion` / `typeset` | Composición tipográfica de PDFs | Typst | ✅ `composicion` |
-| 202 | `conversor` | Conversión entre formatos de documento | Pandoc | 🛠 |
+| 202 | `conversor` / `docconvert` | Conversión entre formatos de documento | Pandoc | ✅ `conversor` |
 | 203 | `lee_excel` / `read_xlsx` | Leer .xlsx/.ods | Calamine | ✅ `lee_excel` |
 | 204 | `dinero` / `money` | Decimales exactos | rust_decimal | ✅ `dinero` |
 | 205 | `indicadores` / `ta` | Análisis técnico (RSI, MACD) | TA-Lib | ✅ `indicadores` |
@@ -301,9 +301,9 @@ Estado: ✅ ya existe en C-Forge · 🔗 se usa hoy vía `cforge bindgen`,
 | 218 | `objetos` / `s3` | Almacenamiento compatible con S3 | MinIO | ✅ `objetos` |
 | 219 | `orquesta` | Cliente de Kubernetes | kube-rs | 🛠 |
 | 220 | `infra` / `hcl` | Infraestructura como código | HCL | ✅ `infra` |
-| 221 | `proxy` | Proxy inverso y balanceo | Caddy, Pingora | 🛠 |
-| 222 | `recolector` | Recolección de logs | Vector | 🛠 |
-| 223 | `proceso` | Flujos de trabajo de larga duración | Temporal | 🛠 |
+| 221 | `proxy` / `reverseproxy` | Proxy inverso y balanceo | Caddy, Pingora | ✅ `proxy` |
+| 222 | `recolector` / `logpipe` | Recolección de logs | Vector | ✅ `recolector` |
+| 223 | `proceso` / `workflow` | Flujos de trabajo de larga duración | Temporal | ✅ `proceso` |
 | 224 | `permisos` / `rbac` | ACL, RBAC y ABAC | Casbin | ✅ `permisos` |
 | 225 | `interruptor` / `flags` | Feature flags y pruebas A/B | OpenFeature | ✅ `interruptor` |
 | 226 | `entorno` | Servicios reales en pruebas | Testcontainers | 🛠 |

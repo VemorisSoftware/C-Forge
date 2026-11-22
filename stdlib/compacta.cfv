@@ -1,0 +1,1245 @@
+// stdlib/compacta.cfv — compresión rápida: Zstandard (descomprime
+// cualquier frame del RFC 8878: bloques Huffman y FSE, repetición de
+// tablas, varios frames y frames saltables; comprime con bloques RLE y
+// crudos), LZ4 (bloques y frames, en los dos sentidos, con compresión
+// real), Snappy (formato crudo, en los dos sentidos) y gzip sobre el
+// zlib nativo, con CRC-32, Adler-32 y XXH32. Resultados comparados con las
+// librerías zstandard, lz4 y cramjam de Python. Inspirada en zstd y LZ4
+// (BSD). En inglés: importar "compress".
+//
+//   importar "compacta"
+//   compacta_zstd_descomprimir(leer_archivo("datos.zst"))
+//   sea c = compacta_lz4_comprimir(texto)       // frame LZ4 estándar
+//   compacta_lz4_descomprimir(c) == texto
+//   compacta_gzip(texto)                        // .gz que entiende gunzip
+
+sea _CP_B = nulo
+
+funcion _cp_bytes() {
+    si (_CP_B == nulo) {
+        _CP_B = []
+        sea i = 0
+        mientras (i < 256) { _CP_B.agregar(bytes_entero(i, 1, 0))  i = i + 1 }
+    }
+    retornar _CP_B
+}
+
+funcion _cp_a_texto(lista, desde, hasta) {
+    sea b = _cp_bytes()
+    sea partes = []
+    sea i = desde
+    mientras (i < hasta) { partes.agregar(b[lista[i]])  i = i + 1 }
+    retornar unir(partes, "")
+}
+
+funcion _cp_le(d, p, n) {
+    sea v = 0
+    sea k = n - 1
+    mientras (k >= 0) { v = v * 256 + byte_en(d, p + k)  k = k - 1 }
+    retornar v
+}
+
+funcion _cp_bit_alto(v) {
+    sea n = -1
+    mientras (v > 0) { v = cociente(v, 2)  n = n + 1 }
+    retornar n
+}
+
+sea _CP_POT = nulo
+funcion _cp_pot(n) {
+    si (_CP_POT == nulo) {
+        _CP_POT = []
+        sea v = 1
+        sea i = 0
+        mientras (i < 62) { _CP_POT.agregar(v)  v = v * 2  i = i + 1 }
+    }
+    retornar _CP_POT[n]
+}
+
+// ══ Lectores de bits ═══════════════════════════════════════════════════════
+
+// Hacia atrás (zstd): bits [ini, fin) del texto d; empieza en el bit alto
+// del último byte (relleno).
+funcion _cp_atras(d, ini, fin) {
+    si (fin <= ini) { lanzar "compacta: flujo de bits vacío" }
+    sea ultimo = byte_en(d, fin - 1)
+    si (ultimo == 0) { lanzar "compacta: flujo de bits sin relleno" }
+    retornar {"d": d, "ini": ini, "p": (fin - ini - 1) * 8 + _cp_bit_alto(ultimo)}
+}
+
+funcion _cp_ver(r, n) {
+    si (n == 0) { retornar 0 }
+    sea p = r["p"] - n
+    sea neg = 0
+    si (p < 0) {
+        // Bits antes del inicio: valen 0.
+        neg = -p
+        p = 0
+    }
+    sea byte0 = cociente(p, 8)
+    sea desp = p % 8
+    sea total = n - neg + desp
+    sea v = 0
+    sea k = cociente(total + 7, 8) - 1
+    mientras (k >= 0) {
+        v = v * 256 + byte_en(r["d"], r["ini"] + byte0 + k)
+        k = k - 1
+    }
+    v = cociente(v, _cp_pot(desp)) % _cp_pot(n - neg)
+    retornar v * _cp_pot(neg)
+}
+
+funcion _cp_leer(r, n) {
+    sea v = _cp_ver(r, n)
+    r["p"] = r["p"] - n
+    retornar v
+}
+
+// Hacia adelante (descripción de tablas FSE): bits menos significativos primero.
+funcion _cp_ver_ad(d, pos_bit, n) {
+    sea byte0 = cociente(pos_bit, 8)
+    sea desp = pos_bit % 8
+    sea total = n + desp
+    sea v = 0
+    sea k = cociente(total + 7, 8) - 1
+    mientras (k >= 0) {
+        sea b = 0
+        si (byte0 + k < longitud(d)) { b = byte_en(d, byte0 + k) }
+        v = v * 256 + b
+        k = k - 1
+    }
+    retornar cociente(v, _cp_pot(desp)) % _cp_pot(n)
+}
+
+// ══ FSE ════════════════════════════════════════════════════════════════════
+
+// Lee una descripción de tabla FSE en d desde p: [probabilidades, log, bytes leídos].
+funcion _cp_fse_descripcion(d, p, max_simbolo) {
+    sea pb = p * 8
+    sea al = _cp_ver_ad(d, pb, 4) + 5
+    pb = pb + 4
+    sea restante = _cp_pot(al) + 1
+    sea umbral = _cp_pot(al)
+    sea nb = al + 1
+    sea probs = []
+    sea anterior0 = falso
+    mientras (restante > 1 y longitud(probs) <= max_simbolo) {
+        si (anterior0) {
+            // Repeticiones de ceros: de a 2 bits, 3 = siguen más.
+            mientras (_cp_ver_ad(d, pb, 2) == 3) {
+                pb = pb + 2
+                sea k = 0
+                mientras (k < 3) { probs.agregar(0)  k = k + 1 }
+            }
+            sea extra = _cp_ver_ad(d, pb, 2)
+            pb = pb + 2
+            sea k2 = 0
+            mientras (k2 < extra) { probs.agregar(0)  k2 = k2 + 1 }
+            anterior0 = falso
+        } sino {
+            sea maxv = 2 * umbral - 1 - restante
+            sea v = _cp_ver_ad(d, pb, nb)
+            sea cuenta = 0
+            si (v % umbral < maxv) {
+                cuenta = v % umbral
+                pb = pb + nb - 1
+            } sino {
+                cuenta = v % (2 * umbral)
+                si (cuenta >= umbral) { cuenta = cuenta - maxv }
+                pb = pb + nb
+            }
+            cuenta = cuenta - 1
+            si (cuenta < 0) { restante = restante + cuenta } sino { restante = restante - cuenta }
+            probs.agregar(cuenta)
+            anterior0 = cuenta == 0
+            mientras (restante < umbral) {
+                nb = nb - 1
+                umbral = cociente(umbral, 2)
+            }
+        }
+    }
+    si (restante != 1) { lanzar "compacta: tabla FSE inválida" }
+    retornar [probs, al, cociente(pb + 7, 8) - p]
+}
+
+funcion _cp_fse_tabla(probs, al) {
+    sea tam = _cp_pot(al)
+    sea sim = []
+    sea i = 0
+    mientras (i < tam) { sim.agregar(0)  i = i + 1 }
+    sea alto = tam - 1
+    sea siguiente = []
+    sea s = 0
+    mientras (s < longitud(probs)) {
+        si (probs[s] == -1) {
+            sim[alto] = s
+            alto = alto - 1
+            siguiente.agregar(1)
+        } sino { siguiente.agregar(probs[s]) }
+        s = s + 1
+    }
+    sea pos = 0
+    sea paso = cociente(tam, 2) + cociente(tam, 8) + 3
+    s = 0
+    mientras (s < longitud(probs)) {
+        sea k = 0
+        mientras (k < probs[s]) {
+            sim[pos] = s
+            pos = (pos + paso) % tam
+            mientras (pos > alto) { pos = (pos + paso) % tam }
+            k = k + 1
+        }
+        s = s + 1
+    }
+    sea bits = []
+    sea base = []
+    i = 0
+    mientras (i < tam) {
+        sea x = sim[i]
+        sea ns = siguiente[x]
+        siguiente[x] = ns + 1
+        sea nb = al - _cp_bit_alto(ns)
+        bits.agregar(nb)
+        base.agregar(ns * _cp_pot(nb) - tam)
+        i = i + 1
+    }
+    retornar {"sim": sim, "bits": bits, "base": base, "al": al}
+}
+
+funcion _cp_fse_rle(simbolo) { retornar {"sim": [simbolo], "bits": [0], "base": [0], "al": 0} }
+
+// ══ Huffman ════════════════════════════════════════════════════════════════
+
+funcion _cp_huff_tabla(pesos) {
+    sea suma = 0
+    para w en pesos { si (w > 0) { suma = suma + _cp_pot(w - 1) } }
+    si (suma == 0) { lanzar "compacta: pesos Huffman vacíos" }
+    sea maxb = _cp_bit_alto(suma) + 1
+    sea resto = _cp_pot(maxb) - suma
+    si (resto <= 0 o _cp_pot(_cp_bit_alto(resto)) != resto) { lanzar "compacta: pesos Huffman inválidos" }
+    sea ws = []
+    para w en pesos { ws.agregar(w) }
+    ws.agregar(_cp_bit_alto(resto) + 1)
+    sea tam = _cp_pot(maxb)
+    // Inicio de cada rango por peso (los pesos bajos van primero).
+    sea cuenta = []
+    sea w2 = 0
+    mientras (w2 <= maxb + 1) { cuenta.agregar(0)  w2 = w2 + 1 }
+    para w en ws { si (w > 0) { cuenta[w] = cuenta[w] + 1 } }
+    sea inicio = []
+    sea acum = 0
+    w2 = 0
+    mientras (w2 <= maxb + 1) {
+        inicio.agregar(acum)
+        si (w2 > 0) { acum = acum + cuenta[w2] * _cp_pot(w2 - 1) }
+        w2 = w2 + 1
+    }
+    sea sim = []
+    sea nb = []
+    sea i = 0
+    mientras (i < tam) { sim.agregar(0)  nb.agregar(0)  i = i + 1 }
+    sea s = 0
+    mientras (s < longitud(ws)) {
+        sea w = ws[s]
+        si (w > 0) {
+            sea largo = _cp_pot(w - 1)
+            sea j = inicio[w]
+            sea k = 0
+            mientras (k < largo) {
+                sim[j + k] = s
+                nb[j + k] = maxb + 1 - w
+                k = k + 1
+            }
+            inicio[w] = j + largo
+        }
+        s = s + 1
+    }
+    retornar {"sim": sim, "nb": nb, "max": maxb}
+}
+
+// Descripción del árbol Huffman en d desde p: [tabla, bytes leídos].
+funcion _cp_huff_descripcion(d, p) {
+    sea cab = byte_en(d, p)
+    sea pesos = []
+    si (cab >= 128) {
+        sea n = cab - 127
+        sea i = 0
+        mientras (i < n) {
+            sea b = byte_en(d, p + 1 + cociente(i, 2))
+            si (i % 2 == 0) { pesos.agregar(cociente(b, 16)) } sino { pesos.agregar(b % 16) }
+            i = i + 1
+        }
+        retornar [_cp_huff_tabla(pesos), 1 + cociente(n + 1, 2)]
+    }
+    // Pesos comprimidos con FSE (dos estados intercalados).
+    sea desc = _cp_fse_descripcion(d, p + 1, 255)
+    sea leidos = desc[2]
+    sea t = _cp_fse_tabla(desc[0], desc[1])
+    sea ini = p + 1 + leidos
+    sea fin = p + 1 + cab
+    sea r = _cp_atras(d, ini, fin)
+    sea e1 = _cp_leer(r, t["al"])
+    sea e2 = _cp_leer(r, t["al"])
+    mientras (verdadero) {
+        pesos.agregar(t["sim"][e1])
+        e1 = t["base"][e1] + _cp_leer(r, t["bits"][e1])
+        si (r["p"] < 0) {
+            pesos.agregar(t["sim"][e2])
+            romper
+        }
+        pesos.agregar(t["sim"][e2])
+        e2 = t["base"][e2] + _cp_leer(r, t["bits"][e2])
+        si (r["p"] < 0) {
+            pesos.agregar(t["sim"][e1])
+            romper
+        }
+        si (longitud(pesos) > 255) { lanzar "compacta: demasiados pesos Huffman" }
+    }
+    retornar [_cp_huff_tabla(pesos), 1 + cab]
+}
+
+
+funcion _cp_huff_flujo(d, ini, fin, t, n, salida) {
+    sea r = _cp_atras(d, ini, fin)
+    sea maxb = t["max"]
+    sea i = 0
+    mientras (i < n) {
+        sea v = _cp_ver(r, maxb)
+        salida.agregar(t["sim"][v])
+        r["p"] = r["p"] - t["nb"][v]
+        i = i + 1
+    }
+}
+
+// ══ Zstandard ══════════════════════════════════════════════════════════════
+
+sea _CP_LL_BASE = [0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 18, 20, 22, 24, 28, 32, 40, 48, 64, 128, 256, 512, 1024, 2048, 4096, 8192, 16384, 32768, 65536]
+sea _CP_LL_BITS = [0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1, 1, 1, 1, 2, 2, 3, 3, 4, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16]
+sea _CP_ML_BASE = [3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24, 25, 26, 27, 28, 29, 30, 31, 32, 33, 34, 35, 37, 39, 41, 43, 47, 51, 59, 67, 83, 99, 131, 259, 515, 1027, 2051, 4099, 8195, 16387, 32771, 65539]
+sea _CP_ML_BITS = [0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1, 1, 1, 1, 2, 2, 3, 3, 4, 4, 5, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16]
+sea _CP_LL_DEF = [4, 3, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 1, 1, 1, 2, 2, 2, 2, 2, 2, 2, 2, 2, 3, 2, 1, 1, 1, 1, 1, -1, -1, -1, -1]
+sea _CP_ML_DEF = [1, 4, 3, 2, 2, 2, 2, 2, 2, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, -1, -1, -1, -1, -1, -1, -1]
+sea _CP_OF_DEF = [1, 1, 1, 1, 1, 1, 2, 2, 2, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, -1, -1, -1, -1, -1]
+
+funcion _cp_tabla_modo(d, p, modo, defecto, al_def, max_sim, previa) {
+    // [tabla, bytes leídos]
+    si (modo == 0) { retornar [_cp_fse_tabla(defecto, al_def), 0] }
+    si (modo == 1) { retornar [_cp_fse_rle(byte_en(d, p)), 1] }
+    si (modo == 2) {
+        sea desc = _cp_fse_descripcion(d, p, max_sim)
+        retornar [_cp_fse_tabla(desc[0], desc[1]), desc[2]]
+    }
+    si (previa == nulo) { lanzar "compacta: tabla repetida sin tabla previa" }
+    retornar [previa, 0]
+}
+
+funcion _cp_bloque(d, ini, tam, st, salida) {
+    sea p = ini
+    sea fin = ini + tam
+    // ── Literales ──
+    sea h0 = byte_en(d, p)
+    sea tipo_l = h0 % 4
+    sea formato = cociente(h0, 4) % 4
+    sea literales = []
+    si (tipo_l == 0 o tipo_l == 1) {
+        sea n = 0
+        si (formato == 0 o formato == 2) {
+            n = cociente(h0, 8)
+            p = p + 1
+        } sino {
+            si (formato == 1) {
+                n = cociente(_cp_le(d, p, 2), 16)
+                p = p + 2
+            } sino {
+                n = cociente(_cp_le(d, p, 3), 16)
+                p = p + 3
+            }
+        }
+        si (tipo_l == 0) {
+            sea i = 0
+            mientras (i < n) { literales.agregar(byte_en(d, p + i))  i = i + 1 }
+            p = p + n
+        } sino {
+            sea b = byte_en(d, p)
+            sea i = 0
+            mientras (i < n) { literales.agregar(b)  i = i + 1 }
+            p = p + 1
+        }
+    } sino {
+        sea regen = 0
+        sea comp = 0
+        sea flujos = 4
+        si (formato == 0 o formato == 1) {
+            sea v = _cp_le(d, p, 3)
+            regen = cociente(v, 16) % 1024
+            comp = cociente(v, 16384) % 1024
+            p = p + 3
+            si (formato == 0) { flujos = 1 }
+        } sino {
+            si (formato == 2) {
+                sea v = _cp_le(d, p, 4)
+                regen = cociente(v, 16) % 16384
+                comp = cociente(v, 262144) % 16384
+                p = p + 4
+            } sino {
+                sea v = _cp_le(d, p, 5)
+                regen = cociente(v, 16) % 262144
+                comp = cociente(v, 4194304) % 262144
+                p = p + 5
+            }
+        }
+        sea fin_lit = p + comp
+        si (tipo_l == 2) {
+            sea hd = _cp_huff_descripcion(d, p)
+            st["huff"] = hd[0]
+            p = p + hd[1]
+        } sino { si (st["huff"] == nulo) { lanzar "compacta: literales sin árbol previo" } }
+        si (flujos == 1) { _cp_huff_flujo(d, p, fin_lit, st["huff"], regen, literales) } sino {
+            sea s1 = _cp_le(d, p, 2)
+            sea s2 = _cp_le(d, p + 2, 2)
+            sea s3 = _cp_le(d, p + 4, 2)
+            sea q = p + 6
+            sea parte = cociente(regen + 3, 4)
+            _cp_huff_flujo(d, q, q + s1, st["huff"], parte, literales)
+            _cp_huff_flujo(d, q + s1, q + s1 + s2, st["huff"], parte, literales)
+            _cp_huff_flujo(d, q + s1 + s2, q + s1 + s2 + s3, st["huff"], parte, literales)
+            _cp_huff_flujo(d, q + s1 + s2 + s3, fin_lit, st["huff"], regen - 3 * parte, literales)
+        }
+        p = fin_lit
+    }
+    // ── Secuencias ──
+    sea ns = 0
+    sea b0 = byte_en(d, p)
+    si (b0 == 0) {
+        p = p + 1
+    } sino {
+        si (b0 < 128) {
+            ns = b0
+            p = p + 1
+        } sino {
+            si (b0 < 255) {
+                ns = (b0 - 128) * 256 + byte_en(d, p + 1)
+                p = p + 2
+            } sino {
+                ns = byte_en(d, p + 1) + byte_en(d, p + 2) * 256 + 32512
+                p = p + 3
+            }
+        }
+    }
+    si (ns == 0) {
+        para x en literales { salida.agregar(x) }
+        retornar nulo
+    }
+    sea modos = byte_en(d, p)
+    p = p + 1
+    sea t_ll = _cp_tabla_modo(d, p, cociente(modos, 64), _CP_LL_DEF, 6, 35, st["ll"])
+    p = p + t_ll[1]
+    sea t_of = _cp_tabla_modo(d, p, cociente(modos, 16) % 4, _CP_OF_DEF, 5, 31, st["of"])
+    p = p + t_of[1]
+    sea t_ml = _cp_tabla_modo(d, p, cociente(modos, 4) % 4, _CP_ML_DEF, 6, 52, st["ml"])
+    p = p + t_ml[1]
+    sea tll = t_ll[0]
+    sea tof = t_of[0]
+    sea tml = t_ml[0]
+    st["ll"] = tll
+    st["of"] = tof
+    st["ml"] = tml
+    sea r = _cp_atras(d, p, fin)
+    sea ell = _cp_leer(r, tll["al"])
+    sea eof = _cp_leer(r, tof["al"])
+    sea eml = _cp_leer(r, tml["al"])
+    sea rep = st["rep"]
+    sea pl = 0
+    sea k = 0
+    mientras (k < ns) {
+        sea cof = tof["sim"][eof]
+        sea cml = tml["sim"][eml]
+        sea cll = tll["sim"][ell]
+        sea valor_of = _cp_pot(cof) + _cp_leer(r, cof)
+        sea ml = _CP_ML_BASE[cml] + _cp_leer(r, _CP_ML_BITS[cml])
+        sea ll = _CP_LL_BASE[cll] + _cp_leer(r, _CP_LL_BITS[cll])
+        sea desp = 0
+        si (valor_of > 3) {
+            desp = valor_of - 3
+            rep = [desp, rep[0], rep[1]]
+        } sino {
+            sea idx = valor_of - 1
+            si (ll == 0) { idx = valor_of }
+            si (idx == 0) { desp = rep[0] } sino {
+                si (idx == 3) { desp = rep[0] - 1 } sino { desp = rep[idx] }
+                si (idx == 1) { rep = [desp, rep[0], rep[2]] } sino { rep = [desp, rep[0], rep[1]] }
+            }
+        }
+        si (k < ns - 1) {
+            ell = tll["base"][ell] + _cp_leer(r, tll["bits"][ell])
+            eml = tml["base"][eml] + _cp_leer(r, tml["bits"][eml])
+            eof = tof["base"][eof] + _cp_leer(r, tof["bits"][eof])
+        }
+        sea i = 0
+        mientras (i < ll) { salida.agregar(literales[pl + i])  i = i + 1 }
+        pl = pl + ll
+        sea origen = longitud(salida) - desp
+        si (origen < st["base_frame"] - st["dict_largo"] o desp <= 0) { lanzar "compacta: desplazamiento inválido" }
+        i = 0
+        mientras (i < ml) {
+            salida.agregar(salida[origen + i])
+            i = i + 1
+        }
+        k = k + 1
+    }
+    st["rep"] = rep
+    mientras (pl < longitud(literales)) { salida.agregar(literales[pl])  pl = pl + 1 }
+}
+
+/// Descomprime Zstandard (uno o varios frames, también saltables).
+/// opciones: diccionario (texto de contenido crudo), maximo (bytes).
+funcion compacta_zstd_descomprimir(datos, opciones) {
+    sea o = opciones ?? {}
+    sea d = "" + datos
+    sea salida = []
+    sea dic = o["diccionario"] ?? ""
+    sea p = 0
+    mientras (p < longitud(d)) {
+        sea magia = _cp_le(d, p, 4)
+        si (magia >= 407710288 y magia <= 407710303) {
+            // Frame saltable: 0x184D2A5?
+            p = p + 8 + _cp_le(d, p + 4, 4)
+        } sino {
+            si (magia != 4247762216) { lanzar "compacta: no es Zstandard (número mágico)" }
+            p = p + 4
+            sea desc = byte_en(d, p)
+            p = p + 1
+            sea fcs_flag = cociente(desc, 64)
+            sea unico = cociente(desc, 32) % 2 == 1
+            sea checksum = cociente(desc, 4) % 2 == 1
+            sea did_flag = desc % 4
+            si (unico == falso) { p = p + 1 }
+            sea largos_did = [0, 1, 2, 4]
+            p = p + largos_did[did_flag]
+            sea largos_fcs = [0, 2, 4, 8]
+            sea nfcs = largos_fcs[fcs_flag]
+            si (fcs_flag == 0 y unico) { nfcs = 1 }
+            p = p + nfcs
+            // Diccionario crudo: se antepone a la salida de este frame.
+            sea base_frame = longitud(salida)
+            sea dic_lista = []
+            si (dic != "") {
+                sea i = 0
+                mientras (i < longitud(dic)) { salida.agregar(byte_en(dic, i))  i = i + 1 }
+            }
+            sea st = {"huff": nulo, "ll": nulo, "of": nulo, "ml": nulo, "rep": [1, 4, 8], "base_frame": base_frame + longitud(dic), "dict_largo": longitud(dic)}
+            sea ultimo = falso
+            mientras (ultimo == falso) {
+                sea h = _cp_le(d, p, 3)
+                p = p + 3
+                ultimo = h % 2 == 1
+                sea tipo_b = cociente(h, 2) % 4
+                sea tam = cociente(h, 8)
+                si (tipo_b == 0) {
+                    sea i = 0
+                    mientras (i < tam) { salida.agregar(byte_en(d, p + i))  i = i + 1 }
+                    p = p + tam
+                } sino {
+                    si (tipo_b == 1) {
+                        sea b = byte_en(d, p)
+                        sea i = 0
+                        mientras (i < tam) { salida.agregar(b)  i = i + 1 }
+                        p = p + 1
+                    } sino {
+                        si (tipo_b == 3) { lanzar "compacta: tipo de bloque reservado" }
+                        _cp_bloque(d, p, tam, st, salida)
+                        p = p + tam
+                    }
+                }
+                si ((o["maximo"] ?? nulo) != nulo y longitud(salida) > o["maximo"]) { lanzar "compacta: la salida supera el máximo" }
+            }
+            si (checksum) { p = p + 4 }
+            // Se quita el diccionario de la salida.
+            si (dic != "") {
+                sea sin_dic = []
+                sea i = 0
+                mientras (i < base_frame) { sin_dic.agregar(salida[i])  i = i + 1 }
+                i = base_frame + longitud(dic)
+                mientras (i < longitud(salida)) { sin_dic.agregar(salida[i])  i = i + 1 }
+                salida = sin_dic
+            }
+        }
+    }
+    retornar _cp_a_texto(salida, 0, longitud(salida))
+}
+
+/// Comprime en Zstandard válido (bloques RLE para tramos repetidos y crudos
+/// para el resto, con el tamaño en la cabecera). Rápido y sin pérdida;
+/// cualquier zstd lo descomprime.
+funcion compacta_zstd_comprimir(datos) {
+    sea d = "" + datos
+    sea n = longitud(d)
+    sea partes = [bytes_entero(4247762216, 4, 1)]
+    // Cabecera: FCS de 8 bytes, un solo segmento.
+    partes.agregar(bytes_entero(224, 1, 0))
+    partes.agregar(bytes_entero(n % 4294967296, 4, 1) + bytes_entero(cociente(n, 4294967296), 4, 1))
+    si (n == 0) {
+        partes.agregar(bytes_entero(1, 3, 1))
+        retornar unir(partes, "")
+    }
+    sea p = 0
+    sea max_bloque = 131072
+    mientras (p < n) {
+        // Busca un tramo repetido de al menos 32 bytes.
+        sea fin = minimo(n, p + max_bloque)
+        sea q = p
+        sea crudo_fin = fin
+        sea rle_ini = -1
+        sea rle_fin = -1
+        mientras (q < fin y rle_ini < 0) {
+            sea b = byte_en(d, q)
+            sea r = q + 1
+            mientras (r < fin y byte_en(d, r) == b) { r = r + 1 }
+            si (r - q >= 32) {
+                rle_ini = q
+                rle_fin = r
+            } sino { q = r }
+        }
+        si (rle_ini == p) {
+            sea tam = rle_fin - p
+            sea ult = 0
+            si (rle_fin >= n) { ult = 1 }
+            partes.agregar(bytes_entero(ult + 2 + tam * 8, 3, 1) + subcadena(d, p, p + 1))
+            p = rle_fin
+        } sino {
+            sea hasta = fin
+            si (rle_ini > p) { hasta = rle_ini }
+            sea tam = hasta - p
+            sea ult = 0
+            si (hasta >= n) { ult = 1 }
+            partes.agregar(bytes_entero(ult + tam * 8, 3, 1) + subcadena(d, p, hasta))
+            p = hasta
+        }
+    }
+    retornar unir(partes, "")
+}
+
+/// Tamaño original declarado en la cabecera del primer frame, o nulo.
+funcion compacta_zstd_tamano(datos) {
+    sea d = "" + datos
+    si (longitud(d) < 6 o _cp_le(d, 0, 4) != 4247762216) { retornar nulo }
+    sea desc = byte_en(d, 4)
+    sea fcs_flag = cociente(desc, 64)
+    sea unico = cociente(desc, 32) % 2 == 1
+    sea p = 5
+    si (unico == falso) { p = p + 1 }
+    sea largos_did = [0, 1, 2, 4]
+    p = p + largos_did[desc % 4]
+    si (fcs_flag == 0) {
+        si (unico) { retornar byte_en(d, p) }
+        retornar nulo
+    }
+    si (fcs_flag == 1) { retornar _cp_le(d, p, 2) + 256 }
+    si (fcs_flag == 2) { retornar _cp_le(d, p, 4) }
+    retornar _cp_le(d, p, 4) + _cp_le(d, p + 4, 4) * 4294967296
+}
+
+// ══ Sumas de verificación ═════════════════════════════════════════════════
+
+sea _CP_CRC = nulo
+
+/// CRC-32 (el de zip, gzip y PNG).
+funcion compacta_crc32(datos, inicial) {
+    si (_CP_CRC == nulo) {
+        _CP_CRC = []
+        sea n = 0
+        mientras (n < 256) {
+            sea c = n
+            sea k = 0
+            mientras (k < 8) {
+                si (c % 2 == 1) { c = bits_xo(3988292384, cociente(c, 2)) } sino { c = cociente(c, 2) }
+                k = k + 1
+            }
+            _CP_CRC.agregar(c)
+            n = n + 1
+        }
+    }
+    sea c = bits_xo(inicial ?? 0, 4294967295)
+    sea d = "" + datos
+    sea i = 0
+    mientras (i < longitud(d)) {
+        c = bits_xo(_CP_CRC[bits_xo(c, byte_en(d, i)) % 256], cociente(c, 256))
+        i = i + 1
+    }
+    retornar bits_xo(c, 4294967295)
+}
+
+funcion compacta_adler32(datos) {
+    sea a = 1
+    sea b = 0
+    sea d = "" + datos
+    sea i = 0
+    mientras (i < longitud(d)) {
+        a = (a + byte_en(d, i)) % 65521
+        b = (b + a) % 65521
+        i = i + 1
+    }
+    retornar b * 65536 + a
+}
+
+// Producto módulo 2^32 sin desbordar (los enteros nativos tienen 62 bits).
+funcion _cp_mul32(a, b) {
+    sea bl = b % 65536
+    sea bh = cociente(b, 65536)
+    retornar (a * bl + ((a * bh) % 65536) * 65536) % 4294967296
+}
+
+funcion _cp_rotl32(x, r) { retornar (x % _cp_pot(32 - r)) * _cp_pot(r) + cociente(x, _cp_pot(32 - r)) }
+
+/// XXH32 (el de LZ4).
+funcion compacta_xxh32(datos, semilla) {
+    sea P1 = 2654435761
+    sea P2 = 2246822519
+    sea P3 = 3266489917
+    sea P4 = 668265263
+    sea P5 = 374761393
+    sea M = 4294967296
+    sea s = semilla ?? 0
+    sea d = "" + datos
+    sea n = longitud(d)
+    sea p = 0
+    sea h = 0
+    si (n >= 16) {
+        sea v1 = (s + P1 + P2) % M
+        sea v2 = (s + P2) % M
+        sea v3 = s
+        sea v4 = (s - P1 + M) % M
+        mientras (p + 16 <= n) {
+            v1 = _cp_mul32(_cp_rotl32((v1 + _cp_mul32(_cp_le(d, p, 4), P2)) % M, 13), P1)
+            v2 = _cp_mul32(_cp_rotl32((v2 + _cp_mul32(_cp_le(d, p + 4, 4), P2)) % M, 13), P1)
+            v3 = _cp_mul32(_cp_rotl32((v3 + _cp_mul32(_cp_le(d, p + 8, 4), P2)) % M, 13), P1)
+            v4 = _cp_mul32(_cp_rotl32((v4 + _cp_mul32(_cp_le(d, p + 12, 4), P2)) % M, 13), P1)
+            p = p + 16
+        }
+        h = (_cp_rotl32(v1, 1) + _cp_rotl32(v2, 7) + _cp_rotl32(v3, 12) + _cp_rotl32(v4, 18)) % M
+    } sino { h = (s + P5) % M }
+    h = (h + n) % M
+    mientras (p + 4 <= n) {
+        h = _cp_mul32(_cp_rotl32((h + _cp_mul32(_cp_le(d, p, 4), P3)) % M, 17), P4)
+        p = p + 4
+    }
+    mientras (p < n) {
+        h = _cp_mul32(_cp_rotl32((h + _cp_mul32(byte_en(d, p), P5)) % M, 11), P1)
+        p = p + 1
+    }
+    h = _cp_mul32(bits_xo(h, cociente(h, 32768)), P2)
+    h = _cp_mul32(bits_xo(h, cociente(h, 8192)), P3)
+    retornar bits_xo(h, cociente(h, 65536))
+}
+
+// ══ LZ4 ════════════════════════════════════════════════════════════════════
+
+/// Comprime un bloque LZ4 crudo (sin frame).
+funcion compacta_lz4_bloque(datos) {
+    sea d = "" + datos
+    sea n = longitud(d)
+    sea b = _cp_bytes()
+    sea salida = []
+    sea tabla = {}
+    sea ancla = 0
+    sea p = 0
+    // Los últimos 5 bytes van siempre como literales; la última coincidencia
+    // debe empezar al menos 12 bytes antes del final.
+    sea limite = n - 12
+    mientras (p < limite) {
+        sea clave = subcadena(d, p, p + 4)
+        sea cand = tabla[clave] ?? -1
+        tabla[clave] = p
+        si (cand >= 0 y p - cand <= 65535) {
+            // Extiende la coincidencia.
+            sea largo = 4
+            mientras (p + largo < n - 5 y byte_en(d, cand + largo) == byte_en(d, p + largo)) { largo = largo + 1 }
+            sea lit = p - ancla
+            sea ml = largo - 4
+            sea tok = minimo(lit, 15) * 16 + minimo(ml, 15)
+            salida.agregar(b[tok])
+            si (lit >= 15) {
+                sea r = lit - 15
+                mientras (r >= 255) { salida.agregar(b[255])  r = r - 255 }
+                salida.agregar(b[r])
+            }
+            salida.agregar(subcadena(d, ancla, p))
+            salida.agregar(bytes_entero(p - cand, 2, 1))
+            si (ml >= 15) {
+                sea r = ml - 15
+                mientras (r >= 255) { salida.agregar(b[255])  r = r - 255 }
+                salida.agregar(b[r])
+            }
+            // Registra algunas posiciones dentro de la coincidencia.
+            sea q = p + 1
+            mientras (q < p + largo y q < limite) {
+                tabla[subcadena(d, q, q + 4)] = q
+                q = q + 3
+            }
+            p = p + largo
+            ancla = p
+        } sino { p = p + 1 }
+    }
+    sea lit = n - ancla
+    salida.agregar(b[minimo(lit, 15) * 16])
+    si (lit >= 15) {
+        sea r = lit - 15
+        mientras (r >= 255) { salida.agregar(b[255])  r = r - 255 }
+        salida.agregar(b[r])
+    }
+    salida.agregar(subcadena(d, ancla, n))
+    retornar unir(salida, "")
+}
+
+/// Descomprime un bloque LZ4 crudo.
+funcion compacta_lz4_bloque_descomprimir(datos, maximo_) {
+    sea d = "" + datos
+    sea n = longitud(d)
+    sea salida = []
+    sea p = 0
+    mientras (p < n) {
+        sea tok = byte_en(d, p)
+        p = p + 1
+        sea lit = cociente(tok, 16)
+        si (lit == 15) {
+            sea b = 255
+            mientras (b == 255) {
+                b = byte_en(d, p)
+                p = p + 1
+                lit = lit + b
+            }
+        }
+        sea i = 0
+        mientras (i < lit) { salida.agregar(byte_en(d, p + i))  i = i + 1 }
+        p = p + lit
+        si (p >= n) { romper }
+        sea desp = _cp_le(d, p, 2)
+        p = p + 2
+        si (desp == 0 o desp > longitud(salida)) { lanzar "compacta: desplazamiento LZ4 inválido" }
+        sea ml = tok % 16
+        si (ml == 15) {
+            sea b = 255
+            mientras (b == 255) {
+                b = byte_en(d, p)
+                p = p + 1
+                ml = ml + b
+            }
+        }
+        ml = ml + 4
+        sea origen = longitud(salida) - desp
+        i = 0
+        mientras (i < ml) { salida.agregar(salida[origen + i])  i = i + 1 }
+        si (maximo_ != nulo y longitud(salida) > maximo_) { lanzar "compacta: la salida supera el máximo" }
+    }
+    retornar _cp_a_texto(salida, 0, longitud(salida))
+}
+
+/// Frame LZ4 estándar (el de la herramienta lz4 y lz4.frame): bloques
+/// independientes de 64 KiB con tamaño y suma del contenido.
+funcion compacta_lz4_comprimir(datos) {
+    sea d = "" + datos
+    // FLG: versión 01, bloques independientes, tamaño y suma del contenido.
+    sea flg = 64 + 32 + 8 + 4
+    sea bd = 64
+    sea cab = bytes_entero(flg, 1, 0) + bytes_entero(bd, 1, 0) + bytes_entero(longitud(d) % 4294967296, 4, 1) + bytes_entero(cociente(longitud(d), 4294967296), 4, 1)
+    sea hc = cociente(compacta_xxh32(cab, 0), 256) % 256
+    sea partes = [bytes_entero(407708164, 4, 1), cab, bytes_entero(hc, 1, 0)]
+    sea p = 0
+    mientras (p < longitud(d)) {
+        sea trozo = subcadena(d, p, minimo(longitud(d), p + 65536))
+        sea c = compacta_lz4_bloque(trozo)
+        si (longitud(c) >= longitud(trozo)) { partes.agregar(bytes_entero(longitud(trozo) + 2147483648, 4, 1) + trozo) } sino { partes.agregar(bytes_entero(longitud(c), 4, 1) + c) }
+        p = p + 65536
+    }
+    partes.agregar(bytes_entero(0, 4, 1))
+    partes.agregar(bytes_entero(compacta_xxh32(d, 0), 4, 1))
+    retornar unir(partes, "")
+}
+
+/// Descomprime frames LZ4 (verifica las sumas si vienen).
+funcion compacta_lz4_descomprimir(datos) {
+    sea d = "" + datos
+    sea r = []
+    sea p = 0
+    mientras (p < longitud(d)) {
+        sea magia = _cp_le(d, p, 4)
+        si (magia >= 407710288 y magia <= 407710303) { p = p + 8 + _cp_le(d, p + 4, 4) } sino {
+            si (magia != 407708164) { lanzar "compacta: no es un frame LZ4" }
+            sea flg = byte_en(d, p + 4)
+            sea ini_cab = p + 4
+            p = p + 6
+            sea suma_bloque = cociente(flg, 16) % 2 == 1
+            sea con_tam = cociente(flg, 8) % 2 == 1
+            sea suma_cont = cociente(flg, 4) % 2 == 1
+            sea con_dic = flg % 2 == 1
+            si (con_tam) { p = p + 8 }
+            si (con_dic) { p = p + 4 }
+            sea hc = byte_en(d, p)
+            si (hc != cociente(compacta_xxh32(subcadena(d, ini_cab, p), 0), 256) % 256) { lanzar "compacta: cabecera LZ4 dañada" }
+            p = p + 1
+            sea contenido = []
+            sea previo = ""
+            mientras (verdadero) {
+                sea tam = _cp_le(d, p, 4)
+                p = p + 4
+                si (tam == 0) { romper }
+                sea crudo = tam >= 2147483648
+                si (crudo) { tam = tam - 2147483648 }
+                sea bloque = subcadena(d, p, p + tam)
+                p = p + tam
+                si (suma_bloque) { p = p + 4 }
+                si (crudo) { contenido.agregar(bloque) } sino {
+                    // Bloques enlazados: el anterior sirve de diccionario.
+                    si (cociente(flg, 32) % 2 == 0 y previo != "") {
+                        sea x = compacta_lz4_bloque_descomprimir(_cp_dic_lz4(previo, bloque), nulo)
+                        contenido.agregar(subcadena(x, minimo(longitud(previo), 65536), longitud(x)))
+                    } sino { contenido.agregar(compacta_lz4_bloque_descomprimir(bloque, nulo)) }
+                }
+                previo = contenido[longitud(contenido) - 1]
+            }
+            sea todo = unir(contenido, "")
+            si (suma_cont) {
+                si (_cp_le(d, p, 4) != compacta_xxh32(todo, 0)) { lanzar "compacta: suma de LZ4 no coincide" }
+                p = p + 4
+            }
+            r.agregar(todo)
+        }
+    }
+    retornar unir(r, "")
+}
+
+// Bloque enlazado: se le antepone el final del anterior como literales.
+funcion _cp_dic_lz4(previo, bloque) { retornar _cp_concatenar_lz4(subcadena(previo, maximo(0, longitud(previo) - 65536), longitud(previo)), bloque) }
+
+funcion _cp_concatenar_lz4(dic, bloque) {
+    // Descomprime el bloque con el diccionario delante: se reescribe el
+    // primer token para incluir los literales del diccionario.
+    sea tok = byte_en(bloque, 0)
+    sea p = 1
+    sea lit = cociente(tok, 16)
+    si (lit == 15) {
+        sea b = 255
+        mientras (b == 255) {
+            b = byte_en(bloque, p)
+            p = p + 1
+            lit = lit + b
+        }
+    }
+    sea nuevo_lit = lit + longitud(dic)
+    sea bs = _cp_bytes()
+    sea s = [bs[minimo(nuevo_lit, 15) * 16 + tok % 16]]
+    si (nuevo_lit >= 15) {
+        sea r = nuevo_lit - 15
+        mientras (r >= 255) { s.agregar(bs[255])  r = r - 255 }
+        s.agregar(bs[r])
+    }
+    s.agregar(dic)
+    s.agregar(subcadena(bloque, p, longitud(bloque)))
+    retornar unir(s, "")
+}
+
+// ══ Snappy ═════════════════════════════════════════════════════════════════
+
+funcion _cp_varint(n) {
+    sea r = ""
+    mientras (n >= 128) {
+        r = r + bytes_entero(n % 128 + 128, 1, 0)
+        n = cociente(n, 128)
+    }
+    retornar r + bytes_entero(n, 1, 0)
+}
+
+/// Comprime en Snappy crudo.
+funcion compacta_snappy_comprimir(datos) {
+    sea d = "" + datos
+    sea n = longitud(d)
+    sea salida = [_cp_varint(n)]
+    sea b = _cp_bytes()
+    sea tabla = {}
+    sea p = 0
+    sea ancla = 0
+    mientras (p + 4 <= n) {
+        sea clave = subcadena(d, p, p + 4)
+        sea cand = tabla[clave] ?? -1
+        tabla[clave] = p
+        si (cand >= 0 y p - cand < 65536) {
+            sea largo = 4
+            mientras (p + largo < n y largo < 64 y byte_en(d, cand + largo) == byte_en(d, p + largo)) { largo = largo + 1 }
+            si (p > ancla) { _cp_snappy_lit(salida, d, ancla, p) }
+            sea desp = p - cand
+            si (largo < 12 y desp < 2048) { salida.agregar(b[1 + (largo - 4) * 4 + cociente(desp, 256) * 32] + b[desp % 256]) } sino { salida.agregar(b[2 + (largo - 1) * 4] + bytes_entero(desp, 2, 1)) }
+            p = p + largo
+            ancla = p
+        } sino { p = p + 1 }
+    }
+    si (ancla < n) { _cp_snappy_lit(salida, d, ancla, n) }
+    retornar unir(salida, "")
+}
+
+funcion _cp_snappy_lit(salida, d, a, z) {
+    sea n = z - a - 1
+    si (n < 60) { salida.agregar(bytes_entero(n * 4, 1, 0)) } sino {
+        si (n < 256) { salida.agregar(bytes_entero(240, 1, 0) + bytes_entero(n, 1, 0)) } sino {
+            si (n < 65536) { salida.agregar(bytes_entero(244, 1, 0) + bytes_entero(n, 2, 1)) } sino { salida.agregar(bytes_entero(252, 1, 0) + bytes_entero(n, 4, 1)) }
+        }
+    }
+    salida.agregar(subcadena(d, a, z))
+}
+
+funcion compacta_snappy_descomprimir(datos) {
+    sea d = "" + datos
+    sea p = 0
+    sea total = 0
+    sea mult = 1
+    mientras (verdadero) {
+        sea b = byte_en(d, p)
+        p = p + 1
+        total = total + (b % 128) * mult
+        mult = mult * 128
+        si (b < 128) { romper }
+    }
+    sea salida = []
+    mientras (p < longitud(d)) {
+        sea t = byte_en(d, p)
+        p = p + 1
+        sea tipo_ = t % 4
+        si (tipo_ == 0) {
+            sea n = cociente(t, 4)
+            si (n >= 60) {
+                sea nb = n - 59
+                n = _cp_le(d, p, nb)
+                p = p + nb
+            }
+            n = n + 1
+            sea i = 0
+            mientras (i < n) { salida.agregar(byte_en(d, p + i))  i = i + 1 }
+            p = p + n
+        } sino {
+            sea largo = 0
+            sea desp = 0
+            si (tipo_ == 1) {
+                largo = cociente(t, 4) % 8 + 4
+                desp = cociente(t, 32) * 256 + byte_en(d, p)
+                p = p + 1
+            }
+            si (tipo_ == 2) {
+                largo = cociente(t, 4) + 1
+                desp = _cp_le(d, p, 2)
+                p = p + 2
+            }
+            si (tipo_ == 3) {
+                largo = cociente(t, 4) + 1
+                desp = _cp_le(d, p, 4)
+                p = p + 4
+            }
+            si (desp == 0 o desp > longitud(salida)) { lanzar "compacta: desplazamiento Snappy inválido" }
+            sea origen = longitud(salida) - desp
+            sea i = 0
+            mientras (i < largo) { salida.agregar(salida[origen + i])  i = i + 1 }
+        }
+    }
+    si (longitud(salida) != total) { lanzar "compacta: largo Snappy no coincide" }
+    retornar _cp_a_texto(salida, 0, longitud(salida))
+}
+
+// ══ gzip ═══════════════════════════════════════════════════════════════════
+
+/// gzip (RFC 1952) con el deflate nativo. nivel 0–9 (6).
+funcion compacta_gzip(datos, nivel) {
+    sea d = "" + datos
+    sea z = zlib_comprimir(d, nivel ?? 6)
+    // zlib = 2 bytes de cabecera + deflate + 4 de Adler-32.
+    sea deflate = subcadena(z, 2, longitud(z) - 4)
+    sea cab = bytes_de_hex("1f8b08000000000000ff")
+    retornar cab + deflate + bytes_entero(compacta_crc32(d, 0), 4, 1) + bytes_entero(longitud(d) % 4294967296, 4, 1)
+}
+
+/// Descomprime gzip (también varios miembros seguidos).
+funcion compacta_gunzip(datos, maximo_) {
+    sea d = "" + datos
+    sea r = []
+    sea p = 0
+    mientras (p < longitud(d)) {
+        si (byte_en(d, p) != 31 o byte_en(d, p + 1) != 139) { lanzar "compacta: no es gzip" }
+        sea flg = byte_en(d, p + 3)
+        sea q = p + 10
+        si (cociente(flg, 4) % 2 == 1) { q = q + 2 + _cp_le(d, q, 2) }
+        si (cociente(flg, 8) % 2 == 1) { mientras (byte_en(d, q) != 0) { q = q + 1 }  q = q + 1 }
+        si (cociente(flg, 16) % 2 == 1) { mientras (byte_en(d, q) != 0) { q = q + 1 }  q = q + 1 }
+        si (cociente(flg, 2) % 2 == 1) { q = q + 2 }
+        // Se arma un flujo zlib para el inflador nativo, que avisa dónde terminó.
+        sea cuerpo = subcadena(d, q, longitud(d))
+        sea x = _cp_inflar(cuerpo, maximo_ ?? 1073741824)
+        r.agregar(x[0])
+        p = q + x[1] + 8
+        si (compacta_crc32(x[0], 0) != _cp_le(d, q + x[1], 4)) { lanzar "compacta: CRC de gzip no coincide" }
+    }
+    retornar unir(r, "")
+}
+
+// ── Inflate (RFC 1951) ────────────────────────────────────────────────────
+
+sea _CP_LBASE = [3, 4, 5, 6, 7, 8, 9, 10, 11, 13, 15, 17, 19, 23, 27, 31, 35, 43, 51, 59, 67, 83, 99, 115, 131, 163, 195, 227, 258]
+sea _CP_LEXT = [0, 0, 0, 0, 0, 0, 0, 0, 1, 1, 1, 1, 2, 2, 2, 2, 3, 3, 3, 3, 4, 4, 4, 4, 5, 5, 5, 5, 0]
+sea _CP_DBASE = [1, 2, 3, 4, 5, 7, 9, 13, 17, 25, 33, 49, 65, 97, 129, 193, 257, 385, 513, 769, 1025, 1537, 2049, 3073, 4097, 6145, 8193, 12289, 16385, 24577]
+sea _CP_DEXT = [0, 0, 0, 0, 1, 1, 2, 2, 3, 3, 4, 4, 5, 5, 6, 6, 7, 7, 8, 8, 9, 9, 10, 10, 11, 11, 12, 12, 13, 13]
+
+funcion _cp_bits_ad(st, n) {
+    sea v = _cp_ver_ad(st["d"], st["pb"], n)
+    st["pb"] = st["pb"] + n
+    retornar v
+}
+
+// Tabla canónica: {largo: {código: símbolo}} con el código invertido para
+// leerlo bit a bit (deflate guarda los códigos desde el bit alto).
+funcion _cp_canonica(largos) {
+    sea maxl = 0
+    para l en largos { maxl = maximo(maxl, l) }
+    sea cuenta = []
+    sea i = 0
+    mientras (i <= maxl) { cuenta.agregar(0)  i = i + 1 }
+    para l en largos { si (l > 0) { cuenta[l] = cuenta[l] + 1 } }
+    sea sig = [0, 0]
+    sea codigo = 0
+    i = 1
+    mientras (i <= maxl) {
+        codigo = (codigo + cuenta[i - 1]) * 2
+        si (i == 1) { codigo = 0 }
+        sig.agregar(0)
+        sig[i] = codigo
+        i = i + 1
+    }
+    // Recalcula como el RFC: next_code[bits] = (code + bl_count[bits-1]) << 1.
+    sea next = []
+    i = 0
+    mientras (i <= maxl + 1) { next.agregar(0)  i = i + 1 }
+    codigo = 0
+    cuenta[0] = 0
+    i = 1
+    mientras (i <= maxl) {
+        codigo = (codigo + cuenta[i - 1]) * 2
+        next[i] = codigo
+        i = i + 1
+    }
+    sea t = {}
+    sea s = 0
+    mientras (s < longitud(largos)) {
+        sea l = largos[s]
+        si (l > 0) {
+            t["" + l + ":" + next[l]] = s
+            next[l] = next[l] + 1
+        }
+        s = s + 1
+    }
+    retornar {"t": t, "max": maxl}
+}
+
+funcion _cp_simbolo(st, tabla) {
+    sea codigo = 0
+    sea l = 1
+    mientras (l <= tabla["max"]) {
+        codigo = codigo * 2 + _cp_bits_ad(st, 1)
+        sea s = tabla["t"]["" + l + ":" + codigo] ?? nulo
+        si (s != nulo) { retornar s }
+        l = l + 1
+    }
+    lanzar "compacta: código deflate inválido"
+}
+
+sea _CP_FIJA_LIT = nulo
+sea _CP_FIJA_DIST = nulo
+
+/// Descomprime deflate crudo desde el byte inicio: {"datos", "fin" (byte
+/// siguiente al último usado)}.
+funcion compacta_inflar(datos, inicio, maximo_) {
+    sea st = {"d": "" + datos, "pb": (inicio ?? 0) * 8}
+    sea salida = []
+    sea ultimo = 0
+    mientras (ultimo == 0) {
+        ultimo = _cp_bits_ad(st, 1)
+        sea tipo_ = _cp_bits_ad(st, 2)
+        si (tipo_ == 0) {
+            st["pb"] = cociente(st["pb"] + 7, 8) * 8
+            sea p = cociente(st["pb"], 8)
+            sea n = _cp_le(st["d"], p, 2)
+            p = p + 4
+            sea i = 0
+            mientras (i < n) { salida.agregar(byte_en(st["d"], p + i))  i = i + 1 }
+            st["pb"] = (p + n) * 8
+        } sino {
+            sea tl = nulo
+            sea td = nulo
+            si (tipo_ == 1) {
+                si (_CP_FIJA_LIT == nulo) {
+                    sea l = []
+                    sea i = 0
+                    mientras (i < 288) {
+                        si (i < 144) { l.agregar(8) } sino { si (i < 256) { l.agregar(9) } sino { si (i < 280) { l.agregar(7) } sino { l.agregar(8) } } }
+                        i = i + 1
+                    }
+                    _CP_FIJA_LIT = _cp_canonica(l)
+                    sea dl = []
+                    i = 0
+                    mientras (i < 30) { dl.agregar(5)  i = i + 1 }
+                    _CP_FIJA_DIST = _cp_canonica(dl)
+                }
+                tl = _CP_FIJA_LIT
+                td = _CP_FIJA_DIST
+            } sino {
+                si (tipo_ == 3) { lanzar "compacta: bloque deflate reservado" }
+                sea hlit = _cp_bits_ad(st, 5) + 257
+                sea hdist = _cp_bits_ad(st, 5) + 1
+                sea hclen = _cp_bits_ad(st, 4) + 4
+                sea orden = [16, 17, 18, 0, 8, 7, 9, 6, 10, 5, 11, 4, 12, 3, 13, 2, 14, 1, 15]
+                sea lc = [0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0]
+                sea i = 0
+                mientras (i < hclen) { lc[orden[i]] = _cp_bits_ad(st, 3)  i = i + 1 }
+                sea tc = _cp_canonica(lc)
+                sea largos = []
+                mientras (longitud(largos) < hlit + hdist) {
+                    sea s = _cp_simbolo(st, tc)
+                    si (s < 16) { largos.agregar(s) } sino {
+                        sea rep = 0
+                        sea val = 0
+                        si (s == 16) {
+                            rep = 3 + _cp_bits_ad(st, 2)
+                            val = largos[longitud(largos) - 1]
+                        }
+                        si (s == 17) { rep = 3 + _cp_bits_ad(st, 3) }
+                        si (s == 18) { rep = 11 + _cp_bits_ad(st, 7) }
+                        sea k = 0
+                        mientras (k < rep) { largos.agregar(val)  k = k + 1 }
+                    }
+                }
+                sea ll = []
+                sea dd = []
+                i = 0
+                mientras (i < hlit) { ll.agregar(largos[i])  i = i + 1 }
+                mientras (i < hlit + hdist) { dd.agregar(largos[i])  i = i + 1 }
+                tl = _cp_canonica(ll)
+                td = _cp_canonica(dd)
+            }
+            mientras (verdadero) {
+                sea s = _cp_simbolo(st, tl)
+                si (s < 256) { salida.agregar(s) } sino {
+                    si (s == 256) { romper }
+                    sea k = s - 257
+                    sea largo = _CP_LBASE[k] + _cp_bits_ad(st, _CP_LEXT[k])
+                    sea dc = _cp_simbolo(st, td)
+                    sea dist = _CP_DBASE[dc] + _cp_bits_ad(st, _CP_DEXT[dc])
+                    si (dist > longitud(salida)) { lanzar "compacta: distancia deflate inválida" }
+                    sea origen = longitud(salida) - dist
+                    sea j = 0
+                    mientras (j < largo) { salida.agregar(salida[origen + j])  j = j + 1 }
+                }
+                si (maximo_ != nulo y longitud(salida) > maximo_) { lanzar "compacta: la salida supera el máximo" }
+            }
+        }
+    }
+    retornar {"datos": _cp_a_texto(salida, 0, longitud(salida)), "fin": cociente(st["pb"] + 7, 8)}
+}
+
+funcion _cp_inflar(cuerpo, maximo_) {
+    sea r = compacta_inflar(cuerpo, 0, maximo_)
+    retornar [r["datos"], r["fin"]]
+}
