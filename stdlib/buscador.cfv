@@ -1,0 +1,475 @@
+// stdlib/buscador.cfv — búsqueda de texto completo con analizadores:
+// español e inglés (sin tildes, palabras vacías y raíces: "corriendo" y
+// "correr" se encuentran), sinónimos, búsqueda tolerante a errores de
+// tipeo (Levenshtein), frases exactas entre comillas, prefijos (auto*),
+// obligatorios (+), excluidos (-), filtros por campo (autor:ana), facetas,
+// fragmentos resaltados, orden por campo y paginación, con ranking BM25 y
+// pesos por campo. Inspirada en Tantivy / Meilisearch (MIT). En inglés:
+// importar "search".
+//
+//   importar "buscador"
+//   sea b = buscador_nuevo({"campos": {"titulo": 3, "cuerpo": 1}, "idioma": "es", "facetas": ["categoria"]})
+//   buscador_agregar(b, "1", {"titulo": "Cómo correr un maratón", "cuerpo": "…", "categoria": "deporte"})
+//   buscador_buscar(b, "corredores maraton", {"limite": 10, "tolerancia": 1})
+
+importar "unicode"
+
+sea _BU_VACIAS = {
+    "es": "a al algo algunas algunos ante antes como con contra cual cuando de del desde donde durante e el ella ellas ellos en entre era es esa esas ese eso esos esta estas este esto estos fue fueron ha han hasta hay la las le les lo los mas me mi mis mucho muy nada ni no nos nosotros o os otra otro para pero poco por porque que quien se ser si sin sobre su sus tambien tanto te tiene tu tus un una uno unos unas y ya yo",
+    "en": "a an and are as at be but by for from has have he her his i if in into is it its me my no not of on or our she so that the their them then there these they this to was we were what when which who will with you your"
+}
+
+funcion _bu_vacias(idioma) {
+    sea r = {}
+    para w en texto_dividir(_BU_VACIAS[idioma] ?? "", " ") { r[w] = verdadero }
+    retornar r
+}
+
+// Raíz ligera en español (inspirada en el "light stemmer" de Savoy).
+funcion _bu_raiz_es(w) {
+    sea n = longitud(w)
+    si (n < 4) { retornar w }
+    para suf en ["amientos", "imientos", "amiento", "imiento", "aciones", "uciones", "adoras", "adores", "ancias", "encias", "logias", "idades", "ividad", "amente", "mente", "acion", "ucion", "adora", "ador", "ancia", "encia", "logia", "idad", "ables", "ibles", "able", "ible", "istas", "ista", "osas", "osos", "osa", "oso", "ando", "iendo", "yendo", "aron", "ieron", "aban", "ian", "aba", "ado", "ida", "ido", "ada", "ar", "er", "ir"] {
+        si (n - longitud(suf) >= 3 y texto_termina_con(w, suf)) { retornar subcadena(w, 0, n - longitud(suf)) }
+    }
+    si (texto_termina_con(w, "ces") y n > 4) { retornar subcadena(w, 0, n - 3) + "z" }
+    si (texto_termina_con(w, "es") y n > 4) { retornar subcadena(w, 0, n - 2) }
+    si (texto_termina_con(w, "s") y n > 3) { w = subcadena(w, 0, n - 1)  n = n - 1 }
+    si ((texto_termina_con(w, "a") o texto_termina_con(w, "o") o texto_termina_con(w, "e")) y n > 3) { retornar subcadena(w, 0, n - 1) }
+    retornar w
+}
+
+// Raíz ligera en inglés (pasos básicos de Porter: plurales, -ed, -ing, -ly…).
+funcion _bu_raiz_en(w) {
+    sea n = longitud(w)
+    si (n < 4) { retornar w }
+    si (texto_termina_con(w, "sses")) { w = subcadena(w, 0, n - 2) } sino {
+        si (texto_termina_con(w, "ies") y n > 4) { w = subcadena(w, 0, n - 3) + "i" } sino {
+            si (texto_termina_con(w, "s") y texto_termina_con(w, "ss") == falso y texto_termina_con(w, "us") == falso) { w = subcadena(w, 0, n - 1) }
+        }
+    }
+    n = longitud(w)
+    para suf en ["ational", "ization", "fulness", "iveness", "ousness", "ation", "ement", "ments", "ment", "ness", "ing", "ed", "ly", "er", "est"] {
+        si (n - longitud(suf) >= 3 y texto_termina_con(w, suf)) {
+            w = subcadena(w, 0, n - longitud(suf))
+            // run-n-ing → run
+            sea m = longitud(w)
+            si (m >= 3 y subcadena(w, m - 1, m) == subcadena(w, m - 2, m - 1) y texto_indice("lsz", subcadena(w, m - 1, m)) < 0) { w = subcadena(w, 0, m - 1) }
+            retornar w
+        }
+    }
+    si (texto_termina_con(w, "e") y longitud(w) > 4) { retornar subcadena(w, 0, longitud(w) - 1) }
+    retornar w
+}
+
+/// Términos de un texto según el analizador del buscador (sin tildes,
+/// minúsculas, sin palabras vacías, con raíz). Devuelve [[término, posición]].
+funcion buscador_analizar(b, texto) {
+    sea t = unicode_minusculas(unicode_sin_acentos("" + texto))
+    sea r = []
+    sea actual = ""
+    sea pos = 0
+    sea i = 0
+    sea n = longitud(t)
+    mientras (i <= n) {
+        sea c = ""
+        si (i < n) { c = subcadena(t, i, i + 1) }
+        sea bb = 0
+        si (i < n) { bb = byte_en(t, i) }
+        si (i < n y ((bb >= 97 y bb <= 122) o (bb >= 48 y bb <= 57) o bb >= 128)) { actual = actual + c } sino {
+            si (actual != "") {
+                si (tiene_clave(b["vacias"], actual) == falso) { r.agregar([_bu_raiz(b, actual), pos]) }
+                pos = pos + 1
+                actual = ""
+            }
+        }
+        i = i + 1
+    }
+    retornar r
+}
+
+funcion _bu_raiz(b, w) {
+    si (b["raices"] == falso) { retornar w }
+    si (b["idioma"] == "es") { retornar _bu_raiz_es(w) }
+    si (b["idioma"] == "en") { retornar _bu_raiz_en(w) }
+    retornar w
+}
+
+/// opciones: campos ({nombre: peso}), idioma ("es" | "en" | nulo),
+/// raices (verdadero), vacias (verdadero), facetas ([campos]),
+/// sinonimos ([["auto", "coche", "carro"], …]).
+funcion buscador_nuevo(opciones) {
+    sea o = opciones ?? {}
+    sea b = {"campos": o["campos"] ?? {"texto": 1}, "idioma": o["idioma"] ?? "es", "raices": o["raices"] ?? verdadero, "facetas": o["facetas"] ?? [], "docs": {}, "orden_docs": [], "post": {}, "largos": {}, "suma_largos": {}, "n": 0, "sinonimos": {}, "trigramas": {}}
+    b["vacias"] = {}
+    si (o["vacias"] ?? verdadero) { b["vacias"] = _bu_vacias(b["idioma"]) }
+    para grupo en (o["sinonimos"] ?? []) {
+        sea terms = []
+        para w en grupo { para t en buscador_analizar(b, w) { terms.agregar(t[0]) } }
+        para t en terms { b["sinonimos"][t] = terms }
+    }
+    para c en claves(b["campos"]) { b["suma_largos"][c] = 0 }
+    retornar b
+}
+
+funcion _bu_trigramas(t) {
+    sea s = "$" + t + "$"
+    sea r = []
+    sea i = 0
+    mientras (i + 3 <= longitud(s)) { r.agregar(subcadena(s, i, i + 3))  i = i + 1 }
+    retornar r
+}
+
+/// Agrega o reemplaza un documento (mapa campo → texto, más otros datos).
+funcion buscador_agregar(b, id, doc) {
+    sea k = "" + id
+    si (tiene_clave(b["docs"], k)) { buscador_quitar(b, k) }
+    b["docs"][k] = doc
+    b["orden_docs"].agregar(k)
+    b["n"] = b["n"] + 1
+    b["largos"][k] = {}
+    para c en claves(b["campos"]) {
+        sea ts = buscador_analizar(b, doc[c] ?? "")
+        b["largos"][k][c] = longitud(ts)
+        b["suma_largos"][c] = b["suma_largos"][c] + longitud(ts)
+        para par en ts {
+            sea t = par[0]
+            si (tiene_clave(b["post"], t) == falso) {
+                b["post"][t] = {}
+                para g en _bu_trigramas(t) {
+                    si (tiene_clave(b["trigramas"], g) == falso) { b["trigramas"][g] = {} }
+                    b["trigramas"][g][t] = verdadero
+                }
+            }
+            si (tiene_clave(b["post"][t], k) == falso) { b["post"][t][k] = {} }
+            si (tiene_clave(b["post"][t][k], c) == falso) { b["post"][t][k][c] = [] }
+            b["post"][t][k][c].agregar(par[1])
+        }
+    }
+}
+
+funcion buscador_quitar(b, id) {
+    sea k = "" + id
+    si (tiene_clave(b["docs"], k) == falso) { retornar falso }
+    para c en claves(b["campos"]) { b["suma_largos"][c] = b["suma_largos"][c] - (b["largos"][k][c] ?? 0) }
+    para t en claves(b["post"]) { si (tiene_clave(b["post"][t], k)) { quitar_clave(b["post"][t], k) } }
+    quitar_clave(b["docs"], k)
+    quitar_clave(b["largos"], k)
+    sea l = []
+    para x en b["orden_docs"] { si (x != k) { l.agregar(x) } }
+    b["orden_docs"] = l
+    b["n"] = b["n"] - 1
+    retornar verdadero
+}
+
+funcion buscador_cantidad(b) { retornar b["n"] }
+
+/// Distancia de edición (Levenshtein) con tope: si pasa el tope devuelve tope + 1.
+funcion buscador_distancia(a, b, tope) {
+    sea n = longitud(a)
+    sea m = longitud(b)
+    sea lim = tope ?? 1000
+    si (absoluto(n - m) > lim) { retornar lim + 1 }
+    sea prev = []
+    sea j = 0
+    mientras (j <= m) { prev.agregar(j)  j = j + 1 }
+    sea i = 1
+    mientras (i <= n) {
+        sea fila = [i]
+        sea minimo_fila = i
+        j = 1
+        mientras (j <= m) {
+            sea costo = 1
+            si (subcadena(a, i - 1, i) == subcadena(b, j - 1, j)) { costo = 0 }
+            sea v = minimo(minimo(prev[j] + 1, fila[j - 1] + 1), prev[j - 1] + costo)
+            fila.agregar(v)
+            minimo_fila = minimo(minimo_fila, v)
+            j = j + 1
+        }
+        si (minimo_fila > lim) { retornar lim + 1 }
+        prev = fila
+        i = i + 1
+    }
+    retornar prev[m]
+}
+
+// Términos del índice parecidos a t (por trigramas y distancia).
+funcion _bu_parecidos(b, t, tol) {
+    sea cand = {}
+    para g en _bu_trigramas(t) { para x en claves(b["trigramas"][g] ?? {}) { cand[x] = (cand[x] ?? 0) + 1 } }
+    sea r = []
+    para x en claves(cand) {
+        si (cand[x] >= 1) {
+            sea d = buscador_distancia(t, x, tol)
+            si (d <= tol) { r.agregar([x, d]) }
+        }
+    }
+    retornar r
+}
+
+funcion _bu_consulta(b, q) {
+    // Partes: frases "…", campo:valor, +obligatorio, -excluido, prefijo*.
+    sea r = {"opcional": [], "obligatorio": [], "excluido": [], "frases": [], "filtros": []}
+    sea s = "" + q
+    sea i = 0
+    mientras (i < longitud(s)) {
+        sea c = subcadena(s, i, i + 1)
+        si (c == " ") { i = i + 1 } sino {
+            sea signo = ""
+            si (c == "+" o c == "-") { signo = c  i = i + 1 }
+            si (subcadena(s, i, i + 1) == "\"") {
+                sea f = texto_indice(subcadena(s, i + 1, longitud(s)), "\"")
+                sea frase = ""
+                si (f < 0) { frase = subcadena(s, i + 1, longitud(s))  i = longitud(s) } sino { frase = subcadena(s, i + 1, i + 1 + f)  i = i + f + 2 }
+                sea ts = []
+                para par en buscador_analizar(b, frase) { ts.agregar(par[0]) }
+                si (longitud(ts) > 0) {
+                    si (signo == "-") { r["excluido"].agregar({"frase": ts}) } sino { r["frases"].agregar(ts) }
+                }
+            } sino {
+                sea j = i
+                mientras (j < longitud(s) y subcadena(s, j, j + 1) != " ") { j = j + 1 }
+                sea w = subcadena(s, i, j)
+                i = j
+                sea dp = texto_indice(w, ":")
+                si (dp > 0 y dp < longitud(w) - 1) { r["filtros"].agregar([subcadena(w, 0, dp), subcadena(w, dp + 1, longitud(w)), signo == "-"]) } sino {
+                    sea prefijo = texto_termina_con(w, "*")
+                    si (prefijo) { w = subcadena(w, 0, longitud(w) - 1) }
+                    para par en buscador_analizar(b, w) {
+                        sea term = {"t": par[0], "prefijo": prefijo, "crudo": unicode_minusculas(unicode_sin_acentos(w))}
+                        si (signo == "+") { r["obligatorio"].agregar(term) }
+                        si (signo == "-") { r["excluido"].agregar(term) }
+                        si (signo == "") { r["opcional"].agregar(term) }
+                    }
+                }
+            }
+        }
+    }
+    retornar r
+}
+
+funcion _bu_expandir(b, term, tol) {
+    // [término del índice, factor].
+    sea r = []
+    sea vistos = {}
+    sea base = [term["t"]]
+    para s en (b["sinonimos"][term["t"]] ?? []) { base.agregar(s) }
+    para t en base {
+        si (tiene_clave(b["post"], t) y tiene_clave(vistos, t) == falso) {
+            vistos[t] = verdadero
+            sea f = 1
+            si (t != term["t"]) { f = 0.8 }
+            r.agregar([t, f])
+        }
+    }
+    si (term["prefijo"]) {
+        para t en claves(b["post"]) {
+            si (tiene_clave(vistos, t) == falso y (texto_empieza_con(t, term["t"]) o texto_empieza_con(t, term["crudo"]))) {
+                vistos[t] = verdadero
+                r.agregar([t, 0.9])
+            }
+        }
+    }
+    si (tol > 0 y longitud(term["t"]) >= 4) {
+        sea lim = tol
+        si (longitud(term["t"]) < 6) { lim = minimo(tol, 1) }
+        para par en _bu_parecidos(b, term["t"], lim) {
+            si (tiene_clave(vistos, par[0]) == falso) {
+                vistos[par[0]] = verdadero
+                r.agregar([par[0], 0.7 / (par[1] + 0.5)])
+            }
+        }
+    }
+    retornar r
+}
+
+funcion _bu_bm25(b, t, k, factor) {
+    sea df = longitud(claves(b["post"][t]))
+    sea idf = logaritmo(1 + (b["n"] - df + 0.5) / (df + 0.5))
+    sea s = 0
+    para c en claves(b["post"][t][k]) {
+        sea tf = longitud(b["post"][t][k][c])
+        sea prom = maximo(1, b["suma_largos"][c] / maximo(1, b["n"]))
+        sea l = b["largos"][k][c] ?? 0
+        sea norm = tf * 2.2 / (tf + 1.2 * (0.25 + 0.75 * l / prom))
+        s = s + idf * norm * (b["campos"][c] ?? 1)
+    }
+    retornar s * factor
+}
+
+funcion _bu_tiene_frase(b, k, ts) {
+    para c en claves(b["campos"]) {
+        sea pos0 = ((b["post"][ts[0]] ?? {})[k] ?? {})[c] ?? []
+        para p en pos0 {
+            sea ok = verdadero
+            sea j = 1
+            mientras (j < longitud(ts) y ok) {
+                sea ps = ((b["post"][ts[j]] ?? {})[k] ?? {})[c] ?? []
+                sea esta = falso
+                para x en ps { si (x == p + j) { esta = verdadero } }
+                // Las palabras vacías ocupan posición: permite un hueco.
+                si (esta == falso) { para x en ps { si (x == p + j + 1) { esta = verdadero } } }
+                ok = esta
+                j = j + 1
+            }
+            si (ok) { retornar verdadero }
+        }
+    }
+    retornar falso
+}
+
+funcion _bu_filtro_ok(doc, f) {
+    sea v = doc[f[0]] ?? nulo
+    sea ok = falso
+    si (v != nulo) {
+        si (tipo(v) == "lista") { para x en v { si (unicode_minusculas("" + x) == unicode_minusculas(f[1])) { ok = verdadero } } } sino { ok = unicode_minusculas("" + v) == unicode_minusculas(f[1]) }
+    }
+    si (f[2]) { retornar ok == falso }
+    retornar ok
+}
+
+/// Busca. opciones: limite (10), desde (0), tolerancia (0, 1 o 2
+/// errores de tipeo), orden ([campo, "asc"|"desc"]; por defecto relevancia),
+/// filtro (f(doc) → bool), resaltar (campo para el fragmento).
+/// Devuelve {"total", "resultados": [{"id", "puntaje", "doc", "fragmento"}], "facetas"}.
+funcion buscador_buscar(b, consulta, opciones) {
+    sea o = opciones ?? {}
+    sea tol = o["tolerancia"] ?? 0
+    sea q = _bu_consulta(b, consulta)
+    sea puntajes = {}
+    sea grupos = []
+    para term en q["opcional"] { grupos.agregar([term, falso]) }
+    para term en q["obligatorio"] { grupos.agregar([term, verdadero]) }
+    sea obligatorios = []
+    para g en grupos {
+        sea encontrados = {}
+        para ex en _bu_expandir(b, g[0], tol) {
+            para k en claves(b["post"][ex[0]]) {
+                puntajes[k] = (puntajes[k] ?? 0) + _bu_bm25(b, ex[0], k, ex[1])
+                encontrados[k] = verdadero
+            }
+        }
+        si (g[1]) { obligatorios.agregar(encontrados) }
+    }
+    // Frases: deben aparecer seguidas.
+    para f en q["frases"] {
+        sea cand = {}
+        para k en claves(b["post"][f[0]] ?? {}) { si (_bu_tiene_frase(b, k, f)) { cand[k] = verdadero } }
+        para k en claves(cand) {
+            sea s = 0
+            para t en f { s = s + _bu_bm25(b, t, k, 1.5) }
+            puntajes[k] = (puntajes[k] ?? 0) + s
+        }
+        obligatorios.agregar(cand)
+    }
+    // Sólo filtros: todos los documentos cuentan.
+    si (longitud(grupos) == 0 y longitud(q["frases"]) == 0) { para k en b["orden_docs"] { puntajes[k] = 0 } }
+    sea resultados = []
+    para k en claves(puntajes) {
+        sea ok = verdadero
+        para ob en obligatorios { si (tiene_clave(ob, k) == falso) { ok = falso } }
+        para ex en q["excluido"] {
+            si (tiene_clave(ex, "frase")) { si (_bu_tiene_frase(b, k, ex["frase"])) { ok = falso } } sino {
+                si (tiene_clave(b["post"], ex["t"]) y tiene_clave(b["post"][ex["t"]], k)) { ok = falso }
+            }
+        }
+        sea doc = b["docs"][k]
+        para f en q["filtros"] { si (ok y _bu_filtro_ok(doc, f) == falso) { ok = falso } }
+        si (ok y (o["filtro"] ?? nulo) != nulo) { ok = o["filtro"](doc) == verdadero }
+        si (ok) { resultados.agregar({"id": k, "puntaje": redondear(puntajes[k], 4), "doc": doc}) }
+    }
+    sea orden = o["orden"] ?? nulo
+    resultados = ordenar(resultados, funcion(x, z) {
+        si (orden != nulo) {
+            sea a = x["doc"][orden[0]] ?? nulo
+            sea c = z["doc"][orden[0]] ?? nulo
+            sea cmp = 0
+            si (a != nulo y c != nulo) {
+                si (a < c) { cmp = -1 }
+                si (a > c) { cmp = 1 }
+            }
+            si ((orden[1] ?? "asc") == "desc") { cmp = -cmp }
+            si (cmp != 0) { retornar cmp }
+        }
+        si (x["puntaje"] > z["puntaje"]) { retornar -1 }
+        si (x["puntaje"] < z["puntaje"]) { retornar 1 }
+        si (x["id"] < z["id"]) { retornar -1 }
+        retornar 1
+    })
+    // Facetas sobre todos los resultados (antes de paginar).
+    sea facetas = {}
+    para f en b["facetas"] {
+        sea cuenta = {}
+        para res en resultados {
+            sea v = res["doc"][f] ?? nulo
+            si (v != nulo) {
+                sea vs = v
+                si (tipo(v) != "lista") { vs = [v] }
+                para x en vs { cuenta["" + x] = (cuenta["" + x] ?? 0) + 1 }
+            }
+        }
+        facetas[f] = cuenta
+    }
+    sea desde = o["desde"] ?? 0
+    sea limite = o["limite"] ?? 10
+    sea pagina = []
+    sea i = desde
+    sea terminos = {}
+    para g en grupos { para ex en _bu_expandir(b, g[0], tol) { terminos[ex[0]] = verdadero } }
+    para f en q["frases"] { para t en f { terminos[t] = verdadero } }
+    mientras (i < longitud(resultados) y longitud(pagina) < limite) {
+        sea res = resultados[i]
+        si ((o["resaltar"] ?? nulo) != nulo) { res["fragmento"] = buscador_fragmento(b, res["doc"][o["resaltar"]] ?? "", terminos) }
+        pagina.agregar(res)
+        i = i + 1
+    }
+    retornar {"total": longitud(resultados), "resultados": pagina, "facetas": facetas}
+}
+
+/// Fragmento de unas 30 palabras alrededor de la primera coincidencia,
+/// con <mark>…</mark> en los términos encontrados.
+funcion buscador_fragmento(b, texto, terminos) {
+    sea palabras = texto_dividir("" + texto, " ")
+    sea marca = []
+    sea primera = -1
+    sea i = 0
+    mientras (i < longitud(palabras)) {
+        sea a = buscador_analizar(b, palabras[i])
+        sea es = falso
+        para par en a { si (tiene_clave(terminos, par[0])) { es = verdadero } }
+        marca.agregar(es)
+        si (es y primera < 0) { primera = i }
+        i = i + 1
+    }
+    sea ini = maximo(0, primera - 10)
+    si (primera < 0) { ini = 0 }
+    sea fin = minimo(longitud(palabras), ini + 30)
+    sea r = []
+    i = ini
+    mientras (i < fin) {
+        sea p = texto_reemplazar(texto_reemplazar(texto_reemplazar(palabras[i], "&", "&amp;"), "<", "&lt;"), ">", "&gt;")
+        si (marca[i]) { r.agregar("<mark>" + p + "</mark>") } sino { r.agregar(p) }
+        i = i + 1
+    }
+    sea s = unir(r, " ")
+    si (ini > 0) { s = "… " + s }
+    si (fin < longitud(palabras)) { s = s + " …" }
+    retornar s
+}
+
+/// Sugerencias para autocompletar: términos que empiezan con el prefijo,
+/// ordenados por cantidad de documentos.
+funcion buscador_sugerir(b, prefijo, n) {
+    sea p = unicode_minusculas(unicode_sin_acentos("" + prefijo))
+    sea r = []
+    para t en claves(b["post"]) { si (texto_empieza_con(t, p)) { r.agregar([t, longitud(claves(b["post"][t]))]) } }
+    r = ordenar(r, funcion(x, z) {
+        si (x[1] != z[1]) { retornar z[1] - x[1] }
+        si (x[0] < z[0]) { retornar -1 }
+        retornar 1
+    })
+    sea s = []
+    sea i = 0
+    mientras (i < minimo(n ?? 5, longitud(r))) { s.agregar(r[i][0])  i = i + 1 }
+    retornar s
+}

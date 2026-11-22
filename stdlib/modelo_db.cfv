@@ -1,0 +1,539 @@
+// stdlib/modelo_db.cfv — esquemas de base de datos en código y consultas
+// sin SQL a mano: defines tablas y columnas (tipos, claves, únicos,
+// valores por defecto, claves foráneas, índices), generas el DDL para
+// SQLite, PostgreSQL o MySQL, calculas migraciones comparando esquemas
+// (incluida la reconstrucción de tablas que SQLite necesita) y armas
+// SELECT/INSERT/UPDATE/DELETE con condiciones, uniones, orden y páginas.
+// Los valores siempre van como parámetros y los nombres se validan contra
+// el esquema: un error de tipeo falla antes de llegar a la base. Ejecuta
+// con "db" (SQLite). Inspirada en Drizzle / Prisma (Apache). En inglés:
+// importar "orm".
+//
+//   importar "modelo_db"
+//   sea usuarios = modelo_tabla("usuarios", {
+//       "id": modelo_col("entero", {"primaria": verdadero, "auto": verdadero}),
+//       "email": modelo_col("texto", {"unico": verdadero}),
+//       "activo": modelo_col("booleano", {"defecto": verdadero})})
+//   sea q = modelo_select(usuarios, {"donde": modelo_y([modelo_igual("activo", verdadero), modelo_como("email", "%@vemoris.cl")]), "orden": [["id", "desc"]], "limite": 10})
+//   modelo_sql(q, "postgres")      // {"sql": "SELECT … WHERE … LIMIT 10", "params": [true, "%@vemoris.cl"]}
+
+importar "json"
+importar "db"
+
+sea _MD_TIPOS = {"entero": 1, "texto": 1, "real": 1, "booleano": 1, "fecha": 1, "json": 1, "bytes": 1, "decimal": 1, "uuid": 1}
+sea _MD_TIPOS_EN = {"integer": "entero", "int": "entero", "text": "texto", "string": "texto", "float": "real", "double": "real", "bool": "booleano", "boolean": "booleano", "date": "fecha", "datetime": "fecha", "timestamp": "fecha", "blob": "bytes"}
+
+funcion _md_ident(n) {
+    sea s = "" + n
+    si (s == "" o longitud(s) > 63) { lanzar "modelo_db: nombre inválido \"" + s + "\"" }
+    sea i = 0
+    mientras (i < longitud(s)) {
+        sea b = byte_en(s, i)
+        sea ok = (b >= 65 y b <= 90) o (b >= 97 y b <= 122) o b == 95 o (i > 0 y b >= 48 y b <= 57)
+        si (ok == falso) { lanzar "modelo_db: nombre inválido \"" + s + "\" (usa letras, números y _)" }
+        i = i + 1
+    }
+    retornar s
+}
+
+funcion _md_q(d, n) {
+    si (d == "mysql") { retornar "`" + _md_ident(n) + "`" }
+    retornar "\"" + _md_ident(n) + "\""
+}
+
+/// Columna. tipo: entero, texto, real, booleano, fecha, json, bytes,
+/// decimal, uuid. opciones: primaria, auto, nulo (permite NULL), unico,
+/// defecto (valor o {"sql": "CURRENT_TIMESTAMP"}), ref ("tabla.columna"),
+/// al_borrar ("cascade" | "set null" | "restrict"), largo (VARCHAR).
+funcion modelo_col(tipo_, opciones) {
+    sea t = _MD_TIPOS_EN[tipo_] ?? tipo_
+    si (tiene_clave(_MD_TIPOS, t) == falso) { lanzar "modelo_db: tipo de columna desconocido " + tipo_ }
+    sea o = opciones ?? {}
+    retornar {"tipo": t, "primaria": o["primaria"] ?? (o["primary"] ?? falso), "auto": o["auto"] ?? falso, "nulo": o["nulo"] ?? (o["nullable"] ?? falso), "unico": o["unico"] ?? (o["unique"] ?? falso), "defecto": o["defecto"] ?? (o["default"] ?? nulo), "tiene_defecto": tiene_clave(o, "defecto") o tiene_clave(o, "default"), "ref": o["ref"] ?? (o["references"] ?? nulo), "al_borrar": o["al_borrar"] ?? (o["on_delete"] ?? nulo), "largo": o["largo"] ?? (o["length"] ?? nulo)}
+}
+
+/// Tabla. indices: [{"columnas": [...], "unico": bool, "nombre"}].
+funcion modelo_tabla(nombre, columnas, indices) {
+    _md_ident(nombre)
+    sea orden = []
+    para k en claves(columnas) { _md_ident(k)  orden.agregar(k) }
+    // La clave primaria primero, el resto en orden alfabético.
+    sea prim = []
+    sea resto = []
+    para k en orden { si (columnas[k]["primaria"]) { prim.agregar(k) } sino { resto.agregar(k) } }
+    sea r = []
+    para k en prim { r.agregar(k) }
+    para k en resto { r.agregar(k) }
+    sea ix = []
+    para i en (indices ?? []) {
+        para c en i["columnas"] { si (tiene_clave(columnas, c) == falso) { lanzar "modelo_db: el índice usa la columna inexistente " + nombre + "." + c } }
+        sea nm = i["nombre"] ?? ("ix_" + nombre + "_" + unir(i["columnas"], "_"))
+        ix.agregar({"nombre": _md_ident(nm), "columnas": i["columnas"], "unico": i["unico"] ?? falso})
+    }
+    retornar {"nombre": nombre, "columnas": columnas, "orden": r, "indices": ix}
+}
+
+/// Esquema: lista de tablas → {"tablas": {nombre: tabla}}.
+funcion modelo_esquema(tablas) {
+    sea r = {}
+    para t en tablas { r[t["nombre"]] = t }
+    // Comprueba las referencias.
+    para n en claves(r) {
+        para c en r[n]["orden"] {
+            sea ref = r[n]["columnas"][c]["ref"]
+            si (ref != nulo) {
+                sea p = texto_dividir(ref, ".")
+                si (longitud(p) != 2 o tiene_clave(r, p[0]) == falso o tiene_clave(r[p[0]]["columnas"], p[1]) == falso) { lanzar "modelo_db: " + n + "." + c + " referencia a " + ref + ", que no existe" }
+            }
+        }
+    }
+    retornar {"tablas": r}
+}
+
+// ── DDL ───────────────────────────────────────────────────────────────────
+
+funcion _md_tipo_sql(d, c) {
+    sea t = c["tipo"]
+    si (d == "postgres") {
+        si (t == "entero" y c["auto"]) { retornar "BIGSERIAL" }
+        retornar {"entero": "BIGINT", "texto": "TEXT", "real": "DOUBLE PRECISION", "booleano": "BOOLEAN", "fecha": "TIMESTAMPTZ", "json": "JSONB", "bytes": "BYTEA", "decimal": "NUMERIC", "uuid": "UUID"}[t]
+    }
+    si (d == "mysql") {
+        si (t == "texto" y (c["largo"] != nulo o c["unico"] o c["primaria"])) { retornar "VARCHAR(" + (c["largo"] ?? 255) + ")" }
+        retornar {"entero": "BIGINT", "texto": "TEXT", "real": "DOUBLE", "booleano": "BOOLEAN", "fecha": "DATETIME", "json": "JSON", "bytes": "BLOB", "decimal": "DECIMAL(38,10)", "uuid": "CHAR(36)"}[t]
+    }
+    retornar {"entero": "INTEGER", "texto": "TEXT", "real": "REAL", "booleano": "INTEGER", "fecha": "TEXT", "json": "TEXT", "bytes": "BLOB", "decimal": "TEXT", "uuid": "TEXT"}[t]
+}
+
+funcion _md_literal(d, v, c) {
+    si (tipo(v) == "mapa" y tiene_clave(v, "sql")) { retornar v["sql"] }
+    si (v == nulo) { retornar "NULL" }
+    si (v == verdadero) {
+        si (d == "sqlite") { retornar "1" }
+        retornar "TRUE"
+    }
+    si (v == falso) {
+        si (d == "sqlite") { retornar "0" }
+        retornar "FALSE"
+    }
+    si (tipo(v) == "numero") { retornar "" + v }
+    sea s = "" + v
+    si (c != nulo y c["tipo"] == "json") { s = json_texto(v) }
+    retornar "'" + texto_reemplazar(s, "'", "''") + "'"
+}
+
+funcion _md_col_sql(d, n, c, prim_unica) {
+    sea s = _md_q(d, n) + " " + _md_tipo_sql(d, c)
+    si (c["primaria"] y prim_unica) {
+        s = s + " PRIMARY KEY"
+        si (c["auto"] y d == "sqlite") { s = s + " AUTOINCREMENT" }
+        si (c["auto"] y d == "mysql") { s = s + " AUTO_INCREMENT" }
+    } sino {
+        si (c["nulo"] == falso) { s = s + " NOT NULL" }
+    }
+    si (c["unico"] y c["primaria"] == falso) { s = s + " UNIQUE" }
+    si (c["tiene_defecto"]) { s = s + " DEFAULT " + _md_literal(d, c["defecto"], c) }
+    si (c["ref"] != nulo) {
+        sea p = texto_dividir(c["ref"], ".")
+        s = s + " REFERENCES " + _md_q(d, p[0]) + " (" + _md_q(d, p[1]) + ")"
+        si (c["al_borrar"] != nulo) { s = s + " ON DELETE " + texto_mayusculas(c["al_borrar"]) }
+    }
+    retornar s
+}
+
+/// CREATE TABLE para un dialecto ("sqlite", "postgres", "mysql").
+funcion modelo_crear_sql(t, dialecto) {
+    sea d = dialecto ?? "sqlite"
+    sea prims = []
+    para n en t["orden"] { si (t["columnas"][n]["primaria"]) { prims.agregar(n) } }
+    sea partes = []
+    para n en t["orden"] { partes.agregar("  " + _md_col_sql(d, n, t["columnas"][n], longitud(prims) == 1)) }
+    si (longitud(prims) > 1) {
+        sea qs = []
+        para n en prims { qs.agregar(_md_q(d, n)) }
+        partes.agregar("  PRIMARY KEY (" + unir(qs, ", ") + ")")
+    }
+    sea r = ["CREATE TABLE " + _md_q(d, t["nombre"]) + " (\n" + unir(partes, ",\n") + "\n)"]
+    para i en t["indices"] { r.agregar(_md_indice_sql(d, t, i)) }
+    retornar r
+}
+
+funcion _md_indice_sql(d, t, i) {
+    sea cs = []
+    para c en i["columnas"] { cs.agregar(_md_q(d, c)) }
+    sea u = ""
+    si (i["unico"]) { u = "UNIQUE " }
+    retornar "CREATE " + u + "INDEX " + _md_q(d, i["nombre"]) + " ON " + _md_q(d, t["nombre"]) + " (" + unir(cs, ", ") + ")"
+}
+
+/// DDL de todo el esquema (en orden de dependencias).
+funcion modelo_ddl(esquema, dialecto) {
+    sea r = []
+    para n en _md_orden_tablas(esquema) { para s en modelo_crear_sql(esquema["tablas"][n], dialecto) { r.agregar(s) } }
+    retornar r
+}
+
+funcion _md_orden_tablas(e) {
+    sea r = []
+    sea hecho = {}
+    sea visitar = nulo
+    visitar = funcion(n, pila) {
+        si (tiene_clave(hecho, n)) { retornar nulo }
+        si (tiene_clave(pila, n)) { retornar nulo }
+        pila[n] = verdadero
+        sea t = e["tablas"][n]
+        para c en t["orden"] {
+            sea ref = t["columnas"][c]["ref"]
+            si (ref != nulo) {
+                sea dep = texto_dividir(ref, ".")[0]
+                si (dep != n) { visitar(dep, pila) }
+            }
+        }
+        hecho[n] = verdadero
+        r.agregar(n)
+    }
+    para n en claves(e["tablas"]) { visitar(n, {}) }
+    retornar r
+}
+
+// ── Migraciones ───────────────────────────────────────────────────────────
+
+funcion _md_misma_col(a, b) { retornar json_texto(a) == json_texto(b) }
+
+/// SQL para pasar de un esquema a otro (nulo = base vacía). En SQLite, los
+/// cambios de columnas que ALTER no soporta reconstruyen la tabla
+/// conservando los datos de las columnas en común.
+funcion modelo_migracion(viejo, nuevo, dialecto) {
+    sea d = dialecto ?? "sqlite"
+    sea v = viejo ?? {"tablas": {}}
+    sea r = []
+    // Tablas nuevas.
+    para n en _md_orden_tablas(nuevo) {
+        si (tiene_clave(v["tablas"], n) == falso) { para s en modelo_crear_sql(nuevo["tablas"][n], d) { r.agregar(s) } }
+    }
+    // Tablas que cambian.
+    para n en claves(nuevo["tablas"]) {
+        si (tiene_clave(v["tablas"], n)) {
+            sea a = v["tablas"][n]
+            sea b = nuevo["tablas"][n]
+            sea agregadas = []
+            sea quitadas = []
+            sea cambiadas = []
+            para c en b["orden"] {
+                si (tiene_clave(a["columnas"], c) == falso) { agregadas.agregar(c) } sino {
+                    si (_md_misma_col(a["columnas"][c], b["columnas"][c]) == falso) { cambiadas.agregar(c) }
+                }
+            }
+            para c en a["orden"] { si (tiene_clave(b["columnas"], c) == falso) { quitadas.agregar(c) } }
+            sea simple = longitud(cambiadas) == 0
+            para c en agregadas {
+                sea col = b["columnas"][c]
+                // ADD COLUMN NOT NULL necesita un valor por defecto; UNIQUE/PK no se puede en SQLite.
+                si (col["primaria"] o col["unico"] o (col["nulo"] == falso y col["tiene_defecto"] == falso)) { simple = falso }
+            }
+            si (d == "sqlite" y longitud(quitadas) > 0) { simple = falso }
+            si (simple o d != "sqlite") {
+                para c en agregadas { r.agregar("ALTER TABLE " + _md_q(d, n) + " ADD COLUMN " + _md_col_sql(d, c, b["columnas"][c], verdadero)) }
+                para c en quitadas { r.agregar("ALTER TABLE " + _md_q(d, n) + " DROP COLUMN " + _md_q(d, c)) }
+                si (d == "postgres") {
+                    para c en cambiadas {
+                        sea col = b["columnas"][c]
+                        r.agregar("ALTER TABLE " + _md_q(d, n) + " ALTER COLUMN " + _md_q(d, c) + " TYPE " + _md_tipo_sql(d, col))
+                        si (col["nulo"]) { r.agregar("ALTER TABLE " + _md_q(d, n) + " ALTER COLUMN " + _md_q(d, c) + " DROP NOT NULL") } sino { r.agregar("ALTER TABLE " + _md_q(d, n) + " ALTER COLUMN " + _md_q(d, c) + " SET NOT NULL") }
+                    }
+                }
+                si (d == "mysql") { para c en cambiadas { r.agregar("ALTER TABLE " + _md_q(d, n) + " MODIFY COLUMN " + _md_col_sql(d, c, b["columnas"][c], verdadero)) } }
+            } sino {
+                // Reconstrucción (SQLite).
+                sea tmp = "_nuevo_" + n
+                sea t2 = {"nombre": tmp, "columnas": b["columnas"], "orden": b["orden"], "indices": []}
+                r.agregar(modelo_crear_sql(t2, d)[0])
+                sea comunes = []
+                para c en b["orden"] { si (tiene_clave(a["columnas"], c)) { comunes.agregar(_md_q(d, c)) } }
+                si (longitud(comunes) > 0) { r.agregar("INSERT INTO " + _md_q(d, tmp) + " (" + unir(comunes, ", ") + ") SELECT " + unir(comunes, ", ") + " FROM " + _md_q(d, n)) }
+                r.agregar("DROP TABLE " + _md_q(d, n))
+                r.agregar("ALTER TABLE " + _md_q(d, tmp) + " RENAME TO " + _md_q(d, n))
+                para i en b["indices"] { r.agregar(_md_indice_sql(d, b, i)) }
+            }
+            // Índices.
+            sea ia = {}
+            para i en a["indices"] { ia[i["nombre"]] = i }
+            sea ib = {}
+            para i en b["indices"] { ib[i["nombre"]] = i }
+            si (simple o d != "sqlite") {
+                para k en claves(ia) { si (tiene_clave(ib, k) == falso o json_texto(ia[k]) != json_texto(ib[k])) { r.agregar("DROP INDEX " + _md_q(d, k)) } }
+                para k en claves(ib) { si (tiene_clave(ia, k) == falso o json_texto(ia[k]) != json_texto(ib[k])) { r.agregar(_md_indice_sql(d, b, ib[k])) } }
+            }
+        }
+    }
+    // Tablas que ya no están.
+    para n en claves(v["tablas"]) { si (tiene_clave(nuevo["tablas"], n) == falso) { r.agregar("DROP TABLE " + _md_q(d, n)) } }
+    retornar r
+}
+
+/// Aplica en una base SQLite las migraciones necesarias para llegar a
+/// "esquema" (guarda el esquema aplicado en la tabla _modelo_db). Devuelve
+/// las sentencias ejecutadas.
+funcion modelo_migrar(db, esquema) {
+    db_ejecutar(db, "CREATE TABLE IF NOT EXISTS _modelo_db (id INTEGER PRIMARY KEY, esquema TEXT NOT NULL, fecha TEXT DEFAULT CURRENT_TIMESTAMP)")
+    sea fila = db_primera(db, "SELECT esquema FROM _modelo_db ORDER BY id DESC LIMIT 1", [])
+    sea viejo = nulo
+    si (fila != nulo) { viejo = json_parsear(fila["esquema"]) }
+    sea pasos = modelo_migracion(viejo, esquema, "sqlite")
+    si (longitud(pasos) == 0) { retornar [] }
+    db_transaccion_con(db, funcion() {
+        db_ejecutar(db, "PRAGMA defer_foreign_keys = ON")
+        para s en pasos { db_ejecutar(db, s) }
+        db_consulta_p(db, "INSERT INTO _modelo_db (esquema) VALUES (?)", [json_texto(esquema)])
+    })
+    retornar pasos
+}
+
+// ── Condiciones ───────────────────────────────────────────────────────────
+
+funcion modelo_igual(c, v) { retornar {"op": "=", "c": c, "v": v} }
+funcion modelo_distinto(c, v) { retornar {"op": "<>", "c": c, "v": v} }
+funcion modelo_mayor(c, v) { retornar {"op": ">", "c": c, "v": v} }
+funcion modelo_mayor_igual(c, v) { retornar {"op": ">=", "c": c, "v": v} }
+funcion modelo_menor(c, v) { retornar {"op": "<", "c": c, "v": v} }
+funcion modelo_menor_igual(c, v) { retornar {"op": "<=", "c": c, "v": v} }
+funcion modelo_como(c, patron) { retornar {"op": "LIKE", "c": c, "v": patron} }
+funcion modelo_en(c, lista) { retornar {"op": "IN", "c": c, "v": lista} }
+funcion modelo_entre(c, a, b) { retornar {"op": "BETWEEN", "c": c, "v": [a, b]} }
+funcion modelo_es_nulo(c) { retornar {"op": "IS NULL", "c": c} }
+funcion modelo_no_nulo(c) { retornar {"op": "IS NOT NULL", "c": c} }
+funcion modelo_y(conds) { retornar {"op": "AND", "l": conds} }
+funcion modelo_o(conds) { retornar {"op": "OR", "l": conds} }
+funcion modelo_no(cond) { retornar {"op": "NOT", "l": [cond]} }
+
+// ── Consultas ─────────────────────────────────────────────────────────────
+
+funcion _md_ph(st) {
+    st["n"] = st["n"] + 1
+    si (st["d"] == "postgres") { retornar "$" + st["n"] }
+    retornar "?"
+}
+
+funcion _md_param(st, v, col) {
+    sea x = v
+    si (st["d"] == "sqlite" y (v == verdadero o v == falso)) {
+        si (v) { x = 1 } sino { x = 0 }
+    }
+    si (col != nulo y col["tipo"] == "json" y v != nulo y tipo(v) != "texto") { x = json_texto(v) }
+    st["params"].agregar(x)
+    retornar _md_ph(st)
+}
+
+// "c" o "tabla.c" → columna validada y citada.
+funcion _md_col_ref(st, nombre) {
+    sea s = "" + nombre
+    sea p = texto_dividir(s, ".")
+    si (longitud(p) == 2) {
+        sea t = st["tablas"][p[0]] ?? nulo
+        si (t == nulo) { lanzar "modelo_db: la tabla " + p[0] + " no está en la consulta" }
+        si (tiene_clave(t["columnas"], p[1]) == falso) { lanzar "modelo_db: no existe la columna " + s }
+        retornar {"sql": _md_q(st["d"], p[0]) + "." + _md_q(st["d"], p[1]), "col": t["columnas"][p[1]]}
+    }
+    sea hallada = nulo
+    sea veces = 0
+    para tn en claves(st["tablas"]) {
+        sea t = st["tablas"][tn]
+        si (tiene_clave(t["columnas"], s)) { hallada = {"sql": _md_q(st["d"], tn) + "." + _md_q(st["d"], s), "col": t["columnas"][s]}  veces = veces + 1 }
+    }
+    si (veces == 0) { lanzar "modelo_db: no existe la columna " + s }
+    si (veces > 1) { lanzar "modelo_db: la columna " + s + " es ambigua (usa tabla.columna)" }
+    si (longitud(claves(st["tablas"])) == 1) { hallada["sql"] = _md_q(st["d"], s) }
+    retornar hallada
+}
+
+funcion _md_cond(st, c) {
+    sea op = c["op"]
+    si (op == "AND" o op == "OR") {
+        si (longitud(c["l"]) == 0) {
+            si (op == "AND") { retornar "1 = 1" }
+            retornar "1 = 0"
+        }
+        sea partes = []
+        para x en c["l"] { partes.agregar("(" + _md_cond(st, x) + ")") }
+        retornar unir(partes, " " + op + " ")
+    }
+    si (op == "NOT") { retornar "NOT (" + _md_cond(st, c["l"][0]) + ")" }
+    sea ref = _md_col_ref(st, c["c"])
+    si (op == "IS NULL" o op == "IS NOT NULL") { retornar ref["sql"] + " " + op }
+    si (op == "IN") {
+        si (longitud(c["v"]) == 0) { retornar "1 = 0" }
+        sea phs = []
+        para v en c["v"] { phs.agregar(_md_param(st, v, ref["col"])) }
+        retornar ref["sql"] + " IN (" + unir(phs, ", ") + ")"
+    }
+    si (op == "BETWEEN") { retornar ref["sql"] + " BETWEEN " + _md_param(st, c["v"][0], ref["col"]) + " AND " + _md_param(st, c["v"][1], ref["col"]) }
+    si (c["v"] == nulo y op == "=") { retornar ref["sql"] + " IS NULL" }
+    si (c["v"] == nulo y op == "<>") { retornar ref["sql"] + " IS NOT NULL" }
+    retornar ref["sql"] + " " + op + " " + _md_param(st, c["v"], ref["col"])
+}
+
+/// SELECT. opciones: columnas ([...] o nulo = todas), donde, orden
+/// ([[col, "asc"|"desc"]]), limite, desde (offset), unir ([{"tabla": t,
+/// "en": [col_a, col_b], "tipo": "inner"|"left"}]), agrupar ([...]).
+funcion modelo_select(tabla, opciones) {
+    sea o = opciones ?? {}
+    retornar {"k": "select", "tabla": tabla, "columnas": o["columnas"] ?? nulo, "donde": o["donde"] ?? nulo, "orden": o["orden"] ?? [], "limite": o["limite"] ?? nulo, "desde": o["desde"] ?? nulo, "unir": o["unir"] ?? [], "agrupar": o["agrupar"] ?? []}
+}
+
+funcion modelo_insert(tabla, filas, opciones) {
+    sea l = filas
+    si (tipo(filas) == "mapa") { l = [filas] }
+    retornar {"k": "insert", "tabla": tabla, "filas": l, "devolver": (opciones ?? {})["devolver"] ?? nulo, "conflicto": (opciones ?? {})["conflicto"] ?? nulo}
+}
+
+funcion modelo_update(tabla, cambios, donde) { retornar {"k": "update", "tabla": tabla, "cambios": cambios, "donde": donde} }
+
+/// DELETE: exige una condición (usa {"op": "AND", "l": []} para todo, a propósito).
+funcion modelo_delete(tabla, donde) {
+    si (donde == nulo) { lanzar "modelo_db: DELETE sin condición; si de verdad quieres borrar todo usa modelo_y([])" }
+    retornar {"k": "delete", "tabla": tabla, "donde": donde}
+}
+
+/// Arma el SQL: {"sql", "params"}.
+funcion modelo_sql(q, dialecto) {
+    sea d = dialecto ?? "sqlite"
+    sea t = q["tabla"]
+    sea st = {"d": d, "n": 0, "params": [], "tablas": {}}
+    st["tablas"][t["nombre"]] = t
+    si (q["k"] == "select") {
+        para u en q["unir"] { st["tablas"][u["tabla"]["nombre"]] = u["tabla"] }
+        sea cols = "*"
+        si (q["columnas"] != nulo) {
+            sea l = []
+            para c en q["columnas"] {
+                si (tipo(c) == "lista") { l.agregar(_md_col_ref(st, c[0])["sql"] + " AS " + _md_q(d, c[1])) } sino { l.agregar(_md_col_ref(st, c)["sql"]) }
+            }
+            cols = unir(l, ", ")
+        } sino {
+            si (longitud(q["unir"]) > 0) {
+                sea l = []
+                para tn en claves(st["tablas"]) { para c en st["tablas"][tn]["orden"] { l.agregar(_md_q(d, tn) + "." + _md_q(d, c) + " AS " + _md_q(d, tn + "_" + c)) } }
+                cols = unir(l, ", ")
+            }
+        }
+        sea s = "SELECT " + cols + " FROM " + _md_q(d, t["nombre"])
+        para u en q["unir"] {
+            sea tipo_ = texto_mayusculas(u["tipo"] ?? "inner")
+            si (tipo_ != "INNER" y tipo_ != "LEFT") { lanzar "modelo_db: tipo de unión desconocido " + tipo_ }
+            s = s + " " + tipo_ + " JOIN " + _md_q(d, u["tabla"]["nombre"]) + " ON " + _md_col_ref(st, u["en"][0])["sql"] + " = " + _md_col_ref(st, u["en"][1])["sql"]
+        }
+        si (q["donde"] != nulo) { s = s + " WHERE " + _md_cond(st, q["donde"]) }
+        si (longitud(q["agrupar"]) > 0) {
+            sea l = []
+            para c en q["agrupar"] { l.agregar(_md_col_ref(st, c)["sql"]) }
+            s = s + " GROUP BY " + unir(l, ", ")
+        }
+        si (longitud(q["orden"]) > 0) {
+            sea l = []
+            para ob en q["orden"] {
+                sea dir = "ASC"
+                si (tipo(ob) == "lista") {
+                    si (texto_minusculas(ob[1] ?? "asc") == "desc") { dir = "DESC" }
+                    l.agregar(_md_col_ref(st, ob[0])["sql"] + " " + dir)
+                } sino { l.agregar(_md_col_ref(st, ob)["sql"] + " ASC") }
+            }
+            s = s + " ORDER BY " + unir(l, ", ")
+        }
+        si (q["limite"] != nulo) {
+            si (tipo(q["limite"]) != "numero" o piso(q["limite"]) != q["limite"] o q["limite"] < 0) { lanzar "modelo_db: límite inválido" }
+            s = s + " LIMIT " + q["limite"]
+        }
+        si (q["desde"] != nulo) {
+            si (tipo(q["desde"]) != "numero" o piso(q["desde"]) != q["desde"] o q["desde"] < 0) { lanzar "modelo_db: desplazamiento inválido" }
+            si (q["limite"] == nulo y d != "postgres") { s = s + " LIMIT -1" }
+            s = s + " OFFSET " + q["desde"]
+        }
+        retornar {"sql": s, "params": st["params"]}
+    }
+    si (q["k"] == "insert") {
+        si (longitud(q["filas"]) == 0) { lanzar "modelo_db: INSERT sin filas" }
+        sea cols = []
+        para k en claves(q["filas"][0]) { si (tiene_clave(t["columnas"], k) == falso) { lanzar "modelo_db: no existe la columna " + t["nombre"] + "." + k }  cols.agregar(k) }
+        sea grupos = []
+        para f en q["filas"] {
+            sea phs = []
+            para c en cols {
+                si (tiene_clave(f, c) == falso) { lanzar "modelo_db: todas las filas deben tener las mismas columnas" }
+                phs.agregar(_md_param(st, f[c], t["columnas"][c]))
+            }
+            si (longitud(claves(f)) != longitud(cols)) { lanzar "modelo_db: todas las filas deben tener las mismas columnas" }
+            grupos.agregar("(" + unir(phs, ", ") + ")")
+        }
+        sea qc = []
+        para c en cols { qc.agregar(_md_q(d, c)) }
+        sea s = "INSERT INTO " + _md_q(d, t["nombre"]) + " (" + unir(qc, ", ") + ") VALUES " + unir(grupos, ", ")
+        si (q["conflicto"] == "ignorar") {
+            si (d == "mysql") { s = "INSERT IGNORE" + subcadena(s, 6, longitud(s)) } sino { s = s + " ON CONFLICT DO NOTHING" }
+        }
+        si (q["devolver"] != nulo y d != "mysql") {
+            sea l = []
+            para c en q["devolver"] { _md_col_ref(st, c)  l.agregar(_md_q(d, c)) }
+            s = s + " RETURNING " + unir(l, ", ")
+        }
+        retornar {"sql": s, "params": st["params"]}
+    }
+    si (q["k"] == "update") {
+        si (q["donde"] == nulo) { lanzar "modelo_db: UPDATE sin condición; si de verdad quieres tocar todo usa modelo_y([])" }
+        sea sets = []
+        para k en claves(q["cambios"]) {
+            si (tiene_clave(t["columnas"], k) == falso) { lanzar "modelo_db: no existe la columna " + t["nombre"] + "." + k }
+            sets.agregar(_md_q(d, k) + " = " + _md_param(st, q["cambios"][k], t["columnas"][k]))
+        }
+        si (longitud(sets) == 0) { lanzar "modelo_db: UPDATE sin cambios" }
+        retornar {"sql": "UPDATE " + _md_q(d, t["nombre"]) + " SET " + unir(sets, ", ") + " WHERE " + _md_cond(st, q["donde"]), "params": st["params"]}
+    }
+    si (q["k"] == "delete") { retornar {"sql": "DELETE FROM " + _md_q(d, t["nombre"]) + " WHERE " + _md_cond(st, q["donde"]), "params": st["params"]} }
+    lanzar "modelo_db: consulta desconocida"
+}
+
+// ── Ejecutar en SQLite ────────────────────────────────────────────────────
+
+funcion _md_leer(t, fila) {
+    sea r = {}
+    para k en claves(fila) {
+        sea v = fila[k]
+        sea c = t["columnas"][k] ?? nulo
+        si (c != nulo y v != nulo) {
+            si (c["tipo"] == "booleano") { v = v == 1 o v == verdadero }
+            si (c["tipo"] == "json" y tipo(v) == "texto") {
+                sea p = v
+                intentar { p = json_parsear(v) } capturar (e) { p = v }
+                v = p
+            }
+        }
+        r[k] = v
+    }
+    retornar r
+}
+
+/// Ejecuta un SELECT y convierte los tipos (booleanos, JSON).
+funcion modelo_todos(db, q) {
+    sea s = modelo_sql(q, "sqlite")
+    sea r = []
+    para f en db_consulta_p(db, s["sql"], s["params"]) { r.agregar(_md_leer(q["tabla"], f)) }
+    retornar r
+}
+
+funcion modelo_primero(db, q) {
+    sea l = q
+    si (q["limite"] == nulo) {
+        l = {}
+        para k en claves(q) { l[k] = q[k] }
+        l["limite"] = 1
+    }
+    sea r = modelo_todos(db, l)
+    si (longitud(r) == 0) { retornar nulo }
+    retornar r[0]
+}
+
+/// Ejecuta INSERT/UPDATE/DELETE; devuelve {"cambios", "ultimo_id"}.
+funcion modelo_ejecutar(db, q) {
+    sea s = modelo_sql(q, "sqlite")
+    db_consulta_p(db, s["sql"], s["params"])
+    retornar {"cambios": db_cambios(db), "ultimo_id": db_ultimo_id(db)}
+}

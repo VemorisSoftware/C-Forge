@@ -1,0 +1,616 @@
+// stdlib/bandeja.cfv — leer correo: interpreta mensajes MIME reales
+// (cabeceras plegadas, asuntos y nombres codificados =?UTF-8?B?…?=,
+// multipart anidado, base64, quoted-printable, UTF-8 / ISO-8859-1 /
+// Windows-1252, adjuntos e imágenes en línea, listas de direcciones con
+// nombres entre comillas) y habla IMAP4rev1 y POP3: arma comandos con
+// etiquetas, lee respuestas con literales {n}, FETCH, SEARCH, LIST,
+// STATUS y listas anidadas. El transporte (TCP/TLS) es reemplazable.
+// Inspirada en mail-parser / async-imap (MIT/Apache). En inglés:
+// importar "mailbox".
+//
+//   importar "bandeja"
+//   sea m = bandeja_mime(leer_archivo("mensaje.eml"))
+//   mostrar(m["asunto"] + " — de " + m["de"][0]["correo"])
+//   para a en m["adjuntos"] { escribir_archivo(a["nombre"], a["datos"]) }
+
+importar "base64"
+
+funcion _bj_byte(v) { retornar bytes_de_hex(subcadena("0123456789abcdef", piso(v / 16), piso(v / 16) + 1) + subcadena("0123456789abcdef", v % 16, v % 16 + 1)) }
+
+sea _BJ_CP1252 = [8364, 0, 8218, 402, 8222, 8230, 8224, 8225, 710, 8240, 352, 8249, 338, 0, 381, 0, 0, 8216, 8217, 8220, 8221, 8226, 8211, 8212, 732, 8482, 353, 8250, 339, 0, 382, 376]
+
+/// Bytes en un juego de caracteres → UTF-8.
+funcion bandeja_a_utf8(b, juego) {
+    sea j = texto_minusculas(texto_recortar("" + (juego ?? "utf-8")))
+    si (j == "utf-8" o j == "utf8" o j == "us-ascii" o j == "ascii" o j == "") { retornar b }
+    si (j == "iso-8859-1" o j == "latin1" o j == "latin-1" o j == "iso-8859-15" o j == "windows-1252" o j == "cp1252") {
+        sea r = []
+        sea i = 0
+        mientras (i < longitud(b)) {
+            sea v = byte_en(b, i)
+            si (v < 128) { r.agregar(subcadena(b, i, i + 1)) } sino {
+                si (v < 160 y (j == "windows-1252" o j == "cp1252")) { v = _BJ_CP1252[v - 128] }
+                si (j == "iso-8859-15" y v == 164) { v = 8364 }
+                r.agregar(caracter(v))
+            }
+            i = i + 1
+        }
+        retornar unir(r, "")
+    }
+    retornar b
+}
+
+funcion _bj_hex(c) {
+    sea b = byte_en(c, 0)
+    si (b >= 48 y b <= 57) { retornar b - 48 }
+    si (b >= 65 y b <= 70) { retornar b - 55 }
+    si (b >= 97 y b <= 102) { retornar b - 87 }
+    retornar -1
+}
+
+/// Quoted-printable → bytes (en_cabecera: "_" es espacio, como en RFC 2047).
+funcion bandeja_qp(t, en_cabecera) {
+    sea s = "" + t
+    sea r = []
+    sea i = 0
+    mientras (i < longitud(s)) {
+        sea c = subcadena(s, i, i + 1)
+        si (c == "=") {
+            si (subcadena(s, i + 1, i + 3) == "\r\n") { i = i + 3 } sino {
+                si (subcadena(s, i + 1, i + 2) == "\n") { i = i + 2 } sino {
+                    sea a = _bj_hex(subcadena(s, i + 1, i + 2))
+                    sea b = _bj_hex(subcadena(s, i + 2, i + 3))
+                    si (a >= 0 y b >= 0) { r.agregar(_bj_byte(a * 16 + b))  i = i + 3 } sino { r.agregar("=")  i = i + 1 }
+                }
+            }
+        } sino {
+            si (c == "_" y en_cabecera == verdadero) { r.agregar(" ") } sino { r.agregar(c) }
+            i = i + 1
+        }
+    }
+    retornar unir(r, "")
+}
+
+funcion _bj_b64(t) {
+    sea limpio = ""
+    sea s = "" + t
+    sea i = 0
+    mientras (i < longitud(s)) {
+        sea b = byte_en(s, i)
+        si ((b >= 65 y b <= 90) o (b >= 97 y b <= 122) o (b >= 48 y b <= 57) o b == 43 o b == 47) { limpio = limpio + subcadena(s, i, i + 1) }
+        i = i + 1
+    }
+    mientras (longitud(limpio) % 4 != 0) { limpio = limpio + "=" }
+    sea r = ""
+    intentar { r = base64_decodificar(limpio) } capturar (e) { r = "" }
+    retornar r
+}
+
+/// Decodifica palabras codificadas RFC 2047 (=?juego?B|Q?…?=) en una cabecera.
+funcion bandeja_palabras(t) {
+    sea s = "" + t
+    sea r = ""
+    sea i = 0
+    sea ultimo_fue_palabra = falso
+    sea pendiente = ""
+    mientras (i < longitud(s)) {
+        sea k = texto_indice(subcadena(s, i, longitud(s)), "=?")
+        si (k < 0) {
+            r = r + pendiente + subcadena(s, i, longitud(s))
+            retornar r
+        }
+        sea entre = subcadena(s, i, i + k)
+        sea ini = i + k
+        // =?juego?C?texto?=
+        sea q1 = texto_indice(subcadena(s, ini + 2, longitud(s)), "?")
+        sea ok = falso
+        si (q1 > 0) {
+            sea juego = subcadena(s, ini + 2, ini + 2 + q1)
+            sea cod = texto_mayusculas(subcadena(s, ini + 3 + q1, ini + 4 + q1))
+            si (subcadena(s, ini + 4 + q1, ini + 5 + q1) == "?" y (cod == "B" o cod == "Q")) {
+                sea resto = subcadena(s, ini + 5 + q1, longitud(s))
+                sea fin = texto_indice(resto, "?=")
+                si (fin >= 0) {
+                    sea dato = subcadena(resto, 0, fin)
+                    sea bytes_ = ""
+                    si (cod == "B") { bytes_ = _bj_b64(dato) } sino { bytes_ = bandeja_qp(dato, verdadero) }
+                    sea p = texto_indice(juego, "*")
+                    si (p >= 0) { juego = subcadena(juego, 0, p) }
+                    // Los espacios entre dos palabras codificadas se ignoran.
+                    si (ultimo_fue_palabra y texto_recortar(entre) == "") { r = r } sino { r = r + entre }
+                    r = r + bandeja_a_utf8(bytes_, juego)
+                    i = ini + 5 + q1 + fin + 2
+                    ok = verdadero
+                    ultimo_fue_palabra = verdadero
+                }
+            }
+        }
+        si (ok == falso) {
+            r = r + entre + "=?"
+            i = ini + 2
+            ultimo_fue_palabra = falso
+        }
+    }
+    retornar r
+}
+
+/// Cabeceras de un mensaje: [[nombre, valor]] (desplegadas, sin decodificar).
+funcion bandeja_cabeceras(texto) {
+    sea s = texto_reemplazar("" + texto, "\r\n", "\n")
+    sea r = []
+    para l en texto_dividir(s, "\n") {
+        si (l == "") { retornar r }
+        si ((texto_empieza_con(l, " ") o texto_empieza_con(l, "\t")) y longitud(r) > 0) { r[longitud(r) - 1][1] = r[longitud(r) - 1][1] + " " + texto_recortar(l) } sino {
+            sea p = texto_indice(l, ":")
+            si (p > 0) { r.agregar([texto_minusculas(texto_recortar(subcadena(l, 0, p))), texto_recortar(subcadena(l, p + 1, longitud(l)))]) }
+        }
+    }
+    retornar r
+}
+
+funcion _bj_cab(cabs, nombre) {
+    para c en cabs { si (c[0] == nombre) { retornar c[1] } }
+    retornar nulo
+}
+
+/// Parámetros de una cabecera: "text/plain; charset=\"utf-8\"" → {"valor", "charset"}.
+funcion bandeja_parametros(v) {
+    sea r = {"valor": ""}
+    si (v == nulo) { retornar r }
+    sea partes = []
+    sea actual = ""
+    sea comillas = falso
+    sea s = "" + v
+    sea i = 0
+    mientras (i < longitud(s)) {
+        sea c = subcadena(s, i, i + 1)
+        si (c == "\"") { comillas = comillas == falso } sino {
+            si (c == ";" y comillas == falso) { partes.agregar(actual)  actual = "" } sino { actual = actual + c }
+        }
+        i = i + 1
+    }
+    partes.agregar(actual)
+    r["valor"] = texto_minusculas(texto_recortar(partes[0]))
+    sea continuaciones = {}
+    i = 1
+    mientras (i < longitud(partes)) {
+        sea p = texto_recortar(partes[i])
+        sea e = texto_indice(p, "=")
+        si (e > 0) {
+            sea k = texto_minusculas(texto_recortar(subcadena(p, 0, e)))
+            sea val = texto_recortar(subcadena(p, e + 1, longitud(p)))
+            // RFC 2231: nombre*=utf-8''valor%20codificado y nombre*0*=…
+            si (texto_termina_con(k, "*")) {
+                k = subcadena(k, 0, longitud(k) - 1)
+                sea q = texto_indice(val, "''")
+                sea juego = "utf-8"
+                si (q >= 0) { juego = subcadena(val, 0, q)  val = subcadena(val, q + 2, longitud(val)) }
+                val = bandeja_a_utf8(_bj_pct(val), juego)
+            }
+            sea est = texto_indice(k, "*")
+            si (est > 0) {
+                sea base = subcadena(k, 0, est)
+                continuaciones[base] = (continuaciones[base] ?? "") + val
+            } sino { r[k] = bandeja_palabras(val) }
+        }
+        i = i + 1
+    }
+    para k en claves(continuaciones) { si (tiene_clave(r, k) == falso) { r[k] = continuaciones[k] } }
+    retornar r
+}
+
+funcion _bj_pct(s) {
+    sea r = ""
+    sea i = 0
+    mientras (i < longitud(s)) {
+        si (subcadena(s, i, i + 1) == "%" y i + 2 < longitud(s) + 1) {
+            sea a = _bj_hex(subcadena(s, i + 1, i + 2))
+            sea b = _bj_hex(subcadena(s, i + 2, i + 3))
+            si (a >= 0 y b >= 0) { r = r + _bj_byte(a * 16 + b)  i = i + 3 } sino { r = r + "%"  i = i + 1 }
+        } sino { r = r + subcadena(s, i, i + 1)  i = i + 1 }
+    }
+    retornar r
+}
+
+/// Lista de direcciones → [{"nombre", "correo"}].
+funcion bandeja_direcciones(v) {
+    sea r = []
+    si (v == nulo) { retornar r }
+    sea s = bandeja_palabras(v)
+    sea partes = []
+    sea actual = ""
+    sea comillas = falso
+    sea angulo = falso
+    sea i = 0
+    mientras (i < longitud(s)) {
+        sea c = subcadena(s, i, i + 1)
+        si (c == "\"" y subcadena(s, i - 1, i) != "\\") { comillas = comillas == falso }
+        si (c == "<" y comillas == falso) { angulo = verdadero }
+        si (c == ">" y comillas == falso) { angulo = falso }
+        si ((c == "," o c == ";") y comillas == falso y angulo == falso) { partes.agregar(actual)  actual = "" } sino {
+            // Grupos "Equipo: a@x, b@y;" → se quita el nombre del grupo.
+            si (c == ":" y comillas == falso y angulo == falso y texto_indice(actual, "@") < 0) { actual = "" } sino { actual = actual + c }
+        }
+        i = i + 1
+    }
+    partes.agregar(actual)
+    para p0 en partes {
+        sea p = texto_recortar(p0)
+        si (p != "") {
+            sea a = texto_indice(p, "<")
+            sea b = texto_indice(p, ">")
+            si (a >= 0 y b > a) {
+                sea nombre = texto_recortar(subcadena(p, 0, a))
+                si (texto_empieza_con(nombre, "\"") y texto_termina_con(nombre, "\"") y longitud(nombre) >= 2) { nombre = texto_reemplazar(subcadena(nombre, 1, longitud(nombre) - 1), "\\\"", "\"") }
+                r.agregar({"nombre": nombre, "correo": texto_recortar(subcadena(p, a + 1, b))})
+            } sino {
+                // "correo (Nombre)"
+                sea pa = texto_indice(p, "(")
+                si (pa > 0 y texto_termina_con(p, ")")) { r.agregar({"nombre": texto_recortar(subcadena(p, pa + 1, longitud(p) - 1)), "correo": texto_recortar(subcadena(p, 0, pa))}) } sino { r.agregar({"nombre": "", "correo": p}) }
+            }
+        }
+    }
+    retornar r
+}
+
+sea _BJ_MESES = {"jan": 1, "feb": 2, "mar": 3, "apr": 4, "may": 5, "jun": 6, "jul": 7, "aug": 8, "sep": 9, "oct": 10, "nov": 11, "dec": 12}
+
+/// Fecha RFC 5322 ("Tue, 4 Nov 2025 10:30:00 -0300") → ms UTC.
+funcion bandeja_fecha(v) {
+    si (v == nulo) { retornar nulo }
+    sea s = texto_reemplazar("" + v, ",", " ")
+    sea pa = texto_indice(s, "(")
+    si (pa >= 0) { s = subcadena(s, 0, pa) }
+    sea t = []
+    para x en texto_dividir(s, " ") { si (x != "") { t.agregar(x) } }
+    sea i = 0
+    si (longitud(t) > 0 y tiene_clave(_BJ_MESES, texto_minusculas(subcadena(t[0], 0, 3))) == falso) {
+        sea n = nulo
+        intentar { n = a_numero(t[0]) } capturar (e) { n = nulo }
+        si (n == nulo) { i = 1 }
+    }
+    si (longitud(t) < i + 4) { retornar nulo }
+    sea dia = a_numero(t[i])
+    sea mes = _BJ_MESES[texto_minusculas(subcadena(t[i + 1], 0, 3))] ?? nulo
+    sea anio = a_numero(t[i + 2])
+    si (mes == nulo) { retornar nulo }
+    si (anio < 50) { anio = anio + 2000 }
+    si (anio < 1000) { anio = anio + 1900 }
+    sea hms = texto_dividir(t[i + 3], ":")
+    sea zona = 0
+    si (longitud(t) > i + 4) {
+        sea z = t[i + 4]
+        si (texto_empieza_con(z, "+") o texto_empieza_con(z, "-")) {
+            sea hh = a_numero(subcadena(z, 1, 3))
+            sea mm = a_numero(subcadena(z, 3, 5))
+            zona = hh * 60 + mm
+            si (texto_empieza_con(z, "-")) { zona = -zona }
+        }
+    }
+    sea yy = anio
+    si (mes <= 2) { yy = yy - 1 }
+    sea era = piso(yy / 400)
+    sea yoe = yy - era * 400
+    sea mp = (mes + 9) % 12
+    sea doy = piso((153 * mp + 2) / 5) + dia - 1
+    sea dias = era * 146097 + yoe * 365 + piso(yoe / 4) - piso(yoe / 100) + doy - 719468
+    retornar ((dias * 1440 + a_numero(hms[0]) * 60 + a_numero(hms[1]) - zona) * 60 + a_numero(hms[2] ?? "0")) * 1000
+}
+
+funcion _bj_cuerpo(texto) {
+    sea s = "" + texto
+    sea k = texto_indice(s, "\r\n\r\n")
+    sea k2 = texto_indice(s, "\n\n")
+    si (k >= 0 y (k2 < 0 o k < k2)) { retornar subcadena(s, k + 4, longitud(s)) }
+    si (k2 >= 0) { retornar subcadena(s, k2 + 2, longitud(s)) }
+    retornar ""
+}
+
+funcion _bj_parte(texto, r, prof) {
+    si (prof > 20) { retornar nulo }
+    sea cabs = bandeja_cabeceras(texto)
+    sea ct = bandeja_parametros(_bj_cab(cabs, "content-type") ?? "text/plain; charset=us-ascii")
+    sea tipo_ = ct["valor"]
+    sea cuerpo = _bj_cuerpo(texto)
+    si (texto_empieza_con(tipo_, "multipart/")) {
+        sea limite = ct["boundary"] ?? nulo
+        si (limite == nulo) { retornar nulo }
+        sea marca = "--" + limite
+        sea partes = texto_dividir(cuerpo, marca)
+        sea i = 1
+        mientras (i < longitud(partes)) {
+            sea p = partes[i]
+            si (texto_empieza_con(p, "--")) { i = longitud(partes) } sino {
+                si (texto_empieza_con(p, "\r\n")) { p = subcadena(p, 2, longitud(p)) } sino { si (texto_empieza_con(p, "\n")) { p = subcadena(p, 1, longitud(p)) } }
+                si (texto_termina_con(p, "\r\n")) { p = subcadena(p, 0, longitud(p) - 2) } sino { si (texto_termina_con(p, "\n")) { p = subcadena(p, 0, longitud(p) - 1) } }
+                _bj_parte(p, r, prof + 1)
+                i = i + 1
+            }
+        }
+        retornar nulo
+    }
+    sea cte = texto_minusculas(texto_recortar(_bj_cab(cabs, "content-transfer-encoding") ?? "7bit"))
+    sea datos = cuerpo
+    si (cte == "base64") { datos = _bj_b64(cuerpo) }
+    si (cte == "quoted-printable") { datos = bandeja_qp(cuerpo, falso) }
+    sea disp = bandeja_parametros(_bj_cab(cabs, "content-disposition"))
+    sea nombre = disp["filename"] ?? (ct["name"] ?? nulo)
+    sea cid = _bj_cab(cabs, "content-id")
+    si (cid != nulo) { cid = texto_reemplazar(texto_reemplazar(texto_recortar(cid), "<", ""), ">", "") }
+    sea es_adjunto = disp["valor"] == "attachment" o (nombre != nulo y texto_empieza_con(tipo_, "text/") == falso) o (texto_empieza_con(tipo_, "text/") == falso y texto_empieza_con(tipo_, "message/") == falso)
+    si (tipo_ == "message/rfc822" y disp["valor"] != "attachment") {
+        r["adjuntos"].agregar({"nombre": nombre ?? "mensaje.eml", "tipo": tipo_, "datos": datos, "cid": cid, "en_linea": falso})
+        retornar nulo
+    }
+    si (es_adjunto) {
+        r["adjuntos"].agregar({"nombre": nombre ?? ("adjunto" + (longitud(r["adjuntos"]) + 1)), "tipo": tipo_, "datos": datos, "cid": cid, "en_linea": disp["valor"] == "inline", "tamano": longitud(datos)})
+        retornar nulo
+    }
+    sea txt = bandeja_a_utf8(datos, ct["charset"] ?? "us-ascii")
+    si (tipo_ == "text/html") {
+        si (r["html"] == nulo) { r["html"] = txt } sino { r["html"] = r["html"] + txt }
+    } sino {
+        si (r["texto"] == nulo) { r["texto"] = txt } sino { r["texto"] = r["texto"] + "\n" + txt }
+    }
+}
+
+/// Interpreta un mensaje completo (.eml / RFC 5322).
+funcion bandeja_mime(texto) {
+    sea cabs = bandeja_cabeceras(texto)
+    sea r = {"cabeceras": cabs, "asunto": bandeja_palabras(_bj_cab(cabs, "subject") ?? ""), "de": bandeja_direcciones(_bj_cab(cabs, "from")), "para": bandeja_direcciones(_bj_cab(cabs, "to")), "cc": bandeja_direcciones(_bj_cab(cabs, "cc")), "responder_a": bandeja_direcciones(_bj_cab(cabs, "reply-to")), "fecha_ms": bandeja_fecha(_bj_cab(cabs, "date")), "id": _bj_cab(cabs, "message-id"), "en_respuesta_a": _bj_cab(cabs, "in-reply-to"), "texto": nulo, "html": nulo, "adjuntos": []}
+    _bj_parte(texto, r, 0)
+    retornar r
+}
+
+/// Arma un mensaje simple (texto y/o HTML, adjuntos) listo para enviar.
+/// m: {"de", "para" (lista), "cc", "asunto", "texto", "html", "adjuntos":
+/// [{"nombre", "tipo", "datos"}], "fecha", "id"}.
+funcion bandeja_armar(m) {
+    sea codificar_cab = funcion(t) {
+        sea s = "" + t
+        sea ascii = verdadero
+        sea i = 0
+        mientras (i < longitud(s)) { si (byte_en(s, i) >= 128) { ascii = falso }  i = i + 1 }
+        si (ascii) { retornar s }
+        retornar "=?UTF-8?B?" + base64_codificar(s) + "?="
+    }
+    sea dirs = funcion(l) {
+        sea r = []
+        para d en l {
+            si (tipo(d) == "mapa") {
+                si ((d["nombre"] ?? "") != "") { r.agregar(codificar_cab(d["nombre"]) + " <" + d["correo"] + ">") } sino { r.agregar(d["correo"]) }
+            } sino { r.agregar("" + d) }
+        }
+        retornar unir(r, ", ")
+    }
+    sea b64_lineas = funcion(datos) {
+        sea e = base64_codificar(datos)
+        sea r = []
+        sea i = 0
+        mientras (i < longitud(e)) { r.agregar(subcadena(e, i, minimo(longitud(e), i + 76)))  i = i + 76 }
+        retornar unir(r, "\r\n")
+    }
+    sea limite = "=_cforge_" + hex_de_bytes(bytes_aleatorios(12))
+    sea cab = []
+    sea de = m["de"]
+    si (tipo(de) != "lista") { de = [de] }
+    cab.agregar("From: " + dirs(de))
+    cab.agregar("To: " + dirs(m["para"] ?? []))
+    si ((m["cc"] ?? nulo) != nulo) { cab.agregar("Cc: " + dirs(m["cc"])) }
+    cab.agregar("Subject: " + codificar_cab(m["asunto"] ?? ""))
+    si ((m["fecha"] ?? nulo) != nulo) { cab.agregar("Date: " + m["fecha"]) }
+    si ((m["id"] ?? nulo) != nulo) { cab.agregar("Message-ID: " + m["id"]) }
+    cab.agregar("MIME-Version: 1.0")
+    sea parte_texto = nulo
+    si ((m["texto"] ?? nulo) != nulo y (m["html"] ?? nulo) != nulo) {
+        sea l2 = limite + "_alt"
+        parte_texto = "Content-Type: multipart/alternative; boundary=\"" + l2 + "\"\r\n\r\n--" + l2 + "\r\nContent-Type: text/plain; charset=utf-8\r\nContent-Transfer-Encoding: base64\r\n\r\n" + b64_lineas(m["texto"]) + "\r\n--" + l2 + "\r\nContent-Type: text/html; charset=utf-8\r\nContent-Transfer-Encoding: base64\r\n\r\n" + b64_lineas(m["html"]) + "\r\n--" + l2 + "--"
+    } sino {
+        sea tp = "text/plain"
+        sea cuerpo = m["texto"] ?? ""
+        si ((m["html"] ?? nulo) != nulo) { tp = "text/html"  cuerpo = m["html"] }
+        parte_texto = "Content-Type: " + tp + "; charset=utf-8\r\nContent-Transfer-Encoding: base64\r\n\r\n" + b64_lineas(cuerpo)
+    }
+    sea adj = m["adjuntos"] ?? []
+    si (longitud(adj) == 0) { retornar unir(cab, "\r\n") + "\r\n" + parte_texto + "\r\n" }
+    sea partes = ["--" + limite + "\r\n" + parte_texto]
+    para a en adj {
+        sea nm = codificar_cab(a["nombre"])
+        partes.agregar("--" + limite + "\r\nContent-Type: " + (a["tipo"] ?? "application/octet-stream") + "; name=\"" + nm + "\"\r\nContent-Disposition: attachment; filename=\"" + nm + "\"\r\nContent-Transfer-Encoding: base64\r\n\r\n" + b64_lineas(a["datos"]))
+    }
+    cab.agregar("Content-Type: multipart/mixed; boundary=\"" + limite + "\"")
+    retornar unir(cab, "\r\n") + "\r\n\r\n" + unir(partes, "\r\n") + "\r\n--" + limite + "--\r\n"
+}
+
+// ── IMAP ──────────────────────────────────────────────────────────────────
+
+/// Cita un texto para IMAP ("…" o literal {n} si hace falta).
+funcion bandeja_imap_cadena(t) {
+    sea s = "" + t
+    sea simple = verdadero
+    sea i = 0
+    mientras (i < longitud(s)) {
+        sea b = byte_en(s, i)
+        si (b < 32 o b > 126) { simple = falso }
+        i = i + 1
+    }
+    si (simple) { retornar "\"" + texto_reemplazar(texto_reemplazar(s, "\\", "\\\\"), "\"", "\\\"") + "\"" }
+    retornar "{" + longitud(s) + "}\r\n" + s
+}
+
+funcion bandeja_imap_nueva() { retornar {"n": 0} }
+
+/// Comando con etiqueta: devuelve {"etiqueta", "linea"} (con \r\n).
+funcion bandeja_imap_comando(st, comando) {
+    st["n"] = st["n"] + 1
+    sea e = "A" + st["n"]
+    retornar {"etiqueta": e, "linea": e + " " + comando + "\r\n"}
+}
+
+funcion bandeja_imap_login(st, usuario, clave) { retornar bandeja_imap_comando(st, "LOGIN " + bandeja_imap_cadena(usuario) + " " + bandeja_imap_cadena(clave)) }
+
+/// Separa una respuesta IMAP en valores: átomos, "cadenas", {literales},
+/// (listas) y NIL. Devuelve la lista de valores de la línea.
+funcion bandeja_imap_valores(t) {
+    sea st = {"s": "" + t, "i": 0}
+    retornar _bj_lista(st, falso)
+}
+
+funcion _bj_lista(st, hasta_parentesis) {
+    sea r = []
+    sea s = st["s"]
+    mientras (st["i"] < longitud(s)) {
+        sea c = subcadena(s, st["i"], st["i"] + 1)
+        si (c == " " o c == "\r" o c == "\n") { st["i"] = st["i"] + 1 } sino {
+            si (c == ")") {
+                st["i"] = st["i"] + 1
+                si (hasta_parentesis) { retornar r }
+            } sino {
+                si (c == "(") {
+                    st["i"] = st["i"] + 1
+                    r.agregar(_bj_lista(st, verdadero))
+                } sino {
+                    si (c == "\"") {
+                        sea v = ""
+                        sea j = st["i"] + 1
+                        mientras (j < longitud(s) y subcadena(s, j, j + 1) != "\"") {
+                            si (subcadena(s, j, j + 1) == "\\") { j = j + 1 }
+                            v = v + subcadena(s, j, j + 1)
+                            j = j + 1
+                        }
+                        r.agregar(v)
+                        st["i"] = j + 1
+                    } sino {
+                        si (c == "{") {
+                            sea f = texto_indice(subcadena(s, st["i"], longitud(s)), "}")
+                            sea n = a_numero(subcadena(s, st["i"] + 1, st["i"] + f))
+                            sea j = st["i"] + f + 1
+                            si (subcadena(s, j, j + 2) == "\r\n") { j = j + 2 } sino { si (subcadena(s, j, j + 1) == "\n") { j = j + 1 } }
+                            r.agregar(subcadena(s, j, j + n))
+                            st["i"] = j + n
+                        } sino {
+                            sea j = st["i"]
+                            sea nivel = 0
+                            mientras (j < longitud(s) y ((subcadena(s, j, j + 1) != " " y subcadena(s, j, j + 1) != ")" y subcadena(s, j, j + 1) != "(" y subcadena(s, j, j + 1) != "\r" y subcadena(s, j, j + 1) != "\n") o nivel > 0)) {
+                                // BODY[HEADER.FIELDS (FROM)] lleva corchetes con espacios.
+                                si (subcadena(s, j, j + 1) == "[") { nivel = nivel + 1 }
+                                si (subcadena(s, j, j + 1) == "]") { nivel = nivel - 1 }
+                                j = j + 1
+                            }
+                            sea tok = subcadena(s, st["i"], j)
+                            si (tok == "NIL") { r.agregar(nulo) } sino { r.agregar(tok) }
+                            st["i"] = j
+                        }
+                    }
+                }
+            }
+        }
+    }
+    retornar r
+}
+
+/// Interpreta la respuesta completa de un comando: {"estado" (OK/NO/BAD),
+/// "texto", "datos": [[valores de cada línea "*"]]}.
+funcion bandeja_imap_respuesta(texto, etiqueta) {
+    sea r = {"estado": nulo, "texto": "", "datos": []}
+    sea s = "" + texto
+    sea i = 0
+    mientras (i < longitud(s)) {
+        // Una "línea" puede contener literales {n} con saltos dentro.
+        sea j = i
+        sea fin = -1
+        mientras (j < longitud(s) y fin < 0) {
+            sea k = texto_indice(subcadena(s, j, longitud(s)), "\r\n")
+            si (k < 0) { fin = longitud(s) } sino {
+                sea linea_hasta = j + k
+                // ¿Termina en {n}? Entonces el literal sigue.
+                sea parte = subcadena(s, i, linea_hasta)
+                si (texto_termina_con(parte, "}") y texto_indice(parte, "{") >= 0) {
+                    sea a = longitud(parte) - 1
+                    mientras (a > 0 y subcadena(parte, a, a + 1) != "{") { a = a - 1 }
+                    sea n = nulo
+                    intentar { n = a_numero(subcadena(parte, a + 1, longitud(parte) - 1)) } capturar (e) { n = nulo }
+                    si (n != nulo) { j = linea_hasta + 2 + n } sino { fin = linea_hasta }
+                } sino { fin = linea_hasta }
+            }
+        }
+        sea linea = subcadena(s, i, fin)
+        i = fin + 2
+        si (texto_empieza_con(linea, "* ")) { r["datos"].agregar(bandeja_imap_valores(subcadena(linea, 2, longitud(linea)))) } sino {
+            si (etiqueta != nulo y texto_empieza_con(linea, etiqueta + " ")) {
+                sea resto = subcadena(linea, longitud(etiqueta) + 1, longitud(linea))
+                sea sp = texto_indice(resto, " ")
+                si (sp < 0) { r["estado"] = resto } sino {
+                    r["estado"] = subcadena(resto, 0, sp)
+                    r["texto"] = subcadena(resto, sp + 1, longitud(resto))
+                }
+            }
+        }
+    }
+    retornar r
+}
+
+/// De los datos de un FETCH, arma {número: {"UID", "FLAGS", "BODY[]", …}}.
+funcion bandeja_imap_fetch(respuesta) {
+    sea r = {}
+    para d en respuesta["datos"] {
+        si (longitud(d) >= 3 y texto_mayusculas("" + d[1]) == "FETCH" y tipo(d[2]) == "lista") {
+            sea m = {}
+            sea l = d[2]
+            sea k = 0
+            mientras (k + 1 < longitud(l)) {
+                m[texto_mayusculas("" + l[k])] = l[k + 1]
+                k = k + 2
+            }
+            r["" + d[0]] = m
+        }
+    }
+    retornar r
+}
+
+/// Números (o UIDs) de un SEARCH.
+funcion bandeja_imap_search(respuesta) {
+    sea r = []
+    para d en respuesta["datos"] {
+        si (longitud(d) > 0 y texto_mayusculas("" + d[0]) == "SEARCH") {
+            sea k = 1
+            mientras (k < longitud(d)) { r.agregar(a_numero(d[k]))  k = k + 1 }
+        }
+    }
+    retornar r
+}
+
+/// Carpetas de un LIST: [{"nombre", "separador", "atributos"}].
+funcion bandeja_imap_list(respuesta) {
+    sea r = []
+    para d en respuesta["datos"] {
+        si (longitud(d) >= 4 y texto_mayusculas("" + d[0]) == "LIST") { r.agregar({"atributos": d[1], "separador": d[2], "nombre": d[3]}) }
+    }
+    retornar r
+}
+
+// ── POP3 ──────────────────────────────────────────────────────────────────
+
+/// Respuesta de varias líneas de POP3 → texto sin el punto final ni el
+/// "byte-stuffing" (".." al inicio de línea).
+funcion bandeja_pop3_multilinea(t) {
+    sea s = texto_reemplazar("" + t, "\r\n", "\n")
+    sea lineas = texto_dividir(s, "\n")
+    sea r = []
+    sea i = 0
+    si (longitud(lineas) > 0 y texto_empieza_con(lineas[0], "+OK")) { i = 1 }
+    mientras (i < longitud(lineas)) {
+        sea l = lineas[i]
+        si (l == ".") { retornar unir(r, "\r\n") }
+        si (texto_empieza_con(l, "..")) { l = subcadena(l, 1, longitud(l)) }
+        r.agregar(l)
+        i = i + 1
+    }
+    retornar unir(r, "\r\n")
+}
+
+/// ¿La respuesta POP3 es +OK? Lanza con el texto del servidor si es -ERR.
+funcion bandeja_pop3_ok(linea) {
+    si (texto_empieza_con(linea, "+OK")) { retornar texto_recortar(subcadena(linea, 3, longitud(linea))) }
+    lanzar "bandeja: el servidor POP3 respondió " + texto_recortar(linea)
+}

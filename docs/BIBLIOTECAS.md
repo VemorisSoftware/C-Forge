@@ -59,13 +59,13 @@ Estado: ✅ ya existe en C-Forge · 🔗 se usa hoy vía `cforge bindgen`,
 | 40 | `calendario` | Fechas y zonas horarias | Day.js, Luxon | ✅ `fecha` |
 | 41 | `cartero` | Cliente HTTP con interceptores | Axios | ✅ `red` · 🛠 interceptores |
 | 42 | `eco` | Eventos en tiempo real | Socket.io | ✅ WebSocket en `red` |
-| 43 | `modelo_db` | Esquemas y consultas limpias | Prisma, Drizzle | 🛠 |
+| 43 | `modelo_db` / `orm` | Esquemas y consultas limpias | Prisma, Drizzle | ✅ `modelo_db` |
 | 44 | `escena` | 3D sobre WebGL | Three.js | ✅ `gl` / `modelo` (básico) |
 | 45 | `cosecha` / `scrape` | HTML con selectores CSS | Cheerio | ✅ `cosecha` |
 | 46 | `tinta` / `ink` | Colores en la terminal | Chalk | ✅ `tinta` |
 | 47 | `matriz` / `ndarray` | Arreglos multidimensionales | NumPy | ✅ `matriz` |
 | 48 | `planilla` / `pivot` | Análisis de datos tabulares | Pandas | ✅ `planilla` |
-| 49 | `api_rapida` | APIs con documentación automática | FastAPI | 🛠 |
+| 49 | `api_rapida` / `fastapi` | APIs con documentación automática | FastAPI | ✅ `api_rapida` |
 | 50 | `vitrina` / `rich` | Interfaces ricas en terminal | Rich | ✅ `vitrina` |
 | 51 | `gradiente` / `autograd` | Tensores con autodiferenciación | PyTorch | ✅ `gradiente` |
 
@@ -124,7 +124,7 @@ Estado: ✅ ya existe en C-Forge · 🔗 se usa hoy vía `cforge bindgen`,
 | 88 | `ficha` | Tokens JWT/JWE | jose | ✅ `auth` (JWT) |
 | 89 | `clave` | Hash de contraseñas | Argon2, bcrypt | ✅ `crypto` (PBKDF2) · 🛠 Argon2 |
 | 90 | `sonda` | Captura de paquetes | libpcap | 🔗 |
-| 91 | `consenso` | Consenso distribuido | Raft | 🛠 |
+| 91 | `consenso` / `raft` | Consenso distribuido | Raft | ✅ `consenso` |
 | 92 | `sensor` / `mqtt` | Mensajería IoT | MQTT | ✅ `sensor` |
 | 93 | `directo` | Audio/video P2P | WebRTC | 🛠 |
 | 94 | `transporte` | Transferencia multiprotocolo | libcurl | ✅ HTTP en `red` · 🔗 |
@@ -142,7 +142,7 @@ Estado: ✅ ya existe en C-Forge · 🔗 se usa hoy vía `cforge bindgen`,
 | 101 | `sin_copia` | Serialización zero-copy | FlatBuffers | 🛠 |
 | 102 | `columnas` | Formato columnar | Arrow, Parquet | 🛠 |
 | 103 | `hoja` / `xlsx` | Hojas de cálculo .xlsx | libxlsxwriter | ✅ `hoja` |
-| 104 | `documento` | PDF: crear, leer y firmar | PDFium, lopdf | 🛠 |
+| 104 | `documento` / `pdf` | PDF: crear, leer y firmar | PDFium, lopdf | ✅ `documento` |
 | 105 | `archivador` / `archive` | ZIP/TAR seguros | libarchive | ✅ `archivador` |
 | 106 | `ajustes` | TOML y YAML estrictos | toml, yaml-rust | ✅ TOML (cforge.toml) · 🛠 |
 | 107 | `marcado` / `markdown` | Markdown a HTML | pulldown-cmark | ✅ `marcado` |
@@ -155,7 +155,7 @@ Estado: ✅ ya existe en C-Forge · 🔗 se usa hoy vía `cforge bindgen`,
 
 | # | Nombre | Para qué | Inspiración | Estado |
 |---|---|---|---|---|
-| 112 | `grafo_api` | Servidor GraphQL | async-graphql | 🛠 |
+| 112 | `grafo_api` / `graphql` | Servidor GraphQL | async-graphql | ✅ `grafo_api` |
 | 113 | `plantilla` / `template` | Plantillas HTML | Tera, Handlebars | ✅ `plantilla` |
 | 114 | `piloto` | Navegadores automatizados | Playwright | 🛠 |
 | 115 | `atributo` | Interactividad por atributos HTML | htmx | 🛠 |
@@ -276,7 +276,7 @@ Estado: ✅ ya existe en C-Forge · 🔗 se usa hoy vía `cforge bindgen`,
 | 198 | `formato_web` | WebP y AVIF | libwebp, libavif | 🔗 |
 | 199 | `escaner` | Documentos escaneados | Leptonica | 🔗 |
 | 200 | `codigo_qr` / `qrcode` | QR y códigos de barras | ZXing | ✅ `codigo_qr` |
-| 201 | `composicion` | Composición tipográfica de PDFs | Typst | 🛠 |
+| 201 | `composicion` / `typeset` | Composición tipográfica de PDFs | Typst | ✅ `composicion` |
 | 202 | `conversor` | Conversión entre formatos de documento | Pandoc | 🛠 |
 | 203 | `lee_excel` / `read_xlsx` | Leer .xlsx/.ods | Calamine | ✅ `lee_excel` |
 | 204 | `dinero` / `money` | Decimales exactos | rust_decimal | ✅ `dinero` |
@@ -328,11 +328,11 @@ Estado: ✅ ya existe en C-Forge · 🔗 se usa hoy vía `cforge bindgen`,
 | 240 | `ident` / `ids` | UUID, ULID y NanoID | uuid, ulid | ✅ `ident` |
 | 241 | `telefono` / `phone` | Números telefónicos | libphonenumber | ✅ `telefono` |
 | 242 | `unicode` / `unicode_en` | Normalización y ordenamiento | ICU | ✅ `unicode` |
-| 243 | `buscador` | Búsqueda full-text | Tantivy | 🛠 |
+| 243 | `buscador` / `fulltext` | Búsqueda full-text | Tantivy | ✅ `buscador` |
 | 244 | `consulta_archivos` / `sqlfiles` | SQL sobre CSV, JSON y Parquet | DataFusion | ✅ `consulta_archivos` |
 | 245 | `socket_web` | WebSocket RFC 6455 | Tungstenite | ✅ `red` |
 | 246 | `correo` | Enviar correos con DKIM | Lettre | 🛠 |
-| 247 | `bandeja` | Leer correo IMAP/POP3 | IMAP | 🛠 |
+| 247 | `bandeja` / `mailbox` | Leer correo IMAP/POP3 | IMAP | ✅ `bandeja` |
 | 248 | `vecinos` | Descubrimiento mDNS | Zeroconf | 🛠 |
 | 249 | `puertos` | Abrir puertos en el router | UPnP | 🛠 |
 | 250 | `usb` | USB de bajo nivel | libusb | 🔗 |

@@ -1,0 +1,980 @@
+// stdlib/grafo_api.cfv — GraphQL del lado del servidor: lee el esquema en
+// SDL (type, input, enum, interface, union, scalar, argumentos con valores
+// por defecto), analiza consultas (variables, alias, fragmentos, fragmentos
+// en línea, @include/@skip), valida contra el esquema y ejecuta con tus
+// resolvedores, con errores por ruta y propagación de nulos como manda la
+// especificación, __typename e introspección básica. Respuestas en el orden
+// de la consulta (grafo_json). Inspirada en graphql-js / async-graphql
+// (MIT). En inglés: importar "graphql".
+//
+//   importar "grafo_api"
+//   sea g = grafo_esquema("type Query { hola(nombre: String = \"mundo\"): String! }")
+//   sea r = {"Query": {"hola": funcion(padre, args, ctx, info) { retornar "Hola " + args["nombre"] }}}
+//   grafo_ejecutar(g, r, "{ hola(nombre: \"Ana\") }")      // {"data": {"hola": "Hola Ana"}}
+importar "json"
+
+
+sea _GQ_S1 = caracter(1)
+sea _GQ_S2 = caracter(2)
+
+// ── Léxico ────────────────────────────────────────────────────────────────
+
+funcion _gq_es_nombre(b, primero) { retornar (b >= 65 y b <= 90) o (b >= 97 y b <= 122) o b == 95 o (primero == falso y b >= 48 y b <= 57) }
+
+funcion _gq_lexico(t) {
+    sea s = "" + t
+    sea r = []
+    sea i = 0
+    sea n = longitud(s)
+    sea linea = 1
+    sea inicio_linea = 0
+    mientras (i < n) {
+        sea c = subcadena(s, i, i + 1)
+        sea b = byte_en(s, i)
+        sea col = i - inicio_linea + 1
+        si (c == "\n") { linea = linea + 1  inicio_linea = i + 1  i = i + 1 } sino {
+            si (c == " " o c == "\t" o c == "\r" o c == "," o b == 239) {
+                si (b == 239) { i = i + 3 } sino { i = i + 1 }
+            } sino {
+                si (c == "#") { mientras (i < n y subcadena(s, i, i + 1) != "\n") { i = i + 1 } } sino {
+                    si (subcadena(s, i, i + 3) == "...") { r.agregar({"t": "p", "v": "...", "l": linea, "c": col})  i = i + 3 } sino {
+                        si (texto_indice("!$&()/:=@[]{|}", c) >= 0) { r.agregar({"t": "p", "v": c, "l": linea, "c": col})  i = i + 1 } sino {
+                            si (_gq_es_nombre(b, verdadero)) {
+                                sea j = i
+                                mientras (j < n y _gq_es_nombre(byte_en(s, j), falso)) { j = j + 1 }
+                                r.agregar({"t": "n", "v": subcadena(s, i, j), "l": linea, "c": col})
+                                i = j
+                            } sino {
+                                si ((b >= 48 y b <= 57) o c == "-") {
+                                    sea j = i + 1
+                                    sea flot = falso
+                                    mientras (j < n y ((byte_en(s, j) >= 48 y byte_en(s, j) <= 57) o subcadena(s, j, j + 1) == "." o subcadena(s, j, j + 1) == "e" o subcadena(s, j, j + 1) == "E" o ((subcadena(s, j, j + 1) == "+" o subcadena(s, j, j + 1) == "-") y (subcadena(s, j - 1, j) == "e" o subcadena(s, j - 1, j) == "E")))) {
+                                        si (subcadena(s, j, j + 1) == "." o subcadena(s, j, j + 1) == "e" o subcadena(s, j, j + 1) == "E") { flot = verdadero }
+                                        j = j + 1
+                                    }
+                                    sea tt = "int"
+                                    si (flot) { tt = "float" }
+                                    r.agregar({"t": tt, "v": subcadena(s, i, j), "l": linea, "c": col})
+                                    i = j
+                                } sino {
+                                    si (c == "\"") {
+                                        si (subcadena(s, i, i + 3) == "\"\"\"") {
+                                            sea f = texto_indice(subcadena(s, i + 3, n), "\"\"\"")
+                                            si (f < 0) { lanzar "grafo: texto de bloque sin cerrar" }
+                                            r.agregar({"t": "s", "v": _gq_bloque(subcadena(s, i + 3, i + 3 + f)), "l": linea, "c": col})
+                                            i = i + 6 + f
+                                        } sino {
+                                            sea j = i + 1
+                                            sea v = ""
+                                            mientras (j < n y subcadena(s, j, j + 1) != "\"") {
+                                                sea d = subcadena(s, j, j + 1)
+                                                si (d == "\n") { lanzar "grafo: texto sin cerrar en la línea " + linea }
+                                                si (d == "\\") {
+                                                    sea e = subcadena(s, j + 1, j + 2)
+                                                    sea mapa = {"n": "\n", "t": "\t", "r": "\r", "b": bytes_de_hex("08"), "f": bytes_de_hex("0c"), "\"": "\"", "\\": "\\", "/": "/"}
+                                                    si (e == "u") {
+                                                        v = v + caracter(_gq_hex4(subcadena(s, j + 2, j + 6)))
+                                                        j = j + 6
+                                                    } sino {
+                                                        v = v + (mapa[e] ?? e)
+                                                        j = j + 2
+                                                    }
+                                                } sino { v = v + d  j = j + 1 }
+                                            }
+                                            si (j >= n) { lanzar "grafo: texto sin cerrar en la línea " + linea }
+                                            r.agregar({"t": "s", "v": v, "l": linea, "c": col})
+                                            i = j + 1
+                                        }
+                                    } sino { lanzar "grafo: carácter inesperado '" + c + "' en la línea " + linea }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+    r.agregar({"t": "fin", "v": "", "l": linea, "c": 1})
+    retornar r
+}
+
+funcion _gq_hex4(h) {
+    sea v = 0
+    sea i = 0
+    mientras (i < 4) {
+        sea b = byte_en(h, i)
+        sea d = b - 48
+        si (b >= 97) { d = b - 87 } sino { si (b >= 65) { d = b - 55 } }
+        v = v * 16 + d
+        i = i + 1
+    }
+    retornar v
+}
+
+funcion _gq_bloque(t) {
+    // Quita la sangría común y las líneas vacías del borde.
+    sea lineas = texto_dividir(texto_reemplazar(t, "\r\n", "\n"), "\n")
+    sea comun = -1
+    sea i = 1
+    mientras (i < longitud(lineas)) {
+        sea l = lineas[i]
+        sea k = 0
+        mientras (k < longitud(l) y (subcadena(l, k, k + 1) == " " o subcadena(l, k, k + 1) == "\t")) { k = k + 1 }
+        si (k < longitud(l) y (comun < 0 o k < comun)) { comun = k }
+        i = i + 1
+    }
+    si (comun > 0) {
+        i = 1
+        mientras (i < longitud(lineas)) { lineas[i] = subcadena(lineas[i], minimo(comun, longitud(lineas[i])), longitud(lineas[i]))  i = i + 1 }
+    }
+    mientras (longitud(lineas) > 0 y texto_recortar(lineas[0]) == "") {
+        sea r = []
+        i = 1
+        mientras (i < longitud(lineas)) { r.agregar(lineas[i])  i = i + 1 }
+        lineas = r
+    }
+    mientras (longitud(lineas) > 0 y texto_recortar(lineas[longitud(lineas) - 1]) == "") { quitar_ultimo(lineas) }
+    retornar unir(lineas, "\n")
+}
+
+// ── Sintaxis ──────────────────────────────────────────────────────────────
+
+funcion _gq_ver(p) { retornar p["toks"][p["i"]] }
+funcion _gq_tomar(p) {
+    sea t = p["toks"][p["i"]]
+    p["i"] = p["i"] + 1
+    retornar t
+}
+funcion _gq_es(p, v) {
+    sea t = _gq_ver(p)
+    retornar (t["t"] == "p" o t["t"] == "n") y t["v"] == v
+}
+funcion _gq_acepta(p, v) {
+    si (_gq_es(p, v)) { _gq_tomar(p)  retornar verdadero }
+    retornar falso
+}
+funcion _gq_error(p, msg) {
+    sea t = _gq_ver(p)
+    lanzar "grafo: " + msg + " (línea " + t["l"] + ", columna " + t["c"] + ")"
+}
+funcion _gq_espera(p, v) { si (_gq_acepta(p, v) == falso) { _gq_error(p, "se esperaba '" + v + "' y llegó '" + _gq_ver(p)["v"] + "'") } }
+funcion _gq_nombre(p) {
+    sea t = _gq_tomar(p)
+    si (t["t"] != "n") { p["i"] = p["i"] - 1  _gq_error(p, "se esperaba un nombre") }
+    retornar t["v"]
+}
+
+funcion _gq_valor(p, constante) {
+    sea t = _gq_ver(p)
+    si (t["t"] == "p" y t["v"] == "$") {
+        si (constante) { _gq_error(p, "no se permiten variables aquí") }
+        _gq_tomar(p)
+        retornar {"k": "var", "n": _gq_nombre(p)}
+    }
+    si (t["t"] == "int") { _gq_tomar(p)  retornar {"k": "int", "v": a_numero(t["v"])} }
+    si (t["t"] == "float") { _gq_tomar(p)  retornar {"k": "float", "v": a_numero(t["v"])} }
+    si (t["t"] == "s") { _gq_tomar(p)  retornar {"k": "string", "v": t["v"]} }
+    si (t["t"] == "n") {
+        _gq_tomar(p)
+        si (t["v"] == "true") { retornar {"k": "bool", "v": verdadero} }
+        si (t["v"] == "false") { retornar {"k": "bool", "v": falso} }
+        si (t["v"] == "null") { retornar {"k": "null"} }
+        retornar {"k": "enum", "v": t["v"]}
+    }
+    si (_gq_acepta(p, "[")) {
+        sea l = []
+        mientras (_gq_es(p, "]") == falso) { l.agregar(_gq_valor(p, constante)) }
+        _gq_tomar(p)
+        retornar {"k": "list", "v": l}
+    }
+    si (_gq_acepta(p, "{")) {
+        sea campos = []
+        mientras (_gq_es(p, "}") == falso) {
+            sea n = _gq_nombre(p)
+            _gq_espera(p, ":")
+            campos.agregar([n, _gq_valor(p, constante)])
+        }
+        _gq_tomar(p)
+        retornar {"k": "object", "v": campos}
+    }
+    _gq_error(p, "valor inesperado '" + t["v"] + "'")
+}
+
+funcion _gq_tipo(p) {
+    sea t = nulo
+    si (_gq_acepta(p, "[")) {
+        sea interno = _gq_tipo(p)
+        _gq_espera(p, "]")
+        t = {"k": "lista", "de": interno}
+    } sino { t = {"k": "nombre", "n": _gq_nombre(p)} }
+    si (_gq_acepta(p, "!")) { retornar {"k": "nonull", "de": t} }
+    retornar t
+}
+
+funcion _gq_args(p, constante) {
+    sea r = []
+    si (_gq_acepta(p, "(")) {
+        mientras (_gq_es(p, ")") == falso) {
+            sea n = _gq_nombre(p)
+            _gq_espera(p, ":")
+            r.agregar([n, _gq_valor(p, constante)])
+        }
+        _gq_tomar(p)
+    }
+    retornar r
+}
+
+funcion _gq_directivas(p) {
+    sea r = []
+    mientras (_gq_es(p, "@")) {
+        _gq_tomar(p)
+        sea n = _gq_nombre(p)
+        r.agregar({"n": n, "args": _gq_args(p, falso)})
+    }
+    retornar r
+}
+
+funcion _gq_seleccion(p) {
+    sea r = []
+    sea t0 = _gq_ver(p)
+    _gq_espera(p, "{")
+    mientras (_gq_es(p, "}") == falso) {
+        si (_gq_ver(p)["t"] == "fin") { _gq_error(p, "falta '}'") }
+        sea t = _gq_ver(p)
+        si (_gq_acepta(p, "...")) {
+            si (_gq_es(p, "on") o _gq_es(p, "{") o _gq_es(p, "@")) {
+                sea tc = nulo
+                si (_gq_acepta(p, "on")) { tc = _gq_nombre(p) }
+                sea dirs = _gq_directivas(p)
+                r.agregar({"k": "inline", "tipo": tc, "dirs": dirs, "sel": _gq_seleccion(p), "l": t["l"], "c": t["c"]})
+            } sino {
+                sea n = _gq_nombre(p)
+                r.agregar({"k": "spread", "n": n, "dirs": _gq_directivas(p), "l": t["l"], "c": t["c"]})
+            }
+        } sino {
+            sea n = _gq_nombre(p)
+            sea alias = n
+            si (_gq_acepta(p, ":")) { n = _gq_nombre(p) }
+            sea args = _gq_args(p, falso)
+            sea dirs = _gq_directivas(p)
+            sea sub = nulo
+            si (_gq_es(p, "{")) { sub = _gq_seleccion(p) }
+            r.agregar({"k": "campo", "n": n, "alias": alias, "args": args, "dirs": dirs, "sel": sub, "l": t["l"], "c": t["c"]})
+        }
+    }
+    _gq_tomar(p)
+    retornar r
+}
+
+/// Analiza un documento de consulta (operaciones y fragmentos).
+funcion grafo_analizar(texto) {
+    sea p = {"toks": _gq_lexico(texto), "i": 0}
+    sea ops = []
+    sea frags = {}
+    mientras (_gq_ver(p)["t"] != "fin") {
+        si (_gq_es(p, "{")) { ops.agregar({"tipo": "query", "nombre": nulo, "vars": [], "dirs": [], "sel": _gq_seleccion(p)}) } sino {
+            sea w = _gq_nombre(p)
+            si (w == "fragment") {
+                sea n = _gq_nombre(p)
+                si (n == "on") { _gq_error(p, "un fragmento no puede llamarse 'on'") }
+                _gq_espera(p, "on")
+                sea tc = _gq_nombre(p)
+                sea dirs = _gq_directivas(p)
+                frags[n] = {"tipo": tc, "dirs": dirs, "sel": _gq_seleccion(p)}
+            } sino {
+                si (w != "query" y w != "mutation" y w != "subscription") { p["i"] = p["i"] - 1  _gq_error(p, "se esperaba query, mutation o fragment") }
+                sea nombre = nulo
+                si (_gq_ver(p)["t"] == "n") { nombre = _gq_nombre(p) }
+                sea vars = []
+                si (_gq_acepta(p, "(")) {
+                    mientras (_gq_es(p, ")") == falso) {
+                        _gq_espera(p, "$")
+                        sea vn = _gq_nombre(p)
+                        _gq_espera(p, ":")
+                        sea vt = _gq_tipo(p)
+                        sea def = nulo
+                        si (_gq_acepta(p, "=")) { def = _gq_valor(p, verdadero) }
+                        vars.agregar({"n": vn, "tipo": vt, "def": def})
+                    }
+                    _gq_tomar(p)
+                }
+                sea dirs = _gq_directivas(p)
+                ops.agregar({"tipo": w, "nombre": nombre, "vars": vars, "dirs": dirs, "sel": _gq_seleccion(p)})
+            }
+        }
+    }
+    si (longitud(ops) == 0) { lanzar "grafo: el documento no tiene operaciones" }
+    retornar {"ops": ops, "frags": frags}
+}
+
+// ── Esquema (SDL) ─────────────────────────────────────────────────────────
+
+funcion _gq_desc(p) { si (_gq_ver(p)["t"] == "s") { retornar _gq_tomar(p)["v"] }  retornar nulo }
+
+funcion _gq_campos_def(p, con_args) {
+    sea r = []
+    _gq_espera(p, "{")
+    mientras (_gq_es(p, "}") == falso) {
+        sea d = _gq_desc(p)
+        sea n = _gq_nombre(p)
+        sea args = []
+        si (con_args y _gq_acepta(p, "(")) {
+            mientras (_gq_es(p, ")") == falso) {
+                sea ad = _gq_desc(p)
+                sea an = _gq_nombre(p)
+                _gq_espera(p, ":")
+                sea at = _gq_tipo(p)
+                sea def = nulo
+                si (_gq_acepta(p, "=")) { def = _gq_valor(p, verdadero) }
+                _gq_directivas(p)
+                args.agregar({"n": an, "tipo": at, "def": def, "desc": ad})
+            }
+            _gq_tomar(p)
+        }
+        _gq_espera(p, ":")
+        sea t = _gq_tipo(p)
+        sea def = nulo
+        si (con_args == falso y _gq_acepta(p, "=")) { def = _gq_valor(p, verdadero) }
+        sea dirs = _gq_directivas(p)
+        sea obsoleto = nulo
+        para dd en dirs { si (dd["n"] == "deprecated") { obsoleto = "No longer supported" } }
+        r.agregar({"n": n, "tipo": t, "args": args, "def": def, "desc": d, "obsoleto": obsoleto})
+    }
+    _gq_tomar(p)
+    retornar r
+}
+
+/// Lee un esquema en SDL.
+funcion grafo_esquema(sdl) {
+    sea p = {"toks": _gq_lexico(sdl), "i": 0}
+    sea tipos = {}
+    para nm en ["Int", "Float", "String", "Boolean", "ID"] { tipos[nm] = {"k": "SCALAR", "n": nm} }
+    sea raiz = {"query": "Query", "mutation": nulo, "subscription": nulo}
+    sea hubo_mut = falso
+    mientras (_gq_ver(p)["t"] != "fin") {
+        sea d = _gq_desc(p)
+        sea w = _gq_nombre(p)
+        si (w == "extend") { w = _gq_nombre(p) }
+        si (w == "schema") {
+            _gq_directivas(p)
+            _gq_espera(p, "{")
+            mientras (_gq_es(p, "}") == falso) {
+                sea op = _gq_nombre(p)
+                _gq_espera(p, ":")
+                raiz[op] = _gq_nombre(p)
+            }
+            _gq_tomar(p)
+        } sino {
+            si (w == "directive") {
+                _gq_espera(p, "@")
+                _gq_nombre(p)
+                si (_gq_acepta(p, "(")) {
+                    sea nivel = 1
+                    mientras (nivel > 0) {
+                        sea t = _gq_tomar(p)
+                        si (t["t"] == "fin") { lanzar "grafo: directiva sin cerrar" }
+                        si (t["v"] == "(") { nivel = nivel + 1 }
+                        si (t["v"] == ")") { nivel = nivel - 1 }
+                    }
+                }
+                _gq_acepta(p, "repeatable")
+                _gq_espera(p, "on")
+                _gq_acepta(p, "|")
+                _gq_nombre(p)
+                mientras (_gq_acepta(p, "|")) { _gq_nombre(p) }
+            } sino {
+                sea n = _gq_nombre(p)
+                si (w == "scalar") { _gq_directivas(p)  tipos[n] = {"k": "SCALAR", "n": n, "desc": d} }
+                si (w == "type" o w == "interface") {
+                    sea impl = []
+                    si (_gq_acepta(p, "implements")) {
+                        _gq_acepta(p, "&")
+                        impl.agregar(_gq_nombre(p))
+                        mientras (_gq_acepta(p, "&")) { impl.agregar(_gq_nombre(p)) }
+                    }
+                    _gq_directivas(p)
+                    sea campos = _gq_campos_def(p, verdadero)
+                    sea k = "OBJECT"
+                    si (w == "interface") { k = "INTERFACE" }
+                    si (tiene_clave(tipos, n) y tipos[n]["k"] == k) {
+                        para c en campos { tipos[n]["campos"].agregar(c)  tipos[n]["por"][c["n"]] = c }
+                    } sino {
+                        sea por = {}
+                        para c en campos { por[c["n"]] = c }
+                        tipos[n] = {"k": k, "n": n, "campos": campos, "por": por, "impl": impl, "desc": d}
+                    }
+                }
+                si (w == "input") {
+                    _gq_directivas(p)
+                    sea campos = _gq_campos_def(p, falso)
+                    sea por = {}
+                    para c en campos { por[c["n"]] = c }
+                    tipos[n] = {"k": "INPUT_OBJECT", "n": n, "campos": campos, "por": por, "desc": d}
+                }
+                si (w == "enum") {
+                    _gq_directivas(p)
+                    _gq_espera(p, "{")
+                    sea vals = []
+                    mientras (_gq_es(p, "}") == falso) {
+                        _gq_desc(p)
+                        vals.agregar(_gq_nombre(p))
+                        _gq_directivas(p)
+                    }
+                    _gq_tomar(p)
+                    tipos[n] = {"k": "ENUM", "n": n, "valores": vals, "desc": d}
+                }
+                si (w == "union") {
+                    _gq_directivas(p)
+                    _gq_espera(p, "=")
+                    _gq_acepta(p, "|")
+                    sea miembros = [_gq_nombre(p)]
+                    mientras (_gq_acepta(p, "|")) { miembros.agregar(_gq_nombre(p)) }
+                    tipos[n] = {"k": "UNION", "n": n, "miembros": miembros, "desc": d}
+                }
+                si (w != "scalar" y w != "type" y w != "interface" y w != "input" y w != "enum" y w != "union") { lanzar "grafo: definición desconocida " + w }
+            }
+        }
+    }
+    si (tiene_clave(tipos, "Mutation") y raiz["mutation"] == nulo) { raiz["mutation"] = "Mutation" }
+    si (tiene_clave(tipos, "Subscription") y raiz["subscription"] == nulo) { raiz["subscription"] = "Subscription" }
+    si (tiene_clave(tipos, raiz["query"]) == falso) { lanzar "grafo: el esquema no tiene el tipo " + raiz["query"] }
+    // Comprueba que los tipos usados existan.
+    para tn en claves(tipos) {
+        sea t = tipos[tn]
+        si (t["k"] == "OBJECT" o t["k"] == "INTERFACE" o t["k"] == "INPUT_OBJECT") {
+            para c en t["campos"] {
+                sea base = _gq_base(c["tipo"])
+                si (tiene_clave(tipos, base) == falso) { lanzar "grafo: " + tn + "." + c["n"] + " usa el tipo desconocido " + base }
+            }
+        }
+    }
+    retornar {"tipos": tipos, "raiz": raiz}
+}
+
+funcion _gq_base(t) {
+    si (t["k"] == "nombre") { retornar t["n"] }
+    retornar _gq_base(t["de"])
+}
+
+funcion _gq_tipo_texto(t) {
+    si (t["k"] == "nombre") { retornar t["n"] }
+    si (t["k"] == "lista") { retornar "[" + _gq_tipo_texto(t["de"]) + "]" }
+    retornar _gq_tipo_texto(t["de"]) + "!"
+}
+
+// ── Valores de entrada ────────────────────────────────────────────────────
+
+funcion _gq_err_val(msg) { lanzar _GQ_S1 + msg }
+
+funcion _gq_coercer_ent(g, t, v, donde) {
+    // v: valor ya en C-Forge (de variables JSON o literal evaluado).
+    si (t["k"] == "nonull") {
+        si (v == nulo) { _gq_err_val(donde + ": se esperaba un valor no nulo de tipo " + _gq_tipo_texto(t)) }
+        retornar _gq_coercer_ent(g, t["de"], v, donde)
+    }
+    si (v == nulo) { retornar nulo }
+    si (t["k"] == "lista") {
+        si (tipo(v) != "lista") { retornar [_gq_coercer_ent(g, t["de"], v, donde)] }
+        sea r = []
+        para x en v { r.agregar(_gq_coercer_ent(g, t["de"], x, donde)) }
+        retornar r
+    }
+    sea tt = g["tipos"][t["n"]] ?? nulo
+    si (tt == nulo) { _gq_err_val(donde + ": tipo desconocido " + t["n"]) }
+    si (tt["k"] == "SCALAR") {
+        sea n = t["n"]
+        si (n == "Int") {
+            si (tipo(v) != "numero" o piso(v) != v o v > 2147483647 o v < -2147483648) { _gq_err_val(donde + ": Int no puede representar " + json_texto(v)) }
+            retornar v
+        }
+        si (n == "Float") {
+            si (tipo(v) != "numero") { _gq_err_val(donde + ": Float no puede representar " + json_texto(v)) }
+            retornar v
+        }
+        si (n == "String") {
+            si (tipo(v) != "texto") { _gq_err_val(donde + ": String no puede representar " + json_texto(v)) }
+            retornar v
+        }
+        si (n == "Boolean") {
+            si (v != verdadero y v != falso) { _gq_err_val(donde + ": Boolean no puede representar " + json_texto(v)) }
+            retornar v
+        }
+        si (n == "ID") {
+            si (tipo(v) == "numero" y piso(v) == v) { retornar "" + v }
+            si (tipo(v) != "texto") { _gq_err_val(donde + ": ID no puede representar " + json_texto(v)) }
+            retornar v
+        }
+        retornar v
+    }
+    si (tt["k"] == "ENUM") {
+        para x en tt["valores"] { si (x == v) { retornar v } }
+        _gq_err_val(donde + ": el valor " + json_texto(v) + " no existe en el enum " + tt["n"])
+    }
+    si (tt["k"] == "INPUT_OBJECT") {
+        si (tipo(v) != "mapa") { _gq_err_val(donde + ": se esperaba un objeto " + tt["n"]) }
+        para k en claves(v) { si (tiene_clave(tt["por"], k) == falso) { _gq_err_val(donde + ": el campo " + k + " no existe en " + tt["n"]) } }
+        sea r = {}
+        para c en tt["campos"] {
+            si (tiene_clave(v, c["n"])) { r[c["n"]] = _gq_coercer_ent(g, c["tipo"], v[c["n"]], donde + "." + c["n"]) } sino {
+                si (c["def"] != nulo) { r[c["n"]] = _gq_coercer_ent(g, c["tipo"], _gq_literal(c["def"], {}), donde + "." + c["n"]) } sino {
+                    si (c["tipo"]["k"] == "nonull") { _gq_err_val(donde + ": falta el campo obligatorio " + c["n"]) }
+                }
+            }
+        }
+        retornar r
+    }
+    _gq_err_val(donde + ": " + tt["n"] + " no es un tipo de entrada")
+}
+
+funcion _gq_literal(v, vars) {
+    sea k = v["k"]
+    si (k == "var") { retornar vars[v["n"]] ?? nulo }
+    si (k == "null") { retornar nulo }
+    si (k == "list") {
+        sea r = []
+        para x en v["v"] { r.agregar(_gq_literal(x, vars)) }
+        retornar r
+    }
+    si (k == "object") {
+        sea r = {}
+        para par en v["v"] { r[par[0]] = _gq_literal(par[1], vars) }
+        retornar r
+    }
+    retornar v["v"]
+}
+
+// Un literal Int escrito como "4" no vale para String, etc.: se comprueba
+// el tipo léxico antes de coercer.
+funcion _gq_literal_ok(g, t, v) {
+    si (v["k"] == "var" o v["k"] == "null") { retornar verdadero }
+    sea tt = t
+    si (tt["k"] == "nonull") { tt = tt["de"] }
+    si (tt["k"] == "lista") {
+        si (v["k"] == "list") {
+            para x en v["v"] { si (_gq_literal_ok(g, tt["de"], x) == falso) { retornar falso } }
+            retornar verdadero
+        }
+        retornar _gq_literal_ok(g, tt["de"], v)
+    }
+    sea d = g["tipos"][tt["n"]] ?? nulo
+    si (d == nulo) { retornar falso }
+    si (d["k"] == "ENUM") { retornar v["k"] == "enum" }
+    si (tt["n"] == "String") { retornar v["k"] == "string" }
+    si (tt["n"] == "ID") { retornar v["k"] == "string" o v["k"] == "int" }
+    si (tt["n"] == "Int") { retornar v["k"] == "int" }
+    si (tt["n"] == "Float") { retornar v["k"] == "int" o v["k"] == "float" }
+    si (tt["n"] == "Boolean") { retornar v["k"] == "bool" }
+    si (d["k"] == "INPUT_OBJECT") {
+        si (v["k"] != "object") { retornar falso }
+        para par en v["v"] {
+            si (tiene_clave(d["por"], par[0]) == falso) { retornar falso }
+            si (_gq_literal_ok(g, d["por"][par[0]]["tipo"], par[1]) == falso) { retornar falso }
+        }
+        retornar verdadero
+    }
+    retornar verdadero
+}
+
+funcion _gq_argumentos(g, defs, args, vars, donde) {
+    sea dados = {}
+    para a en args { dados[a[0]] = a[1] }
+    para k en claves(dados) {
+        sea existe = falso
+        para d en defs { si (d["n"] == k) { existe = verdadero } }
+        si (existe == falso) { _gq_err_val("Argumento desconocido \"" + k + "\" en " + donde + ".") }
+    }
+    sea r = {}
+    para d en defs {
+        si (tiene_clave(dados, d["n"])) {
+            sea lit = dados[d["n"]]
+            si (_gq_literal_ok(g, d["tipo"], lit) == falso) { _gq_err_val("El argumento \"" + d["n"] + "\" de " + donde + " tiene un valor inválido.") }
+            si (lit["k"] == "var" y tiene_clave(vars, lit["n"]) == falso) {
+                si (d["def"] != nulo) { r[d["n"]] = _gq_literal(d["def"], {}) } sino {
+                    si (d["tipo"]["k"] == "nonull") { _gq_err_val("Falta el argumento obligatorio \"" + d["n"] + "\" en " + donde + ".") }
+                }
+            } sino { r[d["n"]] = _gq_coercer_ent(g, d["tipo"], _gq_literal(lit, vars), d["n"]) }
+        } sino {
+            si (d["def"] != nulo) { r[d["n"]] = _gq_coercer_ent(g, d["tipo"], _gq_literal(d["def"], {}), d["n"]) } sino {
+                si (d["tipo"]["k"] == "nonull") { _gq_err_val("Falta el argumento obligatorio \"" + d["n"] + "\" en " + donde + ".") }
+            }
+        }
+    }
+    retornar r
+}
+
+// ── Ejecución ─────────────────────────────────────────────────────────────
+
+funcion _gq_incluir(dirs, vars) {
+    para d en dirs {
+        si (d["n"] == "skip" o d["n"] == "include") {
+            sea v = nulo
+            para a en d["args"] { si (a[0] == "if") { v = _gq_literal(a[1], vars) } }
+            si (d["n"] == "skip" y v == verdadero) { retornar falso }
+            si (d["n"] == "include" y v != verdadero) { retornar falso }
+        }
+    }
+    retornar verdadero
+}
+
+funcion _gq_cumple(g, tipo_obj, condicion) {
+    si (condicion == nulo o condicion == tipo_obj) { retornar verdadero }
+    sea c = g["tipos"][condicion] ?? nulo
+    si (c == nulo) { retornar falso }
+    si (c["k"] == "INTERFACE") { para i en g["tipos"][tipo_obj]["impl"] { si (i == condicion) { retornar verdadero } } }
+    si (c["k"] == "UNION") { para m en c["miembros"] { si (m == tipo_obj) { retornar verdadero } } }
+    retornar falso
+}
+
+// Agrupa los campos por alias respetando el orden (CollectFields).
+funcion _gq_recoger(ctx, tipo_obj, sel, orden, grupos, vistos) {
+    para s en sel {
+        si (_gq_incluir(s["dirs"], ctx["vars"])) {
+            si (s["k"] == "campo") {
+                si (tiene_clave(grupos, s["alias"]) == falso) { grupos[s["alias"]] = []  orden.agregar(s["alias"]) }
+                grupos[s["alias"]].agregar(s)
+            }
+            si (s["k"] == "inline" y _gq_cumple(ctx["g"], tipo_obj, s["tipo"])) { _gq_recoger(ctx, tipo_obj, s["sel"], orden, grupos, vistos) }
+            si (s["k"] == "spread" y tiene_clave(vistos, s["n"]) == falso) {
+                vistos[s["n"]] = verdadero
+                sea f = ctx["doc"]["frags"][s["n"]] ?? nulo
+                si (f == nulo) { _gq_err_val("Fragmento desconocido \"" + s["n"] + "\".") }
+                si (_gq_cumple(ctx["g"], tipo_obj, f["tipo"])) { _gq_recoger(ctx, tipo_obj, f["sel"], orden, grupos, vistos) }
+            }
+        }
+    }
+}
+
+funcion _gq_resolver_tipo(ctx, abstracto, valor) {
+    si (tipo(valor) == "mapa" y tiene_clave(valor, "__typename")) { retornar valor["__typename"] }
+    sea rs = ctx["res"][abstracto] ?? nulo
+    si (rs != nulo y tiene_clave(rs, "__tipo")) { retornar rs["__tipo"](valor, ctx["contexto"]) }
+    lanzar _GQ_S1 + "No se pudo saber el tipo concreto de " + abstracto + " (agrega __typename o un resolvedor __tipo)."
+}
+
+// Valor ordenado: {_GQ_S2: [claves en orden], …} para objetos.
+funcion _gq_completar(ctx, t, valor, campos, ruta) {
+    si (t["k"] == "nonull") {
+        sea r = _gq_completar(ctx, t["de"], valor, campos, ruta)
+        si (r == nulo) { lanzar {"nonull": verdadero, "msg": "No puede devolver null en el campo no nulo " + _gq_ruta_texto(ruta) + "."} }
+        retornar r
+    }
+    si (valor == nulo) { retornar nulo }
+    si (t["k"] == "lista") {
+        si (tipo(valor) != "lista") { lanzar _GQ_S1 + "Se esperaba una lista en " + _gq_ruta_texto(ruta) + "." }
+        sea r = []
+        sea i = 0
+        mientras (i < longitud(valor)) {
+            sea sub = ruta + [i]
+            r.agregar(_gq_campo_seguro(ctx, t["de"], valor[i], campos, sub))
+            i = i + 1
+        }
+        retornar r
+    }
+    sea d = ctx["g"]["tipos"][t["n"]]
+    si (d["k"] == "SCALAR") {
+        sea n = t["n"]
+        si (n == "Int") {
+            si (tipo(valor) != "numero" o piso(valor) != valor) { lanzar _GQ_S1 + "Int no puede representar " + json_texto(valor) + "." }
+            retornar valor
+        }
+        si (n == "Float") {
+            si (tipo(valor) != "numero") { lanzar _GQ_S1 + "Float no puede representar " + json_texto(valor) + "." }
+            retornar valor
+        }
+        si (n == "Boolean") { retornar valor == verdadero }
+        si (n == "String" o n == "ID") {
+            si (tipo(valor) == "mapa" o tipo(valor) == "lista") { lanzar _GQ_S1 + n + " no puede representar un objeto." }
+            si (valor == verdadero) { retornar "true" }
+            si (valor == falso) { retornar "false" }
+            retornar "" + valor
+        }
+        retornar valor
+    }
+    si (d["k"] == "ENUM") { retornar "" + valor }
+    sea concreto = t["n"]
+    si (d["k"] == "INTERFACE" o d["k"] == "UNION") { concreto = _gq_resolver_tipo(ctx, t["n"], valor) }
+    sea sel = []
+    para c en campos { si (c["sel"] != nulo) { para s en c["sel"] { sel.agregar(s) } } }
+    retornar _gq_objeto(ctx, concreto, valor, sel, ruta)
+}
+
+funcion _gq_ruta_texto(ruta) {
+    sea r = []
+    para x en ruta { r.agregar("" + x) }
+    retornar unir(r, ".")
+}
+
+funcion _gq_campo_seguro(ctx, t, valor, campos, ruta) {
+    sea r = nulo
+    intentar { r = _gq_completar(ctx, t, valor, campos, ruta) } capturar (e) {
+        si (t["k"] == "nonull") { lanzar e }
+        _gq_anotar(ctx, e, ruta, campos)
+        r = nulo
+    }
+    retornar r
+}
+
+funcion _gq_anotar(ctx, e, ruta, campos) {
+    si (tipo(e) == "mapa" y tiene_clave(e, "anotado")) { retornar nulo }
+    sea msg = ""
+    si (tipo(e) == "mapa") { msg = e["msg"] } sino {
+        msg = "" + e
+        si (texto_empieza_con(msg, _GQ_S1)) { msg = subcadena(msg, 1, longitud(msg)) }
+    }
+    sea err = {"message": msg, "path": ruta}
+    si (campos != nulo y longitud(campos) > 0) { err["locations"] = [{"line": campos[0]["l"], "column": campos[0]["c"]}] }
+    ctx["errores"].agregar(err)
+}
+
+funcion _gq_objeto(ctx, tipo_obj, padre, sel, ruta) {
+    sea g = ctx["g"]
+    sea d = g["tipos"][tipo_obj] ?? nulo
+    si (d == nulo o d["k"] != "OBJECT") { lanzar _GQ_S1 + tipo_obj + " no es un tipo de objeto." }
+    sea orden = []
+    sea grupos = {}
+    _gq_recoger(ctx, tipo_obj, sel, orden, grupos, {})
+    sea r = {_GQ_S2: orden}
+    para alias en orden {
+        sea campos = grupos[alias]
+        sea f = campos[0]
+        sea sub = ruta + [alias]
+        si (f["n"] == "__typename") { r[alias] = tipo_obj } sino {
+            sea def = d["por"][f["n"]] ?? nulo
+            si (def == nulo y f["n"] == "__schema" y longitud(ruta) == 0) { r[alias] = _gq_completar_intro(ctx, campos, sub) } sino {
+                si (def == nulo y f["n"] == "__type" y longitud(ruta) == 0) { r[alias] = _gq_completar_tipo(ctx, campos, sub) } sino {
+                    si (def == nulo) { lanzar _GQ_S1 + "No existe el campo \"" + f["n"] + "\" en el tipo \"" + tipo_obj + "\"." }
+                    sea v = nulo
+                    sea fallo = nulo
+                    intentar {
+                        sea args = _gq_argumentos(g, def["args"], f["args"], ctx["vars"], tipo_obj + "." + f["n"])
+                        sea res = (ctx["res"][tipo_obj] ?? {})[f["n"]] ?? nulo
+                        si (res != nulo) { v = res(padre, args, ctx["contexto"], {"campo": f["n"], "ruta": sub, "tipo": tipo_obj}) } sino {
+                            si (tipo(padre) == "mapa") { v = padre[f["n"]] ?? nulo }
+                        }
+                    } capturar (e) { fallo = e }
+                    si (fallo != nulo) {
+                        si (def["tipo"]["k"] == "nonull") {
+                            _gq_anotar(ctx, fallo, sub, campos)
+                            lanzar {"nonull": verdadero, "msg": "", "anotado": verdadero}
+                        }
+                        _gq_anotar(ctx, fallo, sub, campos)
+                        r[alias] = nulo
+                    } sino {
+                        intentar { r[alias] = _gq_completar(ctx, def["tipo"], v, campos, sub) } capturar (e) {
+                            si (def["tipo"]["k"] == "nonull") {
+                                _gq_anotar(ctx, e, sub, campos)
+                                lanzar {"nonull": verdadero, "msg": "", "anotado": verdadero}
+                            }
+                            _gq_anotar(ctx, e, sub, campos)
+                            r[alias] = nulo
+                        }
+                    }
+                }
+            }
+        }
+    }
+    retornar r
+}
+
+// ── Introspección básica ──────────────────────────────────────────────────
+
+funcion _gq_intro_tipo_ref(g, t) {
+    si (t["k"] == "nonull") { retornar {"kind": "NON_NULL", "name": nulo, "ofType": _gq_intro_tipo_ref(g, t["de"])} }
+    si (t["k"] == "lista") { retornar {"kind": "LIST", "name": nulo, "ofType": _gq_intro_tipo_ref(g, t["de"])} }
+    retornar {"kind": g["tipos"][t["n"]]["k"], "name": t["n"], "ofType": nulo}
+}
+
+funcion _gq_intro_tipo(g, n) {
+    sea t = g["tipos"][n]
+    sea r = {"__typename": "__Type", "kind": t["k"], "name": n, "description": t["desc"] ?? nulo, "fields": nulo, "inputFields": nulo, "enumValues": nulo, "interfaces": nulo, "possibleTypes": nulo}
+    si (t["k"] == "OBJECT" o t["k"] == "INTERFACE") {
+        sea fs = []
+        para c en t["campos"] {
+            sea as_ = []
+            para a en c["args"] { as_.agregar({"name": a["n"], "type": _gq_intro_tipo_ref(g, a["tipo"]), "description": a["desc"] ?? nulo, "defaultValue": nulo}) }
+            fs.agregar({"name": c["n"], "type": _gq_intro_tipo_ref(g, c["tipo"]), "args": as_, "description": c["desc"] ?? nulo, "isDeprecated": c["obsoleto"] != nulo, "deprecationReason": c["obsoleto"]})
+        }
+        r["fields"] = fs
+        sea ifs = []
+        para i en (t["impl"] ?? []) { ifs.agregar({"kind": "INTERFACE", "name": i, "ofType": nulo}) }
+        r["interfaces"] = ifs
+    }
+    si (t["k"] == "INPUT_OBJECT") {
+        sea fs = []
+        para c en t["campos"] { fs.agregar({"name": c["n"], "type": _gq_intro_tipo_ref(g, c["tipo"]), "description": c["desc"] ?? nulo, "defaultValue": nulo}) }
+        r["inputFields"] = fs
+    }
+    si (t["k"] == "ENUM") {
+        sea vs = []
+        para v en t["valores"] { vs.agregar({"name": v, "description": nulo, "isDeprecated": falso, "deprecationReason": nulo}) }
+        r["enumValues"] = vs
+    }
+    si (t["k"] == "UNION") {
+        sea ps = []
+        para m en t["miembros"] { ps.agregar({"kind": "OBJECT", "name": m, "ofType": nulo}) }
+        r["possibleTypes"] = ps
+    }
+    retornar r
+}
+
+funcion _gq_sel_plana(ctx, campos, valor, ruta) {
+    // Completa un valor de introspección (mapas y listas) según la selección.
+    si (valor == nulo) { retornar nulo }
+    si (tipo(valor) == "lista") {
+        sea r = []
+        sea i = 0
+        mientras (i < longitud(valor)) { r.agregar(_gq_sel_plana(ctx, campos, valor[i], ruta + [i]))  i = i + 1 }
+        retornar r
+    }
+    si (tipo(valor) != "mapa") { retornar valor }
+    sea sel = []
+    para c en campos { si (c["sel"] != nulo) { para s en c["sel"] { sel.agregar(s) } } }
+    sea orden = []
+    sea grupos = {}
+    _gq_recoger_intro(ctx, sel, orden, grupos)
+    sea r = {_GQ_S2: orden}
+    para alias en orden {
+        sea f = grupos[alias][0]
+        si (f["n"] == "__typename") { r[alias] = valor["__typename"] ?? nulo } sino {
+            si (f["n"] == "type" o f["n"] == "ofType" o f["n"] == "queryType" o f["n"] == "mutationType" o f["n"] == "subscriptionType" o f["n"] == "fields" o f["n"] == "args" o f["n"] == "inputFields" o f["n"] == "enumValues" o f["n"] == "interfaces" o f["n"] == "possibleTypes" o f["n"] == "types" o f["n"] == "directives") { r[alias] = _gq_sel_plana(ctx, grupos[alias], valor[f["n"]] ?? nulo, ruta + [alias]) } sino { r[alias] = valor[f["n"]] ?? nulo }
+        }
+    }
+    retornar r
+}
+
+funcion _gq_recoger_intro(ctx, sel, orden, grupos) {
+    para s en sel {
+        si (s["k"] == "campo") {
+            si (tiene_clave(grupos, s["alias"]) == falso) { grupos[s["alias"]] = []  orden.agregar(s["alias"]) }
+            grupos[s["alias"]].agregar(s)
+        }
+        si (s["k"] == "inline") { _gq_recoger_intro(ctx, s["sel"], orden, grupos) }
+        si (s["k"] == "spread") {
+            sea f = ctx["doc"]["frags"][s["n"]] ?? nulo
+            si (f != nulo) { _gq_recoger_intro(ctx, f["sel"], orden, grupos) }
+        }
+    }
+}
+
+funcion _gq_completar_intro(ctx, campos, ruta) {
+    sea g = ctx["g"]
+    sea tipos = []
+    para n en claves(g["tipos"]) { tipos.agregar(_gq_intro_tipo(g, n)) }
+    sea q = {"kind": "OBJECT", "name": g["raiz"]["query"]}
+    sea m = nulo
+    si (g["raiz"]["mutation"] != nulo) { m = {"kind": "OBJECT", "name": g["raiz"]["mutation"]} }
+    retornar _gq_sel_plana(ctx, campos, {"__typename": "__Schema", "types": tipos, "queryType": q, "mutationType": m, "subscriptionType": nulo, "directives": []}, ruta)
+}
+
+funcion _gq_completar_tipo(ctx, campos, ruta) {
+    sea n = nulo
+    para a en campos[0]["args"] { si (a[0] == "name") { n = _gq_literal(a[1], ctx["vars"]) } }
+    si (n == nulo o tiene_clave(ctx["g"]["tipos"], n) == falso) { retornar nulo }
+    retornar _gq_sel_plana(ctx, campos, _gq_intro_tipo(ctx["g"], n), ruta)
+}
+
+// ── API ───────────────────────────────────────────────────────────────────
+
+funcion _gq_plano(v) {
+    si (tipo(v) == "lista") {
+        sea r = []
+        para x en v { r.agregar(_gq_plano(x)) }
+        retornar r
+    }
+    si (tipo(v) == "mapa" y tiene_clave(v, _GQ_S2)) {
+        sea r = {}
+        para k en v[_GQ_S2] { r[k] = _gq_plano(v[k]) }
+        retornar r
+    }
+    retornar v
+}
+
+funcion _gq_json(v) {
+    si (tipo(v) == "lista") {
+        sea partes = []
+        para x en v { partes.agregar(_gq_json(x)) }
+        retornar "[" + unir(partes, ",") + "]"
+    }
+    si (tipo(v) == "mapa") {
+        sea ks = []
+        si (tiene_clave(v, _GQ_S2)) { ks = v[_GQ_S2] } sino { ks = claves(v) }
+        sea partes = []
+        para k en ks { partes.agregar(json_texto("" + k) + ":" + _gq_json(v[k])) }
+        retornar "{" + unir(partes, ",") + "}"
+    }
+    retornar json_texto(v)
+}
+
+funcion _gq_ejecutar_crudo(g, resolvedores, consulta, variables, operacion, contexto) {
+    sea errores = []
+    sea doc = nulo
+    intentar { doc = grafo_analizar(consulta) } capturar (e) {
+        sea m = "" + e
+        retornar {_GQ_S2: ["errors"], "errors": [{"message": m}]}
+    }
+    sea op = nulo
+    para o_ en doc["ops"] {
+        si (operacion == nulo) {
+            si (op != nulo) { retornar {_GQ_S2: ["errors"], "errors": [{"message": "Hay varias operaciones: indica cuál ejecutar."}]} }
+            op = o_
+        } sino { si (o_["nombre"] == operacion) { op = o_ } }
+    }
+    si (op == nulo) { retornar {_GQ_S2: ["errors"], "errors": [{"message": "No existe la operación " + operacion + "."}]} }
+    sea raiz = g["raiz"][op["tipo"]] ?? nulo
+    si (raiz == nulo) { retornar {_GQ_S2: ["errors"], "errors": [{"message": "El esquema no soporta " + op["tipo"] + "."}]} }
+    // Variables.
+    sea vars = {}
+    sea dadas = variables ?? {}
+    para vd en op["vars"] {
+        intentar {
+            si (tiene_clave(dadas, vd["n"])) { vars[vd["n"]] = _gq_coercer_ent(g, vd["tipo"], dadas[vd["n"]], "$" + vd["n"]) } sino {
+                si (vd["def"] != nulo) { vars[vd["n"]] = _gq_coercer_ent(g, vd["tipo"], _gq_literal(vd["def"], {}), "$" + vd["n"]) } sino {
+                    si (vd["tipo"]["k"] == "nonull") { _gq_err_val("La variable $" + vd["n"] + " de tipo " + _gq_tipo_texto(vd["tipo"]) + " es obligatoria.") }
+                }
+            }
+        } capturar (e) {
+            sea m = "" + e
+            si (texto_empieza_con(m, _GQ_S1)) { m = subcadena(m, 1, longitud(m)) }
+            errores.agregar({"message": m})
+        }
+    }
+    si (longitud(errores) > 0) { retornar {_GQ_S2: ["errors"], "errors": errores} }
+    sea ctx = {"g": g, "res": resolvedores ?? {}, "vars": vars, "doc": doc, "errores": errores, "contexto": contexto}
+    sea datos = nulo
+    sea raiz_val = (resolvedores ?? {})["__raiz"] ?? {}
+    intentar { datos = _gq_objeto(ctx, raiz, raiz_val, op["sel"], []) } capturar (e) {
+        _gq_anotar(ctx, e, [], nulo)
+        datos = nulo
+    }
+    // Errores de validación de campos (sin ruta de datos) van sin data.
+    sea r = {_GQ_S2: ["data"], "data": datos}
+    si (longitud(errores) > 0) {
+        r[_GQ_S2] = ["errors", "data"]
+        sea limpio = []
+        para e en errores { si (e["message"] != "") { limpio.agregar(e) } }
+        r["errors"] = limpio
+    }
+    retornar r
+}
+
+/// Ejecuta una consulta. resolvedores: {"Tipo": {"campo": f(padre, args,
+/// contexto, info)}}; un campo sin resolvedor lee padre["campo"]. Para
+/// interfaces/uniones: "__typename" en el valor o {"Interfaz": {"__tipo": f(valor)}}.
+/// Devuelve {"data", "errors"?} (mapas normales).
+funcion grafo_ejecutar(g, resolvedores, consulta, variables, operacion, contexto) {
+    retornar _gq_plano(_gq_ejecutar_crudo(g, resolvedores, consulta, variables, operacion, contexto))
+}
+
+/// Igual, pero devuelve el JSON con los campos en el orden de la consulta.
+funcion grafo_json(g, resolvedores, consulta, variables, operacion, contexto) {
+    retornar _gq_json(_gq_ejecutar_crudo(g, resolvedores, consulta, variables, operacion, contexto))
+}
+
+/// Cuerpo HTTP de GraphQL ({"query", "variables", "operationName"}) →
+/// respuesta JSON (para POST /graphql).
+funcion grafo_http(g, resolvedores, cuerpo, contexto) {
+    sea d = nulo
+    intentar { d = json_parsear("" + cuerpo) } capturar (e) { retornar "{\"errors\":[{\"message\":\"JSON inválido\"}]}" }
+    si (tipo(d) != "mapa" o tipo(d["query"] ?? nulo) != "texto") { retornar "{\"errors\":[{\"message\":\"Falta query\"}]}" }
+    retornar grafo_json(g, resolvedores, d["query"], d["variables"] ?? nulo, d["operationName"] ?? nulo, contexto)
+}
