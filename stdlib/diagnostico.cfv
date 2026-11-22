@@ -1,0 +1,164 @@
+// stdlib/diagnostico.cfv — mensajes de error bonitos para compiladores,
+// configuraciones y validadores: muestra la línea del archivo, subraya el
+// tramo con ^^^ y agrega etiquetas, ayudas y notas (con o sin color).
+// Inspirada en Miette / Ariadne (Apache/MIT). En inglés: importar "diagnostics".
+//
+//   importar "diagnostico"
+//   sea d = diagnostico_nuevo("error", "tipo incompatible", "config.toml", fuente)
+//   diagnostico_marca(d, 120, 128, "se esperaba un número")
+//   diagnostico_ayuda(d, "quita las comillas: puerto = 8080")
+//   mostrar(diagnostico_texto(d))
+//
+//   error: tipo incompatible
+//     ╭─[config.toml:4:9]
+//   4 │ puerto = "8080"
+//     ·          ───┬──
+//     ·             ╰── se esperaba un número
+//     ╰─
+//     ayuda: quita las comillas: puerto = 8080
+
+funcion diagnostico_nuevo(nivel, mensaje, archivo, fuente, codigo) {
+    retornar {"nivel": nivel ?? "error", "mensaje": mensaje, "archivo": archivo ?? "<entrada>", "fuente": "" + (fuente ?? ""), "codigo": codigo, "marcas": [], "ayudas": [], "notas": []}
+}
+
+/// Marca el tramo [inicio, fin) en bytes de la fuente, con una etiqueta.
+funcion diagnostico_marca(d, inicio, fin, etiqueta) {
+    d["marcas"].agregar({"inicio": maximo(0, inicio), "fin": maximo(inicio + 1, fin), "etiqueta": etiqueta})
+    retornar d
+}
+
+/// Marca por línea y columna (desde 1) y largo.
+funcion diagnostico_marca_linea(d, linea, columna, largo, etiqueta) {
+    sea pos = diagnostico_posicion(d["fuente"], linea, columna)
+    retornar diagnostico_marca(d, pos, pos + (largo ?? 1), etiqueta)
+}
+
+funcion diagnostico_ayuda(d, texto) { d["ayudas"].agregar(texto)  retornar d }
+funcion diagnostico_nota(d, texto) { d["notas"].agregar(texto)  retornar d }
+
+/// Byte de (línea, columna) desde 1.
+funcion diagnostico_posicion(fuente, linea, columna) {
+    sea l = 1
+    sea i = 0
+    mientras (i < longitud(fuente) y l < linea) {
+        si (byte_en(fuente, i) == 10) { l = l + 1 }
+        i = i + 1
+    }
+    retornar i + columna - 1
+}
+
+/// [línea, columna] (desde 1) de un byte.
+funcion diagnostico_linea_columna(fuente, pos) {
+    sea l = 1
+    sea ini = 0
+    sea i = 0
+    mientras (i < pos y i < longitud(fuente)) {
+        si (byte_en(fuente, i) == 10) { l = l + 1  ini = i + 1 }
+        i = i + 1
+    }
+    retornar [l, _dg_columnas(subcadena(fuente, ini, pos)) + 1]
+}
+
+funcion _dg_columnas(t) {
+    sea n = 0
+    sea i = 0
+    mientras (i < longitud(t)) {
+        sea b = byte_en(t, i)
+        si (b < 128 o b >= 192) { n = n + 1 }
+        si (b == 9) { n = n + 3 }
+        i = i + 1
+    }
+    retornar n
+}
+
+funcion _dg_lineas(fuente) {
+    sea r = []
+    sea ini = 0
+    sea i = 0
+    mientras (i <= longitud(fuente)) {
+        si (i == longitud(fuente) o byte_en(fuente, i) == 10) {
+            r.agregar([ini, i])
+            ini = i + 1
+        }
+        i = i + 1
+    }
+    retornar r
+}
+
+funcion _dg_color(c, codigo, t) {
+    si (c == falso) { retornar t }
+    retornar caracter(27) + "[" + codigo + "m" + t + caracter(27) + "[0m"
+}
+
+/// Texto del diagnóstico. color = verdadero agrega colores ANSI.
+funcion diagnostico_texto(d, color) {
+    sea c = color == verdadero
+    sea nivel_color = "31;1"
+    si (d["nivel"] == "aviso" o d["nivel"] == "warning") { nivel_color = "33;1" }
+    si (d["nivel"] == "nota" o d["nivel"] == "info") { nivel_color = "36;1" }
+    sea cab = d["nivel"]
+    si (d["codigo"] != nulo) { cab = cab + "[" + d["codigo"] + "]" }
+    sea l = [_dg_color(c, nivel_color, cab) + ": " + _dg_color(c, "1", d["mensaje"])]
+    sea fuente = d["fuente"]
+    si (longitud(d["marcas"]) > 0 y fuente != "") {
+        sea lineas = _dg_lineas(fuente)
+        sea primera = diagnostico_linea_columna(fuente, d["marcas"][0]["inicio"])
+        // Agrupa marcas por línea.
+        sea por_linea = {}
+        sea numeros = []
+        para m en d["marcas"] {
+            sea lc = diagnostico_linea_columna(fuente, m["inicio"])
+            sea k = "" + lc[0]
+            si (tiene_clave(por_linea, k) == falso) { por_linea[k] = []  numeros.agregar(lc[0]) }
+            por_linea[k].agregar(m)
+        }
+        numeros = ordenar(numeros, funcion(a, b) { retornar a - b })
+        sea ancho = longitud("" + numeros[longitud(numeros) - 1])
+        sea pad = texto_repetir(" ", ancho)
+        l.agregar(pad + " ╭─[" + d["archivo"] + ":" + primera[0] + ":" + primera[1] + "]")
+        para n en numeros {
+            sea tramo = lineas[n - 1]
+            sea texto_l = texto_reemplazar(subcadena(fuente, tramo[0], tramo[1]), "\t", "    ")
+            texto_l = texto_reemplazar(texto_l, "\r", "")
+            sea num = "" + n
+            l.agregar(texto_repetir(" ", ancho - longitud(num)) + _dg_color(c, "2", num) + " │ " + texto_l)
+            sea marcas = ordenar(por_linea["" + n], funcion(a, b) { retornar a["inicio"] - b["inicio"] })
+            // Línea de subrayado con ┬ en el centro de cada tramo.
+            sea subr = ""
+            sea centros = []
+            para m en marcas {
+                sea col = diagnostico_linea_columna(fuente, m["inicio"])[1] - 1
+                sea fin = minimo(m["fin"], tramo[1])
+                sea largo = maximo(1, _dg_columnas(subcadena(fuente, m["inicio"], maximo(m["inicio"] + 1, fin))))
+                mientras (_dg_columnas(subr) < col) { subr = subr + " " }
+                sea medio = cociente(largo - 1, 2)
+                sea k = 0
+                mientras (k < largo) {
+                    si (k == medio y m["etiqueta"] != nulo) { subr = subr + "┬" } sino { subr = subr + "─" }
+                    k = k + 1
+                }
+                si (m["etiqueta"] != nulo) { centros.agregar([col + medio, m["etiqueta"]]) }
+            }
+            l.agregar(pad + " · " + _dg_color(c, nivel_color, subr))
+            // Etiquetas de derecha a izquierda para que las líneas no se crucen.
+            sea j = longitud(centros) - 1
+            mientras (j >= 0) {
+                sea fila = ""
+                sea q = 0
+                mientras (q < j) {
+                    mientras (_dg_columnas(fila) < centros[q][0]) { fila = fila + " " }
+                    fila = fila + "│"
+                    q = q + 1
+                }
+                mientras (_dg_columnas(fila) < centros[j][0]) { fila = fila + " " }
+                fila = fila + "╰── " + centros[j][1]
+                l.agregar(pad + " · " + _dg_color(c, nivel_color, fila))
+                j = j - 1
+            }
+        }
+        l.agregar(pad + " ╰─")
+    }
+    para a en d["ayudas"] { l.agregar("  " + _dg_color(c, "36", "ayuda") + ": " + a) }
+    para a en d["notas"] { l.agregar("  " + _dg_color(c, "2", "nota") + ": " + a) }
+    retornar unir(l, "\n")
+}
