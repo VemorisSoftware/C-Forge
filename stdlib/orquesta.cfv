@@ -1,0 +1,312 @@
+// stdlib/orquesta.cfv — cliente de Kubernetes al estilo kube-rs y
+// client-go: lee kubeconfig (contextos, clústeres, usuarios con token o
+// usuario y clave) o la configuración dentro del pod, arma las rutas de la
+// API para cualquier recurso (core y grupos, con espacio de nombres o de
+// clúster, plurales con sus excepciones), y ofrece listar, obtener, crear,
+// reemplazar, parchar (merge, JSON patch y strategic merge), borrar,
+// escalar, reiniciar despliegues, leer logs, aplicar YAML de varios
+// documentos (crear o parchar), seguir eventos de watch y filtrar por
+// etiquetas y campos. Idea de kube-rs (Apache). En inglés: importar
+// "kubernetes".
+//
+//   importar "orquesta"
+//   sea k = orquesta_cliente(nulo)          // ~/.kube/config o dentro del pod
+//   para p en orquesta_listar(k, "v1", "Pod", "default", {"etiquetas": "app=web"}) { mostrar(p["metadata"]["name"]) }
+
+importar "json"
+importar "ajustes"
+importar "base64"
+
+sea _OQ_PLURALES = {"Endpoints": "endpoints", "Ingress": "ingresses", "IngressClass": "ingressclasses", "NetworkPolicy": "networkpolicies", "PodSecurityPolicy": "podsecuritypolicies", "StorageClass": "storageclasses",
+    "PriorityClass": "priorityclasses", "RuntimeClass": "runtimeclasses", "ResourceQuota": "resourcequotas", "LimitRange": "limitranges", "CustomResourceDefinition": "customresourcedefinitions"}
+
+sea _OQ_CLUSTER = {"Namespace": 1, "Node": 1, "PersistentVolume": 1, "ClusterRole": 1, "ClusterRoleBinding": 1, "StorageClass": 1, "CustomResourceDefinition": 1, "PriorityClass": 1, "IngressClass": 1,
+    "RuntimeClass": 1, "APIService": 1, "MutatingWebhookConfiguration": 1, "ValidatingWebhookConfiguration": 1, "CSIDriver": 1, "CSINode": 1, "VolumeAttachment": 1, "CertificateSigningRequest": 1}
+
+/// Plural en minúsculas de un "kind".
+funcion orquesta_plural(kind) {
+    si (tiene_clave(_OQ_PLURALES, kind)) { retornar _OQ_PLURALES[kind] }
+    sea k = texto_minusculas(kind)
+    si (texto_termina_con(k, "s") o texto_termina_con(k, "x") o texto_termina_con(k, "ch") o texto_termina_con(k, "sh")) { retornar k + "es" }
+    si (texto_termina_con(k, "y") y longitud(k) > 1 y texto_indice("aeiou", subcadena(k, longitud(k) - 2, longitud(k) - 1)) < 0) { retornar subcadena(k, 0, longitud(k) - 1) + "ies" }
+    retornar k + "s"
+}
+
+/// Ruta de la API. ns nulo = todos los espacios (o recurso de clúster).
+funcion orquesta_ruta(api_version, kind, ns, nombre, sub) {
+    sea base = "/apis/" + api_version
+    si (texto_indice(api_version, "/") < 0) { base = "/api/" + api_version }
+    sea r = base
+    si (ns != nulo y tiene_clave(_OQ_CLUSTER, kind) == falso) { r = r + "/namespaces/" + ns }
+    r = r + "/" + orquesta_plural(kind)
+    si (nombre != nulo) { r = r + "/" + nombre }
+    si (sub != nulo) { r = r + "/" + sub }
+    retornar r
+}
+
+funcion _oq_codificar(t) {
+    sea r = []
+    sea i = 0
+    mientras (i < longitud(t)) {
+        sea c = subcadena(t, i, i + 1)
+        si (texto_indice("abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789-_.~", c) >= 0) { r.agregar(c) } sino {
+            sea b = byte_en(t, i)
+            r.agregar("%" + subcadena("0123456789ABCDEF", piso(b / 16), piso(b / 16) + 1) + subcadena("0123456789ABCDEF", b % 16, b % 16 + 1))
+        }
+        i = i + 1
+    }
+    retornar unir(r, "")
+}
+
+funcion _oq_consulta(op) {
+    sea partes = []
+    sea mapa = {"etiquetas": "labelSelector", "campos": "fieldSelector", "limite": "limit", "continuar": "continue", "version_recurso": "resourceVersion", "contenedor": "container", "ultimas": "tailLines", "desde_segundos": "sinceSeconds", "seguir": "follow", "previo": "previous", "dry_run": "dryRun", "propagacion": "propagationPolicy", "gracia": "gracePeriodSeconds", "watch": "watch", "gestor": "fieldManager", "forzar": "force", "tiempo": "timeoutSeconds"}
+    para k en ordenar(claves(op ?? {})) {
+        si (tiene_clave(mapa, k)) {
+            sea v = op[k]
+            si (tipo(v) == "mapa") {
+                // {"app": "web", "tier": "front"} → app=web,tier=front
+                sea l = []
+                para kk en ordenar(claves(v)) { l.agregar(kk + "=" + v[kk]) }
+                v = unir(l, ",")
+            }
+            si (v == verdadero) { v = "true" }
+            si (v == falso) { v = "false" }
+            partes.agregar(mapa[k] + "=" + _oq_codificar("" + v))
+        }
+    }
+    si (longitud(partes) == 0) { retornar "" }
+    retornar "?" + unir(partes, "&")
+}
+
+/// Cliente. opciones: "kubeconfig" (texto YAML), "ruta" (archivo),
+/// "contexto", "servidor" y "token" (directos), "transporte"
+/// (función(metodo, url, {"cabeceras", "cuerpo"}) → respuesta).
+funcion orquesta_cliente(opciones) {
+    sea op = opciones ?? {}
+    sea k = {"servidor": op["servidor"] ?? nulo, "token": op["token"] ?? nulo, "usuario": nulo, "clave": nulo, "ns": op["espacio"] ?? "default", "transporte": op["transporte"] ?? nulo, "contexto": nulo, "ca": nulo, "inseguro": falso}
+    si (k["servidor"] == nulo) {
+        sea txt = op["kubeconfig"] ?? nulo
+        si (txt == nulo) {
+            sea ruta = op["ruta"] ?? nulo
+            si (ruta == nulo) {
+                sea home = variable_entorno("HOME") ?? ""
+                ruta = variable_entorno("KUBECONFIG") ?? (home + "/.kube/config")
+            }
+            si (existe_archivo(ruta)) { txt = leer_archivo(ruta) }
+        }
+        si (txt != nulo) { orquesta_cargar_kubeconfig(k, txt, op["contexto"] ?? nulo) } sino {
+            // Dentro del pod.
+            sea sa = "/var/run/secrets/kubernetes.io/serviceaccount"
+            si (existe_archivo(sa + "/token") == falso) { lanzar "orquesta: no hay kubeconfig ni cuenta de servicio" }
+            k["servidor"] = "https://" + (variable_entorno("KUBERNETES_SERVICE_HOST") ?? "kubernetes.default.svc") + ":" + (variable_entorno("KUBERNETES_SERVICE_PORT") ?? "443")
+            k["token"] = texto_recortar(leer_archivo(sa + "/token"))
+            si (existe_archivo(sa + "/namespace")) { k["ns"] = texto_recortar(leer_archivo(sa + "/namespace")) }
+        }
+    }
+    si (texto_termina_con(k["servidor"], "/")) { k["servidor"] = subcadena(k["servidor"], 0, longitud(k["servidor"]) - 1) }
+    retornar k
+}
+
+funcion _oq_buscar(lista, nombre) {
+    para x en lista ?? [] { si (x["name"] == nombre) { retornar x } }
+    retornar nulo
+}
+
+/// Aplica un kubeconfig al cliente (contexto actual o el dado).
+funcion orquesta_cargar_kubeconfig(k, txt, contexto) {
+    sea cfg = ajustes_yaml(txt, nulo)
+    sea nombre = contexto ?? cfg["current-context"]
+    sea ctx = _oq_buscar(cfg["contexts"], nombre)
+    si (ctx == nulo) { lanzar "orquesta: no existe el contexto " + nombre }
+    sea cl = _oq_buscar(cfg["clusters"], ctx["context"]["cluster"])
+    si (cl == nulo) { lanzar "orquesta: no existe el clúster " + ctx["context"]["cluster"] }
+    k["contexto"] = nombre
+    k["servidor"] = cl["cluster"]["server"]
+    k["inseguro"] = cl["cluster"]["insecure-skip-tls-verify"] ?? falso
+    k["ca"] = cl["cluster"]["certificate-authority-data"] ?? nulo
+    k["ns"] = ctx["context"]["namespace"] ?? "default"
+    sea us = _oq_buscar(cfg["users"], ctx["context"]["user"])
+    si (us != nulo) {
+        sea u = us["user"] ?? {}
+        si ((u["token"] ?? nulo) != nulo) { k["token"] = u["token"] }
+        si ((u["tokenFile"] ?? nulo) != nulo y existe_archivo(u["tokenFile"])) { k["token"] = texto_recortar(leer_archivo(u["tokenFile"])) }
+        si ((u["username"] ?? nulo) != nulo) {
+            k["usuario"] = u["username"]
+            k["clave"] = u["password"] ?? ""
+        }
+        si ((u["exec"] ?? nulo) != nulo) { k["exec"] = u["exec"] }
+    }
+    retornar k
+}
+
+/// Contextos del kubeconfig: [{"nombre", "cluster", "usuario", "espacio", "actual"}].
+funcion orquesta_contextos(txt) {
+    sea cfg = ajustes_yaml(txt, nulo)
+    sea r = []
+    para c en cfg["contexts"] ?? [] { r.agregar({"nombre": c["name"], "cluster": c["context"]["cluster"], "usuario": c["context"]["user"] ?? nulo, "espacio": c["context"]["namespace"] ?? "default", "actual": c["name"] == cfg["current-context"]}) }
+    retornar r
+}
+
+// Hace la llamada; lanza con el mensaje de Status si falla.
+funcion _oq_llamar(k, metodo, ruta, cuerpo, tipo_c) {
+    sea cab = {"Accept": "application/json"}
+    si (k["token"] != nulo) { cab["Authorization"] = "Bearer " + k["token"] }
+    sino si (k["usuario"] != nulo) { cab["Authorization"] = "Basic " + base64_codificar(k["usuario"] + ":" + k["clave"]) }
+    si (cuerpo != nulo) { cab["Content-Type"] = tipo_c ?? "application/json" }
+    sea t = k["transporte"]
+    si (t == nulo) { t = funcion(m, url, o) { retornar http_solicitud(m, url, {"cuerpo": o["cuerpo"], "tipo": o["cabeceras"]["Content-Type"] ?? nulo, "cabeceras": o["cabeceras"]}) } }
+    sea txt = nulo
+    si (cuerpo != nulo) {
+        si (tipo(cuerpo) == "texto") { txt = cuerpo } sino { txt = json_texto(cuerpo) }
+    }
+    sea r = t(metodo, k["servidor"] + ruta, {"cabeceras": cab, "cuerpo": txt})
+    sea est = r["estado"]
+    si (est < 200 o est >= 300) {
+        sea msj = "" + r["cuerpo"]
+        intentar {
+            sea s = json_parsear(r["cuerpo"])
+            msj = (s["reason"] ?? "") + ": " + (s["message"] ?? "")
+        } capturar (e) { }
+        lanzar "orquesta: " + metodo + " " + ruta + " → " + est + " " + msj
+    }
+    retornar r
+}
+
+funcion _oq_json(r) {
+    si (texto_recortar("" + r["cuerpo"]) == "") { retornar nulo }
+    retornar json_parsear(r["cuerpo"])
+}
+
+funcion _oq_ns(k, ns) {
+    si (ns == "*") { retornar nulo }
+    retornar ns ?? k["ns"]
+}
+
+/// Lista objetos (sigue la paginación). ns "*" = todos los espacios.
+/// opciones: "etiquetas", "campos", "limite".
+funcion orquesta_listar(k, api_version, kind, ns, opciones) {
+    sea op = {}
+    para x en claves(opciones ?? {}) { op[x] = opciones[x] }
+    sea r = []
+    mientras (verdadero) {
+        sea l = _oq_json(_oq_llamar(k, "GET", orquesta_ruta(api_version, kind, _oq_ns(k, ns), nulo, nulo) + _oq_consulta(op), nulo, nulo))
+        para it en l["items"] ?? [] { r.agregar(it) }
+        sea cont = (l["metadata"] ?? {})["continue"] ?? ""
+        si (cont == "") { romper }
+        op["continuar"] = cont
+    }
+    retornar r
+}
+
+/// Obtiene un objeto o nulo si no existe.
+funcion orquesta_obtener(k, api_version, kind, ns, nombre) {
+    sea r = nulo
+    intentar { r = _oq_llamar(k, "GET", orquesta_ruta(api_version, kind, _oq_ns(k, ns), nombre, nulo), nulo, nulo) } capturar (e) {
+        si (texto_indice("" + e, "→ 404") >= 0) { retornar nulo }
+        lanzar e
+    }
+    retornar _oq_json(r)
+}
+
+funcion _oq_meta(obj, k) {
+    sea md = obj["metadata"] ?? {}
+    retornar [obj["apiVersion"], obj["kind"], md["namespace"] ?? (k["ns"]), md["name"] ?? nulo]
+}
+
+/// Crea un objeto (con apiVersion, kind y metadata).
+funcion orquesta_crear(k, obj, opciones) {
+    sea m = _oq_meta(obj, k)
+    retornar _oq_json(_oq_llamar(k, "POST", orquesta_ruta(m[0], m[1], m[2], nulo, nulo) + _oq_consulta(opciones), obj, nulo))
+}
+
+/// Reemplaza un objeto entero (PUT).
+funcion orquesta_reemplazar(k, obj) {
+    sea m = _oq_meta(obj, k)
+    retornar _oq_json(_oq_llamar(k, "PUT", orquesta_ruta(m[0], m[1], m[2], m[3], nulo), obj, nulo))
+}
+
+sea _OQ_PARCHES = {"merge": "application/merge-patch+json", "json": "application/json-patch+json", "estrategico": "application/strategic-merge-patch+json", "strategic": "application/strategic-merge-patch+json", "aplicar": "application/apply-patch+yaml"}
+
+/// Parcha un objeto. tipo_p: "merge" (por defecto), "json", "estrategico", "aplicar".
+funcion orquesta_parchar(k, api_version, kind, ns, nombre, parche, tipo_p, sub) {
+    sea ct = _OQ_PARCHES[tipo_p ?? "merge"]
+    sea extra = ""
+    si (tipo_p == "aplicar") { extra = "?fieldManager=c-forge&force=true" }
+    retornar _oq_json(_oq_llamar(k, "PATCH", orquesta_ruta(api_version, kind, _oq_ns(k, ns), nombre, sub) + extra, parche, ct))
+}
+
+/// Borra un objeto. Devuelve verdadero si existía.
+funcion orquesta_borrar(k, api_version, kind, ns, nombre, opciones) {
+    intentar { _oq_llamar(k, "DELETE", orquesta_ruta(api_version, kind, _oq_ns(k, ns), nombre, nulo) + _oq_consulta(opciones), nulo, nulo) } capturar (e) {
+        si (texto_indice("" + e, "→ 404") >= 0) { retornar falso }
+        lanzar e
+    }
+    retornar verdadero
+}
+
+/// Escala un Deployment/StatefulSet/ReplicaSet.
+funcion orquesta_escalar(k, kind, ns, nombre, replicas) { retornar orquesta_parchar(k, "apps/v1", kind, ns, nombre, {"spec": {"replicas": replicas}}, "merge", "scale") }
+
+/// Reinicia un despliegue (como "kubectl rollout restart").
+funcion orquesta_reiniciar(k, kind, ns, nombre, cuando) {
+    sea marca = cuando ?? ("" + tiempo_segundos())
+    retornar orquesta_parchar(k, "apps/v1", kind, ns, nombre, {"spec": {"template": {"metadata": {"annotations": {"kubectl.kubernetes.io/restartedAt": marca}}}}}, "estrategico", nulo)
+}
+
+/// Logs de un pod. opciones: "contenedor", "ultimas", "desde_segundos", "previo".
+funcion orquesta_logs(k, ns, pod, opciones) { retornar _oq_llamar(k, "GET", orquesta_ruta("v1", "Pod", _oq_ns(k, ns), pod, "log") + _oq_consulta(opciones), nulo, nulo)["cuerpo"] }
+
+/// Aplica YAML (uno o varios documentos): crea lo que no existe y parcha
+/// (merge) lo que sí. Devuelve [{"kind", "nombre", "accion"}].
+funcion orquesta_aplicar(k, yaml_texto) {
+    sea r = []
+    para doc en ajustes_yaml_todos(yaml_texto, nulo) {
+        si (doc != nulo y tipo(doc) == "mapa") {
+            sea items = [doc]
+            si (texto_termina_con(doc["kind"] ?? "", "List")) { items = doc["items"] }
+            para obj en items {
+                sea m = _oq_meta(obj, k)
+                sea existe = orquesta_obtener(k, m[0], m[1], m[2], m[3])
+                si (existe == nulo) {
+                    orquesta_crear(k, obj, nulo)
+                    r.agregar({"kind": m[1], "nombre": m[3], "accion": "creado"})
+                } sino {
+                    orquesta_parchar(k, m[0], m[1], m[2], m[3], obj, "merge", nulo)
+                    r.agregar({"kind": m[1], "nombre": m[3], "accion": "actualizado"})
+                }
+            }
+        }
+    }
+    retornar r
+}
+
+/// Interpreta el texto de un watch (un JSON por línea): [{"tipo", "objeto"}].
+funcion orquesta_eventos(texto) {
+    sea r = []
+    para l en texto_dividir(texto, "\n") {
+        si (texto_recortar(l) != "") {
+            sea e = json_parsear(l)
+            r.agregar({"tipo": e["type"], "objeto": e["object"]})
+        }
+    }
+    retornar r
+}
+
+/// Watch de un recurso desde una versión: lee la respuesta (que el
+/// servidor corta al pasar "tiempo" segundos) y devuelve los eventos.
+funcion orquesta_vigilar(k, api_version, kind, ns, opciones) {
+    sea op = {"watch": verdadero, "tiempo": 30}
+    para x en claves(opciones ?? {}) { op[x] = opciones[x] }
+    retornar orquesta_eventos(_oq_llamar(k, "GET", orquesta_ruta(api_version, kind, _oq_ns(k, ns), nulo, nulo) + _oq_consulta(op), nulo, nulo)["cuerpo"])
+}
+
+/// Objeto mínimo: orquesta_objeto("apps/v1", "Deployment", "web", "prod", {...spec}).
+funcion orquesta_objeto(api_version, kind, nombre, ns, spec, etiquetas) {
+    sea md = {"name": nombre}
+    si (ns != nulo) { md["namespace"] = ns }
+    si (etiquetas != nulo) { md["labels"] = etiquetas }
+    sea o = {"apiVersion": api_version, "kind": kind, "metadata": md}
+    si (spec != nulo) { o["spec"] = spec }
+    retornar o
+}
