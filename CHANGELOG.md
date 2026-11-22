@@ -65,6 +65,19 @@ Sitio oficial: [c-forge.org](https://c-forge.org)
   `llamada`/`protobuf` (.proto, binario como protoc, marcos gRPC),
   `recolecta`/`crawler` (cookies RFC 6265, formularios, robots.txt,
   rastreo) y `sensor`/`mqtt` (paquetes MQTT, QoS 2, mini broker).
+- Lote 18 de bibliotecas (con alias en inglés y pruebas en ambos idiomas):
+  `columnas`/`columnar` (Parquet con páginas v1 y v2, diccionario y
+  compresión snappy/gzip/zstd/lz4, y Arrow IPC en flujo y archivo; se
+  cruzan con pyarrow en ambos sentidos), `empaca`/`bundler` (empaquetador
+  de JavaScript con módulos ES y CommonJS, node_modules y "exports",
+  enlaces vivos, IIFE/CJS/ESM y compactado; la salida corre en Node igual
+  que el original), `optimalla`/`meshopt` (remapeo y fetch idénticos a
+  meshoptimizer, caché de vértices de Forsyth y simplificación cuádrica),
+  `textura`/`texcompress` (BC1, BC3, BC4, BC5 y ETC1 con DDS y KTX; los
+  decodificadores coinciden con texture2ddecoder), `colas`/`amqp` (AMQP
+  0-9-1 byte a byte igual que pamqp, con cliente completo),
+  `orquesta`/`kubernetes` (kubeconfig, rutas, CRUD, parches, escalar,
+  logs, aplicar y watch) y `descubre`/`discovery` (etcd v3 y Consul).
 - Lote 17 de bibliotecas (con alias en inglés y pruebas en ambos idiomas):
   `espacial`/`audio3d` (audio 3D con los modelos de distancia, conos y
   Doppler de OpenAL 1.1, paneo con retardo entre oídos y reverberación),

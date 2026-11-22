@@ -1,0 +1,104 @@
+importar "orquesta"
+importar "json"
+funcion igual(a, b, q) { afirmar(("" + a) == ("" + b), q + ": [" + a + "] != [" + b + "]") }
+funcion j(t) { retornar texto_reemplazar(texto_reemplazar(t, "«", caracter(123)), "»", caracter(125)) }
+// Rutas y plurales.
+igual([orquesta_plural("Pod"), orquesta_plural("Ingress"), orquesta_plural("NetworkPolicy"), orquesta_plural("Endpoints"), orquesta_plural("Gateway"), orquesta_plural("Class")], ["pods", "ingresses", "networkpolicies", "endpoints", "gateways", "classes"], "plurales")
+igual(orquesta_ruta("v1", "Pod", "default", "web-1", "log"), "/api/v1/namespaces/default/pods/web-1/log", "core")
+igual(orquesta_ruta("apps/v1", "Deployment", "prod", "web", "scale"), "/apis/apps/v1/namespaces/prod/deployments/web/scale", "grupo")
+igual(orquesta_ruta("v1", "Node", "default", "n1", nulo), "/api/v1/nodes/n1", "recurso de clúster")
+igual(orquesta_ruta("networking.k8s.io/v1", "Ingress", nulo, nulo, nulo), "/apis/networking.k8s.io/v1/ingresses", "todos los espacios")
+// kubeconfig.
+sea KC = "apiVersion: v1\nkind: Config\ncurrent-context: dev\nclusters:\n- name: c-dev\n  cluster:\n    server: https://10.0.0.1:6443\n    insecure-skip-tls-verify: true\n- name: c-prod\n  cluster:\n    server: https://k8s.prod:443/\ncontexts:\n- name: dev\n  context:\n    cluster: c-dev\n    user: ana\n    namespace: equipo\n- name: prod\n  context:\n    cluster: c-prod\n    user: ci\nusers:\n- name: ana\n  user:\n    username: ana\n    password: secreta\n- name: ci\n  user:\n    token: abc.def\n"
+igual(orquesta_contextos(KC), [{"actual": verdadero, "cluster": "c-dev", "espacio": "equipo", "nombre": "dev", "usuario": "ana"}, {"actual": falso, "cluster": "c-prod", "espacio": "default", "nombre": "prod", "usuario": "ci"}], "contextos")
+// API falsa en memoria.
+sea objetos = {}
+sea llamadas = []
+sea transporte = funcion(m, url, o) {
+    llamadas.agregar([m, url, o["cabeceras"]["Content-Type"] ?? "", o["cabeceras"]["Authorization"] ?? ""])
+    sea ruta = texto_dividir(subcadena(url, texto_indice(url, "/api"), longitud(url)), "?")[0]
+    sea q = ""
+    si (texto_indice(url, "?") >= 0) { q = texto_dividir(url, "?")[1] }
+    si (texto_termina_con(ruta, "/log")) { retornar {"estado": 200, "cuerpo": "línea 1\nlínea 2\n", "cabeceras": {}} }
+    si (texto_indice(q, "watch=true") >= 0) { retornar {"estado": 200, "cuerpo": j("«\"type\":\"ADDED\",\"object\":«\"kind\":\"Pod\",\"metadata\":«\"name\":\"a\"»»»\n«\"type\":\"DELETED\",\"object\":«\"kind\":\"Pod\",\"metadata\":«\"name\":\"a\"»»»\n"), "cabeceras": {}} }
+    si (m == "POST") {
+        sea obj = json_parsear(o["cuerpo"])
+        sea clave = ruta + "/" + obj["metadata"]["name"]
+        si (tiene_clave(objetos, clave)) { retornar {"estado": 409, "cuerpo": json_texto({"kind": "Status", "reason": "AlreadyExists", "message": "ya existe"}), "cabeceras": {}} }
+        objetos[clave] = obj
+        retornar {"estado": 201, "cuerpo": json_texto(obj), "cabeceras": {}}
+    }
+    sea base = ruta
+    si (texto_termina_con(ruta, "/scale")) { base = subcadena(ruta, 0, longitud(ruta) - 6) }
+    si (m == "GET" y tiene_clave(objetos, ruta)) { retornar {"estado": 200, "cuerpo": json_texto(objetos[ruta]), "cabeceras": {}} }
+    si (m == "GET") {
+        // Lista: objetos cuya ruta empieza con la pedida, en dos páginas.
+        sea items = []
+        para k en ordenar(claves(objetos)) { si (texto_empieza_con(k, ruta + "/")) { items.agregar(objetos[k]) } }
+        si (texto_indice(q, "labelSelector=app%3Dweb") >= 0) {
+            sea f = []
+            para it en items { si ((it["metadata"]["labels"] ?? {})["app"] == "web") { f.agregar(it) } }
+            items = f
+        }
+        sea partes_r = texto_dividir(ruta, "/")
+        sea ultimo = partes_r[longitud(partes_r) - 1]
+        si (lista_contiene(["deployments", "configmaps", "pods"], ultimo) == falso) { retornar {"estado": 404, "cuerpo": json_texto({"kind": "Status", "reason": "NotFound", "message": "no existe"}), "cabeceras": {}} }
+        si (texto_indice(q, "continue=") < 0 y longitud(items) > 1) { retornar {"estado": 200, "cuerpo": json_texto({"items": [items[0]], "metadata": {"continue": "pag2"}}), "cabeceras": {}} }
+        si (texto_indice(q, "continue=pag2") >= 0) {
+            sea resto = []
+            sea i = 1
+            mientras (i < longitud(items)) {
+                resto.agregar(items[i])
+                i = i + 1
+            }
+            items = resto
+        }
+        retornar {"estado": 200, "cuerpo": json_texto({"items": items, "metadata": {}}), "cabeceras": {}}
+    }
+    si (m == "PATCH") {
+        sea obj = objetos[base] ?? nulo
+        si (obj == nulo) { retornar {"estado": 404, "cuerpo": "{}", "cabeceras": {}} }
+        sea p = json_parsear(o["cuerpo"])
+        si ((p["spec"] ?? nulo) != nulo) { para kk en claves(p["spec"]) { obj["spec"][kk] = p["spec"][kk] } }
+        retornar {"estado": 200, "cuerpo": json_texto(obj), "cabeceras": {}}
+    }
+    si (m == "DELETE") {
+        si (tiene_clave(objetos, ruta) == falso) { retornar {"estado": 404, "cuerpo": "{}", "cabeceras": {}} }
+        quitar_clave(objetos, ruta)
+        retornar {"estado": 200, "cuerpo": "{}", "cabeceras": {}}
+    }
+    retornar {"estado": 405, "cuerpo": "", "cabeceras": {}}
+}
+sea k = orquesta_cliente({"kubeconfig": KC, "transporte": transporte})
+igual([k["servidor"], k["ns"], k["inseguro"], k["contexto"]], ["https://10.0.0.1:6443", "equipo", verdadero, "dev"], "cliente")
+sea kp = orquesta_cliente({"kubeconfig": KC, "contexto": "prod", "transporte": transporte})
+igual([kp["servidor"], kp["token"]], ["https://k8s.prod:443", "abc.def"], "otro contexto")
+// Crear, listar con etiquetas y paginación, obtener, escalar y borrar.
+orquesta_crear(k, orquesta_objeto("apps/v1", "Deployment", "web", nulo, {"replicas": 1}, {"app": "web"}), nulo)
+orquesta_crear(k, orquesta_objeto("apps/v1", "Deployment", "api", nulo, {"replicas": 2}, {"app": "api"}), nulo)
+orquesta_crear(k, orquesta_objeto("apps/v1", "Deployment", "web2", nulo, {"replicas": 3}, {"app": "web"}), nulo)
+igual(llamadas[0], ["POST", "https://10.0.0.1:6443/apis/apps/v1/namespaces/equipo/deployments", "application/json", "Basic YW5hOnNlY3JldGE="], "crear")
+sea todos = orquesta_listar(k, "apps/v1", "Deployment", nulo, nulo)
+igual(longitud(todos), 3, "paginación")
+sea web = orquesta_listar(k, "apps/v1", "Deployment", nulo, {"etiquetas": {"app": "web"}})
+igual([longitud(web), web[0]["metadata"]["name"]], [2, "web"], "selector de etiquetas")
+igual(orquesta_obtener(k, "apps/v1", "Deployment", nulo, "api")["spec"]["replicas"], 2, "obtener")
+igual(orquesta_obtener(k, "apps/v1", "Deployment", nulo, "nada"), nulo, "no existe")
+orquesta_escalar(k, "Deployment", nulo, "web", 5)
+igual([orquesta_obtener(k, "apps/v1", "Deployment", nulo, "web")["spec"]["replicas"], llamadas[longitud(llamadas) - 2][1], llamadas[longitud(llamadas) - 2][2]], [5, "https://10.0.0.1:6443/apis/apps/v1/namespaces/equipo/deployments/web/scale", "application/merge-patch+json"], "escalar")
+orquesta_reiniciar(k, "Deployment", nulo, "api", "2026-01-01T00:00:00Z")
+igual([orquesta_obtener(k, "apps/v1", "Deployment", nulo, "api")["spec"]["template"]["metadata"]["annotations"]["kubectl.kubernetes.io/restartedAt"], llamadas[longitud(llamadas) - 2][2]], ["2026-01-01T00:00:00Z", "application/strategic-merge-patch+json"], "reiniciar")
+sea err = ""
+intentar { orquesta_crear(k, orquesta_objeto("apps/v1", "Deployment", "web", nulo, {}, nulo), nulo) } capturar (e) { err = "" + e }
+igual(texto_indice(err, "409 AlreadyExists: ya existe") > 0, verdadero, "error de la API")
+igual([orquesta_borrar(k, "apps/v1", "Deployment", nulo, "web2", nulo), orquesta_borrar(k, "apps/v1", "Deployment", nulo, "web2", nulo)], [verdadero, falso], "borrar")
+// Aplicar varios documentos: crea uno y actualiza otro.
+sea yaml = "apiVersion: v1\nkind: ConfigMap\nmetadata:\n  name: conf\nspec:\n  a: 1\n---\napiVersion: apps/v1\nkind: Deployment\nmetadata:\n  name: api\nspec:\n  replicas: 9\n"
+igual(orquesta_aplicar(k, yaml), [{"accion": "creado", "kind": "ConfigMap", "nombre": "conf"}, {"accion": "actualizado", "kind": "Deployment", "nombre": "api"}], "aplicar")
+igual(orquesta_obtener(k, "apps/v1", "Deployment", nulo, "api")["spec"]["replicas"], 9, "aplicado")
+// Logs y watch.
+igual(orquesta_logs(k, nulo, "web-1", {"ultimas": 10, "contenedor": "app"}), "línea 1\nlínea 2\n", "logs")
+igual(llamadas[longitud(llamadas) - 1][1], "https://10.0.0.1:6443/api/v1/namespaces/equipo/pods/web-1/log?container=app&tailLines=10", "consulta de logs")
+sea ev = orquesta_vigilar(k, "v1", "Pod", "*", nulo)
+igual([ev[0]["tipo"], ev[1]["tipo"], ev[1]["objeto"]["metadata"]["name"]], ["ADDED", "DELETED", "a"], "watch")
+mostrar("[OK] orquesta")

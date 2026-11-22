@@ -1,0 +1,700 @@
+// stdlib/colas.cfv — cliente AMQP 0-9-1 (RabbitMQ) al estilo amqplib y
+// pika: tramas, métodos de connection, channel, exchange, queue, basic,
+// confirm y tx con sus argumentos, tablas de campos (enteros, decimales,
+// textos, listas, tablas, marcas de tiempo, bytes), cabeceras de contenido
+// con todas las propiedades, y un cliente con apretón de manos PLAIN,
+// canales, declarar y enlazar intercambios y colas, publicar (con
+// confirmaciones), consumir, basic.get, ack/nack/reject, QoS, latidos y
+// cierre ordenado. La codificación coincide byte a byte con pamqp. Idea de
+// amqplib (MIT) y pika (BSD). En inglés: importar "amqp".
+//
+//   importar "colas"
+//   sea c = colas_conectar("amqp://guest:guest@localhost:5672/", nulo)
+//   sea ch = colas_canal(c)
+//   colas_declarar_cola(ch, "tareas", {"durable": verdadero})
+//   colas_publicar(ch, "", "tareas", "{\"id\": 1}", {"content_type": "application/json"})
+//   sea m = colas_obtener(ch, "tareas", nulo)
+
+importar "sin_copia"
+
+funcion _am_b(n) { retornar bytes_entero(n, 1, 0) }
+funcion _am_u16(n) { retornar bytes_entero(n, 2, 0) }
+funcion _am_u32(n) { retornar bytes_entero(n, 4, 0) }
+
+funcion _am_i(n, ancho) {
+    sea x = n
+    sea neg = x < 0
+    si (neg) { x = 0 - x - 1 }
+    sea r = []
+    sea k = 0
+    mientras (k < ancho) {
+        sea b = x % 256
+        si (neg) { b = 255 - b }
+        r.agregar(_am_b(b))
+        x = piso(x / 256)
+        k = k + 1
+    }
+    // Big endian.
+    sea s = []
+    sea j = ancho - 1
+    mientras (j >= 0) {
+        s.agregar(r[j])
+        j = j - 1
+    }
+    retornar unir(s, "")
+}
+
+funcion _am_leer(t, p, n, con_signo) {
+    sea v = bytes_leer_entero(t, p, n, 0)
+    si (con_signo y n < 8 y v >= potencia(2, n * 8 - 1)) { v = v - potencia(2, n * 8) }
+    retornar v
+}
+
+funcion _am_ieee_be(v, n) {
+    sea l = _sc_ieee(v, n)
+    sea r = []
+    sea k = n - 1
+    mientras (k >= 0) {
+        r.agregar(_am_b(l[k]))
+        k = k - 1
+    }
+    retornar unir(r, "")
+}
+
+funcion _am_de_ieee_be(t, p, n) {
+    sea inv = []
+    sea k = n - 1
+    mientras (k >= 0) {
+        inv.agregar(subcadena(t, p + k, p + k + 1))
+        k = k - 1
+    }
+    retornar _sc_de_ieee(unir(inv, ""), 0, n)
+}
+
+// ---------- tablas de campos ----------
+
+funcion _am_shortstr(s) {
+    sea t = "" + s
+    si (longitud(t) > 255) { lanzar "amqp: texto corto de más de 255 bytes" }
+    retornar _am_b(longitud(t)) + t
+}
+
+funcion _am_longstr(s) {
+    sea t = "" + s
+    retornar _am_u32(longitud(t)) + t
+}
+
+/// Valor etiquetado: {"tipo": "T", "valor": ms} (marca de tiempo),
+/// {"tipo": "x", "valor": bytes}, {"tipo": "D", "escala", "valor"}, o
+/// {"tipo": letra, "valor"} para forzar un tipo numérico.
+funcion colas_valor(tipo_v, valor) { retornar {"__amqp": tipo_v, "valor": valor} }
+
+funcion _am_valor(v) {
+    si (v == nulo) { retornar "V" }
+    si (v == verdadero) { retornar "t" + _am_b(1) }
+    si (v == falso) { retornar "t" + _am_b(0) }
+    si (tipo(v) == "texto") { retornar "S" + _am_longstr(v) }
+    si (tipo(v) == "lista") {
+        sea partes = []
+        para x en v { partes.agregar(_am_valor(x)) }
+        sea d = unir(partes, "")
+        retornar "A" + _am_u32(longitud(d)) + d
+    }
+    si (tipo(v) == "mapa") {
+        si (tiene_clave(v, "__amqp")) {
+            sea t = v["__amqp"]
+            si (t == "T") { retornar "T" + _am_i(v["valor"], 8) }
+            si (t == "x") { retornar "x" + _am_longstr(v["valor"]) }
+            si (t == "D") { retornar "D" + _am_b(v["escala"] ?? 0) + _am_i(v["valor"], 4) }
+            si (t == "b") { retornar "b" + _am_i(v["valor"], 1) }
+            si (t == "B") { retornar "B" + _am_b(v["valor"]) }
+            si (t == "s") { retornar "s" + _am_i(v["valor"], 2) }
+            si (t == "u") { retornar "u" + _am_u16(v["valor"]) }
+            si (t == "I") { retornar "I" + _am_i(v["valor"], 4) }
+            si (t == "i") { retornar "i" + _am_u32(v["valor"]) }
+            si (t == "l") { retornar "l" + _am_i(v["valor"], 8) }
+            si (t == "f") { retornar "f" + _am_ieee_be(v["valor"], 4) }
+            si (t == "d") { retornar "d" + _am_ieee_be(v["valor"], 8) }
+            lanzar "amqp: tipo de valor desconocido " + t
+        }
+        retornar "F" + colas_tabla(v)
+    }
+    // Números: enteros como I/l (igual que los clientes de Java, Go y pamqp), decimales como d.
+    sea txt = "" + v
+    si (texto_indice(txt, ".") < 0 y texto_indice(txt, "e") < 0 y v == piso(v)) {
+        si (v >= -2147483648 y v <= 2147483647) { retornar "I" + _am_i(v, 4) }
+        retornar "l" + _am_i(v, 8)
+    }
+    retornar "d" + _am_ieee_be(v, 8)
+}
+
+/// Codifica una tabla de campos (con su largo).
+funcion colas_tabla(m) {
+    sea partes = []
+    para k en claves(m ?? {}) { partes.agregar(_am_shortstr(k) + _am_valor(m[k])) }
+    sea d = unir(partes, "")
+    retornar _am_u32(longitud(d)) + d
+}
+
+// Lee un valor; devuelve [valor, siguiente posición].
+funcion _am_leer_valor(t, p) {
+    sea c = subcadena(t, p, p + 1)
+    sea q = p + 1
+    si (c == "t") { retornar [byte_en(t, q) != 0, q + 1] }
+    si (c == "b") { retornar [_am_leer(t, q, 1, verdadero), q + 1] }
+    si (c == "B") { retornar [byte_en(t, q), q + 1] }
+    si (c == "s") { retornar [_am_leer(t, q, 2, verdadero), q + 2] }
+    si (c == "u") { retornar [_am_leer(t, q, 2, falso), q + 2] }
+    si (c == "I") { retornar [_am_leer(t, q, 4, verdadero), q + 4] }
+    si (c == "i") { retornar [_am_leer(t, q, 4, falso), q + 4] }
+    si (c == "l" o c == "L") { retornar [_am_leer(t, q, 8, verdadero), q + 8] }
+    si (c == "f") { retornar [_am_de_ieee_be(t, q, 4), q + 4] }
+    si (c == "d") { retornar [_am_de_ieee_be(t, q, 8), q + 8] }
+    si (c == "D") {
+        sea esc = byte_en(t, q)
+        sea v = _am_leer(t, q + 1, 4, verdadero)
+        retornar [v / potencia(10, esc), q + 5]
+    }
+    si (c == "S" o c == "x") {
+        sea n = _am_leer(t, q, 4, falso)
+        retornar [subcadena(t, q + 4, q + 4 + n), q + 4 + n]
+    }
+    si (c == "T") { retornar [colas_valor("T", _am_leer(t, q, 8, verdadero)), q + 8] }
+    si (c == "V") { retornar [nulo, q] }
+    si (c == "A") {
+        sea n = _am_leer(t, q, 4, falso)
+        sea fin = q + 4 + n
+        sea r = []
+        sea i = q + 4
+        mientras (i < fin) {
+            sea x = _am_leer_valor(t, i)
+            r.agregar(x[0])
+            i = x[1]
+        }
+        retornar [r, fin]
+    }
+    si (c == "F") { retornar _am_leer_tabla(t, q) }
+    lanzar "amqp: tipo de campo desconocido '" + c + "'"
+}
+
+funcion _am_leer_tabla(t, p) {
+    sea n = _am_leer(t, p, 4, falso)
+    sea fin = p + 4 + n
+    sea r = {}
+    sea i = p + 4
+    mientras (i < fin) {
+        sea l = byte_en(t, i)
+        sea k = subcadena(t, i + 1, i + 1 + l)
+        sea x = _am_leer_valor(t, i + 1 + l)
+        r[k] = x[0]
+        i = x[1]
+    }
+    retornar [r, fin]
+}
+
+// ---------- métodos ----------
+
+sea _AM_METODOS = {
+    "10.10": ["connection.start", [["version_major", "octet"], ["version_minor", "octet"], ["server_properties", "table"], ["mechanisms", "longstr"], ["locales", "longstr"]]],
+    "10.11": ["connection.start_ok", [["client_properties", "table"], ["mechanism", "shortstr"], ["response", "longstr"], ["locale", "shortstr"]]],
+    "10.20": ["connection.secure", [["challenge", "longstr"]]],
+    "10.21": ["connection.secure_ok", [["response", "longstr"]]],
+    "10.30": ["connection.tune", [["channel_max", "short"], ["frame_max", "long"], ["heartbeat", "short"]]],
+    "10.31": ["connection.tune_ok", [["channel_max", "short"], ["frame_max", "long"], ["heartbeat", "short"]]],
+    "10.40": ["connection.open", [["virtual_host", "shortstr"], ["capabilities", "shortstr"], ["insist", "bit"]]],
+    "10.41": ["connection.open_ok", [["known_hosts", "shortstr"]]],
+    "10.50": ["connection.close", [["reply_code", "short"], ["reply_text", "shortstr"], ["class_id", "short"], ["method_id", "short"]]],
+    "10.51": ["connection.close_ok", []],
+    "10.60": ["connection.blocked", [["reason", "shortstr"]]],
+    "10.61": ["connection.unblocked", []],
+    "20.10": ["channel.open", [["out_of_band", "shortstr"]]],
+    "20.11": ["channel.open_ok", [["channel_id", "longstr"]]],
+    "20.20": ["channel.flow", [["active", "bit"]]],
+    "20.21": ["channel.flow_ok", [["active", "bit"]]],
+    "20.40": ["channel.close", [["reply_code", "short"], ["reply_text", "shortstr"], ["class_id", "short"], ["method_id", "short"]]],
+    "20.41": ["channel.close_ok", []],
+    "40.10": ["exchange.declare", [["ticket", "short"], ["exchange", "shortstr"], ["exchange_type", "shortstr"], ["passive", "bit"], ["durable", "bit"], ["auto_delete", "bit"], ["internal", "bit"], ["nowait", "bit"], ["arguments", "table"]]],
+    "40.11": ["exchange.declare_ok", []],
+    "40.20": ["exchange.delete", [["ticket", "short"], ["exchange", "shortstr"], ["if_unused", "bit"], ["nowait", "bit"]]],
+    "40.21": ["exchange.delete_ok", []],
+    "40.30": ["exchange.bind", [["ticket", "short"], ["destination", "shortstr"], ["source", "shortstr"], ["routing_key", "shortstr"], ["nowait", "bit"], ["arguments", "table"]]],
+    "40.31": ["exchange.bind_ok", []],
+    "50.10": ["queue.declare", [["ticket", "short"], ["queue", "shortstr"], ["passive", "bit"], ["durable", "bit"], ["exclusive", "bit"], ["auto_delete", "bit"], ["nowait", "bit"], ["arguments", "table"]]],
+    "50.11": ["queue.declare_ok", [["queue", "shortstr"], ["message_count", "long"], ["consumer_count", "long"]]],
+    "50.20": ["queue.bind", [["ticket", "short"], ["queue", "shortstr"], ["exchange", "shortstr"], ["routing_key", "shortstr"], ["nowait", "bit"], ["arguments", "table"]]],
+    "50.21": ["queue.bind_ok", []],
+    "50.30": ["queue.purge", [["ticket", "short"], ["queue", "shortstr"], ["nowait", "bit"]]],
+    "50.31": ["queue.purge_ok", [["message_count", "long"]]],
+    "50.40": ["queue.delete", [["ticket", "short"], ["queue", "shortstr"], ["if_unused", "bit"], ["if_empty", "bit"], ["nowait", "bit"]]],
+    "50.41": ["queue.delete_ok", [["message_count", "long"]]],
+    "50.50": ["queue.unbind", [["ticket", "short"], ["queue", "shortstr"], ["exchange", "shortstr"], ["routing_key", "shortstr"], ["arguments", "table"]]],
+    "50.51": ["queue.unbind_ok", []],
+    "60.10": ["basic.qos", [["prefetch_size", "long"], ["prefetch_count", "short"], ["global_", "bit"]]],
+    "60.11": ["basic.qos_ok", []],
+    "60.20": ["basic.consume", [["ticket", "short"], ["queue", "shortstr"], ["consumer_tag", "shortstr"], ["no_local", "bit"], ["no_ack", "bit"], ["exclusive", "bit"], ["nowait", "bit"], ["arguments", "table"]]],
+    "60.21": ["basic.consume_ok", [["consumer_tag", "shortstr"]]],
+    "60.30": ["basic.cancel", [["consumer_tag", "shortstr"], ["nowait", "bit"]]],
+    "60.31": ["basic.cancel_ok", [["consumer_tag", "shortstr"]]],
+    "60.40": ["basic.publish", [["ticket", "short"], ["exchange", "shortstr"], ["routing_key", "shortstr"], ["mandatory", "bit"], ["immediate", "bit"]]],
+    "60.50": ["basic.return", [["reply_code", "short"], ["reply_text", "shortstr"], ["exchange", "shortstr"], ["routing_key", "shortstr"]]],
+    "60.60": ["basic.deliver", [["consumer_tag", "shortstr"], ["delivery_tag", "longlong"], ["redelivered", "bit"], ["exchange", "shortstr"], ["routing_key", "shortstr"]]],
+    "60.70": ["basic.get", [["ticket", "short"], ["queue", "shortstr"], ["no_ack", "bit"]]],
+    "60.71": ["basic.get_ok", [["delivery_tag", "longlong"], ["redelivered", "bit"], ["exchange", "shortstr"], ["routing_key", "shortstr"], ["message_count", "long"]]],
+    "60.72": ["basic.get_empty", [["cluster_id", "shortstr"]]],
+    "60.80": ["basic.ack", [["delivery_tag", "longlong"], ["multiple", "bit"]]],
+    "60.90": ["basic.reject", [["delivery_tag", "longlong"], ["requeue", "bit"]]],
+    "60.110": ["basic.recover", [["requeue", "bit"]]],
+    "60.111": ["basic.recover_ok", []],
+    "60.120": ["basic.nack", [["delivery_tag", "longlong"], ["multiple", "bit"], ["requeue", "bit"]]],
+    "85.10": ["confirm.select", [["nowait", "bit"]]],
+    "85.11": ["confirm.select_ok", []],
+    "90.10": ["tx.select", []],
+    "90.11": ["tx.select_ok", []],
+    "90.20": ["tx.commit", []],
+    "90.21": ["tx.commit_ok", []],
+    "90.30": ["tx.rollback", []],
+    "90.31": ["tx.rollback_ok", []]
+}
+
+sea _AM_POR_NOMBRE = nulo
+funcion _am_por_nombre() {
+    si (_AM_POR_NOMBRE == nulo) {
+        sea r = {}
+        para k en claves(_AM_METODOS) { r[_AM_METODOS[k][0]] = k }
+        _AM_POR_NOMBRE = r
+    }
+    retornar _AM_POR_NOMBRE
+}
+
+// Valores por defecto de los argumentos que la mayoría deja en blanco.
+sea _AM_DEFECTOS = {"basic.qos": {"prefetch_size": 0}, "connection.open": {"virtual_host": "/"}, "exchange.declare": {"exchange_type": "direct"}}
+
+/// Codifica el contenido de un método (clase, método y argumentos).
+funcion colas_metodo(nombre, args) {
+    sea id = _am_por_nombre()[nombre] ?? nulo
+    si (id == nulo) { lanzar "amqp: método desconocido " + nombre }
+    sea p = texto_dividir(id, ".")
+    sea partes = [_am_u16(a_numero(p[0])) + _am_u16(a_numero(p[1]))]
+    sea a = args ?? {}
+    sea def = _AM_DEFECTOS[nombre] ?? {}
+    sea bits = []
+    sea vaciar_bits = funcion() {
+        si (longitud(bits) > 0) {
+            sea v = 0
+            sea k = 0
+            para b en bits {
+                si (b) { v = v + potencia(2, k) }
+                k = k + 1
+            }
+            partes.agregar(_am_b(v))
+            bits = []
+        }
+    }
+    para campo en _AM_METODOS[id][1] {
+        sea v = a[campo[0]] ?? (def[campo[0]] ?? nulo)
+        sea t = campo[1]
+        si (t == "bit") { bits.agregar(v == verdadero) } sino {
+            vaciar_bits()
+            si (t == "octet") { partes.agregar(_am_b(v ?? 0)) }
+            sino si (t == "short") { partes.agregar(_am_u16(v ?? 0)) }
+            sino si (t == "long") { partes.agregar(_am_u32(v ?? 0)) }
+            sino si (t == "longlong") { partes.agregar(_am_i(v ?? 0, 8)) }
+            sino si (t == "shortstr") { partes.agregar(_am_shortstr(v ?? "")) }
+            sino si (t == "longstr") { partes.agregar(_am_longstr(v ?? "")) }
+            sino si (t == "table") { partes.agregar(colas_tabla(v ?? {})) }
+        }
+    }
+    vaciar_bits()
+    retornar unir(partes, "")
+}
+
+/// Decodifica el contenido de un método: {"metodo", ...argumentos}.
+funcion colas_leer_metodo(t) {
+    sea id = "" + _am_leer(t, 0, 2, falso) + "." + _am_leer(t, 2, 2, falso)
+    sea def = _AM_METODOS[id] ?? nulo
+    si (def == nulo) { lanzar "amqp: método desconocido " + id }
+    sea r = {"metodo": def[0]}
+    sea p = 4
+    sea bit = 0
+    para campo en def[1] {
+        sea tp = campo[1]
+        si (tp == "bit") {
+            r[campo[0]] = piso(byte_en(t, p) / potencia(2, bit)) % 2 == 1
+            bit = bit + 1
+        } sino {
+            si (bit > 0) {
+                p = p + 1
+                bit = 0
+            }
+            si (tp == "octet") {
+                r[campo[0]] = byte_en(t, p)
+                p = p + 1
+            } sino si (tp == "short") {
+                r[campo[0]] = _am_leer(t, p, 2, falso)
+                p = p + 2
+            } sino si (tp == "long") {
+                r[campo[0]] = _am_leer(t, p, 4, falso)
+                p = p + 4
+            } sino si (tp == "longlong") {
+                r[campo[0]] = _am_leer(t, p, 8, falso)
+                p = p + 8
+            } sino si (tp == "shortstr") {
+                sea n = byte_en(t, p)
+                r[campo[0]] = subcadena(t, p + 1, p + 1 + n)
+                p = p + 1 + n
+            } sino si (tp == "longstr") {
+                sea n = _am_leer(t, p, 4, falso)
+                r[campo[0]] = subcadena(t, p + 4, p + 4 + n)
+                p = p + 4 + n
+            } sino si (tp == "table") {
+                sea x = _am_leer_tabla(t, p)
+                r[campo[0]] = x[0]
+                p = x[1]
+            }
+        }
+    }
+    retornar r
+}
+
+// ---------- tramas ----------
+
+/// Trama: tipo 1 (método), 2 (cabecera), 3 (cuerpo), 8 (latido).
+funcion colas_trama(tipo_t, canal, contenido) { retornar _am_b(tipo_t) + _am_u16(canal) + _am_u32(longitud(contenido)) + contenido + _am_b(206) }
+
+sea _AM_PROPS = [["content_type", "shortstr"], ["content_encoding", "shortstr"], ["headers", "table"], ["delivery_mode", "octet"], ["priority", "octet"], ["correlation_id", "shortstr"], ["reply_to", "shortstr"],
+    ["expiration", "shortstr"], ["message_id", "shortstr"], ["timestamp", "longlong"], ["type", "shortstr"], ["user_id", "shortstr"], ["app_id", "shortstr"], ["cluster_id", "shortstr"]]
+
+/// Contenido de una cabecera (clase 60) con propiedades.
+funcion colas_cabecera(tam_cuerpo, props) {
+    sea p = props ?? {}
+    sea flags = 0
+    sea partes = []
+    sea k = 0
+    para pr en _AM_PROPS {
+        sea v = p[pr[0]] ?? nulo
+        si (v != nulo) {
+            flags = flags + potencia(2, 15 - k)
+            si (pr[1] == "shortstr") { partes.agregar(_am_shortstr(v)) }
+            sino si (pr[1] == "table") { partes.agregar(colas_tabla(v)) }
+            sino si (pr[1] == "octet") { partes.agregar(_am_b(v)) }
+            sino si (pr[1] == "longlong") {
+                sea ts = v
+                si (tipo(v) == "mapa") { ts = v["valor"] }
+                partes.agregar(_am_i(ts, 8))
+            }
+        }
+        k = k + 1
+    }
+    retornar _am_u16(60) + _am_u16(0) + _am_i(tam_cuerpo, 8) + _am_u16(flags) + unir(partes, "")
+}
+
+funcion colas_leer_cabecera(t) {
+    sea r = {"clase": _am_leer(t, 0, 2, falso), "tam_cuerpo": _am_leer(t, 4, 8, falso), "propiedades": {}}
+    sea flags = _am_leer(t, 12, 2, falso)
+    sea p = 14
+    sea k = 0
+    para pr en _AM_PROPS {
+        si (piso(flags / potencia(2, 15 - k)) % 2 == 1) {
+            si (pr[1] == "shortstr") {
+                sea n = byte_en(t, p)
+                r["propiedades"][pr[0]] = subcadena(t, p + 1, p + 1 + n)
+                p = p + 1 + n
+            } sino si (pr[1] == "table") {
+                sea x = _am_leer_tabla(t, p)
+                r["propiedades"][pr[0]] = x[0]
+                p = x[1]
+            } sino si (pr[1] == "octet") {
+                r["propiedades"][pr[0]] = byte_en(t, p)
+                p = p + 1
+            } sino {
+                r["propiedades"][pr[0]] = _am_leer(t, p, 8, verdadero)
+                p = p + 8
+            }
+        }
+        k = k + 1
+    }
+    retornar r
+}
+
+/// Lee una trama de un texto desde p: [{"tipo", "canal", "contenido"}, fin].
+funcion colas_leer_trama(t, p) {
+    sea tp = byte_en(t, p)
+    sea canal = _am_leer(t, p + 1, 2, falso)
+    sea n = _am_leer(t, p + 3, 4, falso)
+    si (byte_en(t, p + 7 + n) != 206) { lanzar "amqp: falta el fin de trama" }
+    retornar [{"tipo": tp, "canal": canal, "contenido": subcadena(t, p + 7, p + 7 + n)}, p + 8 + n]
+}
+
+// ---------- cliente ----------
+
+funcion _am_url(url) {
+    sea u = {"usuario": "guest", "clave": "guest", "host": "localhost", "puerto": 5672, "vhost": "/"}
+    sea resto = url
+    si (texto_empieza_con(resto, "amqp://")) { resto = subcadena(resto, 7, longitud(resto)) }
+    sea barra = texto_indice(resto, "/")
+    sea auth_host = resto
+    si (barra >= 0) {
+        auth_host = subcadena(resto, 0, barra)
+        sea vh = subcadena(resto, barra + 1, longitud(resto))
+        si (vh != "") { u["vhost"] = texto_reemplazar(vh, "%2F", "/") }
+    }
+    sea arroba = texto_indice(auth_host, "@")
+    sea hp = auth_host
+    si (arroba >= 0) {
+        sea cred = texto_dividir(subcadena(auth_host, 0, arroba), ":")
+        u["usuario"] = cred[0]
+        si (longitud(cred) > 1) { u["clave"] = cred[1] }
+        hp = subcadena(auth_host, arroba + 1, longitud(auth_host))
+    }
+    sea dos = texto_dividir(hp, ":")
+    si (dos[0] != "") { u["host"] = dos[0] }
+    si (longitud(dos) > 1) { u["puerto"] = a_numero(dos[1]) }
+    retornar u
+}
+
+funcion _am_transporte_red(host, puerto) {
+    sea sock = net_conectar(host, puerto)
+    retornar {"enviar": funcion(d) { net_enviar(sock, d) }, "recibir": funcion(n) { retornar net_recibir_exacto(sock, n) }, "cerrar": funcion() { net_cerrar(sock) }}
+}
+
+funcion _am_enviar_metodo(c, canal, nombre, args) { c["t"]["enviar"](colas_trama(1, canal, colas_metodo(nombre, args))) }
+
+// Lee la siguiente trama del transporte (contesta latidos).
+funcion _am_trama(c) {
+    mientras (verdadero) {
+        sea cab = c["t"]["recibir"](7)
+        sea n = _am_leer(cab, 3, 4, falso)
+        sea resto = c["t"]["recibir"](n + 1)
+        sea tr = colas_leer_trama(cab + resto, 0)[0]
+        si (tr["tipo"] != 8) { retornar tr }
+        c["t"]["enviar"](colas_trama(8, 0, ""))
+    }
+}
+
+// Lee un mensaje completo (cabecera + cuerpos) después de deliver/get_ok/return.
+funcion _am_contenido(c) {
+    sea h = colas_leer_cabecera(_am_trama(c)["contenido"])
+    sea partes = []
+    sea total = 0
+    mientras (total < h["tam_cuerpo"]) {
+        sea b = _am_trama(c)["contenido"]
+        partes.agregar(b)
+        total = total + longitud(b)
+    }
+    retornar [h["propiedades"], unir(partes, "")]
+}
+
+// Espera el método `nombre` en el canal; guarda entregas y confirmaciones que lleguen antes.
+funcion _am_esperar(c, canal, nombres) {
+    mientras (verdadero) {
+        sea tr = _am_trama(c)
+        si (tr["tipo"] == 1) {
+            sea m = colas_leer_metodo(tr["contenido"])
+            sea n = m["metodo"]
+            si (n == "basic.deliver" o n == "basic.return") {
+                sea ct = _am_contenido(c)
+                m["propiedades"] = ct[0]
+                m["cuerpo"] = ct[1]
+                m["canal"] = tr["canal"]
+                c["entregas"].agregar(m)
+                si (lista_contiene(nombres, "__entrega__")) { retornar m }
+            } sino si (n == "basic.ack" o n == "basic.nack") {
+                c["confirmaciones"].agregar(m)
+                si (lista_contiene(nombres, "__confirmacion__")) { retornar m }
+            }
+            sino si (n == "connection.close") {
+                _am_enviar_metodo(c, 0, "connection.close_ok", {})
+                c["abierta"] = falso
+                lanzar "amqp: el servidor cerró la conexión (" + m["reply_code"] + " " + m["reply_text"] + ")"
+            } sino si (n == "channel.close" y tr["canal"] == canal) {
+                _am_enviar_metodo(c, canal, "channel.close_ok", {})
+                lanzar "amqp: el servidor cerró el canal (" + m["reply_code"] + " " + m["reply_text"] + ")"
+            } sino si (tr["canal"] == canal y lista_contiene(nombres, n)) {
+                si (n == "basic.get_ok") {
+                    sea ct = _am_contenido(c)
+                    m["propiedades"] = ct[0]
+                    m["cuerpo"] = ct[1]
+                }
+                retornar m
+            }
+        }
+    }
+}
+
+/// Conecta. opciones: "transporte" ({"enviar", "recibir", "cerrar"}),
+/// "latido" (segundos, 60), "nombre" (connection_name).
+funcion colas_conectar(url, opciones) {
+    sea op = opciones ?? {}
+    sea u = _am_url(url ?? "amqp://localhost")
+    sea t = op["transporte"] ?? nulo
+    si (t == nulo) { t = _am_transporte_red(u["host"], u["puerto"]) }
+    sea c = {"t": t, "u": u, "siguiente_canal": 1, "entregas": [], "confirmaciones": [], "abierta": verdadero, "servidor": {}}
+    t["enviar"]("AMQP" + _am_b(0) + _am_b(0) + _am_b(9) + _am_b(1))
+    sea st = colas_leer_metodo(_am_trama(c)["contenido"])
+    si (st["metodo"] != "connection.start") { lanzar "amqp: se esperaba connection.start" }
+    c["servidor"] = st["server_properties"]
+    sea props = {"product": "C-Forge colas", "platform": "C-Forge", "capabilities": {"publisher_confirms": verdadero, "basic.nack": verdadero, "consumer_cancel_notify": verdadero, "connection.blocked": verdadero}}
+    si ((op["nombre"] ?? nulo) != nulo) { props["connection_name"] = op["nombre"] }
+    _am_enviar_metodo(c, 0, "connection.start_ok", {"client_properties": props, "mechanism": "PLAIN", "response": _am_b(0) + u["usuario"] + _am_b(0) + u["clave"], "locale": "en_US"})
+    sea tune = colas_leer_metodo(_am_trama(c)["contenido"])
+    si (tune["metodo"] != "connection.tune") { lanzar "amqp: autenticación rechazada" }
+    sea latido = minimo(tune["heartbeat"], op["latido"] ?? 60)
+    si (tune["heartbeat"] == 0) { latido = op["latido"] ?? 0 }
+    c["frame_max"] = tune["frame_max"]
+    si (c["frame_max"] == 0) { c["frame_max"] = 131072 }
+    _am_enviar_metodo(c, 0, "connection.tune_ok", {"channel_max": tune["channel_max"], "frame_max": c["frame_max"], "heartbeat": latido})
+    _am_enviar_metodo(c, 0, "connection.open", {"virtual_host": u["vhost"]})
+    _am_esperar(c, 0, ["connection.open_ok"])
+    retornar c
+}
+
+/// Abre un canal.
+funcion colas_canal(c) {
+    sea id = c["siguiente_canal"]
+    c["siguiente_canal"] = id + 1
+    _am_enviar_metodo(c, id, "channel.open", {})
+    _am_esperar(c, id, ["channel.open_ok"])
+    retornar {"c": c, "id": id, "confirmar": falso, "publicados": 0}
+}
+
+/// Declara un intercambio. opciones: "durable", "auto_delete", "internal", "argumentos".
+funcion colas_declarar_intercambio(ch, nombre, tipo_i, opciones) {
+    sea op = opciones ?? {}
+    _am_enviar_metodo(ch["c"], ch["id"], "exchange.declare", {"exchange": nombre, "exchange_type": tipo_i ?? "direct", "durable": op["durable"] ?? falso, "auto_delete": op["auto_delete"] ?? falso, "internal": op["internal"] ?? falso, "passive": op["pasivo"] ?? falso, "arguments": op["argumentos"] ?? {}})
+    _am_esperar(ch["c"], ch["id"], ["exchange.declare_ok"])
+}
+
+/// Declara una cola. Devuelve {"queue", "message_count", "consumer_count"}.
+funcion colas_declarar_cola(ch, nombre, opciones) {
+    sea op = opciones ?? {}
+    _am_enviar_metodo(ch["c"], ch["id"], "queue.declare", {"queue": nombre ?? "", "durable": op["durable"] ?? falso, "exclusive": op["exclusiva"] ?? falso, "auto_delete": op["auto_delete"] ?? falso, "passive": op["pasivo"] ?? falso, "arguments": op["argumentos"] ?? {}})
+    retornar _am_esperar(ch["c"], ch["id"], ["queue.declare_ok"])
+}
+
+funcion colas_enlazar(ch, cola, intercambio, clave, argumentos) {
+    _am_enviar_metodo(ch["c"], ch["id"], "queue.bind", {"queue": cola, "exchange": intercambio, "routing_key": clave ?? "", "arguments": argumentos ?? {}})
+    _am_esperar(ch["c"], ch["id"], ["queue.bind_ok"])
+}
+
+funcion colas_desenlazar(ch, cola, intercambio, clave) {
+    _am_enviar_metodo(ch["c"], ch["id"], "queue.unbind", {"queue": cola, "exchange": intercambio, "routing_key": clave ?? ""})
+    _am_esperar(ch["c"], ch["id"], ["queue.unbind_ok"])
+}
+
+funcion colas_vaciar(ch, cola) {
+    _am_enviar_metodo(ch["c"], ch["id"], "queue.purge", {"queue": cola})
+    retornar _am_esperar(ch["c"], ch["id"], ["queue.purge_ok"])["message_count"]
+}
+
+funcion colas_borrar_cola(ch, cola) {
+    _am_enviar_metodo(ch["c"], ch["id"], "queue.delete", {"queue": cola})
+    retornar _am_esperar(ch["c"], ch["id"], ["queue.delete_ok"])["message_count"]
+}
+
+/// Prefetch del canal.
+funcion colas_qos(ch, cantidad) {
+    _am_enviar_metodo(ch["c"], ch["id"], "basic.qos", {"prefetch_count": cantidad})
+    _am_esperar(ch["c"], ch["id"], ["basic.qos_ok"])
+}
+
+/// Activa confirmaciones de publicación en el canal.
+funcion colas_confirmaciones(ch) {
+    _am_enviar_metodo(ch["c"], ch["id"], "confirm.select", {})
+    _am_esperar(ch["c"], ch["id"], ["confirm.select_ok"])
+    ch["confirmar"] = verdadero
+}
+
+/// Publica un mensaje. props: content_type, headers, delivery_mode
+/// (2 = persistente), priority, correlation_id, reply_to, expiration,
+/// message_id, timestamp, type, user_id, app_id. Con confirmaciones,
+/// devuelve el número de secuencia.
+funcion colas_publicar(ch, intercambio, clave, cuerpo, props, obligatorio) {
+    sea c = ch["c"]
+    sea d = "" + cuerpo
+    sea partes = [colas_trama(1, ch["id"], colas_metodo("basic.publish", {"exchange": intercambio ?? "", "routing_key": clave ?? "", "mandatory": obligatorio ?? falso})), colas_trama(2, ch["id"], colas_cabecera(longitud(d), props))]
+    sea max = c["frame_max"] - 8
+    sea p = 0
+    mientras (p < longitud(d)) {
+        partes.agregar(colas_trama(3, ch["id"], subcadena(d, p, minimo(longitud(d), p + max))))
+        p = p + max
+    }
+    c["t"]["enviar"](unir(partes, ""))
+    ch["publicados"] = ch["publicados"] + 1
+    retornar ch["publicados"]
+}
+
+/// Espera confirmaciones hasta cubrir todo lo publicado. Devuelve
+/// verdadero si nada fue rechazado (nack).
+funcion colas_esperar_confirmaciones(ch) {
+    sea c = ch["c"]
+    sea confirmado = 0
+    sea ok = verdadero
+    mientras (confirmado < ch["publicados"]) {
+        si (longitud(c["confirmaciones"]) == 0) { _am_esperar(c, ch["id"], ["__confirmacion__"]) }
+        sea m = c["confirmaciones"][0]
+        sea resto = []
+        sea k = 1
+        mientras (k < longitud(c["confirmaciones"])) {
+            resto.agregar(c["confirmaciones"][k])
+            k = k + 1
+        }
+        c["confirmaciones"] = resto
+        si (m["metodo"] == "basic.nack") { ok = falso }
+        confirmado = maximo(confirmado, m["delivery_tag"])
+    }
+    retornar ok
+}
+
+/// Saca un mensaje (basic.get) o nulo si la cola está vacía.
+funcion colas_obtener(ch, cola, sin_ack) {
+    _am_enviar_metodo(ch["c"], ch["id"], "basic.get", {"queue": cola, "no_ack": sin_ack ?? falso})
+    sea m = _am_esperar(ch["c"], ch["id"], ["basic.get_ok", "basic.get_empty"])
+    si (m["metodo"] == "basic.get_empty") { retornar nulo }
+    retornar {"etiqueta": m["delivery_tag"], "cuerpo": m["cuerpo"], "propiedades": m["propiedades"], "intercambio": m["exchange"], "clave": m["routing_key"], "reentregado": m["redelivered"], "quedan": m["message_count"]}
+}
+
+/// Empieza a consumir. Devuelve la etiqueta del consumidor.
+funcion colas_consumir(ch, cola, opciones) {
+    sea op = opciones ?? {}
+    _am_enviar_metodo(ch["c"], ch["id"], "basic.consume", {"queue": cola, "consumer_tag": op["etiqueta"] ?? "", "no_ack": op["sin_ack"] ?? falso, "exclusive": op["exclusivo"] ?? falso, "arguments": op["argumentos"] ?? {}})
+    retornar _am_esperar(ch["c"], ch["id"], ["basic.consume_ok"])["consumer_tag"]
+}
+
+funcion colas_cancelar(ch, etiqueta) {
+    _am_enviar_metodo(ch["c"], ch["id"], "basic.cancel", {"consumer_tag": etiqueta})
+    _am_esperar(ch["c"], ch["id"], ["basic.cancel_ok"])
+}
+
+/// Siguiente mensaje entregado a un consumidor (bloquea hasta que llegue).
+funcion colas_siguiente(c) {
+    mientras (longitud(c["entregas"]) == 0) { _am_esperar(c, -1, ["__entrega__"]) }
+    sea m = c["entregas"][0]
+    sea resto = []
+    sea k = 1
+    mientras (k < longitud(c["entregas"])) {
+        resto.agregar(c["entregas"][k])
+        k = k + 1
+    }
+    c["entregas"] = resto
+    retornar {"etiqueta": m["delivery_tag"] ?? nulo, "consumidor": m["consumer_tag"] ?? nulo, "cuerpo": m["cuerpo"], "propiedades": m["propiedades"], "intercambio": m["exchange"], "clave": m["routing_key"], "reentregado": m["redelivered"] ?? falso, "canal": m["canal"], "devuelto": m["metodo"] == "basic.return"}
+}
+
+funcion colas_ack(ch, etiqueta, multiple) { _am_enviar_metodo(ch["c"], ch["id"], "basic.ack", {"delivery_tag": etiqueta, "multiple": multiple ?? falso}) }
+funcion colas_nack(ch, etiqueta, reencolar) { _am_enviar_metodo(ch["c"], ch["id"], "basic.nack", {"delivery_tag": etiqueta, "requeue": reencolar ?? verdadero}) }
+funcion colas_rechazar(ch, etiqueta, reencolar) { _am_enviar_metodo(ch["c"], ch["id"], "basic.reject", {"delivery_tag": etiqueta, "requeue": reencolar ?? falso}) }
+
+funcion colas_cerrar_canal(ch) {
+    _am_enviar_metodo(ch["c"], ch["id"], "channel.close", {"reply_code": 200, "reply_text": "OK"})
+    _am_esperar(ch["c"], ch["id"], ["channel.close_ok"])
+}
+
+/// Cierra la conexión ordenadamente.
+funcion colas_cerrar(c) {
+    si (c["abierta"]) {
+        _am_enviar_metodo(c, 0, "connection.close", {"reply_code": 200, "reply_text": "OK"})
+        _am_esperar(c, 0, ["connection.close_ok"])
+        c["abierta"] = falso
+    }
+    sea f = c["t"]["cerrar"] ?? nulo
+    si (f != nulo) { f() }
+}

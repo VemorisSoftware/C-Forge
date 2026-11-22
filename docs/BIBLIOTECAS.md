@@ -140,7 +140,7 @@ Estado: ✅ ya existe en C-Forge · 🔗 se usa hoy vía `cforge bindgen`,
 | 99 | `cofre` | Base embebida ACID | sled, redb | 🛠 |
 | 100 | `paquete_bin` / `msgpack` | Serialización binaria compacta | MessagePack | ✅ `paquete_bin` |
 | 101 | `sin_copia` / `flatbuffers` | Serialización zero-copy | FlatBuffers | ✅ `sin_copia` |
-| 102 | `columnas` | Formato columnar | Arrow, Parquet | 🛠 |
+| 102 | `columnas` / `columnar` | Formato columnar | Arrow, Parquet | ✅ `columnas` |
 | 103 | `hoja` / `xlsx` | Hojas de cálculo .xlsx | libxlsxwriter | ✅ `hoja` |
 | 104 | `documento` / `pdf` | PDF: crear, leer y firmar | PDFium, lopdf | ✅ `documento` |
 | 105 | `archivador` / `archive` | ZIP/TAR seguros | libarchive | ✅ `archivador` |
@@ -160,7 +160,7 @@ Estado: ✅ ya existe en C-Forge · 🔗 se usa hoy vía `cforge bindgen`,
 | 114 | `piloto` | Navegadores automatizados | Playwright | 🛠 |
 | 115 | `atributo` | Interactividad por atributos HTML | htmx | 🛠 |
 | 116 | `css` | Parser y minificador CSS | LightningCSS | ✅ `css` |
-| 117 | `empaca` | Empaquetador web | esbuild | 🛠 |
+| 117 | `empaca` / `bundler` | Empaquetador web | esbuild | ✅ `empaca` |
 | 118 | `ensayo` / `vitest` | Mocks y snapshots | Vitest | ✅ `ensayo` |
 | 119 | `ficticio` / `faker` | Datos falsos realistas | Faker | ✅ `ficticio` |
 | 120 | `contrato` / `openapi` | Documentación OpenAPI | Swagger | ✅ `contrato` |
@@ -254,8 +254,8 @@ Estado: ✅ ya existe en C-Forge · 🔗 se usa hoy vía `cforge bindgen`,
 |---|---|---|---|---|
 | 182 | `nodos` | Árbol de escenas y señales | Godot | 🛠 |
 | 183 | `manipulador` | Gizmos 3D de editor | ImGuizmo | 🛠 |
-| 184 | `optimalla` | Optimizar mallas y LOD | meshoptimizer | 🛠 |
-| 185 | `textura` | Compresión de texturas | Basis Universal | 🛠 |
+| 184 | `optimalla` / `meshopt` | Optimizar mallas y LOD | meshoptimizer | ✅ `optimalla` |
+| 185 | `textura` / `texcompress` | Compresión de texturas | Basis Universal | ✅ `textura` |
 | 186 | `solido` | Física 3D multinúcleo | Jolt | ✅ `fisica3d` (básica) · 🛠 |
 | 187 | `determinista` | Física reproducible | Rapier | 🛠 |
 | 188 | `inmersiva` | Realidad virtual y aumentada | OpenXR | 🔗 |
@@ -296,10 +296,10 @@ Estado: ✅ ya existe en C-Forge · 🔗 se usa hoy vía `cforge bindgen`,
 | 213 | `metricas` / `metrics` | Métricas en tiempo real | Prometheus | ✅ `metricas` |
 | 214 | `flujo` | Streaming de eventos | Kafka | 🔗 |
 | 215 | `correo_rapido` | Mensajería entre microservicios | NATS | 🛠 |
-| 216 | `colas` | Colas AMQP | RabbitMQ | 🛠 |
-| 217 | `descubre` | Descubrimiento de servicios | etcd, Consul | 🛠 |
+| 216 | `colas` / `amqp` | Colas AMQP | RabbitMQ | ✅ `colas` |
+| 217 | `descubre` / `discovery` | Descubrimiento de servicios | etcd, Consul | ✅ `descubre` |
 | 218 | `objetos` / `s3` | Almacenamiento compatible con S3 | MinIO | ✅ `objetos` |
-| 219 | `orquesta` | Cliente de Kubernetes | kube-rs | 🛠 |
+| 219 | `orquesta` / `kubernetes` | Cliente de Kubernetes | kube-rs | ✅ `orquesta` |
 | 220 | `infra` / `hcl` | Infraestructura como código | HCL | ✅ `infra` |
 | 221 | `proxy` / `reverseproxy` | Proxy inverso y balanceo | Caddy, Pingora | ✅ `proxy` |
 | 222 | `recolector` / `logpipe` | Recolección de logs | Vector | ✅ `recolector` |

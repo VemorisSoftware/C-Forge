@@ -1,0 +1,1137 @@
+// stdlib/columnas.cfv — formatos columnares Apache Parquet y Apache Arrow
+// (IPC): tablas en columnas con tipos (bool, enteros de 8 a 64 bits,
+// float32/64, utf8, binario, fecha y marca de tiempo) y nulos. Parquet:
+// lee y escribe archivos con metadatos Thrift compactos, páginas de datos
+// v1 y v2, codificación PLAIN, diccionario (RLE_DICTIONARY y
+// PLAIN_DICTIONARY), niveles de definición RLE/bit-packed y compresión
+// snappy, gzip, zstd o ninguna. Arrow: flujo IPC y archivo "ARROW1" con
+// metadatos FlatBuffers (vía "sin_copia"), mapas de validez y búferes de
+// desplazamientos. Ambos se leen con pyarrow y al revés. Idea y formatos
+// de Apache Arrow y Parquet (Apache). En inglés: importar "columnar".
+//
+//   importar "columnas"
+//   sea t = columnas_tabla({"id": [1, 2, 3], "nombre": ["Ana", nulo, "Luis"]}, {"id": "int64", "nombre": "utf8"})
+//   escribir_archivo("datos.parquet", columnas_parquet_escribir(t, {"compresion": "snappy"}))
+//   sea u = columnas_parquet_leer(leer_archivo("datos.parquet"), nulo)
+//   mostrar(columnas_filas(u))
+
+importar "compacta"
+importar "sin_copia"
+
+funcion _co_b(n) { retornar bytes_entero(n, 1, 0) }
+
+// ---------- tablas ----------
+
+sea _CO_TIPOS = {"bool": 1, "int8": 1, "int16": 1, "int32": 1, "int64": 1, "uint8": 1, "uint16": 1, "uint32": 1, "uint64": 1, "float32": 1, "float64": 1, "utf8": 1, "binary": 1, "date32": 1,
+    "timestamp_ms": 1, "timestamp_us": 1, "timestamp_ns": 1, "timestamp_s": 1}
+
+funcion _co_inferir(vals) {
+    para v en vals {
+        si (v != nulo) {
+            si (v == verdadero o v == falso) { retornar "bool" }
+            si (tipo(v) == "texto") { retornar "utf8" }
+            si (("" + v) == ("" + piso(v)) y texto_indice("" + v, "e") < 0 y texto_indice("" + v, ".") < 0) { retornar "int64" }
+            retornar "float64"
+        }
+    }
+    retornar "utf8"
+}
+
+/// Tabla desde {columna: [valores]} (en orden de claves dadas por "orden"
+/// o alfabético). tipos: {columna: tipo}; los que falten se infieren.
+funcion columnas_tabla(datos, tipos, orden) {
+    sea cols = []
+    sea ks = orden ?? claves(datos)
+    sea n = -1
+    para k en ks {
+        sea vals = datos[k]
+        si (n >= 0 y longitud(vals) != n) { lanzar "columnas: las columnas tienen largos distintos" }
+        n = longitud(vals)
+        sea t = (tipos ?? {})[k] ?? _co_inferir(vals)
+        si (tiene_clave(_CO_TIPOS, t) == falso) { lanzar "columnas: tipo no soportado " + t }
+        cols.agregar({"nombre": k, "tipo": t, "valores": vals, "nulable": verdadero})
+    }
+    si (n < 0) { n = 0 }
+    retornar {"columnas": cols, "filas": n, "meta": {}}
+}
+
+/// Tabla desde filas [{columna: valor}].
+funcion columnas_desde_filas(filas, tipos, orden) {
+    sea ks = orden
+    si (ks == nulo) {
+        ks = []
+        sea visto = {}
+        para f en filas { para k en claves(f) { si (tiene_clave(visto, k) == falso) {
+            visto[k] = verdadero
+            ks.agregar(k)
+        } } }
+    }
+    sea d = {}
+    para k en ks {
+        sea l = []
+        para f en filas { l.agregar(f[k] ?? nulo) }
+        d[k] = l
+    }
+    retornar columnas_tabla(d, tipos, ks)
+}
+
+/// Filas [{columna: valor}].
+funcion columnas_filas(t) {
+    sea r = []
+    sea i = 0
+    mientras (i < t["filas"]) {
+        sea f = {}
+        para c en t["columnas"] { f[c["nombre"]] = c["valores"][i] }
+        r.agregar(f)
+        i = i + 1
+    }
+    retornar r
+}
+
+/// Valores de una columna por nombre.
+funcion columnas_columna(t, nombre) {
+    para c en t["columnas"] { si (c["nombre"] == nombre) { retornar c["valores"] } }
+    lanzar "columnas: no existe la columna " + nombre
+}
+
+/// Esquema [{"nombre", "tipo"}].
+funcion columnas_esquema(t) {
+    sea r = []
+    para c en t["columnas"] { r.agregar({"nombre": c["nombre"], "tipo": c["tipo"]}) }
+    retornar r
+}
+
+/// Solo algunas columnas.
+funcion columnas_seleccionar(t, nombres) {
+    sea cols = []
+    para n en nombres { para c en t["columnas"] { si (c["nombre"] == n) { cols.agregar(c) } } }
+    retornar {"columnas": cols, "filas": t["filas"], "meta": t["meta"]}
+}
+
+/// Filtra filas con fn(fila) → verdadero/falso.
+funcion columnas_filtrar(t, fn) {
+    sea idx = []
+    sea filas = columnas_filas(t)
+    sea i = 0
+    mientras (i < longitud(filas)) {
+        si (fn(filas[i])) { idx.agregar(i) }
+        i = i + 1
+    }
+    sea cols = []
+    para c en t["columnas"] {
+        sea v = []
+        para k en idx { v.agregar(c["valores"][k]) }
+        cols.agregar({"nombre": c["nombre"], "tipo": c["tipo"], "valores": v, "nulable": c["nulable"]})
+    }
+    retornar {"columnas": cols, "filas": longitud(idx), "meta": t["meta"]}
+}
+
+// ---------- números en bytes ----------
+
+funcion _co_le(v, n) {
+    sea x = v
+    sea neg = x < 0
+    si (neg) { x = 0 - x - 1 }
+    sea r = []
+    sea k = 0
+    mientras (k < n) {
+        sea b = x % 256
+        si (neg) { b = 255 - b }
+        r.agregar(_co_b(b))
+        x = piso(x / 256)
+        k = k + 1
+    }
+    retornar unir(r, "")
+}
+
+funcion _co_lee(t, p, n, con_signo) {
+    sea v = bytes_leer_entero(t, p, n, 1)
+    si (con_signo y n < 8 y v >= potencia(2, n * 8 - 1)) { v = v - potencia(2, n * 8) }
+    si (con_signo == falso y n == 8 y v < 0) { v = v + 18446744073709551616 }
+    retornar v
+}
+
+funcion _co_float(v, n) {
+    sea l = _sc_ieee(v, n)
+    sea r = []
+    para b en l { r.agregar(_co_b(b)) }
+    retornar unir(r, "")
+}
+
+// ---------- Thrift compacto ----------
+
+funcion _co_varint(n) {
+    sea r = []
+    sea v = n
+    mientras (v >= 128) {
+        r.agregar(_co_b(v % 128 + 128))
+        v = piso(v / 128)
+    }
+    r.agregar(_co_b(v))
+    retornar unir(r, "")
+}
+
+funcion _co_zz(n) {
+    si (n >= 0) { retornar n * 2 }
+    retornar (0 - n) * 2 - 1
+}
+
+funcion _co_dezz(n) {
+    si (n % 2 == 0) { retornar n / 2 }
+    retornar 0 - (n + 1) / 2
+}
+
+// Lector: estado {"t", "p"}.
+funcion _co_rvar(st) {
+    sea v = 0
+    sea f = 1
+    mientras (verdadero) {
+        sea b = byte_en(st["t"], st["p"])
+        st["p"] = st["p"] + 1
+        v = v + (b % 128) * f
+        si (b < 128) { retornar v }
+        f = f * 128
+    }
+}
+
+funcion _co_tvalor(st, tp) {
+    si (tp == 1) { retornar verdadero }
+    si (tp == 2) { retornar falso }
+    si (tp == 3) {
+        sea b = byte_en(st["t"], st["p"])
+        st["p"] = st["p"] + 1
+        si (b >= 128) { retornar b - 256 }
+        retornar b
+    }
+    si (tp == 4 o tp == 5 o tp == 6) { retornar _co_dezz(_co_rvar(st)) }
+    si (tp == 7) {
+        sea v = _sc_de_ieee(st["t"], st["p"], 8)
+        st["p"] = st["p"] + 8
+        retornar v
+    }
+    si (tp == 8) {
+        sea n = _co_rvar(st)
+        sea v = subcadena(st["t"], st["p"], st["p"] + n)
+        st["p"] = st["p"] + n
+        retornar v
+    }
+    si (tp == 9 o tp == 10) {
+        sea h = byte_en(st["t"], st["p"])
+        st["p"] = st["p"] + 1
+        sea n = piso(h / 16)
+        sea et = h % 16
+        si (n == 15) { n = _co_rvar(st) }
+        sea r = []
+        sea k = 0
+        mientras (k < n) {
+            si (et == 1 o et == 2) {
+                // Booleanos en listas: un byte cada uno.
+                r.agregar(byte_en(st["t"], st["p"]) == 1)
+                st["p"] = st["p"] + 1
+            } sino { r.agregar(_co_tvalor(st, et)) }
+            k = k + 1
+        }
+        retornar r
+    }
+    si (tp == 11) {
+        sea n = _co_rvar(st)
+        sea r = []
+        si (n == 0) { retornar r }
+        sea h = byte_en(st["t"], st["p"])
+        st["p"] = st["p"] + 1
+        sea k = 0
+        mientras (k < n) {
+            r.agregar([_co_tvalor(st, piso(h / 16)), _co_tvalor(st, h % 16)])
+            k = k + 1
+        }
+        retornar r
+    }
+    si (tp == 12) { retornar _co_tstruct(st) }
+    lanzar "thrift: tipo desconocido " + tp
+}
+
+// Struct como {id: valor}.
+funcion _co_tstruct(st) {
+    sea r = {}
+    sea ultimo = 0
+    mientras (verdadero) {
+        sea h = byte_en(st["t"], st["p"])
+        st["p"] = st["p"] + 1
+        si (h == 0) { retornar r }
+        sea tp = h % 16
+        sea delta = piso(h / 16)
+        sea id = ultimo + delta
+        si (delta == 0) { id = _co_dezz(_co_rvar(st)) }
+        r["" + id] = _co_tvalor(st, tp)
+        ultimo = id
+    }
+}
+
+// Escritor: campos [[id, tipo, valor]] ya ordenados por id.
+funcion _co_wstruct(campos) {
+    sea r = []
+    sea ultimo = 0
+    para c en campos {
+        sea id = c[0]
+        sea tp = c[1]
+        sea v = c[2]
+        si (v != nulo) {
+            sea tcab = tp
+            si (tp == 1) {
+                tcab = 2
+                si (v) { tcab = 1 }
+            }
+            si (id - ultimo > 0 y id - ultimo <= 15) { r.agregar(_co_b((id - ultimo) * 16 + tcab)) } sino { r.agregar(_co_b(tcab) + _co_varint(_co_zz(id))) }
+            ultimo = id
+            si (tp != 1) { r.agregar(_co_wvalor(tp, v)) }
+        }
+    }
+    r.agregar(_co_b(0))
+    retornar unir(r, "")
+}
+
+funcion _co_wvalor(tp, v) {
+    si (tp == 3) { retornar _co_b((v + 256) % 256) }
+    si (tp == 4 o tp == 5 o tp == 6) { retornar _co_varint(_co_zz(v)) }
+    si (tp == 7) { retornar _co_float(v, 8) }
+    si (tp == 8) { retornar _co_varint(longitud(v)) + v }
+    si (tp == 9 o tp == 12) { retornar v }
+    lanzar "thrift: no se escribe el tipo " + tp
+}
+
+// Lista: tipo de elemento y valores ya codificados (para structs) o crudos.
+funcion _co_wlista(et, vals) {
+    sea n = longitud(vals)
+    sea cab = ""
+    si (n < 15) { cab = _co_b(n * 16 + et) } sino { cab = _co_b(240 + et) + _co_varint(n) }
+    sea r = [cab]
+    para v en vals { r.agregar(_co_wvalor(et, v)) }
+    retornar unir(r, "")
+}
+
+// ---------- RLE / bit-packed ----------
+
+// Lee n valores de un flujo híbrido RLE/bit-packed de ancho w desde p.
+funcion _co_rle_leer(t, p, fin, w, n) {
+    sea r = []
+    sea q = p
+    sea ancho_b = piso((w + 7) / 8)
+    mientras (longitud(r) < n y q < fin) {
+        sea st = {"t": t, "p": q}
+        sea h = _co_rvar(st)
+        q = st["p"]
+        si (h % 2 == 0) {
+            sea cuenta = h / 2
+            sea v = 0
+            sea k = 0
+            mientras (k < ancho_b) {
+                v = v + byte_en(t, q + k) * potencia(2, 8 * k)
+                k = k + 1
+            }
+            q = q + ancho_b
+            k = 0
+            mientras (k < cuenta y longitud(r) < n) {
+                r.agregar(v)
+                k = k + 1
+            }
+        } sino {
+            sea grupos = piso(h / 2)
+            sea total = grupos * 8
+            sea bit = 0
+            sea k = 0
+            mientras (k < total) {
+                sea v = 0
+                sea j = 0
+                mientras (j < w) {
+                    sea pb = bit + j
+                    si (piso(byte_en(t, q + piso(pb / 8)) / potencia(2, pb % 8)) % 2 == 1) { v = v + potencia(2, j) }
+                    j = j + 1
+                }
+                bit = bit + w
+                si (longitud(r) < n) { r.agregar(v) }
+                k = k + 1
+            }
+            q = q + grupos * w
+        }
+    }
+    retornar r
+}
+
+// Codifica valores con RLE puro (runs) de ancho w.
+funcion _co_rle_escribir(vals, w) {
+    sea ancho_b = piso((w + 7) / 8)
+    sea r = []
+    sea i = 0
+    mientras (i < longitud(vals)) {
+        sea j = i
+        mientras (j < longitud(vals) y vals[j] == vals[i]) { j = j + 1 }
+        r.agregar(_co_varint((j - i) * 2))
+        sea v = vals[i]
+        sea k = 0
+        mientras (k < ancho_b) {
+            r.agregar(_co_b(v % 256))
+            v = piso(v / 256)
+            k = k + 1
+        }
+        i = j
+    }
+    retornar unir(r, "")
+}
+
+funcion _co_ancho_bits(maximo_v) {
+    sea w = 0
+    mientras (potencia(2, w) <= maximo_v) { w = w + 1 }
+    retornar w
+}
+
+// ---------- Parquet: tipos ----------
+
+// Tipo físico, tipo convertido y logicalType para cada tipo de tabla.
+funcion _co_pq_tipo(t) {
+    si (t == "bool") { retornar [0, nulo, nulo] }
+    si (t == "int8") { retornar [1, 15, [[10, 12, _co_wstruct([[1, 3, 8], [2, 1, verdadero]])]]] }
+    si (t == "int16") { retornar [1, 16, [[10, 12, _co_wstruct([[1, 3, 16], [2, 1, verdadero]])]]] }
+    si (t == "int32") { retornar [1, nulo, nulo] }
+    si (t == "int64") { retornar [2, nulo, nulo] }
+    si (t == "uint8") { retornar [1, 11, [[10, 12, _co_wstruct([[1, 3, 8], [2, 1, falso]])]]] }
+    si (t == "uint16") { retornar [1, 12, [[10, 12, _co_wstruct([[1, 3, 16], [2, 1, falso]])]]] }
+    si (t == "uint32") { retornar [1, 13, [[10, 12, _co_wstruct([[1, 3, 32], [2, 1, falso]])]]] }
+    si (t == "uint64") { retornar [2, 14, [[10, 12, _co_wstruct([[1, 3, 64], [2, 1, falso]])]]] }
+    si (t == "float32") { retornar [4, nulo, nulo] }
+    si (t == "float64") { retornar [5, nulo, nulo] }
+    si (t == "utf8") { retornar [6, 0, [[1, 12, _co_wstruct([])]]] }
+    si (t == "binary") { retornar [6, nulo, nulo] }
+    si (t == "date32") { retornar [1, 6, [[6, 12, _co_wstruct([])]]] }
+    // Marca de tiempo: TimestampType {1: isAdjustedToUTC, 2: unit {1 MILLIS, 2 MICROS, 3 NANOS}}
+    sea unidad = 1
+    sea conv = 9
+    si (t == "timestamp_us") {
+        unidad = 2
+        conv = 10
+    }
+    si (t == "timestamp_ns") {
+        unidad = 3
+        conv = nulo
+    }
+    retornar [2, conv, [[8, 12, _co_wstruct([[1, 1, falso], [2, 12, _co_wstruct([[unidad, 12, _co_wstruct([])]])]])]]]
+}
+
+funcion _co_pq_tipo_leer(se) {
+    sea fis = se["1"] ?? nulo
+    sea conv = se["6"] ?? nulo
+    sea lg = se["10"] ?? nulo
+    si (fis == 0) { retornar "bool" }
+    si (fis == 4) { retornar "float32" }
+    si (fis == 5) { retornar "float64" }
+    si (fis == 6 o fis == 7) {
+        si (conv == 0 o (lg != nulo y (tiene_clave(lg, "1") o tiene_clave(lg, "4") o tiene_clave(lg, "5")))) { retornar "utf8" }
+        retornar "binary"
+    }
+    si (lg != nulo y tiene_clave(lg, "10")) {
+        sea it = lg["10"]
+        sea ancho = it["1"]
+        sea con_signo = it["2"] ?? verdadero
+        si (con_signo) { retornar "int" + ancho }
+        retornar "uint" + ancho
+    }
+    si (lg != nulo y tiene_clave(lg, "8")) {
+        sea u = lg["8"]["2"] ?? {}
+        si (tiene_clave(u, "2")) { retornar "timestamp_us" }
+        si (tiene_clave(u, "3")) { retornar "timestamp_ns" }
+        retornar "timestamp_ms"
+    }
+    si (lg != nulo y tiene_clave(lg, "6")) { retornar "date32" }
+    si (conv == 6) { retornar "date32" }
+    si (conv == 9) { retornar "timestamp_ms" }
+    si (conv == 10) { retornar "timestamp_us" }
+    si (conv == 15) { retornar "int8" }
+    si (conv == 16) { retornar "int16" }
+    si (conv == 11) { retornar "uint8" }
+    si (conv == 12) { retornar "uint16" }
+    si (conv == 13) { retornar "uint32" }
+    si (conv == 14) { retornar "uint64" }
+    si (fis == 1) { retornar "int32" }
+    si (fis == 3) { retornar "int96" }
+    retornar "int64"
+}
+
+// Valores PLAIN de un tipo físico (n valores desde p). Devuelve [lista, fin].
+funcion _co_plain_leer(t, p, fis, n, largo_fijo) {
+    sea r = []
+    sea q = p
+    sea k = 0
+    si (fis == 0) {
+        mientras (k < n) {
+            r.agregar(piso(byte_en(t, q + piso(k / 8)) / potencia(2, k % 8)) % 2 == 1)
+            k = k + 1
+        }
+        retornar [r, q + piso((n + 7) / 8)]
+    }
+    mientras (k < n) {
+        si (fis == 1) {
+            r.agregar(_co_lee(t, q, 4, verdadero))
+            q = q + 4
+        } sino si (fis == 2) {
+            r.agregar(_co_lee(t, q, 8, verdadero))
+            q = q + 8
+        } sino si (fis == 4) {
+            r.agregar(_sc_de_ieee(t, q, 4))
+            q = q + 4
+        } sino si (fis == 5) {
+            r.agregar(_sc_de_ieee(t, q, 8))
+            q = q + 8
+        } sino si (fis == 6) {
+            sea l = _co_lee(t, q, 4, falso)
+            r.agregar(subcadena(t, q + 4, q + 4 + l))
+            q = q + 4 + l
+        } sino si (fis == 7) {
+            r.agregar(subcadena(t, q, q + largo_fijo))
+            q = q + largo_fijo
+        } sino si (fis == 3) {
+            // INT96: nanosegundos del día (8) + día juliano (4) → ns desde 1970.
+            sea ns = _co_lee(t, q, 8, verdadero)
+            sea dia = _co_lee(t, q + 8, 4, verdadero)
+            r.agregar((dia - 2440588) * 86400000000000 + ns)
+            q = q + 12
+        }
+        k = k + 1
+    }
+    retornar [r, q]
+}
+
+funcion _co_plain_escribir(vals, fis) {
+    sea r = []
+    si (fis == 0) {
+        sea b = 0
+        sea k = 0
+        para v en vals {
+            si (v) { b = b + potencia(2, k % 8) }
+            k = k + 1
+            si (k % 8 == 0) {
+                r.agregar(_co_b(b))
+                b = 0
+            }
+        }
+        si (k % 8 != 0) { r.agregar(_co_b(b)) }
+        retornar unir(r, "")
+    }
+    para v en vals {
+        si (fis == 1) { r.agregar(_co_le(v, 4)) }
+        sino si (fis == 2) { r.agregar(_co_le(v, 8)) }
+        sino si (fis == 4) { r.agregar(_co_float(v, 4)) }
+        sino si (fis == 5) { r.agregar(_co_float(v, 8)) }
+        sino si (fis == 6) {
+            sea s = "" + v
+            r.agregar(_co_le(longitud(s), 4) + s)
+        }
+    }
+    retornar unir(r, "")
+}
+
+funcion _co_descomprimir(d, codec, tam) {
+    si (codec == 0) { retornar d }
+    si (codec == 1) { retornar compacta_snappy_descomprimir(d) }
+    si (codec == 2) { retornar compacta_gunzip(d, nulo) }
+    si (codec == 6) { retornar compacta_zstd_descomprimir(d, nulo) }
+    si (codec == 7) { retornar compacta_lz4_bloque_descomprimir(d, tam) }
+    lanzar "parquet: compresión no soportada " + codec
+}
+
+funcion _co_comprimir(d, codec) {
+    si (codec == 0) { retornar d }
+    si (codec == 1) { retornar compacta_snappy_comprimir(d) }
+    si (codec == 2) { retornar compacta_gzip(d, 6) }
+    si (codec == 6) { retornar compacta_zstd_comprimir(d) }
+    si (codec == 7) { retornar compacta_lz4_bloque(d) }
+    lanzar "parquet: compresión no soportada " + codec
+}
+
+sea _CO_CODECS = {"ninguna": 0, "none": 0, "snappy": 1, "gzip": 2, "zstd": 6, "lz4": 7}
+
+// Convierte valores físicos al tipo lógico de la tabla.
+funcion _co_logico(v, t) {
+    si (v == nulo) { retornar nulo }
+    si (t == "uint32" y v < 0) { retornar v + 4294967296 }
+    si (t == "uint8" o t == "uint16") { si (v < 0) { retornar v + potencia(2, 32) } }
+    retornar v
+}
+
+// ---------- Parquet: lectura ----------
+
+/// Metadatos de un archivo Parquet: {"filas", "esquema", "grupos",
+/// "creado_por", "meta"}.
+funcion columnas_parquet_info(datos) {
+    sea n = longitud(datos)
+    si (subcadena(datos, 0, 4) != "PAR1" o subcadena(datos, n - 4, n) != "PAR1") { lanzar "parquet: faltan las marcas PAR1" }
+    sea largo = _co_lee(datos, n - 8, 4, falso)
+    sea st = {"t": datos, "p": n - 8 - largo}
+    sea fm = _co_tstruct(st)
+    sea esq = fm["2"]
+    sea cols = []
+    sea i = 1
+    mientras (i < longitud(esq)) {
+        sea se = esq[i]
+        si ((se["5"] ?? 0) > 0) { lanzar "parquet: columnas anidadas no soportadas (" + se["4"] + ")" }
+        cols.agregar({"nombre": se["4"], "tipo": _co_pq_tipo_leer(se), "fisico": se["1"], "opcional": (se["3"] ?? 0) == 1, "largo_fijo": se["2"] ?? 0})
+        i = i + 1
+    }
+    sea meta = {}
+    // La copia del esquema de Arrow que guarda pyarrow no se reenvía.
+    para kv en fm["5"] ?? [] { si (kv["1"] != "ARROW:schema") { meta[kv["1"]] = kv["2"] ?? "" } }
+    retornar {"filas": fm["3"], "esquema": cols, "grupos": fm["4"] ?? [], "creado_por": fm["6"] ?? "", "meta": meta, "version": fm["1"]}
+}
+
+funcion _co_leer_columna(datos, cc, col) {
+    sea md = cc["3"]
+    sea codec = md["4"]
+    sea total = md["5"]
+    sea p = md["9"]
+    si ((md["11"] ?? nulo) != nulo y md["11"] < p) { p = md["11"] }
+    sea dicc = nulo
+    sea vals = []
+    sea max_def = 0
+    si (col["opcional"]) { max_def = 1 }
+    mientras (longitud(vals) < total) {
+        sea st = {"t": datos, "p": p}
+        sea ph = _co_tstruct(st)
+        sea tam_c = ph["3"]
+        sea tam_u = ph["2"]
+        sea cuerpo = subcadena(datos, st["p"], st["p"] + tam_c)
+        p = st["p"] + tam_c
+        sea tp = ph["1"]
+        si (tp == 2) {
+            sea dh = ph["7"]
+            sea d = _co_descomprimir(cuerpo, codec, tam_u)
+            dicc = _co_plain_leer(d, 0, col["fisico"], dh["1"], col["largo_fijo"])[0]
+        } sino si (tp == 0 o tp == 3) {
+            sea nv = 0
+            sea enc = 0
+            sea defs = []
+            sea d = ""
+            sea q = 0
+            si (tp == 0) {
+                sea dh = ph["5"]
+                nv = dh["1"]
+                enc = dh["2"]
+                d = _co_descomprimir(cuerpo, codec, tam_u)
+                si (max_def > 0) {
+                    sea l = _co_lee(d, 0, 4, falso)
+                    defs = _co_rle_leer(d, 4, 4 + l, 1, nv)
+                    q = 4 + l
+                }
+            } sino {
+                sea dh = ph["8"]
+                nv = dh["1"]
+                enc = dh["4"]
+                sea ld = dh["5"]
+                sea lr = dh["6"]
+                si (max_def > 0) { defs = _co_rle_leer(cuerpo, lr, lr + ld, 1, nv) }
+                sea resto = subcadena(cuerpo, lr + ld, longitud(cuerpo))
+                si (dh["7"] ?? verdadero) { resto = _co_descomprimir(resto, codec, tam_u - lr - ld) }
+                d = resto
+                q = 0
+            }
+            sea presentes = nv
+            si (max_def > 0) {
+                presentes = 0
+                para x en defs { si (x == max_def) { presentes = presentes + 1 } }
+            }
+            sea leidos = []
+            si (enc == 0) { leidos = _co_plain_leer(d, q, col["fisico"], presentes, col["largo_fijo"])[0] }
+            sino si (enc == 2 o enc == 8) {
+                sea w = byte_en(d, q)
+                para ix en _co_rle_leer(d, q + 1, longitud(d), w, presentes) { leidos.agregar(dicc[ix]) }
+            } sino si (enc == 3 y col["fisico"] == 0) {
+                sea l = _co_lee(d, q, 4, falso)
+                para x en _co_rle_leer(d, q + 4, q + 4 + l, 1, presentes) { leidos.agregar(x == 1) }
+            } sino { lanzar "parquet: codificación no soportada " + enc }
+            si (max_def > 0) {
+                sea k = 0
+                para x en defs {
+                    si (x == max_def) {
+                        vals.agregar(_co_logico(leidos[k], col["tipo"]))
+                        k = k + 1
+                    } sino { vals.agregar(nulo) }
+                }
+            } sino { para x en leidos { vals.agregar(_co_logico(x, col["tipo"])) } }
+        } sino { }
+    }
+    retornar vals
+}
+
+/// Lee un Parquet a tabla. opciones: "columnas" (lista de nombres).
+funcion columnas_parquet_leer(datos, opciones) {
+    sea op = opciones ?? {}
+    sea info = columnas_parquet_info(datos)
+    sea quiero = op["columnas"] ?? nulo
+    sea cols = []
+    sea i = 0
+    para c en info["esquema"] {
+        si (quiero == nulo o lista_contiene(quiero, c["nombre"])) {
+            sea vals = []
+            para rg en info["grupos"] { para v en _co_leer_columna(datos, rg["1"][i], c) { vals.agregar(v) } }
+            sea t = c["tipo"]
+            si (t == "int96") { t = "timestamp_ns" }
+            cols.agregar({"nombre": c["nombre"], "tipo": t, "valores": vals, "nulable": c["opcional"]})
+        }
+        i = i + 1
+    }
+    retornar {"columnas": cols, "filas": info["filas"], "meta": info["meta"]}
+}
+
+// ---------- Parquet: escritura ----------
+
+/// Escribe una tabla como Parquet. opciones: "compresion" ("snappy",
+/// "gzip", "zstd", "ninguna"), "filas_por_grupo" (100000), "diccionario"
+/// (verdadero: textos con pocos valores distintos), "meta" ({clave: valor}).
+funcion columnas_parquet_escribir(t, opciones) {
+    sea op = opciones ?? {}
+    sea codec = _CO_CODECS[op["compresion"] ?? "snappy"]
+    sea por_grupo = op["filas_por_grupo"] ?? 100000
+    sea partes = ["PAR1"]
+    sea pos = 4
+    // Esquema.
+    sea esq = [_co_wstruct([[4, 8, "schema"], [5, 5, longitud(t["columnas"])]])]
+    para c en t["columnas"] {
+        sea pt = _co_pq_tipo(c["tipo"])
+        sea campos = [[1, 5, pt[0]], [3, 5, 1], [4, 8, c["nombre"]]]
+        si (pt[1] != nulo) { campos.agregar([6, 5, pt[1]]) }
+        si (pt[2] != nulo) { campos.agregar([10, 12, _co_wstruct(pt[2])]) }
+        esq.agregar(_co_wstruct(campos))
+    }
+    sea grupos = []
+    sea inicio = 0
+    mientras (inicio < t["filas"] o (t["filas"] == 0 y longitud(grupos) == 0)) {
+        sea fin = minimo(t["filas"], inicio + por_grupo)
+        sea ccs = []
+        sea tam_grupo = 0
+        para c en t["columnas"] {
+            sea pt = _co_pq_tipo(c["tipo"])
+            sea fis = pt[0]
+            sea defs = []
+            sea presentes = []
+            sea k = inicio
+            mientras (k < fin) {
+                sea v = c["valores"][k]
+                si (v == nulo) { defs.agregar(0) } sino {
+                    defs.agregar(1)
+                    presentes.agregar(v)
+                }
+                k = k + 1
+            }
+            sea n = fin - inicio
+            sea nulos = n - longitud(presentes)
+            sea niveles = _co_rle_escribir(defs, 1)
+            sea niveles_txt = _co_le(longitud(niveles), 4) + niveles
+            // ¿Diccionario? Solo textos con muchos repetidos.
+            sea usar_dicc = falso
+            sea dicc = []
+            sea indice = {}
+            si ((op["diccionario"] ?? verdadero) y fis == 6 y longitud(presentes) > 0) {
+                para v en presentes { si (tiene_clave(indice, "" + v) == falso) {
+                    indice["" + v] = longitud(dicc)
+                    dicc.agregar(v)
+                } }
+                usar_dicc = longitud(dicc) * 2 <= longitud(presentes)
+            }
+            sea paginas = []
+            sea off_dicc = nulo
+            sea col_inicio = pos
+            sea tam_u_total = 0
+            si (usar_dicc) {
+                sea du = _co_plain_escribir(dicc, 6)
+                sea dc = _co_comprimir(du, codec)
+                sea ph = _co_wstruct([[1, 5, 2], [2, 5, longitud(du)], [3, 5, longitud(dc)], [7, 12, _co_wstruct([[1, 5, longitud(dicc)], [2, 5, 0]])]])
+                off_dicc = pos
+                paginas.agregar(ph + dc)
+                pos = pos + longitud(ph) + longitud(dc)
+                tam_u_total = tam_u_total + longitud(ph) + longitud(du)
+            }
+            sea cuerpo = ""
+            sea enc = 0
+            si (usar_dicc) {
+                sea ids = []
+                para v en presentes { ids.agregar(indice["" + v]) }
+                sea w = maximo(1, _co_ancho_bits(longitud(dicc) - 1))
+                cuerpo = niveles_txt + _co_b(w) + _co_rle_escribir(ids, w)
+                enc = 8
+            } sino { cuerpo = niveles_txt + _co_plain_escribir(presentes, fis) }
+            sea cc_ = _co_comprimir(cuerpo, codec)
+            sea ph = _co_wstruct([[1, 5, 0], [2, 5, longitud(cuerpo)], [3, 5, longitud(cc_)], [5, 12, _co_wstruct([[1, 5, n], [2, 5, enc], [3, 5, 3], [4, 5, 3]])]])
+            sea off_datos = pos
+            paginas.agregar(ph + cc_)
+            pos = pos + longitud(ph) + longitud(cc_)
+            tam_u_total = tam_u_total + longitud(ph) + longitud(cuerpo)
+            sea tam_c_total = pos - col_inicio
+            para pg en paginas { partes.agregar(pg) }
+            sea encs = [0, 3]
+            si (usar_dicc) { encs = [0, 3, 8] }
+            sea stats = _co_wstruct([[3, 6, nulos]])
+            sea md_campos = [[1, 5, fis], [2, 9, _co_wlista(5, encs)], [3, 9, _co_wlista(8, [c["nombre"]])], [4, 5, codec], [5, 6, n], [6, 6, tam_u_total], [7, 6, tam_c_total], [9, 6, off_datos]]
+            si (off_dicc != nulo) { md_campos.agregar([11, 6, off_dicc]) }
+            md_campos.agregar([12, 12, stats])
+            // Los campos deben ir en orden de id.
+            md_campos = ordenar(md_campos, funcion(a, b) { retornar a[0] - b[0] })
+            sea md = _co_wstruct(md_campos)
+            ccs.agregar(_co_wstruct([[2, 6, col_inicio], [3, 12, md]]))
+            tam_grupo = tam_grupo + tam_u_total
+        }
+        grupos.agregar(_co_wstruct([[1, 9, _co_wlista(12, ccs)], [2, 6, tam_grupo], [3, 6, fin - inicio]]))
+        inicio = fin
+        si (t["filas"] == 0) { romper }
+    }
+    sea kvs = []
+    sea meta = op["meta"] ?? (t["meta"] ?? {})
+    para k en claves(meta) { kvs.agregar(_co_wstruct([[1, 8, k], [2, 8, "" + meta[k]]])) }
+    sea fm_campos = [[1, 5, 1], [2, 9, _co_wlista(12, esq)], [3, 6, t["filas"]], [4, 9, _co_wlista(12, grupos)]]
+    si (longitud(kvs) > 0) { fm_campos.agregar([5, 9, _co_wlista(12, kvs)]) }
+    fm_campos.agregar([6, 8, "C-Forge columnas"])
+    sea fm = _co_wstruct(fm_campos)
+    partes.agregar(fm)
+    partes.agregar(_co_le(longitud(fm), 4))
+    partes.agregar("PAR1")
+    retornar unir(partes, "")
+}
+
+// ---------- Arrow IPC ----------
+
+sea _CO_ARROW_FBS_CRUDO = "namespace org.apache.arrow.flatbuf;\n" +
+    "enum MetadataVersion:short < V1, V2, V3, V4, V5 >\n" +
+    "table Null <> table Int < bitWidth: int; is_signed: bool; >\n" +
+    "enum Precision:short < HALF, SINGLE, DOUBLE >\n" +
+    "table FloatingPoint < precision: Precision; >\n" +
+    "table Binary <> table Utf8 <> table Bool <>\n" +
+    "table Decimal < precision: int; scale: int; bitWidth: int = 128; >\n" +
+    "enum DateUnit:short < DAY, MILLISECOND >\n" +
+    "table Date < unit: DateUnit = MILLISECOND; >\n" +
+    "enum TimeUnit:short < SECOND, MILLISECOND, MICROSECOND, NANOSECOND >\n" +
+    "table Time < unit: TimeUnit = MILLISECOND; bitWidth: int = 32; >\n" +
+    "table Timestamp < unit: TimeUnit; timezone: string; >\n" +
+    "table Interval <> table List <> table Struct_ <> table Union <> table FixedSizeBinary < byteWidth: int; > table FixedSizeList < listSize: int; > table Map <> table Duration <>\n" +
+    "table LargeBinary <> table LargeUtf8 <> table LargeList <>\n" +
+    "union Type < Null, Int, FloatingPoint, Binary, Utf8, Bool, Decimal, Date, Time, Timestamp, Interval, List, Struct_, Union, FixedSizeBinary, FixedSizeList, Map, Duration, LargeBinary, LargeUtf8, LargeList >\n" +
+    "table KeyValue < key: string; value: string; >\n" +
+    "enum DictionaryKind:short < DenseArray >\n" +
+    "table DictionaryEncoding < id: long; indexType: Int; isOrdered: bool; dictionaryKind: DictionaryKind; >\n" +
+    "table Field < name: string; nullable: bool; type: Type; dictionary: DictionaryEncoding; children: [Field]; custom_metadata: [KeyValue]; >\n" +
+    "enum Endianness:short < Little, Big >\n" +
+    "table Schema < endianness: Endianness = Little; fields: [Field]; custom_metadata: [KeyValue]; features: [long]; >\n" +
+    "struct FieldNode < length: long; null_count: long; >\n" +
+    "struct Buffer < offset: long; length: long; >\n" +
+    "enum CompressionType:byte < LZ4_FRAME, ZSTD >\n" +
+    "enum BodyCompressionMethod:byte < BUFFER >\n" +
+    "table BodyCompression < codec: CompressionType = LZ4_FRAME; method: BodyCompressionMethod = BUFFER; >\n" +
+    "table RecordBatch < length: long; nodes: [FieldNode]; buffers: [Buffer]; compression: BodyCompression; >\n" +
+    "table DictionaryBatch < id: long; data: RecordBatch; isDelta: bool = false; >\n" +
+    "table Tensor <> table SparseTensor <>\n" +
+    "union MessageHeader < Schema, DictionaryBatch, RecordBatch, Tensor, SparseTensor >\n" +
+    "table Message < version: MetadataVersion; header: MessageHeader; bodyLength: long; custom_metadata: [KeyValue]; >\n" +
+    "struct Block < offset: long; metaDataLength: int; bodyLength: long; >\n" +
+    "table Footer < version: MetadataVersion; schema: Schema; dictionaries: [Block]; recordBatches: [Block]; custom_metadata: [KeyValue]; >\n" +
+    "root_type Message;\n"
+
+sea _CO_ESQ = nulo
+funcion _co_esq() {
+    si (_CO_ESQ == nulo) { _CO_ESQ = sin_copia_esquema(texto_reemplazar(texto_reemplazar(_CO_ARROW_FBS_CRUDO, "<", caracter(123)), ">", caracter(125))) }
+    retornar _CO_ESQ
+}
+
+// Tipo de tabla → [type_type, type] de Arrow.
+funcion _co_ar_tipo(t) {
+    si (t == "bool") { retornar ["Bool", {}] }
+    si (texto_empieza_con(t, "int") o texto_empieza_con(t, "uint")) {
+        sea con_signo = texto_empieza_con(t, "int")
+        sea ancho = a_numero(subcadena(t, texto_indice(t, "t") + 1, longitud(t)))
+        retornar ["Int", {"bitWidth": ancho, "is_signed": con_signo}]
+    }
+    si (t == "float32") { retornar ["FloatingPoint", {"precision": "SINGLE"}] }
+    si (t == "float64") { retornar ["FloatingPoint", {"precision": "DOUBLE"}] }
+    si (t == "utf8") { retornar ["Utf8", {}] }
+    si (t == "binary") { retornar ["Binary", {}] }
+    si (t == "date32") { retornar ["Date", {"unit": "DAY"}] }
+    sea u = {"timestamp_s": "SECOND", "timestamp_ms": "MILLISECOND", "timestamp_us": "MICROSECOND", "timestamp_ns": "NANOSECOND"}
+    retornar ["Timestamp", {"unit": u[t]}]
+}
+
+funcion _co_ar_tipo_leer(tt, tv) {
+    si (tt == "Bool") { retornar "bool" }
+    si (tt == "Int") {
+        sea pre = "uint"
+        si (tv["is_signed"] ?? falso) { pre = "int" }
+        retornar pre + tv["bitWidth"]
+    }
+    si (tt == "FloatingPoint") {
+        si (tv["precision"] == "SINGLE") { retornar "float32" }
+        si (tv["precision"] == "DOUBLE") { retornar "float64" }
+        lanzar "arrow: float16 no soportado"
+    }
+    si (tt == "Utf8" o tt == "LargeUtf8") { retornar "utf8" }
+    si (tt == "Binary" o tt == "LargeBinary") { retornar "binary" }
+    si (tt == "Date") {
+        si (tv["unit"] == "DAY") { retornar "date32" }
+        retornar "date64"
+    }
+    si (tt == "Timestamp") {
+        sea m = {"SECOND": "timestamp_s", "MILLISECOND": "timestamp_ms", "MICROSECOND": "timestamp_us", "NANOSECOND": "timestamp_ns"}
+        retornar m[tv["unit"] ?? "SECOND"]
+    }
+    lanzar "arrow: tipo no soportado " + tt
+}
+
+funcion _co_ancho_tipo(t) {
+    si (t == "int8" o t == "uint8") { retornar 1 }
+    si (t == "int16" o t == "uint16") { retornar 2 }
+    si (t == "int32" o t == "uint32" o t == "float32" o t == "date32") { retornar 4 }
+    retornar 8
+}
+
+funcion _co_relleno8(t) {
+    sea r = t
+    mientras (longitud(r) % 8 != 0) { r = r + _co_b(0) }
+    retornar r
+}
+
+funcion _co_bits(bools) {
+    sea r = []
+    sea b = 0
+    sea k = 0
+    para v en bools {
+        si (v) { b = b + potencia(2, k % 8) }
+        k = k + 1
+        si (k % 8 == 0) {
+            r.agregar(_co_b(b))
+            b = 0
+        }
+    }
+    si (k % 8 != 0) { r.agregar(_co_b(b)) }
+    retornar unir(r, "")
+}
+
+funcion _co_mensaje(cabecera_tipo, cabecera, cuerpo_largo) {
+    sea fb = sin_copia_codificar(_co_esq(), {"version": "V5", "header_type": cabecera_tipo, "header": cabecera, "bodyLength": cuerpo_largo}, "Message")
+    sea fbp = fb
+    mientras ((longitud(fbp) + 8) % 8 != 0) { fbp = fbp + _co_b(0) }
+    retornar bytes_entero(4294967295, 4, 1) + bytes_entero(longitud(fbp), 4, 1) + fbp
+}
+
+funcion _co_schema_fb(t) {
+    sea campos = []
+    para c en t["columnas"] {
+        sea at = _co_ar_tipo(c["tipo"])
+        campos.agregar({"name": c["nombre"], "nullable": c["nulable"] ?? verdadero, "type_type": at[0], "type": at[1], "children": []})
+    }
+    sea s = {"endianness": "Little", "fields": campos}
+    sea kvs = []
+    para k en claves(t["meta"] ?? {}) { kvs.agregar({"key": k, "value": "" + t["meta"][k]}) }
+    si (longitud(kvs) > 0) { s["custom_metadata"] = kvs }
+    retornar s
+}
+
+funcion _co_lote(t) {
+    sea nodos = []
+    sea bufs = []
+    sea cuerpo = []
+    sea off = [0]
+    sea agregar = funcion(d) {
+        sea p = _co_relleno8(d)
+        bufs.agregar({"offset": off[0], "length": longitud(d)})
+        cuerpo.agregar(p)
+        off[0] = off[0] + longitud(p)
+    }
+    para c en t["columnas"] {
+        sea vals = c["valores"]
+        sea nulos = 0
+        sea validos = []
+        para v en vals {
+            validos.agregar(v != nulo)
+            si (v == nulo) { nulos = nulos + 1 }
+        }
+        nodos.agregar({"length": longitud(vals), "null_count": nulos})
+        si (nulos > 0) { agregar(_co_bits(validos)) } sino { agregar("") }
+        sea tp = c["tipo"]
+        si (tp == "bool") {
+            sea bs = []
+            para v en vals { bs.agregar(v == verdadero) }
+            agregar(_co_bits(bs))
+        } sino si (tp == "utf8" o tp == "binary") {
+            sea offs = [_co_le(0, 4)]
+            sea datos = []
+            sea acum = 0
+            para v en vals {
+                si (v != nulo) {
+                    datos.agregar("" + v)
+                    acum = acum + longitud("" + v)
+                }
+                offs.agregar(_co_le(acum, 4))
+            }
+            agregar(unir(offs, ""))
+            agregar(unir(datos, ""))
+        } sino {
+            sea w = _co_ancho_tipo(tp)
+            sea r = []
+            para v en vals {
+                si (v == nulo) { r.agregar(_co_le(0, w)) }
+                sino si (tp == "float32") { r.agregar(_co_float(v, 4)) }
+                sino si (tp == "float64") { r.agregar(_co_float(v, 8)) }
+                sino { r.agregar(_co_le(v, w)) }
+            }
+            agregar(unir(r, ""))
+        }
+    }
+    sea rb = {"length": t["filas"], "nodes": nodos, "buffers": bufs}
+    sea body = unir(cuerpo, "")
+    retornar [rb, body]
+}
+
+/// Flujo IPC de Arrow (esquema + un lote + fin).
+funcion columnas_arrow_flujo(t) {
+    sea sch = _co_mensaje("Schema", _co_schema_fb(t), 0)
+    sea l = _co_lote(t)
+    sea rb = _co_mensaje("RecordBatch", l[0], longitud(l[1]))
+    retornar sch + rb + l[1] + bytes_entero(4294967295, 4, 1) + bytes_entero(0, 4, 1)
+}
+
+/// Archivo IPC de Arrow ("ARROW1", con pie para acceso aleatorio).
+funcion columnas_arrow_archivo(t) {
+    sea cab = "ARROW1" + _co_b(0) + _co_b(0)
+    sea sch = _co_mensaje("Schema", _co_schema_fb(t), 0)
+    sea l = _co_lote(t)
+    sea rb = _co_mensaje("RecordBatch", l[0], longitud(l[1]))
+    sea off_rb = longitud(cab) + longitud(sch)
+    sea pie = sin_copia_codificar(_co_esq(), {"version": "V5", "schema": _co_schema_fb(t), "dictionaries": [], "recordBatches": [{"offset": off_rb, "metaDataLength": longitud(rb), "bodyLength": longitud(l[1])}]}, "Footer")
+    retornar cab + sch + rb + l[1] + bytes_entero(4294967295, 4, 1) + bytes_entero(0, 4, 1) + pie + bytes_entero(longitud(pie), 4, 1) + "ARROW1"
+}
+
+funcion _co_leer_lote(esquema, rb, cuerpo, base) {
+    sea nodos = sin_copia_a_mapa(sin_copia_campo(rb, "nodes"))
+    sea bufs = sin_copia_a_mapa(sin_copia_campo(rb, "buffers"))
+    sea n = sin_copia_campo(rb, "length")
+    sea bi = 0
+    sea r = []
+    sea k = 0
+    para c en esquema {
+        sea nodo = nodos[k]
+        sea len_c = nodo["length"]
+        sea val = bufs[bi]
+        bi = bi + 1
+        sea valido = funcion(i) {
+            si (nodo["null_count"] == 0 o val["length"] == 0) { retornar verdadero }
+            retornar piso(byte_en(cuerpo, base + val["offset"] + piso(i / 8)) / potencia(2, i % 8)) % 2 == 1
+        }
+        sea vals = []
+        sea tp = c["tipo"]
+        si (tp == "bool") {
+            sea d = bufs[bi]
+            bi = bi + 1
+            sea i = 0
+            mientras (i < len_c) {
+                si (valido(i)) { vals.agregar(piso(byte_en(cuerpo, base + d["offset"] + piso(i / 8)) / potencia(2, i % 8)) % 2 == 1) } sino { vals.agregar(nulo) }
+                i = i + 1
+            }
+        } sino si (tp == "utf8" o tp == "binary") {
+            sea ob = bufs[bi]
+            sea db = bufs[bi + 1]
+            bi = bi + 2
+            sea i = 0
+            mientras (i < len_c) {
+                si (valido(i)) {
+                    sea a = _co_lee(cuerpo, base + ob["offset"] + i * 4, 4, falso)
+                    sea b = _co_lee(cuerpo, base + ob["offset"] + i * 4 + 4, 4, falso)
+                    vals.agregar(subcadena(cuerpo, base + db["offset"] + a, base + db["offset"] + b))
+                } sino { vals.agregar(nulo) }
+                i = i + 1
+            }
+        } sino {
+            sea d = bufs[bi]
+            bi = bi + 1
+            sea w = _co_ancho_tipo(tp)
+            sea i = 0
+            mientras (i < len_c) {
+                si (valido(i)) {
+                    sea p = base + d["offset"] + i * w
+                    si (tp == "float32") { vals.agregar(_sc_de_ieee(cuerpo, p, 4)) }
+                    sino si (tp == "float64") { vals.agregar(_sc_de_ieee(cuerpo, p, 8)) }
+                    sino { vals.agregar(_co_lee(cuerpo, p, w, texto_empieza_con(tp, "u") == falso)) }
+                } sino { vals.agregar(nulo) }
+                i = i + 1
+            }
+        }
+        r.agregar(vals)
+        k = k + 1
+    }
+    retornar [r, n]
+}
+
+funcion _co_esquema_de(sch) {
+    sea r = []
+    sea fs = sin_copia_campo(sch, "fields")
+    sea i = 0
+    mientras (i < sin_copia_largo(fs)) {
+        sea f = sin_copia_elemento(fs, i)
+        si (sin_copia_campo(f, "dictionary") != nulo) { lanzar "arrow: columnas con diccionario no soportadas" }
+        sea tt = sin_copia_campo(f, "type_type")
+        sea tv = sin_copia_a_mapa(sin_copia_campo(f, "type")) ?? {}
+        r.agregar({"nombre": sin_copia_campo(f, "name"), "tipo": _co_ar_tipo_leer(tt, tv), "nulable": sin_copia_campo(f, "nullable")})
+        i = i + 1
+    }
+    retornar r
+}
+
+/// Lee un flujo o archivo IPC de Arrow a tabla (todas las tandas juntas).
+funcion columnas_arrow_leer(datos) {
+    sea p = 0
+    si (subcadena(datos, 0, 6) == "ARROW1") { p = 8 }
+    sea esquema = nulo
+    sea meta = {}
+    sea columnas_v = nulo
+    sea filas = 0
+    mientras (p + 8 <= longitud(datos)) {
+        sea largo = _co_lee(datos, p, 4, falso)
+        sea q = p + 4
+        si (largo == 4294967295) {
+            largo = _co_lee(datos, p + 4, 4, falso)
+            q = p + 8
+        }
+        si (largo == 0) { romper }
+        sea fb = subcadena(datos, q, q + largo)
+        sea m = sin_copia_raiz(_co_esq(), fb, "Message")
+        sea ht = sin_copia_campo(m, "header_type")
+        sea h = sin_copia_campo(m, "header")
+        sea cuerpo_largo = sin_copia_campo(m, "bodyLength")
+        sea cuerpo_ini = q + largo
+        si (ht == "Schema") {
+            esquema = _co_esquema_de(h)
+            columnas_v = []
+            para c en esquema { columnas_v.agregar([]) }
+            sea cm = sin_copia_campo(h, "custom_metadata")
+            si (cm != nulo) {
+                sea i = 0
+                mientras (i < sin_copia_largo(cm)) {
+                    sea kv = sin_copia_elemento(cm, i)
+                    meta[sin_copia_campo(kv, "key")] = sin_copia_campo(kv, "value")
+                    i = i + 1
+                }
+            }
+        } sino si (ht == "RecordBatch") {
+            si (sin_copia_campo(h, "compression") != nulo) { lanzar "arrow: búferes comprimidos no soportados" }
+            sea l = _co_leer_lote(esquema, h, datos, cuerpo_ini)
+            sea k = 0
+            mientras (k < longitud(esquema)) {
+                para v en l[0][k] { columnas_v[k].agregar(v) }
+                k = k + 1
+            }
+            filas = filas + l[1]
+        } sino si (ht == "DictionaryBatch") { lanzar "arrow: diccionarios no soportados" }
+        p = cuerpo_ini + cuerpo_largo
+        // En el archivo, después de los mensajes viene el pie.
+        si (subcadena(datos, longitud(datos) - 6, longitud(datos)) == "ARROW1" y p >= longitud(datos) - 10) { romper }
+    }
+    si (esquema == nulo) { lanzar "arrow: falta el esquema" }
+    sea cols = []
+    sea k = 0
+    para c en esquema {
+        cols.agregar({"nombre": c["nombre"], "tipo": c["tipo"], "valores": columnas_v[k], "nulable": c["nulable"]})
+        k = k + 1
+    }
+    retornar {"columnas": cols, "filas": filas, "meta": meta}
+}

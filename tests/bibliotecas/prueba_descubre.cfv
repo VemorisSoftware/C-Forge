@@ -1,0 +1,210 @@
+importar "descubre"
+importar "json"
+importar "base64"
+funcion j(t) { retornar texto_reemplazar(texto_reemplazar(t, "«", caracter(123)), "»", caracter(125)) }
+funcion igual(a, b, q) { afirmar(("" + a) == ("" + b), q + ": [" + a + "] != [" + b + "]") }
+// etcd falso que habla la pasarela JSON de etcd v3 (claves y valores en base64, números como texto).
+sea kv = {}
+sea rev = [1]
+sea arriendos = {}
+funcion guardar(k, v, lease) {
+    rev[0] = rev[0] + 1
+    sea previo = kv[k] ?? nulo
+    sea creado = rev[0]
+    sea version = 1
+    si (previo != nulo) {
+        creado = previo["creado"]
+        version = previo["version"] + 1
+    }
+    kv[k] = {"valor": v, "creado": creado, "mod": rev[0], "version": version, "lease": lease}
+}
+funcion item(k) {
+    sea x = kv[k]
+    sea r = {"key": base64_codificar(k), "value": base64_codificar(x["valor"]), "create_revision": "" + x["creado"], "mod_revision": "" + x["mod"], "version": "" + x["version"]}
+    si (x["lease"] != nulo) { r["lease"] = x["lease"] }
+    retornar r
+}
+funcion en_rango(k, c) {
+    sea a = base64_decodificar(c["key"])
+    si ((c["range_end"] ?? nulo) == nulo) { retornar k == a }
+    retornar k >= a y k < base64_decodificar(c["range_end"])
+}
+funcion etcd(m, url, o) {
+    sea ruta = subcadena(url, texto_indice(url, "/v3"), longitud(url))
+    sea c = json_parsear(o["cuerpo"] ?? j("«»"))
+    sea h = {"revision": "" + rev[0]}
+    si (ruta == "/v3/kv/put") {
+        guardar(base64_decodificar(c["key"]), base64_decodificar(c["value"]), c["lease"] ?? nulo)
+        retornar {"estado": 200, "cuerpo": json_texto({"header": {"revision": "" + rev[0]}})}
+    }
+    si (ruta == "/v3/kv/range") {
+        sea l = []
+        para k en ordenar(claves(kv)) { si (en_rango(k, c)) { l.agregar(item(k)) } }
+        si ((c["limit"] ?? nulo) != nulo) {
+            sea lim = a_numero(c["limit"])
+            sea corto = []
+            sea i = 0
+            mientras (i < minimo(lim, longitud(l))) {
+                corto.agregar(l[i])
+                i = i + 1
+            }
+            l = corto
+        }
+        retornar {"estado": 200, "cuerpo": json_texto({"header": h, "kvs": l, "count": "" + longitud(l)})}
+    }
+    si (ruta == "/v3/kv/deleterange") {
+        sea n = 0
+        para k en claves(kv) { si (en_rango(k, c)) {
+            quitar_clave(kv, k)
+            n = n + 1
+        } }
+        retornar {"estado": 200, "cuerpo": json_texto({"header": h, "deleted": "" + n})}
+    }
+    si (ruta == "/v3/lease/grant") {
+        sea id = "" + (7000 + longitud(claves(arriendos)))
+        arriendos[id] = a_numero(c["TTL"])
+        retornar {"estado": 200, "cuerpo": json_texto({"ID": id, "TTL": c["TTL"]})}
+    }
+    si (ruta == "/v3/lease/keepalive") { retornar {"estado": 200, "cuerpo": json_texto({"result": {"ID": c["ID"], "TTL": "" + arriendos[c["ID"]]}})} }
+    si (ruta == "/v3/lease/revoke") {
+        para k en claves(kv) { si (kv[k]["lease"] == c["ID"]) { quitar_clave(kv, k) } }
+        quitar_clave(arriendos, c["ID"])
+        retornar {"estado": 200, "cuerpo": j("«»")}
+    }
+    si (ruta == "/v3/kv/txn") {
+        sea ok = verdadero
+        para cmp en c["compare"] {
+            sea k = base64_decodificar(cmp["key"])
+            sea x = kv[k] ?? nulo
+            sea actual = 0
+            sea quiero = 0
+            si (cmp["target"] == "CREATE") {
+                si (x != nulo) { actual = x["creado"] }
+                quiero = a_numero(cmp["create_revision"])
+            } sino si (cmp["target"] == "VALUE") {
+                si (x != nulo) { actual = x["valor"] } sino { actual = "" }
+                quiero = base64_decodificar(cmp["value"])
+            } sino si (cmp["target"] == "VERSION") {
+                si (x != nulo) { actual = x["version"] }
+                quiero = a_numero(cmp["version"])
+            }
+            si (cmp["result"] == "EQUAL" y actual != quiero) { ok = falso }
+            si (cmp["result"] == "NOT_EQUAL" y actual == quiero) { ok = falso }
+        }
+        sea ops = c["failure"]
+        si (ok) { ops = c["success"] }
+        sea resp = []
+        para op en ops ?? [] {
+            si ((op["request_put"] ?? nulo) != nulo) {
+                guardar(base64_decodificar(op["request_put"]["key"]), base64_decodificar(op["request_put"]["value"]), nulo)
+                resp.agregar({"response_put": {}})
+            }
+            si ((op["request_range"] ?? nulo) != nulo) {
+                sea k = base64_decodificar(op["request_range"]["key"])
+                sea l = []
+                si (tiene_clave(kv, k)) { l.agregar(item(k)) }
+                resp.agregar({"response_range": {"kvs": l}})
+            }
+        }
+        retornar {"estado": 200, "cuerpo": json_texto({"succeeded": ok, "responses": resp})}
+    }
+    retornar {"estado": 404, "cuerpo": "no"}
+}
+sea e = descubre_etcd("http://etcd:2379/", {"transporte": etcd})
+igual(descubre_fin_prefijo("/config/"), "/config0", "fin de prefijo")
+descubre_etcd_poner(e, "/config/modo", "prod", nulo)
+descubre_etcd_poner(e, "/config/nivel", "3", nulo)
+descubre_etcd_poner(e, "/otro", "x", nulo)
+igual([descubre_etcd_obtener(e, "/config/modo"), descubre_etcd_obtener(e, "/nada")], ["prod", nulo], "poner y obtener")
+sea r = descubre_etcd_rango(e, "/config/", {"prefijo": verdadero})
+igual([longitud(r), r[0]["clave"], r[1]["valor"], r[0]["version"]], [2, "/config/modo", "3", 1], "prefijo")
+descubre_etcd_poner(e, "/config/modo", "dev", nulo)
+igual(descubre_etcd_rango(e, "/config/modo", nulo)[0]["version"], 2, "versiones")
+// Transacción de comparar y cambiar.
+igual(descubre_etcd_txn(e, [["valor", "/config/modo", "==", "dev"]], [["poner", "/config/modo", "qa"]], nulo)["exito"], verdadero, "cas ok")
+sea t2 = descubre_etcd_txn(e, [["valor", "/config/modo", "==", "dev"]], nulo, [["obtener", "/config/modo"]])
+igual([t2["exito"], t2["respuestas"][0][0]["valor"]], [falso, "qa"], "cas falla")
+// Arrendamientos, bloqueos y líder.
+sea b1 = descubre_etcd_bloquear(e, "cron", "nodo-a", 10)
+sea b2 = descubre_etcd_bloquear(e, "cron", "nodo-b", 10)
+igual([b1["tomado"], b2["tomado"], descubre_etcd_obtener(e, "/bloqueos/cron")], [verdadero, falso, "nodo-a"], "bloqueo")
+igual(descubre_etcd_renovar(e, b1["arriendo"]), 10, "renovar")
+descubre_etcd_soltar(e, "cron", b1)
+igual(descubre_etcd_bloquear(e, "cron", "nodo-b", 10)["tomado"], verdadero, "bloqueo liberado")
+igual([descubre_etcd_elegir(e, "jefe", "ana", 10), descubre_etcd_elegir(e, "jefe", "luis", 10)], ["ana", "ana"], "líder")
+igual(descubre_etcd_borrar(e, "/config/", verdadero), 2, "borrar prefijo")
+sea w = "«\"result\":«\"events\":[«\"kv\":«\"key\":\"" + base64_codificar("/a") + "\",\"value\":\"" + base64_codificar("1") + "\",\"version\":\"1\"»»,«\"type\":\"DELETE\",\"kv\":«\"key\":\"" + base64_codificar("/a") + "\"»»]»»\n"
+w = texto_reemplazar(texto_reemplazar(w, "«", caracter(123)), "»", caracter(125))
+sea ev = descubre_etcd_eventos(w)
+igual([ev[0]["tipo"], ev[0]["valor"], ev[1]["tipo"]], ["PUT", "1", "DELETE"], "watch")
+// Consul falso.
+sea servicios = {}
+sea ckv = {}
+funcion consul(m, url, o) {
+    sea ruta = texto_dividir(subcadena(url, texto_indice(url, "/v1"), longitud(url)), "?")[0]
+    sea q = ""
+    si (texto_indice(url, "?") >= 0) { q = texto_dividir(url, "?")[1] }
+    si (ruta == "/v1/agent/service/register") {
+        sea s = json_parsear(o["cuerpo"])
+        servicios[s["ID"]] = s
+        retornar {"estado": 200, "cuerpo": ""}
+    }
+    si (texto_empieza_con(ruta, "/v1/agent/service/deregister/")) {
+        quitar_clave(servicios, subcadena(ruta, 29, longitud(ruta)))
+        retornar {"estado": 200, "cuerpo": ""}
+    }
+    si (texto_empieza_con(ruta, "/v1/health/service/")) {
+        sea nombre = subcadena(ruta, 19, longitud(ruta))
+        sea l = []
+        para id en ordenar(claves(servicios)) {
+            sea s = servicios[id]
+            si (s["Name"] == nombre) {
+                sea est = "passing"
+                si (((s["Meta"] ?? {})["roto"] ?? "no") == "si") { est = "critical" }
+                si (est == "passing" o texto_indice(q, "passing=true") < 0) { l.agregar({"Node": {"Node": "n1", "Address": "10.0.0.9"}, "Service": s, "Checks": [{"Status": est}]}) }
+            }
+        }
+        retornar {"estado": 200, "cuerpo": json_texto(l)}
+    }
+    si (ruta == "/v1/catalog/services") {
+        sea r = {}
+        para id en claves(servicios) { r[servicios[id]["Name"]] = servicios[id]["Tags"] }
+        retornar {"estado": 200, "cuerpo": json_texto(r)}
+    }
+    si (texto_empieza_con(ruta, "/v1/kv/")) {
+        sea k = subcadena(ruta, 7, longitud(ruta))
+        si (m == "PUT") {
+            si (texto_indice(q, "cas=") >= 0 y ("" + (ckv[k] ?? {"i": 0})["i"]) != subcadena(q, 4, longitud(q))) { retornar {"estado": 200, "cuerpo": "false"} }
+            ckv[k] = {"v": o["cuerpo"], "i": longitud(claves(ckv)) + 10}
+            retornar {"estado": 200, "cuerpo": "true"}
+        }
+        si (m == "DELETE") {
+            quitar_clave(ckv, k)
+            retornar {"estado": 200, "cuerpo": "true"}
+        }
+        sea l = []
+        para kk en ordenar(claves(ckv)) { si (kk == k o (texto_indice(q, "recurse") >= 0 y texto_empieza_con(kk, k))) { l.agregar({"Key": kk, "Value": base64_codificar(ckv[kk]["v"]), "ModifyIndex": ckv[kk]["i"]}) } }
+        si (longitud(l) == 0) { retornar {"estado": 404, "cuerpo": ""} }
+        retornar {"estado": 200, "cuerpo": json_texto(l)}
+    }
+    retornar {"estado": 404, "cuerpo": ""}
+}
+sea cs = descubre_consul("http://consul:8500", {"transporte": consul, "token": "t1"})
+descubre_consul_registrar(cs, {"nombre": "web", "id": "web-1", "direccion": "10.0.0.1", "puerto": 8080, "etiquetas": ["v1"], "chequeo": {"http": "http://10.0.0.1:8080/salud", "intervalo": "10s"}})
+descubre_consul_registrar(cs, {"nombre": "web", "id": "web-2", "puerto": 8081})
+descubre_consul_registrar(cs, {"nombre": "web", "id": "web-3", "direccion": "10.0.0.3", "puerto": 8082, "meta": {"roto": "si"}})
+igual(servicios["web-1"]["Check"], {"HTTP": "http://10.0.0.1:8080/salud", "Interval": "10s"}, "chequeo")
+sea inst = descubre_consul_servicio(cs, "web", nulo, nulo)
+igual([longitud(inst), inst[1]["direccion"], descubre_url(inst[0], nulo)], [2, "10.0.0.9", "http://10.0.0.1:8080"], "sanos")
+igual(longitud(descubre_consul_servicio(cs, "web", falso, nulo)), 3, "todos")
+sea bal = {"turno": 0}
+igual([descubre_elegir(inst, nulo, bal)["id"], descubre_elegir(inst, nulo, bal)["id"], descubre_elegir(inst, nulo, bal)["id"]], ["web-1", "web-2", "web-1"], "round robin")
+descubre_consul_baja(cs, "web-2")
+igual(longitud(descubre_consul_servicio(cs, "web", nulo, nulo)), 1, "baja")
+igual(tiene_clave(descubre_consul_servicios(cs), "web"), verdadero, "catálogo")
+igual(descubre_consul_poner(cs, "app/color", "azul", nulo), verdadero, "kv poner")
+descubre_consul_poner(cs, "app/tam", "9", nulo)
+igual([descubre_consul_obtener(cs, "app/color"), descubre_consul_obtener(cs, "app/nada")], ["azul", nulo], "kv obtener")
+igual(longitud(descubre_consul_prefijo(cs, "app/")), 2, "kv prefijo")
+igual(descubre_consul_poner(cs, "app/color", "rojo", 999), falso, "cas")
+mostrar("[OK] descubre")
