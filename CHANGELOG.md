@@ -9,6 +9,9 @@ Sitio oficial: [c-forge.org](https://c-forge.org)
   contra fórmulas), `progreso` (barras y spinners) y `dinero` (decimales
   exactos, redondeo bancario, reparto sin perder centavos). Pruebas en
   `tests/bibliotecas` (normal y `--release`).
+- **Bilingües:** `import "ink"`, `"ids"`, `"progress"`, `"money"` y los
+  nombres en inglés de `csv` (`csv_read`, `csv_write`…); `money_round`
+  acepta `"even"` y `"up"`. Pruebas escritas en inglés.
 - Nuevas funciones del lenguaje: `escribir(v)` (sin salto de línea) y
   `variable_entorno(nombre)`.
 
