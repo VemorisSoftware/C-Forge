@@ -1,0 +1,1555 @@
+// stdlib/ajustes.cfv — archivos de configuración TOML 1.0 y YAML 1.2
+// estrictos: leer y escribir, con errores que dicen línea y columna, claves
+// duplicadas prohibidas, fechas TOML, anclas y alias YAML, bloques | y >,
+// varios documentos, mezcla profunda de configuraciones, variables de
+// entorno ${VAR:-defecto} y validación con molde. Inspirada en toml-rs y
+// yaml-rust (MIT/Apache). En inglés: importar "config".
+//
+//   importar "ajustes"
+//   sea c = ajustes_toml("[servidor]\npuerto = 8080\nhosts = [\"a\", \"b\"]")
+//   c["servidor"]["puerto"]                       // 8080
+//   sea y = ajustes_yaml("base: &b {x: 1}\nprod:\n  <<: *b\n  y: 2")
+//   ajustes_a_toml(c)  ·  ajustes_a_yaml(y)
+//   ajustes_cargar("app.toml", {"entorno": verdadero})
+
+importar "unicode"
+importar "molde"
+importar "json"
+
+sea _AJ_SEP = caracter(1)
+
+// ══ Utilidades ═════════════════════════════════════════════════════════════
+
+funcion _aj_error(fuente, pos, msg) {
+    sea linea = 1
+    sea col = 1
+    sea i = 0
+    mientras (i < pos y i < longitud(fuente)) {
+        si (byte_en(fuente, i) == 10) { linea = linea + 1  col = 1 } sino { col = col + 1 }
+        i = i + 1
+    }
+    lanzar "ajustes: " + msg + " (línea " + linea + ", columna " + col + ")"
+}
+
+funcion _aj_c(s, i) {
+    si (i >= longitud(s)) { retornar "" }
+    retornar subcadena(s, i, i + 1)
+}
+
+funcion _aj_es_digito(c) { retornar c != "" y texto_indice("0123456789", c) >= 0 }
+
+funcion _aj_hex(t) {
+    sea v = 0
+    sea i = 0
+    mientras (i < longitud(t)) {
+        sea d = texto_indice("0123456789abcdef", texto_minusculas(subcadena(t, i, i + 1)))
+        si (d < 0) { retornar -1 }
+        v = v * 16 + d
+        i = i + 1
+    }
+    retornar v
+}
+
+// ══ TOML ═══════════════════════════════════════════════════════════════════
+
+funcion _tm_ws(p) {
+    mientras (p["i"] < p["n"] y (_aj_c(p["s"], p["i"]) == " " o _aj_c(p["s"], p["i"]) == "\t")) { p["i"] = p["i"] + 1 }
+}
+
+funcion _tm_comentario(p) {
+    si (_aj_c(p["s"], p["i"]) == "#") {
+        mientras (p["i"] < p["n"] y byte_en(p["s"], p["i"]) != 10) {
+            sea b = byte_en(p["s"], p["i"])
+            si ((b < 32 y b != 9) o b == 127) { _aj_error(p["s"], p["i"], "carácter de control en un comentario") }
+            p["i"] = p["i"] + 1
+        }
+    }
+}
+
+// Espacios, saltos de línea y comentarios (dentro de arreglos).
+funcion _tm_ws_nl(p) {
+    mientras (p["i"] < p["n"]) {
+        sea c = _aj_c(p["s"], p["i"])
+        si (c == " " o c == "\t" o c == "\n") { p["i"] = p["i"] + 1 } sino {
+            si (c == "\r" y _aj_c(p["s"], p["i"] + 1) == "\n") { p["i"] = p["i"] + 2 } sino {
+                si (c == "#") { _tm_comentario(p) } sino { retornar nulo }
+            }
+        }
+    }
+}
+
+funcion _tm_fin_linea(p) {
+    _tm_ws(p)
+    _tm_comentario(p)
+    si (p["i"] >= p["n"]) { retornar nulo }
+    sea c = _aj_c(p["s"], p["i"])
+    si (c == "\n") { p["i"] = p["i"] + 1  retornar nulo }
+    si (c == "\r" y _aj_c(p["s"], p["i"] + 1) == "\n") { p["i"] = p["i"] + 2  retornar nulo }
+    _aj_error(p["s"], p["i"], "se esperaba fin de línea y llegó '" + c + "'")
+}
+
+funcion _tm_escape(p) {
+    // p["i"] apunta después de la barra.
+    sea c = _aj_c(p["s"], p["i"])
+    p["i"] = p["i"] + 1
+    si (c == "b") { retornar caracter(8) }
+    si (c == "t") { retornar "\t" }
+    si (c == "n") { retornar "\n" }
+    si (c == "f") { retornar caracter(12) }
+    si (c == "r") { retornar "\r" }
+    si (c == "\"") { retornar "\"" }
+    si (c == "\\") { retornar "\\" }
+    si (c == "u" o c == "U") {
+        sea n = 4
+        si (c == "U") { n = 8 }
+        sea v = _aj_hex(subcadena(p["s"], p["i"], minimo(p["n"], p["i"] + n)))
+        si (v < 0 o p["i"] + n > p["n"] o (v >= 55296 y v <= 57343) o v > 1114111) { _aj_error(p["s"], p["i"], "escape unicode inválido") }
+        p["i"] = p["i"] + n
+        retornar caracter(v)
+    }
+    _aj_error(p["s"], p["i"] - 1, "escape inválido \\" + c)
+}
+
+funcion _tm_control(p, multilinea) {
+    sea b = byte_en(p["s"], p["i"])
+    si ((b < 32 y b != 9 y (multilinea == falso o (b != 10 y b != 13))) o b == 127) { _aj_error(p["s"], p["i"], "carácter de control en un texto") }
+}
+
+funcion _tm_texto(p) {
+    sea s = p["s"]
+    sea i = p["i"]
+    si (subcadena(s, i, minimo(p["n"], i + 3)) == "\"\"\"") {
+        p["i"] = i + 3
+        // Un salto de línea justo después de las comillas se ignora.
+        si (_aj_c(s, p["i"]) == "\n") { p["i"] = p["i"] + 1 } sino { si (subcadena(s, p["i"], minimo(p["n"], p["i"] + 2)) == "\r\n") { p["i"] = p["i"] + 2 } }
+        sea r = ""
+        mientras (verdadero) {
+            si (p["i"] >= p["n"]) { _aj_error(s, i, "texto multilínea sin cerrar") }
+            si (subcadena(s, p["i"], minimo(p["n"], p["i"] + 3)) == "\"\"\"") {
+                // Hasta dos comillas extra pertenecen al texto.
+                sea extra = 0
+                mientras (extra < 2 y _aj_c(s, p["i"] + 3 + extra) == "\"") { extra = extra + 1 }
+                sea k = 0
+                mientras (k < extra) { r = r + "\""  k = k + 1 }
+                p["i"] = p["i"] + 3 + extra
+                retornar r
+            }
+            sea c = _aj_c(s, p["i"])
+            si (c == "\\") {
+                // Barra al final de línea: se come el salto y los espacios.
+                sea j = p["i"] + 1
+                mientras (_aj_c(s, j) == " " o _aj_c(s, j) == "\t") { j = j + 1 }
+                si (_aj_c(s, j) == "\n" o (_aj_c(s, j) == "\r" y _aj_c(s, j + 1) == "\n")) {
+                    mientras (j < p["n"] y (_aj_c(s, j) == " " o _aj_c(s, j) == "\t" o _aj_c(s, j) == "\n" o _aj_c(s, j) == "\r")) { j = j + 1 }
+                    p["i"] = j
+                } sino {
+                    p["i"] = p["i"] + 1
+                    r = r + _tm_escape(p)
+                }
+            } sino {
+                _tm_control(p, verdadero)
+                si (c == "\r" y _aj_c(s, p["i"] + 1) != "\n") { _aj_error(s, p["i"], "retorno de carro suelto") }
+                r = r + c
+                p["i"] = p["i"] + 1
+            }
+        }
+    }
+    si (subcadena(s, i, minimo(p["n"], i + 3)) == "'''") {
+        p["i"] = i + 3
+        si (_aj_c(s, p["i"]) == "\n") { p["i"] = p["i"] + 1 } sino { si (subcadena(s, p["i"], minimo(p["n"], p["i"] + 2)) == "\r\n") { p["i"] = p["i"] + 2 } }
+        sea ini = p["i"]
+        mientras (verdadero) {
+            si (p["i"] >= p["n"]) { _aj_error(s, i, "texto literal multilínea sin cerrar") }
+            si (subcadena(s, p["i"], minimo(p["n"], p["i"] + 3)) == "'''") {
+                sea extra = 0
+                mientras (extra < 2 y _aj_c(s, p["i"] + 3 + extra) == "'") { extra = extra + 1 }
+                sea r = subcadena(s, ini, p["i"] + extra)
+                p["i"] = p["i"] + 3 + extra
+                retornar r
+            }
+            _tm_control(p, verdadero)
+            p["i"] = p["i"] + 1
+        }
+    }
+    si (_aj_c(s, i) == "'") {
+        p["i"] = i + 1
+        sea ini = p["i"]
+        mientras (_aj_c(s, p["i"]) != "'") {
+            si (p["i"] >= p["n"] o _aj_c(s, p["i"]) == "\n") { _aj_error(s, i, "texto literal sin cerrar") }
+            _tm_control(p, falso)
+            p["i"] = p["i"] + 1
+        }
+        p["i"] = p["i"] + 1
+        retornar subcadena(s, ini, p["i"] - 1)
+    }
+    p["i"] = i + 1
+    sea r = ""
+    mientras (_aj_c(s, p["i"]) != "\"") {
+        si (p["i"] >= p["n"] o _aj_c(s, p["i"]) == "\n") { _aj_error(s, i, "texto sin cerrar") }
+        si (_aj_c(s, p["i"]) == "\\") {
+            p["i"] = p["i"] + 1
+            r = r + _tm_escape(p)
+        } sino {
+            _tm_control(p, falso)
+            r = r + _aj_c(s, p["i"])
+            p["i"] = p["i"] + 1
+        }
+    }
+    p["i"] = p["i"] + 1
+    retornar r
+}
+
+funcion _tm_clave_simple(p) {
+    _tm_ws(p)
+    sea c = _aj_c(p["s"], p["i"])
+    si (c == "\"" o c == "'") {
+        si (subcadena(p["s"], p["i"], minimo(p["n"], p["i"] + 3)) == "\"\"\"" o subcadena(p["s"], p["i"], minimo(p["n"], p["i"] + 3)) == "'''") { _aj_error(p["s"], p["i"], "una clave no puede ser multilínea") }
+        retornar _tm_texto(p)
+    }
+    sea ini = p["i"]
+    mientras (p["i"] < p["n"]) {
+        sea b = byte_en(p["s"], p["i"])
+        si ((b >= 65 y b <= 90) o (b >= 97 y b <= 122) o (b >= 48 y b <= 57) o b == 95 o b == 45) { p["i"] = p["i"] + 1 } sino {
+            si (p["i"] == ini) { _aj_error(p["s"], p["i"], "clave inválida") }
+            retornar subcadena(p["s"], ini, p["i"])
+        }
+    }
+    si (p["i"] == ini) { _aj_error(p["s"], p["i"], "falta la clave") }
+    retornar subcadena(p["s"], ini, p["i"])
+}
+
+funcion _tm_clave(p) {
+    sea partes = [_tm_clave_simple(p)]
+    _tm_ws(p)
+    mientras (_aj_c(p["s"], p["i"]) == ".") {
+        p["i"] = p["i"] + 1
+        partes.agregar(_tm_clave_simple(p))
+        _tm_ws(p)
+    }
+    retornar partes
+}
+
+funcion _tm_es_fecha(t) {
+    retornar longitud(t) >= 10 y _aj_es_digito(_aj_c(t, 0)) y _aj_es_digito(_aj_c(t, 3)) y _aj_c(t, 4) == "-" y _aj_c(t, 7) == "-"
+}
+
+funcion _tm_dos(t, i, max) {
+    si (_aj_es_digito(_aj_c(t, i)) == falso o _aj_es_digito(_aj_c(t, i + 1)) == falso) { retornar -1 }
+    sea v = a_numero(subcadena(t, i, i + 2))
+    si (v > max) { retornar -1 }
+    retornar v
+}
+
+// Valida fecha y hora RFC 3339. Devuelve el tipo o nulo.
+funcion _tm_tipo_fecha(t) {
+    sea fecha = falso
+    sea hora = falso
+    sea i = 0
+    si (_tm_es_fecha(t)) {
+        sea anio = a_numero(subcadena(t, 0, 4))
+        sea mes = _tm_dos(t, 5, 12)
+        sea dia = _tm_dos(t, 8, 31)
+        si (mes < 1 o dia < 1) { retornar nulo }
+        sea dias = [31, 28, 31, 30, 31, 30, 31, 31, 30, 31, 30, 31]
+        si ((anio % 4 == 0 y anio % 100 != 0) o anio % 400 == 0) { dias[1] = 29 }
+        si (dia > dias[mes - 1]) { retornar nulo }
+        fecha = verdadero
+        i = 10
+        si (i == longitud(t)) { retornar "fecha" }
+        sea sep = _aj_c(t, i)
+        si (sep != "T" y sep != "t" y sep != " ") { retornar nulo }
+        i = i + 1
+    }
+    si (_tm_dos(t, i, 23) < 0 o _aj_c(t, i + 2) != ":" o _tm_dos(t, i + 3, 59) < 0 o _aj_c(t, i + 5) != ":" o _tm_dos(t, i + 6, 60) < 0) { retornar nulo }
+    hora = verdadero
+    i = i + 8
+    si (_aj_c(t, i) == ".") {
+        i = i + 1
+        sea d = i
+        mientras (_aj_es_digito(_aj_c(t, i))) { i = i + 1 }
+        si (i == d) { retornar nulo }
+    }
+    si (i == longitud(t)) {
+        si (fecha) { retornar "fecha_hora_local" }
+        retornar "hora"
+    }
+    si (fecha == falso) { retornar nulo }
+    sea z = _aj_c(t, i)
+    si ((z == "Z" o z == "z") y i + 1 == longitud(t)) { retornar "fecha_hora" }
+    si ((z == "+" o z == "-") y i + 6 == longitud(t) y _tm_dos(t, i + 1, 23) >= 0 y _aj_c(t, i + 3) == ":" y _tm_dos(t, i + 4, 59) >= 0) { retornar "fecha_hora" }
+    retornar nulo
+}
+
+funcion _tm_numero(p, crudo, pos) {
+    sea t = crudo
+    si (t == "true") { retornar verdadero }
+    si (t == "false") { retornar falso }
+    si (t == "inf" o t == "+inf") { retornar 1e308 * 10 }
+    si (t == "-inf") { retornar -1e308 * 10 }
+    si (t == "nan" o t == "+nan" o t == "-nan") { retornar (1e308 * 10) - (1e308 * 10) }
+    // Guiones bajos: sólo entre dígitos.
+    sea i = 0
+    mientras (i < longitud(t)) {
+        si (_aj_c(t, i) == "_") {
+            si (i == 0 o i == longitud(t) - 1 o texto_indice("0123456789abcdefABCDEF", _aj_c(t, i - 1)) < 0 o texto_indice("0123456789abcdefABCDEF", _aj_c(t, i + 1)) < 0) { _aj_error(p["s"], pos, "guion bajo mal puesto en número") }
+        }
+        i = i + 1
+    }
+    sea l = texto_reemplazar(t, "_", "")
+    si (texto_empieza_con(l, "0x") o texto_empieza_con(l, "0o") o texto_empieza_con(l, "0b")) {
+        sea base = 16
+        sea alf = "0123456789abcdef"
+        si (texto_empieza_con(l, "0o")) { base = 8  alf = "01234567" }
+        si (texto_empieza_con(l, "0b")) { base = 2  alf = "01" }
+        sea v = 0
+        sea k = 2
+        si (longitud(l) == 2) { _aj_error(p["s"], pos, "número sin dígitos") }
+        mientras (k < longitud(l)) {
+            sea d = texto_indice(alf, texto_minusculas(_aj_c(l, k)))
+            si (d < 0) { _aj_error(p["s"], pos, "dígito inválido en " + t) }
+            v = v * base + d
+            k = k + 1
+        }
+        retornar v
+    }
+    sea cuerpo = l
+    si (texto_empieza_con(cuerpo, "+") o texto_empieza_con(cuerpo, "-")) { cuerpo = subcadena(cuerpo, 1, longitud(cuerpo)) }
+    si (cuerpo == "" o _aj_es_digito(_aj_c(cuerpo, 0)) == falso) { _aj_error(p["s"], pos, "valor inválido: " + t) }
+    // Ceros a la izquierda prohibidos.
+    si (longitud(cuerpo) > 1 y _aj_c(cuerpo, 0) == "0" y _aj_es_digito(_aj_c(cuerpo, 1))) { _aj_error(p["s"], pos, "ceros a la izquierda en " + t) }
+    sea k = 0
+    sea punto = falso
+    sea exp = falso
+    mientras (k < longitud(cuerpo)) {
+        sea c = _aj_c(cuerpo, k)
+        si (_aj_es_digito(c) == falso) {
+            si (c == "." y punto == falso y exp == falso y _aj_es_digito(_aj_c(cuerpo, k + 1)) y _aj_es_digito(_aj_c(cuerpo, k - 1))) { punto = verdadero } sino {
+                si ((c == "e" o c == "E") y exp == falso) {
+                    exp = verdadero
+                    si (_aj_c(cuerpo, k + 1) == "+" o _aj_c(cuerpo, k + 1) == "-") { k = k + 1 }
+                    si (_aj_es_digito(_aj_c(cuerpo, k + 1)) == falso) { _aj_error(p["s"], pos, "exponente inválido en " + t) }
+                } sino { _aj_error(p["s"], pos, "valor inválido: " + t) }
+            }
+        }
+        k = k + 1
+    }
+    retornar a_numero(l)
+}
+
+funcion _tm_valor(p) {
+    _tm_ws(p)
+    sea s = p["s"]
+    sea c = _aj_c(s, p["i"])
+    si (c == "\"" o c == "'") { retornar _tm_texto(p) }
+    si (c == "[") {
+        p["i"] = p["i"] + 1
+        sea r = []
+        mientras (verdadero) {
+            _tm_ws_nl(p)
+            si (_aj_c(s, p["i"]) == "]") { p["i"] = p["i"] + 1  retornar r }
+            r.agregar(_tm_valor(p))
+            _tm_ws_nl(p)
+            sea d = _aj_c(s, p["i"])
+            si (d == ",") { p["i"] = p["i"] + 1 } sino {
+                si (d == "]") { p["i"] = p["i"] + 1  retornar r }
+                _aj_error(s, p["i"], "se esperaba ',' o ']' en el arreglo")
+            }
+        }
+    }
+    si (c == "{") {
+        p["i"] = p["i"] + 1
+        sea r = {}
+        sea fijos = {}
+        _tm_ws(p)
+        si (_aj_c(s, p["i"]) == "}") { p["i"] = p["i"] + 1  p["inmutables"].agregar(r)  retornar r }
+        mientras (verdadero) {
+            sea pos = p["i"]
+            sea k = _tm_clave(p)
+            si (_aj_c(s, p["i"]) != "=") { _aj_error(s, p["i"], "se esperaba '='") }
+            p["i"] = p["i"] + 1
+            sea v = _tm_valor(p)
+            _tm_asignar(p, r, k, v, pos, fijos)
+            _tm_ws(p)
+            sea d = _aj_c(s, p["i"])
+            si (d == ",") {
+                p["i"] = p["i"] + 1
+                _tm_ws(p)
+                si (_aj_c(s, p["i"]) == "}") { _aj_error(s, p["i"], "coma final en tabla en línea") }
+            } sino {
+                si (d == "}") { p["i"] = p["i"] + 1  p["inmutables"].agregar(r)  retornar r }
+                _aj_error(s, p["i"], "se esperaba ',' o '}' en la tabla en línea")
+            }
+        }
+    }
+    // Número, booleano o fecha: hasta un delimitador.
+    sea ini = p["i"]
+    mientras (p["i"] < p["n"]) {
+        sea x = _aj_c(s, p["i"])
+        si (x == "," o x == "]" o x == "}" o x == "\n" o x == "\r" o x == "#" o x == "\t") { romper }
+        // Espacio: sólo dentro de una fecha y hora ("1979-05-27 07:32:00").
+        si (x == " ") {
+            si (_tm_es_fecha(subcadena(s, ini, p["i"])) y p["i"] - ini == 10 y _aj_es_digito(_aj_c(s, p["i"] + 1))) { p["i"] = p["i"] + 1 } sino { romper }
+        } sino { p["i"] = p["i"] + 1 }
+    }
+    sea crudo = subcadena(s, ini, p["i"])
+    si (crudo == "") { _aj_error(s, ini, "falta el valor") }
+    sea tf = _tm_tipo_fecha(crudo)
+    si (tf != nulo) {
+        si (p["fechas"] == "tipadas") { retornar {"$fecha": crudo, "tipo": tf} }
+        retornar crudo
+    }
+    si (_aj_es_digito(_aj_c(crudo, 0)) y longitud(crudo) >= 5 y (_aj_c(crudo, 4) == "-" o _aj_c(crudo, 2) == ":")) { _aj_error(s, ini, "fecha u hora inválida: " + crudo) }
+    retornar _tm_numero(p, crudo, ini)
+}
+
+funcion _tm_es_inmutable(p, m) {
+    para x en p["inmutables"] { si (x == m) { retornar verdadero } }
+    retornar falso
+}
+
+// Asigna k (lista de partes) = v en la tabla t, creando tablas intermedias.
+funcion _tm_asignar(p, t, k, v, pos, fijos) {
+    sea actual = t
+    sea i = 0
+    sea ruta = ""
+    mientras (i < longitud(k) - 1) {
+        ruta = ruta + _AJ_SEP + k[i]
+        sea parte = k[i]
+        si (tiene_clave(actual, parte)) {
+            sea x = actual[parte]
+            si (tipo(x) != "mapa" o _tm_es_inmutable(p, x) o tiene_clave(p["arreglos_tabla"], ruta)) { _aj_error(p["s"], pos, "la clave '" + parte + "' ya tiene un valor") }
+            si (tiene_clave(p["definidas"], _tm_id(p, x)) y tiene_clave(fijos, ruta) == falso) { _aj_error(p["s"], pos, "la tabla '" + parte + "' ya se definió") }
+        } sino {
+            actual[parte] = {}
+            fijos[ruta] = verdadero
+        }
+        actual = actual[parte]
+        i = i + 1
+    }
+    sea ult = k[longitud(k) - 1]
+    si (tiene_clave(actual, ult)) { _aj_error(p["s"], pos, "clave duplicada '" + unir(k, ".") + "'") }
+    actual[ult] = v
+}
+
+funcion _tm_id(p, m) {
+    // Identidad de una tabla para saber si ya se definió con [encabezado].
+    sea i = 0
+    mientras (i < longitud(p["lista_definidas"])) {
+        si (p["lista_definidas"][i] == m) { retornar "" + i }
+        i = i + 1
+    }
+    retornar "-"
+}
+
+/// Lee un documento TOML 1.0. opciones: fechas ("texto" por defecto, o
+/// "tipadas" → {"$fecha": "...", "tipo": "fecha_hora" | "fecha_hora_local"
+/// | "fecha" | "hora"}). Lanza un error con línea y columna si es inválido.
+funcion ajustes_toml(texto, opciones) {
+    sea o = opciones ?? {}
+    sea s = "" + texto
+    si (texto_empieza_con(s, caracter(65279))) { s = subcadena(s, 3, longitud(s)) }
+    sea raiz = {}
+    sea p = {"s": s, "i": 0, "n": longitud(s), "fechas": o["fechas"] ?? "texto", "inmutables": [], "definidas": {}, "lista_definidas": [], "arreglos_tabla": {}, "implicitas": {}}
+    sea actual = raiz
+    sea fijos_actual = {}
+    sea encabezados = {}
+    mientras (verdadero) {
+        _tm_ws_nl(p)
+        si (p["i"] >= p["n"]) { retornar raiz }
+        sea pos = p["i"]
+        si (_aj_c(s, p["i"]) == "[") {
+            sea doble = _aj_c(s, p["i"] + 1) == "["
+            p["i"] = p["i"] + 1
+            si (doble) { p["i"] = p["i"] + 1 }
+            sea k = _tm_clave(p)
+            si (_aj_c(s, p["i"]) != "]" o (doble y _aj_c(s, p["i"] + 1) != "]")) { _aj_error(s, p["i"], "encabezado de tabla sin cerrar") }
+            p["i"] = p["i"] + 1
+            si (doble) { p["i"] = p["i"] + 1 }
+            _tm_fin_linea(p)
+            // Recorre / crea el camino.
+            sea t = raiz
+            sea ruta = ""
+            sea j = 0
+            mientras (j < longitud(k)) {
+                sea parte = k[j]
+                ruta = ruta + _AJ_SEP + parte
+                sea ultimo = j == longitud(k) - 1
+                si (ultimo y doble) {
+                    si (tiene_clave(t, parte)) {
+                        si (tiene_clave(p["arreglos_tabla"], ruta) == falso) { _aj_error(s, pos, "'" + unir(k, ".") + "' no es un arreglo de tablas") }
+                    } sino {
+                        t[parte] = []
+                        p["arreglos_tabla"][ruta] = verdadero
+                    }
+                    sea nueva = {}
+                    t[parte].agregar(nueva)
+                    // Las subtablas de un elemento anterior se olvidan.
+                    para kk en claves(encabezados) { si (texto_empieza_con(kk, ruta + _AJ_SEP)) { quitar_clave(encabezados, kk) } }
+                    para kk en claves(p["arreglos_tabla"]) { si (texto_empieza_con(kk, ruta + _AJ_SEP)) { quitar_clave(p["arreglos_tabla"], kk) } }
+                    t = nueva
+                } sino {
+                    si (tiene_clave(t, parte)) {
+                        sea x = t[parte]
+                        si (tipo(x) == "lista" y tiene_clave(p["arreglos_tabla"], ruta)) {
+                            si (ultimo) { _aj_error(s, pos, "'" + unir(k, ".") + "' es un arreglo de tablas") }
+                            x = x[longitud(x) - 1]
+                        } sino {
+                            si (tipo(x) != "mapa" o _tm_es_inmutable(p, x)) { _aj_error(s, pos, "la clave '" + parte + "' ya tiene un valor") }
+                            si (ultimo y tiene_clave(encabezados, ruta)) { _aj_error(s, pos, "la tabla '" + unir(k, ".") + "' ya se definió") }
+                            si (ultimo y tiene_clave(p["implicitas"], ruta)) { _aj_error(s, pos, "la tabla '" + unir(k, ".") + "' ya se definió con claves con punto") }
+                        }
+                        t = x
+                    } sino {
+                        t[parte] = {}
+                        t = t[parte]
+                    }
+                    si (ultimo) { encabezados[ruta] = verdadero }
+                }
+                j = j + 1
+            }
+            actual = t
+            p["ruta_actual"] = ruta
+            fijos_actual = {}
+        } sino {
+            sea k = _tm_clave(p)
+            si (_aj_c(s, p["i"]) != "=") { _aj_error(s, p["i"], "se esperaba '=' después de la clave") }
+            p["i"] = p["i"] + 1
+            sea v = _tm_valor(p)
+            // Tablas creadas con claves con punto: no se pueden reabrir.
+            sea ruta = p["ruta_actual"] ?? ""
+            sea j = 0
+            mientras (j < longitud(k) - 1) {
+                ruta = ruta + _AJ_SEP + k[j]
+                si (tiene_clave(encabezados, ruta) y tiene_clave(fijos_actual, ruta) == falso) { _aj_error(s, pos, "la tabla '" + k[j] + "' ya se definió") }
+                p["implicitas"][ruta] = verdadero
+                j = j + 1
+            }
+            sea antes = {}
+            para kk en claves(fijos_actual) { antes[kk] = verdadero }
+            _tm_asignar_raiz(p, actual, k, v, pos, fijos_actual)
+            _tm_fin_linea(p)
+        }
+    }
+}
+
+funcion _tm_asignar_raiz(p, t, k, v, pos, fijos) {
+    sea actual = t
+    sea i = 0
+    sea ruta = p["ruta_actual"] ?? ""
+    mientras (i < longitud(k) - 1) {
+        sea parte = k[i]
+        ruta = ruta + _AJ_SEP + parte
+        si (tiene_clave(actual, parte)) {
+            sea x = actual[parte]
+            si (tipo(x) != "mapa" o _tm_es_inmutable(p, x) o tiene_clave(fijos, ruta) == falso) { _aj_error(p["s"], pos, "la clave '" + parte + "' ya tiene un valor") }
+        } sino {
+            actual[parte] = {}
+            fijos[ruta] = verdadero
+        }
+        actual = actual[parte]
+        i = i + 1
+    }
+    sea ult = k[longitud(k) - 1]
+    si (tiene_clave(actual, ult)) { _aj_error(p["s"], pos, "clave duplicada '" + unir(k, ".") + "'") }
+    actual[ult] = v
+}
+
+// ── Escribir TOML ─────────────────────────────────────────────────────────
+
+funcion _tm_clave_texto(k) {
+    sea ok = longitud(k) > 0
+    sea i = 0
+    mientras (i < longitud(k)) {
+        sea b = byte_en(k, i)
+        si ((b >= 65 y b <= 90) o (b >= 97 y b <= 122) o (b >= 48 y b <= 57) o b == 95 o b == 45) { } sino { ok = falso }
+        i = i + 1
+    }
+    si (ok) { retornar k }
+    retornar _tm_cita(k)
+}
+
+funcion _tm_cita(t) {
+    sea r = "\""
+    sea i = 0
+    mientras (i < longitud(t)) {
+        sea c = subcadena(t, i, i + 1)
+        sea b = byte_en(t, i)
+        si (c == "\"") { r = r + "\\\"" } sino {
+            si (c == "\\") { r = r + "\\\\" } sino {
+                si (c == "\n") { r = r + "\\n" } sino {
+                    si (c == "\t") { r = r + "\\t" } sino {
+                        si (c == "\r") { r = r + "\\r" } sino {
+                            si (b < 32 o b == 127) {
+                                sea h = texto_mayusculas(hex_de_bytes(bytes_entero(b, 2, 0)))
+                                r = r + "\\u" + h
+                            } sino { r = r + c }
+                        }
+                    }
+                }
+            }
+        }
+        i = i + 1
+    }
+    retornar r + "\""
+}
+
+funcion _tm_es_fecha_valor(v) { retornar tipo(v) == "mapa" y tiene_clave(v, "$fecha") }
+
+funcion _tm_valor_texto(v) {
+    si (v == nulo) { lanzar "ajustes: TOML no tiene nulo" }
+    sea t = tipo(v)
+    si (t == "booleano") {
+        si (v) { retornar "true" }
+        retornar "false"
+    }
+    si (t == "numero") {
+        si (v != v) { retornar "nan" }
+        si (v > 1e308) { retornar "inf" }
+        si (v < -1e308) { retornar "-inf" }
+        retornar json_texto(v)
+    }
+    si (t == "texto") { retornar _tm_cita(v) }
+    si (t == "lista") {
+        sea r = []
+        para x en v { r.agregar(_tm_valor_texto(x)) }
+        retornar "[" + unir(r, ", ") + "]"
+    }
+    si (_tm_es_fecha_valor(v)) { retornar v["$fecha"] }
+    si (t == "mapa") {
+        sea r = []
+        para k en claves(v) { si (v[k] != nulo) { r.agregar(_tm_clave_texto(k) + " = " + _tm_valor_texto(v[k])) } }
+        si (longitud(r) == 0) { retornar "{}" }
+        retornar "{ " + unir(r, ", ") + " }"
+    }
+    lanzar "ajustes: no se puede escribir en TOML un valor de tipo " + t
+}
+
+funcion _tm_es_tabla(v) { retornar tipo(v) == "mapa" y _tm_es_fecha_valor(v) == falso }
+funcion _tm_es_arreglo_tablas(v) {
+    si (tipo(v) != "lista" o longitud(v) == 0) { retornar falso }
+    para x en v { si (_tm_es_tabla(x) == falso) { retornar falso } }
+    retornar verdadero
+}
+
+funcion _tm_escribir(m, ruta, salida) {
+    sea simples = []
+    para k en claves(m) {
+        sea v = m[k]
+        si (v != nulo y _tm_es_tabla(v) == falso y _tm_es_arreglo_tablas(v) == falso) { simples.agregar(_tm_clave_texto(k) + " = " + _tm_valor_texto(v)) }
+    }
+    si (longitud(simples) > 0 o (ruta != "" y longitud(claves(m)) == 0)) {
+        si (ruta != "") { salida.agregar("[" + ruta + "]") }
+        para l en simples { salida.agregar(l) }
+        salida.agregar("")
+    }
+    para k en claves(m) {
+        sea v = m[k]
+        sea sub = _tm_clave_texto(k)
+        si (ruta != "") { sub = ruta + "." + sub }
+        si (_tm_es_tabla(v)) {
+            // Tabla que sólo tiene subtablas: no hace falta su encabezado.
+            _tm_escribir(v, sub, salida)
+        }
+        si (_tm_es_arreglo_tablas(v)) {
+            para x en v {
+                salida.agregar("[[" + sub + "]]")
+                sea interno = []
+                _tm_escribir_arreglo(x, sub, salida)
+            }
+        }
+    }
+}
+
+funcion _tm_escribir_arreglo(m, ruta, salida) {
+    para k en claves(m) {
+        sea v = m[k]
+        si (v != nulo y _tm_es_tabla(v) == falso y _tm_es_arreglo_tablas(v) == falso) { salida.agregar(_tm_clave_texto(k) + " = " + _tm_valor_texto(v)) }
+    }
+    salida.agregar("")
+    para k en claves(m) {
+        sea v = m[k]
+        sea sub = ruta + "." + _tm_clave_texto(k)
+        si (_tm_es_tabla(v)) { _tm_escribir(v, sub, salida) }
+        si (_tm_es_arreglo_tablas(v)) {
+            para x en v {
+                salida.agregar("[[" + sub + "]]")
+                _tm_escribir_arreglo(x, sub, salida)
+            }
+        }
+    }
+}
+
+/// Escribe un mapa como TOML (los nulos se omiten).
+funcion ajustes_a_toml(m) {
+    sea salida = []
+    _tm_escribir(m, "", salida)
+    mientras (longitud(salida) > 0 y salida[longitud(salida) - 1] == "") { quitar_ultimo(salida) }
+    retornar unir(salida, "\n") + "\n"
+}
+
+// ══ YAML ═══════════════════════════════════════════════════════════════════
+// Se lee por líneas lógicas con su sangría; el texto en línea ([...], {...},
+// comillas) se lee con un cursor sobre el texto completo.
+
+funcion _ym_nuevo(texto, o) {
+    retornar {"s": texto, "n": longitud(texto), "i": 0, "anclas": {}, "duplicadas": o["duplicadas"] ?? falso}
+}
+
+funcion _ym_blanco(c) { retornar c == "" o c == " " o c == "\t" o c == "\n" o c == "\r" }
+
+funcion _ym_c(p, k) { retornar _aj_c(p["s"], p["i"] + k) }
+
+// Columna (en bytes) de la posición i dentro de su línea.
+funcion _ym_col(p, i) {
+    sea j = i
+    mientras (j > 0 y byte_en(p["s"], j - 1) != 10) { j = j - 1 }
+    retornar i - j
+}
+
+// Salta espacios, comentarios y líneas vacías. Devuelve la sangría de la
+// siguiente línea con contenido (o -1 si se acabó el documento).
+funcion _ym_saltar(p) {
+    mientras (p["i"] < p["n"]) {
+        sea c = _ym_c(p, 0)
+        si (c == " " o c == "\t" o c == "\r" o c == "\n") { p["i"] = p["i"] + 1 } sino {
+            si (c == "#" y (p["i"] == 0 o texto_indice(" \t\n", _aj_c(p["s"], p["i"] - 1)) >= 0)) {
+                mientras (p["i"] < p["n"] y _ym_c(p, 0) != "\n") { p["i"] = p["i"] + 1 }
+            } sino {
+                // Fin de documento.
+                si (_ym_col(p, p["i"]) == 0 y (subcadena(p["s"], p["i"], minimo(p["n"], p["i"] + 3)) == "---" o subcadena(p["s"], p["i"], minimo(p["n"], p["i"] + 3)) == "...") y _ym_blanco(_ym_c(p, 3))) { retornar -1 }
+                retornar _ym_col(p, p["i"])
+            }
+        }
+    }
+    retornar -1
+}
+
+funcion _ym_ws(p) {
+    mientras (_ym_c(p, 0) == " " o _ym_c(p, 0) == "\t") { p["i"] = p["i"] + 1 }
+}
+
+funcion _ym_fin_linea(p) {
+    _ym_ws(p)
+    si (_ym_c(p, 0) == "#") { mientras (p["i"] < p["n"] y _ym_c(p, 0) != "\n") { p["i"] = p["i"] + 1 } }
+    retornar p["i"] >= p["n"] o _ym_c(p, 0) == "\n" o _ym_c(p, 0) == "\r"
+}
+
+// Lee &ancla y !etiqueta antes de un nodo.
+funcion _ym_propiedades(p) {
+    sea r = {"ancla": nulo, "etiqueta": nulo}
+    mientras (verdadero) {
+        _ym_ws(p)
+        sea c = _ym_c(p, 0)
+        si (c == "&" o c == "!") {
+            sea ini = p["i"] + 1
+            p["i"] = p["i"] + 1
+            mientras (p["i"] < p["n"] y texto_indice(" \t\n\r,[]{}", _ym_c(p, 0)) < 0) { p["i"] = p["i"] + 1 }
+            sea nombre = subcadena(p["s"], ini, p["i"])
+            si (c == "&") { r["ancla"] = nombre } sino { r["etiqueta"] = "!" + nombre }
+        } sino { retornar r }
+    }
+}
+
+funcion _ym_guardar(p, props, v) {
+    si (props["ancla"] != nulo) { p["anclas"][props["ancla"]] = v }
+    retornar v
+}
+
+funcion _ym_etiquetar(p, props, v, pos) {
+    sea e = props["etiqueta"]
+    si (e == nulo) { retornar v }
+    si (e == "!!str") { retornar "" + v }
+    si (e == "!!int") { retornar a_numero("" + v) }
+    si (e == "!!float") { retornar a_numero("" + v) }
+    si (e == "!!bool") { retornar v == verdadero o v == "true" }
+    si (e == "!!null") { retornar nulo }
+    retornar v
+}
+
+// Resuelve un escalar sin comillas con el esquema núcleo de YAML 1.2.
+funcion _ym_escalar(t) {
+    si (t == "" o t == "~" o t == "null" o t == "Null" o t == "NULL") { retornar nulo }
+    si (t == "true" o t == "True" o t == "TRUE") { retornar verdadero }
+    si (t == "false" o t == "False" o t == "FALSE") { retornar falso }
+    si (t == ".inf" o t == ".Inf" o t == ".INF" o t == "+.inf" o t == "+.Inf" o t == "+.INF") { retornar 1e308 * 10 }
+    si (t == "-.inf" o t == "-.Inf" o t == "-.INF") { retornar -1e308 * 10 }
+    si (t == ".nan" o t == ".NaN" o t == ".NAN") { retornar (1e308 * 10) - (1e308 * 10) }
+    si (texto_empieza_con(t, "0x") y longitud(t) > 2 y _aj_hex(subcadena(t, 2, longitud(t))) >= 0) { retornar _aj_hex(subcadena(t, 2, longitud(t))) }
+    si (texto_empieza_con(t, "0o") y longitud(t) > 2) {
+        sea v = 0
+        sea i = 2
+        mientras (i < longitud(t)) {
+            sea d = texto_indice("01234567", _aj_c(t, i))
+            si (d < 0) { retornar t }
+            v = v * 8 + d
+            i = i + 1
+        }
+        retornar v
+    }
+    // [-+]?(\.[0-9]+|[0-9]+(\.[0-9]*)?)([eE][-+]?[0-9]+)?
+    sea i = 0
+    si (_aj_c(t, 0) == "-" o _aj_c(t, 0) == "+") { i = 1 }
+    sea digitos = 0
+    mientras (_aj_es_digito(_aj_c(t, i))) { i = i + 1  digitos = digitos + 1 }
+    sea es_float = falso
+    si (_aj_c(t, i) == ".") {
+        es_float = verdadero
+        i = i + 1
+        mientras (_aj_es_digito(_aj_c(t, i))) { i = i + 1  digitos = digitos + 1 }
+    }
+    si (digitos == 0) { retornar t }
+    si (_aj_c(t, i) == "e" o _aj_c(t, i) == "E") {
+        i = i + 1
+        si (_aj_c(t, i) == "-" o _aj_c(t, i) == "+") { i = i + 1 }
+        sea d2 = 0
+        mientras (_aj_es_digito(_aj_c(t, i))) { i = i + 1  d2 = d2 + 1 }
+        si (d2 == 0) { retornar t }
+    }
+    si (i != longitud(t)) { retornar t }
+    si (texto_empieza_con(t, "+")) { retornar a_numero(subcadena(t, 1, longitud(t))) }
+    retornar a_numero(t)
+}
+
+funcion _ym_doble(p) {
+    sea ini = p["i"]
+    p["i"] = p["i"] + 1
+    sea r = ""
+    sea pendiente = ""
+    mientras (verdadero) {
+        si (p["i"] >= p["n"]) { _aj_error(p["s"], ini, "texto entre comillas sin cerrar") }
+        sea c = _ym_c(p, 0)
+        si (c == "\"") { p["i"] = p["i"] + 1  retornar r }
+        si (c == "\\") {
+            sea e = _ym_c(p, 1)
+            p["i"] = p["i"] + 2
+            si (e == "n") { r = r + "\n" } sino {
+                si (e == "t" o e == "\t") { r = r + "\t" } sino {
+                    si (e == "\\" o e == "\"" o e == "/" o e == " ") { r = r + e } sino {
+                        si (e == "0") { r = r + caracter(0) } sino {
+                            si (e == "r") { r = r + "\r" } sino {
+                                si (e == "e") { r = r + caracter(27) } sino {
+                                    si (e == "N") { r = r + caracter(133) } sino {
+                                        si (e == "_") { r = r + caracter(160) } sino {
+                                            si (e == "x" o e == "u" o e == "U") {
+                                                sea n = 2
+                                                si (e == "u") { n = 4 }
+                                                si (e == "U") { n = 8 }
+                                                sea v = _aj_hex(subcadena(p["s"], p["i"], minimo(p["n"], p["i"] + n)))
+                                                si (v < 0) { _aj_error(p["s"], p["i"], "escape inválido") }
+                                                r = r + caracter(v)
+                                                p["i"] = p["i"] + n
+                                            } sino {
+                                                si (e == "\n" o e == "\r") {
+                                                    // Barra al final: une líneas sin espacio.
+                                                    mientras (texto_indice(" \t\r\n", _ym_c(p, 0)) >= 0 y p["i"] < p["n"]) { p["i"] = p["i"] + 1 }
+                                                } sino { _aj_error(p["s"], p["i"] - 2, "escape inválido \\" + e) }
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        } sino {
+            si (c == "\n" o c == "\r") {
+                // Plegado: un salto de línea es un espacio; líneas vacías son saltos.
+                r = _ym_sin_espacios_finales(r)
+                sea saltos = 0
+                mientras (texto_indice(" \t\r\n", _ym_c(p, 0)) >= 0 y p["i"] < p["n"]) {
+                    si (_ym_c(p, 0) == "\n") { saltos = saltos + 1 }
+                    p["i"] = p["i"] + 1
+                }
+                si (saltos <= 1) { r = r + " " } sino {
+                    sea k = 1
+                    mientras (k < saltos) { r = r + "\n"  k = k + 1 }
+                }
+            } sino {
+                r = r + c
+                p["i"] = p["i"] + 1
+            }
+        }
+    }
+}
+
+funcion _ym_sin_espacios_finales(r) {
+    mientras (texto_termina_con(r, " ") o texto_termina_con(r, "\t")) { r = subcadena(r, 0, longitud(r) - 1) }
+    retornar r
+}
+
+funcion _ym_simple(p) {
+    sea ini = p["i"]
+    p["i"] = p["i"] + 1
+    sea r = ""
+    mientras (verdadero) {
+        si (p["i"] >= p["n"]) { _aj_error(p["s"], ini, "texto entre comillas sin cerrar") }
+        sea c = _ym_c(p, 0)
+        si (c == "'") {
+            si (_ym_c(p, 1) == "'") { r = r + "'"  p["i"] = p["i"] + 2 } sino { p["i"] = p["i"] + 1  retornar r }
+        } sino {
+            si (c == "\n" o c == "\r") {
+                r = _ym_sin_espacios_finales(r)
+                sea saltos = 0
+                mientras (texto_indice(" \t\r\n", _ym_c(p, 0)) >= 0 y p["i"] < p["n"]) {
+                    si (_ym_c(p, 0) == "\n") { saltos = saltos + 1 }
+                    p["i"] = p["i"] + 1
+                }
+                si (saltos <= 1) { r = r + " " } sino {
+                    sea k = 1
+                    mientras (k < saltos) { r = r + "\n"  k = k + 1 }
+                }
+            } sino {
+                r = r + c
+                p["i"] = p["i"] + 1
+            }
+        }
+    }
+}
+
+// Escalar sin comillas. en_flujo: termina también en , [ ] { }.
+// sangria: las líneas siguientes con más sangría continúan el escalar.
+funcion _ym_plano(p, en_flujo, sangria) {
+    sea r = ""
+    sea linea = ""
+    mientras (verdadero) {
+        si (p["i"] >= p["n"]) { romper }
+        sea c = _ym_c(p, 0)
+        si (c == "\n" o c == "\r") {
+            // ¿Continúa en la línea siguiente?
+            sea guardado = p["i"]
+            sea saltos = 0
+            mientras (p["i"] < p["n"] y texto_indice(" \t\r\n", _ym_c(p, 0)) >= 0) {
+                si (_ym_c(p, 0) == "\n") { saltos = saltos + 1 }
+                p["i"] = p["i"] + 1
+            }
+            sea col = _ym_col(p, p["i"])
+            sea sigue = p["i"] < p["n"] y _ym_c(p, 0) != "#" y (en_flujo o col > sangria)
+            si (sigue y en_flujo == falso y col == 0 y (subcadena(p["s"], p["i"], minimo(p["n"], p["i"] + 3)) == "---" o subcadena(p["s"], p["i"], minimo(p["n"], p["i"] + 3)) == "...")) { sigue = falso }
+            si (sigue y en_flujo == falso) {
+                // Una línea "clave: valor" o "- x" no continúa un escalar.
+                sea j = p["i"]
+                sea fin = j
+                mientras (fin < p["n"] y byte_en(p["s"], fin) != 10) { fin = fin + 1 }
+                sea l = subcadena(p["s"], j, fin)
+                si (texto_indice(l, ": ") >= 0 o texto_termina_con(texto_recortar(l), ":") o texto_empieza_con(l, "- ") o l == "-" o texto_indice(l, " #") >= 0) { sigue = falso }
+            }
+            si (sigue == falso) {
+                p["i"] = guardado
+                romper
+            }
+            r = r + _ym_sin_espacios_finales(linea)
+            si (saltos <= 1) { r = r + " " } sino {
+                sea k = 1
+                mientras (k < saltos) { r = r + "\n"  k = k + 1 }
+            }
+            linea = ""
+        } sino {
+            si (c == "#" y (linea == "" o texto_termina_con(linea, " ") o texto_termina_con(linea, "\t"))) { romper }
+            si (c == ":" y (_ym_blanco(_ym_c(p, 1)) o (en_flujo y texto_indice(",[]{}", _ym_c(p, 1)) >= 0))) {
+                si (_ym_c(p, 1) != "" o verdadero) { romper }
+            }
+            si (en_flujo y texto_indice(",[]{}", c) >= 0) { romper }
+            linea = linea + c
+            p["i"] = p["i"] + 1
+        }
+    }
+    retornar texto_recortar(r + _ym_sin_espacios_finales(linea))
+}
+
+funcion _ym_flujo(p) {
+    _ym_saltar_flujo(p)
+    sea props = _ym_propiedades(p)
+    _ym_saltar_flujo(p)
+    sea c = _ym_c(p, 0)
+    sea pos = p["i"]
+    si (c == "*") {
+        p["i"] = p["i"] + 1
+        sea ini = p["i"]
+        mientras (p["i"] < p["n"] y texto_indice(" \t\n\r,[]{}", _ym_c(p, 0)) < 0) { p["i"] = p["i"] + 1 }
+        sea nombre = subcadena(p["s"], ini, p["i"])
+        si (tiene_clave(p["anclas"], nombre) == falso) { _aj_error(p["s"], pos, "alias desconocido *" + nombre) }
+        retornar p["anclas"][nombre]
+    }
+    si (c == "[") {
+        p["i"] = p["i"] + 1
+        sea r = []
+        _ym_guardar(p, props, r)
+        mientras (verdadero) {
+            _ym_saltar_flujo(p)
+            si (_ym_c(p, 0) == "]") { p["i"] = p["i"] + 1  retornar r }
+            sea antes = p["i"]
+            sea v = _ym_flujo(p)
+            _ym_saltar_flujo(p)
+            si (_ym_c(p, 0) == ":") {
+                // [a: 1] es una lista con un mapa de un par.
+                p["i"] = p["i"] + 1
+                sea m = {}
+                m["" + v] = _ym_flujo(p)
+                v = m
+                _ym_saltar_flujo(p)
+            }
+            r.agregar(v)
+            si (_ym_c(p, 0) == ",") { p["i"] = p["i"] + 1 } sino {
+                si (_ym_c(p, 0) != "]") { _aj_error(p["s"], p["i"], "se esperaba ',' o ']'") }
+            }
+        }
+    }
+    si (c == "{") {
+        p["i"] = p["i"] + 1
+        sea r = {}
+        _ym_guardar(p, props, r)
+        mientras (verdadero) {
+            _ym_saltar_flujo(p)
+            si (_ym_c(p, 0) == "}") { p["i"] = p["i"] + 1  retornar r }
+            sea kpos = p["i"]
+            sea k = _ym_flujo(p)
+            _ym_saltar_flujo(p)
+            sea v = nulo
+            si (_ym_c(p, 0) == ":") {
+                p["i"] = p["i"] + 1
+                _ym_saltar_flujo(p)
+                si (_ym_c(p, 0) != "," y _ym_c(p, 0) != "}") { v = _ym_flujo(p) }
+            }
+            _ym_poner(p, r, k, v, kpos)
+            _ym_saltar_flujo(p)
+            si (_ym_c(p, 0) == ",") { p["i"] = p["i"] + 1 } sino {
+                si (_ym_c(p, 0) != "}") { _aj_error(p["s"], p["i"], "se esperaba ',' o '}'") }
+            }
+        }
+    }
+    si (c == "\"") { retornar _ym_guardar(p, props, _ym_etiquetar(p, props, _ym_doble(p), pos)) }
+    si (c == "'") { retornar _ym_guardar(p, props, _ym_etiquetar(p, props, _ym_simple(p), pos)) }
+    sea t = _ym_plano(p, verdadero, -1)
+    sea v = _ym_escalar(t)
+    si (props["etiqueta"] == "!!str") { v = t }
+    retornar _ym_guardar(p, props, _ym_etiquetar(p, props, v, pos))
+}
+
+funcion _ym_saltar_flujo(p) {
+    mientras (p["i"] < p["n"]) {
+        sea c = _ym_c(p, 0)
+        si (c == " " o c == "\t" o c == "\n" o c == "\r") { p["i"] = p["i"] + 1 } sino {
+            si (c == "#") { mientras (p["i"] < p["n"] y _ym_c(p, 0) != "\n") { p["i"] = p["i"] + 1 } } sino { retornar nulo }
+        }
+    }
+}
+
+funcion _ym_clave_texto(k) {
+    si (k == nulo) { retornar "null" }
+    si (k == verdadero) { retornar "true" }
+    si (k == falso) { retornar "false" }
+    retornar "" + k
+}
+
+funcion _ym_poner(p, m, k, v, pos) {
+    sea kt = _ym_clave_texto(k)
+    si (kt == "<<") {
+        // Clave de mezcla: copia lo que no esté ya.
+        sea fuentes = v
+        si (tipo(v) == "mapa") { fuentes = [v] }
+        para f en fuentes {
+            si (tipo(f) != "mapa") { _aj_error(p["s"], pos, "<< espera un mapa o lista de mapas") }
+            para kk en claves(f) { si (tiene_clave(m, kk) == falso) { m[kk] = f[kk] } }
+        }
+        retornar nulo
+    }
+    si (tiene_clave(m, kt) y p["duplicadas"] == falso y tiene_clave(p["mezclados"] ?? {}, kt) == falso) { _aj_error(p["s"], pos, "clave duplicada '" + kt + "'") }
+    m[kt] = v
+}
+
+// Bloque | o >. Devuelve el texto.
+funcion _ym_bloque(p, sangria_padre) {
+    sea ind = _ym_c(p, 0)
+    p["i"] = p["i"] + 1
+    sea mascar = "clip"
+    sea explicita = 0
+    mientras (_ym_c(p, 0) == "-" o _ym_c(p, 0) == "+" o _aj_es_digito(_ym_c(p, 0))) {
+        sea c = _ym_c(p, 0)
+        si (c == "-") { mascar = "strip" }
+        si (c == "+") { mascar = "keep" }
+        si (_aj_es_digito(c)) { explicita = a_numero(c) }
+        p["i"] = p["i"] + 1
+    }
+    si (_ym_fin_linea(p) == falso) { _aj_error(p["s"], p["i"], "se esperaba fin de línea después del indicador de bloque") }
+    si (_ym_c(p, 0) == "\r") { p["i"] = p["i"] + 1 }
+    si (_ym_c(p, 0) == "\n") { p["i"] = p["i"] + 1 }
+    // Líneas del bloque.
+    sea lineas = []
+    sea sangria = -1
+    si (explicita > 0) { sangria = maximo(0, sangria_padre) + explicita }
+    mientras (p["i"] < p["n"]) {
+        sea ini = p["i"]
+        sea fin = ini
+        mientras (fin < p["n"] y byte_en(p["s"], fin) != 10) { fin = fin + 1 }
+        sea l = subcadena(p["s"], ini, fin)
+        si (texto_termina_con(l, "\r")) { l = subcadena(l, 0, longitud(l) - 1) }
+        sea esp = 0
+        mientras (esp < longitud(l) y _aj_c(l, esp) == " ") { esp = esp + 1 }
+        si (esp == longitud(l)) {
+            lineas.agregar("")
+        } sino {
+            si (sangria < 0) { sangria = esp }
+            si (esp < sangria o esp <= sangria_padre) { romper }
+            lineas.agregar(subcadena(l, sangria, longitud(l)))
+        }
+        p["i"] = minimo(p["n"], fin + 1)
+        si (fin >= p["n"]) { romper }
+    }
+    // Se retrocede hasta el salto que terminó la última línea leída.
+    si (p["i"] < p["n"] o (p["i"] == p["n"] y p["n"] > 0 y byte_en(p["s"], p["n"] - 1) == 10)) { p["i"] = p["i"] - 1 }
+    si (p["i"] < 0) { p["i"] = 0 }
+    // Separa las líneas vacías finales.
+    sea finales = 0
+    mientras (longitud(lineas) > 0 y lineas[longitud(lineas) - 1] == "") {
+        quitar_ultimo(lineas)
+        finales = finales + 1
+    }
+    sea r = ""
+    si (ind == "|") { r = unir(lineas, "\n") } sino {
+        // Plegado: líneas normales se unen con espacio; las vacías son saltos;
+        // las más sangradas se conservan.
+        sea i = 0
+        mientras (i < longitud(lineas)) {
+            sea l = lineas[i]
+            si (i > 0) {
+                sea prev = lineas[i - 1]
+                si (l == "" ) { r = r + "\n" } sino {
+                    si (prev == "" o texto_empieza_con(l, " ") o texto_empieza_con(prev, " ")) {
+                        si (prev != "" ) { r = r + "\n" } sino { si (texto_empieza_con(l, " ") y i >= 2) { r = r + "" } }
+                    } sino { r = r + " " }
+                }
+            }
+            r = r + l
+            i = i + 1
+        }
+    }
+    si (longitud(lineas) == 0) {
+        si (mascar == "keep") {
+            sea k = 0
+            mientras (k < finales) { r = r + "\n"  k = k + 1 }
+        }
+        retornar r
+    }
+    si (mascar == "clip") { r = r + "\n" }
+    si (mascar == "keep") {
+        r = r + "\n"
+        sea k = 0
+        mientras (k < finales) { r = r + "\n"  k = k + 1 }
+    }
+    retornar r
+}
+
+// Nodo en bloque que empieza en la posición actual (ya sin espacios), con
+// la sangría del contexto padre.
+funcion _ym_nodo(p, sangria) {
+    sea props = _ym_propiedades(p)
+    // Si las propiedades terminan la línea, el nodo sigue abajo.
+    si (_ym_fin_linea(p)) {
+        sea s2 = _ym_saltar(p)
+        si (s2 < 0 o s2 < sangria o (s2 == sangria y _ym_c(p, 0) != "-")) { retornar _ym_guardar(p, props, _ym_etiquetar(p, props, nulo, p["i"])) }
+        retornar _ym_guardar(p, props, _ym_etiquetar(p, props, _ym_bloque_nodo(p, s2, props), p["i"]))
+    }
+    sea col = _ym_col(p, p["i"])
+    sea c = _ym_c(p, 0)
+    si (c == "|" o c == ">") { retornar _ym_guardar(p, props, _ym_etiquetar(p, props, _ym_bloque(p, sangria), p["i"])) }
+    // Secuencia o mapa que empieza en esta misma línea ("- a", "k: v").
+    si ((c == "-" y _ym_blanco(_ym_c(p, 1))) o _ym_es_clave_bloque(p)) {
+        retornar _ym_guardar(p, props, _ym_bloque_nodo(p, col, props))
+    }
+    si (c == "[" o c == "{" o c == "*" o c == "\"" o c == "'") {
+        sea v = nulo
+        sea antes = p["i"]
+        si (c == "*" o c == "\"" o c == "'") {
+            v = _ym_flujo(p)
+        } sino { v = _ym_flujo(p) }
+        si (props["ancla"] != nulo) { p["anclas"][props["ancla"]] = v }
+        si (_ym_fin_linea(p) == falso) { _aj_error(p["s"], p["i"], "contenido inesperado después del valor") }
+        retornar _ym_etiquetar(p, props, v, antes)
+    }
+    sea pos = p["i"]
+    sea t = _ym_plano(p, falso, sangria)
+    sea v = _ym_escalar(t)
+    si (props["etiqueta"] == "!!str") { v = t }
+    retornar _ym_guardar(p, props, _ym_etiquetar(p, props, v, pos))
+}
+
+// ¿La línea actual es "clave: ..." (clave simple o entre comillas)?
+funcion _ym_es_clave_bloque(p) {
+    sea j = p["i"]
+    sea c = _aj_c(p["s"], j)
+    si (c == "\"" o c == "'") {
+        sea g = p["i"]
+        intentar {
+            si (c == "\"") { _ym_doble(p) } sino { _ym_simple(p) }
+        } capturar (e) { p["i"] = g  retornar falso }
+        _ym_ws(p)
+        sea es = _ym_c(p, 0) == ":" y _ym_blanco(_ym_c(p, 1))
+        p["i"] = g
+        retornar es
+    }
+    si (c == "[" o c == "{" o c == "#" o c == "|" o c == ">" o c == "&" o c == "!" o c == "*") { retornar falso }
+    si (c == "?" y _ym_blanco(_aj_c(p["s"], j + 1))) { retornar verdadero }
+    mientras (j < p["n"] y byte_en(p["s"], j) != 10) {
+        sea x = _aj_c(p["s"], j)
+        si (x == ":" y _ym_blanco(_aj_c(p["s"], j + 1))) { retornar verdadero }
+        si (x == "#" y j > p["i"] y texto_indice(" \t", _aj_c(p["s"], j - 1)) >= 0) { retornar falso }
+        j = j + 1
+    }
+    retornar falso
+}
+
+// Secuencia o mapa en bloque con sangría s (la posición está en su primer
+// elemento).
+funcion _ym_bloque_nodo(p, s, props) {
+    si (_ym_c(p, 0) == "-" y _ym_blanco(_ym_c(p, 1))) {
+        sea r = []
+        si (props != nulo) { _ym_guardar(p, props, r) }
+        mientras (verdadero) {
+            p["i"] = p["i"] + 1
+            _ym_ws(p)
+            sea v = nulo
+            si (_ym_fin_linea(p)) {
+                sea s2 = _ym_saltar(p)
+                si (s2 > s) { v = _ym_nodo(p, s) }
+            } sino { v = _ym_nodo(p, s) }
+            r.agregar(v)
+            sea s3 = _ym_saltar(p)
+            si (s3 != s o _ym_c(p, 0) != "-" o (_ym_blanco(_ym_c(p, 1)) == falso)) {
+                si (s3 > s) { _aj_error(p["s"], p["i"], "sangría inesperada") }
+                retornar r
+            }
+        }
+    }
+    sea m = {}
+    si (props != nulo) { _ym_guardar(p, props, m) }
+    sea mezclados = {}
+    mientras (verdadero) {
+        sea kpos = p["i"]
+        sea k = nulo
+        sea c = _ym_c(p, 0)
+        si (c == "?" y _ym_blanco(_ym_c(p, 1))) {
+            p["i"] = p["i"] + 1
+            _ym_ws(p)
+            k = _ym_nodo(p, s)
+            _ym_saltar(p)
+            si (_ym_c(p, 0) == ":") { } sino { _ym_poner(p, m, k, nulo, kpos)  k = "$sin_valor" }
+        } sino {
+            si (c == "\"") { k = _ym_doble(p) } sino {
+                si (c == "'") { k = _ym_simple(p) } sino {
+                    sea ini = p["i"]
+                    mientras (p["i"] < p["n"] y (_ym_c(p, 0) != ":" o (_ym_blanco(_ym_c(p, 1)) == falso))) { p["i"] = p["i"] + 1 }
+                    k = _ym_escalar(texto_recortar(subcadena(p["s"], ini, p["i"])))
+                    si (tipo(k) == "numero" y texto_recortar(subcadena(p["s"], ini, p["i"])) != "" + k) { k = texto_recortar(subcadena(p["s"], ini, p["i"])) }
+                }
+            }
+        }
+        si (k != "$sin_valor") {
+            _ym_ws(p)
+            si (_ym_c(p, 0) != ":") { _aj_error(p["s"], p["i"], "se esperaba ':'") }
+            p["i"] = p["i"] + 1
+            _ym_ws(p)
+            sea v = nulo
+            si (_ym_fin_linea(p)) {
+                sea s2 = _ym_saltar(p)
+                // Una secuencia puede ir a la misma sangría que la clave.
+                si (s2 > s o (s2 == s y _ym_c(p, 0) == "-" y _ym_blanco(_ym_c(p, 1)))) {
+                    si (s2 == s) { v = _ym_bloque_nodo(p, s2, nulo) } sino { v = _ym_nodo(p, s) }
+                }
+            } sino { v = _ym_nodo(p, s) }
+            p["mezclados"] = mezclados
+            si (_ym_clave_texto(k) == "<<") {
+                sea antes = {}
+                para kk en claves(m) { antes[kk] = verdadero }
+                _ym_poner(p, m, k, v, kpos)
+                para kk en claves(m) { si (tiene_clave(antes, kk) == falso) { mezclados[kk] = verdadero } }
+            } sino {
+                _ym_poner(p, m, k, v, kpos)
+                quitar_clave(mezclados, _ym_clave_texto(k))
+            }
+            p["mezclados"] = {}
+        }
+        sea s3 = _ym_saltar(p)
+        si (s3 != s o (_ym_c(p, 0) == "-" y _ym_blanco(_ym_c(p, 1)))) {
+            si (s3 > s) { _aj_error(p["s"], p["i"], "sangría inesperada") }
+            retornar m
+        }
+    }
+}
+
+funcion _ym_documento(p) {
+    sea s = _ym_saltar(p)
+    si (s < 0) { retornar nulo }
+    retornar _ym_nodo(p, -1)
+}
+
+/// Lee todos los documentos de un texto YAML (separados por ---).
+/// opciones: duplicadas (falso: una clave repetida es error).
+funcion ajustes_yaml_todos(texto, opciones) {
+    sea o = opciones ?? {}
+    sea t = texto_reemplazar("" + texto, "\r\n", "\n")
+    si (texto_empieza_con(t, caracter(65279))) { t = subcadena(t, 3, longitud(t)) }
+    sea p = _ym_nuevo(t, o)
+    sea docs = []
+    sea hubo = falso
+    mientras (verdadero) {
+        // Directivas %YAML / %TAG y marcadores.
+        mientras (verdadero) {
+            sea s = _ym_saltar(p)
+            si (p["i"] >= p["n"]) { retornar docs }
+            si (_ym_col(p, p["i"]) == 0 y _ym_c(p, 0) == "%") {
+                mientras (p["i"] < p["n"] y _ym_c(p, 0) != "\n") { p["i"] = p["i"] + 1 }
+            } sino {
+                si (subcadena(p["s"], p["i"], minimo(p["n"], p["i"] + 3)) == "...") { p["i"] = p["i"] + 3 } sino { romper }
+            }
+        }
+        sea explicito = falso
+        si (subcadena(p["s"], p["i"], minimo(p["n"], p["i"] + 3)) == "---") {
+            p["i"] = p["i"] + 3
+            explicito = verdadero
+        }
+        p["anclas"] = {}
+        _ym_ws(p)
+        sea v = nulo
+        si (_ym_fin_linea(p)) { v = _ym_documento(p) } sino { v = _ym_nodo(p, -1) }
+        si (explicito o v != nulo o hubo == falso) { docs.agregar(v) }
+        hubo = verdadero
+        sea s4 = _ym_saltar(p)
+        si (p["i"] < p["n"] y subcadena(p["s"], p["i"], minimo(p["n"], p["i"] + 3)) != "---" y subcadena(p["s"], p["i"], minimo(p["n"], p["i"] + 3)) != "...") { _aj_error(p["s"], p["i"], "contenido inesperado") }
+    }
+}
+
+/// Lee un documento YAML 1.2 (esquema núcleo: "yes"/"no" son textos).
+funcion ajustes_yaml(texto, opciones) {
+    sea d = ajustes_yaml_todos(texto, opciones)
+    si (longitud(d) == 0) { retornar nulo }
+    si (longitud(d) > 1) { lanzar "ajustes: el texto tiene " + longitud(d) + " documentos (usa ajustes_yaml_todos)" }
+    retornar d[0]
+}
+
+// ── Escribir YAML ─────────────────────────────────────────────────────────
+
+funcion _ym_necesita_comillas(t) {
+    si (t == "") { retornar verdadero }
+    si (_ym_escalar(t) != t) { retornar verdadero }
+    sea minus = texto_minusculas(t)
+    // También yes/no/on/off: así YAML 1.1 los lee igual.
+    para w en ["yes", "no", "on", "off", "y", "n"] { si (minus == w) { retornar verdadero } }
+    si (texto_indice("-?:,[]{}#&*!|>'\"%@`", _aj_c(t, 0)) >= 0) { retornar verdadero }
+    si (texto_empieza_con(t, " ") o texto_termina_con(t, " ")) { retornar verdadero }
+    si (texto_indice(t, ": ") >= 0 o texto_indice(t, " #") >= 0 o texto_termina_con(t, ":")) { retornar verdadero }
+    sea i = 0
+    mientras (i < longitud(t)) {
+        sea b = byte_en(t, i)
+        si (b < 32 o b == 127) { retornar verdadero }
+        i = i + 1
+    }
+    retornar falso
+}
+
+funcion _ym_cita(t) {
+    sea r = "\""
+    sea i = 0
+    mientras (i < longitud(t)) {
+        sea c = subcadena(t, i, i + 1)
+        sea b = byte_en(t, i)
+        si (c == "\"") { r = r + "\\\"" } sino {
+            si (c == "\\") { r = r + "\\\\" } sino {
+                si (c == "\n") { r = r + "\\n" } sino {
+                    si (c == "\t") { r = r + "\\t" } sino {
+                        si (b < 32 o b == 127) { r = r + "\\x" + hex_de_bytes(bytes_entero(b, 1, 0)) } sino { r = r + c }
+                    }
+                }
+            }
+        }
+        i = i + 1
+    }
+    retornar r + "\""
+}
+
+funcion _ym_escalar_texto(v) {
+    si (v == nulo) { retornar "null" }
+    sea t = tipo(v)
+    si (t == "booleano") {
+        si (v) { retornar "true" }
+        retornar "false"
+    }
+    si (t == "numero") {
+        si (v != v) { retornar ".nan" }
+        si (v > 1e308) { retornar ".inf" }
+        si (v < -1e308) { retornar "-.inf" }
+        retornar json_texto(v)
+    }
+    si (_tm_es_fecha_valor(v)) { retornar v["$fecha"] }
+    sea s = "" + v
+    si (_ym_necesita_comillas(s)) { retornar _ym_cita(s) }
+    retornar s
+}
+
+funcion _ym_espacios(n) {
+    sea r = ""
+    sea i = 0
+    mientras (i < n) { r = r + " "  i = i + 1 }
+    retornar r
+}
+
+funcion _ym_es_compuesto(v) { retornar (tipo(v) == "lista" y longitud(v) > 0) o (tipo(v) == "mapa" y longitud(claves(v)) > 0 y _tm_es_fecha_valor(v) == falso) }
+
+funcion _ym_escribir(v, sangria, salida, prefijo) {
+    si (tipo(v) == "lista" y longitud(v) > 0) {
+        sea primero = verdadero
+        para x en v {
+            sea pre = _ym_espacios(sangria) + "- "
+            si (primero y prefijo != nulo) { pre = prefijo + "- " }
+            primero = falso
+            si (_ym_es_compuesto(x)) { _ym_escribir(x, sangria + 2, salida, pre) } sino { salida.agregar(pre + _ym_valor_linea(x, sangria + 2)) }
+        }
+        retornar nulo
+    }
+    si (tipo(v) == "mapa" y longitud(claves(v)) > 0 y _tm_es_fecha_valor(v) == falso) {
+        sea primero = verdadero
+        para k en claves(v) {
+            sea pre = _ym_espacios(sangria)
+            si (primero y prefijo != nulo) { pre = prefijo }
+            primero = falso
+            sea kt = _ym_escalar_texto(k)
+            sea x = v[k]
+            si (_ym_es_compuesto(x)) {
+                salida.agregar(pre + kt + ":")
+                si (tipo(x) == "lista") { _ym_escribir(x, sangria, salida, nulo) } sino { _ym_escribir(x, sangria + 2, salida, nulo) }
+            } sino { salida.agregar(pre + kt + ": " + _ym_valor_linea(x, sangria + 2)) }
+        }
+        retornar nulo
+    }
+    sea pre = _ym_espacios(sangria)
+    si (prefijo != nulo) { pre = prefijo }
+    salida.agregar(pre + _ym_valor_linea(v, sangria))
+}
+
+funcion _ym_valor_linea(x, sangria) {
+    si (tipo(x) == "lista") { retornar "[]" }
+    si (tipo(x) == "mapa" y _tm_es_fecha_valor(x) == falso) { retornar "{}" }
+    // Textos de varias líneas: bloque literal.
+    si (tipo(x) == "texto" y texto_indice(x, "\n") >= 0 y texto_indice(x, "\r") < 0 y texto_empieza_con(x, " ") == falso) {
+        sea cuerpo = x
+        sea ind = "|"
+        si (texto_termina_con(x, "\n") == falso) { ind = "|-" } sino { cuerpo = subcadena(x, 0, longitud(x) - 1) }
+        si (texto_termina_con(cuerpo, "\n")) { retornar _ym_cita(x) }
+        sea r = ind
+        para l en texto_dividir(cuerpo, "\n") {
+            si (l == "") { r = r + "\n" } sino { r = r + "\n" + _ym_espacios(sangria) + l }
+        }
+        retornar r
+    }
+    retornar _ym_escalar_texto(x)
+}
+
+/// Escribe un valor como YAML en bloque.
+funcion ajustes_a_yaml(v) {
+    sea salida = []
+    _ym_escribir(v, 0, salida, nulo)
+    retornar unir(salida, "\n") + "\n"
+}
+
+// ══ Utilidades de configuración ═══════════════════════════════════════════
+
+/// Mezcla profunda: los valores de b ganan; los mapas se mezclan.
+funcion ajustes_mezclar(a, b) {
+    si (tipo(a) != "mapa" o tipo(b) != "mapa") { retornar b }
+    sea r = {}
+    para k en claves(a) { r[k] = a[k] }
+    para k en claves(b) {
+        si (tiene_clave(r, k) y tipo(r[k]) == "mapa" y tipo(b[k]) == "mapa") { r[k] = ajustes_mezclar(r[k], b[k]) } sino { r[k] = b[k] }
+    }
+    retornar r
+}
+
+/// Reemplaza ${VAR} y ${VAR:-defecto} en todos los textos usando las
+/// variables de entorno (o el mapa vars). Falla si falta una sin defecto.
+funcion ajustes_entorno(v, vars) {
+    si (tipo(v) == "lista") {
+        sea r = []
+        para x en v { r.agregar(ajustes_entorno(x, vars)) }
+        retornar r
+    }
+    si (tipo(v) == "mapa") {
+        sea r = {}
+        para k en claves(v) { r[k] = ajustes_entorno(v[k], vars) }
+        retornar r
+    }
+    si (tipo(v) != "texto" o texto_indice(v, "$") < 0) { retornar v }
+    sea r = ""
+    sea i = 0
+    mientras (i < longitud(v)) {
+        si (subcadena(v, i, minimo(longitud(v), i + 2)) == "$$") { r = r + "$"  i = i + 2 } sino {
+            si (subcadena(v, i, minimo(longitud(v), i + 2)) == "$" + caracter(123)) {
+                sea f = texto_indice(subcadena(v, i, longitud(v)), caracter(125))
+                si (f < 0) { lanzar "ajustes: $" + caracter(123) + " sin cerrar en '" + v + "'" }
+                sea dentro = subcadena(v, i + 2, i + f)
+                sea nombre = dentro
+                sea defecto = nulo
+                sea d = texto_indice(dentro, ":-")
+                si (d >= 0) { nombre = subcadena(dentro, 0, d)  defecto = subcadena(dentro, d + 2, longitud(dentro)) }
+                sea val = nulo
+                si (vars != nulo) { val = vars[nombre] ?? nulo } sino {
+                    val = variable_entorno(nombre)
+                    si (val == "") { val = nulo }
+                }
+                si (val == nulo) { val = defecto }
+                si (val == nulo) { lanzar "ajustes: falta la variable de entorno " + nombre }
+                r = r + val
+                i = i + f + 1
+            } sino {
+                r = r + subcadena(v, i, i + 1)
+                i = i + 1
+            }
+        }
+    }
+    retornar r
+}
+
+/// Lee un texto según el formato ("toml", "yaml" o "json").
+funcion ajustes_leer(texto, formato, opciones) {
+    si (formato == "toml") { retornar ajustes_toml(texto, opciones) }
+    si (formato == "yaml" o formato == "yml") { retornar ajustes_yaml(texto, opciones) }
+    si (formato == "json") { retornar ajustes_yaml(texto, opciones) }
+    lanzar "ajustes: formato desconocido " + formato
+}
+
+/// Carga un archivo de configuración por su extensión. Acepta una lista de
+/// rutas: se mezclan en orden (las últimas ganan). opciones: entorno
+/// (verdadero: aplica ${VAR}), molde (valida y completa con molde),
+/// opcional (verdadero: ignora archivos que no existen).
+funcion ajustes_cargar(rutas, opciones) {
+    sea o = opciones ?? {}
+    sea lista = rutas
+    si (tipo(rutas) != "lista") { lista = [rutas] }
+    sea r = {}
+    para ruta en lista {
+        si (existe_archivo(ruta) == falso) {
+            si ((o["opcional"] ?? falso) == falso) { lanzar "ajustes: no existe " + ruta }
+        } sino {
+            sea ext = texto_minusculas(ruta)
+            sea fmt = "yaml"
+            si (texto_termina_con(ext, ".toml")) { fmt = "toml" }
+            si (texto_termina_con(ext, ".json")) { fmt = "json" }
+            sea v = nulo
+            intentar { v = ajustes_leer(leer_archivo(ruta), fmt, o) } capturar (e) { lanzar ruta + ": " + e }
+            r = ajustes_mezclar(r, v ?? {})
+        }
+    }
+    si (o["entorno"] ?? falso) { r = ajustes_entorno(r, o["variables"] ?? nulo) }
+    si ((o["molde"] ?? nulo) != nulo) { r = molde_validar(o["molde"], r) }
+    retornar r
+}
+
+/// Valor en una ruta con puntos ("servidor.puerto"), o defecto.
+funcion ajustes_obtener(c, ruta, defecto) {
+    sea actual = c
+    para parte en texto_dividir(ruta, ".") {
+        si (tipo(actual) == "mapa" y tiene_clave(actual, parte)) { actual = actual[parte] } sino {
+            si (tipo(actual) == "lista" y _aj_es_digito(_aj_c(parte, 0)) y a_numero(parte) < longitud(actual)) { actual = actual[a_numero(parte)] } sino { retornar defecto }
+        }
+    }
+    retornar actual
+}
