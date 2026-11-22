@@ -115,7 +115,7 @@ Estado: ✅ ya existe en C-Forge · 🔗 se usa hoy vía `cforge bindgen`,
 
 | # | Nombre | Para qué | Inspiración | Estado |
 |---|---|---|---|---|
-| 82 | `llamada` | RPC binario | gRPC, Protobuf | 🛠 |
+| 82 | `llamada` / `protobuf` | RPC binario | gRPC, Protobuf | ✅ `llamada` |
 | 83 | `veloz` | QUIC y HTTP/3 | Quinn | 🛠 |
 | 84 | `buzon` | Mensajería entre procesos | ZeroMQ | 🛠 |
 | 85 | `malla` | Redes P2P | libp2p | 🛠 |
@@ -125,7 +125,7 @@ Estado: ✅ ya existe en C-Forge · 🔗 se usa hoy vía `cforge bindgen`,
 | 89 | `clave` | Hash de contraseñas | Argon2, bcrypt | ✅ `crypto` (PBKDF2) · 🛠 Argon2 |
 | 90 | `sonda` | Captura de paquetes | libpcap | 🔗 |
 | 91 | `consenso` | Consenso distribuido | Raft | 🛠 |
-| 92 | `sensor` | Mensajería IoT | MQTT | 🛠 |
+| 92 | `sensor` / `mqtt` | Mensajería IoT | MQTT | ✅ `sensor` |
 | 93 | `directo` | Audio/video P2P | WebRTC | 🛠 |
 | 94 | `transporte` | Transferencia multiprotocolo | libcurl | ✅ HTTP en `red` · 🔗 |
 | 95 | `freno` / `ratelimit` | Límite de peticiones | Governor | ✅ `freno` |
@@ -217,16 +217,16 @@ Estado: ✅ ya existe en C-Forge · 🔗 se usa hoy vía `cforge bindgen`,
 | 154 | `huella` | Patrones de malware | YARA | 🔗 |
 | 155 | `desarma` | Ensamblador y desensamblador | Capstone, Keystone | 🔗 |
 | 156 | `emulador` | Emulación de CPU | Unicorn | 🔗 |
-| 157 | `curva` | Curva secp256k1 | libsecp256k1 | 🛠 |
-| 158 | `cadena` | Contratos EVM y Web3 | ethers-rs | 🛠 |
-| 159 | `semilla` | Frases mnemónicas y billeteras HD | BIP39 | 🛠 |
+| 157 | `curva` / `secp256k1` | Curva secp256k1 | libsecp256k1 | ✅ `curva` |
+| 158 | `cadena` / `evm` | Contratos EVM y Web3 | ethers-rs | ✅ `cadena` |
+| 159 | `semilla` / `hdwallet` | Frases mnemónicas y billeteras HD | BIP39 | ✅ `semilla` |
 | 160 | `paseo` / `paseto` | Tokens PASETO | PASETO | ✅ `paseo` |
 | 161 | `federa` / `oidc` | OAuth2 y OpenID Connect | OAuth2 | ✅ `federa` |
 | 162 | `segundo_factor` / `totp` | TOTP y Passkeys | TOTP, WebAuthn | ✅ `segundo_factor` |
 | 163 | `antivirus` | Escaneo por firmas | ClamAV | 🔗 |
 | 164 | `centinela` | Detección de intrusos | Suricata | 🛠 |
 | 165 | `secretos` / `secrets` | Secretos cifrados en repos | sops | ✅ `secretos` |
-| 166 | `apreton` | Protocolo Noise | snow | 🛠 |
+| 166 | `apreton` / `noise_protocol` | Protocolo Noise | snow | ✅ `apreton` |
 
 ### I. Ciencia, ingeniería y geoespacial
 
@@ -298,7 +298,7 @@ Estado: ✅ ya existe en C-Forge · 🔗 se usa hoy vía `cforge bindgen`,
 | 215 | `correo_rapido` | Mensajería entre microservicios | NATS | 🛠 |
 | 216 | `colas` | Colas AMQP | RabbitMQ | 🛠 |
 | 217 | `descubre` | Descubrimiento de servicios | etcd, Consul | 🛠 |
-| 218 | `objetos` | Almacenamiento compatible con S3 | MinIO | 🛠 |
+| 218 | `objetos` / `s3` | Almacenamiento compatible con S3 | MinIO | ✅ `objetos` |
 | 219 | `orquesta` | Cliente de Kubernetes | kube-rs | 🛠 |
 | 220 | `infra` / `hcl` | Infraestructura como código | HCL | ✅ `infra` |
 | 221 | `proxy` | Proxy inverso y balanceo | Caddy, Pingora | 🛠 |
@@ -323,7 +323,7 @@ Estado: ✅ ya existe en C-Forge · 🔗 se usa hoy vía `cforge bindgen`,
 | 235 | `manzana` | APIs nativas de macOS e iOS | Cocoa | ✅ `apple` (básico) |
 | 236 | `bus` | D-Bus en Linux | zbus | 🛠 |
 | 237 | `teclado` | Simular teclado y ratón | Enigo | 🛠 |
-| 238 | `recolecta` | Extracción web con sesiones | Fantoccini | 🛠 |
+| 238 | `recolecta` / `crawler` | Extracción web con sesiones | Fantoccini | ✅ `recolecta` |
 | 239 | `agenda` / `schedule` | Cron con zonas horarias | tokio-cron | ✅ `agenda` |
 | 240 | `ident` / `ids` | UUID, ULID y NanoID | uuid, ulid | ✅ `ident` |
 | 241 | `telefono` / `phone` | Números telefónicos | libphonenumber | ✅ `telefono` |

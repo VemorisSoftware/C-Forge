@@ -1,0 +1,236 @@
+// stdlib/objetos.cfv — almacenamiento compatible con S3 (AWS S3, MinIO,
+// Cloudflare R2, Backblaze B2, DigitalOcean Spaces…): firma AWS
+// Signature V4 (cabeceras y URL prefirmadas), arma las peticiones para
+// subir, bajar, borrar, listar y copiar objetos, y lee las respuestas XML
+// (listados y errores). No hace HTTP: entrega método, URL, cabeceras y
+// cuerpo para tu cliente. Inspirada en MinIO / aws-sigv4 (Apache).
+// En inglés: importar "s3".
+//
+//   importar "objetos"
+//   sea c = objetos_cliente({"extremo": "https://<cuenta>.r2.cloudflarestorage.com",
+//       "region": "auto", "clave": "AKIA…", "secreto": "…"})
+//   sea p = objetos_subir(c, "fotos", "2026/gato.jpg", datos, {"tipo": "image/jpeg"})
+//   // p = {"metodo": "PUT", "url": "https://…", "cabeceras": {…}, "cuerpo": datos}
+//   objetos_url_firmada(c, "GET", "fotos", "2026/gato.jpg", 3600)
+
+importar "xml"
+importar "base64"
+
+funcion objetos_cliente(o) {
+    sea ext = o["extremo"] ?? (o["endpoint"] ?? nulo)
+    sea region = o["region"] ?? "us-east-1"
+    si (ext == nulo) { ext = "https://s3." + region + ".amazonaws.com" }
+    si (texto_termina_con(ext, "/")) { ext = subcadena(ext, 0, longitud(ext) - 1) }
+    sea clave = o["clave"] ?? (o["access_key"] ?? nulo)
+    sea secreto = o["secreto"] ?? (o["secret_key"] ?? nulo)
+    si (clave == nulo o secreto == nulo) { lanzar "objetos: faltan la clave y el secreto" }
+    // Estilo de ruta (bucket en la ruta) por defecto fuera de AWS.
+    sea ruta = o["estilo_ruta"] ?? (o["path_style"] ?? (texto_indice(ext, "amazonaws.com") < 0))
+    retornar {"extremo": ext, "region": region, "clave": clave, "secreto": secreto, "token": o["token"] ?? (o["session_token"] ?? nulo), "ruta": ruta, "servicio": o["servicio"] ?? "s3"}
+}
+
+funcion _ob_hex(b) { retornar hex_de_bytes(b) }
+
+/// Codificación URI de AWS (RFC 3986; "/" se conserva en las rutas).
+funcion objetos_codificar(s, ruta) {
+    sea t = "" + s
+    sea r = ""
+    sea hx = "0123456789ABCDEF"
+    sea i = 0
+    mientras (i < longitud(t)) {
+        sea b = byte_en(t, i)
+        si ((b >= 48 y b <= 57) o (b >= 65 y b <= 90) o (b >= 97 y b <= 122) o b == 45 o b == 46 o b == 95 o b == 126 o (b == 47 y ruta == verdadero)) { r = r + subcadena(t, i, i + 1) } sino { r = r + "%" + subcadena(hx, piso(b / 16), piso(b / 16) + 1) + subcadena(hx, b % 16, b % 16 + 1) }
+        i = i + 1
+    }
+    retornar r
+}
+
+funcion _ob_dos(n) {
+    si (n < 10) { retornar "0" + n }
+    retornar "" + n
+}
+
+// ms → ["20260115T083000Z", "20260115"]
+funcion _ob_fecha(ms) {
+    sea s = piso(ms / 1000)
+    sea dias = piso(s / 86400)
+    sea resto = s - dias * 86400
+    sea z = dias + 719468
+    sea era = piso(z / 146097)
+    sea doe = z - era * 146097
+    sea yoe = piso((doe - piso(doe / 1460) + piso(doe / 36524) - piso(doe / 146096)) / 365)
+    sea yy = yoe + era * 400
+    sea doy = doe - (365 * yoe + piso(yoe / 4) - piso(yoe / 100))
+    sea mp = piso((5 * doy + 2) / 153)
+    sea d = doy - piso((153 * mp + 2) / 5) + 1
+    sea m = mp + 3
+    si (mp >= 10) { m = mp - 9 }
+    si (m <= 2) { yy = yy + 1 }
+    sea fecha = yy + _ob_dos(m) + _ob_dos(d)
+    retornar [fecha + "T" + _ob_dos(piso(resto / 3600)) + _ob_dos(piso((resto % 3600) / 60)) + _ob_dos(resto % 60) + "Z", fecha]
+}
+
+funcion _ob_host_ruta(c, bucket, clave) {
+    sea ext = c["extremo"]
+    sea i = texto_indice(ext, "://")
+    sea esquema = subcadena(ext, 0, i)
+    sea host = subcadena(ext, i + 3, longitud(ext))
+    sea base = ""
+    sea j = texto_indice(host, "/")
+    si (j >= 0) { base = subcadena(host, j, longitud(host))  host = subcadena(host, 0, j) }
+    sea ruta = base
+    si (bucket != nulo y bucket != "") {
+        si (c["ruta"]) { ruta = ruta + "/" + bucket } sino { host = bucket + "." + host }
+    }
+    si (clave != nulo y clave != "") { ruta = ruta + "/" + clave }
+    si (ruta == "") { ruta = "/" }
+    retornar [esquema, host, ruta]
+}
+
+funcion _ob_consulta(q) {
+    si (q == nulo) { retornar "" }
+    sea pares = []
+    para k en claves(q) {
+        sea v = q[k]
+        si (v == nulo) { v = "" }
+        pares.agregar(objetos_codificar(k, falso) + "=" + objetos_codificar("" + v, falso))
+    }
+    pares = ordenar(pares, funcion(a, b) {
+        si (a < b) { retornar -1 }
+        si (a > b) { retornar 1 }
+        retornar 0
+    })
+    retornar unir(pares, "&")
+}
+
+funcion _ob_clave_firma(c, fecha) {
+    sea k = hmac_sha256_bytes("AWS4" + c["secreto"], fecha)
+    k = hmac_sha256_bytes(k, c["region"])
+    k = hmac_sha256_bytes(k, c["servicio"])
+    retornar hmac_sha256_bytes(k, "aws4_request")
+}
+
+/// Firma una petición. opciones: consulta (mapa), cabeceras (mapa), cuerpo,
+/// sin_firmar_cuerpo (UNSIGNED-PAYLOAD), ahora_ms. Devuelve
+/// {"metodo", "url", "cabeceras", "cuerpo"}.
+funcion objetos_firmar(c, metodo, bucket, clave, opciones) {
+    sea o = opciones ?? {}
+    sea hr = _ob_host_ruta(c, bucket, clave)
+    sea f = _ob_fecha(o["ahora_ms"] ?? tiempo_ms())
+    sea cuerpo = o["cuerpo"] ?? ""
+    sea hash_cuerpo = "UNSIGNED-PAYLOAD"
+    si ((o["sin_firmar_cuerpo"] ?? nulo) != verdadero) { hash_cuerpo = _ob_hex(sha256_bytes(cuerpo)) }
+    sea cab = {}
+    si ((o["cabeceras"] ?? nulo) != nulo) { para k en claves((o["cabeceras"] ?? nulo)) { cab[texto_minusculas(k)] = texto_recortar("" + (o["cabeceras"] ?? nulo)[k]) } }
+    cab["host"] = hr[1]
+    cab["x-amz-date"] = f[0]
+    cab["x-amz-content-sha256"] = hash_cuerpo
+    si (c["token"] != nulo) { cab["x-amz-security-token"] = c["token"] }
+    sea nombres = ordenar(claves(cab), funcion(a, b) {
+        si (a < b) { retornar -1 }
+        si (a > b) { retornar 1 }
+        retornar 0
+    })
+    sea canon_cab = ""
+    para k en nombres { canon_cab = canon_cab + k + ":" + cab[k] + "\n" }
+    sea firmadas = unir(nombres, ";")
+    sea consulta = _ob_consulta(o["consulta"] ?? nulo)
+    sea canonica = texto_mayusculas(metodo) + "\n" + objetos_codificar(hr[2], verdadero) + "\n" + consulta + "\n" + canon_cab + "\n" + firmadas + "\n" + hash_cuerpo
+    sea alcance = f[1] + "/" + c["region"] + "/" + c["servicio"] + "/aws4_request"
+    sea a_firmar = "AWS4-HMAC-SHA256\n" + f[0] + "\n" + alcance + "\n" + _ob_hex(sha256_bytes(canonica))
+    sea firma = _ob_hex(hmac_sha256_bytes(_ob_clave_firma(c, f[1]), a_firmar))
+    cab["authorization"] = "AWS4-HMAC-SHA256 Credential=" + c["clave"] + "/" + alcance + ", SignedHeaders=" + firmadas + ", Signature=" + firma
+    sea url = hr[0] + "://" + hr[1] + objetos_codificar(hr[2], verdadero)
+    si (consulta != "") { url = url + "?" + consulta }
+    retornar {"metodo": texto_mayusculas(metodo), "url": url, "cabeceras": cab, "cuerpo": cuerpo, "canonica": canonica}
+}
+
+/// URL prefirmada (válida "segundos", máximo 7 días).
+funcion objetos_url_firmada(c, metodo, bucket, clave, segundos, ahora_ms, consulta_extra) {
+    sea exp = segundos ?? 3600
+    si (exp < 1 o exp > 604800) { lanzar "objetos: la URL prefirmada dura entre 1 segundo y 7 días" }
+    sea hr = _ob_host_ruta(c, bucket, clave)
+    sea f = _ob_fecha(ahora_ms ?? tiempo_ms())
+    sea alcance = f[1] + "/" + c["region"] + "/" + c["servicio"] + "/aws4_request"
+    sea q = {"X-Amz-Algorithm": "AWS4-HMAC-SHA256", "X-Amz-Credential": c["clave"] + "/" + alcance, "X-Amz-Date": f[0], "X-Amz-Expires": "" + exp, "X-Amz-SignedHeaders": "host"}
+    si (c["token"] != nulo) { q["X-Amz-Security-Token"] = c["token"] }
+    si (consulta_extra != nulo) { para k en claves(consulta_extra) { q[k] = consulta_extra[k] } }
+    sea consulta = _ob_consulta(q)
+    sea canonica = texto_mayusculas(metodo) + "\n" + objetos_codificar(hr[2], verdadero) + "\n" + consulta + "\nhost:" + hr[1] + "\n\nhost\nUNSIGNED-PAYLOAD"
+    sea a_firmar = "AWS4-HMAC-SHA256\n" + f[0] + "\n" + alcance + "\n" + _ob_hex(sha256_bytes(canonica))
+    sea firma = _ob_hex(hmac_sha256_bytes(_ob_clave_firma(c, f[1]), a_firmar))
+    retornar hr[0] + "://" + hr[1] + objetos_codificar(hr[2], verdadero) + "?" + consulta + "&X-Amz-Signature=" + firma
+}
+
+// ── Operaciones ───────────────────────────────────────────────────────────
+
+/// PUT de un objeto. opciones: tipo (Content-Type), metadatos (mapa →
+/// x-amz-meta-*), cache, publico (ACL public-read), clase (storage class).
+funcion objetos_subir(c, bucket, clave, datos, opciones) {
+    sea o = opciones ?? {}
+    sea cab = {"content-type": o["tipo"] ?? "application/octet-stream", "content-length": "" + longitud(datos)}
+    si ((o["metadatos"] ?? nulo) != nulo) { para k en claves((o["metadatos"] ?? nulo)) { cab["x-amz-meta-" + texto_minusculas(k)] = (o["metadatos"] ?? nulo)[k] } }
+    si ((o["cache"] ?? nulo) != nulo) { cab["cache-control"] = (o["cache"] ?? nulo) }
+    si ((o["publico"] ?? nulo) == verdadero) { cab["x-amz-acl"] = "public-read" }
+    si ((o["clase"] ?? nulo) != nulo) { cab["x-amz-storage-class"] = (o["clase"] ?? nulo) }
+    cab["content-md5"] = base64_codificar(bytes_de_hex(md5(datos)))
+    retornar objetos_firmar(c, "PUT", bucket, clave, {"cabeceras": cab, "cuerpo": datos, "ahora_ms": o["ahora_ms"] ?? nulo})
+}
+
+funcion objetos_bajar(c, bucket, clave, opciones) {
+    sea o = opciones ?? {}
+    sea cab = {}
+    si ((o["rango"] ?? nulo) != nulo) { cab["range"] = "bytes=" + (o["rango"] ?? nulo)[0] + "-" + (o["rango"] ?? nulo)[1] }
+    retornar objetos_firmar(c, "GET", bucket, clave, {"cabeceras": cab, "ahora_ms": o["ahora_ms"] ?? nulo})
+}
+
+funcion objetos_borrar(c, bucket, clave, ahora_ms) { retornar objetos_firmar(c, "DELETE", bucket, clave, {"ahora_ms": ahora_ms}) }
+
+funcion objetos_info(c, bucket, clave, ahora_ms) { retornar objetos_firmar(c, "HEAD", bucket, clave, {"ahora_ms": ahora_ms}) }
+
+/// ListObjectsV2. opciones: prefijo, delimitador ("/"), maximo, continuar.
+funcion objetos_listar(c, bucket, opciones) {
+    sea o = opciones ?? {}
+    sea q = {"list-type": "2"}
+    si ((o["prefijo"] ?? nulo) != nulo) { q["prefix"] = (o["prefijo"] ?? nulo) }
+    si ((o["delimitador"] ?? nulo) != nulo) { q["delimiter"] = (o["delimitador"] ?? nulo) }
+    si ((o["maximo"] ?? nulo) != nulo) { q["max-keys"] = "" + (o["maximo"] ?? nulo) }
+    si ((o["continuar"] ?? nulo) != nulo) { q["continuation-token"] = (o["continuar"] ?? nulo) }
+    retornar objetos_firmar(c, "GET", bucket, "", {"consulta": q, "ahora_ms": o["ahora_ms"] ?? nulo})
+}
+
+/// Copia del lado del servidor.
+funcion objetos_copiar(c, bucket_origen, clave_origen, bucket, clave, ahora_ms) {
+    retornar objetos_firmar(c, "PUT", bucket, clave, {"cabeceras": {"x-amz-copy-source": "/" + bucket_origen + "/" + objetos_codificar(clave_origen, verdadero)}, "ahora_ms": ahora_ms})
+}
+
+// ── Respuestas ────────────────────────────────────────────────────────────
+
+funcion _ob_texto(n, nombre) {
+    sea h = xml_hijo(n, nombre)
+    si (h == nulo) { retornar nulo }
+    retornar xml_contenido(h)
+}
+
+/// XML de ListObjectsV2 → {"objetos": [{"clave", "tamano", "etag",
+/// "modificado", "clase"}], "carpetas": [...], "truncado", "continuar"}.
+funcion objetos_leer_listado(texto) {
+    sea r = xml_analizar(texto)
+    si (r["nombre"] == "Error") { lanzar objetos_leer_error(texto) }
+    sea obs = []
+    para h en r["hijos"] {
+        si (tipo(h) == "mapa" y h["nombre"] == "Contents") {
+            sea et = _ob_texto(h, "ETag") ?? ""
+            obs.agregar({"clave": _ob_texto(h, "Key"), "tamano": a_numero(_ob_texto(h, "Size") ?? "0"), "etag": texto_reemplazar(et, "\"", ""), "modificado": _ob_texto(h, "LastModified"), "clase": _ob_texto(h, "StorageClass")})
+        }
+    }
+    sea carpetas = []
+    para h en r["hijos"] { si (tipo(h) == "mapa" y h["nombre"] == "CommonPrefixes") { carpetas.agregar(_ob_texto(h, "Prefix")) } }
+    retornar {"objetos": obs, "carpetas": carpetas, "truncado": (_ob_texto(r, "IsTruncated") ?? "false") == "true", "continuar": _ob_texto(r, "NextContinuationToken")}
+}
+
+/// XML de error de S3 → texto "Código: mensaje".
+funcion objetos_leer_error(texto) {
+    sea r = xml_analizar(texto)
+    retornar "objetos: " + (_ob_texto(r, "Code") ?? "Error") + ": " + (_ob_texto(r, "Message") ?? "")
+}
