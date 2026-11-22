@@ -65,6 +65,20 @@ Sitio oficial: [c-forge.org](https://c-forge.org)
   `llamada`/`protobuf` (.proto, binario como protoc, marcos gRPC),
   `recolecta`/`crawler` (cookies RFC 6265, formularios, robots.txt,
   rastreo) y `sensor`/`mqtt` (paquetes MQTT, QoS 2, mini broker).
+- Lote 16 de bibliotecas (con alias en inglés y pruebas en ambos idiomas):
+  `compacta`/`compress` (zstd completo para descomprimir con FSE, Huffman,
+  diccionarios y varios marcos; LZ4 de bloque y marco; Snappy; gzip con
+  inflate propio; crc32, adler32 y xxh32; probado contra zstandard, lz4,
+  cramjam y gzip de Python), `terminal`/`tui` (búfer, diseño por
+  restricciones y widgets al estilo Ratatui), `recolector`/`logpipe`
+  (fuentes, transformaciones con un lenguaje remap y destinos como
+  Elasticsearch y Loki, al estilo Vector), `proxy`/`reverseproxy` (rutas,
+  balanceo round robin/ponderado/menos conexiones/hash de IP, reintentos,
+  salud pasiva y activa, límite por cliente y caché), `proceso`/`workflow`
+  (flujos durables con historial, temporizadores, señales, sagas y
+  versionado, al estilo Temporal) y `conversor`/`docconvert` (markdown,
+  html y texto hacia html, LaTeX, markdown, texto, rst, asciidoc y json;
+  html igual a markdown-it en los casos de CommonMark).
 - Lote 15 de bibliotecas (con alias en inglés y pruebas en ambos idiomas):
   `correo`/`mailer` (SMTP con AUTH y TLS implícito, firma y verificación
   DKIM rsa-sha256 y ed25519-sha256 compatibles con dkimpy), `formatos`/

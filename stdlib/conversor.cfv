@@ -1,0 +1,1516 @@
+// stdlib/conversor.cfv — conversión entre formatos de documento al estilo
+// Pandoc: cada lector produce un árbol común (bloques e inlines) y cada
+// escritor lo emite. Lectores: markdown (CommonMark básico + tablas GFM,
+// tachado), html y texto. Escritores: html, latex, markdown, texto plano,
+// rst, asciidoc y json (el árbol). Incluye metadatos YAML al inicio del
+// markdown, tabla de contenidos, numeración de secciones, identificadores
+// de títulos y filtros sobre el árbol. Idea de Pandoc (GPL; solo la idea).
+// En inglés: importar "docconvert".
+//
+//   importar "conversor"
+//   sea html = conversor_convertir("# Hola\n\nUn *texto*.", "markdown", "html")
+//   sea tex = conversor_convertir(html, "html", "latex", {"documento": verdadero})
+
+importar "json"
+importar "ajustes"
+importar "unicode"
+
+// ---------- utilidades ----------
+
+funcion _cv_rep(t, n) {
+    sea r = []
+    sea i = 0
+    mientras (i < n) {
+        r.agregar(t)
+        i = i + 1
+    }
+    retornar unir(r, "")
+}
+
+funcion _cv_rder(t) {
+    sea z = longitud(t)
+    mientras (z > 0 y texto_indice(" \t\n\r", subcadena(t, z - 1, z)) >= 0) { z = z - 1 }
+    retornar subcadena(t, 0, z)
+}
+
+funcion _cv_rizq(t) {
+    sea a = 0
+    mientras (a < longitud(t) y texto_indice(" \t\n\r", subcadena(t, a, a + 1)) >= 0) { a = a + 1 }
+    retornar subcadena(t, a, longitud(t))
+}
+
+funcion _cv_rebanar(l, a, b) {
+    sea r = []
+    sea i = a
+    mientras (i < b) {
+        r.agregar(l[i])
+        i = i + 1
+    }
+    retornar r
+}
+
+funcion _cv_html_esc(t) { retornar texto_reemplazar(texto_reemplazar(texto_reemplazar(texto_reemplazar("" + t, "&", "&amp;"), "<", "&lt;"), ">", "&gt;"), "\"", "&quot;") }
+
+funcion _cv_id(t) {
+    sea s = texto_minusculas(texto_recortar(t))
+    sea r = []
+    sea i = 0
+    sea guion = falso
+    mientras (i < longitud(s)) {
+        sea c = subcadena(s, i, i + 1)
+        si (texto_indice("abcdefghijklmnopqrstuvwxyz0123456789_áéíóúñü", c) >= 0) {
+            r.agregar(c)
+            guion = falso
+        } sino si ((c == " " o c == "-") y guion == falso y longitud(r) > 0) {
+            r.agregar("-")
+            guion = verdadero
+        }
+        i = i + 1
+    }
+    sea x = unir(r, "")
+    si (texto_termina_con(x, "-")) { x = subcadena(x, 0, longitud(x) - 1) }
+    retornar x
+}
+
+funcion _cv_texto_plano(inl) {
+    sea r = []
+    para n en inl {
+        si (n["t"] == "texto" o n["t"] == "codigo") { r.agregar(n["v"]) }
+        sino si (n["t"] == "espacio" o n["t"] == "salto_suave") { r.agregar(" ") }
+        sino si (n["t"] == "salto") { r.agregar("\n") }
+        sino si ((n["hijos"] ?? nulo) != nulo) { r.agregar(_cv_texto_plano(n["hijos"])) }
+    }
+    retornar unir(r, "")
+}
+
+// ---------- lector markdown: inlines ----------
+
+funcion _cv_inl_texto(r, t) {
+    si (t == "") { retornar nulo }
+    si (longitud(r) > 0 y r[longitud(r) - 1]["t"] == "texto") { r[longitud(r) - 1]["v"] = r[longitud(r) - 1]["v"] + t } sino { r.agregar({"t": "texto", "v": t}) }
+}
+
+// Busca el cierre de un delimitador desde i; -1 si no hay.
+funcion _cv_cierre(s, i, d) {
+    sea j = i
+    mientras (j <= longitud(s) - longitud(d)) {
+        si (subcadena(s, j, j + 1) == "\\") { j = j + 2 } sino {
+            si (subcadena(s, j, j + longitud(d)) == d y j > i y subcadena(s, j - 1, j) != " ") { retornar j }
+            j = j + 1
+        }
+    }
+    retornar -1
+}
+
+funcion _cv_corchete(s, i) {
+    // s[i] == "[" → índice del "]" que lo cierra
+    sea prof = 0
+    sea j = i
+    mientras (j < longitud(s)) {
+        sea c = subcadena(s, j, j + 1)
+        si (c == "\\") { j = j + 1 }
+        sino si (c == "[") { prof = prof + 1 }
+        sino si (c == "]") {
+            prof = prof - 1
+            si (prof == 0) { retornar j }
+        }
+        j = j + 1
+    }
+    retornar -1
+}
+
+funcion _cv_inlines(s, refs) {
+    sea r = []
+    sea i = 0
+    sea buf = ""
+    mientras (i < longitud(s)) {
+        sea c = subcadena(s, i, i + 1)
+        sea c2 = subcadena(s, i, minimo(i + 2, longitud(s)))
+        si (c == "\\" y i + 1 < longitud(s)) {
+            sea sig = subcadena(s, i + 1, i + 2)
+            si (sig == "\n") {
+                _cv_inl_texto(r, buf)
+                buf = ""
+                r.agregar({"t": "salto"})
+            } sino { buf = buf + sig }
+            i = i + 2
+        } sino si (c == "`") {
+            sea n = 0
+            mientras (i + n < longitud(s) y subcadena(s, i + n, i + n + 1) == "`") { n = n + 1 }
+            sea marca = _cv_rep("`", n)
+            sea j = texto_indice(subcadena(s, i + n, longitud(s)), marca)
+            si (j < 0) {
+                buf = buf + marca
+                i = i + n
+            } sino {
+                _cv_inl_texto(r, buf)
+                buf = ""
+                sea cod = texto_reemplazar(subcadena(s, i + n, i + n + j), "\n", " ")
+                si (longitud(cod) > 1 y texto_empieza_con(cod, " ") y texto_termina_con(cod, " ")) { cod = subcadena(cod, 1, longitud(cod) - 1) }
+                r.agregar({"t": "codigo", "v": cod})
+                i = i + n + j + n
+            }
+        } sino si ((subcadena(s, i, minimo(i + 3, longitud(s))) == "***" o subcadena(s, i, minimo(i + 3, longitud(s))) == "___") y _cv_cierre(s, i + 3, subcadena(s, i, i + 3)) > 0) {
+            sea d3 = subcadena(s, i, i + 3)
+            sea j = _cv_cierre(s, i + 3, d3)
+            _cv_inl_texto(r, buf)
+            buf = ""
+            r.agregar({"t": "enfasis", "hijos": [{"t": "fuerte", "hijos": _cv_inlines(subcadena(s, i + 3, j), refs)}]})
+            i = j + 3
+        } sino si (c2 == "**" o c2 == "__" o c2 == "~~") {
+            sea j = _cv_cierre(s, i + 2, c2)
+            si (j < 0 o subcadena(s, i + 2, i + 3) == " ") {
+                buf = buf + c2
+                i = i + 2
+            } sino {
+                _cv_inl_texto(r, buf)
+                buf = ""
+                sea tipo_n = "fuerte"
+                si (c2 == "~~") { tipo_n = "tachado" }
+                r.agregar({"t": tipo_n, "hijos": _cv_inlines(subcadena(s, i + 2, j), refs)})
+                i = j + 2
+            }
+        } sino si ((c == "*" o c == "_") y i + 1 < longitud(s) y subcadena(s, i + 1, i + 2) != " ") {
+            sea antes = " "
+            si (i > 0) { antes = subcadena(s, i - 1, i) }
+            sea j = _cv_cierre(s, i + 1, c)
+            // "_" dentro de palabras no enfatiza.
+            si (j < 0 o (c == "_" y texto_indice(" \n([", antes) < 0)) {
+                buf = buf + c
+                i = i + 1
+            } sino {
+                _cv_inl_texto(r, buf)
+                buf = ""
+                r.agregar({"t": "enfasis", "hijos": _cv_inlines(subcadena(s, i + 1, j), refs)})
+                i = j + 1
+            }
+        } sino si (c == "<" y texto_indice(subcadena(s, i, minimo(i + 300, longitud(s))), ">") > 0 y (texto_empieza_con(subcadena(s, i + 1, longitud(s)), "http") o texto_empieza_con(subcadena(s, i + 1, longitud(s)), "mailto:"))) {
+            sea j = i + texto_indice(subcadena(s, i, longitud(s)), ">")
+            sea url = subcadena(s, i + 1, j)
+            _cv_inl_texto(r, buf)
+            buf = ""
+            r.agregar({"t": "enlace", "url": url, "titulo": "", "hijos": [{"t": "texto", "v": url}]})
+            i = j + 1
+        } sino si (c == "[" o (c == "!" y i + 1 < longitud(s) y subcadena(s, i + 1, i + 2) == "[")) {
+            sea imagen = c == "!"
+            sea a = i
+            si (imagen) { a = i + 1 }
+            sea b = _cv_corchete(s, a)
+            sea hecho = falso
+            si (b > 0) {
+                sea etiqueta = subcadena(s, a + 1, b)
+                sea url = nulo
+                sea titulo = ""
+                sea fin = b + 1
+                si (b + 1 < longitud(s) y subcadena(s, b + 1, b + 2) == "(") {
+                    sea k = texto_indice(subcadena(s, b + 1, longitud(s)), ")")
+                    si (k > 0) {
+                        sea dentro = texto_recortar(subcadena(s, b + 2, b + 1 + k))
+                        sea q = texto_indice(dentro, " \"")
+                        si (q > 0 y texto_termina_con(dentro, "\"")) {
+                            titulo = subcadena(dentro, q + 2, longitud(dentro) - 1)
+                            dentro = subcadena(dentro, 0, q)
+                        }
+                        si (texto_empieza_con(dentro, "<") y texto_termina_con(dentro, ">")) { dentro = subcadena(dentro, 1, longitud(dentro) - 1) }
+                        url = dentro
+                        fin = b + 2 + k
+                    }
+                } sino {
+                    sea clave_ref = texto_minusculas(etiqueta)
+                    si (b + 2 < longitud(s) y subcadena(s, b + 1, b + 2) == "[") {
+                        sea k2 = texto_indice(subcadena(s, b + 2, longitud(s)), "]")
+                        si (k2 >= 0) {
+                            sea x = subcadena(s, b + 2, b + 2 + k2)
+                            si (x != "") { clave_ref = texto_minusculas(x) }
+                            fin = b + 3 + k2
+                        }
+                    }
+                    si (tiene_clave(refs, clave_ref)) {
+                        url = refs[clave_ref]["url"]
+                        titulo = refs[clave_ref]["titulo"]
+                    } sino { fin = b + 1 }
+                }
+                si (url != nulo) {
+                    _cv_inl_texto(r, buf)
+                    buf = ""
+                    si (imagen) { r.agregar({"t": "imagen", "url": url, "titulo": titulo, "alt": _cv_texto_plano(_cv_inlines(etiqueta, refs))}) }
+                    sino { r.agregar({"t": "enlace", "url": url, "titulo": titulo, "hijos": _cv_inlines(etiqueta, refs)}) }
+                    i = fin
+                    hecho = verdadero
+                }
+            }
+            si (hecho == falso) {
+                buf = buf + c
+                i = i + 1
+            }
+        } sino si (c == "\n") {
+            si (texto_termina_con(buf, "  ")) {
+                _cv_inl_texto(r, _cv_rder(buf))
+                buf = ""
+                r.agregar({"t": "salto"})
+            } sino {
+                _cv_inl_texto(r, _cv_rder(buf))
+                buf = ""
+                r.agregar({"t": "salto_suave"})
+            }
+            i = i + 1
+        } sino {
+            buf = buf + c
+            i = i + 1
+        }
+    }
+    _cv_inl_texto(r, buf)
+    retornar r
+}
+
+// ---------- lector markdown: bloques ----------
+
+funcion _cv_sangria(l) {
+    sea n = 0
+    mientras (n < longitud(l) y subcadena(l, n, n + 1) == " ") { n = n + 1 }
+    retornar n
+}
+
+funcion _cv_es_hr(l) {
+    sea t = texto_reemplazar(texto_recortar(l), " ", "")
+    si (longitud(t) < 3) { retornar falso }
+    para ch en ["-", "*", "_"] { si (texto_reemplazar(t, ch, "") == "") { retornar verdadero } }
+    retornar falso
+}
+
+// Marca de lista: {"ordenada", "inicio", "ancho"} o nulo.
+funcion _cv_marca(l) {
+    sea s = _cv_sangria(l)
+    si (s > 3) { retornar nulo }
+    sea t = subcadena(l, s, longitud(l))
+    si ((texto_empieza_con(t, "- ") o texto_empieza_con(t, "* ") o texto_empieza_con(t, "+ ")) o t == "-" o t == "*") { retornar {"ordenada": falso, "inicio": 1, "ancho": s + 2, "car": subcadena(t, 0, 1)} }
+    sea j = 0
+    mientras (j < longitud(t) y j < 9 y texto_indice("0123456789", subcadena(t, j, j + 1)) >= 0) { j = j + 1 }
+    si (j > 0 y j + 1 < longitud(t) + 1 y (subcadena(t, j, j + 1) == "." o subcadena(t, j, j + 1) == ")") y (j + 1 == longitud(t) o subcadena(t, j + 1, j + 2) == " ")) {
+        retornar {"ordenada": verdadero, "inicio": a_numero(subcadena(t, 0, j)), "ancho": s + j + 2, "car": subcadena(t, j, j + 1)}
+    }
+    retornar nulo
+}
+
+funcion _cv_celdas(l) {
+    sea t = texto_recortar(l)
+    si (texto_empieza_con(t, "|")) { t = subcadena(t, 1, longitud(t)) }
+    si (texto_termina_con(t, "|") y texto_termina_con(t, "\\|") == falso) { t = subcadena(t, 0, longitud(t) - 1) }
+    sea r = []
+    sea actual = ""
+    sea i = 0
+    mientras (i < longitud(t)) {
+        sea c = subcadena(t, i, i + 1)
+        si (c == "\\" y subcadena(t, i + 1, i + 2) == "|") {
+            actual = actual + "|"
+            i = i + 2
+        } sino si (c == "|") {
+            r.agregar(texto_recortar(actual))
+            actual = ""
+            i = i + 1
+        } sino {
+            actual = actual + c
+            i = i + 1
+        }
+    }
+    r.agregar(texto_recortar(actual))
+    retornar r
+}
+
+funcion _cv_es_separador_tabla(l) {
+    si (texto_indice(l, "-") < 0) { retornar falso }
+    para c en _cv_celdas(l) {
+        sea x = texto_reemplazar(texto_reemplazar(c, ":", ""), "-", "")
+        si (x != "" o c == "") { retornar falso }
+    }
+    retornar verdadero
+}
+
+funcion _cv_bloques(lineas, refs) {
+    sea r = []
+    sea i = 0
+    sea n = longitud(lineas)
+    mientras (i < n) {
+        sea l = lineas[i]
+        sea t = texto_recortar(l)
+        sea s = _cv_sangria(l)
+        si (t == "") { i = i + 1 }
+        sino si (s >= 4) {
+            sea cod = []
+            mientras (i < n y (_cv_sangria(lineas[i]) >= 4 o texto_recortar(lineas[i]) == "")) {
+                cod.agregar(subcadena(lineas[i], minimo(4, longitud(lineas[i])), longitud(lineas[i])))
+                i = i + 1
+            }
+            mientras (longitud(cod) > 0 y texto_recortar(cod[longitud(cod) - 1]) == "") { cod = _cv_rebanar(cod, 0, longitud(cod) - 1) }
+            r.agregar({"t": "codigo", "lenguaje": "", "v": unir(cod, "\n")})
+        } sino si (texto_empieza_con(t, "```") o texto_empieza_con(t, "~~~")) {
+            sea marca = subcadena(t, 0, 3)
+            sea lang = texto_recortar(subcadena(t, 3, longitud(t)))
+            sea cod = []
+            i = i + 1
+            mientras (i < n y texto_empieza_con(texto_recortar(lineas[i]), marca) == falso) {
+                sea x = lineas[i]
+                sea q = 0
+                mientras (q < s y q < longitud(x) y subcadena(x, q, q + 1) == " ") { q = q + 1 }
+                cod.agregar(subcadena(x, q, longitud(x)))
+                i = i + 1
+            }
+            i = i + 1
+            r.agregar({"t": "codigo", "lenguaje": texto_dividir(lang, " ")[0], "v": unir(cod, "\n")})
+        } sino si (texto_empieza_con(t, "#") y (texto_indice(t, " ") > 0 o texto_reemplazar(t, "#", "") == "")) {
+            sea k = 0
+            mientras (k < longitud(t) y subcadena(t, k, k + 1) == "#") { k = k + 1 }
+            si (k <= 6 y (k == longitud(t) o subcadena(t, k, k + 1) == " ")) {
+                sea texto_t = texto_recortar(subcadena(t, k, longitud(t)))
+                // quita #### finales
+                sea z = longitud(texto_t)
+                mientras (z > 0 y subcadena(texto_t, z - 1, z) == "#") { z = z - 1 }
+                si (z == 0 o subcadena(texto_t, z - 1, z) == " ") { texto_t = texto_recortar(subcadena(texto_t, 0, z)) }
+                r.agregar({"t": "titulo", "nivel": k, "hijos": _cv_inlines(texto_t, refs)})
+                i = i + 1
+            } sino {
+                r.agregar({"t": "parrafo", "hijos": _cv_inlines(t, refs)})
+                i = i + 1
+            }
+        } sino si (_cv_es_hr(l) y _cv_marca(l) == nulo o (_cv_es_hr(l) y texto_indice(t, "- - -") >= 0)) {
+            r.agregar({"t": "linea"})
+            i = i + 1
+        } sino si (texto_empieza_con(t, ">")) {
+            sea dentro = []
+            mientras (i < n y texto_recortar(lineas[i]) != "" ) {
+                sea x = texto_recortar(lineas[i])
+                si (texto_empieza_con(x, ">")) {
+                    x = subcadena(x, 1, longitud(x))
+                    si (texto_empieza_con(x, " ")) { x = subcadena(x, 1, longitud(x)) }
+                }
+                dentro.agregar(x)
+                i = i + 1
+            }
+            r.agregar({"t": "cita", "hijos": _cv_bloques(dentro, refs)})
+        } sino si (_cv_marca(l) != nulo) {
+            sea m0 = _cv_marca(l)
+            sea items = []
+            sea suelta = falso
+            sea hueco = falso
+            mientras (i < n) {
+                sea mk = _cv_marca(lineas[i])
+                si (mk == nulo o mk["ordenada"] != m0["ordenada"] o mk["car"] != m0["car"]) { romper }
+                si (hueco) { suelta = verdadero }
+                hueco = falso
+                sea primera = subcadena(lineas[i], minimo(mk["ancho"], longitud(lineas[i])), longitud(lineas[i]))
+                sea cuerpo = [primera]
+                i = i + 1
+                sea vacias = 0
+                mientras (i < n) {
+                    sea x = lineas[i]
+                    si (texto_recortar(x) == "") {
+                        vacias = vacias + 1
+                        cuerpo.agregar("")
+                        i = i + 1
+                    } sino si (_cv_sangria(x) >= mk["ancho"]) {
+                        si (vacias > 0) { suelta = verdadero }
+                        vacias = 0
+                        cuerpo.agregar(subcadena(x, mk["ancho"], longitud(x)))
+                        i = i + 1
+                    } sino si (vacias == 0 y _cv_marca(x) == nulo y texto_empieza_con(texto_recortar(x), "#") == falso y _cv_es_hr(x) == falso) {
+                        cuerpo.agregar(texto_recortar(x))
+                        i = i + 1
+                    } sino {
+                        si (vacias > 0) { hueco = verdadero }
+                        romper
+                    }
+                }
+                mientras (longitud(cuerpo) > 0 y cuerpo[longitud(cuerpo) - 1] == "") { cuerpo = _cv_rebanar(cuerpo, 0, longitud(cuerpo) - 1) }
+                // Tarea GFM [ ] / [x]
+                sea tarea = nulo
+                si (texto_empieza_con(cuerpo[0], "[ ] ")) {
+                    tarea = falso
+                    cuerpo[0] = subcadena(cuerpo[0], 4, longitud(cuerpo[0]))
+                } sino si (texto_empieza_con(texto_minusculas(cuerpo[0]), "[x] ")) {
+                    tarea = verdadero
+                    cuerpo[0] = subcadena(cuerpo[0], 4, longitud(cuerpo[0]))
+                }
+                items.agregar({"bloques": _cv_bloques(cuerpo, refs), "tarea": tarea})
+            }
+            r.agregar({"t": "lista", "ordenada": m0["ordenada"], "inicio": m0["inicio"], "suelta": suelta, "items": items, "marca": m0["car"]})
+        } sino si (i + 1 < n y texto_indice(l, "|") >= 0 y _cv_es_separador_tabla(lineas[i + 1])) {
+            sea cab = _cv_celdas(l)
+            sea alin = []
+            para c en _cv_celdas(lineas[i + 1]) {
+                sea iz = texto_empieza_con(c, ":")
+                sea de = texto_termina_con(c, ":")
+                si (iz y de) { alin.agregar("centro") } sino si (de) { alin.agregar("derecha") } sino si (iz) { alin.agregar("izquierda") } sino { alin.agregar("") }
+            }
+            sea filas = []
+            i = i + 2
+            mientras (i < n y texto_recortar(lineas[i]) != "" y texto_indice(lineas[i], "|") >= 0) {
+                sea cs = _cv_celdas(lineas[i])
+                sea fila = []
+                sea k = 0
+                mientras (k < longitud(cab)) {
+                    si (k < longitud(cs)) { fila.agregar(_cv_inlines(cs[k], refs)) } sino { fila.agregar([]) }
+                    k = k + 1
+                }
+                filas.agregar(fila)
+                i = i + 1
+            }
+            sea cabi = []
+            para c en cab { cabi.agregar(_cv_inlines(c, refs)) }
+            r.agregar({"t": "tabla", "alineacion": alin, "cabecera": cabi, "filas": filas})
+        } sino {
+            // Párrafo (o título setext).
+            sea par = []
+            mientras (i < n) {
+                sea x = lineas[i]
+                sea xt = texto_recortar(x)
+                si (xt == "") { romper }
+                si (longitud(par) > 0) {
+                    si (texto_reemplazar(xt, "=", "") == "" o (texto_reemplazar(xt, "-", "") == "" y longitud(par) > 0)) {
+                        sea nv = 2
+                        si (texto_empieza_con(xt, "=")) { nv = 1 }
+                        r.agregar({"t": "titulo", "nivel": nv, "hijos": _cv_inlines(texto_recortar(unir(par, "\n")), refs)})
+                        par = nulo
+                        i = i + 1
+                        romper
+                    }
+                    si (texto_empieza_con(xt, "#") o texto_empieza_con(xt, ">") o texto_empieza_con(xt, "```") o _cv_es_hr(x) o (_cv_marca(x) != nulo y (_cv_marca(x)["ordenada"] == falso o _cv_marca(x)["inicio"] == 1))) { romper }
+                }
+                par.agregar(subcadena(x, minimo(_cv_sangria(x), 3), longitud(x)))
+                i = i + 1
+            }
+            si (par != nulo) { r.agregar({"t": "parrafo", "hijos": _cv_inlines(texto_recortar(unir(par, "\n")), refs)}) }
+        }
+    }
+    retornar r
+}
+
+/// Lee markdown → documento {"meta", "bloques"}.
+funcion conversor_leer_markdown(texto) {
+    sea lineas = texto_dividir(texto_reemplazar(texto_reemplazar("" + texto, "\r\n", "\n"), "\t", "    "), "\n")
+    sea meta = {}
+    // Metadatos YAML entre --- al inicio.
+    si (longitud(lineas) > 2 y texto_recortar(lineas[0]) == "---") {
+        sea j = 1
+        mientras (j < longitud(lineas) y texto_recortar(lineas[j]) != "---" y texto_recortar(lineas[j]) != "...") { j = j + 1 }
+        si (j < longitud(lineas)) {
+            sea y = ajustes_yaml(unir(_cv_rebanar(lineas, 1, j), "\n"), nulo)
+            si (tipo(y) == "mapa") { meta = y }
+            lineas = _cv_rebanar(lineas, j + 1, longitud(lineas))
+        }
+    }
+    // Definiciones de referencias [x]: url "título".
+    sea refs = {}
+    sea resto = []
+    sea en_codigo = falso
+    para l en lineas {
+        sea t = texto_recortar(l)
+        si (texto_empieza_con(t, "```") o texto_empieza_con(t, "~~~")) { en_codigo = no en_codigo }
+        sea k = texto_indice(t, "]:")
+        si (en_codigo == falso y texto_empieza_con(t, "[") y k > 1 y texto_empieza_con(t, "[^") == falso) {
+            sea etiqueta = texto_minusculas(subcadena(t, 1, k))
+            sea d = texto_recortar(subcadena(t, k + 2, longitud(t)))
+            sea titulo = ""
+            sea q = texto_indice(d, " \"")
+            si (q > 0 y texto_termina_con(d, "\"")) {
+                titulo = subcadena(d, q + 2, longitud(d) - 1)
+                d = subcadena(d, 0, q)
+            }
+            si (texto_empieza_con(d, "<") y texto_termina_con(d, ">")) { d = subcadena(d, 1, longitud(d) - 1) }
+            si (tiene_clave(refs, etiqueta) == falso) { refs[etiqueta] = {"url": d, "titulo": titulo} }
+        } sino { resto.agregar(l) }
+    }
+    retornar {"meta": meta, "bloques": _cv_bloques(resto, refs)}
+}
+
+/// Lee texto plano: párrafos separados por líneas vacías.
+funcion conversor_leer_texto(texto) {
+    sea r = []
+    para p en texto_dividir(texto_reemplazar("" + texto, "\r\n", "\n"), "\n\n") {
+        si (texto_recortar(p) != "") {
+            sea inl = []
+            sea ls = texto_dividir(texto_recortar(p), "\n")
+            sea i = 0
+            mientras (i < longitud(ls)) {
+                si (i > 0) { inl.agregar({"t": "salto"}) }
+                inl.agregar({"t": "texto", "v": ls[i]})
+                i = i + 1
+            }
+            r.agregar({"t": "parrafo", "hijos": inl})
+        }
+    }
+    retornar {"meta": {}, "bloques": r}
+}
+
+// ---------- lector html ----------
+
+sea _CV_ENT = {"amp": "&", "lt": "<", "gt": ">", "quot": "\"", "apos": "'", "nbsp": " ", "copy": "©", "mdash": "—", "ndash": "–", "hellip": "…", "laquo": "«", "raquo": "»"}
+
+funcion _cv_entidades(t) {
+    si (texto_indice(t, "&") < 0) { retornar t }
+    sea r = []
+    sea i = 0
+    mientras (i < longitud(t)) {
+        sea c = subcadena(t, i, i + 1)
+        sea k = texto_indice(subcadena(t, i, minimo(i + 12, longitud(t))), ";")
+        si (c == "&" y k > 1) {
+            sea nom = subcadena(t, i + 1, i + k)
+            si (texto_empieza_con(nom, "#x") o texto_empieza_con(nom, "#X")) {
+                r.agregar(caracter(a_numero("0x" + subcadena(nom, 2, longitud(nom)))))
+                i = i + k + 1
+            } sino si (texto_empieza_con(nom, "#")) {
+                r.agregar(caracter(a_numero(subcadena(nom, 1, longitud(nom)))))
+                i = i + k + 1
+            } sino si (tiene_clave(_CV_ENT, nom)) {
+                r.agregar(_CV_ENT[nom])
+                i = i + k + 1
+            } sino {
+                r.agregar(c)
+                i = i + 1
+            }
+        } sino {
+            r.agregar(c)
+            i = i + 1
+        }
+    }
+    retornar unir(r, "")
+}
+
+// Tokeniza html en etiquetas y texto.
+funcion _cv_html_tokens(h) {
+    sea r = []
+    sea i = 0
+    mientras (i < longitud(h)) {
+        sea j = texto_indice(subcadena(h, i, longitud(h)), "<")
+        si (j < 0) {
+            r.agregar({"k": "texto", "v": subcadena(h, i, longitud(h))})
+            romper
+        }
+        si (j > 0) { r.agregar({"k": "texto", "v": subcadena(h, i, i + j)}) }
+        i = i + j
+        si (texto_empieza_con(subcadena(h, i, i + 4), "<!--")) {
+            sea f = texto_indice(subcadena(h, i, longitud(h)), "-->")
+            si (f < 0) { romper }
+            i = i + f + 3
+        } sino {
+            sea f = texto_indice(subcadena(h, i, longitud(h)), ">")
+            si (f < 0) { romper }
+            sea dentro = subcadena(h, i + 1, i + f)
+            i = i + f + 1
+            si (texto_empieza_con(dentro, "!") == falso y texto_empieza_con(dentro, "?") == falso) {
+                sea cierra = texto_empieza_con(dentro, "/")
+                si (cierra) { dentro = subcadena(dentro, 1, longitud(dentro)) }
+                sea auto = texto_termina_con(dentro, "/")
+                si (auto) { dentro = subcadena(dentro, 0, longitud(dentro) - 1) }
+                sea p = 0
+                mientras (p < longitud(dentro) y texto_indice(" \n\t", subcadena(dentro, p, p + 1)) < 0) { p = p + 1 }
+                sea nombre = texto_minusculas(subcadena(dentro, 0, p))
+                sea attrs = {}
+                sea resto = subcadena(dentro, p, longitud(dentro))
+                sea q = 0
+                mientras (q < longitud(resto)) {
+                    mientras (q < longitud(resto) y texto_indice(" \n\t", subcadena(resto, q, q + 1)) >= 0) { q = q + 1 }
+                    sea a0 = q
+                    mientras (q < longitud(resto) y texto_indice(" \n\t=", subcadena(resto, q, q + 1)) < 0) { q = q + 1 }
+                    sea an = texto_minusculas(subcadena(resto, a0, q))
+                    sea av = ""
+                    si (q < longitud(resto) y subcadena(resto, q, q + 1) == "=") {
+                        q = q + 1
+                        sea com = subcadena(resto, q, q + 1)
+                        si (com == "\"" o com == "'") {
+                            sea e = texto_indice(subcadena(resto, q + 1, longitud(resto)), com)
+                            si (e < 0) { e = longitud(resto) - q - 1 }
+                            av = subcadena(resto, q + 1, q + 1 + e)
+                            q = q + e + 2
+                        } sino {
+                            sea v0 = q
+                            mientras (q < longitud(resto) y texto_indice(" \n\t", subcadena(resto, q, q + 1)) < 0) { q = q + 1 }
+                            av = subcadena(resto, v0, q)
+                        }
+                    }
+                    si (an != "") { attrs[an] = _cv_entidades(av) }
+                }
+                r.agregar({"k": "etiqueta", "nombre": nombre, "cierra": cierra, "auto": auto, "attrs": attrs})
+                // contenido crudo de script/style/pre se mantiene
+                si (cierra == falso y (nombre == "script" o nombre == "style")) {
+                    sea f2 = texto_indice(texto_minusculas(subcadena(h, i, longitud(h))), "</" + nombre)
+                    si (f2 < 0) { f2 = longitud(h) - i }
+                    i = i + f2
+                }
+            }
+        }
+    }
+    retornar r
+}
+
+sea _CV_VACIAS = {"br": 1, "hr": 1, "img": 1, "meta": 1, "link": 1, "input": 1, "col": 1, "source": 1, "wbr": 1, "area": 1, "base": 1}
+
+// Árbol de nodos {"nombre", "attrs", "hijos"} / {"texto"}.
+funcion _cv_html_arbol(h) {
+    sea raiz = {"nombre": "#raiz", "attrs": {}, "hijos": []}
+    sea pila = [raiz]
+    para tk en _cv_html_tokens(h) {
+        sea tope = pila[longitud(pila) - 1]
+        si (tk["k"] == "texto") { tope["hijos"].agregar({"texto": _cv_entidades(tk["v"])}) }
+        sino si (tk["cierra"]) {
+            sea k = longitud(pila) - 1
+            mientras (k > 0 y pila[k]["nombre"] != tk["nombre"]) { k = k - 1 }
+            si (k > 0) { pila = _cv_rebanar(pila, 0, k) }
+        } sino {
+            // <p> y <li> se cierran implícitamente.
+            si ((tk["nombre"] == "p" o tk["nombre"] == "li") y tope["nombre"] == tk["nombre"]) {
+                pila = _cv_rebanar(pila, 0, longitud(pila) - 1)
+                tope = pila[longitud(pila) - 1]
+            }
+            sea nodo = {"nombre": tk["nombre"], "attrs": tk["attrs"], "hijos": []}
+            tope["hijos"].agregar(nodo)
+            si (tk["auto"] == falso y tiene_clave(_CV_VACIAS, tk["nombre"]) == falso) { pila.agregar(nodo) }
+        }
+    }
+    retornar raiz
+}
+
+sea _CV_BLOQUE_HTML = {"p": 1, "div": 1, "h1": 1, "h2": 1, "h3": 1, "h4": 1, "h5": 1, "h6": 1, "ul": 1, "ol": 1, "li": 1, "pre": 1, "blockquote": 1, "hr": 1, "table": 1, "section": 1, "article": 1, "header": 1, "footer": 1, "main": 1, "nav": 1, "body": 1, "html": 1, "figure": 1, "aside": 1, "dl": 1, "#raiz": 1}
+
+funcion _cv_texto_nodo(n) {
+    si (tiene_clave(n, "texto")) { retornar n["texto"] }
+    sea r = []
+    para h en n["hijos"] { r.agregar(_cv_texto_nodo(h)) }
+    retornar unir(r, "")
+}
+
+funcion _cv_espacios(t) {
+    sea r = []
+    sea esp = falso
+    sea i = 0
+    mientras (i < longitud(t)) {
+        sea c = subcadena(t, i, i + 1)
+        si (c == " " o c == "\n" o c == "\t" o c == "\r") {
+            si (esp == falso) { r.agregar(" ") }
+            esp = verdadero
+        } sino {
+            r.agregar(c)
+            esp = falso
+        }
+        i = i + 1
+    }
+    retornar unir(r, "")
+}
+
+funcion _cv_html_inl(nodos) {
+    sea r = []
+    para n en nodos {
+        si (tiene_clave(n, "texto")) { _cv_inl_texto(r, _cv_espacios(n["texto"])) }
+        sino {
+            sea nm = n["nombre"]
+            si (nm == "strong" o nm == "b") { r.agregar({"t": "fuerte", "hijos": _cv_html_inl(n["hijos"])}) }
+            sino si (nm == "em" o nm == "i") { r.agregar({"t": "enfasis", "hijos": _cv_html_inl(n["hijos"])}) }
+            sino si (nm == "del" o nm == "s" o nm == "strike") { r.agregar({"t": "tachado", "hijos": _cv_html_inl(n["hijos"])}) }
+            sino si (nm == "code" o nm == "kbd" o nm == "samp" o nm == "tt") { r.agregar({"t": "codigo", "v": _cv_texto_nodo(n)}) }
+            sino si (nm == "a") { r.agregar({"t": "enlace", "url": n["attrs"]["href"] ?? "", "titulo": n["attrs"]["title"] ?? "", "hijos": _cv_html_inl(n["hijos"])}) }
+            sino si (nm == "img") { r.agregar({"t": "imagen", "url": n["attrs"]["src"] ?? "", "titulo": n["attrs"]["title"] ?? "", "alt": n["attrs"]["alt"] ?? ""}) }
+            sino si (nm == "br") { r.agregar({"t": "salto"}) }
+            sino si (nm == "script" o nm == "style" o nm == "head") { }
+            sino { para x en _cv_html_inl(n["hijos"]) { si (x["t"] == "texto") { _cv_inl_texto(r, x["v"]) } sino { r.agregar(x) } } }
+        }
+    }
+    retornar r
+}
+
+funcion _cv_recortar_inl(inl) {
+    sea r = inl
+    mientras (longitud(r) > 0 y r[0]["t"] == "texto" y texto_recortar(r[0]["v"]) == "") { r = _cv_rebanar(r, 1, longitud(r)) }
+    mientras (longitud(r) > 0 y r[longitud(r) - 1]["t"] == "texto" y texto_recortar(r[longitud(r) - 1]["v"]) == "") { r = _cv_rebanar(r, 0, longitud(r) - 1) }
+    si (longitud(r) > 0 y r[0]["t"] == "texto") { r[0] = {"t": "texto", "v": _cv_rizq(r[0]["v"])} }
+    si (longitud(r) > 0 y r[longitud(r) - 1]["t"] == "texto") { r[longitud(r) - 1] = {"t": "texto", "v": _cv_rder(r[longitud(r) - 1]["v"])} }
+    retornar r
+}
+
+funcion _cv_html_bloques(nodos) {
+    sea r = []
+    sea suelto = []
+    sea vaciar = funcion() {
+        sea inl = _cv_recortar_inl(_cv_html_inl(suelto))
+        si (longitud(inl) > 0) { r.agregar({"t": "parrafo", "hijos": inl}) }
+        suelto = []
+    }
+    para n en nodos {
+        si (tiene_clave(n, "texto") o tiene_clave(_CV_BLOQUE_HTML, n["nombre"]) == falso) {
+            si ((n["nombre"] ?? "") != "head" y (n["nombre"] ?? "") != "title") { suelto.agregar(n) }
+        } sino {
+            vaciar()
+            sea nm = n["nombre"]
+            si (nm == "p") {
+                sea inl = _cv_recortar_inl(_cv_html_inl(n["hijos"]))
+                si (longitud(inl) > 0) { r.agregar({"t": "parrafo", "hijos": inl}) }
+            } sino si (longitud(nm) == 2 y subcadena(nm, 0, 1) == "h" y texto_indice("123456", subcadena(nm, 1, 2)) >= 0) {
+                r.agregar({"t": "titulo", "nivel": a_numero(subcadena(nm, 1, 2)), "hijos": _cv_recortar_inl(_cv_html_inl(n["hijos"])), "id": n["attrs"]["id"] ?? nulo})
+            } sino si (nm == "hr") { r.agregar({"t": "linea"}) }
+            sino si (nm == "pre") {
+                sea lang = ""
+                para h en n["hijos"] { si ((h["nombre"] ?? "") == "code") {
+                    sea cl = h["attrs"]["class"] ?? ""
+                    si (texto_empieza_con(cl, "language-")) { lang = subcadena(cl, 9, longitud(cl)) }
+                } }
+                sea v = _cv_texto_nodo(n)
+                si (texto_termina_con(v, "\n")) { v = subcadena(v, 0, longitud(v) - 1) }
+                si (texto_empieza_con(v, "\n")) { v = subcadena(v, 1, longitud(v)) }
+                r.agregar({"t": "codigo", "lenguaje": lang, "v": v})
+            } sino si (nm == "blockquote") { r.agregar({"t": "cita", "hijos": _cv_html_bloques(n["hijos"])}) }
+            sino si (nm == "ul" o nm == "ol") {
+                sea items = []
+                para h en n["hijos"] { si ((h["nombre"] ?? "") == "li") { items.agregar({"bloques": _cv_html_bloques(h["hijos"]), "tarea": nulo}) } }
+                r.agregar({"t": "lista", "ordenada": nm == "ol", "inicio": a_numero(n["attrs"]["start"] ?? "1"), "suelta": falso, "items": items})
+            } sino si (nm == "table") {
+                sea filas_html = []
+                sea recoger = nulo
+                recoger = funcion(x) { para h en x["hijos"] {
+                    si ((h["nombre"] ?? "") == "tr") { filas_html.agregar(h) }
+                    sino si (tiene_clave(h, "hijos")) { recoger(h) }
+                } }
+                recoger(n)
+                sea cab = []
+                sea filas = []
+                sea alin = []
+                sea k = 0
+                para tr en filas_html {
+                    sea celdas = []
+                    sea es_cab = falso
+                    para td en tr["hijos"] { si ((td["nombre"] ?? "") == "td" o (td["nombre"] ?? "") == "th") {
+                        si (td["nombre"] == "th") { es_cab = verdadero }
+                        celdas.agregar(_cv_recortar_inl(_cv_html_inl(td["hijos"])))
+                        si (k == 0) {
+                            sea al = td["attrs"]["align"] ?? ""
+                            si (al == "center") { alin.agregar("centro") } sino si (al == "right") { alin.agregar("derecha") } sino si (al == "left") { alin.agregar("izquierda") } sino { alin.agregar("") }
+                        }
+                    } }
+                    si (k == 0 y es_cab) { cab = celdas } sino { filas.agregar(celdas) }
+                    k = k + 1
+                }
+                r.agregar({"t": "tabla", "alineacion": alin, "cabecera": cab, "filas": filas})
+            } sino { para b en _cv_html_bloques(n["hijos"]) { r.agregar(b) } }
+        }
+    }
+    vaciar()
+    retornar r
+}
+
+/// Lee html → documento. Toma <title> como meta "title".
+funcion conversor_leer_html(h) {
+    sea arbol = _cv_html_arbol("" + h)
+    sea meta = {}
+    sea buscar = nulo
+    buscar = funcion(n) {
+        si ((n["nombre"] ?? "") == "title") { meta["title"] = texto_recortar(_cv_texto_nodo(n)) }
+        sino si ((n["nombre"] ?? "") == "meta" y (n["attrs"]["name"] ?? nulo) != nulo) { meta[n["attrs"]["name"]] = n["attrs"]["content"] ?? "" }
+        para x en n["hijos"] ?? [] { buscar(x) }
+    }
+    buscar(arbol)
+    retornar {"meta": meta, "bloques": _cv_html_bloques(arbol["hijos"])}
+}
+
+// ---------- escritores ----------
+
+funcion _cv_ids(doc) {
+    sea usados = {}
+    para b en doc["bloques"] {
+        si (b["t"] == "titulo") {
+            sea base = b["id"] ?? nulo
+            si (base == nulo) { base = _cv_id(_cv_texto_plano(b["hijos"])) }
+            si (base == "") { base = "seccion" }
+            sea id = base
+            sea k = 1
+            mientras (tiene_clave(usados, id)) {
+                id = base + "-" + k
+                k = k + 1
+            }
+            usados[id] = verdadero
+            b["id"] = id
+        }
+    }
+}
+
+funcion _cv_numerar(doc) {
+    sea cont = [0, 0, 0, 0, 0, 0]
+    para b en doc["bloques"] {
+        si (b["t"] == "titulo") {
+            cont[b["nivel"] - 1] = cont[b["nivel"] - 1] + 1
+            sea k = b["nivel"]
+            mientras (k < 6) {
+                cont[k] = 0
+                k = k + 1
+            }
+            sea p = []
+            sea j = 0
+            mientras (j < b["nivel"]) {
+                si (cont[j] > 0 o longitud(p) > 0) { p.agregar("" + cont[j]) }
+                j = j + 1
+            }
+            b["numero"] = unir(p, ".")
+        }
+    }
+}
+
+/// Tabla de contenidos: [{"nivel", "texto", "id", "numero"}].
+funcion conversor_indice(doc, profundidad) {
+    _cv_ids(doc)
+    sea r = []
+    para b en doc["bloques"] { si (b["t"] == "titulo" y b["nivel"] <= (profundidad ?? 3)) { r.agregar({"nivel": b["nivel"], "texto": _cv_texto_plano(b["hijos"]), "id": b["id"], "numero": b["numero"] ?? nulo}) } }
+    retornar r
+}
+
+// --- html ---
+
+funcion _cv_w_html_inl(inl) {
+    sea r = []
+    para n en inl {
+        sea t = n["t"]
+        si (t == "texto") { r.agregar(_cv_html_esc(n["v"])) }
+        sino si (t == "salto_suave") { r.agregar("\n") }
+        sino si (t == "salto") { r.agregar("<br />\n") }
+        sino si (t == "codigo") { r.agregar("<code>" + _cv_html_esc(n["v"]) + "</code>") }
+        sino si (t == "enfasis") { r.agregar("<em>" + _cv_w_html_inl(n["hijos"]) + "</em>") }
+        sino si (t == "fuerte") { r.agregar("<strong>" + _cv_w_html_inl(n["hijos"]) + "</strong>") }
+        sino si (t == "tachado") { r.agregar("<del>" + _cv_w_html_inl(n["hijos"]) + "</del>") }
+        sino si (t == "enlace") {
+            sea ti = ""
+            si ((n["titulo"] ?? "") != "") { ti = " title=\"" + _cv_html_esc(n["titulo"]) + "\"" }
+            r.agregar("<a href=\"" + _cv_html_esc(n["url"]) + "\"" + ti + ">" + _cv_w_html_inl(n["hijos"]) + "</a>")
+        } sino si (t == "imagen") {
+            sea ti = ""
+            si ((n["titulo"] ?? "") != "") { ti = " title=\"" + _cv_html_esc(n["titulo"]) + "\"" }
+            r.agregar("<img src=\"" + _cv_html_esc(n["url"]) + "\" alt=\"" + _cv_html_esc(n["alt"]) + "\"" + ti + " />")
+        }
+    }
+    retornar unir(r, "")
+}
+
+funcion _cv_w_html(bloques, apretada) {
+    sea r = []
+    para b en bloques {
+        sea t = b["t"]
+        si (t == "parrafo") {
+            si (apretada) { r.agregar(_cv_w_html_inl(b["hijos"])) } sino { r.agregar("<p>" + _cv_w_html_inl(b["hijos"]) + "</p>") }
+        } sino si (t == "titulo") {
+            sea id = ""
+            si ((b["id"] ?? nulo) != nulo) { id = " id=\"" + b["id"] + "\"" }
+            sea num = ""
+            si ((b["numero"] ?? nulo) != nulo) { num = "<span class=\"numero\">" + b["numero"] + "</span> " }
+            r.agregar("<h" + b["nivel"] + id + ">" + num + _cv_w_html_inl(b["hijos"]) + "</h" + b["nivel"] + ">")
+        } sino si (t == "linea") { r.agregar("<hr />") }
+        sino si (t == "codigo") {
+            sea cl = ""
+            si (b["lenguaje"] != "") { cl = " class=\"language-" + _cv_html_esc(b["lenguaje"]) + "\"" }
+            r.agregar("<pre><code" + cl + ">" + _cv_html_esc(b["v"]) + "\n</code></pre>")
+        } sino si (t == "cita") { r.agregar("<blockquote>\n" + _cv_w_html(b["hijos"], falso) + "\n</blockquote>") }
+        sino si (t == "lista") {
+            sea et = "ul"
+            sea ini = ""
+            si (b["ordenada"]) {
+                et = "ol"
+                si (b["inicio"] != 1) { ini = " start=\"" + b["inicio"] + "\"" }
+            }
+            sea items = []
+            para it en b["items"] {
+                sea pre = ""
+                si (it["tarea"] == verdadero) { pre = "<input type=\"checkbox\" checked=\"\" disabled=\"\" /> " }
+                si (it["tarea"] == falso) { pre = "<input type=\"checkbox\" disabled=\"\" /> " }
+                sea dentro = _cv_w_html(it["bloques"], b["suelta"] == falso)
+                sea fin_li = ""
+                si (b["suelta"] == falso y longitud(it["bloques"]) > 0 y it["bloques"][longitud(it["bloques"]) - 1]["t"] != "parrafo") { fin_li = "\n" }
+                si (b["suelta"] == falso y longitud(it["bloques"]) > 0 y it["bloques"][0]["t"] != "parrafo") { pre = "\n" + pre }
+                si (b["suelta"]) { items.agregar("<li>\n" + pre + dentro + "\n</li>") } sino { items.agregar("<li>" + pre + dentro + fin_li + "</li>") }
+            }
+            r.agregar("<" + et + ini + ">\n" + unir(items, "\n") + "\n</" + et + ">")
+        } sino si (t == "tabla") {
+            sea al = funcion(k) {
+                sea a = b["alineacion"][k] ?? ""
+                si (a == "centro") { retornar " style=\"text-align: center;\"" }
+                si (a == "derecha") { retornar " style=\"text-align: right;\"" }
+                si (a == "izquierda") { retornar " style=\"text-align: left;\"" }
+                retornar ""
+            }
+            sea l = ["<table>"]
+            si (longitud(b["cabecera"]) > 0) {
+                l.agregar("<thead>\n<tr>")
+                sea k = 0
+                para c en b["cabecera"] {
+                    l.agregar("<th" + al(k) + ">" + _cv_w_html_inl(c) + "</th>")
+                    k = k + 1
+                }
+                l.agregar("</tr>\n</thead>")
+            }
+            si (longitud(b["filas"]) > 0) {
+                l.agregar("<tbody>")
+                para f en b["filas"] {
+                    l.agregar("<tr>")
+                    sea k = 0
+                    para c en f {
+                        l.agregar("<td" + al(k) + ">" + _cv_w_html_inl(c) + "</td>")
+                        k = k + 1
+                    }
+                    l.agregar("</tr>")
+                }
+                l.agregar("</tbody>")
+            }
+            l.agregar("</table>")
+            r.agregar(unir(l, "\n"))
+        }
+    }
+    retornar unir(r, "\n")
+}
+
+// --- latex ---
+
+funcion _cv_tex_esc(t) {
+    sea r = []
+    sea i = 0
+    mientras (i < longitud(t)) {
+        sea c = subcadena(t, i, i + 1)
+        si (c == "\\") { r.agregar("\\textbackslash{}") }
+        sino si (texto_indice("&%$#_{}", c) >= 0) { r.agregar("\\" + c) }
+        sino si (c == "~") { r.agregar("\\textasciitilde{}") }
+        sino si (c == "^") { r.agregar("\\textasciicircum{}") }
+        sino { r.agregar(c) }
+        i = i + 1
+    }
+    retornar unir(r, "")
+}
+
+sea _CV_LL = caracter(123)
+sea _CV_LR = caracter(125)
+
+funcion _cv_tex_cmd(cmd, x) { retornar "\\" + cmd + _CV_LL + x + _CV_LR }
+
+funcion _cv_w_tex_inl(inl) {
+    sea r = []
+    para n en inl {
+        sea t = n["t"]
+        si (t == "texto") { r.agregar(_cv_tex_esc(n["v"])) }
+        sino si (t == "salto_suave") { r.agregar("\n") }
+        sino si (t == "salto") { r.agregar("\\\\\n") }
+        sino si (t == "codigo") { r.agregar(_cv_tex_cmd("texttt", _cv_tex_esc(n["v"]))) }
+        sino si (t == "enfasis") { r.agregar(_cv_tex_cmd("emph", _cv_w_tex_inl(n["hijos"]))) }
+        sino si (t == "fuerte") { r.agregar(_cv_tex_cmd("textbf", _cv_w_tex_inl(n["hijos"]))) }
+        sino si (t == "tachado") { r.agregar(_cv_tex_cmd("sout", _cv_w_tex_inl(n["hijos"]))) }
+        sino si (t == "enlace") { r.agregar("\\href" + _CV_LL + texto_reemplazar(texto_reemplazar(n["url"], "%", "\\%"), "#", "\\#") + _CV_LR + _CV_LL + _cv_w_tex_inl(n["hijos"]) + _CV_LR) }
+        sino si (t == "imagen") { r.agregar("\\includegraphics" + _CV_LL + n["url"] + _CV_LR) }
+    }
+    retornar unir(r, "")
+}
+
+sea _CV_TEX_SEC = ["section", "subsection", "subsubsection", "paragraph", "subparagraph", "subparagraph"]
+
+funcion _cv_w_tex(bloques, op) {
+    sea r = []
+    para b en bloques {
+        sea t = b["t"]
+        si (t == "parrafo") { r.agregar(_cv_w_tex_inl(b["hijos"])) }
+        sino si (t == "titulo") {
+            sea estrella = ""
+            si (op["numerar"] == falso) { estrella = "*" }
+            sea et = ""
+            si ((b["id"] ?? nulo) != nulo) { et = _cv_tex_cmd("label", b["id"]) }
+            r.agregar("\\" + _CV_TEX_SEC[b["nivel"] - 1] + estrella + _CV_LL + _cv_w_tex_inl(b["hijos"]) + _CV_LR + et)
+        } sino si (t == "linea") { r.agregar("\\begin" + _CV_LL + "center" + _CV_LR + "\\rule" + _CV_LL + "0.5\\linewidth" + _CV_LR + _CV_LL + "0.5pt" + _CV_LR + "\\end" + _CV_LL + "center" + _CV_LR) }
+        sino si (t == "codigo") { r.agregar(_cv_tex_cmd("begin", "verbatim") + "\n" + b["v"] + "\n" + _cv_tex_cmd("end", "verbatim")) }
+        sino si (t == "cita") { r.agregar(_cv_tex_cmd("begin", "quote") + "\n" + _cv_w_tex(b["hijos"], op) + "\n" + _cv_tex_cmd("end", "quote")) }
+        sino si (t == "lista") {
+            sea env = "itemize"
+            si (b["ordenada"]) { env = "enumerate" }
+            sea l = [_cv_tex_cmd("begin", env)]
+            si (b["ordenada"] y b["inicio"] != 1) { l.agregar("\\setcounter" + _CV_LL + "enumi" + _CV_LR + _CV_LL + (b["inicio"] - 1) + _CV_LR) }
+            para it en b["items"] {
+                sea pre = "\\item "
+                si (it["tarea"] == verdadero) { pre = "\\item[$\\boxtimes$] " }
+                si (it["tarea"] == falso) { pre = "\\item[$\\square$] " }
+                l.agregar(pre + _cv_w_tex(it["bloques"], op))
+            }
+            l.agregar(_cv_tex_cmd("end", env))
+            r.agregar(unir(l, "\n"))
+        } sino si (t == "tabla") {
+            sea cols = []
+            sea k = 0
+            mientras (k < longitud(b["cabecera"])) {
+                sea a = b["alineacion"][k] ?? ""
+                si (a == "centro") { cols.agregar("c") } sino si (a == "derecha") { cols.agregar("r") } sino { cols.agregar("l") }
+                k = k + 1
+            }
+            sea l = ["\\begin" + _CV_LL + "tabular" + _CV_LR + _CV_LL + unir(cols, "") + _CV_LR, "\\hline"]
+            sea fila = funcion(cs) {
+                sea x = []
+                para c en cs { x.agregar(_cv_w_tex_inl(c)) }
+                retornar unir(x, " & ") + " \\\\"
+            }
+            si (longitud(b["cabecera"]) > 0) {
+                l.agregar(fila(b["cabecera"]))
+                l.agregar("\\hline")
+            }
+            para f en b["filas"] { l.agregar(fila(f)) }
+            l.agregar("\\hline")
+            l.agregar(_cv_tex_cmd("end", "tabular"))
+            r.agregar(unir(l, "\n"))
+        }
+    }
+    retornar unir(r, "\n\n")
+}
+
+// --- markdown ---
+
+funcion _cv_md_esc(t) {
+    sea r = []
+    sea i = 0
+    mientras (i < longitud(t)) {
+        sea c = subcadena(t, i, i + 1)
+        si (texto_indice("\\*_`[]", c) >= 0) { r.agregar("\\" + c) } sino { r.agregar(c) }
+        i = i + 1
+    }
+    retornar unir(r, "")
+}
+
+funcion _cv_w_md_inl(inl) {
+    sea r = []
+    para n en inl {
+        sea t = n["t"]
+        si (t == "texto") { r.agregar(_cv_md_esc(n["v"])) }
+        sino si (t == "salto_suave") { r.agregar("\n") }
+        sino si (t == "salto") { r.agregar("\\\n") }
+        sino si (t == "codigo") {
+            sea m = "`"
+            si (texto_indice(n["v"], "`") >= 0) { m = "``" }
+            sea esp = ""
+            si (texto_empieza_con(n["v"], "`") o texto_termina_con(n["v"], "`")) { esp = " " }
+            r.agregar(m + esp + n["v"] + esp + m)
+        } sino si (t == "enfasis") { r.agregar("*" + _cv_w_md_inl(n["hijos"]) + "*") }
+        sino si (t == "fuerte") { r.agregar("**" + _cv_w_md_inl(n["hijos"]) + "**") }
+        sino si (t == "tachado") { r.agregar("~~" + _cv_w_md_inl(n["hijos"]) + "~~") }
+        sino si (t == "enlace") {
+            sea ti = ""
+            si ((n["titulo"] ?? "") != "") { ti = " \"" + n["titulo"] + "\"" }
+            sea txt = _cv_w_md_inl(n["hijos"])
+            si (txt == n["url"] y ti == "" y (texto_empieza_con(n["url"], "http") o texto_empieza_con(n["url"], "mailto:"))) { r.agregar("<" + n["url"] + ">") } sino { r.agregar("[" + txt + "](" + n["url"] + ti + ")") }
+        } sino si (t == "imagen") {
+            sea ti = ""
+            si ((n["titulo"] ?? "") != "") { ti = " \"" + n["titulo"] + "\"" }
+            r.agregar("![" + n["alt"] + "](" + n["url"] + ti + ")")
+        }
+    }
+    retornar unir(r, "")
+}
+
+funcion _cv_sangrar(t, pre, resto) {
+    sea l = texto_dividir(t, "\n")
+    sea r = []
+    sea i = 0
+    mientras (i < longitud(l)) {
+        si (i == 0) { r.agregar(pre + l[i]) } sino si (l[i] == "") { r.agregar("") } sino { r.agregar(resto + l[i]) }
+        i = i + 1
+    }
+    retornar unir(r, "\n")
+}
+
+funcion _cv_w_md(bloques) {
+    sea r = []
+    para b en bloques {
+        sea t = b["t"]
+        si (t == "parrafo") { r.agregar(_cv_w_md_inl(b["hijos"])) }
+        sino si (t == "titulo") { r.agregar(_cv_rep("#", b["nivel"]) + " " + _cv_w_md_inl(b["hijos"])) }
+        sino si (t == "linea") { r.agregar("---") }
+        sino si (t == "codigo") {
+            sea m = "```"
+            si (texto_indice(b["v"], "```") >= 0) { m = "~~~~" }
+            r.agregar(m + b["lenguaje"] + "\n" + b["v"] + "\n" + m)
+        } sino si (t == "cita") {
+            sea l = []
+            para x en texto_dividir(_cv_w_md(b["hijos"]), "\n") { si (x == "") { l.agregar(">") } sino { l.agregar("> " + x) } }
+            r.agregar(unir(l, "\n"))
+        } sino si (t == "lista") {
+            sea items = []
+            sea k = b["inicio"]
+            para it en b["items"] {
+                sea mc = b["marca"] ?? nulo
+                sea marca = (mc ?? "-") + " "
+                si (b["ordenada"]) {
+                    si (mc == ")") { marca = k + ") " } sino { marca = k + ". " }
+                }
+                si (it["tarea"] == verdadero) { marca = marca + "[x] " }
+                si (it["tarea"] == falso) { marca = marca + "[ ] " }
+                sea dentro = _cv_w_md(it["bloques"])
+                si (b["suelta"] == falso) {
+                    sea partes = []
+                    para x en it["bloques"] { partes.agregar(_cv_w_md([x])) }
+                    dentro = unir(partes, "\n")
+                }
+                items.agregar(_cv_sangrar(dentro, marca, _cv_rep(" ", longitud(marca))))
+                k = k + 1
+            }
+            si (b["suelta"]) { r.agregar(unir(items, "\n\n")) } sino { r.agregar(unir(items, "\n")) }
+        } sino si (t == "tabla") {
+            sea cel = funcion(c) { retornar texto_reemplazar(_cv_w_md_inl(c), "|", "\\|") }
+            sea cab = []
+            para c en b["cabecera"] { cab.agregar(cel(c)) }
+            sea sep = []
+            sea k = 0
+            mientras (k < longitud(b["cabecera"])) {
+                sea a = b["alineacion"][k] ?? ""
+                si (a == "centro") { sep.agregar(":---:") } sino si (a == "derecha") { sep.agregar("---:") } sino si (a == "izquierda") { sep.agregar(":---") } sino { sep.agregar("---") }
+                k = k + 1
+            }
+            sea l = ["| " + unir(cab, " | ") + " |", "|" + unir(sep, "|") + "|"]
+            para f en b["filas"] {
+                sea x = []
+                para c en f { x.agregar(cel(c)) }
+                l.agregar("| " + unir(x, " | ") + " |")
+            }
+            r.agregar(unir(l, "\n"))
+        }
+    }
+    retornar unir(r, "\n\n")
+}
+
+// --- texto plano ---
+
+funcion _cv_ajustar(t, ancho) {
+    si (ancho == nulo o ancho <= 0) { retornar t }
+    sea lineas = []
+    para trozo en texto_dividir(t, "\n") {
+        sea actual = ""
+        para p en texto_dividir(trozo, " ") {
+            si (p != "") {
+                si (actual == "") { actual = p }
+                sino si (unicode_largo(actual) + 1 + unicode_largo(p) <= ancho) { actual = actual + " " + p }
+                sino {
+                    lineas.agregar(actual)
+                    actual = p
+                }
+            }
+        }
+        lineas.agregar(actual)
+    }
+    retornar unir(lineas, "\n")
+}
+
+funcion _cv_w_txt_inl(inl) {
+    sea r = []
+    para n en inl {
+        sea t = n["t"]
+        si (t == "texto" o t == "codigo") { r.agregar(n["v"]) }
+        sino si (t == "salto_suave") { r.agregar(" ") }
+        sino si (t == "salto") { r.agregar("\n") }
+        sino si (t == "enlace") {
+            sea x = _cv_w_txt_inl(n["hijos"])
+            si (x == n["url"]) { r.agregar(x) } sino { r.agregar(x + " <" + n["url"] + ">") }
+        } sino si (t == "imagen") { r.agregar("[" + n["alt"] + "]") }
+        sino { r.agregar(_cv_w_txt_inl(n["hijos"])) }
+    }
+    retornar unir(r, "")
+}
+
+funcion _cv_w_txt(bloques, ancho) {
+    sea r = []
+    para b en bloques {
+        sea t = b["t"]
+        si (t == "parrafo") { r.agregar(_cv_ajustar(_cv_w_txt_inl(b["hijos"]), ancho)) }
+        sino si (t == "titulo") {
+            sea x = _cv_w_txt_inl(b["hijos"])
+            si ((b["numero"] ?? nulo) != nulo) { x = b["numero"] + " " + x }
+            si (b["nivel"] == 1) { r.agregar(unicode_mayusculas(x)) }
+            sino si (b["nivel"] == 2) { r.agregar(x + "\n" + _cv_rep("-", unicode_largo(x))) }
+            sino { r.agregar(x) }
+        } sino si (t == "linea") { r.agregar(_cv_rep("-", 40)) }
+        sino si (t == "codigo") { r.agregar(_cv_sangrar(b["v"], "    ", "    ")) }
+        sino si (t == "cita") { r.agregar(_cv_sangrar(_cv_w_txt(b["hijos"], ancho), "  ", "  ")) }
+        sino si (t == "lista") {
+            sea items = []
+            sea k = b["inicio"]
+            para it en b["items"] {
+                sea marca = "- "
+                si (b["ordenada"]) { marca = k + ". " }
+                si (it["tarea"] == verdadero) { marca = marca + "[x] " }
+                si (it["tarea"] == falso) { marca = marca + "[ ] " }
+                items.agregar(_cv_sangrar(_cv_w_txt(it["bloques"], ancho), marca, _cv_rep(" ", longitud(marca))))
+                k = k + 1
+            }
+            r.agregar(unir(items, "\n"))
+        } sino si (t == "tabla") {
+            sea filas = []
+            sea cab = []
+            para c en b["cabecera"] { cab.agregar(_cv_w_txt_inl(c)) }
+            filas.agregar(cab)
+            para f en b["filas"] {
+                sea x = []
+                para c en f { x.agregar(_cv_w_txt_inl(c)) }
+                filas.agregar(x)
+            }
+            sea anchos = []
+            para c en cab { anchos.agregar(0) }
+            para f en filas {
+                sea k = 0
+                para c en f {
+                    si (k < longitud(anchos) y unicode_largo(c) > anchos[k]) { anchos[k] = unicode_largo(c) }
+                    k = k + 1
+                }
+            }
+            sea l = []
+            sea j = 0
+            para f en filas {
+                sea x = []
+                sea k = 0
+                para c en f {
+                    si (k < longitud(anchos)) {
+                        sea a = b["alineacion"][k] ?? ""
+                        sea relleno = _cv_rep(" ", anchos[k] - unicode_largo(c))
+                        si (a == "derecha") { x.agregar(relleno + c) } sino { x.agregar(c + relleno) }
+                    }
+                    k = k + 1
+                }
+                l.agregar(_cv_rder(unir(x, "  ")))
+                si (j == 0) {
+                    sea s = []
+                    para w en anchos { s.agregar(_cv_rep("-", w)) }
+                    l.agregar(unir(s, "  "))
+                }
+                j = j + 1
+            }
+            r.agregar(unir(l, "\n"))
+        }
+    }
+    retornar unir(r, "\n\n")
+}
+
+// --- rst y asciidoc ---
+
+funcion _cv_w_rst_inl(inl) {
+    sea r = []
+    para n en inl {
+        sea t = n["t"]
+        si (t == "texto") { r.agregar(n["v"]) }
+        sino si (t == "salto_suave") { r.agregar("\n") }
+        sino si (t == "salto") { r.agregar("\n") }
+        sino si (t == "codigo") { r.agregar("``" + n["v"] + "``") }
+        sino si (t == "enfasis") { r.agregar("*" + _cv_w_rst_inl(n["hijos"]) + "*") }
+        sino si (t == "fuerte") { r.agregar("**" + _cv_w_rst_inl(n["hijos"]) + "**") }
+        sino si (t == "tachado") { r.agregar(_cv_w_rst_inl(n["hijos"])) }
+        sino si (t == "enlace") { r.agregar("`" + _cv_w_rst_inl(n["hijos"]) + " <" + n["url"] + ">`_") }
+        sino si (t == "imagen") { r.agregar("[" + n["alt"] + "]") }
+    }
+    retornar unir(r, "")
+}
+
+sea _CV_RST_SUB = ["=", "-", "~", "^", "\"", "'"]
+
+funcion _cv_w_rst(bloques) {
+    sea r = []
+    para b en bloques {
+        sea t = b["t"]
+        si (t == "parrafo") { r.agregar(_cv_w_rst_inl(b["hijos"])) }
+        sino si (t == "titulo") {
+            sea x = _cv_w_rst_inl(b["hijos"])
+            r.agregar(x + "\n" + _cv_rep(_CV_RST_SUB[b["nivel"] - 1], unicode_largo(x)))
+        } sino si (t == "linea") { r.agregar("----") }
+        sino si (t == "codigo") {
+            sea cab = ".. code-block::"
+            si (b["lenguaje"] != "") { cab = cab + " " + b["lenguaje"] } sino { cab = "::" }
+            r.agregar(cab + "\n\n" + _cv_sangrar(b["v"], "   ", "   "))
+        } sino si (t == "cita") { r.agregar(_cv_sangrar(_cv_w_rst(b["hijos"]), "   ", "   ")) }
+        sino si (t == "lista") {
+            sea items = []
+            sea k = b["inicio"]
+            para it en b["items"] {
+                sea marca = "- "
+                si (b["ordenada"]) { marca = k + ". " }
+                items.agregar(_cv_sangrar(_cv_w_rst(it["bloques"]), marca, _cv_rep(" ", longitud(marca))))
+                k = k + 1
+            }
+            r.agregar(unir(items, "\n"))
+        } sino si (t == "tabla") {
+            sea l = [".. list-table::", "   :header-rows: 1", ""]
+            sea filas = [b["cabecera"]]
+            para f en b["filas"] { filas.agregar(f) }
+            para f en filas {
+                sea pri = verdadero
+                para c en f {
+                    si (pri) { l.agregar("   * - " + _cv_w_rst_inl(c)) } sino { l.agregar("     - " + _cv_w_rst_inl(c)) }
+                    pri = falso
+                }
+            }
+            r.agregar(unir(l, "\n"))
+        }
+    }
+    retornar unir(r, "\n\n")
+}
+
+funcion _cv_w_adoc_inl(inl) {
+    sea r = []
+    para n en inl {
+        sea t = n["t"]
+        si (t == "texto") { r.agregar(n["v"]) }
+        sino si (t == "salto_suave") { r.agregar("\n") }
+        sino si (t == "salto") { r.agregar(" +\n") }
+        sino si (t == "codigo") { r.agregar("`" + n["v"] + "`") }
+        sino si (t == "enfasis") { r.agregar("_" + _cv_w_adoc_inl(n["hijos"]) + "_") }
+        sino si (t == "fuerte") { r.agregar("*" + _cv_w_adoc_inl(n["hijos"]) + "*") }
+        sino si (t == "tachado") { r.agregar("[.line-through]#" + _cv_w_adoc_inl(n["hijos"]) + "#") }
+        sino si (t == "enlace") { r.agregar(n["url"] + "[" + _cv_w_adoc_inl(n["hijos"]) + "]") }
+        sino si (t == "imagen") { r.agregar("image:" + n["url"] + "[" + n["alt"] + "]") }
+    }
+    retornar unir(r, "")
+}
+
+funcion _cv_w_adoc(bloques, prof) {
+    sea r = []
+    para b en bloques {
+        sea t = b["t"]
+        si (t == "parrafo") { r.agregar(_cv_w_adoc_inl(b["hijos"])) }
+        sino si (t == "titulo") { r.agregar(_cv_rep("=", b["nivel"] + 1) + " " + _cv_w_adoc_inl(b["hijos"])) }
+        sino si (t == "linea") { r.agregar("'''") }
+        sino si (t == "codigo") {
+            sea cab = "----"
+            si (b["lenguaje"] != "") { cab = "[source," + b["lenguaje"] + "]\n----" }
+            r.agregar(cab + "\n" + b["v"] + "\n----")
+        } sino si (t == "cita") { r.agregar("____\n" + _cv_w_adoc(b["hijos"], prof) + "\n____") }
+        sino si (t == "lista") {
+            sea items = []
+            para it en b["items"] {
+                sea marca = _cv_rep("*", prof + 1) + " "
+                si (b["ordenada"]) { marca = _cv_rep(".", prof + 1) + " " }
+                si (it["tarea"] == verdadero) { marca = marca + "[x] " }
+                si (it["tarea"] == falso) { marca = marca + "[ ] " }
+                sea partes = []
+                para x en it["bloques"] {
+                    si (x["t"] == "lista") { partes.agregar(_cv_w_adoc([x], prof + 1)) } sino { partes.agregar(_cv_w_adoc([x], prof)) }
+                }
+                items.agregar(marca + unir(partes, "\n"))
+            }
+            r.agregar(unir(items, "\n"))
+        } sino si (t == "tabla") {
+            sea l = ["[options=\"header\"]", "|==="]
+            sea x = []
+            para c en b["cabecera"] { x.agregar("|" + _cv_w_adoc_inl(c)) }
+            l.agregar(unir(x, " "))
+            para f en b["filas"] {
+                sea y = []
+                para c en f { y.agregar("|" + _cv_w_adoc_inl(c)) }
+                l.agregar(unir(y, " "))
+            }
+            l.agregar("|===")
+            r.agregar(unir(l, "\n"))
+        }
+    }
+    retornar unir(r, "\n\n")
+}
+
+// ---------- api ----------
+
+/// Lee un texto en el formato dado (markdown/md, html, texto/txt, json).
+funcion conversor_leer(texto, formato) {
+    sea f = texto_minusculas(formato ?? "markdown")
+    si (f == "markdown" o f == "md" o f == "gfm" o f == "commonmark") { retornar conversor_leer_markdown(texto) }
+    si (f == "html" o f == "htm") { retornar conversor_leer_html(texto) }
+    si (f == "texto" o f == "txt" o f == "plain") { retornar conversor_leer_texto(texto) }
+    si (f == "json") { retornar json_parsear(texto) }
+    lanzar "formato de entrada no soportado: " + formato
+}
+
+/// Escribe un documento. opciones: "documento" (completo con cabecera),
+/// "indice" (tabla de contenidos), "numerar", "ancho" (texto), "titulo",
+/// "css" (html).
+funcion conversor_escribir(doc, formato, opciones) {
+    sea op = opciones ?? {}
+    sea f = texto_minusculas(formato ?? "html")
+    si (op["numerar"] ?? falso) { _cv_numerar(doc) }
+    si (((f == "html" o f == "html5") y (op["ids"] ?? verdadero)) o (op["indice"] ?? falso)) { _cv_ids(doc) }
+    sea titulo = op["titulo"] ?? (doc["meta"]["title"] ?? (doc["meta"]["titulo"] ?? nulo))
+    sea indice = nulo
+    si (op["indice"] ?? falso) { indice = conversor_indice(doc, op["profundidad"] ?? 3) }
+    si (f == "html" o f == "html5") {
+        sea cuerpo = _cv_w_html(doc["bloques"], falso)
+        si (indice != nulo) {
+            sea l = ["<nav id=\"indice\">", "<ul>"]
+            para e en indice { l.agregar("<li class=\"nivel-" + e["nivel"] + "\"><a href=\"#" + e["id"] + "\">" + _cv_html_esc(e["texto"]) + "</a></li>") }
+            l.agregar("</ul>")
+            l.agregar("</nav>")
+            cuerpo = unir(l, "\n") + "\n" + cuerpo
+        }
+        si (op["documento"] ?? falso) {
+            sea cab = ["<!DOCTYPE html>", "<html lang=\"" + (doc["meta"]["lang"] ?? "es") + "\">", "<head>", "<meta charset=\"utf-8\" />"]
+            si (titulo != nulo) { cab.agregar("<title>" + _cv_html_esc(titulo) + "</title>") }
+            si ((op["css"] ?? nulo) != nulo) { cab.agregar("<link rel=\"stylesheet\" href=\"" + _cv_html_esc(op["css"]) + "\" />") }
+            cab.agregar("</head>")
+            cab.agregar("<body>")
+            si (titulo != nulo) { cab.agregar("<h1 class=\"title\">" + _cv_html_esc(titulo) + "</h1>") }
+            retornar unir(cab, "\n") + "\n" + cuerpo + "\n</body>\n</html>\n"
+        }
+        retornar cuerpo + "\n"
+    }
+    si (f == "latex" o f == "tex") {
+        sea cuerpo = _cv_w_tex(doc["bloques"], {"numerar": op["numerar"] ?? verdadero})
+        si (op["documento"] ?? falso) {
+            sea l = ["\\documentclass" + _CV_LL + "article" + _CV_LR, "\\usepackage[utf8]" + _CV_LL + "inputenc" + _CV_LR, "\\usepackage" + _CV_LL + "hyperref" + _CV_LR, "\\usepackage" + _CV_LL + "graphicx" + _CV_LR, "\\usepackage" + _CV_LL + "ulem" + _CV_LR, "\\usepackage" + _CV_LL + "amssymb" + _CV_LR]
+            si (titulo != nulo) { l.agregar(_cv_tex_cmd("title", _cv_tex_esc(titulo))) }
+            si ((doc["meta"]["author"] ?? nulo) != nulo) { l.agregar(_cv_tex_cmd("author", _cv_tex_esc("" + doc["meta"]["author"]))) }
+            l.agregar(_cv_tex_cmd("begin", "document"))
+            si (titulo != nulo) { l.agregar("\\maketitle") }
+            si (indice != nulo) { l.agregar("\\tableofcontents") }
+            retornar unir(l, "\n") + "\n\n" + cuerpo + "\n\n" + _cv_tex_cmd("end", "document") + "\n"
+        }
+        retornar cuerpo + "\n"
+    }
+    si (f == "markdown" o f == "md" o f == "gfm") {
+        sea cuerpo = _cv_w_md(doc["bloques"])
+        si ((op["documento"] ?? falso) y longitud(claves(doc["meta"])) > 0) { cuerpo = "---\n" + ajustes_a_yaml(doc["meta"]) + "---\n\n" + cuerpo }
+        retornar cuerpo + "\n"
+    }
+    si (f == "texto" o f == "txt" o f == "plain") { retornar _cv_w_txt(doc["bloques"], op["ancho"] ?? 72) + "\n" }
+    si (f == "rst") {
+        sea cuerpo = _cv_w_rst(doc["bloques"])
+        si ((op["documento"] ?? falso) y titulo != nulo) { cuerpo = _cv_rep("=", unicode_largo(titulo)) + "\n" + titulo + "\n" + _cv_rep("=", unicode_largo(titulo)) + "\n\n" + cuerpo }
+        retornar cuerpo + "\n"
+    }
+    si (f == "asciidoc" o f == "adoc") {
+        sea cuerpo = _cv_w_adoc(doc["bloques"], 0)
+        si ((op["documento"] ?? falso) y titulo != nulo) { cuerpo = "= " + titulo + "\n\n" + cuerpo }
+        retornar cuerpo + "\n"
+    }
+    si (f == "json") { retornar json_texto(doc) }
+    lanzar "formato de salida no soportado: " + formato
+}
+
+/// Convierte texto entre formatos.
+funcion conversor_convertir(texto, desde, hacia, opciones) { retornar conversor_escribir(conversor_leer(texto, desde), hacia, opciones) }
+
+/// Filtro estilo Pandoc: aplica fn a cada bloque e inline (recorrido en
+/// profundidad). fn(nodo) devuelve nulo (sin cambio), un nodo o una lista
+/// de nodos que lo reemplazan ([] lo borra).
+funcion conversor_filtrar(doc, fn) {
+    doc["bloques"] = _cv_filtrar_lista(doc["bloques"], fn)
+    retornar doc
+}
+
+funcion _cv_filtrar_lista(l, fn) {
+    sea r = []
+    para n en l {
+        si ((n["hijos"] ?? nulo) != nulo) { n["hijos"] = _cv_filtrar_lista(n["hijos"], fn) }
+        si (n["t"] == "lista") { para it en n["items"] { it["bloques"] = _cv_filtrar_lista(it["bloques"], fn) } }
+        si (n["t"] == "tabla") {
+            sea cab = []
+            para c en n["cabecera"] { cab.agregar(_cv_filtrar_lista(c, fn)) }
+            n["cabecera"] = cab
+            sea filas = []
+            para f en n["filas"] {
+                sea x = []
+                para c en f { x.agregar(_cv_filtrar_lista(c, fn)) }
+                filas.agregar(x)
+            }
+            n["filas"] = filas
+        }
+        sea v = fn(n)
+        si (v == nulo) { r.agregar(n) } sino si (tipo(v) == "lista") { para x en v { r.agregar(x) } } sino { r.agregar(v) }
+    }
+    retornar r
+}
+
+/// Texto plano de un documento o de una lista de inlines.
+funcion conversor_texto_de(x) {
+    si (tipo(x) == "lista") { retornar _cv_texto_plano(x) }
+    retornar texto_recortar(_cv_w_txt(x["bloques"], 0))
+}
