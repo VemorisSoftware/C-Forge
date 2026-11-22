@@ -42,7 +42,7 @@ Estado: ✅ ya existe en C-Forge · 🔗 se usa hoy vía `cforge bindgen`,
 | 23 | `mapeador` | ORM con migraciones | EF Core | ✅ `db` (migraciones) · 🛠 ORM |
 | 24 | `senal` | Tiempo real con reconexión | SignalR | 🛠 |
 | 25 | `arbol_json` | JSON tipado y dinámico | System.Text.Json | ✅ `json` |
-| 26 | `regla` | Validación encadenada | FluentValidation | 🛠 |
+| 26 | `regla` / `validator` | Validación encadenada | FluentValidation | ✅ `regla` |
 | 27 | `calco` / `mapper` | Mapeo entre estructuras | AutoMapper | ✅ `calco` |
 | 28 | `resiste` / `resilience` | Reintentos y circuit breaker | Polly | ✅ `resiste` |
 | 29 | `bitacora` / `logger` | Logs estructurados | Serilog | ✅ `bitacora` |
@@ -199,10 +199,10 @@ Estado: ✅ ya existe en C-Forge · 🔗 se usa hoy vía `cforge bindgen`,
 | 143 | `historia` | Repositorios Git nativos | libgit2 | 🔗 |
 | 144 | `contenedor` | Controlar Docker | Bollard | 🛠 |
 | 145 | `version` | Versionado semántico | semver | ✅ gestor de paquetes |
-| 146 | `cronometro` | Micro-benchmarks estadísticos | Criterion | 🛠 |
+| 146 | `cronometro` / `bench` | Micro-benchmarks estadísticos | Criterion | ✅ `cronometro` |
 | 147 | `huesped` | Ejecutar WebAssembly embebido | Wasmtime | 🛠 |
 | 148 | `jit` | Código máquina en tiempo de ejecución | Cranelift | 🛠 |
-| 149 | `diagnostico` | Errores con flechas y colores | Miette | 🛠 |
+| 149 | `diagnostico` / `diagnostics` | Errores con flechas y colores | Miette | ✅ `diagnostico` |
 | 150 | `canal` | Canales sin bloqueo | Crossbeam | ✅ canales en `concurrencia` |
 | 151 | `asignador` | Asignador de memoria rápido | mimalloc | ✅ asignador propio |
 
@@ -220,9 +220,9 @@ Estado: ✅ ya existe en C-Forge · 🔗 se usa hoy vía `cforge bindgen`,
 | 157 | `curva` | Curva secp256k1 | libsecp256k1 | 🛠 |
 | 158 | `cadena` | Contratos EVM y Web3 | ethers-rs | 🛠 |
 | 159 | `semilla` | Frases mnemónicas y billeteras HD | BIP39 | 🛠 |
-| 160 | `paseo` | Tokens PASETO | PASETO | 🛠 |
+| 160 | `paseo` / `paseto` | Tokens PASETO | PASETO | ✅ `paseo` |
 | 161 | `federa` | OAuth2 y OpenID Connect | OAuth2 | 🛠 |
-| 162 | `segundo_factor` | TOTP y Passkeys | TOTP, WebAuthn | 🛠 |
+| 162 | `segundo_factor` / `totp` | TOTP y Passkeys | TOTP, WebAuthn | ✅ `segundo_factor` |
 | 163 | `antivirus` | Escaneo por firmas | ClamAV | 🔗 |
 | 164 | `centinela` | Detección de intrusos | Suricata | 🛠 |
 | 165 | `secretos` | Secretos cifrados en repos | sops | 🛠 |
@@ -234,7 +234,7 @@ Estado: ✅ ya existe en C-Forge · 🔗 se usa hoy vía `cforge bindgen`,
 |---|---|---|---|---|
 | 167 | `territorio` | Datos geoespaciales | GDAL | 🔗 |
 | 168 | `proyeccion` | Sistemas de coordenadas | PROJ | 🔗 |
-| 169 | `geometria` | Operaciones espaciales | GEOS, Turf | 🛠 |
+| 169 | `geometria` / `geo` | Operaciones espaciales | GEOS, Turf | ✅ `geometria` |
 | 170 | `panal` | Índice hexagonal del planeta | H3 | 🛠 |
 | 171 | `ciencia` | Optimización e interpolación | SciPy | 🛠 |
 | 172 | `fourier` | FFT rápida | FFTW | 🛠 |
@@ -260,13 +260,13 @@ Estado: ✅ ya existe en C-Forge · 🔗 se usa hoy vía `cforge bindgen`,
 | 187 | `determinista` | Física reproducible | Rapier | 🛠 |
 | 188 | `inmersiva` | Realidad virtual y aumentada | OpenXR | 🔗 |
 | 189 | `sombreador` | Traducir shaders | naga | 🛠 |
-| 190 | `mosaico` | Mapas de tiles | Tiled, LDtk | 🛠 |
+| 190 | `mosaico` / `tilemap` | Mapas de tiles | Tiled, LDtk | ✅ `mosaico` |
 | 191 | `esqueleto` | Animación por huesos 2D | Spine | 🛠 |
 | 192 | `multitud` | Simulación de multitudes | DetourCrowd | 🛠 |
-| 193 | `ruido` | Terrenos procedurales | FastNoiseLite | 🛠 |
+| 193 | `ruido` / `noise` | Terrenos procedurales | FastNoiseLite | ✅ `ruido` |
 | 194 | `carga3d` | Cargar OBJ y glTF | tinyobjloader | ✅ `modelo` (OBJ) · 🛠 glTF |
 | 195 | `grafica` | Gráficas en tiempo real | ImPlot | 🛠 |
-| 196 | `dialogo` | Narrativa interactiva | ink, YarnSpinner | 🛠 |
+| 196 | `dialogo` / `dialogue` | Narrativa interactiva | ink, YarnSpinner | ✅ `dialogo` |
 
 ### K. Multimedia, documentos y finanzas
 
@@ -280,8 +280,8 @@ Estado: ✅ ya existe en C-Forge · 🔗 se usa hoy vía `cforge bindgen`,
 | 202 | `conversor` | Conversión entre formatos de documento | Pandoc | 🛠 |
 | 203 | `lee_excel` | Leer .xlsx/.ods | Calamine | 🛠 |
 | 204 | `dinero` / `money` | Decimales exactos | rust_decimal | ✅ `dinero` |
-| 205 | `indicadores` | Análisis técnico (RSI, MACD) | TA-Lib | 🛠 |
-| 206 | `derivados` | Valoración de opciones y bonos | QuantLib | 🛠 |
+| 205 | `indicadores` / `ta` | Análisis técnico (RSI, MACD) | TA-Lib | ✅ `indicadores` |
+| 206 | `derivados` / `quant` | Valoración de opciones y bonos | QuantLib | ✅ `derivados` |
 | 207 | `mensaje_bancario` | ISO 8583 y FIX | ISO 8583, FIX | 🛠 |
 | 208 | `cobro` | Cobros idempotentes y webhooks | Stripe | 🛠 |
 | 209 | `postura` | Rostro, manos y pose | MediaPipe | 🔗 |
@@ -293,7 +293,7 @@ Estado: ✅ ya existe en C-Forge · 🔗 se usa hoy vía `cforge bindgen`,
 | # | Nombre | Para qué | Inspiración | Estado |
 |---|---|---|---|---|
 | 212 | `traza` | Trazas y métricas distribuidas | OpenTelemetry | 🛠 |
-| 213 | `metricas` | Métricas en tiempo real | Prometheus | 🛠 |
+| 213 | `metricas` / `metrics` | Métricas en tiempo real | Prometheus | ✅ `metricas` |
 | 214 | `flujo` | Streaming de eventos | Kafka | 🔗 |
 | 215 | `correo_rapido` | Mensajería entre microservicios | NATS | 🛠 |
 | 216 | `colas` | Colas AMQP | RabbitMQ | 🛠 |
@@ -304,8 +304,8 @@ Estado: ✅ ya existe en C-Forge · 🔗 se usa hoy vía `cforge bindgen`,
 | 221 | `proxy` | Proxy inverso y balanceo | Caddy, Pingora | 🛠 |
 | 222 | `recolector` | Recolección de logs | Vector | 🛠 |
 | 223 | `proceso` | Flujos de trabajo de larga duración | Temporal | 🛠 |
-| 224 | `permisos` | ACL, RBAC y ABAC | Casbin | 🛠 |
-| 225 | `interruptor` | Feature flags y pruebas A/B | OpenFeature | 🛠 |
+| 224 | `permisos` / `rbac` | ACL, RBAC y ABAC | Casbin | ✅ `permisos` |
+| 225 | `interruptor` / `flags` | Feature flags y pruebas A/B | OpenFeature | ✅ `interruptor` |
 | 226 | `entorno` | Servicios reales en pruebas | Testcontainers | 🛠 |
 
 ### M. Automatización, compiladores y sistema
@@ -315,7 +315,7 @@ Estado: ✅ ya existe en C-Forge · 🔗 se usa hoy vía `cforge bindgen`,
 | 227 | `asistente` | Servidor de lenguaje | LSP | ✅ `cforge lsp` |
 | 228 | `depura` | Depuración paso a paso | DAP | 🛠 |
 | 229 | `intermedio` | Optimización de código intermedio | LLVM, MLIR | 🛠 (v5) |
-| 230 | `gramatica` | Combinadores de parsers | Pest, Nom | 🛠 |
+| 230 | `gramatica` / `parser` | Combinadores de parsers | Pest, Nom | ✅ `gramatica` |
 | 231 | `analiza` | Compilador como servicio | Roslyn | 🛠 |
 | 232 | `nucleo` | Programas en el kernel | eBPF | 🛠 |
 | 233 | `anillo` | E/S asíncrona en Linux | io_uring | 🛠 |
@@ -326,7 +326,7 @@ Estado: ✅ ya existe en C-Forge · 🔗 se usa hoy vía `cforge bindgen`,
 | 238 | `recolecta` | Extracción web con sesiones | Fantoccini | 🛠 |
 | 239 | `agenda` | Cron con zonas horarias | tokio-cron | 🛠 |
 | 240 | `ident` / `ids` | UUID, ULID y NanoID | uuid, ulid | ✅ `ident` |
-| 241 | `telefono` | Números telefónicos | libphonenumber | 🛠 |
+| 241 | `telefono` / `phone` | Números telefónicos | libphonenumber | ✅ `telefono` |
 | 242 | `unicode` | Normalización y ordenamiento | ICU | 🛠 |
 | 243 | `buscador` | Búsqueda full-text | Tantivy | 🛠 |
 | 244 | `consulta_archivos` | SQL sobre CSV, JSON y Parquet | DataFusion | 🛠 |

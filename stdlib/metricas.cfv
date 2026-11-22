@@ -1,0 +1,169 @@
+// stdlib/metricas.cfv — métricas para monitoreo en formato Prometheus:
+// contadores, medidores, histogramas y resúmenes con etiquetas, listos para
+// servir en /metrics. Inspirada en el cliente de Prometheus (Apache). En
+// inglés: importar "metrics".
+//
+//   importar "metricas"
+//   sea r = metricas_registro()
+//   sea pedidos = metricas_contador(r, "http_pedidos_total", "Pedidos HTTP", ["ruta", "codigo"])
+//   metricas_sumar(pedidos, 1, {"ruta": "/api", "codigo": "200"})
+//   sea lat = metricas_histograma(r, "http_latencia_segundos", "Latencia", [], [0.05, 0.1, 0.5, 1])
+//   metricas_observar(lat, 0.08)
+//   web_responder(req, 200, metricas_texto(r), "text/plain; version=0.0.4")
+
+funcion metricas_registro() { retornar {"metricas": [], "nombres": {}} }
+
+funcion _mt_nombre_ok(n) {
+    si (longitud(n) == 0) { retornar falso }
+    para c en texto_dividir(n, "") {
+        sea b = byte_en(c, 0)
+        si ((b >= 97 y b <= 122) o (b >= 65 y b <= 90) o (b >= 48 y b <= 57) o c == "_" o c == ":") { } sino { retornar falso }
+    }
+    sea b0 = byte_en(n, 0)
+    retornar b0 < 48 o b0 > 57
+}
+
+funcion _mt_nueva(r, tipo_m, nombre, ayuda, etiquetas, extra) {
+    si (_mt_nombre_ok(nombre) == falso) { lanzar "metricas: nombre inválido " + nombre }
+    si (tiene_clave(r["nombres"], nombre)) { lanzar "metricas: " + nombre + " ya está registrada" }
+    para e en etiquetas ?? [] { si (_mt_nombre_ok(e) == falso o texto_empieza_con(e, "__")) { lanzar "metricas: etiqueta inválida " + e } }
+    sea m = {"tipo": tipo_m, "nombre": nombre, "ayuda": ayuda ?? "", "etiquetas": etiquetas ?? [], "series": {}, "orden": [], "extra": extra}
+    r["metricas"].agregar(m)
+    r["nombres"][nombre] = verdadero
+    retornar m
+}
+
+funcion metricas_contador(r, nombre, ayuda, etiquetas) { retornar _mt_nueva(r, "counter", nombre, ayuda, etiquetas, nulo) }
+funcion metricas_medidor(r, nombre, ayuda, etiquetas) { retornar _mt_nueva(r, "gauge", nombre, ayuda, etiquetas, nulo) }
+
+/// Histograma con límites de cubetas (por defecto los de Prometheus).
+funcion metricas_histograma(r, nombre, ayuda, etiquetas, cubetas) {
+    sea c = cubetas ?? [0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1, 2.5, 5, 10]
+    sea ordenadas = ordenar(c, funcion(a, b) { retornar a - b })
+    retornar _mt_nueva(r, "histogram", nombre, ayuda, etiquetas, ordenadas)
+}
+
+/// Resumen con cuantiles calculados sobre las últimas "ventana" observaciones.
+funcion metricas_resumen(r, nombre, ayuda, etiquetas, cuantiles, ventana) {
+    retornar _mt_nueva(r, "summary", nombre, ayuda, etiquetas, {"cuantiles": cuantiles ?? [0.5, 0.9, 0.99], "ventana": ventana ?? 1000})
+}
+
+funcion _mt_clave(m, valores) {
+    sea v = valores ?? {}
+    sea partes = []
+    para e en m["etiquetas"] {
+        si (tiene_clave(v, e) == falso) { lanzar "metricas: falta la etiqueta " + e + " en " + m["nombre"] }
+        partes.agregar("" + v[e])
+    }
+    para k en claves(v) {
+        sea esta = falso
+        para e en m["etiquetas"] { si (e == k) { esta = verdadero } }
+        si (esta == falso) { lanzar "metricas: etiqueta desconocida " + k + " en " + m["nombre"] }
+    }
+    sea k = unir(partes, caracter(31))
+    si (tiene_clave(m["series"], k) == falso) {
+        sea s = {"valores": v, "valor": 0, "suma": 0, "cuenta": 0, "cubetas": [], "muestras": []}
+        si (m["tipo"] == "histogram") { para b en m["extra"] { s["cubetas"].agregar(0) } }
+        m["series"][k] = s
+        m["orden"].agregar(k)
+    }
+    retornar m["series"][k]
+}
+
+funcion metricas_sumar(m, n, etiquetas) {
+    sea x = n ?? 1
+    si (m["tipo"] == "counter" y x < 0) { lanzar "metricas: un contador no puede bajar" }
+    si (m["tipo"] != "counter" y m["tipo"] != "gauge") { lanzar "metricas: sumar es para contadores y medidores" }
+    sea s = _mt_clave(m, etiquetas)
+    s["valor"] = s["valor"] + x
+    retornar m
+}
+
+funcion metricas_fijar(m, v, etiquetas) {
+    si (m["tipo"] != "gauge") { lanzar "metricas: fijar es para medidores" }
+    sea s = _mt_clave(m, etiquetas)
+    s["valor"] = v
+    retornar m
+}
+
+funcion metricas_observar(m, v, etiquetas) {
+    sea s = _mt_clave(m, etiquetas)
+    si (m["tipo"] == "histogram") {
+        sea i = 0
+        mientras (i < longitud(m["extra"])) {
+            si (v <= m["extra"][i]) { s["cubetas"][i] = s["cubetas"][i] + 1 }
+            i = i + 1
+        }
+    } sino {
+        si (m["tipo"] != "summary") { lanzar "metricas: observar es para histogramas y resúmenes" }
+        s["muestras"].agregar(v)
+        si (longitud(s["muestras"]) > m["extra"]["ventana"]) {
+            sea r = []
+            sea k = 1
+            mientras (k < longitud(s["muestras"])) { r.agregar(s["muestras"][k])  k = k + 1 }
+            s["muestras"] = r
+        }
+    }
+    s["suma"] = s["suma"] + v
+    s["cuenta"] = s["cuenta"] + 1
+    retornar m
+}
+
+/// Mide la duración de f() en segundos y la observa.
+funcion metricas_cronometrar(m, f, etiquetas) {
+    sea t = cfv_fecha_ahora_ms()
+    sea r = f()
+    metricas_observar(m, (cfv_fecha_ahora_ms() - t) / 1000, etiquetas)
+    retornar r
+}
+
+funcion metricas_valor(m, etiquetas) { retornar _mt_clave(m, etiquetas)["valor"] }
+
+funcion _mt_escapar(v) { retornar texto_reemplazar(texto_reemplazar(texto_reemplazar("" + v, "\\", "\\\\"), "\n", "\\n"), "\"", "\\\"") }
+
+funcion _mt_etq(valores, extra_k, extra_v) {
+    sea partes = []
+    para k en claves(valores) { partes.agregar(k + "=\"" + _mt_escapar(valores[k]) + "\"") }
+    si (extra_k != nulo) { partes.agregar(extra_k + "=\"" + extra_v + "\"") }
+    si (longitud(partes) == 0) { retornar "" }
+    retornar caracter(123) + unir(partes, ",") + caracter(125)
+}
+
+funcion _mt_num(v) {
+    si (v == piso(v) y absoluto(v) < 1000000000000000) { retornar "" + piso(v) }
+    retornar "" + v
+}
+
+/// Formato de exposición de texto de Prometheus 0.0.4.
+funcion metricas_texto(r) {
+    sea l = []
+    para m en r["metricas"] {
+        l.agregar("# HELP " + m["nombre"] + " " + texto_reemplazar(texto_reemplazar(m["ayuda"], "\\", "\\\\"), "\n", "\\n"))
+        l.agregar("# TYPE " + m["nombre"] + " " + m["tipo"])
+        para k en m["orden"] {
+            sea s = m["series"][k]
+            si (m["tipo"] == "counter" o m["tipo"] == "gauge") { l.agregar(m["nombre"] + _mt_etq(s["valores"]) + " " + _mt_num(s["valor"])) }
+            si (m["tipo"] == "histogram") {
+                sea i = 0
+                mientras (i < longitud(m["extra"])) {
+                    l.agregar(m["nombre"] + "_bucket" + _mt_etq(s["valores"], "le", _mt_num(m["extra"][i])) + " " + s["cubetas"][i])
+                    i = i + 1
+                }
+                l.agregar(m["nombre"] + "_bucket" + _mt_etq(s["valores"], "le", "+Inf") + " " + s["cuenta"])
+                l.agregar(m["nombre"] + "_sum" + _mt_etq(s["valores"]) + " " + _mt_num(s["suma"]))
+                l.agregar(m["nombre"] + "_count" + _mt_etq(s["valores"]) + " " + s["cuenta"])
+            }
+            si (m["tipo"] == "summary") {
+                sea o = ordenar(s["muestras"], funcion(a, b) { retornar a - b })
+                para q en m["extra"]["cuantiles"] {
+                    sea v = "NaN"
+                    si (longitud(o) > 0) { v = _mt_num(o[minimo(longitud(o) - 1, piso(q * longitud(o)))]) }
+                    l.agregar(m["nombre"] + _mt_etq(s["valores"], "quantile", "" + q) + " " + v)
+                }
+                l.agregar(m["nombre"] + "_sum" + _mt_etq(s["valores"]) + " " + _mt_num(s["suma"]))
+                l.agregar(m["nombre"] + "_count" + _mt_etq(s["valores"]) + " " + s["cuenta"])
+            }
+        }
+    }
+    retornar unir(l, "\n") + "\n"
+}

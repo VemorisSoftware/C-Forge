@@ -18,6 +18,25 @@ Sitio oficial: [c-forge.org](https://c-forge.org)
   JSON, sin inyección de líneas), `resiste`/`resilience` (reintentos con
   espera exponencial y cortacircuitos) y `plantilla`/`template` (`{{ }}`
   escapado, `#si`/`#if`, `#cada`/`#each`). Pruebas en español e inglés.
+- **Lote 6 (bilingüe):** `regla`/`validator` (formularios campo a campo,
+  RUT chileno), `permisos`/`rbac` (roles con herencia, dominios, denegar y
+  condiciones ABAC), `interruptor`/`flags` (feature flags con despliegue
+  gradual estable y variantes A/B), `telefono`/`phone` (E.164, móvil/fijo,
+  WhatsApp), `indicadores`/`ta` (SMA, EMA, RSI de Wilder, MACD, Bollinger,
+  ATR, estocástico), `derivados`/`quant` (Black–Scholes con griegas,
+  volatilidad implícita, binomial, bonos, VAN/TIR, amortización),
+  `ruido`/`noise` (Perlin, simplex, celular, fractal) y
+  `diagnostico`/`diagnostics` (errores con el código subrayado).
+- **Lote 7 (bilingüe):** `segundo_factor`/`totp` (TOTP/HOTP con los vectores
+  de los RFC 6238 y 4226), `metricas`/`metrics` (formato Prometheus),
+  `gramatica`/`parser` (combinadores con precedencia y errores con
+  línea/columna), `mosaico`/`tilemap` (Tiled, colisiones, A*),
+  `dialogo`/`dialogue` (narrativa con condiciones y variables),
+  `geometria`/`geo` (haversine, polígonos, envolvente, GeoJSON),
+  `cronometro`/`bench` (benchmarks con estadística) y `paseo`/`paseto`
+  (PASETO v4.public, verificado con el vector oficial).
+- **`a_numero` y JSON:** aceptan exponentes (`"2.5e1"`) y redondean una sola
+  vez, igual que los literales del compilador.
 - **Lote 5 (bilingüe):** `indice`/`search` (texto completo con BM25, pesos
   por campo, tildes, plurales, prefijos y exclusiones), `vecindad`/`vectors`
   (k vecinos por coseno, euclídea o punto, con filtros), `numerica`/`numeric`

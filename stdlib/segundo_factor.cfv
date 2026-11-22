@@ -1,0 +1,142 @@
+// stdlib/segundo_factor.cfv — segundo factor de autenticación: códigos
+// TOTP (RFC 6238, los de Google Authenticator / Authy / 1Password), HOTP
+// (RFC 4226), secretos en Base32, URI otpauth:// para el QR y códigos de
+// respaldo. Verificación en tiempo constante y con ventana de tolerancia.
+// En inglés: importar "totp".
+//
+//   importar "segundo_factor"
+//   sea secreto = segundo_factor_secreto()                       // "JBSWY3DPEHPK3PXP…"
+//   segundo_factor_uri(secreto, "ana@vemoris.cl", "Vemoris")     // para el QR
+//   segundo_factor_verificar(secreto, "492039")                  // verdadero / falso
+
+sea _SF_B32 = "ABCDEFGHIJKLMNOPQRSTUVWXYZ234567"
+
+funcion segundo_factor_base32(bytes) {
+    sea r = ""
+    sea buf = 0
+    sea bits = 0
+    sea i = 0
+    mientras (i < longitud(bytes)) {
+        buf = buf * 256 + byte_en(bytes, i)
+        bits = bits + 8
+        mientras (bits >= 5) {
+            sea v = cociente(buf, potencia(2, bits - 5)) % 32
+            r = r + subcadena(_SF_B32, v, v + 1)
+            bits = bits - 5
+        }
+        buf = buf % potencia(2, bits)
+        i = i + 1
+    }
+    si (bits > 0) {
+        sea v = (buf * potencia(2, 5 - bits)) % 32
+        r = r + subcadena(_SF_B32, v, v + 1)
+    }
+    retornar r
+}
+
+funcion segundo_factor_desde_base32(texto) {
+    sea t = texto_mayusculas(texto_reemplazar(texto_reemplazar(texto_reemplazar("" + texto, " ", ""), "-", ""), "=", ""))
+    sea r = ""
+    sea buf = 0
+    sea bits = 0
+    para c en texto_dividir(t, "") {
+        sea v = texto_indice(_SF_B32, c)
+        si (v < 0) { lanzar "segundo_factor: carácter inválido en Base32: " + c }
+        buf = buf * 32 + v
+        bits = bits + 5
+        si (bits >= 8) {
+            r = r + bytes_entero(cociente(buf, potencia(2, bits - 8)), 1, 0)
+            bits = bits - 8
+            buf = buf % potencia(2, bits)
+        }
+    }
+    retornar r
+}
+
+/// Secreto nuevo de 20 bytes (160 bits, lo recomendado) en Base32.
+funcion segundo_factor_secreto(bytes_n) { retornar segundo_factor_base32(bytes_aleatorios(bytes_n ?? 20)) }
+
+funcion _sf_hmac_sha1(clave, mensaje) {
+    sea k = clave
+    si (longitud(k) > 64) { k = sha1_bytes(k) }
+    mientras (longitud(k) < 64) { k = k + bytes_entero(0, 1, 0) }
+    retornar sha1_bytes(bytes_xor(k, texto_repetir(bytes_entero(92, 1, 0), 64)) + sha1_bytes(bytes_xor(k, texto_repetir(bytes_entero(54, 1, 0), 64)) + mensaje))
+}
+
+/// HOTP: código del contador dado (6 dígitos por defecto).
+funcion segundo_factor_hotp(secreto, contador, digitos) {
+    sea d = digitos ?? 6
+    sea clave = segundo_factor_desde_base32(secreto)
+    sea alto = cociente(contador, 4294967296)
+    sea bajo = contador % 4294967296
+    sea h = _sf_hmac_sha1(clave, bytes_entero(alto, 4, 0) + bytes_entero(bajo, 4, 0))
+    sea o = byte_en(h, 19) % 16
+    sea n = (byte_en(h, o) % 128) * 16777216 + byte_en(h, o + 1) * 65536 + byte_en(h, o + 2) * 256 + byte_en(h, o + 3)
+    sea codigo = "" + (n % potencia(10, d))
+    mientras (longitud(codigo) < d) { codigo = "0" + codigo }
+    retornar codigo
+}
+
+/// TOTP para el instante ms (ahora por defecto), pasos de 30 s.
+funcion segundo_factor_totp(secreto, ms, paso_s, digitos) {
+    sea t = ms ?? cfv_fecha_ahora_ms()
+    sea p = paso_s ?? 30
+    retornar segundo_factor_hotp(secreto, cociente(cociente(t, 1000), p), digitos)
+}
+
+funcion _sf_igual(a, b) {
+    si (longitud(a) != longitud(b)) { retornar falso }
+    sea d = 0
+    sea i = 0
+    mientras (i < longitud(a)) {
+        si (byte_en(a, i) != byte_en(b, i)) { d = d + 1 }
+        i = i + 1
+    }
+    retornar d == 0
+}
+
+/// Verifica aceptando "ventana" pasos antes y después (1 = ±30 s).
+funcion segundo_factor_verificar(secreto, codigo, ventana, ms, paso_s) {
+    sea c = texto_reemplazar(texto_recortar("" + codigo), " ", "")
+    sea w = ventana ?? 1
+    sea t = ms ?? cfv_fecha_ahora_ms()
+    sea p = paso_s ?? 30
+    sea base = cociente(cociente(t, 1000), p)
+    sea ok = falso
+    sea k = 0 - w
+    mientras (k <= w) {
+        si (_sf_igual(segundo_factor_hotp(secreto, base + k, longitud(c)), c)) { ok = verdadero }
+        k = k + 1
+    }
+    retornar ok y (longitud(c) == 6 o longitud(c) == 8)
+}
+
+funcion _sf_url(t) {
+    sea r = ""
+    para c en texto_dividir("" + t, "") {
+        sea b = byte_en(c, 0)
+        si ((b >= 48 y b <= 57) o (b >= 65 y b <= 90) o (b >= 97 y b <= 122) o c == "-" o c == "." o c == "_" o c == "~") { r = r + c } sino {
+            sea i = 0
+            mientras (i < longitud(c)) { r = r + "%" + texto_mayusculas(hex_de_bytes(subcadena(c, i, i + 1)))  i = i + 1 }
+        }
+    }
+    retornar r
+}
+
+/// otpauth://totp/Emisor:cuenta?secret=…&issuer=… (para generar el QR).
+funcion segundo_factor_uri(secreto, cuenta, emisor) {
+    sea e = emisor ?? "C-Forge"
+    retornar "otpauth://totp/" + _sf_url(e) + ":" + _sf_url(cuenta) + "?secret=" + secreto + "&issuer=" + _sf_url(e) + "&algorithm=SHA1&digits=6&period=30"
+}
+
+/// n códigos de respaldo de un solo uso ("ab12-cd34"); guarda sus hashes.
+funcion segundo_factor_respaldo(n) {
+    sea r = []
+    sea i = 0
+    mientras (i < (n ?? 10)) {
+        sea h = hex_de_bytes(bytes_aleatorios(4))
+        r.agregar(subcadena(h, 0, 4) + "-" + subcadena(h, 4, 8))
+        i = i + 1
+    }
+    retornar r
+}

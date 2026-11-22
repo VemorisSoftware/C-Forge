@@ -99,3 +99,145 @@ funcion str_digitos_ceros_decimales(r, fraccion, decimales) {
     str_liberar(digitos)
     retornar r
 }
+
+// ── Texto → decimal con un solo redondeo (misma técnica que los literales
+// del compilador: doble-doble de ~106 bits). Lo usan a_numero y JSON.
+
+funcion rtdd_nuevo(hi, lo, e2) {
+    sea p = mem_reservar(24)
+    __guardar64(p, hi)
+    __guardar64(p + 8, lo)
+    __guardar64(p + 16, e2)
+    retornar p
+}
+funcion rtdd_abs(x) { retornar __desplazar_der(__desplazar_izq(x, 1), 1) }
+funcion rtdd_hi(p) { retornar __cargar64(p) }
+funcion rtdd_lo(p) { retornar __cargar64(p + 8) }
+funcion rtdd_e2(p) { retornar __cargar64(p + 16) }
+
+funcion rtdd_rapida(a, b, e2) {
+    sea s = __f64_suma(a, b)
+    retornar rtdd_nuevo(s, __f64_resta(b, __f64_resta(s, a)), e2)
+}
+
+// 2^n exacto (|n| <= 1000) por multiplicaciones de 2.
+funcion rtdd_dos_a(n) {
+    sea r = __f64_desde_entero(1)
+    sea base = __f64_desde_entero(2)
+    si (n < 0) { base = __f64_div(__f64_desde_entero(1), base) }
+    sea k = n
+    si (k < 0) { k = 0 - k }
+    mientras (k > 0) {
+        r = __f64_mul(r, base)
+        k = k - 1
+    }
+    retornar r
+}
+
+// Producto exacto a·b = p + error (Dekker).
+funcion rtdd_partir_alto(a) {
+    sea t = __f64_mul(__f64_desde_entero(134217729), a)
+    retornar __f64_resta(t, __f64_resta(t, a))
+}
+funcion rtdd_producto(a, b, e2) {
+    sea p = __f64_mul(a, b)
+    sea ah = rtdd_partir_alto(a)
+    sea al = __f64_resta(a, ah)
+    sea bh = rtdd_partir_alto(b)
+    sea bl = __f64_resta(b, bh)
+    sea err = __f64_suma(__f64_suma(__f64_suma(__f64_resta(__f64_mul(ah, bh), p), __f64_mul(ah, bl)), __f64_mul(al, bh)), __f64_mul(al, bl))
+    retornar rtdd_nuevo(p, err, e2)
+}
+
+// Mantiene hi en [2^-400, 2^400] moviendo la escala a e2 (exacto).
+funcion rtdd_normalizar(x) {
+    sea alto = rtdd_dos_a(400)
+    sea bajo = rtdd_dos_a(0 - 400)
+    sea hi = rtdd_hi(x)
+    sea lo = rtdd_lo(x)
+    sea e2 = rtdd_e2(x)
+    mientras (__f64_menor(alto, rtdd_abs(hi))) {
+        hi = __f64_mul(hi, bajo)
+        lo = __f64_mul(lo, bajo)
+        e2 = e2 + 400
+    }
+    mientras (hi != 0 y __f64_menor(rtdd_abs(hi), bajo)) {
+        hi = __f64_mul(hi, alto)
+        lo = __f64_mul(lo, alto)
+        e2 = e2 - 400
+    }
+    retornar rtdd_nuevo(hi, lo, e2)
+}
+
+funcion rtdd_mul(x, y) {
+    sea p = rtdd_producto(rtdd_hi(x), rtdd_hi(y), rtdd_e2(x) + rtdd_e2(y))
+    sea lo = __f64_suma(rtdd_lo(p), __f64_suma(__f64_mul(rtdd_hi(x), rtdd_lo(y)), __f64_mul(rtdd_lo(x), rtdd_hi(y))))
+    retornar rtdd_normalizar(rtdd_rapida(rtdd_hi(p), lo, rtdd_e2(p)))
+}
+
+// x - q·y con x, y en la misma escala.
+funcion rtdd_menos_por(x, q, y) {
+    sea p = rtdd_producto(q, rtdd_hi(y), 0)
+    sea plo = __f64_suma(rtdd_lo(p), __f64_mul(q, rtdd_lo(y)))
+    sea s = __f64_resta(rtdd_hi(x), rtdd_hi(p))
+    sea bb = __f64_resta(s, rtdd_hi(x))
+    sea err = __f64_resta(__f64_resta(rtdd_hi(x), __f64_resta(s, bb)), __f64_suma(rtdd_hi(p), bb))
+    err = __f64_suma(err, __f64_resta(rtdd_lo(x), plo))
+    retornar rtdd_rapida(s, err, rtdd_e2(x))
+}
+
+funcion rtdd_div(x, y) {
+    sea q1 = __f64_div(rtdd_hi(x), rtdd_hi(y))
+    sea r = rtdd_menos_por(x, q1, y)
+    sea q2 = __f64_div(rtdd_hi(r), rtdd_hi(y))
+    r = rtdd_menos_por(r, q2, y)
+    sea q3 = __f64_div(rtdd_hi(r), rtdd_hi(y))
+    sea q = rtdd_rapida(q1, q2, 0)
+    sea s = __f64_suma(rtdd_hi(q), q3)
+    sea lo = __f64_suma(__f64_resta(q3, __f64_resta(s, rtdd_hi(q))), rtdd_lo(q))
+    retornar rtdd_normalizar(rtdd_rapida(s, lo, rtdd_e2(x) - rtdd_e2(y)))
+}
+
+// 10^n (n >= 0) en doble-doble por cuadrados sucesivos.
+funcion rtdd_potencia10(n) {
+    sea r = rtdd_nuevo(__f64_desde_entero(1), 0, 0)
+    sea b = rtdd_nuevo(__f64_desde_entero(10), 0, 0)
+    sea k = n
+    mientras (k > 0) {
+        si (k % 2 == 1) { r = rtdd_mul(r, b) }
+        k = k / 2
+        si (k > 0) { b = rtdd_mul(b, b) }
+    }
+    retornar r
+}
+
+funcion rtdd_p10(n) {
+    sea p = __f64_desde_entero(1)
+    sea k = 0
+    mientras (k < n) {
+        p = __f64_mul(p, __f64_desde_entero(10))
+        k = k + 1
+    }
+    retornar p
+}
+
+// M · 10^E correctamente redondeado (salvo empates de 1 en 2^50).
+funcion rt_decimal_a_f64(m, e) {
+    si (m == 0) { retornar __f64_desde_entero(0) }
+    si (m < 9007199254740992 y e >= 0 - 22 y e <= 22) {
+        si (e >= 0) { retornar __f64_mul(__f64_desde_entero(m), rtdd_p10(e)) }
+        retornar __f64_div(__f64_desde_entero(m), rtdd_p10(0 - e))
+    }
+    si (e > 330) { retornar __f64_div(__f64_desde_entero(1), __f64_desde_entero(0)) }
+    si (e < 0 - 360) { retornar __f64_desde_entero(0) }
+    sea hi = __f64_desde_entero(m)
+    sea mm = rtdd_nuevo(hi, __f64_desde_entero(m - __f64_a_entero(hi)), 0)
+    sea r = 0
+    si (e >= 0) { r = rtdd_mul(mm, rtdd_potencia10(e)) } sino { r = rtdd_div(mm, rtdd_potencia10(0 - e)) }
+    sea v = __f64_suma(rtdd_hi(r), rtdd_lo(r))
+    sea e2 = rtdd_e2(r)
+    mientras (e2 >= 400) { v = __f64_mul(v, rtdd_dos_a(400))  e2 = e2 - 400 }
+    mientras (e2 <= 0 - 400) { v = __f64_mul(v, rtdd_dos_a(0 - 400))  e2 = e2 + 400 }
+    retornar __f64_mul(v, rtdd_dos_a(e2))
+}
+

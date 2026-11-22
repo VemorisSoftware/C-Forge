@@ -1,0 +1,116 @@
+// stdlib/permisos.cfv — control de acceso: roles con herencia (RBAC),
+// permisos con comodines, dominios (multi-empresa), denegaciones explícitas
+// y condiciones sobre atributos (ABAC). Denegar gana a permitir. Inspirada
+// en Casbin (Apache). En inglés: importar "rbac".
+//
+//   importar "permisos"
+//   sea p = permisos_nuevo()
+//   permisos_rol(p, "editor", ["lector"])                    // editor hereda de lector
+//   permisos_permitir(p, "lector", "articulos", "leer")
+//   permisos_permitir(p, "editor", "articulos", "*")
+//   permisos_permitir(p, "autor", "articulos", "editar", funcion(u, r) { retornar r["autor"] == u["id"] })
+//   permisos_asignar(p, "ana", "editor")
+//   permisos_puede(p, "ana", "articulos", "borrar")          // verdadero
+//
+// Recursos con comodín: "articulos/*" cubre "articulos/42".
+
+funcion permisos_nuevo() { retornar {"herencia": {}, "reglas": [], "asignados": {}} }
+
+funcion permisos_rol(p, rol, hereda) {
+    p["herencia"][rol] = hereda ?? []
+    retornar p
+}
+
+/// Asigna un rol a un sujeto (opcionalmente solo en un dominio).
+funcion permisos_asignar(p, sujeto, rol, dominio) {
+    sea k = "" + sujeto
+    si (tiene_clave(p["asignados"], k) == falso) { p["asignados"][k] = [] }
+    p["asignados"][k].agregar([rol, dominio ?? "*"])
+    retornar p
+}
+
+funcion permisos_revocar(p, sujeto, rol, dominio) {
+    sea k = "" + sujeto
+    si (tiene_clave(p["asignados"], k) == falso) { retornar p }
+    sea r = []
+    para a en p["asignados"][k] { si (a[0] != rol o a[1] != (dominio ?? "*")) { r.agregar(a) } }
+    p["asignados"][k] = r
+    retornar p
+}
+
+funcion _pm_regla(p, efecto, rol, recurso, accion, condicion, dominio) {
+    p["reglas"].agregar({"efecto": efecto, "rol": rol, "recurso": recurso, "accion": accion, "condicion": condicion, "dominio": dominio ?? "*"})
+    retornar p
+}
+
+funcion permisos_permitir(p, rol, recurso, accion, condicion, dominio) { retornar _pm_regla(p, "permitir", rol, recurso, accion, condicion, dominio) }
+funcion permisos_denegar(p, rol, recurso, accion, condicion, dominio) { retornar _pm_regla(p, "denegar", rol, recurso, accion, condicion, dominio) }
+
+/// Todos los roles efectivos del sujeto en el dominio (incluye herencia y
+/// al propio sujeto, para reglas directas).
+funcion permisos_roles(p, sujeto, dominio) {
+    sea d = dominio ?? "*"
+    sea vistos = {}
+    sea cola = ["" + sujeto]
+    si (tiene_clave(p["asignados"], "" + sujeto)) {
+        para a en p["asignados"]["" + sujeto] { si (a[1] == "*" o a[1] == d) { cola.agregar(a[0]) } }
+    }
+    sea r = []
+    mientras (longitud(cola) > 0) {
+        sea x = cola[0]
+        sea resto = []
+        sea i = 1
+        mientras (i < longitud(cola)) { resto.agregar(cola[i])  i = i + 1 }
+        cola = resto
+        si (tiene_clave(vistos, x) == falso) {
+            vistos[x] = verdadero
+            r.agregar(x)
+            si (tiene_clave(p["herencia"], x)) { para h en p["herencia"][x] { cola.agregar(h) } }
+        }
+    }
+    retornar r
+}
+
+funcion _pm_calza(patron, valor) {
+    si (patron == "*" o patron == valor) { retornar verdadero }
+    si (texto_termina_con(patron, "*")) { retornar texto_empieza_con(valor, subcadena(patron, 0, longitud(patron) - 1)) }
+    retornar falso
+}
+
+/// ¿Puede? usuario puede ser un id o un mapa con "id" (para condiciones);
+/// recurso puede ser un texto o un mapa con "tipo" (y demás atributos).
+funcion permisos_puede(p, usuario, recurso, accion, dominio) {
+    sea id = usuario
+    si (tipo(usuario) == "mapa") { id = usuario["id"] }
+    sea nombre_rec = recurso
+    si (tipo(recurso) == "mapa") { nombre_rec = recurso["tipo"] }
+    sea d = dominio ?? "*"
+    sea roles = {}
+    para r en permisos_roles(p, id, d) { roles[r] = verdadero }
+    sea permitido = falso
+    para regla en p["reglas"] {
+        si (tiene_clave(roles, regla["rol"]) y _pm_calza(regla["recurso"], "" + nombre_rec) y _pm_calza(regla["accion"], "" + accion) y (regla["dominio"] == "*" o regla["dominio"] == d)) {
+            sea vale = verdadero
+            si (regla["condicion"] != nulo) {
+                vale = falso
+                intentar { vale = regla["condicion"](usuario, recurso) == verdadero } capturar (e) { vale = falso }
+            }
+            si (vale) {
+                si (regla["efecto"] == "denegar") { retornar falso }
+                permitido = verdadero
+            }
+        }
+    }
+    retornar permitido
+}
+
+/// Lanza "permisos: … no puede …" si no está permitido.
+funcion permisos_exigir(p, usuario, recurso, accion, dominio) {
+    si (permisos_puede(p, usuario, recurso, accion, dominio) == falso) {
+        sea id = usuario
+        si (tipo(usuario) == "mapa") { id = usuario["id"] }
+        sea r = recurso
+        si (tipo(recurso) == "mapa") { r = recurso["tipo"] }
+        lanzar "permisos: " + id + " no puede " + accion + " en " + r
+    }
+}

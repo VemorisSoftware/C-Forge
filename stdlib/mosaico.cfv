@@ -1,0 +1,212 @@
+// stdlib/mosaico.cfv — mapas de tiles para juegos 2D: crear capas, leer
+// mapas JSON de Tiled (.tmj) o LDtk simplificado, consultar tiles,
+// colisiones con cajas, objetos por nombre y conversión píxel ↔ celda.
+// Inspirada en Tiled / LDtk (BSD/MIT). En inglés: importar "tilemap".
+//
+//   importar "mosaico"
+//   sea m = mosaico_desde_tiled(leer_archivo("nivel1.tmj"))
+//   mosaico_tile(m, "suelo", 3, 5)                     // id del tile (0 = vacío)
+//   mosaico_solido(m, "colisiones", x_px, y_px)        // ¿pared?
+//   mosaico_mover(m, "colisiones", caja, dx, dy)       // caja ajustada sin atravesar paredes
+//   mosaico_objetos(m, "entidades", "jugador")          // [{"x", "y", …}]
+
+importar "json"
+
+funcion mosaico_nuevo(ancho, alto, tam_tile_x, tam_tile_y) {
+    retornar {"ancho": ancho, "alto": alto, "tw": tam_tile_x ?? 16, "th": tam_tile_y ?? tam_tile_x ?? 16, "capas": {}, "orden": [], "objetos": {}, "propiedades": {}}
+}
+
+/// Capa de tiles (datos = lista plana ancho×alto; 0 = vacío).
+funcion mosaico_capa(m, nombre, datos) {
+    sea d = datos
+    si (d == nulo) {
+        d = []
+        sea i = 0
+        mientras (i < m["ancho"] * m["alto"]) { d.agregar(0)  i = i + 1 }
+    }
+    si (longitud(d) != m["ancho"] * m["alto"]) { lanzar "mosaico: la capa " + nombre + " debe tener " + (m["ancho"] * m["alto"]) + " tiles" }
+    m["capas"][nombre] = d
+    m["orden"].agregar(nombre)
+    retornar m
+}
+
+/// Capa desde texto: cada línea una fila, cada carácter un tile según la leyenda.
+funcion mosaico_capa_texto(m, nombre, texto, leyenda) {
+    sea d = []
+    sea filas = texto_dividir(texto_recortar(texto), "\n")
+    si (longitud(filas) != m["alto"]) { lanzar "mosaico: se esperaban " + m["alto"] + " filas" }
+    para f en filas {
+        sea cs = texto_dividir(texto_recortar(f), "")
+        si (longitud(cs) != m["ancho"]) { lanzar "mosaico: cada fila debe tener " + m["ancho"] + " columnas" }
+        para c en cs {
+            si (tiene_clave(leyenda, c)) { d.agregar(leyenda[c]) } sino { d.agregar(0) }
+        }
+    }
+    retornar mosaico_capa(m, nombre, d)
+}
+
+funcion mosaico_dentro(m, cx, cy) { retornar cx >= 0 y cy >= 0 y cx < m["ancho"] y cy < m["alto"] }
+
+funcion mosaico_tile(m, capa, cx, cy) {
+    si (mosaico_dentro(m, cx, cy) == falso) { retornar 0 }
+    retornar m["capas"][capa][cy * m["ancho"] + cx]
+}
+
+funcion mosaico_poner(m, capa, cx, cy, id) {
+    si (mosaico_dentro(m, cx, cy) == falso) { lanzar "mosaico: celda fuera del mapa" }
+    m["capas"][capa][cy * m["ancho"] + cx] = id
+    retornar m
+}
+
+/// Píxel → celda [cx, cy].
+funcion mosaico_celda(m, x, y) { retornar [piso(x / m["tw"]), piso(y / m["th"])] }
+
+/// Celda → píxel de la esquina superior izquierda.
+funcion mosaico_pixel(m, cx, cy) { retornar [cx * m["tw"], cy * m["th"]] }
+
+/// ¿Hay un tile no vacío en esa posición (en píxeles)? Fuera del mapa cuenta como sólido.
+funcion mosaico_solido(m, capa, x, y) {
+    sea c = mosaico_celda(m, x, y)
+    si (mosaico_dentro(m, c[0], c[1]) == falso) { retornar verdadero }
+    retornar mosaico_tile(m, capa, c[0], c[1]) != 0
+}
+
+/// ¿La caja {x, y, ancho, alto} toca algún tile sólido?
+funcion mosaico_choca(m, capa, caja) {
+    sea a = mosaico_celda(m, caja["x"], caja["y"])
+    sea b = mosaico_celda(m, caja["x"] + caja["ancho"] - 0.001, caja["y"] + caja["alto"] - 0.001)
+    sea cy = a[1]
+    mientras (cy <= b[1]) {
+        sea cx = a[0]
+        mientras (cx <= b[0]) {
+            si (mosaico_dentro(m, cx, cy) == falso) { retornar verdadero }
+            si (mosaico_tile(m, capa, cx, cy) != 0) { retornar verdadero }
+            cx = cx + 1
+        }
+        cy = cy + 1
+    }
+    retornar falso
+}
+
+/// Mueve la caja eje por eje y la detiene contra los tiles sólidos.
+/// Devuelve {"x", "y", "ancho", "alto", "choco_x", "choco_y"}.
+funcion mosaico_mover(m, capa, caja, dx, dy) {
+    sea c = {"x": caja["x"], "y": caja["y"], "ancho": caja["ancho"], "alto": caja["alto"], "choco_x": falso, "choco_y": falso}
+    sea pasos = maximo(1, techo(maximo(absoluto(dx), absoluto(dy)) / (minimo(m["tw"], m["th"]) / 2)))
+    sea sx = dx / pasos
+    sea sy = dy / pasos
+    sea i = 0
+    mientras (i < pasos) {
+        si (sx != 0 y c["choco_x"] == falso) {
+            c["x"] = c["x"] + sx
+            si (mosaico_choca(m, capa, c)) {
+                si (sx > 0) { c["x"] = (mosaico_celda(m, c["x"] + c["ancho"], 0)[0]) * m["tw"] - c["ancho"] } sino { c["x"] = (mosaico_celda(m, c["x"], 0)[0] + 1) * m["tw"] }
+                c["choco_x"] = verdadero
+            }
+        }
+        si (sy != 0 y c["choco_y"] == falso) {
+            c["y"] = c["y"] + sy
+            si (mosaico_choca(m, capa, c)) {
+                si (sy > 0) { c["y"] = (mosaico_celda(m, 0, c["y"] + c["alto"])[1]) * m["th"] - c["alto"] } sino { c["y"] = (mosaico_celda(m, 0, c["y"])[1] + 1) * m["th"] }
+                c["choco_y"] = verdadero
+            }
+        }
+        i = i + 1
+    }
+    retornar c
+}
+
+funcion mosaico_agregar_objeto(m, capa, objeto) {
+    si (tiene_clave(m["objetos"], capa) == falso) { m["objetos"][capa] = [] }
+    m["objetos"][capa].agregar(objeto)
+    retornar m
+}
+
+/// Objetos de una capa (filtrados por nombre o tipo si se da).
+funcion mosaico_objetos(m, capa, nombre) {
+    si (tiene_clave(m["objetos"], capa) == falso) { retornar [] }
+    si (nombre == nulo) { retornar m["objetos"][capa] }
+    sea r = []
+    para o en m["objetos"][capa] {
+        si ((tiene_clave(o, "nombre") y o["nombre"] == nombre) o (tiene_clave(o, "tipo") y o["tipo"] == nombre)) { r.agregar(o) }
+    }
+    retornar r
+}
+
+/// Celdas visibles para una cámara {x, y, ancho, alto} en píxeles: [cx0, cy0, cx1, cy1].
+funcion mosaico_visibles(m, camara) {
+    sea a = mosaico_celda(m, camara["x"], camara["y"])
+    sea b = mosaico_celda(m, camara["x"] + camara["ancho"], camara["y"] + camara["alto"])
+    retornar [maximo(0, a[0]), maximo(0, a[1]), minimo(m["ancho"] - 1, b[0]), minimo(m["alto"] - 1, b[1])]
+}
+
+/// Lee un mapa de Tiled exportado en JSON (capas de tiles CSV y de objetos).
+/// Quita las banderas de volteo de los ids (bits altos).
+funcion mosaico_desde_tiled(texto) {
+    sea d = json_parsear(texto)
+    sea m = mosaico_nuevo(d["width"], d["height"], d["tilewidth"], d["tileheight"])
+    si (tiene_clave(d, "properties")) { para p en d["properties"] { m["propiedades"][p["name"]] = p["value"] } }
+    para c en d["layers"] {
+        si (c["type"] == "tilelayer") {
+            si (tiene_clave(c, "encoding") y c["encoding"] != "csv") { lanzar "mosaico: exporta las capas de Tiled en CSV (no base64)" }
+            sea datos = []
+            para id en c["data"] { datos.agregar(id % 536870912) }
+            mosaico_capa(m, c["name"], datos)
+        }
+        si (c["type"] == "objectgroup") {
+            para o en c["objects"] {
+                sea x = {"id": o["id"], "nombre": o["name"] ?? "", "tipo": o["type"] ?? (o["class"] ?? ""), "x": o["x"], "y": o["y"], "ancho": o["width"] ?? 0, "alto": o["height"] ?? 0}
+                si (tiene_clave(o, "properties")) { para p en o["properties"] { x[p["name"]] = p["value"] } }
+                mosaico_agregar_objeto(m, c["name"], x)
+            }
+        }
+    }
+    retornar m
+}
+
+/// Camino más corto entre celdas (A*, 4 direcciones) evitando tiles sólidos.
+funcion mosaico_camino(m, capa, desde, hasta) {
+    sea w = m["ancho"]
+    sea clave = funcion(c) { retornar c[1] * w + c[0] }
+    sea abiertos = [[0, desde]]
+    sea de = {}
+    sea costo = {}
+    costo["" + clave(desde)] = 0
+    sea visitados = 0
+    mientras (longitud(abiertos) > 0 y visitados < w * m["alto"] * 4) {
+        sea mejor = 0
+        sea i = 1
+        mientras (i < longitud(abiertos)) { si (abiertos[i][0] < abiertos[mejor][0]) { mejor = i }  i = i + 1 }
+        sea actual = abiertos[mejor][1]
+        sea resto = []
+        i = 0
+        mientras (i < longitud(abiertos)) { si (i != mejor) { resto.agregar(abiertos[i]) }  i = i + 1 }
+        abiertos = resto
+        visitados = visitados + 1
+        si (actual[0] == hasta[0] y actual[1] == hasta[1]) {
+            sea camino = [actual]
+            sea k = "" + clave(actual)
+            mientras (tiene_clave(de, k)) {
+                camino.agregar(de[k])
+                k = "" + clave(de[k])
+            }
+            sea r = []
+            sea j = longitud(camino) - 1
+            mientras (j >= 0) { r.agregar(camino[j])  j = j - 1 }
+            retornar r
+        }
+        para d en [[1, 0], [-1, 0], [0, 1], [0, -1]] {
+            sea v = [actual[0] + d[0], actual[1] + d[1]]
+            si (mosaico_dentro(m, v[0], v[1]) y mosaico_tile(m, capa, v[0], v[1]) == 0) {
+                sea c = costo["" + clave(actual)] + 1
+                sea kv = "" + clave(v)
+                si (tiene_clave(costo, kv) == falso o c < costo[kv]) {
+                    costo[kv] = c
+                    de[kv] = actual
+                    abiertos.agregar([c + absoluto(v[0] - hasta[0]) + absoluto(v[1] - hasta[1]), v])
+                }
+            }
+        }
+    }
+    retornar nulo
+}

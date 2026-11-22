@@ -1,0 +1,233 @@
+// stdlib/gramatica.cfv — combinadores de analizadores: arma parsers para
+// lenguajes, fórmulas, configuraciones o protocolos juntando piezas
+// pequeñas, con errores que dicen línea, columna y qué se esperaba.
+// Inspirada en Nom / Parsec / Pest (MIT). En inglés: importar "parser".
+//
+//   importar "gramatica"
+//   sea numero = gramatica_mapear(gramatica_regex("[0-9]+"), funcion(t) { retornar a_numero(t) })
+//   sea suma = gramatica_separados(numero, gramatica_simbolo("+"), 1)
+//   gramatica_analizar(gramatica_mapear(suma, funcion(l) { … }), "1 + 2 + 3")
+//
+// Un parser es una función (texto, posición) → {"ok", "valor", "pos"} o
+// {"ok": falso, "pos", "espera"}. gramatica_analizar exige consumir todo.
+
+importar "regex"
+
+funcion _gr_ok(v, p) { retornar {"ok": verdadero, "valor": v, "pos": p} }
+funcion _gr_no(p, espera) { retornar {"ok": falso, "pos": p, "espera": espera} }
+
+funcion _gr_blancos(t, p) {
+    sea i = p
+    mientras (i < longitud(t)) {
+        sea b = byte_en(t, i)
+        si (b == 32 o b == 9 o b == 10 o b == 13) { i = i + 1 } sino { retornar i }
+    }
+    retornar i
+}
+
+/// Texto exacto.
+funcion gramatica_literal(s) {
+    retornar funcion(t, p) {
+        si (subcadena(t, p, p + longitud(s)) == s) { retornar _gr_ok(s, p + longitud(s)) }
+        retornar _gr_no(p, "\"" + s + "\"")
+    }
+}
+
+/// Literal rodeado de espacios opcionales (lo más común en gramáticas).
+funcion gramatica_simbolo(s) { retornar gramatica_lexema(gramatica_literal(s)) }
+
+/// Expresión regular anclada en la posición actual.
+funcion gramatica_regex(patron, nombre) {
+    retornar funcion(t, p) {
+        sea resto = subcadena(t, p, longitud(t))
+        // Prueba prefijos del más largo al más corto (el motor solo dice si calza).
+        sea m = regex_buscar("^(" + patron + ")", resto)
+        si (m != nulo) {
+            sea txt = m
+            si (tipo(m) == "mapa") { txt = m["texto"] ?? m["coincidencia"] }
+            si (tipo(m) == "lista") { txt = m[0] }
+            si (texto_empieza_con(resto, "" + txt)) { retornar _gr_ok("" + txt, p + longitud("" + txt)) }
+        }
+        retornar _gr_no(p, nombre ?? ("/" + patron + "/"))
+    }
+}
+
+/// Ignora espacios antes y después.
+funcion gramatica_lexema(par) {
+    retornar funcion(t, p) {
+        sea r = par(t, _gr_blancos(t, p))
+        si (r["ok"]) { retornar _gr_ok(r["valor"], _gr_blancos(t, r["pos"])) }
+        retornar r
+    }
+}
+
+/// Todos en orden → lista de valores.
+funcion gramatica_secuencia(partes) {
+    retornar funcion(t, p) {
+        sea vals = []
+        sea pos = p
+        para par en partes {
+            sea r = par(t, pos)
+            si (r["ok"] == falso) { retornar r }
+            vals.agregar(r["valor"])
+            pos = r["pos"]
+        }
+        retornar _gr_ok(vals, pos)
+    }
+}
+
+/// La primera alternativa que funcione. El error informa la que llegó más lejos.
+funcion gramatica_alternativa(opciones) {
+    retornar funcion(t, p) {
+        sea mejor = nulo
+        sea esperas = []
+        para par en opciones {
+            sea r = par(t, p)
+            si (r["ok"]) { retornar r }
+            si (mejor == nulo o r["pos"] > mejor["pos"]) { mejor = r  esperas = [r["espera"]] } sino { si (r["pos"] == mejor["pos"]) { esperas.agregar(r["espera"]) } }
+        }
+        retornar _gr_no(mejor["pos"], unir(esperas, " o "))
+    }
+}
+
+/// Cero o más (min = 1 para uno o más).
+funcion gramatica_muchos(par, min) {
+    retornar funcion(t, p) {
+        sea vals = []
+        sea pos = p
+        sea seguir = verdadero
+        sea ultimo = nulo
+        mientras (seguir) {
+            sea r = par(t, pos)
+            si (r["ok"] y r["pos"] > pos) { vals.agregar(r["valor"])  pos = r["pos"] } sino { seguir = falso  ultimo = r }
+        }
+        si (longitud(vals) < (min ?? 0)) { retornar ultimo }
+        retornar _gr_ok(vals, pos)
+    }
+}
+
+funcion gramatica_opcional(par, defecto) {
+    retornar funcion(t, p) {
+        sea r = par(t, p)
+        si (r["ok"]) { retornar r }
+        retornar _gr_ok(defecto, p)
+    }
+}
+
+/// a, b, c (min elementos).
+funcion gramatica_separados(par, separador, min) {
+    retornar funcion(t, p) {
+        sea primero = par(t, p)
+        si (primero["ok"] == falso) {
+            si ((min ?? 0) == 0) { retornar _gr_ok([], p) }
+            retornar primero
+        }
+        sea vals = [primero["valor"]]
+        sea pos = primero["pos"]
+        sea seguir = verdadero
+        mientras (seguir) {
+            sea s = separador(t, pos)
+            si (s["ok"] == falso) { seguir = falso } sino {
+                sea x = par(t, s["pos"])
+                si (x["ok"] == falso) { retornar x }
+                vals.agregar(x["valor"])
+                pos = x["pos"]
+            }
+        }
+        si (longitud(vals) < (min ?? 0)) { retornar _gr_no(pos, "más elementos") }
+        retornar _gr_ok(vals, pos)
+    }
+}
+
+/// Transforma el valor si el parser funcionó.
+funcion gramatica_mapear(par, f) {
+    retornar funcion(t, p) {
+        sea r = par(t, p)
+        si (r["ok"]) { retornar _gr_ok(f(r["valor"]), r["pos"]) }
+        retornar r
+    }
+}
+
+/// abre par cierra → el valor de par.
+funcion gramatica_entre(abre, par, cierra) {
+    retornar gramatica_mapear(gramatica_secuencia([abre, par, cierra]), funcion(v) { retornar v[1] })
+}
+
+/// Parser recursivo: f recibe una referencia a sí mismo.
+funcion gramatica_recursivo(f) {
+    sea caja = [nulo]
+    sea yo = funcion(t, p) { retornar caja[0](t, p) }
+    caja[0] = f(yo)
+    retornar yo
+}
+
+/// Operadores binarios con precedencia (izquierda a derecha):
+/// niveles = [[["+", f], ["-", f]], [["*", f], ["/", f]]] (de menor a mayor).
+funcion gramatica_operadores(atomo, niveles) {
+    sea actual = atomo
+    sea i = longitud(niveles) - 1
+    mientras (i >= 0) {
+        sea nivel = niveles[i]
+        sea siguiente = actual
+        sea ops = []
+        para o en nivel { ops.agregar(gramatica_mapear(gramatica_simbolo(o[0]), funcion(x) { retornar x })) }
+        sea op_p = gramatica_alternativa(ops)
+        sea tabla = {}
+        para o en nivel { tabla[o[0]] = o[1] }
+        actual = funcion(t, p) {
+            sea r = siguiente(t, p)
+            si (r["ok"] == falso) { retornar r }
+            sea v = r["valor"]
+            sea pos = r["pos"]
+            sea seguir = verdadero
+            mientras (seguir) {
+                sea o = op_p(t, pos)
+                si (o["ok"] == falso) { seguir = falso } sino {
+                    sea d = siguiente(t, o["pos"])
+                    si (d["ok"] == falso) { retornar d }
+                    v = tabla[o["valor"]](v, d["valor"])
+                    pos = d["pos"]
+                }
+            }
+            retornar _gr_ok(v, pos)
+        }
+        i = i - 1
+    }
+    retornar actual
+}
+
+funcion _gr_linea_col(t, p) {
+    sea l = 1
+    sea c = 1
+    sea i = 0
+    mientras (i < p y i < longitud(t)) {
+        si (byte_en(t, i) == 10) { l = l + 1  c = 1 } sino { c = c + 1 }
+        i = i + 1
+    }
+    retornar [l, c]
+}
+
+/// Analiza todo el texto o lanza "línea L, columna C: se esperaba …".
+funcion gramatica_analizar(par, texto) {
+    sea t = "" + texto
+    sea r = par(t, 0)
+    si (r["ok"]) {
+        sea fin = _gr_blancos(t, r["pos"])
+        si (fin == longitud(t)) { retornar r["valor"] }
+        r = _gr_no(fin, "fin del texto")
+    }
+    sea lc = _gr_linea_col(t, r["pos"])
+    sea encontrado = "el final"
+    si (r["pos"] < longitud(t)) { encontrado = "\"" + subcadena(t, r["pos"], minimo(longitud(t), r["pos"] + 10)) + "\"" }
+    lanzar "gramatica: línea " + lc[0] + ", columna " + lc[1] + ": se esperaba " + r["espera"] + " y hay " + encontrado
+}
+
+// Piezas listas.
+funcion gramatica_numero() { retornar gramatica_lexema(gramatica_mapear(gramatica_regex("-?[0-9]+(\\.[0-9]+)?([eE][-+]?[0-9]+)?", "un número"), funcion(t) { retornar a_numero(t) })) }
+funcion gramatica_identificador() { retornar gramatica_lexema(gramatica_regex("[A-Za-z_][A-Za-z0-9_]*", "un identificador")) }
+funcion gramatica_cadena() {
+    retornar gramatica_lexema(gramatica_mapear(gramatica_regex("\"([^\"\\\\]|\\\\.)*\"", "un texto entre comillas"), funcion(t) {
+        sea s = subcadena(t, 1, longitud(t) - 1)
+        retornar texto_reemplazar(texto_reemplazar(texto_reemplazar(s, "\\n", "\n"), "\\\"", "\""), "\\\\", "\\")
+    }))
+}
