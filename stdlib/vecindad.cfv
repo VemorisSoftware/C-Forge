@@ -1,0 +1,148 @@
+// stdlib/vecindad.cfv — búsqueda vectorial: los k vecinos más cercanos por
+// coseno, distancia euclídea o producto punto, con metadatos y filtros.
+// Para embeddings de IA (búsqueda semántica, RAG, recomendaciones).
+// Inspirada en FAISS (MIT). En inglés: importar "vectors".
+//
+//   importar "vecindad"
+//   sea v = vecindad_nueva(3, "coseno")
+//   vecindad_agregar(v, "doc1", [0.1, 0.9, 0.0], {"idioma": "es"})
+//   vecindad_buscar(v, [0.2, 0.8, 0.1], 5)          // [{"id", "puntaje", "meta"}]
+//   vecindad_buscar(v, q, 5, funcion(meta) { retornar meta["idioma"] == "es" })
+//
+// "coseno" y "punto": mayor puntaje = más parecido; "euclidea": el puntaje
+// es la distancia (menor = más cerca). Búsqueda exacta (sin aproximar).
+
+importar "json"
+
+funcion vecindad_nueva(dimension, metrica) {
+    sea m = metrica ?? "coseno"
+    si (m == "cosine") { m = "coseno" }
+    si (m == "euclidean") { m = "euclidea" }
+    si (m == "dot") { m = "punto" }
+    si (m != "coseno" y m != "euclidea" y m != "punto") { lanzar "vecindad: métrica \"coseno\", \"euclidea\" o \"punto\"" }
+    si (dimension < 1) { lanzar "vecindad: dimensión inválida" }
+    retornar {"dim": dimension, "metrica": m, "ids": [], "vectores": [], "metas": [], "pos": {}}
+}
+
+funcion _vc_norma(v) {
+    sea s = 0
+    para x en v { s = s + x * x }
+    retornar raiz(s)
+}
+
+funcion _vc_preparar(v, vec) {
+    si (tipo(vec) != "lista" o longitud(vec) != v["dim"]) { lanzar "vecindad: se esperaba un vector de " + v["dim"] + " números" }
+    para x en vec { si (tipo(x) != "numero") { lanzar "vecindad: el vector tiene un valor que no es número" } }
+    si (v["metrica"] != "coseno") { retornar vec }
+    sea n = _vc_norma(vec)
+    si (n == 0) { lanzar "vecindad: vector nulo (no tiene dirección)" }
+    sea r = []
+    para x en vec { r.agregar(x / n) }
+    retornar r
+}
+
+/// Agrega o reemplaza.
+funcion vecindad_agregar(v, id, vector, meta) {
+    sea clave = "" + id
+    sea p = _vc_preparar(v, vector)
+    si (tiene_clave(v["pos"], clave)) {
+        sea i = v["pos"][clave]
+        v["vectores"][i] = p
+        v["metas"][i] = meta
+    } sino {
+        v["pos"][clave] = longitud(v["ids"])
+        v["ids"].agregar(clave)
+        v["vectores"].agregar(p)
+        v["metas"].agregar(meta)
+    }
+    retornar v
+}
+
+funcion vecindad_quitar(v, id) {
+    sea clave = "" + id
+    si (tiene_clave(v["pos"], clave) == falso) { retornar falso }
+    sea quitar = v["pos"][clave]
+    sea ids = []
+    sea vs = []
+    sea ms = []
+    sea pos = {}
+    sea i = 0
+    mientras (i < longitud(v["ids"])) {
+        si (i != quitar) {
+            pos[v["ids"][i]] = longitud(ids)
+            ids.agregar(v["ids"][i])
+            vs.agregar(v["vectores"][i])
+            ms.agregar(v["metas"][i])
+        }
+        i = i + 1
+    }
+    v["ids"] = ids  v["vectores"] = vs  v["metas"] = ms  v["pos"] = pos
+    retornar verdadero
+}
+
+funcion vecindad_tamano(v) { retornar longitud(v["ids"]) }
+
+funcion _vc_puntaje(metrica, a, b) {
+    sea s = 0
+    sea i = 0
+    sea n = longitud(a)
+    si (metrica == "euclidea") {
+        mientras (i < n) { sea d = a[i] - b[i]  s = s + d * d  i = i + 1 }
+        retornar raiz(s)
+    }
+    mientras (i < n) { s = s + a[i] * b[i]  i = i + 1 }
+    retornar s
+}
+
+/// Los k más cercanos (opcionalmente filtrados por meta).
+funcion vecindad_buscar(v, consulta, k, filtro) {
+    sea q = _vc_preparar(v, consulta)
+    sea menor_mejor = v["metrica"] == "euclidea"
+    sea mejores = []
+    sea i = 0
+    mientras (i < longitud(v["ids"])) {
+        sea pasa = verdadero
+        si (filtro != nulo) { pasa = filtro(v["metas"][i]) == verdadero }
+        si (pasa) {
+            sea s = _vc_puntaje(v["metrica"], q, v["vectores"][i])
+            // Inserción ordenada en una lista de a lo más k.
+            sea entra = longitud(mejores) < k
+            si (entra == falso y k > 0) {
+                sea ultimo = mejores[longitud(mejores) - 1]["puntaje"]
+                si (menor_mejor) { entra = s < ultimo } sino { entra = s > ultimo }
+            }
+            si (entra y k > 0) {
+                sea nuevo = {"id": v["ids"][i], "puntaje": s, "meta": v["metas"][i]}
+                sea r = []
+                sea puesto = falso
+                para m en mejores {
+                    sea antes = falso
+                    si (puesto == falso) { si (menor_mejor) { antes = s < m["puntaje"] } sino { antes = s > m["puntaje"] } }
+                    si (antes) { r.agregar(nuevo)  puesto = verdadero }
+                    r.agregar(m)
+                }
+                si (puesto == falso) { r.agregar(nuevo) }
+                si (longitud(r) > k) {
+                    sea corto = []
+                    sea j = 0
+                    mientras (j < k) { corto.agregar(r[j])  j = j + 1 }
+                    r = corto
+                }
+                mejores = r
+            }
+        }
+        i = i + 1
+    }
+    retornar mejores
+}
+
+/// Similitud coseno entre dos vectores (−1 a 1).
+funcion vecindad_coseno(a, b) {
+    sea na = _vc_norma(a)
+    sea nb = _vc_norma(b)
+    si (na == 0 o nb == 0) { retornar 0 }
+    retornar _vc_puntaje("punto", a, b) / (na * nb)
+}
+
+funcion vecindad_guardar(v, ruta) { escribir_archivo(ruta, json_texto(v)) }
+funcion vecindad_cargar(ruta) { retornar json_parsear(leer_archivo(ruta)) }

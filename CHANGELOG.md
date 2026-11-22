@@ -18,6 +18,15 @@ Sitio oficial: [c-forge.org](https://c-forge.org)
   JSON, sin inyección de líneas), `resiste`/`resilience` (reintentos con
   espera exponencial y cortacircuitos) y `plantilla`/`template` (`{{ }}`
   escapado, `#si`/`#if`, `#cada`/`#each`). Pruebas en español e inglés.
+- **Lote 5 (bilingüe):** `indice`/`search` (texto completo con BM25, pesos
+  por campo, tildes, plurales, prefijos y exclusiones), `vecindad`/`vectors`
+  (k vecinos por coseno, euclídea o punto, con filtros), `numerica`/`numeric`
+  (estadística, regresión, FFT, integrales y raíces), `aprende`/`ml`
+  (k-medias, k vecinos, regresión lineal y logística, métricas),
+  `elenco`/`ecs` (entidades, componentes, sistemas y eventos),
+  `pregunta`/`prompt` (preguntas en la terminal con validación),
+  `tabla`/`dataframe` (filtrar, agrupar, unir, CSV) y `flex`/`flexbox`
+  (diseño Flexbox completo).
 - **Lote 4 (bilingüe):** `paquete_bin`/`msgpack` (MessagePack con vectores
   de la especificación y límites contra mensajes hostiles), `css`
   (minificador y analizador), `subida`/`multipart` (formularios con

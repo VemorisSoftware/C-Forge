@@ -1,0 +1,226 @@
+// stdlib/indice.cfv — búsqueda de texto completo: índice invertido con
+// puntaje BM25, pesos por campo, sin tildes ni mayúsculas, palabras vacías
+// de español e inglés, plurales, prefijos (autocompletar) y exclusiones.
+// Inspirada en Lucene/Tantivy (Apache/MIT). En inglés: importar "search".
+//
+//   importar "indice"
+//   sea i = indice_nuevo({"campos": {"titulo": 3, "cuerpo": 1}})
+//   indice_agregar(i, "p1", {"titulo": "Canción nueva", "cuerpo": "El álbum sale en marzo"})
+//   indice_buscar(i, "albumes marzo")       // [{"id": "p1", "puntaje": 1.23}]
+//   indice_buscar(i, "canc", {"prefijo": verdadero})
+//   indice_buscar(i, "album -marzo")         // excluye documentos con "marzo"
+
+importar "json"
+
+sea _IX_VACIAS = {}
+para _p en texto_dividir("de la que el en y a los se del las un por con no una su para es al lo como mas o pero sus le ya fue este ha si porque esta son entre cuando muy sin sobre ser tiene tambien me hasta hay donde quien desde todo nos durante todos uno les ni contra otros ese eso ante ellos e esto mi antes algunos que unos yo otro otras otra el tanto esa estos mucho quienes nada muchos cual poco ella estar estas algunas algo nosotros the of and to in is it you that he was for on are as with his they i at be this have from or one had by but not what all were we when your can said there use an each which she do how their if will up other about out many then them these so some her would make like him into time has look two more go see no way could my than been who its now did get come made may part", " ") { _IX_VACIAS[_p] = verdadero }
+
+sea _IX_TILDES = [["á", "a"], ["é", "e"], ["í", "i"], ["ó", "o"], ["ú", "u"], ["ü", "u"], ["ñ", "n"], ["Á", "a"], ["É", "e"], ["Í", "i"], ["Ó", "o"], ["Ú", "u"], ["Ü", "u"], ["Ñ", "n"], ["à", "a"], ["è", "e"], ["ç", "c"], ["ã", "a"], ["õ", "o"], ["â", "a"], ["ê", "e"], ["ô", "o"]]
+
+funcion _ix_normal(t) {
+    sea r = "" + t
+    para p en _IX_TILDES { r = texto_reemplazar(r, p[0], p[1]) }
+    retornar texto_minusculas(r)
+}
+
+// Raíz liviana: plurales y algunas terminaciones (sin tocar palabras cortas).
+funcion _ix_raiz(w) {
+    sea n = longitud(w)
+    si (n > 4 y texto_termina_con(w, "ces")) { retornar subcadena(w, 0, n - 3) + "z" }
+    si (n > 4 y texto_termina_con(w, "es") y texto_indice("aeiou", subcadena(w, n - 3, n - 2)) < 0) { retornar subcadena(w, 0, n - 2) }
+    si (n > 5 y texto_termina_con(w, "ing")) { retornar subcadena(w, 0, n - 3) }
+    si (n > 3 y texto_termina_con(w, "s") y texto_termina_con(w, "ss") == falso) { retornar subcadena(w, 0, n - 1) }
+    retornar w
+}
+
+/// Texto → términos (normalizados, sin palabras vacías).
+funcion indice_terminos(texto, conservar_vacias) {
+    sea t = _ix_normal(texto)
+    sea r = []
+    sea actual = ""
+    sea i = 0
+    mientras (i <= longitud(t)) {
+        sea b = 32
+        si (i < longitud(t)) { b = byte_en(t, i) }
+        si ((b >= 97 y b <= 122) o (b >= 48 y b <= 57) o b >= 128) { actual = actual + subcadena(t, i, i + 1) } sino {
+            si (actual != "") {
+                si (conservar_vacias == verdadero o tiene_clave(_IX_VACIAS, actual) == falso) { r.agregar(_ix_raiz(actual)) }
+                actual = ""
+            }
+        }
+        i = i + 1
+    }
+    retornar r
+}
+
+funcion indice_nuevo(opciones) {
+    sea campos = {"texto": 1}
+    si (opciones != nulo) { si (tiene_clave(opciones, "campos")) { campos = opciones["campos"] } }
+    retornar {"campos": campos, "docs": {}, "terminos": {}, "largo_total": {}, "n": 0}
+}
+
+/// Agrega o reemplaza un documento (mapa campo → texto; un texto suelto va a "texto").
+funcion indice_agregar(i, id, doc) {
+    sea clave = "" + id
+    si (tiene_clave(i["docs"], clave)) { indice_quitar(i, clave) }
+    sea d = doc
+    si (tipo(doc) == "texto") { d = {"texto": doc} }
+    sea largos = {}
+    sea vistos = {}
+    para campo en claves(i["campos"]) {
+        si (tiene_clave(d, campo) y d[campo] != nulo) {
+            sea ts = indice_terminos(d[campo])
+            largos[campo] = longitud(ts)
+            i["largo_total"][campo] = (i["largo_total"][campo] ?? 0) + longitud(ts)
+            para t en ts {
+                si (tiene_clave(i["terminos"], t) == falso) { i["terminos"][t] = {} }
+                sea post = i["terminos"][t]
+                si (tiene_clave(post, clave) == falso) { post[clave] = {} }
+                post[clave][campo] = (post[clave][campo] ?? 0) + 1
+                vistos[t] = verdadero
+            }
+        } sino { largos[campo] = 0 }
+    }
+    i["docs"][clave] = {"largos": largos, "terminos": claves(vistos), "doc": d}
+    i["n"] = i["n"] + 1
+    retornar i
+}
+
+funcion indice_quitar(i, id) {
+    sea clave = "" + id
+    si (tiene_clave(i["docs"], clave) == falso) { retornar falso }
+    sea info = i["docs"][clave]
+    para t en info["terminos"] {
+        sea post = i["terminos"][t]
+        sea nuevo = {}
+        para k en claves(post) { si (k != clave) { nuevo[k] = post[k] } }
+        si (longitud(claves(nuevo)) == 0) {
+            sea quedan = {}
+            para k en claves(i["terminos"]) { si (k != t) { quedan[k] = i["terminos"][k] } }
+            i["terminos"] = quedan
+        } sino { i["terminos"][t] = nuevo }
+    }
+    para campo en claves(info["largos"]) { i["largo_total"][campo] = (i["largo_total"][campo] ?? 0) - info["largos"][campo] }
+    sea docs = {}
+    para k en claves(i["docs"]) { si (k != clave) { docs[k] = i["docs"][k] } }
+    i["docs"] = docs
+    i["n"] = i["n"] - 1
+    retornar verdadero
+}
+
+funcion indice_documento(i, id) {
+    si (tiene_clave(i["docs"], "" + id)) { retornar i["docs"]["" + id]["doc"] }
+    retornar nulo
+}
+
+funcion indice_tamano(i) { retornar i["n"] }
+
+funcion _ix_op(o, k, d) {
+    si (o != nulo) { si (tiene_clave(o, k)) { retornar o[k] } }
+    retornar d
+}
+
+/// Busca. opciones: limite (10), prefijo (falso; el último término se
+/// completa), todos (falso; exige todos los términos). "-palabra" excluye.
+funcion indice_buscar(i, consulta, opciones) {
+    sea limite = _ix_op(opciones, "limite", _ix_op(opciones, "limit", 10))
+    sea prefijo = _ix_op(opciones, "prefijo", _ix_op(opciones, "prefix", falso))
+    sea todos = _ix_op(opciones, "todos", _ix_op(opciones, "all", falso))
+    sea positivos = []
+    sea negativos = []
+    sea palabras = texto_dividir("" + consulta, " ")
+    sea k = 0
+    mientras (k < longitud(palabras)) {
+        sea p = palabras[k]
+        si (texto_empieza_con(p, "-") y longitud(p) > 1) {
+            para t en indice_terminos(subcadena(p, 1, longitud(p)), verdadero) { negativos.agregar(t) }
+        } sino {
+            sea ts = indice_terminos(p, prefijo y k == longitud(palabras) - 1)
+            para t en ts {
+                si (prefijo y k == longitud(palabras) - 1) {
+                    // Expandir el prefijo (sin raíz: "canc" no es palabra completa).
+                    sea base = _ix_normal(p)
+                    sea grupo = []
+                    para tt en claves(i["terminos"]) { si (texto_empieza_con(tt, base) o tt == t) { grupo.agregar(tt) } }
+                    positivos.agregar(grupo)
+                } sino { positivos.agregar([t]) }
+            }
+        }
+        k = k + 1
+    }
+    si (longitud(positivos) == 0 o i["n"] == 0) { retornar [] }
+    sea excluir = {}
+    para t en negativos {
+        si (tiene_clave(i["terminos"], t)) { para d en claves(i["terminos"][t]) { excluir[d] = verdadero } }
+        sea r = _ix_raiz(t)
+        si (tiene_clave(i["terminos"], r)) { para d en claves(i["terminos"][r]) { excluir[d] = verdadero } }
+    }
+    sea k1 = 1.2
+    sea b = 0.75
+    sea puntajes = {}
+    sea aciertos = {}
+    para grupo en positivos {
+        sea en_grupo = {}
+        para t en grupo {
+            si (tiene_clave(i["terminos"], t)) {
+                sea post = i["terminos"][t]
+                sea df = longitud(claves(post))
+                sea idf = logaritmo(1 + (i["n"] - df + 0.5) / (df + 0.5))
+                para d en claves(post) {
+                    si (tiene_clave(excluir, d) == falso) {
+                        sea s = 0
+                        para campo en claves(post[d]) {
+                            sea tf = post[d][campo]
+                            sea promedio = i["largo_total"][campo] / i["n"]
+                            si (promedio <= 0) { promedio = 1 }
+                            sea largo = i["docs"][d]["largos"][campo]
+                            s = s + i["campos"][campo] * idf * tf * (k1 + 1) / (tf + k1 * (1 - b + b * largo / promedio))
+                        }
+                        puntajes[d] = (puntajes[d] ?? 0) + s
+                        en_grupo[d] = verdadero
+                    }
+                }
+            }
+        }
+        para d en claves(en_grupo) { aciertos[d] = (aciertos[d] ?? 0) + 1 }
+    }
+    sea r = []
+    para d en claves(puntajes) {
+        si (todos == falso o aciertos[d] == longitud(positivos)) { r.agregar({"id": d, "puntaje": redondear(puntajes[d], 4)}) }
+    }
+    r = ordenar(r, funcion(x, y) {
+        si (x["puntaje"] > y["puntaje"]) { retornar -1 }
+        si (x["puntaje"] < y["puntaje"]) { retornar 1 }
+        si (x["id"] < y["id"]) { retornar -1 }
+        retornar 1
+    })
+    si (longitud(r) > limite) {
+        sea corto = []
+        sea j = 0
+        mientras (j < limite) { corto.agregar(r[j])  j = j + 1 }
+        r = corto
+    }
+    retornar r
+}
+
+/// Fragmento del campo con los términos marcados (para mostrar resultados).
+funcion indice_resaltar(i, id, campo, consulta, antes, despues) {
+    sea d = indice_documento(i, id)
+    si (d == nulo) { retornar nulo }
+    si (tiene_clave(d, campo) == falso) { retornar nulo }
+    sea buscados = {}
+    para t en indice_terminos(consulta, verdadero) { buscados[t] = verdadero }
+    sea a = antes ?? "<mark>"
+    sea z = despues ?? "</mark>"
+    sea r = []
+    para palabra en texto_dividir("" + d[campo], " ") {
+        sea ts = indice_terminos(palabra, verdadero)
+        sea marcar = falso
+        para t en ts { si (tiene_clave(buscados, t)) { marcar = verdadero } }
+        si (marcar) { r.agregar(a + palabra + z) } sino { r.agregar(palabra) }
+    }
+    retornar unir(r, " ")
+}
+
+funcion indice_guardar(i, ruta) { escribir_archivo(ruta, json_texto(i)) }
+funcion indice_cargar(ruta) { retornar json_parsear(leer_archivo(ruta)) }
