@@ -65,6 +65,21 @@ Sitio oficial: [c-forge.org](https://c-forge.org)
   `llamada`/`protobuf` (.proto, binario como protoc, marcos gRPC),
   `recolecta`/`crawler` (cookies RFC 6265, formularios, robots.txt,
   rastreo) y `sensor`/`mqtt` (paquetes MQTT, QoS 2, mini broker).
+- Lote 13 de bibliotecas (con alias en inglés y pruebas en ambos idiomas):
+  `grafo_api`/`graphql` (servidor GraphQL con SDL, variables, fragmentos,
+  directivas e introspección), `api_rapida`/`fastapi` (rutas tipadas,
+  validación 422, dependencias, Bearer y OpenAPI 3.1 con /docs),
+  `modelo_db`/`orm` (esquemas, consultas y migraciones para SQLite,
+  Postgres y MySQL), `documento`/`pdf` (crear y leer PDF con fuentes
+  base-14, imágenes y enlaces), `composicion`/`typeset` (documentos con
+  párrafos justificados, tablas, markdown y pie "Página X de Y"),
+  `bandeja`/`mailbox` (MIME, IMAP y POP3), `consenso`/`raft` (Raft con
+  red simulada) y `buscador`/`fulltext` (BM25, raíces en español e
+  inglés, tolerancia a errores, frases y facetas).
+- `sqlite`: los nombres de columnas se leen tras el primer paso, así ya no
+  quedan viejos después de un `ALTER TABLE`.
+- `planilla` y `consulta_archivos`: el separador interno ya no usa el
+  texto literal "\u0001".
 - `rastreo`/`glob`: recorrer carpetas y buscar con comodines (`**`, `{a,b}`,
   `[a-z]`). El lenguaje suma `listar_carpeta`, `es_carpeta` y `crear_carpeta`
   (como `mkdir -p`).

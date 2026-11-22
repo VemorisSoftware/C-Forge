@@ -1,0 +1,398 @@
+// stdlib/api_rapida.cfv — APIs HTTP con validación y documentación
+// automáticas: declaras rutas con parámetros, consulta, cuerpo y respuesta
+// usando moldes ("molde") y obtienes validación con errores 422 al estilo
+// FastAPI, conversión de tipos, OpenAPI 3.1 y una página de documentación
+// (Swagger UI) sin escribir nada más. Rutas con ":id" o "*resto",
+// dependencias (autenticación), CORS y manejo de errores. Inspirada en
+// FastAPI (MIT). En inglés: importar "fastapi".
+//
+//   importar "api_rapida"
+//   importar "molde"
+//   sea Libro = molde_registro({"id": "entero", "titulo": "texto"})
+//   sea app = api_nueva({"titulo": "Biblioteca", "version": "1.0"})
+//   api_get(app, "/libros/:id", {"parametros": {"id": "entero"}, "respuesta": Libro},
+//       funcion(req) { retornar {"id": req["parametros"]["id"], "titulo": "Rayuela"} })
+//   api_servir(app, 8000)      // docs en /docs, esquema en /openapi.json
+
+importar "molde"
+importar "json"
+
+funcion api_nueva(opciones) {
+    sea o = opciones ?? {}
+    retornar {"titulo": o["titulo"] ?? (o["title"] ?? "API"), "version": o["version"] ?? "0.1.0", "descripcion": o["descripcion"] ?? (o["description"] ?? nulo), "rutas": [], "esquemas": {}, "cors": o["cors"] ?? nulo, "dependencias": [], "seguridad": nulo, "docs": o["docs"] ?? "/docs"}
+}
+
+funcion _ar_partes_ruta(ruta) {
+    sea r = []
+    para p en texto_dividir("" + ruta, "/") { si (p != "") { r.agregar(p) } }
+    retornar r
+}
+
+/// Registra una ruta. spec: parametros {nombre: molde}, consulta {nombre:
+/// molde}, cuerpo (molde), respuesta (molde), estado (200), resumen,
+/// descripcion, etiquetas, seguridad (verdadero = exige la dependencia de
+/// seguridad), nombre (operationId).
+funcion api_ruta(app, metodo, ruta, spec, manejador) {
+    sea s = spec ?? {}
+    sea partes = _ar_partes_ruta(ruta)
+    para p en partes {
+        si (texto_empieza_con(p, ":")) {
+            sea n = subcadena(p, 1, longitud(p))
+            si (tiene_clave(s["parametros"] ?? {}, n) == falso) {
+                si (tiene_clave(s, "parametros") == falso) { s["parametros"] = {} }
+                s["parametros"][n] = "texto"
+            }
+        }
+    }
+    app["rutas"].agregar({"metodo": texto_mayusculas(metodo), "ruta": ruta, "partes": partes, "spec": s, "f": manejador})
+    retornar app
+}
+
+funcion api_get(app, ruta, spec, f) { retornar api_ruta(app, "GET", ruta, spec, f) }
+funcion api_post(app, ruta, spec, f) { retornar api_ruta(app, "POST", ruta, spec, f) }
+funcion api_put(app, ruta, spec, f) { retornar api_ruta(app, "PUT", ruta, spec, f) }
+funcion api_patch(app, ruta, spec, f) { retornar api_ruta(app, "PATCH", ruta, spec, f) }
+funcion api_delete(app, ruta, spec, f) { retornar api_ruta(app, "DELETE", ruta, spec, f) }
+
+/// Dependencia para todas las rutas: f(req) devuelve nulo para seguir o
+/// una respuesta (api_error) para cortar. Puede escribir en req["estado"].
+funcion api_dependencia(app, f) { app["dependencias"].agregar(f) }
+
+/// Seguridad con token Bearer: verificar(token) → usuario o nulo. Se aplica
+/// a las rutas con "seguridad": verdadero; el usuario queda en req["usuario"].
+funcion api_bearer(app, verificar) { app["seguridad"] = verificar }
+
+/// Nombra un molde para que aparezca como componente en OpenAPI.
+funcion api_esquema(app, nombre, m) {
+    app["esquemas"][nombre] = m
+    m["_nombre_api"] = nombre
+    retornar m
+}
+
+/// Respuesta de error: {"detail": mensaje}.
+funcion api_error(estado, mensaje, cabeceras) { retornar {"__respuesta": verdadero, "estado": estado, "cuerpo": {"detail": mensaje}, "cabeceras": cabeceras ?? {}} }
+
+/// Respuesta propia (estado, cuerpo como dato o texto, tipo).
+funcion api_respuesta(estado, cuerpo, tipo_, cabeceras) { retornar {"__respuesta": verdadero, "estado": estado, "cuerpo": cuerpo, "tipo": tipo_, "cabeceras": cabeceras ?? {}} }
+
+// ── Despacho ──────────────────────────────────────────────────────────────
+
+funcion _ar_coincide(r, partes) {
+    sea params = {}
+    sea i = 0
+    mientras (i < longitud(r["partes"])) {
+        sea p = r["partes"][i]
+        si (texto_empieza_con(p, "*")) {
+            sea resto = []
+            sea k = i
+            mientras (k < longitud(partes)) { resto.agregar(partes[k])  k = k + 1 }
+            params[subcadena(p, 1, longitud(p))] = unir(resto, "/")
+            retornar params
+        }
+        si (i >= longitud(partes)) { retornar nulo }
+        si (texto_empieza_con(p, ":")) { params[subcadena(p, 1, longitud(p))] = _ar_url_dec(partes[i]) } sino {
+            si (p != partes[i]) { retornar nulo }
+        }
+        i = i + 1
+    }
+    si (i != longitud(partes)) { retornar nulo }
+    retornar params
+}
+
+funcion _ar_url_dec(s) {
+    sea t = texto_reemplazar("" + s, "+", " ")
+    sea r = ""
+    sea hex = ""
+    sea i = 0
+    mientras (i < longitud(t)) {
+        si (byte_en(t, i) == 37 y i + 2 < longitud(t) + 1) {
+            hex = hex + subcadena(t, i + 1, i + 3)
+            i = i + 3
+        } sino {
+            si (hex != "") { r = r + bytes_de_hex(hex)  hex = "" }
+            r = r + subcadena(t, i, i + 1)
+            i = i + 1
+        }
+    }
+    si (hex != "") { r = r + bytes_de_hex(hex) }
+    retornar r
+}
+
+funcion _ar_consulta(q) {
+    sea r = {}
+    si (q == nulo o q == "") { retornar r }
+    sea t = "" + q
+    si (texto_empieza_con(t, "?")) { t = subcadena(t, 1, longitud(t)) }
+    para par en texto_dividir(t, "&") {
+        si (par != "") {
+            sea i = texto_indice(par, "=")
+            sea k = par
+            sea v = ""
+            si (i >= 0) { k = subcadena(par, 0, i)  v = subcadena(par, i + 1, longitud(par)) }
+            k = _ar_url_dec(k)
+            v = _ar_url_dec(v)
+            si (tiene_clave(r, k)) {
+                si (tipo(r[k]) != "lista") { r[k] = [r[k]] }
+                r[k].agregar(v)
+            } sino { r[k] = v }
+        }
+    }
+    retornar r
+}
+
+// Error de molde "molde: a.b[2]: msg" → {"loc": [donde, "a", "b", 2], "msg"}.
+funcion _ar_detalle(donde, err) {
+    sea m = "" + err
+    si (texto_empieza_con(m, "molde: ")) { m = subcadena(m, 7, longitud(m)) }
+    sea i = texto_indice(m, ": ")
+    sea loc = [donde]
+    sea msg = m
+    si (i > 0) {
+        sea ruta = subcadena(m, 0, i)
+        msg = subcadena(m, i + 2, longitud(m))
+        para seg en texto_dividir(texto_reemplazar(texto_reemplazar(ruta, "[", "."), "]", ""), ".") {
+            si (seg != "") {
+                sea n = nulo
+                intentar { n = a_numero(seg) } capturar (e) { n = nulo }
+                si (n != nulo y ("" + n) == seg) { loc.agregar(n) } sino { loc.agregar(seg) }
+            }
+        }
+    }
+    retornar {"loc": loc, "msg": msg, "type": "value_error"}
+}
+
+funcion _ar_validar_mapa(def, valores, donde, detalles) {
+    si (def == nulo) { retornar {} }
+    sea campos = {}
+    para k en claves(def) { campos[k] = def[k] }
+    sea reg = molde_registro(campos)
+    sea r = nulo
+    // Uno por uno para reportar todos los errores.
+    sea salida = {}
+    para k en claves(def) {
+        sea uno = {}
+        uno[k] = def[k]
+        sea m1 = molde_registro(uno)
+        sea dato = {}
+        si (tiene_clave(valores, k)) { dato[k] = valores[k] }
+        intentar {
+            sea v = _md_desde(m1, dato, "", verdadero)
+            salida[k] = v[k]
+        } capturar (e) { detalles.agregar(_ar_detalle(donde, e)) }
+    }
+    retornar salida
+}
+
+funcion _ar_cors(app, cab) {
+    si (app["cors"] == nulo) { retornar cab }
+    sea c = app["cors"]
+    cab["Access-Control-Allow-Origin"] = c["origen"] ?? (c["origin"] ?? "*")
+    cab["Access-Control-Allow-Methods"] = c["metodos"] ?? "GET, POST, PUT, PATCH, DELETE, OPTIONS"
+    cab["Access-Control-Allow-Headers"] = c["cabeceras"] ?? "Content-Type, Authorization"
+    retornar cab
+}
+
+funcion _ar_resp(app, estado, cuerpo, tipo_, cab) {
+    sea c = _ar_cors(app, cab ?? {})
+    si (tipo(cuerpo) == "texto" y tipo_ != nulo) { retornar {"estado": estado, "tipo": tipo_, "cuerpo": cuerpo, "cabeceras": c} }
+    si (cuerpo == nulo y (estado == 204 o estado == 304)) { retornar {"estado": estado, "tipo": "application/json", "cuerpo": "", "cabeceras": c} }
+    retornar {"estado": estado, "tipo": tipo_ ?? "application/json", "cuerpo": json_texto(cuerpo), "cabeceras": c}
+}
+
+/// Atiende una solicitud {"metodo", "ruta", "consulta" (texto o mapa),
+/// "cabeceras", "cuerpo"} → {"estado", "tipo", "cuerpo", "cabeceras"}.
+funcion api_manejar(app, solicitud) {
+    sea metodo = texto_mayusculas(solicitud["metodo"] ?? "GET")
+    sea ruta_t = "" + (solicitud["ruta"] ?? "/")
+    sea consulta = solicitud["consulta"] ?? (solicitud["query"] ?? nulo)
+    sea qi = texto_indice(ruta_t, "?")
+    si (qi >= 0) {
+        si (consulta == nulo) { consulta = subcadena(ruta_t, qi + 1, longitud(ruta_t)) }
+        ruta_t = subcadena(ruta_t, 0, qi)
+    }
+    si (tipo(consulta) != "mapa") { consulta = _ar_consulta(consulta) }
+    sea cab = {}
+    para k en claves(solicitud["cabeceras"] ?? {}) { cab[texto_minusculas(k)] = solicitud["cabeceras"][k] }
+    si (metodo == "OPTIONS" y app["cors"] != nulo) { retornar _ar_resp(app, 204, nulo, nulo, {}) }
+    si (metodo == "GET" y ruta_t == "/openapi.json") { retornar _ar_resp(app, 200, api_openapi(app), "application/json", {}) }
+    si (metodo == "GET" y app["docs"] != nulo y ruta_t == app["docs"]) { retornar _ar_resp(app, 200, api_docs_html(app), "text/html; charset=utf-8", {}) }
+    sea partes = _ar_partes_ruta(ruta_t)
+    sea ruta = nulo
+    sea params = nulo
+    sea otro_metodo = falso
+    para r en app["rutas"] {
+        si (ruta == nulo) {
+            sea p = _ar_coincide(r, partes)
+            si (p != nulo) {
+                si (r["metodo"] == metodo o (metodo == "HEAD" y r["metodo"] == "GET")) { ruta = r  params = p } sino { otro_metodo = verdadero }
+            }
+        }
+    }
+    si (ruta == nulo) {
+        si (otro_metodo) { retornar _ar_resp(app, 405, {"detail": "Method Not Allowed"}, nulo, {}) }
+        retornar _ar_resp(app, 404, {"detail": "Not Found"}, nulo, {})
+    }
+    sea s = ruta["spec"]
+    sea req = {"metodo": metodo, "ruta": ruta_t, "cabeceras": cab, "crudo": solicitud, "estado": {}, "usuario": nulo}
+    // Dependencias y seguridad.
+    para dep en app["dependencias"] {
+        sea x = dep(req)
+        si (x != nulo) { retornar _ar_resp(app, x["estado"], x["cuerpo"], x["tipo"] ?? nulo, x["cabeceras"]) }
+    }
+    si ((s["seguridad"] ?? falso) y app["seguridad"] != nulo) {
+        sea a = "" + (cab["authorization"] ?? "")
+        si (texto_empieza_con(texto_minusculas(a), "bearer ") == falso) { retornar _ar_resp(app, 401, {"detail": "Not authenticated"}, nulo, {"WWW-Authenticate": "Bearer"}) }
+        sea u = app["seguridad"](texto_recortar(subcadena(a, 7, longitud(a))))
+        si (u == nulo) { retornar _ar_resp(app, 401, {"detail": "Invalid token"}, nulo, {"WWW-Authenticate": "Bearer"}) }
+        req["usuario"] = u
+    }
+    sea detalles = []
+    req["parametros"] = _ar_validar_mapa(s["parametros"] ?? nulo, params, "path", detalles)
+    req["consulta"] = _ar_validar_mapa(s["consulta"] ?? nulo, consulta, "query", detalles)
+    req["cuerpo"] = nulo
+    si ((s["cuerpo"] ?? nulo) != nulo) {
+        sea texto = "" + (solicitud["cuerpo"] ?? "")
+        si (texto_recortar(texto) == "") { detalles.agregar({"loc": ["body"], "msg": "Field required", "type": "missing"}) } sino {
+            sea dato = nulo
+            sea ok = verdadero
+            intentar { dato = json_parsear(texto) } capturar (e) {
+                ok = falso
+                detalles.agregar({"loc": ["body"], "msg": "JSON decode error", "type": "json_invalid"})
+            }
+            si (ok) {
+                intentar { req["cuerpo"] = molde_desde_dato(s["cuerpo"], dato) } capturar (e) { detalles.agregar(_ar_detalle("body", e)) }
+            }
+        }
+    }
+    si (longitud(detalles) > 0) { retornar _ar_resp(app, 422, {"detail": detalles}, nulo, {}) }
+    sea res = nulo
+    sea error = nulo
+    intentar { res = ruta["f"](req) } capturar (e) { error = e }
+    si (error != nulo) {
+        si (tipo(error) == "mapa" y tiene_clave(error, "__respuesta")) { retornar _ar_resp(app, error["estado"], error["cuerpo"], error["tipo"] ?? nulo, error["cabeceras"]) }
+        retornar _ar_resp(app, 500, {"detail": "Internal Server Error"}, nulo, {})
+    }
+    si (tipo(res) == "mapa" y tiene_clave(res, "__respuesta")) { retornar _ar_resp(app, res["estado"], res["cuerpo"], res["tipo"] ?? nulo, res["cabeceras"]) }
+    sea estado = s["estado"] ?? 200
+    si ((s["respuesta"] ?? nulo) != nulo) {
+        sea salida = nulo
+        intentar { salida = molde_a_dato(s["respuesta"], res) } capturar (e) { retornar _ar_resp(app, 500, {"detail": "La respuesta no cumple su molde: " + e}, nulo, {}) }
+        retornar _ar_resp(app, estado, salida, nulo, req["estado"])
+    }
+    retornar _ar_resp(app, estado, res, nulo, req["estado"])
+}
+
+// ── OpenAPI ───────────────────────────────────────────────────────────────
+
+sea _AR_LLAVE_A = caracter(123)
+sea _AR_LLAVE_C = caracter(125)
+
+funcion _ar_schema(app, m0) {
+    sea m = _md_norm(m0)
+    sea nombre = m["_nombre_api"] ?? nulo
+    si (nombre != nulo y m0 != nulo) { retornar {"$ref": "#/components/schemas/" + nombre} }
+    retornar _ar_schema_crudo(app, m)
+}
+
+funcion _ar_schema_crudo(app, m) {
+    sea t = m["molde"]
+    sea r = {}
+    si (t == "texto") { r = {"type": "string"} }
+    si (t == "entero") { r = {"type": "integer"} }
+    si (t == "numero") { r = {"type": "number"} }
+    si (t == "booleano") { r = {"type": "boolean"} }
+    si (t == "fecha") { r = {"type": "string", "format": "date-time"} }
+    si (t == "cualquiera" o t == "propio") { r = {} }
+    si (t == "enum") { r = {"enum": m["valores"]} }
+    si (t == "lista") { r = {"type": "array", "items": _ar_schema(app, m["elemento"])} }
+    si (t == "mapa") { r = {"type": "object", "additionalProperties": _ar_schema(app, m["valor"])} }
+    si (t == "union") {
+        sea l = []
+        para k en claves(m["variantes"]) { l.agregar(_ar_schema(app, m["variantes"][k])) }
+        r = {"oneOf": l, "discriminator": {"propertyName": m["etiqueta"]}}
+    }
+    si (t == "registro") {
+        sea props = {}
+        sea req = []
+        para c en m["campos"] {
+            si ((c["opc"]["omitir"] ?? falso) == falso) {
+                sea n = _md_externo(m, c)
+                sea s = _ar_schema(app, c["molde"])
+                si (c["molde"]["tiene_defecto"] ?? falso) { s["default"] = c["molde"]["defecto"] }
+                props[n] = s
+                si ((c["molde"]["opcional"] ?? falso) == falso) { req.agregar(n) }
+            }
+        }
+        r = {"type": "object", "properties": props}
+        si (longitud(req) > 0) { r["required"] = req }
+    }
+    si ((m["opcional"] ?? falso) y (m["tiene_defecto"] ?? falso) == falso) {
+        si (tiene_clave(r, "type")) { r["type"] = [r["type"], "null"] }
+    }
+    retornar r
+}
+
+funcion _ar_parametros(app, def, donde) {
+    sea r = []
+    si (def == nulo) { retornar r }
+    para k en claves(def) {
+        sea m = _md_norm(def[k])
+        r.agregar({"name": k, "in": donde, "required": donde == "path" o (m["opcional"] ?? falso) == falso, "schema": _ar_schema(app, def[k])})
+    }
+    retornar r
+}
+
+/// Documento OpenAPI 3.1 (mapa).
+funcion api_openapi(app) {
+    sea paths = {}
+    para r en app["rutas"] {
+        sea segs = []
+        para p en r["partes"] {
+            si (texto_empieza_con(p, ":") o texto_empieza_con(p, "*")) { segs.agregar(_AR_LLAVE_A + subcadena(p, 1, longitud(p)) + _AR_LLAVE_C) } sino { segs.agregar(p) }
+        }
+        sea ruta = "/" + unir(segs, "/")
+        si (tiene_clave(paths, ruta) == falso) { paths[ruta] = {} }
+        sea s = r["spec"]
+        sea op = {"responses": {}}
+        si ((s["resumen"] ?? nulo) != nulo) { op["summary"] = s["resumen"] }
+        si ((s["descripcion"] ?? nulo) != nulo) { op["description"] = s["descripcion"] }
+        si ((s["etiquetas"] ?? nulo) != nulo) { op["tags"] = s["etiquetas"] }
+        si ((s["nombre"] ?? nulo) != nulo) { op["operationId"] = s["nombre"] }
+        sea ps = _ar_parametros(app, s["parametros"] ?? nulo, "path")
+        para x en _ar_parametros(app, s["consulta"] ?? nulo, "query") { ps.agregar(x) }
+        si (longitud(ps) > 0) { op["parameters"] = ps }
+        si ((s["cuerpo"] ?? nulo) != nulo) { op["requestBody"] = {"required": verdadero, "content": {"application/json": {"schema": _ar_schema(app, s["cuerpo"])}}} }
+        sea estado = "" + (s["estado"] ?? 200)
+        sea resp = {"description": "Respuesta correcta"}
+        si ((s["respuesta"] ?? nulo) != nulo) { resp["content"] = {"application/json": {"schema": _ar_schema(app, s["respuesta"])}} }
+        op["responses"][estado] = resp
+        si (longitud(ps) > 0 o (s["cuerpo"] ?? nulo) != nulo) { op["responses"]["422"] = {"description": "Error de validación"} }
+        si ((s["seguridad"] ?? falso) y app["seguridad"] != nulo) {
+            op["security"] = [{"bearer": []}]
+            op["responses"]["401"] = {"description": "No autenticado"}
+        }
+        paths[ruta][texto_minusculas(r["metodo"])] = op
+    }
+    sea comps = {"schemas": {}}
+    para n en claves(app["esquemas"]) { comps["schemas"][n] = _ar_schema_crudo(app, _md_norm(app["esquemas"][n])) }
+    si (app["seguridad"] != nulo) { comps["securitySchemes"] = {"bearer": {"type": "http", "scheme": "bearer"}} }
+    sea info = {"title": app["titulo"], "version": app["version"]}
+    si (app["descripcion"] != nulo) { info["description"] = app["descripcion"] }
+    retornar {"openapi": "3.1.0", "info": info, "paths": paths, "components": comps}
+}
+
+/// Página de documentación interactiva (Swagger UI desde unpkg).
+funcion api_docs_html(app) {
+    sea t = texto_reemplazar(texto_reemplazar(app["titulo"], "<", "&lt;"), "&", "&amp;")
+    retornar "<!DOCTYPE html><html lang=\"es\"><head><meta charset=\"utf-8\"><title>" + t + " — documentación</title><link rel=\"stylesheet\" href=\"https://unpkg.com/swagger-ui-dist@5/swagger-ui.css\"></head><body><div id=\"swagger-ui\"></div><script src=\"https://unpkg.com/swagger-ui-dist@5/swagger-ui-bundle.js\"></script><script>SwaggerUIBundle(" + _AR_LLAVE_A + "url: \"/openapi.json\", dom_id: \"#swagger-ui\"" + _AR_LLAVE_C + ");</script></body></html>"
+}
+
+/// Sirve la API en un puerto (bloquea).
+funcion api_servir(app, puerto) {
+    sea srv = servidor_http_escuchar(puerto)
+    mientras (verdadero) {
+        sea req = servidor_http_solicitud(srv)
+        sea r = api_manejar(app, {"metodo": req["metodo"], "ruta": req["ruta"], "consulta": req["query"] ?? nulo, "cabeceras": req["cabeceras"] ?? {}, "cuerpo": req["cuerpo"] ?? ""})
+        servidor_http_responder(req["_srv_id"], r["estado"], r["cuerpo"], r["tipo"])
+    }
+}
