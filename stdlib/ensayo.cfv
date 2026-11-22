@@ -1,0 +1,490 @@
+// stdlib/ensayo.cfv — pruebas al estilo Vitest/Jest: grupos con
+// describir, pruebas, antes/después (de todo y de cada una), saltar y solo,
+// tablas de casos, expectativas con diferencias legibles (igualdad
+// profunda, coincidencia parcial, cercanía, errores esperados), funciones
+// simuladas (mocks) que registran llamadas y devuelven lo que pidas,
+// espías sobre objetos, reloj falso e instantáneas (snapshots) guardadas
+// en archivos. Funciona con "cforge test". Inspirada en Vitest (MIT).
+// En inglés: importar "vitest".
+//
+//   importar "ensayo"
+//   ensayo_describir("carrito", funcion() {
+//       ensayo_prueba("suma el total", funcion() {
+//           ensayo_igual(total([1, 2]), 3)
+//       })
+//   })
+//   ensayo_correr()            // imprime el resumen; lanza si algo falló
+
+importar "json"
+
+sea _ENS = {"raiz": nulo, "actual": nulo, "solo": falso, "instantaneas": {}, "archivo_snap": nulo, "snap_cambios": falso, "prueba_actual": nulo}
+
+funcion _ens_grupo(nombre, padre) {
+    retornar {"nombre": nombre, "padre": padre, "pruebas": [], "grupos": [], "items": [], "antes_todo": [], "despues_todo": [], "antes_cada": [], "despues_cada": [], "saltar": falso, "solo": falso}
+}
+
+funcion _ens_actual() {
+    si (_ENS["raiz"] == nulo) {
+        _ENS["raiz"] = _ens_grupo("", nulo)
+        _ENS["actual"] = _ENS["raiz"]
+    }
+    retornar _ENS["actual"]
+}
+
+funcion _ens_describir(nombre, f, saltar, solo) {
+    sea padre = _ens_actual()
+    sea g = _ens_grupo(nombre, padre)
+    g["saltar"] = saltar
+    g["solo"] = solo
+    si (solo) { _ENS["solo"] = verdadero }
+    padre["grupos"].agregar(g)
+    padre["items"].agregar(["grupo", g])
+    _ENS["actual"] = g
+    intentar { f() } capturar (e) {
+        _ENS["actual"] = padre
+        lanzar e
+    }
+    _ENS["actual"] = padre
+}
+
+/// Agrupa pruebas (se pueden anidar).
+funcion ensayo_describir(nombre, f) { _ens_describir(nombre, f, falso, falso) }
+funcion ensayo_describir_saltar(nombre, f) { _ens_describir(nombre, f, verdadero, falso) }
+funcion ensayo_describir_solo(nombre, f) { _ens_describir(nombre, f, falso, verdadero) }
+
+funcion _ens_prueba(nombre, f, saltar, solo, pendiente) {
+    si (solo) { _ENS["solo"] = verdadero }
+    sea p = {"nombre": nombre, "f": f, "saltar": saltar, "solo": solo, "pendiente": pendiente}
+    _ens_actual()["pruebas"].agregar(p)
+    _ens_actual()["items"].agregar(["prueba", p])
+}
+
+funcion ensayo_prueba(nombre, f) { _ens_prueba(nombre, f, falso, falso, falso) }
+funcion ensayo_saltar(nombre, f) { _ens_prueba(nombre, f, verdadero, falso, falso) }
+funcion ensayo_solo(nombre, f) { _ens_prueba(nombre, f, falso, verdadero, falso) }
+/// Prueba por hacer (aparece como pendiente).
+funcion ensayo_pendiente(nombre) { _ens_prueba(nombre, nulo, verdadero, falso, verdadero) }
+
+/// Una prueba por caso: nombre con %0, %1… (o %nombre si el caso es un
+/// mapa) y f(caso).
+funcion ensayo_cada(casos, plantilla, f) {
+    para c en casos {
+        sea n = plantilla
+        si (tipo(c) == "lista") {
+            sea i = longitud(c) - 1
+            mientras (i >= 0) { n = texto_reemplazar(n, "%" + i, "" + c[i])  i = i - 1 }
+        }
+        si (tipo(c) == "mapa") { para k en claves(c) { n = texto_reemplazar(n, "%" + k, "" + c[k]) } }
+        sea caso = c
+        ensayo_prueba(n, funcion() { f(caso) })
+    }
+}
+
+funcion ensayo_antes_de_todo(f) { _ens_actual()["antes_todo"].agregar(f) }
+funcion ensayo_despues_de_todo(f) { _ens_actual()["despues_todo"].agregar(f) }
+funcion ensayo_antes_de_cada(f) { _ens_actual()["antes_cada"].agregar(f) }
+funcion ensayo_despues_de_cada(f) { _ens_actual()["despues_cada"].agregar(f) }
+
+// ── Ejecución ─────────────────────────────────────────────────────────────
+
+funcion _ens_tiene_solo(g) {
+    si (g["solo"]) { retornar verdadero }
+    para p en g["pruebas"] { si (p["solo"]) { retornar verdadero } }
+    para h en g["grupos"] { si (_ens_tiene_solo(h)) { retornar verdadero } }
+    retornar falso
+}
+
+funcion _ens_cadena(g, campo) {
+    // Ganchos de los padres primero (antes) o al final (después).
+    sea l = []
+    sea x = g
+    mientras (x != nulo) {
+        l.agregar(x)
+        x = x["padre"]
+    }
+    sea r = []
+    si (campo == "antes_cada") {
+        sea i = longitud(l) - 1
+        mientras (i >= 0) { para f en l[i][campo] { r.agregar(f) }  i = i - 1 }
+    } sino { para y en l { para f en y[campo] { r.agregar(f) } } }
+    retornar r
+}
+
+funcion _ens_correr_grupo(g, ruta, res, forzar_saltar, en_solo) {
+    sea saltar = forzar_saltar o g["saltar"]
+    sea solo_aqui = en_solo o g["solo"]
+    sea nombre = ruta
+    si (g["nombre"] != "") {
+        si (nombre != "") { nombre = nombre + " › " }
+        nombre = nombre + g["nombre"]
+    }
+    sea activo = saltar == falso
+    si (activo) { para f en g["antes_todo"] { f() } }
+    para item en g["items"] {
+      si (item[0] == "grupo") { _ens_correr_grupo(item[1], nombre, res, saltar, solo_aqui) } sino {
+        sea p = item[1]
+        sea completo = nombre
+        si (completo != "") { completo = completo + " › " }
+        completo = completo + p["nombre"]
+        sea omitir = saltar o p["saltar"] o (_ENS["solo"] y solo_aqui == falso y p["solo"] == falso)
+        si (p["pendiente"]) {
+            res["pendientes"].agregar(completo)
+        } sino {
+            si (omitir) { res["saltadas"].agregar(completo) } sino {
+                sea t0 = tiempo_ms()
+                sea error = nulo
+                _ENS["prueba_actual"] = completo
+                intentar {
+                    para f en _ens_cadena(g, "antes_cada") { f() }
+                    p["f"]()
+                } capturar (e) { error = e }
+                intentar { para f en _ens_cadena(g, "despues_cada") { f() } } capturar (e2) { si (error == nulo) { error = e2 } }
+                sea ms = tiempo_ms() - t0
+                si (error == nulo) { res["pasaron"].agregar({"nombre": completo, "ms": ms}) } sino { res["fallaron"].agregar({"nombre": completo, "error": "" + error, "ms": ms}) }
+            }
+        }
+      }
+    }
+    si (activo) { para f en g["despues_todo"] { f() } }
+}
+
+/// Corre todas las pruebas registradas. opciones: silencioso (no imprime),
+/// lanzar (verdadero: lanza si alguna falló). Devuelve {"pasaron",
+/// "fallaron", "saltadas", "pendientes", "total", "ms"}.
+funcion ensayo_correr(opciones) {
+    sea o = opciones ?? {}
+    sea raiz_ = _ens_actual()
+    _ENS["solo"] = _ens_tiene_solo(raiz_)
+    sea res = {"pasaron": [], "fallaron": [], "saltadas": [], "pendientes": []}
+    sea t0 = tiempo_ms()
+    _ens_correr_grupo(raiz_, "", res, falso, falso)
+    res["ms"] = tiempo_ms() - t0
+    res["total"] = longitud(res["pasaron"]) + longitud(res["fallaron"]) + longitud(res["saltadas"]) + longitud(res["pendientes"])
+    _ens_guardar_instantaneas()
+    si ((o["silencioso"] ?? falso) == falso) {
+        para p en res["pasaron"] { mostrar(" ✓ " + p["nombre"] + " (" + p["ms"] + " ms)") }
+        para p en res["saltadas"] { mostrar(" ↓ " + p) }
+        para p en res["pendientes"] { mostrar(" ✎ " + p) }
+        para p en res["fallaron"] {
+            mostrar(" ✗ " + p["nombre"])
+            para l en texto_dividir(p["error"], "\n") { mostrar("     " + l) }
+        }
+        mostrar("")
+        mostrar(" Pruebas: " + longitud(res["pasaron"]) + " pasaron, " + longitud(res["fallaron"]) + " fallaron, " + longitud(res["saltadas"]) + " saltadas, " + longitud(res["pendientes"]) + " pendientes (" + res["ms"] + " ms)")
+    }
+    // Se limpia el registro para poder volver a usarlo.
+    _ENS["raiz"] = nulo
+    _ENS["actual"] = nulo
+    si ((o["lanzar"] ?? verdadero) y longitud(res["fallaron"]) > 0) { lanzar "ensayo: " + longitud(res["fallaron"]) + " prueba(s) fallaron" }
+    retornar res
+}
+
+// ── Expectativas ──────────────────────────────────────────────────────────
+
+funcion _ens_bonito(v) {
+    si (tipo(v) == "funcion") { retornar "<funcion>" }
+    intentar { retornar json_bonito(v) } capturar (e) { retornar "" + v }
+}
+
+/// Diferencia línea a línea (LCS): "- esperado / + recibido".
+funcion ensayo_diferencia(esperado, recibido) { retornar _ens_dif_lineas(texto_dividir(_ens_bonito(esperado), "\n"), texto_dividir(_ens_bonito(recibido), "\n")) }
+
+funcion _ens_dif_lineas(a, b) {
+    sea n = longitud(a)
+    sea m = longitud(b)
+    sea t = []
+    sea i = 0
+    mientras (i <= n) {
+        sea fila = []
+        sea j = 0
+        mientras (j <= m) { fila.agregar(0)  j = j + 1 }
+        t.agregar(fila)
+        i = i + 1
+    }
+    i = n - 1
+    mientras (i >= 0) {
+        sea j = m - 1
+        mientras (j >= 0) {
+            si (a[i] == b[j]) { t[i][j] = t[i + 1][j + 1] + 1 } sino { t[i][j] = maximo(t[i + 1][j], t[i][j + 1]) }
+            j = j - 1
+        }
+        i = i - 1
+    }
+    sea r = []
+    i = 0
+    sea j2 = 0
+    mientras (i < n o j2 < m) {
+        si (i < n y j2 < m y a[i] == b[j2]) { r.agregar("  " + a[i])  i = i + 1  j2 = j2 + 1 } sino {
+            si (j2 < m y (i >= n o t[i][j2 + 1] >= t[i + 1][j2])) { r.agregar("+ " + b[j2])  j2 = j2 + 1 } sino { r.agregar("- " + a[i])  i = i + 1 }
+        }
+    }
+    retornar unir(r, "\n")
+}
+
+funcion _ens_iguales(a, b) {
+    si (tipo(a) != tipo(b)) { retornar falso }
+    si (tipo(a) == "lista") {
+        si (longitud(a) != longitud(b)) { retornar falso }
+        sea i = 0
+        mientras (i < longitud(a)) {
+            si (_ens_iguales(a[i], b[i]) == falso) { retornar falso }
+            i = i + 1
+        }
+        retornar verdadero
+    }
+    si (tipo(a) == "mapa") {
+        si (longitud(claves(a)) != longitud(claves(b))) { retornar falso }
+        para k en claves(a) { si (tiene_clave(b, k) == falso o _ens_iguales(a[k], b[k]) == falso) { retornar falso } }
+        retornar verdadero
+    }
+    si (tipo(a) == "funcion") { retornar verdadero }
+    retornar a == b
+}
+
+funcion _ens_fallo(msg, esperado, recibido, mostrar_dif) {
+    sea t = msg
+    si (mostrar_dif) { t = t + "\n" + ensayo_diferencia(esperado, recibido) }
+    lanzar t
+}
+
+/// Igualdad profunda (listas y mapas por contenido).
+funcion ensayo_igual(recibido, esperado, mensaje) {
+    si (_ens_iguales(recibido, esperado) == falso) { _ens_fallo((mensaje ?? "se esperaba igualdad") + " (- esperado, + recibido)", esperado, recibido, verdadero) }
+}
+
+funcion ensayo_distinto(recibido, no_esperado, mensaje) {
+    si (_ens_iguales(recibido, no_esperado)) { lanzar (mensaje ?? "no se esperaba") + ": " + _ens_bonito(recibido) }
+}
+
+funcion ensayo_verdadero(v, mensaje) { si (v != verdadero) { lanzar (mensaje ?? "se esperaba verdadero") + " y llegó " + _ens_bonito(v) } }
+funcion ensayo_falso(v, mensaje) { si (v != falso) { lanzar (mensaje ?? "se esperaba falso") + " y llegó " + _ens_bonito(v) } }
+funcion ensayo_nulo(v, mensaje) { si (v != nulo) { lanzar (mensaje ?? "se esperaba nulo") + " y llegó " + _ens_bonito(v) } }
+
+/// |a − b| < 10^(−decimales) / 2 (como toBeCloseTo; 2 decimales por defecto).
+funcion ensayo_cerca(recibido, esperado, decimales) {
+    sea d = decimales ?? 2
+    sea tol = 0.5
+    sea i = 0
+    mientras (i < d) { tol = tol / 10  i = i + 1 }
+    si (absoluto(recibido - esperado) >= tol) { lanzar "se esperaba " + esperado + " ± " + tol + " y llegó " + recibido }
+}
+
+/// Texto o lista que contiene el elemento.
+funcion ensayo_contiene(contenedor, elemento) {
+    si (tipo(contenedor) == "texto") {
+        si (texto_indice(contenedor, "" + elemento) < 0) { lanzar "se esperaba que '" + contenedor + "' contuviera '" + elemento + "'" }
+        retornar nulo
+    }
+    para x en contenedor { si (_ens_iguales(x, elemento)) { retornar nulo } }
+    lanzar "la lista no contiene " + _ens_bonito(elemento)
+}
+
+funcion _ens_parcial(sub, v) {
+    si (tipo(sub) == "mapa") {
+        si (tipo(v) != "mapa") { retornar falso }
+        para k en claves(sub) { si (tiene_clave(v, k) == falso o _ens_parcial(sub[k], v[k]) == falso) { retornar falso } }
+        retornar verdadero
+    }
+    si (tipo(sub) == "lista") {
+        si (tipo(v) != "lista" o longitud(sub) != longitud(v)) { retornar falso }
+        sea i = 0
+        mientras (i < longitud(sub)) {
+            si (_ens_parcial(sub[i], v[i]) == falso) { retornar falso }
+            i = i + 1
+        }
+        retornar verdadero
+    }
+    retornar _ens_iguales(sub, v)
+}
+
+/// El objeto contiene (recursivamente) lo indicado (toMatchObject).
+funcion ensayo_coincide(recibido, parcial) {
+    si (_ens_parcial(parcial, recibido) == falso) { _ens_fallo("el objeto no coincide (- esperado, + recibido)", parcial, recibido, verdadero) }
+}
+
+/// f() debe lanzar; si se da patron, el mensaje debe contenerlo.
+/// Devuelve el error.
+funcion ensayo_lanza(f, patron) {
+    sea error = nulo
+    sea lanzo = falso
+    intentar { f() } capturar (e) {
+        error = e
+        lanzo = verdadero
+    }
+    si (lanzo == falso) { lanzar "se esperaba un error y no lo hubo" }
+    si (patron != nulo y texto_indice("" + error, patron) < 0) { lanzar "el error '" + error + "' no contiene '" + patron + "'" }
+    retornar error
+}
+
+funcion ensayo_largo(v, n) { si (longitud(v) != n) { lanzar "se esperaba largo " + n + " y es " + longitud(v) } }
+funcion ensayo_mayor(a, b) { si ((a > b) == falso) { lanzar "se esperaba " + a + " > " + b } }
+funcion ensayo_menor(a, b) { si ((a < b) == falso) { lanzar "se esperaba " + a + " < " + b } }
+funcion ensayo_tipo(v, t) { si (tipo(v) != t) { lanzar "se esperaba tipo " + t + " y es " + tipo(v) } }
+
+// ── Funciones simuladas ───────────────────────────────────────────────────
+
+/// Función simulada con la aridad dada (0–6). Devuelve un mapa con "f"
+/// (la función a pasar), "llamadas" ([[args…]]) y "resultados".
+/// implementacion(args) es opcional.
+funcion ensayo_mock(aridad, implementacion) {
+    sea m = {"llamadas": [], "resultados": [], "impl": implementacion, "una_vez": [], "valor": nulo, "tiene_valor": falso}
+    sea llamar = funcion(args) {
+        m["llamadas"].agregar(args)
+        sea r = nulo
+        si (longitud(m["una_vez"]) > 0) {
+            r = m["una_vez"][0]
+            sea resto = []
+            sea i = 1
+            mientras (i < longitud(m["una_vez"])) { resto.agregar(m["una_vez"][i])  i = i + 1 }
+            m["una_vez"] = resto
+            si (tipo(r) == "mapa" y tiene_clave(r, "$lanzar")) { lanzar r["$lanzar"] }
+            si (tipo(r) == "mapa" y tiene_clave(r, "$impl")) { r = r["$impl"](args) }
+        } sino {
+            si (m["tiene_valor"]) { r = m["valor"] } sino { si (m["impl"] != nulo) { r = m["impl"](args) } }
+        }
+        m["resultados"].agregar(r)
+        retornar r
+    }
+    sea n = aridad ?? 0
+    si (n == 0) { m["f"] = funcion() { retornar llamar([]) } }
+    si (n == 1) { m["f"] = funcion(a) { retornar llamar([a]) } }
+    si (n == 2) { m["f"] = funcion(a, b) { retornar llamar([a, b]) } }
+    si (n == 3) { m["f"] = funcion(a, b, c) { retornar llamar([a, b, c]) } }
+    si (n == 4) { m["f"] = funcion(a, b, c, d) { retornar llamar([a, b, c, d]) } }
+    si (n == 5) { m["f"] = funcion(a, b, c, d, e) { retornar llamar([a, b, c, d, e]) } }
+    si (n == 6) { m["f"] = funcion(a, b, c, d, e, g) { retornar llamar([a, b, c, d, e, g]) } }
+    si (n > 6) { lanzar "ensayo: aridad máxima 6" }
+    retornar m
+}
+
+funcion ensayo_mock_devolver(m, v) {
+    m["valor"] = v
+    m["tiene_valor"] = verdadero
+}
+funcion ensayo_mock_devolver_una_vez(m, v) { m["una_vez"].agregar(v) }
+funcion ensayo_mock_lanzar_una_vez(m, error) { m["una_vez"].agregar({"$lanzar": error}) }
+funcion ensayo_mock_implementar(m, f) {
+    m["impl"] = f
+    m["tiene_valor"] = falso
+}
+
+funcion ensayo_mock_reiniciar(m) {
+    m["llamadas"] = []
+    m["resultados"] = []
+    m["una_vez"] = []
+}
+
+funcion ensayo_llamado(m, veces) {
+    si (veces == nulo) {
+        si (longitud(m["llamadas"]) == 0) { lanzar "se esperaba al menos una llamada" }
+        retornar nulo
+    }
+    si (longitud(m["llamadas"]) != veces) { lanzar "se esperaban " + veces + " llamadas y hubo " + longitud(m["llamadas"]) }
+}
+
+funcion ensayo_llamado_con(m, args) {
+    para l en m["llamadas"] { si (_ens_iguales(l, args)) { retornar nulo } }
+    lanzar "no hubo una llamada con " + _ens_bonito(args) + "; llamadas: " + _ens_bonito(m["llamadas"])
+}
+
+funcion ensayo_ultima_llamada(m, args) {
+    si (longitud(m["llamadas"]) == 0) { lanzar "no hubo llamadas" }
+    ensayo_igual(m["llamadas"][longitud(m["llamadas"]) - 1], args, "la última llamada no coincide")
+}
+
+/// Espía una función guardada en un mapa (objeto[clave]): la reemplaza por
+/// un mock que llama a la original. Devuelve el mock; restaurar con
+/// ensayo_restaurar(m).
+funcion ensayo_espiar(objeto, clave, aridad) {
+    sea original = objeto[clave]
+    sea m = ensayo_mock(aridad ?? 1, nulo)
+    sea n = aridad ?? 1
+    m["impl"] = funcion(args) {
+        si (n == 0) { retornar original() }
+        si (n == 1) { retornar original(args[0]) }
+        si (n == 2) { retornar original(args[0], args[1]) }
+        si (n == 3) { retornar original(args[0], args[1], args[2]) }
+        retornar original(args[0], args[1], args[2], args[3])
+    }
+    m["restaurar"] = funcion() { objeto[clave] = original }
+    objeto[clave] = m["f"]
+    retornar m
+}
+
+funcion ensayo_restaurar(m) { m["restaurar"]() }
+
+// ── Reloj falso ───────────────────────────────────────────────────────────
+
+/// Reloj controlable: {"ahora": f() → ms, "avanzar": f(ms), "programar":
+/// f(ms, callback)}. Los callbacks vencidos corren al avanzar.
+funcion ensayo_reloj(inicio) {
+    sea estado = {"t": inicio ?? 0, "tareas": []}
+    sea r = {}
+    r["ahora"] = funcion() { retornar estado["t"] }
+    r["programar"] = funcion(ms, f) { estado["tareas"].agregar({"t": estado["t"] + ms, "f": f}) }
+    r["avanzar"] = funcion(ms) {
+        sea fin = estado["t"] + ms
+        mientras (verdadero) {
+            sea prox = nulo
+            para x en estado["tareas"] { si (x["t"] <= fin y (prox == nulo o x["t"] < prox["t"])) { prox = x } }
+            si (prox == nulo) { romper }
+            sea resto = []
+            para x en estado["tareas"] { si (x != prox) { resto.agregar(x) } }
+            estado["tareas"] = resto
+            estado["t"] = prox["t"]
+            prox["f"]()
+        }
+        estado["t"] = fin
+    }
+    r["pendientes"] = funcion() { retornar longitud(estado["tareas"]) }
+    retornar r
+}
+
+// ── Instantáneas ──────────────────────────────────────────────────────────
+
+/// Archivo donde se guardan las instantáneas (por defecto
+/// "__instantaneas__.json" en la carpeta actual).
+funcion ensayo_archivo_instantaneas(ruta) {
+    _ens_guardar_instantaneas()
+    _ENS["archivo_snap"] = ruta
+    _ENS["instantaneas"] = {}
+    si (existe_archivo(ruta)) { _ENS["instantaneas"] = json_parsear(leer_archivo(ruta)) }
+}
+
+funcion _ens_guardar_instantaneas() {
+    si (_ENS["snap_cambios"] y _ENS["archivo_snap"] != nulo) {
+        escribir_archivo(_ENS["archivo_snap"], json_bonito(_ENS["instantaneas"]) + "\n")
+        _ENS["snap_cambios"] = falso
+    }
+}
+
+/// Compara v con la instantánea guardada con ese nombre (o con el nombre
+/// de la prueba actual). Si no existe la guarda. Con la variable de entorno
+/// CFORGE_ACTUALIZAR=1 la reemplaza.
+funcion ensayo_instantanea(v, nombre) {
+    si (_ENS["archivo_snap"] == nulo) { ensayo_archivo_instantaneas("__instantaneas__.json") }
+    sea clave = nombre
+    si (clave == nulo) {
+        // Sin nombre: el de la prueba, numerado si hay varias en ella.
+        sea n = _ENS["prueba_actual"] ?? "instantánea"
+        si ((_ENS["usadas_de"] ?? nulo) != n) {
+            _ENS["usadas_de"] = n
+            _ENS["usadas"] = 0
+        }
+        _ENS["usadas"] = _ENS["usadas"] + 1
+        clave = n
+        si (_ENS["usadas"] > 1) { clave = n + " " + _ENS["usadas"] }
+    }
+    sea texto = _ens_bonito(v)
+    sea actualizar = variable_entorno("CFORGE_ACTUALIZAR") == "1"
+    si (tiene_clave(_ENS["instantaneas"], clave) == falso o actualizar) {
+        _ENS["instantaneas"][clave] = texto
+        _ENS["snap_cambios"] = verdadero
+        _ens_guardar_instantaneas()
+        retornar nulo
+    }
+    sea guardado = _ENS["instantaneas"][clave]
+    si (guardado != texto) { lanzar "la instantánea '" + clave + "' no coincide (CFORGE_ACTUALIZAR=1 para reemplazarla)\n" + ensayo_diferencia_texto(guardado, texto) }
+}
+
+funcion ensayo_diferencia_texto(a, b) { retornar _ens_dif_lineas(texto_dividir(a, "\n"), texto_dividir(b, "\n")) }
