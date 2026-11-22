@@ -1,0 +1,589 @@
+// stdlib/caja.cfv — cachés y colecciones avanzadas al estilo Guava y
+// Caffeine: caché con límite por cantidad o peso (LRU o LFU), vencimiento
+// tras escribir o tras leer, carga automática con función, refresco,
+// estadísticas y aviso al desalojar; además multimapa, bimapa, multiconjunto,
+// tabla de dos claves, conjunto de rangos, filtro de Bloom y limitador de
+// tasa. Todo en O(1) o O(log n). Inspirada en Guava y Caffeine (Apache).
+// En inglés: importar "cache".
+//
+//   importar "caja"
+//   sea c = caja_cache({"maximo": 1000, "vence_escritura_ms": 60000,
+//                       "cargar": funcion(k) { retornar leer_bd(k) }})
+//   caja_obtener(c, "usuario:1")        // carga una vez y luego sale de la caché
+//   caja_estadisticas(c)                // {"aciertos", "fallos", "tasa", …}
+
+// ══ Caché ══════════════════════════════════════════════════════════════════
+// Lista doblemente enlazada (mapas "ant"/"sig" por clave) para el orden de
+// uso, y para LFU cubetas por frecuencia con la misma técnica.
+
+/// opciones: maximo (cantidad), peso_maximo + peso (f(k, v) → número),
+/// politica ("lru" | "lfu"), vence_escritura_ms, vence_lectura_ms,
+/// refrescar_ms (con cargar: se recarga al leer un valor viejo), cargar
+/// (f(k) → valor o nulo), al_desalojar (f(k, v, causa)), reloj (f() → ms).
+funcion caja_cache(opciones) {
+    sea o = opciones ?? {}
+    retornar {"o": o, "datos": {}, "escrito": {}, "leido": {}, "pesos": {}, "peso_total": 0, "ant": {}, "sig": {}, "cabeza": nulo, "cola": nulo,
+              "frec": {}, "cubetas": {}, "min_frec": 0, "n": 0,
+              "aciertos": 0, "fallos": 0, "cargas": 0, "fallos_carga": 0, "desalojos": 0, "tiempo_carga_ms": 0}
+}
+
+funcion _cj_ahora(c) {
+    sea r = c["o"]["reloj"] ?? nulo
+    si (r != nulo) { retornar r() }
+    retornar tiempo_ms()
+}
+
+funcion _cj_desenlazar(c, k) {
+    sea a = c["ant"][k] ?? nulo
+    sea s = c["sig"][k] ?? nulo
+    si (a != nulo) { c["sig"][a] = s } sino { c["cabeza"] = s }
+    si (s != nulo) { c["ant"][s] = a } sino { c["cola"] = a }
+    quitar_clave(c["ant"], k)
+    quitar_clave(c["sig"], k)
+}
+
+// Al final = usado más recientemente.
+funcion _cj_al_final(c, k) {
+    c["ant"][k] = c["cola"]
+    c["sig"][k] = nulo
+    si (c["cola"] != nulo) { c["sig"][c["cola"]] = k } sino { c["cabeza"] = k }
+    c["cola"] = k
+}
+
+// LFU: cubetas {frecuencia: {"cabeza", "cola", "ant", "sig"}}.
+funcion _cj_cubeta(c, f) {
+    sea kf = "" + f
+    si (tiene_clave(c["cubetas"], kf) == falso) { c["cubetas"][kf] = {"cabeza": nulo, "cola": nulo, "ant": {}, "sig": {}, "n": 0} }
+    retornar c["cubetas"][kf]
+}
+
+funcion _cj_lfu_quitar(c, k) {
+    sea f = c["frec"][k]
+    sea b = _cj_cubeta(c, f)
+    sea a = b["ant"][k] ?? nulo
+    sea s = b["sig"][k] ?? nulo
+    si (a != nulo) { b["sig"][a] = s } sino { b["cabeza"] = s }
+    si (s != nulo) { b["ant"][s] = a } sino { b["cola"] = a }
+    quitar_clave(b["ant"], k)
+    quitar_clave(b["sig"], k)
+    b["n"] = b["n"] - 1
+    si (b["n"] == 0) {
+        quitar_clave(c["cubetas"], "" + f)
+        si (c["min_frec"] == f) { c["min_frec"] = f + 1 }
+    }
+}
+
+funcion _cj_lfu_poner(c, k, f) {
+    c["frec"][k] = f
+    sea b = _cj_cubeta(c, f)
+    b["ant"][k] = b["cola"]
+    b["sig"][k] = nulo
+    si (b["cola"] != nulo) { b["sig"][b["cola"]] = k } sino { b["cabeza"] = k }
+    b["cola"] = k
+    b["n"] = b["n"] + 1
+}
+
+funcion _cj_lfu(c) { retornar (c["o"]["politica"] ?? "lru") == "lfu" }
+
+funcion _cj_tocar(c, k) {
+    si (_cj_lfu(c)) {
+        sea f = c["frec"][k]
+        _cj_lfu_quitar(c, k)
+        _cj_lfu_poner(c, k, f + 1)
+    } sino {
+        _cj_desenlazar(c, k)
+        _cj_al_final(c, k)
+    }
+}
+
+funcion _cj_sacar(c, k, causa) {
+    si (tiene_clave(c["datos"], k) == falso) { retornar nulo }
+    sea v = c["datos"][k]
+    si (_cj_lfu(c)) {
+        _cj_lfu_quitar(c, k)
+        quitar_clave(c["frec"], k)
+    } sino { _cj_desenlazar(c, k) }
+    quitar_clave(c["datos"], k)
+    c["n"] = c["n"] - 1
+    quitar_clave(c["escrito"], k)
+    quitar_clave(c["leido"], k)
+    c["peso_total"] = c["peso_total"] - (c["pesos"][k] ?? 0)
+    quitar_clave(c["pesos"], k)
+    si (causa == "tamano" o causa == "vencido") { c["desalojos"] = c["desalojos"] + 1 }
+    sea aviso = c["o"]["al_desalojar"] ?? nulo
+    si (aviso != nulo) { aviso((c["claves_orig"] ?? {})[k] ?? k, v, causa) }
+    retornar v
+}
+
+funcion _cj_victima(c) {
+    si (_cj_lfu(c)) {
+        // La de menor frecuencia; entre iguales, la más antigua.
+        mientras (tiene_clave(c["cubetas"], "" + c["min_frec"]) == falso) { c["min_frec"] = c["min_frec"] + 1 }
+        retornar c["cubetas"]["" + c["min_frec"]]["cabeza"]
+    }
+    retornar c["cabeza"]
+}
+
+funcion _cj_vencido(c, k, ahora) {
+    sea ve = c["o"]["vence_escritura_ms"] ?? nulo
+    si (ve != nulo y ahora - c["escrito"][k] >= ve) { retornar verdadero }
+    sea vl = c["o"]["vence_lectura_ms"] ?? nulo
+    si (vl != nulo y ahora - c["leido"][k] >= vl) { retornar verdadero }
+    retornar falso
+}
+
+funcion _cj_ajustar(c) {
+    sea max = c["o"]["maximo"] ?? nulo
+    sea pmax = c["o"]["peso_maximo"] ?? nulo
+    mientras ((max != nulo y c["n"] > max) o (pmax != nulo y c["peso_total"] > pmax)) {
+        sea v = _cj_victima(c)
+        si (v == nulo) { retornar nulo }
+        _cj_sacar(c, v, "tamano")
+    }
+}
+
+funcion _cj_k(c, k) {
+    sea s = "" + k
+    si (tipo(k) != "texto") {
+        si (tiene_clave(c, "claves_orig") == falso) { c["claves_orig"] = {} }
+        c["claves_orig"][s] = k
+    }
+    retornar s
+}
+
+/// Guarda un valor (reemplaza el anterior).
+funcion caja_poner(c, clave, valor) {
+    sea k = _cj_k(c, clave)
+    sea ahora = _cj_ahora(c)
+    si (tiene_clave(c["datos"], k)) { _cj_sacar(c, k, "reemplazo") }
+    c["datos"][k] = valor
+    c["n"] = c["n"] + 1
+    c["escrito"][k] = ahora
+    c["leido"][k] = ahora
+    sea fp = c["o"]["peso"] ?? nulo
+    sea p = 1
+    si (fp != nulo) { p = fp(clave, valor) }
+    c["pesos"][k] = p
+    c["peso_total"] = c["peso_total"] + p
+    si (_cj_lfu(c)) {
+        _cj_lfu_poner(c, k, 1)
+        c["min_frec"] = 1
+    } sino { _cj_al_final(c, k) }
+    _cj_ajustar(c)
+}
+
+/// Valor si está y no venció (sin cargar), o nulo.
+funcion caja_si_esta(c, clave) {
+    sea k = _cj_k(c, clave)
+    si (tiene_clave(c["datos"], k) == falso) {
+        c["fallos"] = c["fallos"] + 1
+        retornar nulo
+    }
+    sea ahora = _cj_ahora(c)
+    si (_cj_vencido(c, k, ahora)) {
+        _cj_sacar(c, k, "vencido")
+        c["fallos"] = c["fallos"] + 1
+        retornar nulo
+    }
+    c["aciertos"] = c["aciertos"] + 1
+    c["leido"][k] = ahora
+    _cj_tocar(c, k)
+    retornar c["datos"][k]
+}
+
+funcion _cj_cargar(c, clave, f) {
+    sea t0 = _cj_ahora(c)
+    sea v = nulo
+    intentar { v = f(clave) } capturar (e) {
+        c["fallos_carga"] = c["fallos_carga"] + 1
+        lanzar e
+    }
+    c["cargas"] = c["cargas"] + 1
+    c["tiempo_carga_ms"] = c["tiempo_carga_ms"] + (_cj_ahora(c) - t0)
+    si (v != nulo) { caja_poner(c, clave, v) }
+    retornar v
+}
+
+/// Valor de la caché; si falta o venció lo calcula con cargador (o con la
+/// opción cargar) y lo guarda. Un cargador que devuelve nulo no se guarda.
+funcion caja_obtener(c, clave, cargador) {
+    sea k = _cj_k(c, clave)
+    sea f = cargador ?? (c["o"]["cargar"] ?? nulo)
+    sea ahora = _cj_ahora(c)
+    sea r = c["o"]["refrescar_ms"] ?? nulo
+    si (tiene_clave(c["datos"], k) y _cj_vencido(c, k, ahora) == falso) {
+        si (r != nulo y f != nulo y ahora - c["escrito"][k] >= r) {
+            // Refresco: se recarga; si falla se mantiene el valor viejo.
+            sea viejo = c["datos"][k]
+            c["aciertos"] = c["aciertos"] + 1
+            intentar { _cj_cargar(c, clave, f) } capturar (e) { retornar viejo }
+            retornar c["datos"][k] ?? viejo
+        }
+    }
+    sea v = caja_si_esta(c, clave)
+    si (v != nulo o f == nulo) { retornar v }
+    retornar _cj_cargar(c, clave, f)
+}
+
+/// Varios a la vez: {clave: valor} (carga los que falten).
+funcion caja_obtener_varios(c, claves_, cargador) {
+    sea r = {}
+    para k en claves_ { r["" + k] = caja_obtener(c, k, cargador) }
+    retornar r
+}
+
+funcion caja_invalidar(c, clave) {
+    sea k = _cj_k(c, clave)
+    retornar _cj_sacar(c, k, "explicito") != nulo
+}
+
+funcion caja_invalidar_todo(c) {
+    para k en claves(c["datos"]) { _cj_sacar(c, k, "explicito") }
+}
+
+/// Quita los vencidos (normalmente se hace solo, al leer).
+funcion caja_limpiar(c) {
+    sea ahora = _cj_ahora(c)
+    sea n = 0
+    para k en claves(c["datos"]) {
+        si (_cj_vencido(c, k, ahora)) {
+            _cj_sacar(c, k, "vencido")
+            n = n + 1
+        }
+    }
+    retornar n
+}
+
+funcion caja_cantidad(c) { retornar c["n"] }
+funcion caja_peso(c) { retornar c["peso_total"] }
+
+/// Claves de la menos a la más recientemente usada (LRU) o de menor a mayor
+/// frecuencia (LFU).
+funcion caja_claves(c) {
+    sea r = []
+    si (_cj_lfu(c)) {
+        sea fs = []
+        para f en claves(c["cubetas"]) { fs.agregar(a_numero(f)) }
+        fs = ordenar(fs, funcion(a, b) { retornar a - b })
+        para f en fs {
+            sea b = c["cubetas"]["" + f]
+            sea k = b["cabeza"]
+            mientras (k != nulo) { r.agregar((c["claves_orig"] ?? {})[k] ?? k)  k = b["sig"][k] ?? nulo }
+        }
+        retornar r
+    }
+    sea k = c["cabeza"]
+    mientras (k != nulo) { r.agregar((c["claves_orig"] ?? {})[k] ?? k)  k = c["sig"][k] ?? nulo }
+    retornar r
+}
+
+funcion caja_estadisticas(c) {
+    sea total = c["aciertos"] + c["fallos"]
+    sea tasa = 0
+    si (total > 0) { tasa = redondear(c["aciertos"] / total, 4) }
+    sea prom = 0
+    si (c["cargas"] > 0) { prom = c["tiempo_carga_ms"] / c["cargas"] }
+    retornar {"aciertos": c["aciertos"], "fallos": c["fallos"], "tasa": tasa, "cargas": c["cargas"], "fallos_carga": c["fallos_carga"], "desalojos": c["desalojos"], "carga_promedio_ms": prom, "cantidad": caja_cantidad(c)}
+}
+
+/// Envuelve una función de un argumento con una caché (memoización).
+funcion caja_memo(f, opciones) {
+    sea c = caja_cache(opciones)
+    retornar funcion(x) { retornar caja_obtener(c, x, f) }
+}
+
+// ══ Multimapa: clave → varios valores ══════════════════════════════════════
+
+funcion caja_multimapa() { retornar {"m": {}, "n": 0} }
+
+funcion caja_mm_poner(mm, k, v) {
+    sea kk = "" + k
+    si (tiene_clave(mm["m"], kk) == falso) { mm["m"][kk] = [] }
+    mm["m"][kk].agregar(v)
+    mm["n"] = mm["n"] + 1
+}
+
+funcion caja_mm_obtener(mm, k) { retornar mm["m"]["" + k] ?? [] }
+
+funcion caja_mm_quitar(mm, k, v) {
+    sea kk = "" + k
+    si (tiene_clave(mm["m"], kk) == falso) { retornar falso }
+    sea r = []
+    sea quitado = falso
+    para x en mm["m"][kk] { si (quitado == falso y x == v) { quitado = verdadero } sino { r.agregar(x) } }
+    si (quitado) { mm["n"] = mm["n"] - 1 }
+    si (longitud(r) == 0) { quitar_clave(mm["m"], kk) } sino { mm["m"][kk] = r }
+    retornar quitado
+}
+
+funcion caja_mm_quitar_todos(mm, k) {
+    sea kk = "" + k
+    sea r = mm["m"][kk] ?? []
+    mm["n"] = mm["n"] - longitud(r)
+    si (tiene_clave(mm["m"], kk)) { quitar_clave(mm["m"], kk) }
+    retornar r
+}
+
+funcion caja_mm_claves(mm) { retornar claves(mm["m"]) }
+funcion caja_mm_cantidad(mm) { retornar mm["n"] }
+
+/// Invierte: valor → [claves].
+funcion caja_mm_invertir(mm) {
+    sea r = caja_multimapa()
+    para k en claves(mm["m"]) { para v en mm["m"][k] { caja_mm_poner(r, v, k) } }
+    retornar r
+}
+
+// ══ Bimapa: clave ↔ valor, ambos únicos ═══════════════════════════════════
+
+funcion caja_bimapa() { retornar {"ida": {}, "vuelta": {}} }
+
+/// Lanza si el valor ya pertenece a otra clave (forzar: verdadero lo mueve).
+funcion caja_bm_poner(bm, k, v, forzar) {
+    sea kk = "" + k
+    sea vv = "" + v
+    si (tiene_clave(bm["vuelta"], vv) y bm["vuelta"][vv] != kk) {
+        si (forzar != verdadero) { lanzar "caja: el valor '" + vv + "' ya está en el bimapa" }
+        quitar_clave(bm["ida"], bm["vuelta"][vv])
+    }
+    si (tiene_clave(bm["ida"], kk)) { quitar_clave(bm["vuelta"], "" + bm["ida"][kk]) }
+    bm["ida"][kk] = v
+    bm["vuelta"][vv] = kk
+}
+
+funcion caja_bm_valor(bm, k) { retornar bm["ida"]["" + k] ?? nulo }
+funcion caja_bm_clave(bm, v) { retornar bm["vuelta"]["" + v] ?? nulo }
+funcion caja_bm_inverso(bm) {
+    sea r = caja_bimapa()
+    para k en claves(bm["ida"]) { caja_bm_poner(r, bm["ida"][k], k, falso) }
+    retornar r
+}
+
+// ══ Multiconjunto: elementos con conteo ════════════════════════════════════
+
+funcion caja_multiconjunto(lista) {
+    sea mc = {"c": {}, "n": 0}
+    para x en (lista ?? []) { caja_mc_agregar(mc, x, 1) }
+    retornar mc
+}
+
+funcion caja_mc_agregar(mc, x, n) {
+    sea k = "" + x
+    sea veces = n ?? 1
+    mc["c"][k] = (mc["c"][k] ?? 0) + veces
+    mc["n"] = mc["n"] + veces
+    si (mc["c"][k] <= 0) {
+        mc["n"] = mc["n"] - mc["c"][k]
+        quitar_clave(mc["c"], k)
+    }
+}
+
+funcion caja_mc_quitar(mc, x, n) { caja_mc_agregar(mc, x, -(n ?? 1)) }
+funcion caja_mc_contar(mc, x) { retornar mc["c"]["" + x] ?? 0 }
+funcion caja_mc_total(mc) { retornar mc["n"] }
+
+/// Los n más frecuentes: [[elemento, conteo]] (empates por orden alfabético).
+funcion caja_mc_mas_comunes(mc, n) {
+    sea r = []
+    para k en claves(mc["c"]) { r.agregar([k, mc["c"][k]]) }
+    r = ordenar(r, funcion(a, b) {
+        si (a[1] != b[1]) { retornar b[1] - a[1] }
+        si (a[0] < b[0]) { retornar -1 }
+        retornar 1
+    })
+    si (n == nulo) { retornar r }
+    sea s = []
+    sea i = 0
+    mientras (i < minimo(n, longitud(r))) { s.agregar(r[i])  i = i + 1 }
+    retornar s
+}
+
+// ══ Tabla: (fila, columna) → valor ═════════════════════════════════════════
+
+funcion caja_tabla() { retornar {"f": {}, "c": {}} }
+
+funcion caja_tb_poner(t, fila, col, v) {
+    sea f = "" + fila
+    sea c = "" + col
+    si (tiene_clave(t["f"], f) == falso) { t["f"][f] = {} }
+    si (tiene_clave(t["c"], c) == falso) { t["c"][c] = {} }
+    t["f"][f][c] = v
+    t["c"][c][f] = v
+}
+
+funcion caja_tb_obtener(t, fila, col) { retornar (t["f"]["" + fila] ?? {})["" + col] ?? nulo }
+funcion caja_tb_fila(t, fila) { retornar t["f"]["" + fila] ?? {} }
+funcion caja_tb_columna(t, col) { retornar t["c"]["" + col] ?? {} }
+
+funcion caja_tb_quitar(t, fila, col) {
+    sea f = "" + fila
+    sea c = "" + col
+    si (tiene_clave(t["f"], f) y tiene_clave(t["f"][f], c)) {
+        quitar_clave(t["f"][f], c)
+        quitar_clave(t["c"][c], f)
+        si (longitud(claves(t["f"][f])) == 0) { quitar_clave(t["f"], f) }
+        si (longitud(claves(t["c"][c])) == 0) { quitar_clave(t["c"], c) }
+        retornar verdadero
+    }
+    retornar falso
+}
+
+funcion caja_tb_filas(t) { retornar claves(t["f"]) }
+funcion caja_tb_columnas(t) { retornar claves(t["c"]) }
+
+// ══ Conjunto de rangos [a, b) ══════════════════════════════════════════════
+// Lista ordenada de intervalos disjuntos y no contiguos.
+
+funcion caja_rangos() { retornar {"r": []} }
+
+/// Agrega [desde, hasta): une con los que se toquen.
+funcion caja_rg_agregar(rs, desde, hasta) {
+    si (hasta <= desde) { retornar nulo }
+    sea a = desde
+    sea b = hasta
+    sea r = []
+    sea puesto = falso
+    para x en rs["r"] {
+        si (x[1] < a) { r.agregar(x) } sino {
+            si (x[0] > b) {
+                si (puesto == falso) { r.agregar([a, b])  puesto = verdadero }
+                r.agregar(x)
+            } sino {
+                a = minimo(a, x[0])
+                b = maximo(b, x[1])
+            }
+        }
+    }
+    si (puesto == falso) { r.agregar([a, b]) }
+    rs["r"] = r
+}
+
+/// Quita [desde, hasta) (puede partir un rango en dos).
+funcion caja_rg_quitar(rs, desde, hasta) {
+    sea r = []
+    para x en rs["r"] {
+        si (x[1] <= desde o x[0] >= hasta) { r.agregar(x) } sino {
+            si (x[0] < desde) { r.agregar([x[0], desde]) }
+            si (x[1] > hasta) { r.agregar([hasta, x[1]]) }
+        }
+    }
+    rs["r"] = r
+}
+
+// Búsqueda binaria del rango que contiene v.
+funcion caja_rg_contiene(rs, v) {
+    sea lo = 0
+    sea hi = longitud(rs["r"]) - 1
+    mientras (lo <= hi) {
+        sea m = piso((lo + hi) / 2)
+        sea x = rs["r"][m]
+        si (v < x[0]) { hi = m - 1 } sino {
+            si (v >= x[1]) { lo = m + 1 } sino { retornar verdadero }
+        }
+    }
+    retornar falso
+}
+
+funcion caja_rg_lista(rs) { retornar rs["r"] }
+
+/// Huecos dentro de [desde, hasta) que no cubre el conjunto.
+funcion caja_rg_complemento(rs, desde, hasta) {
+    sea r = caja_rangos()
+    caja_rg_agregar(r, desde, hasta)
+    para x en rs["r"] { caja_rg_quitar(r, x[0], x[1]) }
+    retornar r
+}
+
+// ══ Filtro de Bloom ════════════════════════════════════════════════════════
+
+/// Filtro para n elementos con tasa de falsos positivos p (0.01).
+funcion caja_bloom(n, p) {
+    sea fp = p ?? 0.01
+    sea m = techo(-n * logaritmo(fp) / (logaritmo(2) * logaritmo(2)))
+    sea k = maximo(1, redondear(m / n * logaritmo(2)))
+    sea bits = []
+    sea i = 0
+    sea palabras = techo(m / 30)
+    mientras (i < palabras) { bits.agregar(0)  i = i + 1 }
+    retornar {"m": m, "k": k, "bits": bits, "n": 0}
+}
+
+funcion _cj_bloom_pos(b, x) {
+    // Doble hash (Kirsch–Mitzenmacher) con dos mitades de SHA-256.
+    sea h = sha256_bytes("" + x)
+    sea h1 = bytes_leer_entero(h, 0, 4, 0)
+    sea h2 = bytes_leer_entero(h, 4, 4, 0)
+    sea r = []
+    sea i = 0
+    mientras (i < b["k"]) {
+        r.agregar((h1 + i * h2) % b["m"])
+        i = i + 1
+    }
+    retornar r
+}
+
+funcion _cj_pot2(n) {
+    sea r = 1
+    sea i = 0
+    mientras (i < n) { r = r * 2  i = i + 1 }
+    retornar r
+}
+
+funcion caja_bloom_agregar(b, x) {
+    para pos en _cj_bloom_pos(b, x) {
+        sea w = cociente(pos, 30)
+        sea bit = _cj_pot2(pos % 30)
+        b["bits"][w] = bits_o(b["bits"][w], bit)
+    }
+    b["n"] = b["n"] + 1
+}
+
+/// falso: seguro que no está. verdadero: probablemente está.
+funcion caja_bloom_tal_vez(b, x) {
+    para pos en _cj_bloom_pos(b, x) {
+        sea w = cociente(pos, 30)
+        sea bit = _cj_pot2(pos % 30)
+        si (bits_y(b["bits"][w], bit) == 0) { retornar falso }
+    }
+    retornar verdadero
+}
+
+// ══ Limitador de tasa (cubeta de fichas) ═══════════════════════════════════
+
+/// por_segundo fichas por segundo, ráfaga máxima (por defecto 1 segundo).
+funcion caja_limitador(por_segundo, rafaga, reloj) {
+    sea cap = rafaga ?? por_segundo
+    sea l = {"tasa": por_segundo, "cap": cap, "fichas": cap, "reloj": reloj, "ultimo": 0}
+    l["ultimo"] = _cj_reloj_lim(l)
+    retornar l
+}
+
+funcion _cj_reloj_lim(l) {
+    si (l["reloj"] != nulo) { retornar l["reloj"]() }
+    retornar tiempo_ms()
+}
+
+funcion _cj_recargar(l) {
+    sea ahora = _cj_reloj_lim(l)
+    l["fichas"] = minimo(l["cap"], l["fichas"] + (ahora - l["ultimo"]) * l["tasa"] / 1000)
+    l["ultimo"] = ahora
+}
+
+/// ¿Se puede ahora? (gasta n fichas si es así).
+funcion caja_permitir(l, n) {
+    sea k = n ?? 1
+    _cj_recargar(l)
+    si (l["fichas"] >= k) {
+        l["fichas"] = l["fichas"] - k
+        retornar verdadero
+    }
+    retornar falso
+}
+
+/// Milisegundos a esperar para tener n fichas (0 si ya hay).
+funcion caja_espera_ms(l, n) {
+    _cj_recargar(l)
+    sea falta = (n ?? 1) - l["fichas"]
+    si (falta <= 0) { retornar 0 }
+    retornar techo(falta * 1000 / l["tasa"])
+}

@@ -47,7 +47,7 @@ Estado: ✅ ya existe en C-Forge · 🔗 se usa hoy vía `cforge bindgen`,
 | 28 | `resiste` / `resilience` | Reintentos y circuit breaker | Polly | ✅ `resiste` |
 | 29 | `bitacora` / `logger` | Logs estructurados | Serilog | ✅ `bitacora` |
 | 30 | `torrente` | Red asíncrona de alto tráfico | Netty | 🛠 |
-| 31 | `caja` | Colecciones avanzadas y cachés | Guava | ✅ `colecciones` · 🛠 cachés |
+| 31 | `caja` / `cache` | Colecciones avanzadas y cachés | Guava | ✅ `caja` |
 | 32 | `formatos` | JSON, XML, CSV y YAML | Jackson | ✅ JSON · 🛠 resto |
 | 33 | `registro` / `logging` | Registro de eventos desacoplado | SLF4J, Logback | ✅ `registro` |
 | 34 | `reloj` / `cron` | Tareas programadas (cron) | Quartz | ✅ `reloj` |
@@ -77,10 +77,10 @@ Estado: ✅ ya existe en C-Forge · 🔗 se usa hoy vía `cforge bindgen`,
 |---|---|---|---|---|
 | 52 | `oraculo` | LLM locales cuantizados | llama.cpp | 🔗 |
 | 53 | `cerebro` | Ejecutar modelos entrenados | ONNX Runtime | 🔗 |
-| 54 | `algebra` | Álgebra lineal | Eigen | ✅ `matematica` (básica) · 🛠 |
+| 54 | `algebra` / `linalg` | Álgebra lineal | Eigen | ✅ `algebra` |
 | 55 | `vision` | Visión por computadora | OpenCV | 🔗 |
 | 56 | `vela` / `trees` | Machine learning ligero | Candle | ✅ `vela` |
-| 57 | `fichas` | Tokenización (BPE, WordPiece) | Tokenizers | ✅ `nlp` (básico) · 🛠 |
+| 57 | `fichas` / `tokenizers` | Tokenización (BPE, WordPiece) | Tokenizers | ✅ `fichas` |
 | 58 | `vecindad` / `vectors` | Búsqueda vectorial | FAISS | ✅ `vecindad` |
 | 59 | `aprende` / `ml` | ML clásico | scikit-learn | ✅ `aprende` |
 | 60 | `lector` | OCR | Tesseract | 🔗 |
@@ -122,7 +122,7 @@ Estado: ✅ ya existe en C-Forge · 🔗 se usa hoy vía `cforge bindgen`,
 | 86 | `tunel` | VPN criptográfica | WireGuard | 🛠 |
 | 87 | `certifica` | Certificados HTTPS automáticos | ACME | 🛠 |
 | 88 | `ficha` | Tokens JWT/JWE | jose | ✅ `auth` (JWT) |
-| 89 | `clave` | Hash de contraseñas | Argon2, bcrypt | ✅ `crypto` (PBKDF2) · 🛠 Argon2 |
+| 89 | `clave` / `password` | Hash de contraseñas | Argon2, bcrypt | ✅ `clave` |
 | 90 | `sonda` | Captura de paquetes | libpcap | 🔗 |
 | 91 | `consenso` / `raft` | Consenso distribuido | Raft | ✅ `consenso` |
 | 92 | `sensor` / `mqtt` | Mensajería IoT | MQTT | ✅ `sensor` |
@@ -144,7 +144,7 @@ Estado: ✅ ya existe en C-Forge · 🔗 se usa hoy vía `cforge bindgen`,
 | 103 | `hoja` / `xlsx` | Hojas de cálculo .xlsx | libxlsxwriter | ✅ `hoja` |
 | 104 | `documento` / `pdf` | PDF: crear, leer y firmar | PDFium, lopdf | ✅ `documento` |
 | 105 | `archivador` / `archive` | ZIP/TAR seguros | libarchive | ✅ `archivador` |
-| 106 | `ajustes` | TOML y YAML estrictos | toml, yaml-rust | ✅ TOML (cforge.toml) · 🛠 |
+| 106 | `ajustes` / `config` | TOML y YAML estrictos | toml, yaml-rust | ✅ `ajustes` |
 | 107 | `marcado` / `markdown` | Markdown a HTML | pulldown-cmark | ✅ `marcado` |
 | 108 | `sintaxis` | Parser incremental | tree-sitter | 🔗 |
 | 109 | `xml` | XML rápido | quick-xml | ✅ `xml` |
@@ -179,7 +179,7 @@ Estado: ✅ ya existe en C-Forge · 🔗 se usa hoy vía `cforge bindgen`,
 | 128 | `mezcla` | Mezclador y decodificadores | Rodio | ✅ WAV · 🛠 MP3/OGG/FLAC |
 | 129 | `estudio` | Audio en tiempo real | PortAudio | 🔗 |
 | 130 | `entidades` / `entities` | ECS de alto rendimiento | EnTT | ✅ `entidades` |
-| 131 | `navegacion` | Pathfinding y NavMesh | Recast & Detour | ✅ `algoritmos` (Dijkstra) · 🛠 A* y NavMesh |
+| 131 | `navegacion` / `navmesh` | Pathfinding y NavMesh | Recast & Detour | ✅ `navegacion` |
 | 132 | `serie` | Puertos serie (Arduino) | serialport | 🛠 |
 | 133 | `mando` | Dispositivos USB HID | hidapi | 🔗 |
 | 134 | `pines` | GPIO, I2C y SPI | rppal | 🛠 |
@@ -241,12 +241,12 @@ Estado: ✅ ya existe en C-Forge · 🔗 se usa hoy vía `cforge bindgen`,
 | 173 | `blas` | Matrices de alto rendimiento | OpenBLAS | 🔗 |
 | 174 | `malla_geo` / `geometry2d` | Geometría computacional | CGAL | ✅ `malla_geo` |
 | 175 | `robotica` | Física para robótica | MuJoCo | 🔗 |
-| 176 | `cuaternion` | Álgebra lineal y transformaciones | nalgebra | ✅ `matematica` (básica) · 🛠 |
+| 176 | `cuaternion` / `quaternion` | Álgebra lineal y transformaciones | nalgebra | ✅ `cuaternion` |
 | 177 | `astro` / `astronomy` | Órbitas y efemérides | NOVAS | ✅ `astro` |
 | 178 | `molecula` | Quimioinformática | RDKit | 🔗 |
 | 179 | `genoma` / `bio` | Bioinformática | Rust-Bio | ✅ `genoma` |
 | 180 | `cientifica` | Funciones especiales y EDO | GSL | 🔗 |
-| 181 | `grafos` | Grafos y rutas | petgraph | ✅ `algoritmos` (BFS, DFS, Dijkstra) · 🛠 A* |
+| 181 | `grafos` / `graph` | Grafos y rutas | petgraph | ✅ `grafos` |
 
 ### J. Motores de juego y realidad virtual
 

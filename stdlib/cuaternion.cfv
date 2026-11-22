@@ -1,0 +1,445 @@
+// stdlib/cuaternion.cfv — rotaciones y transformaciones 3D al estilo
+// nalgebra / glm: vectores [x, y, z], cuaterniones [w, x, y, z], matrices
+// 3×3 y 4×4 (listas de filas), ángulos de Euler en las 12 secuencias
+// (intrínsecas en mayúsculas "XYZ", extrínsecas en minúsculas "xyz", como
+// SciPy), eje-ángulo, vector de rotación, slerp, arco más corto, "mirar
+// hacia", matrices TRS, perspectiva y ortográfica (OpenGL), inversa y
+// descomposición. Resultados comparados con scipy.spatial.transform.
+// En inglés: importar "quaternion".
+//
+//   importar "cuaternion"
+//   sea q = cuaternion_eje_angulo([0, 0, 1], 90, "grados")
+//   cuaternion_rotar(q, [1, 0, 0])                 // [0, 1, 0]
+//   cuaternion_a_euler(q, "xyz", "grados")         // [0, 0, 90]
+
+sea _CQ_PI = 3.141592653589793
+
+funcion _cq_atan2(yv, x) {
+    si (x == 0 y yv == 0) { retornar 0 }
+    si (absoluto(x) >= absoluto(yv)) {
+        sea a = arcotangente(yv / x)
+        si (x > 0) { retornar a }
+        si (yv >= 0) { retornar a + _CQ_PI }
+        retornar a - _CQ_PI
+    }
+    // |y| > |x|: π/2 − atan(x/y) es más preciso.
+    sea b = arcotangente(x / yv)
+    si (yv > 0) { retornar _CQ_PI / 2 - b }
+    retornar -_CQ_PI / 2 - b
+}
+
+funcion _cq_acos(x) { retornar _CQ_PI / 2 - arcoseno(maximo(-1, minimo(1, x))) }
+
+funcion _cq_rad(a, unidad) {
+    si (unidad == "grados") { retornar a * _CQ_PI / 180 }
+    retornar a
+}
+
+funcion _cq_deg(a, unidad) {
+    si (unidad == "grados") { retornar a * 180 / _CQ_PI }
+    retornar a
+}
+
+// ══ Vectores ═══════════════════════════════════════════════════════════════
+
+funcion cuaternion_sumar(a, b) { retornar [a[0] + b[0], a[1] + b[1], a[2] + b[2]] }
+funcion cuaternion_restar(a, b) { retornar [a[0] - b[0], a[1] - b[1], a[2] - b[2]] }
+funcion cuaternion_escalar(a, k) { retornar [a[0] * k, a[1] * k, a[2] * k] }
+funcion cuaternion_punto(a, b) { retornar a[0] * b[0] + a[1] * b[1] + a[2] * b[2] }
+funcion cuaternion_cruz(a, b) { retornar [a[1] * b[2] - a[2] * b[1], a[2] * b[0] - a[0] * b[2], a[0] * b[1] - a[1] * b[0]] }
+funcion cuaternion_largo(a) { retornar raiz(cuaternion_punto(a, a)) }
+
+funcion cuaternion_unitario(a) {
+    sea n = cuaternion_largo(a)
+    si (n == 0) { retornar [0, 0, 0] }
+    retornar [a[0] / n, a[1] / n, a[2] / n]
+}
+
+/// Ángulo entre dos vectores (radianes o "grados").
+funcion cuaternion_angulo_entre(a, b, unidad) {
+    sea c = cuaternion_punto(a, b) / (cuaternion_largo(a) * cuaternion_largo(b))
+    retornar _cq_deg(_cq_acos(maximo(-1, minimo(1, c))), unidad)
+}
+
+// ══ Cuaterniones [w, x, y, z] ══════════════════════════════════════════════
+
+funcion cuaternion_identidad() { retornar [1, 0, 0, 0] }
+
+funcion cuaternion_normalizar(q) {
+    sea n = raiz(q[0] * q[0] + q[1] * q[1] + q[2] * q[2] + q[3] * q[3])
+    si (n == 0) { lanzar "cuaternion: cuaternión nulo" }
+    retornar [q[0] / n, q[1] / n, q[2] / n, q[3] / n]
+}
+
+/// Producto de Hamilton a·b (primero se aplica b, después a).
+funcion cuaternion_mul(a, b) {
+    retornar [a[0] * b[0] - a[1] * b[1] - a[2] * b[2] - a[3] * b[3],
+              a[0] * b[1] + a[1] * b[0] + a[2] * b[3] - a[3] * b[2],
+              a[0] * b[2] - a[1] * b[3] + a[2] * b[0] + a[3] * b[1],
+              a[0] * b[3] + a[1] * b[2] - a[2] * b[1] + a[3] * b[0]]
+}
+
+funcion cuaternion_conjugado(q) { retornar [q[0], -q[1], -q[2], -q[3]] }
+
+funcion cuaternion_inverso(q) {
+    sea n = q[0] * q[0] + q[1] * q[1] + q[2] * q[2] + q[3] * q[3]
+    retornar [q[0] / n, -q[1] / n, -q[2] / n, -q[3] / n]
+}
+
+/// Forma canónica: w ≥ 0 (q y −q son la misma rotación).
+funcion cuaternion_canonico(q) {
+    si (q[0] < 0 o (q[0] == 0 y (q[1] < 0 o (q[1] == 0 y (q[2] < 0 o (q[2] == 0 y q[3] < 0)))))) { retornar [-q[0], -q[1], -q[2], -q[3]] }
+    retornar q
+}
+
+funcion cuaternion_eje_angulo(eje, angulo, unidad) {
+    sea e = cuaternion_unitario(eje)
+    sea a = _cq_rad(angulo, unidad) / 2
+    sea s = seno(a)
+    retornar [coseno(a), e[0] * s, e[1] * s, e[2] * s]
+}
+
+/// {"eje", "angulo"} (ángulo en [0, π]).
+funcion cuaternion_a_eje_angulo(q, unidad) {
+    sea c = cuaternion_canonico(cuaternion_normalizar(q))
+    sea s = raiz(c[1] * c[1] + c[2] * c[2] + c[3] * c[3])
+    sea ang = 2 * _cq_atan2(s, c[0])
+    si (s < 1e-15) { retornar {"eje": [1, 0, 0], "angulo": 0} }
+    retornar {"eje": [c[1] / s, c[2] / s, c[3] / s], "angulo": _cq_deg(ang, unidad)}
+}
+
+/// Vector de rotación (eje × ángulo en radianes), como en SciPy.
+funcion cuaternion_desde_vector_rotacion(v) {
+    sea ang = cuaternion_largo(v)
+    si (ang < 1e-15) { retornar [1, 0, 0, 0] }
+    retornar cuaternion_eje_angulo(v, ang, nulo)
+}
+
+funcion cuaternion_a_vector_rotacion(q) {
+    sea ea = cuaternion_a_eje_angulo(q, nulo)
+    retornar cuaternion_escalar(ea["eje"], ea["angulo"])
+}
+
+/// Rota un vector.
+funcion cuaternion_rotar(q, v) {
+    sea u = [q[1], q[2], q[3]]
+    sea t = cuaternion_escalar(cuaternion_cruz(u, v), 2)
+    retornar cuaternion_sumar(cuaternion_sumar(v, cuaternion_escalar(t, q[0])), cuaternion_cruz(u, t))
+}
+
+/// Interpolación esférica (por el camino corto).
+funcion cuaternion_slerp(a, b, t) {
+    sea c = a[0] * b[0] + a[1] * b[1] + a[2] * b[2] + a[3] * b[3]
+    sea bb = b
+    si (c < 0) {
+        c = -c
+        bb = [-b[0], -b[1], -b[2], -b[3]]
+    }
+    si (c > 0.9995) {
+        retornar cuaternion_normalizar([a[0] + (bb[0] - a[0]) * t, a[1] + (bb[1] - a[1]) * t, a[2] + (bb[2] - a[2]) * t, a[3] + (bb[3] - a[3]) * t])
+    }
+    sea th = _cq_acos(c)
+    sea s = seno(th)
+    sea k0 = seno((1 - t) * th) / s
+    sea k1 = seno(t * th) / s
+    retornar [a[0] * k0 + bb[0] * k1, a[1] * k0 + bb[1] * k1, a[2] * k0 + bb[2] * k1, a[3] * k0 + bb[3] * k1]
+}
+
+/// Ángulo de la rotación que lleva a hasta b.
+funcion cuaternion_angulo(a, b, unidad) {
+    sea d = absoluto(a[0] * b[0] + a[1] * b[1] + a[2] * b[2] + a[3] * b[3])
+    retornar _cq_deg(2 * _cq_acos(minimo(1, d)), unidad)
+}
+
+/// Rotación más corta que lleva la dirección a hasta la dirección b.
+funcion cuaternion_entre_vectores(a, b) {
+    sea u = cuaternion_unitario(a)
+    sea v = cuaternion_unitario(b)
+    sea d = cuaternion_punto(u, v)
+    si (d < -0.999999999) {
+        // Opuestos: 180° alrededor de cualquier perpendicular.
+        sea p = cuaternion_cruz([1, 0, 0], u)
+        si (cuaternion_largo(p) < 1e-6) { p = cuaternion_cruz([0, 1, 0], u) }
+        retornar cuaternion_eje_angulo(p, _CQ_PI, nulo)
+    }
+    sea c = cuaternion_cruz(u, v)
+    retornar cuaternion_normalizar([1 + d, c[0], c[1], c[2]])
+}
+
+/// Orientación que mira en la dirección dada con el "arriba" indicado
+/// (convención de cámara: mira hacia −Z local).
+funcion cuaternion_mirar(direccion, arriba) {
+    sea f = cuaternion_unitario(direccion)
+    sea s = cuaternion_unitario(cuaternion_cruz(f, arriba ?? [0, 1, 0]))
+    sea u = cuaternion_cruz(s, f)
+    // Columnas: s, u, −f.
+    retornar cuaternion_desde_matriz([[s[0], u[0], -f[0]], [s[1], u[1], -f[1]], [s[2], u[2], -f[2]]])
+}
+
+// ── Matrices 3×3 ──────────────────────────────────────────────────────────
+
+funcion cuaternion_a_matriz(q) {
+    sea n = cuaternion_normalizar(q)
+    sea w = n[0]
+    sea x = n[1]
+    sea yy = n[2]
+    sea z = n[3]
+    retornar [[1 - 2 * (yy * yy + z * z), 2 * (x * yy - z * w), 2 * (x * z + yy * w)],
+              [2 * (x * yy + z * w), 1 - 2 * (x * x + z * z), 2 * (yy * z - x * w)],
+              [2 * (x * z - yy * w), 2 * (yy * z + x * w), 1 - 2 * (x * x + yy * yy)]]
+}
+
+/// Desde una matriz de rotación 3×3 (método de Shepperd, estable).
+funcion cuaternion_desde_matriz(m) {
+    sea tr = m[0][0] + m[1][1] + m[2][2]
+    sea q = nulo
+    si (tr > m[0][0] y tr > m[1][1] y tr > m[2][2]) {
+        sea s = raiz(tr + 1) * 2
+        q = [0.25 * s, (m[2][1] - m[1][2]) / s, (m[0][2] - m[2][0]) / s, (m[1][0] - m[0][1]) / s]
+    } sino {
+        si (m[0][0] > m[1][1] y m[0][0] > m[2][2]) {
+            sea s = raiz(1 + m[0][0] - m[1][1] - m[2][2]) * 2
+            q = [(m[2][1] - m[1][2]) / s, 0.25 * s, (m[0][1] + m[1][0]) / s, (m[0][2] + m[2][0]) / s]
+        } sino {
+            si (m[1][1] > m[2][2]) {
+                sea s = raiz(1 + m[1][1] - m[0][0] - m[2][2]) * 2
+                q = [(m[0][2] - m[2][0]) / s, (m[0][1] + m[1][0]) / s, 0.25 * s, (m[1][2] + m[2][1]) / s]
+            } sino {
+                sea s = raiz(1 + m[2][2] - m[0][0] - m[1][1]) * 2
+                q = [(m[1][0] - m[0][1]) / s, (m[0][2] + m[2][0]) / s, (m[1][2] + m[2][1]) / s, 0.25 * s]
+            }
+        }
+    }
+    retornar cuaternion_canonico(cuaternion_normalizar(q))
+}
+
+// ── Euler ─────────────────────────────────────────────────────────────────
+
+funcion _cq_eje(c) {
+    sea l = texto_minusculas(c)
+    si (l == "x") { retornar 0 }
+    si (l == "y") { retornar 1 }
+    si (l == "z") { retornar 2 }
+    lanzar "cuaternion: eje inválido " + c
+}
+
+funcion _cq_basico(eje, a) {
+    sea v = [0, 0, 0]
+    v[eje] = 1
+    retornar cuaternion_eje_angulo(v, a, nulo)
+}
+
+funcion _cq_orden(secuencia) {
+    si (longitud(secuencia) != 3) { lanzar "cuaternion: la secuencia de Euler tiene 3 ejes" }
+    sea intr = subcadena(secuencia, 0, 1) == texto_mayusculas(subcadena(secuencia, 0, 1))
+    sea ejes = [_cq_eje(subcadena(secuencia, 0, 1)), _cq_eje(subcadena(secuencia, 1, 2)), _cq_eje(subcadena(secuencia, 2, 3))]
+    si (ejes[0] == ejes[1] o ejes[1] == ejes[2]) { lanzar "cuaternion: ejes consecutivos iguales en " + secuencia }
+    retornar [ejes, intr]
+}
+
+/// Desde ángulos de Euler [a, b, c] en la secuencia dada: minúsculas =
+/// ejes fijos (extrínseca), mayúsculas = ejes que giran (intrínseca).
+funcion cuaternion_desde_euler(angulos, secuencia, unidad) {
+    sea o = _cq_orden(secuencia ?? "xyz")
+    sea q = [1, 0, 0, 0]
+    sea i = 0
+    mientras (i < 3) {
+        sea r = _cq_basico(o[0][i], _cq_rad(angulos[i], unidad))
+        si (o[1]) { q = cuaternion_mul(q, r) } sino { q = cuaternion_mul(r, q) }
+        i = i + 1
+    }
+    retornar cuaternion_canonico(q)
+}
+
+/// A ángulos de Euler (algoritmo general de Bernardes y Viollet, igual que
+/// SciPy): el segundo ángulo en [0, π] para secuencias propias (zxz) o en
+/// [−π/2, π/2] para Tait-Bryan (xyz). En el bloqueo de cardán el tercer
+/// ángulo vale 0.
+funcion cuaternion_a_euler(q, secuencia, unidad) {
+    sea o = _cq_orden(secuencia ?? "xyz")
+    sea ejes = o[0]
+    sea extr = o[1] == falso
+    si (extr == falso) { ejes = [ejes[2], ejes[1], ejes[0]] }
+    sea i = ejes[0]
+    sea j = ejes[1]
+    sea k = ejes[2]
+    sea simetrica = i == k
+    si (simetrica) { k = 3 - i - j }
+    sea signo = ((i - j) * (j - k) * (k - i)) / 2
+    sea qc = cuaternion_normalizar(q)
+    // qx, qy, qz están en qc[1..3]; qw en qc[0].
+    sea qw = qc[0]
+    sea a = 0
+    sea b = 0
+    sea c = 0
+    sea d = 0
+    si (simetrica) {
+        a = qw
+        b = qc[1 + i]
+        c = qc[1 + j]
+        d = qc[1 + k] * signo
+    } sino {
+        a = qw - qc[1 + j]
+        b = qc[1 + i] + qc[1 + k] * signo
+        c = qc[1 + j] + qw
+        d = qc[1 + k] * signo - qc[1 + i]
+    }
+    sea mas = _cq_atan2(b, a)
+    sea menos = _cq_atan2(d, c)
+    sea ang = [0, 0, 0]
+    ang[1] = 2 * _cq_atan2(raiz(c * c + d * d), raiz(a * a + b * b))
+    sea primero = 0
+    sea tercero = 2
+    si (extr == falso) { primero = 2  tercero = 0 }
+    sea caso1 = absoluto(ang[1]) <= 1e-7
+    sea caso2 = absoluto(ang[1] - _CQ_PI) <= 1e-7
+    si (caso1) { ang[0] = 2 * mas } sino {
+        si (extr) { ang[0] = -2 * menos } sino { ang[0] = 2 * menos }
+    }
+    sea caso0 = caso1 == falso y caso2 == falso
+    si (caso0) { ang[primero] = mas - menos }
+    sea a3 = ang[tercero]
+    si (caso0) { a3 = mas + menos }
+    si (simetrica == falso) {
+        a3 = a3 * signo
+        ang[1] = ang[1] - _CQ_PI / 2
+    }
+    ang[tercero] = a3
+    sea r = []
+    para x en ang {
+        // Igual que SciPy: (x + π) mod 2π − π.
+        sea y2 = x + _CQ_PI
+        y2 = y2 - 2 * _CQ_PI * piso(y2 / (2 * _CQ_PI))
+        r.agregar(_cq_deg(y2 - _CQ_PI, unidad))
+    }
+    retornar r
+}
+
+// ══ Matrices 4×4 (columna-vector: p' = M·p) ═════════════════════════════════
+
+funcion cuaternion_m4_identidad() { retornar [[1, 0, 0, 0], [0, 1, 0, 0], [0, 0, 1, 0], [0, 0, 0, 1]] }
+
+funcion cuaternion_m4_mul(a, b) {
+    sea r = [[0, 0, 0, 0], [0, 0, 0, 0], [0, 0, 0, 0], [0, 0, 0, 0]]
+    sea i = 0
+    mientras (i < 4) {
+        sea j = 0
+        mientras (j < 4) {
+            r[i][j] = a[i][0] * b[0][j] + a[i][1] * b[1][j] + a[i][2] * b[2][j] + a[i][3] * b[3][j]
+            j = j + 1
+        }
+        i = i + 1
+    }
+    retornar r
+}
+
+funcion cuaternion_m4_traslacion(t) { retornar [[1, 0, 0, t[0]], [0, 1, 0, t[1]], [0, 0, 1, t[2]], [0, 0, 0, 1]] }
+funcion cuaternion_m4_escala(s) { retornar [[s[0], 0, 0, 0], [0, s[1], 0, 0], [0, 0, s[2], 0], [0, 0, 0, 1]] }
+
+funcion cuaternion_m4_rotacion(q) {
+    sea m = cuaternion_a_matriz(q)
+    retornar [[m[0][0], m[0][1], m[0][2], 0], [m[1][0], m[1][1], m[1][2], 0], [m[2][0], m[2][1], m[2][2], 0], [0, 0, 0, 1]]
+}
+
+/// Traslación · Rotación · Escala.
+funcion cuaternion_m4_trs(t, q, s) {
+    sea m = cuaternion_a_matriz(q)
+    sea e = s ?? [1, 1, 1]
+    retornar [[m[0][0] * e[0], m[0][1] * e[1], m[0][2] * e[2], t[0]], [m[1][0] * e[0], m[1][1] * e[1], m[1][2] * e[2], t[1]], [m[2][0] * e[0], m[2][1] * e[1], m[2][2] * e[2], t[2]], [0, 0, 0, 1]]
+}
+
+/// Separa una matriz afín en {"traslacion", "rotacion", "escala"}.
+funcion cuaternion_m4_descomponer(m) {
+    sea t = [m[0][3], m[1][3], m[2][3]]
+    sea sx = cuaternion_largo([m[0][0], m[1][0], m[2][0]])
+    sea sy = cuaternion_largo([m[0][1], m[1][1], m[2][1]])
+    sea sz = cuaternion_largo([m[0][2], m[1][2], m[2][2]])
+    // Determinante negativo: reflejo en x.
+    sea det = m[0][0] * (m[1][1] * m[2][2] - m[1][2] * m[2][1]) - m[0][1] * (m[1][0] * m[2][2] - m[1][2] * m[2][0]) + m[0][2] * (m[1][0] * m[2][1] - m[1][1] * m[2][0])
+    si (det < 0) { sx = -sx }
+    sea r = [[m[0][0] / sx, m[0][1] / sy, m[0][2] / sz], [m[1][0] / sx, m[1][1] / sy, m[1][2] / sz], [m[2][0] / sx, m[2][1] / sy, m[2][2] / sz]]
+    retornar {"traslacion": t, "rotacion": cuaternion_desde_matriz(r), "escala": [sx, sy, sz]}
+}
+
+/// Perspectiva de OpenGL (fov vertical, profundidad −1…1).
+funcion cuaternion_m4_perspectiva(fov, aspecto, cerca, lejos, unidad) {
+    sea f = 1 / tangente(_cq_rad(fov, unidad) / 2)
+    retornar [[f / aspecto, 0, 0, 0], [0, f, 0, 0], [0, 0, (lejos + cerca) / (cerca - lejos), 2 * lejos * cerca / (cerca - lejos)], [0, 0, -1, 0]]
+}
+
+funcion cuaternion_m4_ortografica(izq, der, abajo, arriba, cerca, lejos) {
+    retornar [[2 / (der - izq), 0, 0, -(der + izq) / (der - izq)], [0, 2 / (arriba - abajo), 0, -(arriba + abajo) / (arriba - abajo)], [0, 0, -2 / (lejos - cerca), -(lejos + cerca) / (lejos - cerca)], [0, 0, 0, 1]]
+}
+
+/// Matriz de vista (gluLookAt).
+funcion cuaternion_m4_mirar(ojo, objetivo, arriba) {
+    sea f = cuaternion_unitario(cuaternion_restar(objetivo, ojo))
+    sea s = cuaternion_unitario(cuaternion_cruz(f, arriba ?? [0, 1, 0]))
+    sea u = cuaternion_cruz(s, f)
+    retornar [[s[0], s[1], s[2], -cuaternion_punto(s, ojo)], [u[0], u[1], u[2], -cuaternion_punto(u, ojo)], [-f[0], -f[1], -f[2], cuaternion_punto(f, ojo)], [0, 0, 0, 1]]
+}
+
+/// Inversa general de una 4×4 (cofactores).
+funcion cuaternion_m4_inversa(m) {
+    sea a = []
+    para f en m { para x en f { a.agregar(x) } }
+    sea inv = [0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0]
+    inv[0] = a[5] * a[10] * a[15] - a[5] * a[11] * a[14] - a[9] * a[6] * a[15] + a[9] * a[7] * a[14] + a[13] * a[6] * a[11] - a[13] * a[7] * a[10]
+    inv[4] = -a[4] * a[10] * a[15] + a[4] * a[11] * a[14] + a[8] * a[6] * a[15] - a[8] * a[7] * a[14] - a[12] * a[6] * a[11] + a[12] * a[7] * a[10]
+    inv[8] = a[4] * a[9] * a[15] - a[4] * a[11] * a[13] - a[8] * a[5] * a[15] + a[8] * a[7] * a[13] + a[12] * a[5] * a[11] - a[12] * a[7] * a[9]
+    inv[12] = -a[4] * a[9] * a[14] + a[4] * a[10] * a[13] + a[8] * a[5] * a[14] - a[8] * a[6] * a[13] - a[12] * a[5] * a[10] + a[12] * a[6] * a[9]
+    inv[1] = -a[1] * a[10] * a[15] + a[1] * a[11] * a[14] + a[9] * a[2] * a[15] - a[9] * a[3] * a[14] - a[13] * a[2] * a[11] + a[13] * a[3] * a[10]
+    inv[5] = a[0] * a[10] * a[15] - a[0] * a[11] * a[14] - a[8] * a[2] * a[15] + a[8] * a[3] * a[14] + a[12] * a[2] * a[11] - a[12] * a[3] * a[10]
+    inv[9] = -a[0] * a[9] * a[15] + a[0] * a[11] * a[13] + a[8] * a[1] * a[15] - a[8] * a[3] * a[13] - a[12] * a[1] * a[11] + a[12] * a[3] * a[9]
+    inv[13] = a[0] * a[9] * a[14] - a[0] * a[10] * a[13] - a[8] * a[1] * a[14] + a[8] * a[2] * a[13] + a[12] * a[1] * a[10] - a[12] * a[2] * a[9]
+    inv[2] = a[1] * a[6] * a[15] - a[1] * a[7] * a[14] - a[5] * a[2] * a[15] + a[5] * a[3] * a[14] + a[13] * a[2] * a[7] - a[13] * a[3] * a[6]
+    inv[6] = -a[0] * a[6] * a[15] + a[0] * a[7] * a[14] + a[4] * a[2] * a[15] - a[4] * a[3] * a[14] - a[12] * a[2] * a[7] + a[12] * a[3] * a[6]
+    inv[10] = a[0] * a[5] * a[15] - a[0] * a[7] * a[13] - a[4] * a[1] * a[15] + a[4] * a[3] * a[13] + a[12] * a[1] * a[7] - a[12] * a[3] * a[5]
+    inv[14] = -a[0] * a[5] * a[14] + a[0] * a[6] * a[13] + a[4] * a[1] * a[14] - a[4] * a[2] * a[13] - a[12] * a[1] * a[6] + a[12] * a[2] * a[5]
+    inv[3] = -a[1] * a[6] * a[11] + a[1] * a[7] * a[10] + a[5] * a[2] * a[11] - a[5] * a[3] * a[10] - a[9] * a[2] * a[7] + a[9] * a[3] * a[6]
+    inv[7] = a[0] * a[6] * a[11] - a[0] * a[7] * a[10] - a[4] * a[2] * a[11] + a[4] * a[3] * a[10] + a[8] * a[2] * a[7] - a[8] * a[3] * a[6]
+    inv[11] = -a[0] * a[5] * a[11] + a[0] * a[7] * a[9] + a[4] * a[1] * a[11] - a[4] * a[3] * a[9] - a[8] * a[1] * a[7] + a[8] * a[3] * a[5]
+    inv[15] = a[0] * a[5] * a[10] - a[0] * a[6] * a[9] - a[4] * a[1] * a[10] + a[4] * a[2] * a[9] + a[8] * a[1] * a[6] - a[8] * a[2] * a[5]
+    sea det = a[0] * inv[0] + a[1] * inv[4] + a[2] * inv[8] + a[3] * inv[12]
+    si (absoluto(det) < 1e-300) { lanzar "cuaternion: matriz no invertible" }
+    sea r = []
+    sea i = 0
+    mientras (i < 4) { r.agregar([inv[i * 4] / det, inv[i * 4 + 1] / det, inv[i * 4 + 2] / det, inv[i * 4 + 3] / det])  i = i + 1 }
+    retornar r
+}
+
+/// Transforma un punto (con división por w).
+funcion cuaternion_m4_punto(m, p) {
+    sea x = m[0][0] * p[0] + m[0][1] * p[1] + m[0][2] * p[2] + m[0][3]
+    sea yy = m[1][0] * p[0] + m[1][1] * p[1] + m[1][2] * p[2] + m[1][3]
+    sea z = m[2][0] * p[0] + m[2][1] * p[1] + m[2][2] * p[2] + m[2][3]
+    sea w = m[3][0] * p[0] + m[3][1] * p[1] + m[3][2] * p[2] + m[3][3]
+    si (w != 1 y w != 0) { retornar [x / w, yy / w, z / w] }
+    retornar [x, yy, z]
+}
+
+/// Transforma una dirección (sin traslación).
+funcion cuaternion_m4_vector(m, v) {
+    retornar [m[0][0] * v[0] + m[0][1] * v[1] + m[0][2] * v[2], m[1][0] * v[0] + m[1][1] * v[1] + m[1][2] * v[2], m[2][0] * v[0] + m[2][1] * v[1] + m[2][2] * v[2]]
+}
+
+/// Matriz para normales: (M⁻¹)ᵀ de la parte 3×3.
+funcion cuaternion_m4_normal(m) {
+    sea inv = cuaternion_m4_inversa(m)
+    retornar [[inv[0][0], inv[1][0], inv[2][0]], [inv[0][1], inv[1][1], inv[2][1]], [inv[0][2], inv[1][2], inv[2][2]]]
+}
+
+/// ¿Casi iguales? (listas anidadas).
+funcion cuaternion_casi_igual(a, b, tol) {
+    sea t = tol ?? 1e-9
+    si (tipo(a) == "lista") {
+        si (longitud(a) != longitud(b)) { retornar falso }
+        sea i = 0
+        mientras (i < longitud(a)) {
+            si (cuaternion_casi_igual(a[i], b[i], t) == falso) { retornar falso }
+            i = i + 1
+        }
+        retornar verdadero
+    }
+    retornar absoluto(a - b) <= t
+}

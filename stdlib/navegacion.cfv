@@ -1,0 +1,615 @@
+// stdlib/navegacion.cfv — búsqueda de caminos para juegos y robótica: A*
+// sobre grillas con costos (4 u 8 direcciones, sin cortar esquinas), Jump
+// Point Search para grillas uniformes, suavizado por línea de visión,
+// mapas de flujo (muchos agentes hacia un mismo destino), y mallas de
+// navegación (NavMesh) de polígonos convexos con A* entre polígonos y el
+// algoritmo del embudo para el camino más corto real. Inspirada en
+// Recast & Detour (zlib). En inglés: importar "navmesh".
+//
+//   importar "navegacion"
+//   sea m = navegacion_grilla(["....#", ".##.#", "....."])
+//   navegacion_astar(m, [0, 0], [4, 2], {"diagonal": verdadero})
+//   // {"camino": [[0,0], …, [4,2]], "costo": 5.83}
+
+importar "grafos"
+
+sea _NV_RAIZ2 = 1.4142135623730951
+
+// ══ Grillas ════════════════════════════════════════════════════════════════
+
+/// Grilla desde filas de texto ("#" bloqueado, "." libre, dígito 1–9 =
+/// costo) o desde una lista de listas de costos (0 = bloqueado).
+funcion navegacion_grilla(filas) {
+    sea alto = longitud(filas)
+    sea ancho = 0
+    sea celdas = []
+    para f en filas {
+        sea fila = []
+        si (tipo(f) == "texto") {
+            sea i = 0
+            mientras (i < longitud(f)) {
+                sea c = subcadena(f, i, i + 1)
+                si (c == "#" o c == "X" o c == "x") { fila.agregar(0) } sino {
+                    si (texto_indice("123456789", c) >= 0) { fila.agregar(a_numero(c)) } sino { fila.agregar(1) }
+                }
+                i = i + 1
+            }
+        } sino { para v en f { fila.agregar(v) } }
+        ancho = maximo(ancho, longitud(fila))
+        celdas.agregar(fila)
+    }
+    para fila en celdas { mientras (longitud(fila) < ancho) { fila.agregar(0) } }
+    retornar {"ancho": ancho, "alto": alto, "c": celdas}
+}
+
+funcion navegacion_libre(m, x, fy) {
+    retornar x >= 0 y fy >= 0 y x < m["ancho"] y fy < m["alto"] y m["c"][fy][x] > 0
+}
+
+funcion navegacion_fijar(m, x, fy, costo) { m["c"][fy][x] = costo }
+
+funcion _nv_vecinos(m, x, fy, diagonal) {
+    sea r = []
+    para d en [[1, 0], [-1, 0], [0, 1], [0, -1]] {
+        si (navegacion_libre(m, x + d[0], fy + d[1])) { r.agregar([x + d[0], fy + d[1], m["c"][fy + d[1]][x + d[0]]]) }
+    }
+    si (diagonal) {
+        para d en [[1, 1], [1, -1], [-1, 1], [-1, -1]] {
+            // Sin cortar esquinas: ambos lados deben estar libres.
+            si (navegacion_libre(m, x + d[0], fy + d[1]) y navegacion_libre(m, x + d[0], fy) y navegacion_libre(m, x, fy + d[1])) {
+                r.agregar([x + d[0], fy + d[1], m["c"][fy + d[1]][x + d[0]] * _NV_RAIZ2])
+            }
+        }
+    }
+    retornar r
+}
+
+funcion _nv_h(a, b, diagonal) {
+    sea dx = absoluto(a[0] - b[0])
+    sea dy = absoluto(a[1] - b[1])
+    si (diagonal) { retornar maximo(dx, dy) + (_NV_RAIZ2 - 1) * minimo(dx, dy) }
+    retornar dx + dy
+}
+
+funcion _nv_clave(x, fy) { retornar x + "," + fy }
+
+// Montículo simple (prioridad, desempate, valor).
+funcion _nv_mont() { retornar {"h": [], "n": 0} }
+funcion _nv_menor(a, b) {
+    si (a[0] != b[0]) { retornar a[0] < b[0] }
+    retornar a[1] < b[1]
+}
+funcion _nv_meter(m, p, v) {
+    m["n"] = m["n"] + 1
+    sea h = m["h"]
+    h.agregar([p, m["n"], v])
+    sea i = longitud(h) - 1
+    mientras (i > 0) {
+        sea q = cociente(i - 1, 2)
+        si (_nv_menor(h[i], h[q])) {
+            sea t = h[i]
+            h[i] = h[q]
+            h[q] = t
+            i = q
+        } sino { romper }
+    }
+}
+funcion _nv_sacar(m) {
+    sea h = m["h"]
+    sea r = h[0]
+    sea u = quitar_ultimo(h)
+    si (longitud(h) > 0) {
+        h[0] = u
+        sea i = 0
+        mientras (verdadero) {
+            sea a = 2 * i + 1
+            sea b = a + 1
+            sea k = i
+            si (a < longitud(h) y _nv_menor(h[a], h[k])) { k = a }
+            si (b < longitud(h) y _nv_menor(h[b], h[k])) { k = b }
+            si (k == i) { romper }
+            sea t = h[i]
+            h[i] = h[k]
+            h[k] = t
+            i = k
+        }
+    }
+    retornar r
+}
+
+/// A* en la grilla. opciones: diagonal (falso), peso (1: heurística
+/// inflada, más rápido y menos óptimo), suavizar (falso: quita puntos
+/// intermedios con línea de visión). Devuelve {"camino", "costo",
+/// "explorados"} o nulo si no hay camino.
+funcion navegacion_astar(m, inicio, fin, opciones) {
+    sea o = opciones ?? {}
+    sea diag = o["diagonal"] ?? falso
+    sea w = o["peso"] ?? 1
+    si (navegacion_libre(m, inicio[0], inicio[1]) == falso o navegacion_libre(m, fin[0], fin[1]) == falso) { retornar nulo }
+    sea g = {}
+    sea prev = {}
+    sea cerrado = {}
+    sea ks = _nv_clave(inicio[0], inicio[1])
+    g[ks] = 0
+    sea mon = _nv_mont()
+    _nv_meter(mon, _nv_h(inicio, fin, diag) * w, [inicio[0], inicio[1]])
+    sea explorados = 0
+    mientras (longitud(mon["h"]) > 0) {
+        sea p = _nv_sacar(mon)[2]
+        sea k = _nv_clave(p[0], p[1])
+        si (tiene_clave(cerrado, k) == falso) {
+            cerrado[k] = verdadero
+            explorados = explorados + 1
+            si (p[0] == fin[0] y p[1] == fin[1]) {
+                sea camino = [p]
+                sea x = k
+                mientras (tiene_clave(prev, x)) {
+                    camino.agregar(prev[x][1])
+                    x = prev[x][0]
+                }
+                camino = lista_invertir(camino)
+                si (o["suavizar"] ?? falso) { camino = navegacion_suavizar(m, camino) }
+                retornar {"camino": camino, "costo": redondear(g[k], 6), "explorados": explorados}
+            }
+            para v en _nv_vecinos(m, p[0], p[1], diag) {
+                sea kv = _nv_clave(v[0], v[1])
+                sea ng = g[k] + v[2]
+                si (tiene_clave(g, kv) == falso o ng < g[kv]) {
+                    g[kv] = ng
+                    prev[kv] = [k, p]
+                    _nv_meter(mon, ng + _nv_h([v[0], v[1]], fin, diag) * w, [v[0], v[1]])
+                }
+            }
+        }
+    }
+    retornar nulo
+}
+
+// ── Jump Point Search (grilla uniforme, 8 direcciones sin cortar esquinas) ─
+
+funcion _nv_jps_salto(m, x, fy, dx, dy, fin) {
+    // Avanza en (dx, dy) hasta un punto de salto, la meta o un muro.
+    mientras (verdadero) {
+        sea nx = x + dx
+        sea ny = fy + dy
+        si (navegacion_libre(m, nx, ny) == falso) { retornar nulo }
+        si (dx != 0 y dy != 0 y (navegacion_libre(m, x + dx, fy) == falso o navegacion_libre(m, x, fy + dy) == falso)) { retornar nulo }
+        x = nx
+        fy = ny
+        si (x == fin[0] y fy == fin[1]) { retornar [x, fy] }
+        si (dx != 0 y dy != 0) {
+            si (_nv_jps_salto(m, x, fy, dx, 0, fin) != nulo o _nv_jps_salto(m, x, fy, 0, dy, fin) != nulo) { retornar [x, fy] }
+        } sino {
+            si (dx != 0) {
+                // Vecino forzado: un muro detrás en diagonal que se abre adelante.
+                si ((navegacion_libre(m, x, fy + 1) y navegacion_libre(m, x - dx, fy + 1) == falso) o (navegacion_libre(m, x, fy - 1) y navegacion_libre(m, x - dx, fy - 1) == falso)) { retornar [x, fy] }
+            } sino {
+                si ((navegacion_libre(m, x + 1, fy) y navegacion_libre(m, x + 1, fy - dy) == falso) o (navegacion_libre(m, x - 1, fy) y navegacion_libre(m, x - 1, fy - dy) == falso)) { retornar [x, fy] }
+            }
+        }
+    }
+}
+
+funcion _nv_signo(v) {
+    si (v > 0) { retornar 1 }
+    si (v < 0) { retornar -1 }
+    retornar 0
+}
+
+/// Jump Point Search: mismo resultado óptimo que A* con diagonal en grillas
+/// de costo uniforme, explorando muchos menos nodos. Devuelve los puntos de
+/// salto (o el camino completo celda a celda con {"completo": verdadero}).
+funcion navegacion_jps(m, inicio, fin, opciones) {
+    sea o = opciones ?? {}
+    si (navegacion_libre(m, inicio[0], inicio[1]) == falso o navegacion_libre(m, fin[0], fin[1]) == falso) { retornar nulo }
+    sea g = {}
+    sea prev = {}
+    sea cerrado = {}
+    sea ks = _nv_clave(inicio[0], inicio[1])
+    g[ks] = 0
+    sea mon = _nv_mont()
+    _nv_meter(mon, _nv_h(inicio, fin, verdadero), [inicio[0], inicio[1], nulo])
+    sea explorados = 0
+    mientras (longitud(mon["h"]) > 0) {
+        sea p = _nv_sacar(mon)[2]
+        sea k = _nv_clave(p[0], p[1])
+        si (tiene_clave(cerrado, k) == falso) {
+            cerrado[k] = verdadero
+            explorados = explorados + 1
+            si (p[0] == fin[0] y p[1] == fin[1]) {
+                sea camino = [[p[0], p[1]]]
+                sea x = k
+                mientras (tiene_clave(prev, x)) {
+                    camino.agregar(prev[x][1])
+                    x = prev[x][0]
+                }
+                camino = lista_invertir(camino)
+                si (o["completo"] ?? falso) { camino = _nv_expandir(camino) }
+                retornar {"camino": camino, "costo": redondear(g[k], 6), "explorados": explorados}
+            }
+            // Direcciones a explorar (podadas según de dónde se llegó).
+            sea dirs = []
+            si (tiene_clave(prev, k) == falso) {
+                para d en [[1, 0], [-1, 0], [0, 1], [0, -1], [1, 1], [1, -1], [-1, 1], [-1, -1]] { dirs.agregar(d) }
+            } sino {
+                sea pp = prev[k][1]
+                sea dx = _nv_signo(p[0] - pp[0])
+                sea dy = _nv_signo(p[1] - pp[1])
+                si (dx != 0 y dy != 0) {
+                    dirs.agregar([dx, 0])
+                    dirs.agregar([0, dy])
+                    dirs.agregar([dx, dy])
+                } sino {
+                    si (dx != 0) {
+                        dirs.agregar([dx, 0])
+                        para s en [1, -1] {
+                            si (navegacion_libre(m, p[0], p[1] + s) y navegacion_libre(m, p[0] - dx, p[1] + s) == falso) {
+                                dirs.agregar([0, s])
+                                dirs.agregar([dx, s])
+                            }
+                        }
+                    } sino {
+                        dirs.agregar([0, dy])
+                        para s en [1, -1] {
+                            si (navegacion_libre(m, p[0] + s, p[1]) y navegacion_libre(m, p[0] + s, p[1] - dy) == falso) {
+                                dirs.agregar([s, 0])
+                                dirs.agregar([s, dy])
+                            }
+                        }
+                    }
+                }
+            }
+            para d en dirs {
+                sea j = _nv_jps_salto(m, p[0], p[1], d[0], d[1], fin)
+                si (j != nulo) {
+                    sea kj = _nv_clave(j[0], j[1])
+                    sea ng = g[k] + _nv_h([p[0], p[1]], j, verdadero)
+                    si (tiene_clave(g, kj) == falso o ng < g[kj] - 1e-9) {
+                        g[kj] = ng
+                        prev[kj] = [k, [p[0], p[1]]]
+                        _nv_meter(mon, ng + _nv_h(j, fin, verdadero), [j[0], j[1]])
+                    }
+                }
+            }
+        }
+    }
+    retornar nulo
+}
+
+funcion _nv_expandir(puntos) {
+    si (longitud(puntos) == 0) { retornar [] }
+    sea r = [puntos[0]]
+    sea i = 1
+    mientras (i < longitud(puntos)) {
+        sea a = r[longitud(r) - 1]
+        sea b = puntos[i]
+        sea dx = _nv_signo(b[0] - a[0])
+        sea dy = _nv_signo(b[1] - a[1])
+        sea x = a[0]
+        sea fy = a[1]
+        mientras (x != b[0] o fy != b[1]) {
+            x = x + dx
+            fy = fy + dy
+            si (x == b[0]) { dx = 0 }
+            si (fy == b[1]) { dy = 0 }
+            r.agregar([x, fy])
+        }
+        i = i + 1
+    }
+    retornar r
+}
+
+/// ¿Hay línea de visión entre dos celdas? (recorrido de celdas tipo
+/// Bresenham "supercobertura": no atraviesa esquinas bloqueadas).
+funcion navegacion_vision(m, a, b) {
+    sea x0 = a[0]
+    sea y0 = a[1]
+    sea dx = absoluto(b[0] - x0)
+    sea dy = absoluto(b[1] - y0)
+    sea sx = _nv_signo(b[0] - x0)
+    sea sy = _nv_signo(b[1] - y0)
+    sea x = x0
+    sea fy = y0
+    sea n = 1 + dx + dy
+    sea err = dx - dy
+    dx = dx * 2
+    dy = dy * 2
+    mientras (n > 0) {
+        si (navegacion_libre(m, x, fy) == falso) { retornar falso }
+        si (x == b[0] y fy == b[1]) { retornar verdadero }
+        si (err > 0) { x = x + sx  err = err - dy } sino {
+            si (err < 0) { fy = fy + sy  err = err + dx } sino {
+                // Pasa justo por una esquina: ambas celdas deben estar libres.
+                si (navegacion_libre(m, x + sx, fy) == falso o navegacion_libre(m, x, fy + sy) == falso) { retornar falso }
+                x = x + sx
+                fy = fy + sy
+                err = err - dy + dx
+                n = n - 1
+            }
+        }
+        n = n - 1
+    }
+    retornar verdadero
+}
+
+/// Quita puntos intermedios mientras haya línea de visión.
+funcion navegacion_suavizar(m, camino) {
+    si (longitud(camino) <= 2) { retornar camino }
+    sea r = [camino[0]]
+    sea i = 0
+    mientras (i < longitud(camino) - 1) {
+        sea j = longitud(camino) - 1
+        mientras (j > i + 1 y navegacion_vision(m, camino[i], camino[j]) == falso) { j = j - 1 }
+        r.agregar(camino[j])
+        i = j
+    }
+    retornar r
+}
+
+/// Largo euclidiano de un camino de puntos.
+funcion navegacion_largo(camino) {
+    sea t = 0
+    sea i = 1
+    mientras (i < longitud(camino)) {
+        sea dx = camino[i][0] - camino[i - 1][0]
+        sea dy = camino[i][1] - camino[i - 1][1]
+        t = t + raiz(dx * dx + dy * dy)
+        i = i + 1
+    }
+    retornar t
+}
+
+/// Mapa de flujo hacia una meta (Dijkstra inverso): {"distancia":
+/// [[d o -1]], "direccion": [[[dx, dy] o nulo]]}. Cada agente sólo sigue la
+/// dirección de su celda.
+funcion navegacion_flujo(m, meta, opciones) {
+    sea o = opciones ?? {}
+    sea diag = o["diagonal"] ?? verdadero
+    sea dist = []
+    sea dir = []
+    sea fy = 0
+    mientras (fy < m["alto"]) {
+        sea fd = []
+        sea fr = []
+        sea x = 0
+        mientras (x < m["ancho"]) { fd.agregar(-1)  fr.agregar(nulo)  x = x + 1 }
+        dist.agregar(fd)
+        dir.agregar(fr)
+        fy = fy + 1
+    }
+    si (navegacion_libre(m, meta[0], meta[1]) == falso) { retornar {"distancia": dist, "direccion": dir} }
+    dist[meta[1]][meta[0]] = 0
+    sea mon = _nv_mont()
+    _nv_meter(mon, 0, meta)
+    mientras (longitud(mon["h"]) > 0) {
+        sea e = _nv_sacar(mon)
+        sea p = e[2]
+        si (e[0] <= dist[p[1]][p[0]] + 1e-9) {
+            para v en _nv_vecinos(m, p[0], p[1], diag) {
+                // Costo de entrar a p desde v.
+                sea paso = m["c"][p[1]][p[0]]
+                si (v[0] != p[0] y v[1] != p[1]) { paso = paso * _NV_RAIZ2 }
+                sea nd = dist[p[1]][p[0]] + paso
+                si (dist[v[1]][v[0]] < 0 o nd < dist[v[1]][v[0]] - 1e-9) {
+                    dist[v[1]][v[0]] = nd
+                    dir[v[1]][v[0]] = [p[0] - v[0], p[1] - v[1]]
+                    _nv_meter(mon, nd, [v[0], v[1]])
+                }
+            }
+        }
+    }
+    retornar {"distancia": dist, "direccion": dir}
+}
+
+/// Sigue un mapa de flujo desde una celda hasta la meta.
+funcion navegacion_seguir_flujo(f, desde) {
+    sea r = [desde]
+    sea p = desde
+    sea pasos = 0
+    mientras (f["direccion"][p[1]][p[0]] != nulo y pasos < 100000) {
+        sea d = f["direccion"][p[1]][p[0]]
+        p = [p[0] + d[0], p[1] + d[1]]
+        r.agregar(p)
+        pasos = pasos + 1
+    }
+    si (f["distancia"][p[1]][p[0]] != 0) { retornar nulo }
+    retornar r
+}
+
+// ══ NavMesh ════════════════════════════════════════════════════════════════
+
+/// Malla de navegación: vertices [[x, fy]], poligonos [[i, j, k, …]] convexos
+/// en sentido antihorario. Calcula vecinos por aristas compartidas.
+funcion navegacion_malla(vertices, poligonos) {
+    sea aristas = {}
+    sea vecinos = []
+    sea centros = []
+    sea pi = 0
+    mientras (pi < longitud(poligonos)) {
+        sea p = poligonos[pi]
+        vecinos.agregar([])
+        sea cx = 0
+        sea cy = 0
+        para i en p { cx = cx + vertices[i][0]  cy = cy + vertices[i][1] }
+        centros.agregar([cx / longitud(p), cy / longitud(p)])
+        sea k = 0
+        mientras (k < longitud(p)) {
+            sea a = p[k]
+            sea b = p[(k + 1) % longitud(p)]
+            sea clave = minimo(a, b) + "-" + maximo(a, b)
+            si (tiene_clave(aristas, clave)) {
+                sea otro = aristas[clave]
+                vecinos[pi].agregar({"poligono": otro[0], "a": a, "b": b})
+                vecinos[otro[0]].agregar({"poligono": pi, "a": otro[1], "b": otro[2]})
+            } sino { aristas[clave] = [pi, a, b] }
+            k = k + 1
+        }
+        pi = pi + 1
+    }
+    retornar {"v": vertices, "p": poligonos, "vecinos": vecinos, "centros": centros}
+}
+
+funcion _nv_cruz(o, a, b) { retornar (a[0] - o[0]) * (b[1] - o[1]) - (a[1] - o[1]) * (b[0] - o[0]) }
+
+/// Índice del polígono que contiene el punto, o -1.
+funcion navegacion_poligono_en(nm, punto) {
+    sea i = 0
+    mientras (i < longitud(nm["p"])) {
+        sea p = nm["p"][i]
+        sea dentro = verdadero
+        sea k = 0
+        mientras (k < longitud(p) y dentro) {
+            si (_nv_cruz(nm["v"][p[k]], nm["v"][p[(k + 1) % longitud(p)]], punto) < -1e-9) { dentro = falso }
+            k = k + 1
+        }
+        si (dentro) { retornar i }
+        i = i + 1
+    }
+    retornar -1
+}
+
+funcion _nv_dist(a, b) { retornar raiz((a[0] - b[0]) * (a[0] - b[0]) + (a[1] - b[1]) * (a[1] - b[1])) }
+
+/// Camino más corto entre dos puntos sobre la malla: A* entre polígonos
+/// (por los puntos medios de los portales) y luego el algoritmo del embudo.
+/// Devuelve {"camino": [[x, fy]], "largo", "poligonos": [índices]} o nulo.
+funcion navegacion_malla_camino(nm, desde, hasta) {
+    sea a = navegacion_poligono_en(nm, desde)
+    sea b = navegacion_poligono_en(nm, hasta)
+    si (a < 0 o b < 0) { retornar nulo }
+    sea corredor = [a]
+    si (a != b) {
+        // Grafo: nodos = polígonos, aristas por portal con el largo entre
+        // centros de los portales.
+        sea g = grafos_nuevo(falso)
+        sea medios = {}
+        sea i = 0
+        mientras (i < longitud(nm["p"])) {
+            grafos_nodo(g, i, nulo)
+            para v en nm["vecinos"][i] {
+                si (v["poligono"] > i) {
+                    sea m = [(nm["v"][v["a"]][0] + nm["v"][v["b"]][0]) / 2, (nm["v"][v["a"]][1] + nm["v"][v["b"]][1]) / 2]
+                    grafos_arista(g, i, v["poligono"], _nv_dist(nm["centros"][i], m) + _nv_dist(m, nm["centros"][v["poligono"]]), nulo)
+                }
+            }
+            i = i + 1
+        }
+        sea r = grafos_astar(g, a, b, funcion(n) { retornar _nv_dist(nm["centros"][a_numero(n)], hasta) * 0 })
+        si (r == nulo) { retornar nulo }
+        corredor = []
+        para x en r["camino"] { corredor.agregar(a_numero(x)) }
+    }
+    // Portales (izquierda, derecha) en el sentido de avance.
+    sea portales = [[desde, desde]]
+    sea i2 = 0
+    mientras (i2 < longitud(corredor) - 1) {
+        para v en nm["vecinos"][corredor[i2]] {
+            si (v["poligono"] == corredor[i2 + 1]) {
+                // En un polígono antihorario la arista a→b deja el interior
+                // a la izquierda: viendo hacia afuera, b queda a la izquierda.
+                portales.agregar([nm["v"][v["b"]], nm["v"][v["a"]]])
+            }
+        }
+        i2 = i2 + 1
+    }
+    portales.agregar([hasta, hasta])
+    sea camino = navegacion_embudo(portales)
+    retornar {"camino": camino, "largo": navegacion_largo(camino), "poligonos": corredor}
+}
+
+/// Algoritmo del embudo ("simple stupid funnel"): portales [[izq, der]]
+/// desde el inicio ([p, p]) hasta el final ([q, q]).
+funcion navegacion_embudo(portales) {
+    sea camino = [portales[0][0]]
+    sea apice = portales[0][0]
+    sea izq = portales[0][0]
+    sea der = portales[0][1]
+    sea ia = 0
+    sea il = 0
+    sea ir = 0
+    sea i = 1
+    mientras (i < longitud(portales)) {
+        sea l = portales[i][0]
+        sea r = portales[i][1]
+        // Lado derecho.
+        si (_nv_cruz(apice, der, r) >= 0) {
+            si ((apice[0] == der[0] y apice[1] == der[1]) o _nv_cruz(apice, izq, r) < 0) {
+                der = r
+                ir = i
+            } sino {
+                // Cruza la izquierda: la izquierda es un nuevo ápice.
+                camino.agregar(izq)
+                apice = izq
+                ia = il
+                izq = apice
+                der = apice
+                il = ia
+                ir = ia
+                i = ia + 1
+                continuar
+            }
+        }
+        // Lado izquierdo.
+        si (_nv_cruz(apice, izq, l) <= 0) {
+            si ((apice[0] == izq[0] y apice[1] == izq[1]) o _nv_cruz(apice, der, l) > 0) {
+                izq = l
+                il = i
+            } sino {
+                camino.agregar(der)
+                apice = der
+                ia = ir
+                izq = apice
+                der = apice
+                il = ia
+                ir = ia
+                i = ia + 1
+                continuar
+            }
+        }
+        i = i + 1
+    }
+    sea fin = portales[longitud(portales) - 1][0]
+    sea ult = camino[longitud(camino) - 1]
+    si (ult[0] != fin[0] o ult[1] != fin[1]) { camino.agregar(fin) }
+    retornar camino
+}
+
+/// Triangula un polígono simple (lista de puntos antihoraria) por recorte
+/// de orejas y devuelve una malla de navegación lista para usar.
+funcion navegacion_malla_desde_poligono(puntos) {
+    sea idx = []
+    sea i = 0
+    mientras (i < longitud(puntos)) { idx.agregar(i)  i = i + 1 }
+    sea tris = []
+    sea guarda = 0
+    mientras (longitud(idx) > 3 y guarda < 10000) {
+        sea n = longitud(idx)
+        sea hecho = falso
+        sea k = 0
+        mientras (k < n y hecho == falso) {
+            sea a = idx[(k + n - 1) % n]
+            sea b = idx[k]
+            sea c = idx[(k + 1) % n]
+            si (_nv_cruz(puntos[a], puntos[b], puntos[c]) > 1e-12) {
+                sea oreja = verdadero
+                para j en idx {
+                    si (j != a y j != b y j != c) {
+                        si (_nv_cruz(puntos[a], puntos[b], puntos[j]) >= 0 y _nv_cruz(puntos[b], puntos[c], puntos[j]) >= 0 y _nv_cruz(puntos[c], puntos[a], puntos[j]) >= 0) { oreja = falso }
+                    }
+                }
+                si (oreja) {
+                    tris.agregar([a, b, c])
+                    sea nuevo = []
+                    para j en idx { si (j != b) { nuevo.agregar(j) } }
+                    idx = nuevo
+                    hecho = verdadero
+                }
+            }
+            k = k + 1
+        }
+        si (hecho == falso) { lanzar "navegacion: el polígono no es simple o no está en sentido antihorario" }
+        guarda = guarda + 1
+    }
+    si (longitud(idx) == 3) { tris.agregar([idx[0], idx[1], idx[2]]) }
+    retornar navegacion_malla(puntos, tris)
+}

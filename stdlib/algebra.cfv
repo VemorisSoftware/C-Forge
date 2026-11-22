@@ -1,0 +1,884 @@
+// stdlib/algebra.cfv — álgebra lineal densa al estilo Eigen: matrices
+// como listas de filas, producto, LU con pivoteo (resolver, determinante,
+// inversa), QR de Householder, Cholesky, LDLᵀ, valores y vectores propios
+// (simétricos con Jacobi; generales con QR de Hessenberg, también complejos),
+// SVD, mínimos cuadrados, pseudoinversa, rango, núcleo, normas, número de
+// condición y exponencial de matrices. Resultados comparados con NumPy.
+// Inspirada en Eigen (MPL2: sólo la idea, sin copiar código).
+// En inglés: importar "linalg".
+//
+//   importar "algebra"
+//   sea a = [[4, 1], [2, 3]]
+//   algebra_resolver(a, [1, 2])          // x tal que a·x = b
+//   algebra_propios_simetrica([[2, 1], [1, 2]])["valores"]   // [1, 3]
+//   algebra_svd(a)["s"]                   // valores singulares
+
+// ══ Básico ═════════════════════════════════════════════════════════════════
+
+funcion algebra_ceros(f, c) {
+    sea m = []
+    sea i = 0
+    mientras (i < f) {
+        sea fila = []
+        sea j = 0
+        mientras (j < c) { fila.agregar(0)  j = j + 1 }
+        m.agregar(fila)
+        i = i + 1
+    }
+    retornar m
+}
+
+funcion algebra_identidad(n) {
+    sea m = algebra_ceros(n, n)
+    sea i = 0
+    mientras (i < n) { m[i][i] = 1  i = i + 1 }
+    retornar m
+}
+
+funcion algebra_diagonal(v) {
+    sea m = algebra_ceros(longitud(v), longitud(v))
+    sea i = 0
+    mientras (i < longitud(v)) { m[i][i] = v[i]  i = i + 1 }
+    retornar m
+}
+
+funcion algebra_copia(a) {
+    sea r = []
+    para f en a {
+        sea fila = []
+        para x en f { fila.agregar(x) }
+        r.agregar(fila)
+    }
+    retornar r
+}
+
+funcion algebra_filas(a) { retornar longitud(a) }
+funcion algebra_columnas(a) {
+    si (longitud(a) == 0) { retornar 0 }
+    retornar longitud(a[0])
+}
+
+funcion algebra_transpuesta(a) {
+    sea f = algebra_filas(a)
+    sea c = algebra_columnas(a)
+    sea r = algebra_ceros(c, f)
+    sea i = 0
+    mientras (i < f) {
+        sea j = 0
+        mientras (j < c) { r[j][i] = a[i][j]  j = j + 1 }
+        i = i + 1
+    }
+    retornar r
+}
+
+/// Producto de matrices; si b es un vector (lista de números) da un vector.
+funcion algebra_mul(a, b) {
+    si (longitud(b) > 0 y tipo(b[0]) != "lista") {
+        sea r = []
+        para fila en a {
+            sea s = 0
+            sea k = 0
+            mientras (k < longitud(b)) { s = s + fila[k] * b[k]  k = k + 1 }
+            r.agregar(s)
+        }
+        retornar r
+    }
+    sea n = algebra_filas(a)
+    sea m = algebra_columnas(b)
+    sea p = algebra_columnas(a)
+    si (p != algebra_filas(b)) { lanzar "algebra: dimensiones incompatibles " + n + "x" + p + " · " + algebra_filas(b) + "x" + m }
+    sea r = algebra_ceros(n, m)
+    sea i = 0
+    mientras (i < n) {
+        sea k = 0
+        mientras (k < p) {
+            sea aik = a[i][k]
+            si (aik != 0) {
+                sea bk = b[k]
+                sea j = 0
+                mientras (j < m) { r[i][j] = r[i][j] + aik * bk[j]  j = j + 1 }
+            }
+            k = k + 1
+        }
+        i = i + 1
+    }
+    retornar r
+}
+
+funcion _al_comb(a, b, fa, fb) {
+    sea r = []
+    sea i = 0
+    mientras (i < longitud(a)) {
+        si (tipo(a[i]) == "lista") { r.agregar(_al_comb(a[i], b[i], fa, fb)) } sino { r.agregar(a[i] * fa + b[i] * fb) }
+        i = i + 1
+    }
+    retornar r
+}
+
+funcion algebra_sumar(a, b) { retornar _al_comb(a, b, 1, 1) }
+funcion algebra_restar(a, b) { retornar _al_comb(a, b, 1, -1) }
+funcion algebra_escalar(a, k) { retornar _al_comb(a, a, k, 0) }
+
+funcion algebra_punto(u, v) {
+    sea s = 0
+    sea i = 0
+    mientras (i < longitud(u)) { s = s + u[i] * v[i]  i = i + 1 }
+    retornar s
+}
+
+funcion algebra_traza(a) {
+    sea s = 0
+    sea i = 0
+    mientras (i < minimo(algebra_filas(a), algebra_columnas(a))) { s = s + a[i][i]  i = i + 1 }
+    retornar s
+}
+
+/// Normas: "fro" (Frobenius, por defecto), 1, "inf", 2 (mayor valor
+/// singular). Para vectores: 2 (euclidiana), 1 o "inf".
+funcion algebra_norma(a, tipo_) {
+    sea t = tipo_ ?? "fro"
+    si (longitud(a) > 0 y tipo(a[0]) != "lista") {
+        sea s = 0
+        para x en a {
+            si (t == 1) { s = s + absoluto(x) } sino {
+                si (t == "inf") { s = maximo(s, absoluto(x)) } sino { s = s + x * x }
+            }
+        }
+        si (t == 1 o t == "inf") { retornar s }
+        retornar raiz(s)
+    }
+    si (t == 2) { retornar algebra_svd(a)["s"][0] }
+    si (t == 1) {
+        sea mejor = 0
+        sea j = 0
+        mientras (j < algebra_columnas(a)) {
+            sea s = 0
+            para f en a { s = s + absoluto(f[j]) }
+            mejor = maximo(mejor, s)
+            j = j + 1
+        }
+        retornar mejor
+    }
+    si (t == "inf") {
+        sea mejor = 0
+        para f en a {
+            sea s = 0
+            para x en f { s = s + absoluto(x) }
+            mejor = maximo(mejor, s)
+        }
+        retornar mejor
+    }
+    sea s = 0
+    para f en a { para x en f { s = s + x * x } }
+    retornar raiz(s)
+}
+
+// ══ LU con pivoteo parcial ═════════════════════════════════════════════════
+
+/// PA = LU. Devuelve {"lu" (L y U juntas), "p" (permutación), "signo"}.
+funcion algebra_lu(a) {
+    sea n = algebra_filas(a)
+    si (n != algebra_columnas(a)) { lanzar "algebra: LU requiere una matriz cuadrada" }
+    sea lu = algebra_copia(a)
+    sea p = []
+    sea i = 0
+    mientras (i < n) { p.agregar(i)  i = i + 1 }
+    sea signo = 1
+    sea k = 0
+    mientras (k < n) {
+        sea piv = k
+        sea mx = absoluto(lu[k][k])
+        i = k + 1
+        mientras (i < n) {
+            si (absoluto(lu[i][k]) > mx) { mx = absoluto(lu[i][k])  piv = i }
+            i = i + 1
+        }
+        si (piv != k) {
+            sea t = lu[k]
+            lu[k] = lu[piv]
+            lu[piv] = t
+            sea tp = p[k]
+            p[k] = p[piv]
+            p[piv] = tp
+            signo = -signo
+        }
+        si (lu[k][k] != 0) {
+            i = k + 1
+            mientras (i < n) {
+                sea f = lu[i][k] / lu[k][k]
+                lu[i][k] = f
+                si (f != 0) {
+                    sea j = k + 1
+                    mientras (j < n) { lu[i][j] = lu[i][j] - f * lu[k][j]  j = j + 1 }
+                }
+                i = i + 1
+            }
+        }
+        k = k + 1
+    }
+    retornar {"lu": lu, "p": p, "signo": signo}
+}
+
+funcion _al_singular(lu, tol) {
+    sea escala = 0
+    para f en lu { para x en f { escala = maximo(escala, absoluto(x)) } }
+    sea i = 0
+    mientras (i < longitud(lu)) {
+        si (absoluto(lu[i][i]) <= tol * maximo(1, escala)) { retornar verdadero }
+        i = i + 1
+    }
+    retornar falso
+}
+
+funcion _al_lu_resolver(d, b) {
+    sea lu = d["lu"]
+    sea n = longitud(lu)
+    sea x = []
+    sea i = 0
+    mientras (i < n) { x.agregar(b[d["p"][i]])  i = i + 1 }
+    i = 0
+    mientras (i < n) {
+        sea j = 0
+        mientras (j < i) { x[i] = x[i] - lu[i][j] * x[j]  j = j + 1 }
+        i = i + 1
+    }
+    i = n - 1
+    mientras (i >= 0) {
+        sea j = i + 1
+        mientras (j < n) { x[i] = x[i] - lu[i][j] * x[j]  j = j + 1 }
+        x[i] = x[i] / lu[i][i]
+        i = i - 1
+    }
+    retornar x
+}
+
+/// Resuelve a·x = b (b vector o matriz). Lanza si a es singular.
+funcion algebra_resolver(a, b) {
+    sea d = algebra_lu(a)
+    si (_al_singular(d["lu"], 1e-13)) { lanzar "algebra: la matriz es singular" }
+    si (longitud(b) > 0 y tipo(b[0]) == "lista") {
+        sea bt = algebra_transpuesta(b)
+        sea r = []
+        para col en bt { r.agregar(_al_lu_resolver(d, col)) }
+        retornar algebra_transpuesta(r)
+    }
+    retornar _al_lu_resolver(d, b)
+}
+
+funcion algebra_determinante(a) {
+    sea d = algebra_lu(a)
+    sea r = d["signo"]
+    sea i = 0
+    mientras (i < longitud(a)) { r = r * d["lu"][i][i]  i = i + 1 }
+    retornar r
+}
+
+funcion algebra_inversa(a) { retornar algebra_resolver(a, algebra_identidad(longitud(a))) }
+
+// ══ Cholesky y LDLᵀ ════════════════════════════════════════════════════════
+
+/// L con A = L·Lᵀ (A simétrica definida positiva). Lanza si no lo es.
+funcion algebra_cholesky(a) {
+    sea n = longitud(a)
+    sea l = algebra_ceros(n, n)
+    sea i = 0
+    mientras (i < n) {
+        sea j = 0
+        mientras (j <= i) {
+            sea s = a[i][j]
+            sea k = 0
+            mientras (k < j) { s = s - l[i][k] * l[j][k]  k = k + 1 }
+            si (i == j) {
+                si (s <= 0) { lanzar "algebra: la matriz no es definida positiva" }
+                l[i][i] = raiz(s)
+            } sino { l[i][j] = s / l[j][j] }
+            j = j + 1
+        }
+        i = i + 1
+    }
+    retornar l
+}
+
+/// A = L·D·Lᵀ (simétrica, sin raíces): {"l", "d"}.
+funcion algebra_ldlt(a) {
+    sea n = longitud(a)
+    sea l = algebra_identidad(n)
+    sea d = []
+    sea i = 0
+    mientras (i < n) {
+        sea s = a[i][i]
+        sea k = 0
+        mientras (k < i) { s = s - l[i][k] * l[i][k] * d[k]  k = k + 1 }
+        d.agregar(s)
+        sea j = i + 1
+        mientras (j < n) {
+            sea t = a[j][i]
+            k = 0
+            mientras (k < i) { t = t - l[j][k] * l[i][k] * d[k]  k = k + 1 }
+            si (s == 0) { lanzar "algebra: LDLᵀ con pivote nulo" }
+            l[j][i] = t / s
+            j = j + 1
+        }
+        i = i + 1
+    }
+    retornar {"l": l, "d": d}
+}
+
+// ══ QR de Householder ══════════════════════════════════════════════════════
+
+/// A = Q·R (m×n, m ≥ n): {"q" (m×m ortogonal), "r" (m×n triangular)}.
+funcion algebra_qr(a) {
+    sea m = algebra_filas(a)
+    sea n = algebra_columnas(a)
+    sea r = algebra_copia(a)
+    sea q = algebra_identidad(m)
+    sea k = 0
+    mientras (k < minimo(m - 1, n)) {
+        sea nx = 0
+        sea i = k
+        mientras (i < m) { nx = nx + r[i][k] * r[i][k]  i = i + 1 }
+        nx = raiz(nx)
+        si (nx > 0) {
+            sea alfa = -nx
+            si (r[k][k] < 0) { alfa = nx }
+            sea v = []
+            i = 0
+            mientras (i < m) {
+                si (i < k) { v.agregar(0) } sino { v.agregar(r[i][k]) }
+                i = i + 1
+            }
+            v[k] = v[k] - alfa
+            sea vv = 0
+            para x en v { vv = vv + x * x }
+            si (vv > 0) {
+                // R = (I - 2vvᵀ/vᵀv)·R ; Q = Q·(I - 2vvᵀ/vᵀv)
+                sea j = 0
+                mientras (j < n) {
+                    sea s = 0
+                    i = k
+                    mientras (i < m) { s = s + v[i] * r[i][j]  i = i + 1 }
+                    s = 2 * s / vv
+                    i = k
+                    mientras (i < m) { r[i][j] = r[i][j] - s * v[i]  i = i + 1 }
+                    j = j + 1
+                }
+                i = 0
+                mientras (i < m) {
+                    sea s = 0
+                    j = k
+                    mientras (j < m) { s = s + q[i][j] * v[j]  j = j + 1 }
+                    s = 2 * s / vv
+                    j = k
+                    mientras (j < m) { q[i][j] = q[i][j] - s * v[j]  j = j + 1 }
+                    i = i + 1
+                }
+            }
+        }
+        k = k + 1
+    }
+    // Ceros exactos bajo la diagonal.
+    sea i2 = 0
+    mientras (i2 < m) {
+        sea j2 = 0
+        mientras (j2 < minimo(i2, n)) { r[i2][j2] = 0  j2 = j2 + 1 }
+        i2 = i2 + 1
+    }
+    retornar {"q": q, "r": r}
+}
+
+/// Mínimos cuadrados: x que minimiza |a·x − b| (por SVD, también con
+/// rango deficiente: da la solución de norma mínima).
+funcion algebra_minimos_cuadrados(a, b) { retornar algebra_mul(algebra_pseudoinversa(a), b) }
+
+// ══ Valores propios ════════════════════════════════════════════════════════
+
+/// Matriz simétrica: Jacobi cíclico. {"valores" (ascendentes), "vectores"
+/// (columnas, en el mismo orden)}.
+funcion algebra_propios_simetrica(a) {
+    sea n = longitud(a)
+    sea m = algebra_copia(a)
+    sea v = algebra_identidad(n)
+    sea barrido = 0
+    mientras (barrido < 100) {
+        sea fuera = 0
+        sea i = 0
+        mientras (i < n) {
+            sea j = i + 1
+            mientras (j < n) { fuera = fuera + m[i][j] * m[i][j]  j = j + 1 }
+            i = i + 1
+        }
+        si (fuera < 1e-30) { romper }
+        sea p = 0
+        mientras (p < n) {
+            sea q = p + 1
+            mientras (q < n) {
+                si (absoluto(m[p][q]) > 1e-18 * (absoluto(m[p][p]) + absoluto(m[q][q])) y absoluto(m[p][q]) > 1e-300) {
+                    sea theta = (m[q][q] - m[p][p]) / (2 * m[p][q])
+                    sea t = 0
+                    // Grande: aproximación sin elevar al cuadrado (los decimales con valor
+                    // entero se guardan como enteros y el cuadrado podría desbordar).
+                    si (absoluto(theta) > 1e8) { t = 1 / (2 * absoluto(theta)) } sino { t = 1 / (absoluto(theta) + raiz(theta * theta + 1)) }
+                    si (theta < 0) { t = -t }
+                    sea c = 1 / raiz(t * t + 1)
+                    sea s = t * c
+                    sea k = 0
+                    mientras (k < n) {
+                        sea mkp = m[k][p]
+                        sea mkq = m[k][q]
+                        m[k][p] = c * mkp - s * mkq
+                        m[k][q] = s * mkp + c * mkq
+                        k = k + 1
+                    }
+                    k = 0
+                    mientras (k < n) {
+                        sea mpk = m[p][k]
+                        sea mqk = m[q][k]
+                        m[p][k] = c * mpk - s * mqk
+                        m[q][k] = s * mpk + c * mqk
+                        k = k + 1
+                    }
+                    k = 0
+                    mientras (k < n) {
+                        sea vkp = v[k][p]
+                        sea vkq = v[k][q]
+                        v[k][p] = c * vkp - s * vkq
+                        v[k][q] = s * vkp + c * vkq
+                        k = k + 1
+                    }
+                }
+                q = q + 1
+            }
+            p = p + 1
+        }
+        barrido = barrido + 1
+    }
+    sea orden = []
+    sea i3 = 0
+    mientras (i3 < n) { orden.agregar(i3)  i3 = i3 + 1 }
+    orden = ordenar(orden, funcion(x, z) {
+        si (m[x][x] < m[z][z]) { retornar -1 }
+        si (m[x][x] > m[z][z]) { retornar 1 }
+        retornar x - z
+    })
+    sea valores = []
+    sea vectores = algebra_ceros(n, n)
+    sea c2 = 0
+    para k en orden {
+        valores.agregar(m[k][k])
+        // Signo canónico: la componente de mayor módulo, positiva.
+        sea mayor = 0
+        sea r = 0
+        mientras (r < n) { si (absoluto(v[r][k]) > absoluto(v[mayor][k])) { mayor = r }  r = r + 1 }
+        sea sg = 1
+        si (v[mayor][k] < 0) { sg = -1 }
+        r = 0
+        mientras (r < n) { vectores[r][c2] = v[r][k] * sg  r = r + 1 }
+        c2 = c2 + 1
+    }
+    retornar {"valores": valores, "vectores": vectores}
+}
+
+/// Valores propios de una matriz general (QR con desplazamientos sobre la
+/// forma de Hessenberg). Cada valor es [real, imaginario]; ordenados por
+/// parte real y luego imaginaria.
+funcion algebra_propios(a) {
+    sea n = longitud(a)
+    sea h = algebra_copia(a)
+    // Reducción a Hessenberg por Householder.
+    sea k = 0
+    mientras (k < n - 2) {
+        sea nx = 0
+        sea i = k + 1
+        mientras (i < n) { nx = nx + h[i][k] * h[i][k]  i = i + 1 }
+        nx = raiz(nx)
+        si (nx > 0) {
+            sea alfa = -nx
+            si (h[k + 1][k] < 0) { alfa = nx }
+            sea v = []
+            i = 0
+            mientras (i < n) {
+                si (i <= k) { v.agregar(0) } sino { v.agregar(h[i][k]) }
+                i = i + 1
+            }
+            v[k + 1] = v[k + 1] - alfa
+            sea vv = 0
+            para x en v { vv = vv + x * x }
+            si (vv > 0) {
+                sea j = 0
+                mientras (j < n) {
+                    sea s = 0
+                    i = k + 1
+                    mientras (i < n) { s = s + v[i] * h[i][j]  i = i + 1 }
+                    s = 2 * s / vv
+                    i = k + 1
+                    mientras (i < n) { h[i][j] = h[i][j] - s * v[i]  i = i + 1 }
+                    j = j + 1
+                }
+                i = 0
+                mientras (i < n) {
+                    sea s = 0
+                    j = k + 1
+                    mientras (j < n) { s = s + h[i][j] * v[j]  j = j + 1 }
+                    s = 2 * s / vv
+                    j = k + 1
+                    mientras (j < n) { h[i][j] = h[i][j] - s * v[j]  j = j + 1 }
+                    i = i + 1
+                }
+            }
+        }
+        k = k + 1
+    }
+    // QR de Francis (doble desplazamiento) como en EISPACK hqr.
+    sea valores = []
+    sea nn = n - 1
+    sea t = 0
+    sea iter = 0
+    mientras (nn >= 0) {
+        sea l = nn
+        mientras (l > 0) {
+            sea s = absoluto(h[l - 1][l - 1]) + absoluto(h[l][l])
+            si (s == 0) { s = 1 }
+            si (absoluto(h[l][l - 1]) < 1e-14 * s) { romper }
+            l = l - 1
+        }
+        sea x = h[nn][nn]
+        si (l == nn) {
+            valores.agregar([x + t, 0])
+            nn = nn - 1
+            iter = 0
+        } sino {
+            sea yv = h[nn - 1][nn - 1]
+            sea w = h[nn][nn - 1] * h[nn - 1][nn]
+            si (l == nn - 1) {
+                sea p = (yv - x) / 2
+                sea q = p * p + w
+                sea z = raiz(absoluto(q))
+                x = x + t
+                si (q >= 0) {
+                    si (p >= 0) { z = p + z } sino { z = p - z }
+                    sea v1 = x + z
+                    sea v2 = v1
+                    si (z != 0) { v2 = x - w / z }
+                    valores.agregar([v1, 0])
+                    valores.agregar([v2, 0])
+                } sino {
+                    valores.agregar([x + p, z])
+                    valores.agregar([x + p, -z])
+                }
+                nn = nn - 2
+                iter = 0
+            } sino {
+                si (iter == 30) { lanzar "algebra: los valores propios no convergen" }
+                si (iter == 10 o iter == 20) {
+                    t = t + x
+                    sea i = 0
+                    mientras (i <= nn) { h[i][i] = h[i][i] - x  i = i + 1 }
+                    sea s = absoluto(h[nn][nn - 1]) + absoluto(h[nn - 1][nn - 2])
+                    x = 0.75 * s
+                    yv = x
+                    w = -0.4375 * s * s
+                }
+                iter = iter + 1
+                sea m2 = nn - 2
+                sea p = 0
+                sea q = 0
+                sea r = 0
+                sea z = 0
+                mientras (m2 >= l) {
+                    z = h[m2][m2]
+                    r = x - z
+                    sea s = yv - z
+                    p = (r * s - w) / h[m2 + 1][m2] + h[m2][m2 + 1]
+                    q = h[m2 + 1][m2 + 1] - z - r - s
+                    r = h[m2 + 2][m2 + 1]
+                    s = absoluto(p) + absoluto(q) + absoluto(r)
+                    p = p / s
+                    q = q / s
+                    r = r / s
+                    si (m2 == l) { romper }
+                    sea u = absoluto(h[m2][m2 - 1]) * (absoluto(q) + absoluto(r))
+                    sea vv = absoluto(p) * (absoluto(h[m2 - 1][m2 - 1]) + absoluto(z) + absoluto(h[m2 + 1][m2 + 1]))
+                    si (u <= 1e-14 * vv) { romper }
+                    m2 = m2 - 1
+                }
+                sea i = m2 + 2
+                mientras (i <= nn) {
+                    h[i][i - 2] = 0
+                    si (i != m2 + 2) { h[i][i - 3] = 0 }
+                    i = i + 1
+                }
+                sea kk = m2
+                mientras (kk <= nn - 1) {
+                    si (kk != m2) {
+                        p = h[kk][kk - 1]
+                        q = h[kk + 1][kk - 1]
+                        r = 0
+                        si (kk != nn - 1) { r = h[kk + 2][kk - 1] }
+                        x = absoluto(p) + absoluto(q) + absoluto(r)
+                        si (x != 0) {
+                            p = p / x
+                            q = q / x
+                            r = r / x
+                        }
+                    }
+                    sea s = raiz(p * p + q * q + r * r)
+                    si (p < 0) { s = -s }
+                    si (s != 0) {
+                        si (kk == m2) {
+                            si (l != m2) { h[kk][kk - 1] = -h[kk][kk - 1] }
+                        } sino { h[kk][kk - 1] = -s * x }
+                        p = p + s
+                        x = p / s
+                        yv = q / s
+                        z = r / s
+                        q = q / p
+                        r = r / p
+                        sea j = kk
+                        mientras (j <= nn) {
+                            p = h[kk][j] + q * h[kk + 1][j]
+                            si (kk != nn - 1) {
+                                p = p + r * h[kk + 2][j]
+                                h[kk + 2][j] = h[kk + 2][j] - p * z
+                            }
+                            h[kk + 1][j] = h[kk + 1][j] - p * yv
+                            h[kk][j] = h[kk][j] - p * x
+                            j = j + 1
+                        }
+                        sea mmin = nn
+                        si (kk + 3 < nn) { mmin = kk + 3 }
+                        i = l
+                        mientras (i <= mmin) {
+                            p = x * h[i][kk] + yv * h[i][kk + 1]
+                            si (kk != nn - 1) {
+                                p = p + z * h[i][kk + 2]
+                                h[i][kk + 2] = h[i][kk + 2] - p * r
+                            }
+                            h[i][kk + 1] = h[i][kk + 1] - p * q
+                            h[i][kk] = h[i][kk] - p
+                            i = i + 1
+                        }
+                    }
+                    kk = kk + 1
+                }
+            }
+        }
+    }
+    retornar ordenar(valores, funcion(a1, b1) {
+        si (absoluto(a1[0] - b1[0]) > 1e-9) {
+            si (a1[0] < b1[0]) { retornar -1 }
+            retornar 1
+        }
+        si (a1[1] < b1[1]) { retornar -1 }
+        si (a1[1] > b1[1]) { retornar 1 }
+        retornar 0
+    })
+}
+
+// ══ SVD ════════════════════════════════════════════════════════════════════
+
+/// Descomposición en valores singulares A = U·diag(s)·Vᵀ (Jacobi de un lado).
+/// {"u" (m×k), "s" (k, descendentes), "v" (n×k)} con k = min(m, n).
+funcion algebra_svd(a) {
+    sea m = algebra_filas(a)
+    sea n = algebra_columnas(a)
+    si (m < n) {
+        sea t = algebra_svd(algebra_transpuesta(a))
+        retornar {"u": t["v"], "s": t["s"], "v": t["u"]}
+    }
+    sea u = algebra_copia(a)
+    sea v = algebra_identidad(n)
+    sea barrido = 0
+    mientras (barrido < 60) {
+        sea cambio = falso
+        sea p = 0
+        mientras (p < n - 1) {
+            sea q = p + 1
+            mientras (q < n) {
+                sea alfa = 0
+                sea beta = 0
+                sea gama = 0
+                sea i = 0
+                mientras (i < m) {
+                    alfa = alfa + u[i][p] * u[i][p]
+                    beta = beta + u[i][q] * u[i][q]
+                    gama = gama + u[i][p] * u[i][q]
+                    i = i + 1
+                }
+                si (absoluto(gama) > 1e-15 * raiz(alfa * beta) y gama != 0) {
+                    cambio = verdadero
+                    sea zeta = (beta - alfa) / (2 * gama)
+                    sea t = 0
+                    si (absoluto(zeta) > 1e8) { t = 1 / (2 * absoluto(zeta)) } sino { t = 1 / (absoluto(zeta) + raiz(1 + zeta * zeta)) }
+                    si (zeta < 0) { t = -t }
+                    sea c = 1 / raiz(1 + t * t)
+                    sea s = c * t
+                    i = 0
+                    mientras (i < m) {
+                        sea up = u[i][p]
+                        u[i][p] = c * up - s * u[i][q]
+                        u[i][q] = s * up + c * u[i][q]
+                        i = i + 1
+                    }
+                    i = 0
+                    mientras (i < n) {
+                        sea vp = v[i][p]
+                        v[i][p] = c * vp - s * v[i][q]
+                        v[i][q] = s * vp + c * v[i][q]
+                        i = i + 1
+                    }
+                }
+                q = q + 1
+            }
+            p = p + 1
+        }
+        si (cambio == falso) { romper }
+        barrido = barrido + 1
+    }
+    sea sv = []
+    sea j = 0
+    mientras (j < n) {
+        sea s = 0
+        sea i = 0
+        mientras (i < m) { s = s + u[i][j] * u[i][j]  i = i + 1 }
+        sv.agregar(raiz(s))
+        j = j + 1
+    }
+    sea orden = []
+    j = 0
+    mientras (j < n) { orden.agregar(j)  j = j + 1 }
+    orden = ordenar(orden, funcion(x, z) {
+        si (sv[x] > sv[z]) { retornar -1 }
+        si (sv[x] < sv[z]) { retornar 1 }
+        retornar x - z
+    })
+    sea uu = algebra_ceros(m, n)
+    sea vv = algebra_ceros(n, n)
+    sea ss = []
+    sea c2 = 0
+    para k en orden {
+        ss.agregar(sv[k])
+        sea i = 0
+        // Signo canónico: componente de mayor módulo de v positiva.
+        sea mayor = 0
+        mientras (i < n) { si (absoluto(v[i][k]) > absoluto(v[mayor][k])) { mayor = i }  i = i + 1 }
+        sea sg = 1
+        si (v[mayor][k] < 0) { sg = -1 }
+        i = 0
+        mientras (i < m) {
+            si (sv[k] > 0) { uu[i][c2] = u[i][k] / sv[k] * sg }
+            i = i + 1
+        }
+        i = 0
+        mientras (i < n) { vv[i][c2] = v[i][k] * sg  i = i + 1 }
+        c2 = c2 + 1
+    }
+    retornar {"u": uu, "s": ss, "v": vv}
+}
+
+funcion _al_tol(s, m, n) {
+    si (longitud(s) == 0) { retornar 0 }
+    retornar s[0] * maximo(m, n) * 2.220446049250313e-16
+}
+
+/// Rango numérico.
+funcion algebra_rango(a) {
+    sea d = algebra_svd(a)
+    sea tol = _al_tol(d["s"], algebra_filas(a), algebra_columnas(a))
+    sea r = 0
+    para x en d["s"] { si (x > tol) { r = r + 1 } }
+    retornar r
+}
+
+/// Pseudoinversa de Moore-Penrose.
+funcion algebra_pseudoinversa(a) {
+    sea d = algebra_svd(a)
+    sea m = algebra_filas(a)
+    sea n = algebra_columnas(a)
+    sea tol = _al_tol(d["s"], m, n)
+    sea r = algebra_ceros(n, m)
+    sea k = 0
+    mientras (k < longitud(d["s"])) {
+        si (d["s"][k] > tol) {
+            sea inv = 1 / d["s"][k]
+            sea i = 0
+            mientras (i < n) {
+                sea vik = d["v"][i][k] * inv
+                sea j = 0
+                mientras (j < m) { r[i][j] = r[i][j] + vik * d["u"][j][k]  j = j + 1 }
+                i = i + 1
+            }
+        }
+        k = k + 1
+    }
+    retornar r
+}
+
+/// Base ortonormal del núcleo (vectores x con a·x = 0), como lista.
+funcion algebra_nucleo(a) {
+    sea n = algebra_columnas(a)
+    // SVD de AᵀA (n×n) para tener todos los vectores de V.
+    sea d = algebra_svd(algebra_mul(algebra_transpuesta(a), a))
+    sea tol = maximo(_al_tol(d["s"], n, n), 1e-10 * maximo(1, d["s"][0] ?? 0))
+    sea r = []
+    sea k = 0
+    mientras (k < n) {
+        si (d["s"][k] <= tol) {
+            sea v = []
+            sea i = 0
+            mientras (i < n) { v.agregar(d["v"][i][k])  i = i + 1 }
+            r.agregar(v)
+        }
+        k = k + 1
+    }
+    retornar r
+}
+
+/// Número de condición (norma 2).
+funcion algebra_condicion(a) {
+    sea s = algebra_svd(a)["s"]
+    si (s[longitud(s) - 1] == 0) { retornar 1e308 * 10 }
+    retornar s[0] / s[longitud(s) - 1]
+}
+
+/// Exponencial de una matriz (Padé 13 con escalado y cuadrados, como
+/// scipy.linalg.expm).
+funcion algebra_exp(a) {
+    sea n = longitud(a)
+    sea norma = algebra_norma(a, 1)
+    sea s = 0
+    si (norma > 5.371920351148152) { s = maximo(0, techo(logaritmo(norma / 5.371920351148152) / logaritmo(2))) }
+    sea esc = 1
+    sea k = 0
+    mientras (k < s) { esc = esc * 2  k = k + 1 }
+    sea x = algebra_escalar(a, 1 / esc)
+    sea b = [64764752532480000, 32382376266240000, 7771770303897600, 1187353796428800, 129060195264000, 10559470521600, 670442572800, 33522128640, 1323241920, 40840800, 960960, 16380, 182, 1]
+    sea i = algebra_identidad(n)
+    sea x2 = algebra_mul(x, x)
+    sea x4 = algebra_mul(x2, x2)
+    sea x6 = algebra_mul(x4, x2)
+    sea u1 = algebra_mul(x6, _al_suma3(x6, b[13], x4, b[11], x2, b[9]))
+    sea u = algebra_mul(x, algebra_sumar(u1, _al_suma4(x6, b[7], x4, b[5], x2, b[3], i, b[1])))
+    sea v1 = algebra_mul(x6, _al_suma3(x6, b[12], x4, b[10], x2, b[8]))
+    sea v = algebra_sumar(v1, _al_suma4(x6, b[6], x4, b[4], x2, b[2], i, b[0]))
+    sea r = algebra_resolver(algebra_restar(v, u), algebra_sumar(v, u))
+    k = 0
+    mientras (k < s) { r = algebra_mul(r, r)  k = k + 1 }
+    retornar r
+}
+
+funcion _al_suma3(a, ka, b, kb, c, kc) { retornar algebra_sumar(_al_comb(a, b, ka, kb), algebra_escalar(c, kc)) }
+funcion _al_suma4(a, ka, b, kb, c, kc, d, kd) { retornar algebra_sumar(_al_comb(a, b, ka, kb), _al_comb(c, d, kc, kd)) }
+
+/// ¿Iguales con tolerancia? (matrices o vectores).
+funcion algebra_casi_igual(a, b, tol) {
+    sea t = tol ?? 1e-9
+    si (longitud(a) != longitud(b)) { retornar falso }
+    sea i = 0
+    mientras (i < longitud(a)) {
+        si (tipo(a[i]) == "lista") {
+            si (algebra_casi_igual(a[i], b[i], t) == falso) { retornar falso }
+        } sino { si (absoluto(a[i] - b[i]) > t * maximo(1, absoluto(b[i]))) { retornar falso } }
+        i = i + 1
+    }
+    retornar verdadero
+}
