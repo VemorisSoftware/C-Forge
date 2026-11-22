@@ -1,0 +1,405 @@
+// stdlib/agenda.cfv — fechas con zonas horarias reales y cron que respeta
+// el cambio de hora: lee la base de zonas del sistema (TZif de
+// /usr/share/zoneinfo, versiones 1 a 4, con la regla POSIX para el futuro),
+// convierte entre UTC y hora local (huecos y horas repetidas incluidos),
+// formatea ISO 8601 con desfase y calcula las próximas ejecuciones de una
+// expresión cron en una zona ("0 9 * * 1-5" en America/Santiago sigue
+// siendo a las 9:00 locales todo el año). Inspirada en tokio-cron /
+// chrono-tz (MIT/Apache). En inglés: importar "schedule".
+//
+//   importar "agenda"
+//   sea z = agenda_zona("America/Santiago")
+//   agenda_formato(z, 1763769600000)            // "2025-11-21T21:00:00-03:00"
+//   sea a = agenda_cron("0 9 * * 1-5", z)
+//   agenda_proximas(a, tiempo_ms(), 3)          // en ms UTC
+//
+// Sin base de zonas (Windows, navegador) usa agenda_zona_posix("<-04>4<-03>,M9.1.6/24,M4.1.6/24")
+// o un desfase fijo: agenda_zona("UTC-03:00").
+
+importar "reloj"
+
+funcion _ag_div(a, b) {
+    sea q = cociente(a, b)
+    si (a < 0 y a % b != 0) { q = q - 1 }
+    retornar q
+}
+
+funcion _ag_civil(dias) {
+    sea z = dias + 719468
+    sea era = _ag_div(z, 146097)
+    sea doe = z - era * 146097
+    sea yoe = cociente(doe - cociente(doe, 1460) + cociente(doe, 36524) - cociente(doe, 146096), 365)
+    sea yy = yoe + era * 400
+    sea doy = doe - (365 * yoe + cociente(yoe, 4) - cociente(yoe, 100))
+    sea mp = cociente(5 * doy + 2, 153)
+    sea d = doy - cociente(153 * mp + 2, 5) + 1
+    sea m = mp + 3
+    si (mp >= 10) { m = mp - 9 }
+    si (m <= 2) { yy = yy + 1 }
+    retornar [yy, m, d]
+}
+
+funcion _ag_dias(a, m, d) {
+    sea yy = a
+    si (m <= 2) { yy = yy - 1 }
+    sea era = _ag_div(yy, 400)
+    sea yoe = yy - era * 400
+    sea mp = (m + 9) % 12
+    sea doy = cociente(153 * mp + 2, 5) + d - 1
+    sea doe = yoe * 365 + cociente(yoe, 4) - cociente(yoe, 100) + doy
+    retornar era * 146097 + doe - 719468
+}
+
+funcion _ag_bisiesto(a) { retornar (a % 4 == 0 y a % 100 != 0) o a % 400 == 0 }
+
+funcion _ag_dias_mes(a, m) {
+    si (m == 2) {
+        si (_ag_bisiesto(a)) { retornar 29 }
+        retornar 28
+    }
+    si (m == 4 o m == 6 o m == 9 o m == 11) { retornar 30 }
+    retornar 31
+}
+
+// ── Reglas POSIX (TZ="CLT4CLST,M9.1.6/24,M4.1.6/24") ─────────────────────
+
+funcion _ag_nombre(s, i) {
+    si (i < longitud(s) y subcadena(s, i, i + 1) == "<") {
+        sea j = texto_indice(subcadena(s, i, longitud(s)), ">")
+        si (j < 0) { lanzar "agenda: regla POSIX inválida" }
+        retornar [subcadena(s, i + 1, i + j), i + j + 1]
+    }
+    sea j = i
+    mientras (j < longitud(s) y ((byte_en(s, j) >= 65 y byte_en(s, j) <= 90) o (byte_en(s, j) >= 97 y byte_en(s, j) <= 122))) { j = j + 1 }
+    retornar [subcadena(s, i, j), j]
+}
+
+// [segundos, siguiente índice]; acepta signo y hh[:mm[:ss]].
+funcion _ag_hora(s, i) {
+    sea signo = 1
+    sea j = i
+    si (j < longitud(s) y subcadena(s, j, j + 1) == "-") { signo = -1  j = j + 1 }
+    si (j < longitud(s) y subcadena(s, j, j + 1) == "+") { j = j + 1 }
+    sea partes = [0, 0, 0]
+    sea k = 0
+    sea num = ""
+    mientras (j < longitud(s) y ((byte_en(s, j) >= 48 y byte_en(s, j) <= 57) o subcadena(s, j, j + 1) == ":")) {
+        si (subcadena(s, j, j + 1) == ":") {
+            partes[k] = a_numero(num)
+            num = ""
+            k = k + 1
+        } sino { num = num + subcadena(s, j, j + 1) }
+        j = j + 1
+    }
+    si (num == "") { lanzar "agenda: regla POSIX inválida (falta una hora)" }
+    partes[k] = a_numero(num)
+    retornar [signo * (partes[0] * 3600 + partes[1] * 60 + partes[2]), j]
+}
+
+funcion _ag_regla_fecha(s, i) {
+    sea j = i
+    sea r = {}
+    si (subcadena(s, j, j + 1) == "M") {
+        sea fin = j + 1
+        mientras (fin < longitud(s) y subcadena(s, fin, fin + 1) != "/" y subcadena(s, fin, fin + 1) != ",") { fin = fin + 1 }
+        sea p = texto_dividir(subcadena(s, j + 1, fin), ".")
+        r = {"tipo": "M", "m": a_numero(p[0]), "w": a_numero(p[1]), "d": a_numero(p[2])}
+        j = fin
+    } sino {
+        sea tipo_ = "n"
+        si (subcadena(s, j, j + 1) == "J") { tipo_ = "J"  j = j + 1 }
+        sea fin = j
+        mientras (fin < longitud(s) y byte_en(s, fin) >= 48 y byte_en(s, fin) <= 57) { fin = fin + 1 }
+        r = {"tipo": tipo_, "n": a_numero(subcadena(s, j, fin))}
+        j = fin
+    }
+    r["hora"] = 7200
+    si (j < longitud(s) y subcadena(s, j, j + 1) == "/") {
+        sea h = _ag_hora(s, j + 1)
+        r["hora"] = h[0]
+        j = h[1]
+    }
+    retornar [r, j]
+}
+
+/// Interpreta una regla POSIX TZ.
+funcion agenda_posix(texto) {
+    sea s = texto_recortar("" + texto)
+    sea a = _ag_nombre(s, 0)
+    sea dz = _ag_hora(s, a[1])
+    sea r = {"std": a[0], "std_off": -dz[0], "dst": nulo}
+    sea i = dz[1]
+    si (i < longitud(s)) {
+        sea b = _ag_nombre(s, i)
+        r["dst"] = b[0]
+        i = b[1]
+        r["dst_off"] = r["std_off"] + 3600
+        si (i < longitud(s) y subcadena(s, i, i + 1) != ",") {
+            sea od = _ag_hora(s, i)
+            r["dst_off"] = -od[0]
+            i = od[1]
+        }
+        si (i >= longitud(s)) {
+            // Sin reglas: las de EE. UU. por defecto (POSIX).
+            s = s + ",M3.2.0,M11.1.0"
+        }
+        si (subcadena(s, i, i + 1) != ",") { lanzar "agenda: regla POSIX inválida: " + texto }
+        sea x = _ag_regla_fecha(s, i + 1)
+        r["inicio"] = x[0]
+        i = x[1]
+        si (subcadena(s, i, i + 1) != ",") { lanzar "agenda: regla POSIX inválida: " + texto }
+        sea yv = _ag_regla_fecha(s, i + 1)
+        r["fin"] = yv[0]
+    }
+    retornar r
+}
+
+// Segundos (UTC local, sin desfase) de la regla en el año a.
+funcion _ag_regla_seg(regla, a) {
+    sea dia = 0
+    si (regla["tipo"] == "M") {
+        sea primero = _ag_dias(a, regla["m"], 1)
+        sea sem = (primero % 7 + 11) % 7
+        sea d = 1 + (regla["d"] - sem + 7) % 7 + (regla["w"] - 1) * 7
+        mientras (d > _ag_dias_mes(a, regla["m"])) { d = d - 7 }
+        dia = primero + d - 1
+    }
+    si (regla["tipo"] == "J") {
+        sea n = regla["n"]
+        si (_ag_bisiesto(a) y n >= 60) { n = n + 1 }
+        dia = _ag_dias(a, 1, 1) + n - 1
+    }
+    si (regla["tipo"] == "n") { dia = _ag_dias(a, 1, 1) + regla["n"] }
+    retornar dia * 86400 + regla["hora"]
+}
+
+funcion _ag_posix_tipo(p, t) {
+    si (p["dst"] == nulo) { retornar {"desfase": p["std_off"], "abrev": p["std"], "verano": falso} }
+    sea a = _ag_civil(_ag_div(t + p["std_off"], 86400))[0]
+    sea ini = _ag_regla_seg(p["inicio"], a) - p["std_off"]
+    sea fin = _ag_regla_seg(p["fin"], a) - p["dst_off"]
+    sea verano = falso
+    si (ini < fin) { verano = t >= ini y t < fin } sino { verano = (t >= fin y t < ini) == falso }
+    si (verano) { retornar {"desfase": p["dst_off"], "abrev": p["dst"], "verano": verdadero} }
+    retornar {"desfase": p["std_off"], "abrev": p["std"], "verano": falso}
+}
+
+// ── TZif ──────────────────────────────────────────────────────────────────
+
+funcion _ag_u32(d, i) { retornar ((byte_en(d, i) * 256 + byte_en(d, i + 1)) * 256 + byte_en(d, i + 2)) * 256 + byte_en(d, i + 3) }
+
+funcion _ag_i32(d, i) {
+    sea v = _ag_u32(d, i)
+    si (v >= 2147483648) { v = v - 4294967296 }
+    retornar v
+}
+
+funcion _ag_i64(d, i) {
+    sea alto = _ag_i32(d, i)
+    retornar alto * 4294967296 + _ag_u32(d, i + 4)
+}
+
+/// Zona desde el contenido de un archivo TZif.
+funcion agenda_zona_bytes(nombre, d) {
+    si (longitud(d) < 44 o subcadena(d, 0, 4) != "TZif") { lanzar "agenda: no es un archivo TZif" }
+    sea version = byte_en(d, 4)
+    sea cuentas = funcion(base) {
+        retornar {"isut": _ag_u32(d, base + 20), "isstd": _ag_u32(d, base + 24), "leap": _ag_u32(d, base + 28), "time": _ag_u32(d, base + 32), "type": _ag_u32(d, base + 36), "char": _ag_u32(d, base + 40)}
+    }
+    sea c = cuentas(0)
+    sea base = 0
+    sea ancho = 4
+    si (version >= 50) {
+        base = 44 + c["time"] * 5 + c["type"] * 6 + c["char"] + c["leap"] * 8 + c["isstd"] + c["isut"]
+        c = cuentas(base)
+        ancho = 8
+    }
+    sea p = base + 44
+    sea trans = []
+    sea k = 0
+    mientras (k < c["time"]) {
+        si (ancho == 8) { trans.agregar(_ag_i64(d, p + k * 8)) } sino { trans.agregar(_ag_i32(d, p + k * 4)) }
+        k = k + 1
+    }
+    p = p + c["time"] * ancho
+    sea idx = []
+    k = 0
+    mientras (k < c["time"]) { idx.agregar(byte_en(d, p + k))  k = k + 1 }
+    p = p + c["time"]
+    sea tipos_raw = []
+    k = 0
+    mientras (k < c["type"]) {
+        tipos_raw.agregar([_ag_i32(d, p + k * 6), byte_en(d, p + k * 6 + 4), byte_en(d, p + k * 6 + 5)])
+        k = k + 1
+    }
+    p = p + c["type"] * 6
+    sea chars = subcadena(d, p, p + c["char"])
+    p = p + c["char"] + c["leap"] * (ancho + 4) + c["isstd"] + c["isut"]
+    sea tipos = []
+    para t en tipos_raw {
+        sea fin = t[2]
+        mientras (fin < longitud(chars) y byte_en(chars, fin) != 0) { fin = fin + 1 }
+        tipos.agregar({"desfase": t[0], "verano": t[1] == 1, "abrev": subcadena(chars, t[2], fin)})
+    }
+    sea posix = nulo
+    si (version >= 50 y p < longitud(d)) {
+        sea resto = subcadena(d, p, longitud(d))
+        sea partes = texto_dividir(resto, "\n")
+        si (longitud(partes) >= 2 y texto_recortar(partes[1]) != "") { posix = agenda_posix(partes[1]) }
+    }
+    retornar {"nombre": nombre, "trans": trans, "idx": idx, "tipos": tipos, "posix": posix}
+}
+
+/// Zona desde una regla POSIX (sin archivo).
+funcion agenda_zona_posix(regla) { retornar {"nombre": regla, "trans": [], "idx": [], "tipos": [], "posix": agenda_posix(regla)} }
+
+funcion _ag_fija(nombre, seg) {
+    retornar {"nombre": nombre, "trans": [], "idx": [], "tipos": [], "posix": {"std": nombre, "std_off": seg, "dst": nulo}}
+}
+
+/// Zona por nombre IANA ("America/Santiago", "Europe/Madrid"), "UTC" o un
+/// desfase fijo ("UTC-03:00", "+05:30").
+funcion agenda_zona(nombre) {
+    sea n = texto_recortar("" + nombre)
+    si (n == "UTC" o n == "Z" o n == "GMT" o n == "Etc/UTC") { retornar _ag_fija("UTC", 0) }
+    sea f = n
+    si (texto_empieza_con(f, "UTC") o texto_empieza_con(f, "GMT")) { f = subcadena(f, 3, longitud(f)) }
+    si (texto_empieza_con(f, "+") o texto_empieza_con(f, "-")) {
+        sea h = _ag_hora(f, 0)
+        retornar _ag_fija(n, h[0])
+    }
+    // Solo nombres seguros: nada de "..", rutas absolutas ni caracteres raros.
+    si (texto_indice(n, "..") >= 0 o texto_empieza_con(n, "/") o n == "") { lanzar "agenda: nombre de zona inválido " + n }
+    sea i = 0
+    mientras (i < longitud(n)) {
+        sea b = byte_en(n, i)
+        sea ok = (b >= 65 y b <= 90) o (b >= 97 y b <= 122) o (b >= 48 y b <= 57) o b == 95 o b == 45 o b == 43 o b == 47
+        si (ok == falso) { lanzar "agenda: nombre de zona inválido " + n }
+        i = i + 1
+    }
+    sea dirs = ["/usr/share/zoneinfo", "/usr/lib/zoneinfo", "/usr/share/lib/zoneinfo", "/etc/zoneinfo"]
+    sea env = variable_entorno("TZDIR")
+    si (env != nulo y env != "") { dirs = [env] + dirs }
+    para dd en dirs {
+        sea ruta = dd + "/" + n
+        si (existe_archivo(ruta)) { retornar agenda_zona_bytes(n, leer_archivo(ruta)) }
+    }
+    lanzar "agenda: no encontré la zona " + n + " (¿falta /usr/share/zoneinfo? usa agenda_zona_posix)"
+}
+
+/// Desfase en un instante: {"desfase": segundos, "abrev", "verano"}.
+funcion agenda_desfase(zona, ms) {
+    sea t = _ag_div(ms, 1000)
+    sea tr = zona["trans"]
+    si (longitud(tr) == 0 o t < tr[0]) {
+        si (longitud(tr) == 0 y zona["posix"] != nulo) { retornar _ag_posix_tipo(zona["posix"], t) }
+        // Antes de la primera transición: el primer tipo sin horario de verano.
+        para x en zona["tipos"] { si (x["verano"] == falso) { retornar x } }
+        si (longitud(zona["tipos"]) > 0) { retornar zona["tipos"][0] }
+        retornar {"desfase": 0, "abrev": "UTC", "verano": falso}
+    }
+    si (t >= tr[longitud(tr) - 1] y zona["posix"] != nulo) { retornar _ag_posix_tipo(zona["posix"], t) }
+    sea a = 0
+    sea b = longitud(tr) - 1
+    mientras (a < b) {
+        sea m = piso((a + b + 1) / 2)
+        si (tr[m] <= t) { a = m } sino { b = m - 1 }
+    }
+    retornar zona["tipos"][zona["idx"][a]]
+}
+
+funcion _ag_dos(n) {
+    si (n < 10) { retornar "0" + n }
+    retornar "" + n
+}
+
+/// Campos locales: {"anio", "mes", "dia", "hora", "minuto", "segundo", "ms",
+/// "dia_semana" (0 = domingo), "desfase", "abrev", "verano"}.
+funcion agenda_local(zona, ms) {
+    sea dz = agenda_desfase(zona, ms)
+    sea local = ms + dz["desfase"] * 1000
+    sea dias = _ag_div(local, 86400000)
+    sea resto = local - dias * 86400000
+    sea f = _ag_civil(dias)
+    retornar {"anio": f[0], "mes": f[1], "dia": f[2], "hora": cociente(resto, 3600000), "minuto": cociente(resto % 3600000, 60000), "segundo": cociente(resto % 60000, 1000), "ms": resto % 1000, "dia_semana": (dias % 7 + 11) % 7, "desfase": dz["desfase"], "abrev": dz["abrev"], "verano": dz["verano"]}
+}
+
+/// ISO 8601 con desfase: "2026-03-01T09:00:00-03:00".
+funcion agenda_formato(zona, ms) {
+    sea l = agenda_local(zona, ms)
+    sea dz = l["desfase"]
+    sea signo = "+"
+    si (dz < 0) { signo = "-"  dz = -dz }
+    sea s = l["anio"] + "-" + _ag_dos(l["mes"]) + "-" + _ag_dos(l["dia"]) + "T" + _ag_dos(l["hora"]) + ":" + _ag_dos(l["minuto"]) + ":" + _ag_dos(l["segundo"])
+    si (l["desfase"] == 0 y zona["nombre"] == "UTC") { retornar s + "Z" }
+    retornar s + signo + _ag_dos(cociente(dz, 3600)) + ":" + _ag_dos(cociente(dz % 3600, 60))
+}
+
+/// Hora local → ms UTC. Si la hora no existe (salto de primavera) avanza
+/// lo que dura el salto; si se repite (otoño), elige la primera
+/// (opcion = "ultima" para la segunda).
+funcion agenda_desde_local(zona, anio, mes, dia, hora, minuto, segundo, opcion) {
+    sea local = (_ag_dias(anio, mes, dia) * 86400 + (hora ?? 0) * 3600 + (minuto ?? 0) * 60 + (segundo ?? 0)) * 1000
+    retornar _ag_local_a_utc(zona, local, opcion)
+}
+
+funcion _ag_local_a_utc(zona, local, opcion) {
+    sea validos = []
+    para delta en [-86400000, 0, 86400000] {
+        sea dz = agenda_desfase(zona, local - delta)["desfase"] * 1000
+        sea u = local - dz
+        si (agenda_desfase(zona, u)["desfase"] * 1000 == dz) {
+            sea ya = falso
+            para v en validos { si (v == u) { ya = verdadero } }
+            si (ya == falso) { validos.agregar(u) }
+        }
+    }
+    si (longitud(validos) == 0) {
+        // Hueco: usa el desfase de antes del salto.
+        retornar local - agenda_desfase(zona, local - 86400000)["desfase"] * 1000
+    }
+    validos = ordenar(validos, funcion(a, b) { retornar a - b })
+    si (opcion == "ultima" o opcion == "later") { retornar validos[longitud(validos) - 1] }
+    retornar validos[0]
+}
+
+// ── Cron en una zona ──────────────────────────────────────────────────────
+
+/// Expresión cron (5 campos, macros como @diario) evaluada en hora local.
+funcion agenda_cron(expr, zona) {
+    sea z = zona
+    si (tipo(zona) == "texto") { z = agenda_zona(zona) }
+    retornar {"cron": reloj_cron(expr, 0), "zona": z, "expr": expr}
+}
+
+/// Próxima ejecución (ms UTC) estrictamente después de ms. En el salto de
+/// primavera las horas que no existen corren al terminar el salto; en el
+/// otoño la hora repetida corre una sola vez.
+funcion agenda_siguiente(a, ms) {
+    sea z = a["zona"]
+    sea local = ms + agenda_desfase(z, ms)["desfase"] * 1000
+    sea intentos = 0
+    mientras (intentos < 100000) {
+        sea cand = reloj_siguiente(a["cron"], local)
+        sea u = _ag_local_a_utc(z, cand, nulo)
+        si (u > ms) { retornar u }
+        local = cand
+        intentos = intentos + 1
+    }
+    lanzar "agenda: no encontré una próxima ejecución"
+}
+
+funcion agenda_proximas(a, ms, n) {
+    sea r = []
+    sea t = ms
+    mientras (longitud(r) < n) {
+        sea x = agenda_siguiente(a, t)
+        si (longitud(r) > 0 y x <= r[longitud(r) - 1]) { lanzar "agenda: error interno (no avanza)" }
+        r.agregar(x)
+        t = x
+    }
+    retornar r
+}
+
+/// Convierte un instante a otra zona y lo formatea.
+funcion agenda_en(zona, ms) { retornar agenda_formato(agenda_zona(zona), ms) }

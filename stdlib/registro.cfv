@@ -1,0 +1,293 @@
+// stdlib/registro.cfv — fachada de registro (logging) desacoplada: el
+// código pide un registrador por nombre ("app.db.consultas") y la
+// configuración, en un solo lugar, decide niveles por jerarquía, destinos
+// (pantalla, archivo con rotación por tamaño, memoria circular, función
+// propia), formato (patrón de texto o JSON) y contexto por petición (MDC).
+// Inspirada en SLF4J + Logback (MIT/EPL, solo la idea). En inglés:
+// importar "logging".
+//
+//   importar "registro"
+//   registro_configurar({"nivel": "info", "niveles": {"app.db": "depuracion"},
+//       "destinos": [registro_pantalla(), registro_archivo("/tmp/app.log", {"max_bytes": 1000000, "copias": 3})]})
+//   sea log = registro_obtener("app.db")
+//   registro_info(log, "consulta lista", {"ms": 12})
+//
+// Niveles: traza < depuracion < info < aviso < error < fatal (y "apagado").
+// Patrón: %fecha %hora %ms %nivel %NIVEL %nombre %mensaje %campos %hilo, y
+// %contexto. Los saltos de línea del mensaje se escapan (sin inyección).
+
+sea _RG_NIVELES = {"traza": 5, "depuracion": 10, "info": 20, "aviso": 30, "error": 40, "fatal": 50, "apagado": 99, "trace": 5, "debug": 10, "warn": 30, "warning": 30, "off": 99}
+sea _RG_EN = {"traza": "TRACE", "depuracion": "DEBUG", "info": "INFO", "aviso": "WARN", "error": "ERROR", "fatal": "FATAL"}
+sea _RG = [{"nivel": "info", "niveles": {}, "destinos": nulo, "reloj": nulo, "contexto": [], "conteo": {}}]
+
+funcion _rg_nivel(n) {
+    si (tiene_clave(_RG_NIVELES, n) == falso) { lanzar "registro: nivel desconocido " + n }
+    retornar _RG_NIVELES[n]
+}
+
+/// Configura todo de una vez. opciones: nivel (raíz), niveles (por nombre,
+/// heredan por prefijo con puntos), destinos (lista), reloj (función → ms).
+funcion registro_configurar(opciones) {
+    sea c = _RG[0]
+    si (tiene_clave(opciones, "nivel")) { _rg_nivel(opciones["nivel"])  c["nivel"] = opciones["nivel"] }
+    si (tiene_clave(opciones, "level")) { _rg_nivel(opciones["level"])  c["nivel"] = opciones["level"] }
+    sea nv = opciones["niveles"] ?? (opciones["levels"] ?? nulo)
+    si (nv != nulo) {
+        para k en claves(nv) { _rg_nivel(nv[k]) }
+        c["niveles"] = nv
+    }
+    sea ds = opciones["destinos"] ?? (opciones["sinks"] ?? nulo)
+    si (ds != nulo) { c["destinos"] = ds }
+    si (tiene_clave(opciones, "reloj")) { c["reloj"] = opciones["reloj"] }
+    si (tiene_clave(opciones, "clock")) { c["reloj"] = opciones["clock"] }
+    c["conteo"] = {}
+    retornar c
+}
+
+/// Vuelve a la configuración inicial (nivel info, a pantalla).
+funcion registro_reiniciar() {
+    _RG[0] = {"nivel": "info", "niveles": {}, "destinos": nulo, "reloj": nulo, "contexto": [], "conteo": {}}
+}
+
+funcion registro_obtener(nombre) { retornar {"nombre": "" + (nombre ?? "raiz"), "campos": {}} }
+
+/// Registrador hijo con campos fijos que se agregan a cada evento.
+funcion registro_con(r, campos) {
+    sea c = {}
+    para k en claves(r["campos"]) { c[k] = r["campos"][k] }
+    para k en claves(campos) { c[k] = campos[k] }
+    retornar {"nombre": r["nombre"], "campos": c}
+}
+
+/// Nivel efectivo de un nombre (el prefijo configurado más largo gana).
+funcion registro_nivel_de(nombre) {
+    sea c = _RG[0]
+    sea mejor = c["nivel"]
+    sea largo = -1
+    para k en claves(c["niveles"]) {
+        si ((nombre == k o texto_empieza_con(nombre, k + ".")) y longitud(k) > largo) { mejor = c["niveles"][k]  largo = longitud(k) }
+    }
+    retornar mejor
+}
+
+funcion registro_activo(r, nivel) { retornar _rg_nivel(nivel) >= _rg_nivel(registro_nivel_de(r["nombre"])) }
+
+/// Contexto por petición (MDC): se agrega a todos los eventos hasta quitarlo.
+funcion registro_contexto(campos) { _RG[0]["contexto"].agregar(campos) }
+funcion registro_quitar_contexto() {
+    sea l = _RG[0]["contexto"]
+    sea r = []
+    sea i = 0
+    mientras (i < longitud(l) - 1) { r.agregar(l[i])  i = i + 1 }
+    _RG[0]["contexto"] = r
+}
+
+/// Ejecuta f con un contexto puesto y lo quita al terminar (aunque falle).
+funcion registro_en_contexto(campos, f) {
+    registro_contexto(campos)
+    sea res = nulo
+    sea err = nulo
+    intentar { res = f() } capturar (e) { err = e }
+    registro_quitar_contexto()
+    si (err != nulo) { lanzar err }
+    retornar res
+}
+
+// ── Fechas ────────────────────────────────────────────────────────────────
+
+funcion _rg_dos(n) {
+    si (n < 10) { retornar "0" + n }
+    retornar "" + n
+}
+
+funcion _rg_fecha(ms) {
+    sea dias = piso(ms / 86400000)
+    sea resto = ms - dias * 86400000
+    // Días desde 1970 → fecha civil (algoritmo de Howard Hinnant).
+    sea z = dias + 719468
+    sea era = piso(z / 146097)
+    sea doe = z - era * 146097
+    sea yoe = piso((doe - piso(doe / 1460) + piso(doe / 36524) - piso(doe / 146096)) / 365)
+    sea yy = yoe + era * 400
+    sea doy = doe - (365 * yoe + piso(yoe / 4) - piso(yoe / 100))
+    sea mp = piso((5 * doy + 2) / 153)
+    sea d = doy - piso((153 * mp + 2) / 5) + 1
+    sea m = mp + 3
+    si (mp >= 10) { m = mp - 9 }
+    si (m <= 2) { yy = yy + 1 }
+    sea h = piso(resto / 3600000)
+    sea mi = piso((resto % 3600000) / 60000)
+    sea s = piso((resto % 60000) / 1000)
+    sea mss = resto % 1000
+    sea msx = "" + mss
+    si (mss < 100) { msx = "0" + msx }
+    si (mss < 10) { msx = "0" + msx }
+    retornar {"fecha": yy + "-" + _rg_dos(m) + "-" + _rg_dos(d), "hora": _rg_dos(h) + ":" + _rg_dos(mi) + ":" + _rg_dos(s), "ms": msx}
+}
+
+funcion _rg_escapar(t) {
+    retornar texto_reemplazar(texto_reemplazar(texto_reemplazar("" + t, "\\", "\\\\"), "\n", "\\n"), "\r", "\\r")
+}
+
+funcion _rg_campos_texto(c) {
+    sea p = []
+    para k en claves(c) {
+        sea v = c[k]
+        si (tipo(v) == "texto") {
+            si (texto_indice(v, " ") >= 0 o texto_indice(v, "=") >= 0 o v == "") { p.agregar(k + "=" + json_texto(v)) } sino { p.agregar(k + "=" + _rg_escapar(v)) }
+        } sino { p.agregar(k + "=" + json_texto(v)) }
+    }
+    retornar unir(p, " ")
+}
+
+/// Da formato a un evento con un patrón.
+funcion registro_formatear(ev, patron) {
+    sea pt = patron ?? "%fecha %hora.%ms %NIVEL %nombre - %mensaje %campos"
+    sea f = _rg_fecha(ev["ms"])
+    sea campos = _rg_campos_texto(ev["campos"])
+    sea niv = _RG_EN[ev["nivel"]] ?? texto_mayusculas(ev["nivel"])
+    sea t = pt
+    t = texto_reemplazar(t, "%fecha", f["fecha"])
+    t = texto_reemplazar(t, "%hora", f["hora"])
+    t = texto_reemplazar(t, "%ms", f["ms"])
+    t = texto_reemplazar(t, "%NIVEL", _rg_rellenar(niv, 5))
+    t = texto_reemplazar(t, "%nivel", ev["nivel"])
+    t = texto_reemplazar(t, "%nombre", ev["nombre"])
+    t = texto_reemplazar(t, "%campos", campos)
+    t = texto_reemplazar(t, "%mensaje", _rg_escapar(ev["mensaje"]))
+    retornar texto_recortar(t)
+}
+
+funcion _rg_rellenar(t, n) {
+    sea r = t
+    mientras (longitud(r) < n) { r = r + " " }
+    retornar r
+}
+
+/// Evento → línea JSON.
+funcion registro_json(ev) {
+    sea f = _rg_fecha(ev["ms"])
+    sea o = {"ts": f["fecha"] + "T" + f["hora"] + "." + f["ms"] + "Z", "nivel": ev["nivel"], "nombre": ev["nombre"], "mensaje": ev["mensaje"]}
+    para k en claves(ev["campos"]) { si (tiene_clave(o, k) == falso) { o[k] = ev["campos"][k] } }
+    retornar json_texto(o)
+}
+
+// ── Destinos ──────────────────────────────────────────────────────────────
+
+funcion _rg_dest(tipo_, opciones) {
+    sea d = {"tipo": tipo_, "patron": nulo, "formato": "texto", "nivel": nulo}
+    si (opciones != nulo) { para k en claves(opciones) { d[k] = opciones[k] } }
+    si (d["formato"] == "text") { d["formato"] = "texto" }
+    retornar d
+}
+
+funcion _rg_linea(d, ev) {
+    si (d["formato"] == "json") { retornar registro_json(ev) }
+    retornar registro_formatear(ev, d["patron"])
+}
+
+funcion registro_pantalla(opciones) { retornar _rg_dest("pantalla", opciones) }
+
+/// Archivo con rotación: al pasar max_bytes, app.log → app.log.1 → … (copias).
+funcion registro_archivo(ruta, opciones) {
+    sea d = _rg_dest("archivo", opciones)
+    d["ruta"] = ruta
+    si (tiene_clave(d, "max_bytes") == falso) { d["max_bytes"] = 10485760 }
+    si (tiene_clave(d, "copias") == falso) { d["copias"] = 5 }
+    retornar d
+}
+
+/// Memoria circular con las últimas n líneas (útil en pruebas o para /debug).
+funcion registro_memoria(n, opciones) {
+    sea d = _rg_dest("memoria", opciones)
+    d["max"] = n ?? 1000
+    d["lineas"] = []
+    d["eventos"] = []
+    retornar d
+}
+
+/// Destino propio: f(evento, linea).
+funcion registro_funcion(f, opciones) {
+    sea d = _rg_dest("funcion", opciones)
+    d["f"] = f
+    retornar d
+}
+
+funcion registro_lineas(d) { retornar d["lineas"] }
+funcion registro_eventos(d) { retornar d["eventos"] }
+
+funcion _rg_rotar(d) {
+    sea k = d["copias"]
+    mientras (k >= 1) {
+        sea origen = d["ruta"]
+        si (k > 1) { origen = d["ruta"] + "." + (k - 1) }
+        si (existe_archivo(origen)) { escribir_archivo(d["ruta"] + "." + k, leer_archivo(origen)) }
+        k = k - 1
+    }
+    escribir_archivo(d["ruta"], "")
+}
+
+funcion _rg_emitir(d, ev) {
+    si (d["nivel"] != nulo y _rg_nivel(ev["nivel"]) < _rg_nivel(d["nivel"])) { retornar nulo }
+    sea linea = _rg_linea(d, ev)
+    si (d["tipo"] == "pantalla") { mostrar(linea) }
+    si (d["tipo"] == "memoria") {
+        d["lineas"].agregar(linea)
+        d["eventos"].agregar(ev)
+        si (longitud(d["lineas"]) > d["max"]) {
+            sea l = []
+            sea e = []
+            sea i = longitud(d["lineas"]) - d["max"]
+            mientras (i < longitud(d["lineas"])) { l.agregar(d["lineas"][i])  e.agregar(d["eventos"][i])  i = i + 1 }
+            d["lineas"] = l
+            d["eventos"] = e
+        }
+    }
+    si (d["tipo"] == "archivo") {
+        sea previo = ""
+        si (existe_archivo(d["ruta"])) { previo = leer_archivo(d["ruta"]) }
+        si (longitud(previo) > 0 y longitud(previo) + longitud(linea) + 1 > d["max_bytes"]) {
+            _rg_rotar(d)
+            previo = ""
+        }
+        escribir_archivo(d["ruta"], previo + linea + "\n")
+    }
+    si (d["tipo"] == "funcion") { d["f"](ev, linea) }
+}
+
+// ── Emitir ────────────────────────────────────────────────────────────────
+
+funcion registro_evento(r, nivel, mensaje, campos) {
+    si (registro_activo(r, nivel) == falso) { retornar falso }
+    sea c = _RG[0]
+    sea ms = 0
+    si (c["reloj"] != nulo) { ms = c["reloj"]() } sino { ms = tiempo_ms() }
+    sea todos = {}
+    para x en c["contexto"] { para k en claves(x) { todos[k] = x[k] } }
+    para k en claves(r["campos"]) { todos[k] = r["campos"][k] }
+    si (campos != nulo) { para k en claves(campos) { todos[k] = campos[k] } }
+    sea ev = {"ms": ms, "nivel": nivel, "nombre": r["nombre"], "mensaje": "" + mensaje, "campos": todos}
+    c["conteo"][nivel] = (c["conteo"][nivel] ?? 0) + 1
+    sea ds = c["destinos"]
+    si (ds == nulo) { ds = [registro_pantalla()] }
+    para d en ds { _rg_emitir(d, ev) }
+    retornar verdadero
+}
+
+funcion registro_traza(r, m, c) { retornar registro_evento(r, "traza", m, c) }
+funcion registro_depuracion(r, m, c) { retornar registro_evento(r, "depuracion", m, c) }
+funcion registro_info(r, m, c) { retornar registro_evento(r, "info", m, c) }
+funcion registro_aviso(r, m, c) { retornar registro_evento(r, "aviso", m, c) }
+funcion registro_error(r, m, c) { retornar registro_evento(r, "error", m, c) }
+funcion registro_fatal(r, m, c) { retornar registro_evento(r, "fatal", m, c) }
+
+/// Cuántos eventos se emitieron por nivel desde la última configuración.
+funcion registro_conteo() { retornar _RG[0]["conteo"] }
+
+/// Mide cuánto tarda f y lo registra en info (con el campo "ms").
+funcion registro_medir(r, mensaje, f) {
+    sea t0 = tiempo_ms()
+    sea res = f()
+    registro_info(r, mensaje, {"duracion_ms": tiempo_ms() - t0})
+    retornar res
+}

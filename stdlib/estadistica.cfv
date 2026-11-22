@@ -1,0 +1,286 @@
+// stdlib/estadistica.cfv — pruebas estadísticas: distribuciones (normal, t
+// de Student, chi cuadrado, F) con densidad, acumulada e inversa; pruebas t
+// (una muestra, dos muestras de Welch, pareada), chi cuadrado de
+// independencia, ANOVA de un factor, correlación con valor p e intervalos
+// de confianza. Inspirada en statrs / SciPy.stats (MIT/BSD). En inglés:
+// importar "stats".
+//
+//   importar "estadistica"
+//   sea r = estadistica_t_dos([5.1, 4.9, 5.6], [6.2, 6.0, 6.8])   // {"t", "gl", "p"}
+//   estadistica_chi2_tabla([[10, 20], [30, 40]])                 // {"chi2", "gl", "p"}
+//   estadistica_normal_inv(0.975)                                // 1.959964…
+
+importar "numerica"
+
+// ln Γ(x) (Lanczos, g = 7).
+funcion estadistica_ln_gamma(x) {
+    si (x < 0.5) { retornar logaritmo(pi() / absoluto(seno(pi() * x))) - estadistica_ln_gamma(1 - x) }
+    sea c = [0.99999999999980993, 676.5203681218851, -1259.1392167224028, 771.32342877765313, -176.61502916214059, 12.507343278686905, -0.13857109526572012, 0.0000099843695780195716, 0.00000015056327351493116]
+    sea xx = x - 1
+    sea a = c[0]
+    sea t = xx + 7.5
+    sea i = 1
+    mientras (i < 9) { a = a + c[i] / (xx + i)  i = i + 1 }
+    retornar 0.5 * logaritmo(2 * pi()) + (xx + 0.5) * logaritmo(t) - t + logaritmo(a)
+}
+
+// Beta incompleta regularizada I_x(a, b) (fracción continua de Lentz).
+funcion estadistica_beta_inc(x, a, b) {
+    si (x <= 0) { retornar 0 }
+    si (x >= 1) { retornar 1 }
+    si (x > (a + 1) / (a + b + 2)) { retornar 1 - estadistica_beta_inc(1 - x, b, a) }
+    sea ln_pre = estadistica_ln_gamma(a + b) - estadistica_ln_gamma(a) - estadistica_ln_gamma(b) + a * logaritmo(x) + b * logaritmo(1 - x)
+    sea tiny = 1e-30
+    sea f = 1
+    sea C = 1
+    sea D = 0
+    sea m = 0
+    mientras (m <= 300) {
+        sea num = 0
+        si (m == 0) { num = 1 } sino {
+            sea k = cociente(m, 2)
+            si (m % 2 == 0) { num = k * (b - k) * x / ((a + 2 * k - 1) * (a + 2 * k)) } sino { num = 0 - (a + k) * (a + b + k) * x / ((a + 2 * k) * (a + 2 * k + 1)) }
+        }
+        D = 1 + num * D
+        si (absoluto(D) < tiny) { D = tiny }
+        D = 1 / D
+        C = 1 + num / C
+        si (absoluto(C) < tiny) { C = tiny }
+        sea cd = C * D
+        f = f * cd
+        si (absoluto(1 - cd) < 1e-15) { retornar exponencial(ln_pre) * (f - 1) / a }
+        m = m + 1
+    }
+    retornar exponencial(ln_pre) * (f - 1) / a
+}
+
+// Gamma incompleta regularizada inferior P(a, x).
+funcion estadistica_gamma_inc(a, x) {
+    si (x <= 0) { retornar 0 }
+    si (x < a + 1) {
+        sea suma = 1 / a
+        sea termino = suma
+        sea n = 1
+        mientras (n < 500) {
+            termino = termino * x / (a + n)
+            suma = suma + termino
+            si (absoluto(termino) < absoluto(suma) * 1e-16) { n = 500 }
+            n = n + 1
+        }
+        retornar suma * exponencial(0 - x + a * logaritmo(x) - estadistica_ln_gamma(a))
+    }
+    // Fracción continua para Q y P = 1 − Q.
+    sea b = x + 1 - a
+    sea c = 1e300
+    sea d = 1 / b
+    sea h = d
+    sea i = 1
+    mientras (i < 500) {
+        sea an = 0 - i * (i - a)
+        b = b + 2
+        d = an * d + b
+        si (absoluto(d) < 1e-300) { d = 1e-300 }
+        c = b + an / c
+        si (absoluto(c) < 1e-300) { c = 1e-300 }
+        d = 1 / d
+        sea del = d * c
+        h = h * del
+        si (absoluto(del - 1) < 1e-16) { i = 500 }
+        i = i + 1
+    }
+    retornar 1 - exponencial(0 - x + a * logaritmo(x) - estadistica_ln_gamma(a)) * h
+}
+
+funcion estadistica_normal_pdf(x, media, desv) {
+    sea m = media ?? 0
+    sea s = desv ?? 1
+    sea z = (x - m) / s
+    retornar exponencial(0 - z * z / 2) / (s * raiz(2 * pi()))
+}
+
+funcion estadistica_normal_cdf(x, media, desv) {
+    sea z = (x - (media ?? 0)) / (desv ?? 1)
+    // Φ(z) = P(1/2, z²/2) para z ≥ 0.
+    si (z == 0) { retornar 0.5 }
+    sea p = 0.5 * estadistica_gamma_inc(0.5, z * z / 2)
+    si (z > 0) { retornar 0.5 + p }
+    retornar 0.5 - p
+}
+
+/// Inversa de la normal (Acklam + un paso de Newton; error < 1e-12).
+funcion estadistica_normal_inv(p, media, desv) {
+    si (p <= 0 o p >= 1) { lanzar "estadistica: p debe estar entre 0 y 1" }
+    sea a = [-39.69683028665376, 220.9460984245205, -275.9285104469687, 138.3577518672690, -30.66479806614716, 2.506628277459239]
+    sea b = [-54.47609879822406, 161.5858368580409, -155.6989798598866, 66.80131188771972, -13.28068155288572]
+    sea c = [-0.007784894002430293, -0.3223964580411365, -2.400758277161838, -2.549732539343734, 4.374664141464968, 2.938163982698783]
+    sea d = [0.007784695709041462, 0.3224671290700398, 2.445134137142996, 3.754408661907416]
+    sea x = 0
+    si (p < 0.02425) {
+        sea q = raiz(-2 * logaritmo(p))
+        x = (((((c[0] * q + c[1]) * q + c[2]) * q + c[3]) * q + c[4]) * q + c[5]) / ((((d[0] * q + d[1]) * q + d[2]) * q + d[3]) * q + 1)
+    } sino {
+        si (p > 1 - 0.02425) {
+            sea q = raiz(-2 * logaritmo(1 - p))
+            x = 0 - (((((c[0] * q + c[1]) * q + c[2]) * q + c[3]) * q + c[4]) * q + c[5]) / ((((d[0] * q + d[1]) * q + d[2]) * q + d[3]) * q + 1)
+        } sino {
+            sea q = p - 0.5
+            sea r = q * q
+            x = (((((a[0] * r + a[1]) * r + a[2]) * r + a[3]) * r + a[4]) * r + a[5]) * q / (((((b[0] * r + b[1]) * r + b[2]) * r + b[3]) * r + b[4]) * r + 1)
+        }
+    }
+    sea e = estadistica_normal_cdf(x) - p
+    sea u = e * raiz(2 * pi()) * exponencial(x * x / 2)
+    x = x - u / (1 + x * u / 2)
+    retornar (media ?? 0) + (desv ?? 1) * x
+}
+
+/// Acumulada de la t de Student con gl grados de libertad.
+funcion estadistica_t_cdf(t, gl) {
+    sea x = gl / (gl + t * t)
+    sea p = 0.5 * estadistica_beta_inc(x, gl / 2, 0.5)
+    si (t > 0) { retornar 1 - p }
+    retornar p
+}
+
+funcion estadistica_t_inv(p, gl) {
+    sea lo = -1000
+    sea hi = 1000
+    sea k = 0
+    mientras (k < 200) {
+        sea m = (lo + hi) / 2
+        si (estadistica_t_cdf(m, gl) < p) { lo = m } sino { hi = m }
+        k = k + 1
+    }
+    retornar (lo + hi) / 2
+}
+
+funcion estadistica_chi2_cdf(x, gl) { retornar estadistica_gamma_inc(gl / 2, x / 2) }
+
+funcion estadistica_f_cdf(x, d1, d2) {
+    si (x <= 0) { retornar 0 }
+    retornar estadistica_beta_inc(d1 * x / (d1 * x + d2), d1 / 2, d2 / 2)
+}
+
+funcion _es_p(t, gl, cola) {
+    sea c = cola ?? "dos"
+    si (c == "mayor" o c == "greater") { retornar 1 - estadistica_t_cdf(t, gl) }
+    si (c == "menor" o c == "less") { retornar estadistica_t_cdf(t, gl) }
+    retornar 2 * (1 - estadistica_t_cdf(absoluto(t), gl))
+}
+
+/// Prueba t de una muestra contra la media mu.
+funcion estadistica_t_una(xs, mu, cola) {
+    sea n = longitud(xs)
+    si (n < 2) { lanzar "estadistica: se necesitan al menos 2 datos" }
+    sea t = (numerica_media(xs) - mu) / (numerica_desviacion(xs) / raiz(n))
+    retornar {"t": t, "gl": n - 1, "p": _es_p(t, n - 1, cola)}
+}
+
+/// Prueba t de Welch para dos muestras independientes (varianzas distintas).
+funcion estadistica_t_dos(a, b, cola) {
+    si (longitud(a) < 2 o longitud(b) < 2) { lanzar "estadistica: se necesitan al menos 2 datos por grupo" }
+    sea va = numerica_varianza(a) / longitud(a)
+    sea vb = numerica_varianza(b) / longitud(b)
+    sea t = (numerica_media(a) - numerica_media(b)) / raiz(va + vb)
+    sea gl = (va + vb) * (va + vb) / (va * va / (longitud(a) - 1) + vb * vb / (longitud(b) - 1))
+    retornar {"t": t, "gl": gl, "p": _es_p(t, gl, cola)}
+}
+
+/// Prueba t pareada (antes / después).
+funcion estadistica_t_pareada(a, b, cola) {
+    si (longitud(a) != longitud(b)) { lanzar "estadistica: las muestras pareadas deben tener el mismo largo" }
+    sea d = []
+    sea i = 0
+    mientras (i < longitud(a)) { d.agregar(a[i] - b[i])  i = i + 1 }
+    retornar estadistica_t_una(d, 0, cola)
+}
+
+/// Chi cuadrado de independencia en una tabla de contingencia.
+funcion estadistica_chi2_tabla(tabla) {
+    sea filas = longitud(tabla)
+    sea cols = longitud(tabla[0])
+    sea total = 0
+    sea sf = []
+    sea sc = []
+    para c en tabla[0] { sc.agregar(0) }
+    para f en tabla {
+        sea s = 0
+        sea j = 0
+        mientras (j < cols) { s = s + f[j]  sc[j] = sc[j] + f[j]  j = j + 1 }
+        sf.agregar(s)
+        total = total + s
+    }
+    sea chi = 0
+    sea i = 0
+    mientras (i < filas) {
+        sea j = 0
+        mientras (j < cols) {
+            sea e = sf[i] * sc[j] / total
+            si (e > 0) { chi = chi + (tabla[i][j] - e) * (tabla[i][j] - e) / e }
+            j = j + 1
+        }
+        i = i + 1
+    }
+    sea gl = (filas - 1) * (cols - 1)
+    retornar {"chi2": chi, "gl": gl, "p": 1 - estadistica_chi2_cdf(chi, gl)}
+}
+
+/// Bondad de ajuste: observados vs esperados (o uniforme).
+funcion estadistica_chi2_ajuste(observados, esperados) {
+    sea total = 0
+    para o en observados { total = total + o }
+    sea chi = 0
+    sea i = 0
+    mientras (i < longitud(observados)) {
+        sea e = total / longitud(observados)
+        si (esperados != nulo) { e = esperados[i] }
+        chi = chi + (observados[i] - e) * (observados[i] - e) / e
+        i = i + 1
+    }
+    sea gl = longitud(observados) - 1
+    retornar {"chi2": chi, "gl": gl, "p": 1 - estadistica_chi2_cdf(chi, gl)}
+}
+
+/// ANOVA de un factor: {"f", "gl_entre", "gl_dentro", "p"}.
+funcion estadistica_anova(grupos) {
+    sea todos = []
+    para g en grupos { para x en g { todos.agregar(x) } }
+    sea media = numerica_media(todos)
+    sea entre = 0
+    sea dentro = 0
+    para g en grupos {
+        sea m = numerica_media(g)
+        entre = entre + longitud(g) * (m - media) * (m - media)
+        para x en g { dentro = dentro + (x - m) * (x - m) }
+    }
+    sea k = longitud(grupos)
+    sea n = longitud(todos)
+    sea f = (entre / (k - 1)) / (dentro / (n - k))
+    retornar {"f": f, "gl_entre": k - 1, "gl_dentro": n - k, "p": 1 - estadistica_f_cdf(f, k - 1, n - k)}
+}
+
+/// Pearson con valor p (t con n−2 gl).
+funcion estadistica_correlacion(xs, ys) {
+    sea r = numerica_correlacion(xs, ys)
+    sea n = longitud(xs)
+    si (absoluto(r) >= 1) { retornar {"r": r, "p": 0} }
+    sea t = r * raiz((n - 2) / (1 - r * r))
+    retornar {"r": r, "p": 2 * (1 - estadistica_t_cdf(absoluto(t), n - 2))}
+}
+
+/// Intervalo de confianza para la media (t de Student).
+funcion estadistica_intervalo(xs, confianza) {
+    sea c = confianza ?? 0.95
+    sea n = longitud(xs)
+    sea m = numerica_media(xs)
+    sea e = estadistica_t_inv(1 - (1 - c) / 2, n - 1) * numerica_desviacion(xs) / raiz(n)
+    retornar [m - e, m + e]
+}
+
+/// Tamaño del efecto (d de Cohen con desviación combinada).
+funcion estadistica_cohen_d(a, b) {
+    sea na = longitud(a)
+    sea nb = longitud(b)
+    sea s = raiz(((na - 1) * numerica_varianza(a) + (nb - 1) * numerica_varianza(b)) / (na + nb - 2))
+    retornar (numerica_media(a) - numerica_media(b)) / s
+}
