@@ -178,7 +178,7 @@ Estado: ✅ ya existe en C-Forge · 🔗 se usa hoy vía `cforge bindgen`,
 | 127 | `sonido` | Reproducir y capturar audio | miniaudio | ✅ `audio` |
 | 128 | `mezcla` | Mezclador y decodificadores | Rodio | ✅ WAV · 🛠 MP3/OGG/FLAC |
 | 129 | `estudio` | Audio en tiempo real | PortAudio | 🔗 |
-| 130 | `entidades` | ECS de alto rendimiento | EnTT | 🛠 |
+| 130 | `entidades` / `entities` | ECS de alto rendimiento | EnTT | ✅ `entidades` |
 | 131 | `navegacion` | Pathfinding y NavMesh | Recast & Detour | ✅ `algoritmos` (Dijkstra) · 🛠 A* y NavMesh |
 | 132 | `serie` | Puertos serie (Arduino) | serialport | 🛠 |
 | 133 | `mando` | Dispositivos USB HID | hidapi | 🔗 |
@@ -221,7 +221,7 @@ Estado: ✅ ya existe en C-Forge · 🔗 se usa hoy vía `cforge bindgen`,
 | 158 | `cadena` | Contratos EVM y Web3 | ethers-rs | 🛠 |
 | 159 | `semilla` | Frases mnemónicas y billeteras HD | BIP39 | 🛠 |
 | 160 | `paseo` / `paseto` | Tokens PASETO | PASETO | ✅ `paseo` |
-| 161 | `federa` | OAuth2 y OpenID Connect | OAuth2 | 🛠 |
+| 161 | `federa` / `oidc` | OAuth2 y OpenID Connect | OAuth2 | ✅ `federa` |
 | 162 | `segundo_factor` / `totp` | TOTP y Passkeys | TOTP, WebAuthn | ✅ `segundo_factor` |
 | 163 | `antivirus` | Escaneo por firmas | ClamAV | 🔗 |
 | 164 | `centinela` | Detección de intrusos | Suricata | 🛠 |
@@ -235,11 +235,11 @@ Estado: ✅ ya existe en C-Forge · 🔗 se usa hoy vía `cforge bindgen`,
 | 167 | `territorio` | Datos geoespaciales | GDAL | 🔗 |
 | 168 | `proyeccion` | Sistemas de coordenadas | PROJ | 🔗 |
 | 169 | `geometria` / `geo` | Operaciones espaciales | GEOS, Turf | ✅ `geometria` |
-| 170 | `panal` | Índice hexagonal del planeta | H3 | 🛠 |
+| 170 | `panal` / `hexgrid` | Índice hexagonal del planeta | H3 | ✅ `panal` |
 | 171 | `ciencia` / `science` | Optimización e interpolación | SciPy | ✅ `ciencia` |
 | 172 | `fourier` / `fft` | FFT rápida | FFTW | ✅ `fourier` |
 | 173 | `blas` | Matrices de alto rendimiento | OpenBLAS | 🔗 |
-| 174 | `malla_geo` | Geometría computacional | CGAL | 🛠 |
+| 174 | `malla_geo` / `geometry2d` | Geometría computacional | CGAL | ✅ `malla_geo` |
 | 175 | `robotica` | Física para robótica | MuJoCo | 🔗 |
 | 176 | `cuaternion` | Álgebra lineal y transformaciones | nalgebra | ✅ `matematica` (básica) · 🛠 |
 | 177 | `astro` / `astronomy` | Órbitas y efemérides | NOVAS | ✅ `astro` |
@@ -275,7 +275,7 @@ Estado: ✅ ya existe en C-Forge · 🔗 se usa hoy vía `cforge bindgen`,
 | 197 | `revelado` | Imágenes masivas con poca RAM | libvips | 🔗 |
 | 198 | `formato_web` | WebP y AVIF | libwebp, libavif | 🔗 |
 | 199 | `escaner` | Documentos escaneados | Leptonica | 🔗 |
-| 200 | `codigo_qr` | QR y códigos de barras | ZXing | 🛠 |
+| 200 | `codigo_qr` / `qrcode` | QR y códigos de barras | ZXing | ✅ `codigo_qr` |
 | 201 | `composicion` | Composición tipográfica de PDFs | Typst | 🛠 |
 | 202 | `conversor` | Conversión entre formatos de documento | Pandoc | 🛠 |
 | 203 | `lee_excel` / `read_xlsx` | Leer .xlsx/.ods | Calamine | ✅ `lee_excel` |
@@ -324,12 +324,12 @@ Estado: ✅ ya existe en C-Forge · 🔗 se usa hoy vía `cforge bindgen`,
 | 236 | `bus` | D-Bus en Linux | zbus | 🛠 |
 | 237 | `teclado` | Simular teclado y ratón | Enigo | 🛠 |
 | 238 | `recolecta` | Extracción web con sesiones | Fantoccini | 🛠 |
-| 239 | `agenda` | Cron con zonas horarias | tokio-cron | 🛠 |
+| 239 | `agenda` / `schedule` | Cron con zonas horarias | tokio-cron | ✅ `agenda` |
 | 240 | `ident` / `ids` | UUID, ULID y NanoID | uuid, ulid | ✅ `ident` |
 | 241 | `telefono` / `phone` | Números telefónicos | libphonenumber | ✅ `telefono` |
-| 242 | `unicode` | Normalización y ordenamiento | ICU | 🛠 |
+| 242 | `unicode` / `unicode_en` | Normalización y ordenamiento | ICU | ✅ `unicode` |
 | 243 | `buscador` | Búsqueda full-text | Tantivy | 🛠 |
-| 244 | `consulta_archivos` | SQL sobre CSV, JSON y Parquet | DataFusion | 🛠 |
+| 244 | `consulta_archivos` / `sqlfiles` | SQL sobre CSV, JSON y Parquet | DataFusion | ✅ `consulta_archivos` |
 | 245 | `socket_web` | WebSocket RFC 6455 | Tungstenite | ✅ `red` |
 | 246 | `correo` | Enviar correos con DKIM | Lettre | 🛠 |
 | 247 | `bandeja` | Leer correo IMAP/POP3 | IMAP | 🛠 |

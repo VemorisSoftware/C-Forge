@@ -43,6 +43,18 @@ Sitio oficial: [c-forge.org](https://c-forge.org)
   Needleman–Wunsch y Smith–Waterman), `registro`/`logging` (fachada con
   niveles por jerarquía, destinos, rotación y contexto) y `planilla`/`pivot`
   (pivote, melt, ventanas móviles, rangos; contra Pandas).
+- **Lote 11 (bilingüe):** `codigo_qr`/`qrcode` (QR 1–40 idéntico a
+  python-qrcode, EAN-13, UPC-A y Code 128; leídos con ZXing),
+  `panal`/`hexgrid` (hexágonos de igual área en todo el planeta, sin
+  costura en el antimeridiano, y grillas planas con A*), `malla_geo`/
+  `geometry2d` (Delaunay como SciPy, Voronoi, orejas, recorte, Welzl),
+  `unicode`/`unicode_en` (NFC/NFD, mayúsculas con ß e İ, grafemas, ancho y
+  orden en español), `agenda`/`schedule` (zonas TZif y POSIX, cron que
+  respeta el cambio de hora; contra Python zoneinfo), `consulta_archivos`/
+  `sqlfiles` (SQL con JOIN, GROUP BY y parámetros sobre CSV y JSON),
+  `entidades`/`entities` (ECS con conjuntos dispersos y señales) y
+  `federa`/`oidc` (PKCE, state, nonce y validación de ID tokens RS256,
+  EdDSA y HS256).
 - `rastreo`/`glob`: recorrer carpetas y buscar con comodines (`**`, `{a,b}`,
   `[a-z]`). El lenguaje suma `listar_carpeta`, `es_carpeta` y `crear_carpeta`
   (como `mkdir -p`).

@@ -1,0 +1,411 @@
+// stdlib/malla_geo.cfv — geometría computacional en el plano: triangulación
+// de Delaunay (Bowyer–Watson), diagramas de Voronoi recortados a una caja,
+// triangular polígonos simples (orejas), recortar un polígono contra otro
+// convexo (Sutherland–Hodgman), intersección de segmentos, círculo mínimo
+// (Welzl), par de puntos más cercano, ¿es convexo?, orientación y el
+// vecino natural de un punto. Inspirada en CGAL / delaunator (GPL/ISC:
+// solo la idea). En inglés: importar "geometry2d".
+//
+//   importar "malla_geo"
+//   sea t = malla_delaunay([[0, 0], [4, 0], [2, 3], [2, 1]])   // [[i, j, k], …]
+//   sea celdas = malla_voronoi(puntos, [0, 0, 100, 100])          // un polígono por punto
+//   malla_triangular([[0, 0], [4, 0], [4, 4], [2, 2], [0, 4]])
+
+/// Orientación: > 0 antihorario, < 0 horario, 0 colineales.
+funcion malla_orientacion(a, b, c) { retornar (b[0] - a[0]) * (c[1] - a[1]) - (b[1] - a[1]) * (c[0] - a[0]) }
+
+funcion _mg_circun(a, b, c) {
+    sea d = 2 * (a[0] * (b[1] - c[1]) + b[0] * (c[1] - a[1]) + c[0] * (a[1] - b[1]))
+    si (absoluto(d) < 0.000000000001) { retornar nulo }
+    sea a2 = a[0] * a[0] + a[1] * a[1]
+    sea b2 = b[0] * b[0] + b[1] * b[1]
+    sea c2 = c[0] * c[0] + c[1] * c[1]
+    sea ux = (a2 * (b[1] - c[1]) + b2 * (c[1] - a[1]) + c2 * (a[1] - b[1])) / d
+    sea uy = (a2 * (c[0] - b[0]) + b2 * (a[0] - c[0]) + c2 * (b[0] - a[0])) / d
+    retornar [ux, uy, (a[0] - ux) * (a[0] - ux) + (a[1] - uy) * (a[1] - uy)]
+}
+
+/// Centro del círculo que pasa por tres puntos (nulo si son colineales).
+funcion malla_circuncentro(a, b, c) {
+    sea r = _mg_circun(a, b, c)
+    si (r == nulo) { retornar nulo }
+    retornar [r[0], r[1]]
+}
+
+/// Triangulación de Delaunay: lista de triángulos [i, j, k] (índices de
+/// los puntos, en sentido antihorario). Ignora puntos repetidos.
+funcion malla_delaunay(puntos) {
+    sea n = longitud(puntos)
+    si (n < 3) { retornar [] }
+    sea minx = puntos[0][0]
+    sea miny = puntos[0][1]
+    sea maxx = minx
+    sea maxy = miny
+    para p en puntos {
+        minx = minimo(minx, p[0])  miny = minimo(miny, p[1])
+        maxx = maximo(maxx, p[0])  maxy = maximo(maxy, p[1])
+    }
+    sea d = maximo(maxx - minx, maxy - miny) * 20 + 1
+    sea mx = (minx + maxx) / 2
+    sea my = (miny + maxy) / 2
+    sea pts = []
+    para p en puntos { pts.agregar(p) }
+    pts.agregar([mx - d, my - d])
+    pts.agregar([mx + d, my - d])
+    pts.agregar([mx, my + d])
+    sea tris = [[n, n + 1, n + 2, _mg_circun(pts[n], pts[n + 1], pts[n + 2])]]
+    sea vistos = {}
+    sea i = 0
+    mientras (i < n) {
+        sea p = pts[i]
+        sea k = "" + p[0] + "," + p[1]
+        si (tiene_clave(vistos, k) == falso) {
+            vistos[k] = verdadero
+            sea malos = []
+            sea buenos = []
+            para t en tris {
+                sea c = t[3]
+                si (c != nulo y (p[0] - c[0]) * (p[0] - c[0]) + (p[1] - c[1]) * (p[1] - c[1]) < c[2] * (1 + 0.000000001)) { malos.agregar(t) } sino { buenos.agregar(t) }
+            }
+            // Borde de la cavidad: aristas que aparecen una sola vez.
+            sea cuenta = {}
+            para t en malos {
+                para e en [[t[0], t[1]], [t[1], t[2]], [t[2], t[0]]] {
+                    sea ke = minimo(e[0], e[1]) + "_" + maximo(e[0], e[1])
+                    cuenta[ke] = (cuenta[ke] ?? 0) + 1
+                }
+            }
+            para t en malos {
+                para e en [[t[0], t[1]], [t[1], t[2]], [t[2], t[0]]] {
+                    sea ke = minimo(e[0], e[1]) + "_" + maximo(e[0], e[1])
+                    si (cuenta[ke] == 1) {
+                        sea a = e[0]
+                        sea b = e[1]
+                        si (malla_orientacion(pts[a], pts[b], p) < 0) { sea tmp = a  a = b  b = tmp }
+                        buenos.agregar([a, b, i, _mg_circun(pts[a], pts[b], p)])
+                    }
+                }
+            }
+            tris = buenos
+        }
+        i = i + 1
+    }
+    sea r = []
+    para t en tris {
+        si (t[0] < n y t[1] < n y t[2] < n y absoluto(malla_orientacion(pts[t[0]], pts[t[1]], pts[t[2]])) > 0.000000000001) { r.agregar([t[0], t[1], t[2]]) }
+    }
+    retornar r
+}
+
+/// Aristas únicas de una triangulación: [[i, j], …] con i < j.
+funcion malla_aristas(triangulos) {
+    sea vistos = {}
+    sea r = []
+    para t en triangulos {
+        para e en [[t[0], t[1]], [t[1], t[2]], [t[2], t[0]]] {
+            sea a = minimo(e[0], e[1])
+            sea b = maximo(e[0], e[1])
+            sea k = a + "_" + b
+            si (tiene_clave(vistos, k) == falso) { vistos[k] = verdadero  r.agregar([a, b]) }
+        }
+    }
+    retornar ordenar(r, funcion(x, z) {
+        si (x[0] != z[0]) { retornar x[0] - z[0] }
+        retornar x[1] - z[1]
+    })
+}
+
+// Recorta un polígono contra un semiplano (a·x + b·y <= c).
+funcion _mg_semiplano(poli, a, b, c) {
+    sea r = []
+    sea n = longitud(poli)
+    si (n == 0) { retornar r }
+    sea i = 0
+    mientras (i < n) {
+        sea p = poli[i]
+        sea q = poli[(i + 1) % n]
+        sea fp = a * p[0] + b * p[1] - c
+        sea fq = a * q[0] + b * q[1] - c
+        si (fp <= 0) { r.agregar(p) }
+        si ((fp < 0 y fq > 0) o (fp > 0 y fq < 0)) {
+            sea t = fp / (fp - fq)
+            r.agregar([p[0] + (q[0] - p[0]) * t, p[1] + (q[1] - p[1]) * t])
+        }
+        i = i + 1
+    }
+    retornar r
+}
+
+/// Diagrama de Voronoi: para cada punto, su celda (polígono antihorario)
+/// recortada a la caja [minx, miny, maxx, maxy].
+funcion malla_voronoi(puntos, caja) {
+    sea n = longitud(puntos)
+    sea tris = malla_delaunay(puntos)
+    sea vecinos = []
+    sea i = 0
+    mientras (i < n) { vecinos.agregar({})  i = i + 1 }
+    para t en tris {
+        vecinos[t[0]]["" + t[1]] = t[1]  vecinos[t[0]]["" + t[2]] = t[2]
+        vecinos[t[1]]["" + t[0]] = t[0]  vecinos[t[1]]["" + t[2]] = t[2]
+        vecinos[t[2]]["" + t[0]] = t[0]  vecinos[t[2]]["" + t[1]] = t[1]
+    }
+    sea r = []
+    i = 0
+    mientras (i < n) {
+        sea poli = [[caja[0], caja[1]], [caja[2], caja[1]], [caja[2], caja[3]], [caja[0], caja[3]]]
+        sea p = puntos[i]
+        // Sin triangulación (pocos puntos o colineales) usa todos como vecinos.
+        sea vs = []
+        si (longitud(tris) == 0) {
+            sea j = 0
+            mientras (j < n) { si (j != i) { vs.agregar(j) }  j = j + 1 }
+        } sino { para k en claves(vecinos[i]) { vs.agregar(vecinos[i][k]) } }
+        para j en vs {
+            sea q = puntos[j]
+            si (q[0] != p[0] o q[1] != p[1]) {
+                // Semiplano más cerca de p que de q.
+                sea a = q[0] - p[0]
+                sea b = q[1] - p[1]
+                sea c = (q[0] * q[0] + q[1] * q[1] - p[0] * p[0] - p[1] * p[1]) / 2
+                poli = _mg_semiplano(poli, a, b, c)
+            }
+        }
+        r.agregar(poli)
+        i = i + 1
+    }
+    retornar r
+}
+
+/// Área con signo (positiva si es antihoraria).
+funcion malla_area(poli) {
+    sea s = 0
+    sea n = longitud(poli)
+    sea i = 0
+    mientras (i < n) {
+        sea a = poli[i]
+        sea b = poli[(i + 1) % n]
+        s = s + a[0] * b[1] - b[0] * a[1]
+        i = i + 1
+    }
+    retornar s / 2
+}
+
+funcion _mg_en_triangulo(p, a, b, c) {
+    sea d1 = malla_orientacion(a, b, p)
+    sea d2 = malla_orientacion(b, c, p)
+    sea d3 = malla_orientacion(c, a, p)
+    retornar d1 >= 0 y d2 >= 0 y d3 >= 0
+}
+
+/// Triangula un polígono simple (sin huecos) por orejas: [[i, j, k], …].
+funcion malla_triangular(poli) {
+    sea n = longitud(poli)
+    si (n < 3) { retornar [] }
+    // Rechaza polígonos que se cruzan (aristas no vecinas que se tocan).
+    sea a = 0
+    mientras (a < n) {
+        sea b = a + 2
+        mientras (b < n) {
+            si ((b + 1) % n != a) {
+                si (malla_interseccion(poli[a], poli[(a + 1) % n], poli[b], poli[(b + 1) % n]) != nulo) { lanzar "malla_geo: el polígono no es simple (se cruza) o tiene puntos repetidos" }
+            }
+            b = b + 1
+        }
+        a = a + 1
+    }
+    sea idx = []
+    sea i = 0
+    mientras (i < n) { idx.agregar(i)  i = i + 1 }
+    si (malla_area(poli) < 0) {
+        sea inv = []
+        i = n - 1
+        mientras (i >= 0) { inv.agregar(i)  i = i - 1 }
+        idx = inv
+    }
+    sea r = []
+    sea guardia = 0
+    mientras (longitud(idx) > 3 y guardia < n * n) {
+        guardia = guardia + 1
+        sea m = longitud(idx)
+        sea hecho = falso
+        i = 0
+        mientras (i < m y hecho == falso) {
+            sea a = idx[(i + m - 1) % m]
+            sea b = idx[i]
+            sea c = idx[(i + 1) % m]
+            si (malla_orientacion(poli[a], poli[b], poli[c]) > 0.000000000001) {
+                sea oreja = verdadero
+                para k en idx {
+                    si (oreja y k != a y k != b y k != c y _mg_en_triangulo(poli[k], poli[a], poli[b], poli[c])) { oreja = falso }
+                }
+                si (oreja) {
+                    r.agregar([a, b, c])
+                    sea nuevo = []
+                    sea j = 0
+                    mientras (j < m) { si (j != i) { nuevo.agregar(idx[j]) }  j = j + 1 }
+                    idx = nuevo
+                    hecho = verdadero
+                }
+            }
+            i = i + 1
+        }
+        si (hecho == falso) { lanzar "malla_geo: el polígono no es simple (se cruza) o tiene puntos repetidos" }
+    }
+    si (longitud(idx) == 3) { r.agregar([idx[0], idx[1], idx[2]]) }
+    retornar r
+}
+
+/// ¿Es convexo el polígono?
+funcion malla_es_convexo(poli) {
+    sea n = longitud(poli)
+    si (n < 3) { retornar falso }
+    sea signo = 0
+    sea i = 0
+    mientras (i < n) {
+        sea o = malla_orientacion(poli[i], poli[(i + 1) % n], poli[(i + 2) % n])
+        si (absoluto(o) > 0.000000000001) {
+            sea sg = 1
+            si (o < 0) { sg = -1 }
+            si (signo == 0) { signo = sg } sino { si (sg != signo) { retornar falso } }
+        }
+        i = i + 1
+    }
+    retornar signo != 0
+}
+
+/// Recorta `poli` contra un polígono convexo `recorte` (Sutherland–Hodgman).
+funcion malla_recortar(poli, recorte) {
+    si (malla_es_convexo(recorte) == falso) { lanzar "malla_geo: el polígono de recorte debe ser convexo" }
+    sea c = recorte
+    si (malla_area(c) < 0) {
+        sea inv = []
+        sea i = longitud(c) - 1
+        mientras (i >= 0) { inv.agregar(c[i])  i = i - 1 }
+        c = inv
+    }
+    sea r = poli
+    sea n = longitud(c)
+    sea i = 0
+    mientras (i < n y longitud(r) > 0) {
+        sea a = c[i]
+        sea b = c[(i + 1) % n]
+        // Dentro = a la izquierda de a→b:  (b-a) × (p-a) >= 0.
+        sea nx = b[1] - a[1]
+        sea ny = a[0] - b[0]
+        r = _mg_semiplano(r, nx, ny, nx * a[0] + ny * a[1])
+        i = i + 1
+    }
+    retornar r
+}
+
+/// Intersección de los segmentos ab y cd: el punto, o nulo.
+funcion malla_interseccion(a, b, c, d) {
+    sea r = [b[0] - a[0], b[1] - a[1]]
+    sea s = [d[0] - c[0], d[1] - c[1]]
+    sea den = r[0] * s[1] - r[1] * s[0]
+    si (absoluto(den) < 0.000000000001) { retornar nulo }
+    sea t = ((c[0] - a[0]) * s[1] - (c[1] - a[1]) * s[0]) / den
+    sea u = ((c[0] - a[0]) * r[1] - (c[1] - a[1]) * r[0]) / den
+    si (t < 0 o t > 1 o u < 0 o u > 1) { retornar nulo }
+    retornar [a[0] + t * r[0], a[1] + t * r[1]]
+}
+
+funcion _mg_dentro_circ(c, p) { retornar c != nulo y (p[0] - c[0]) * (p[0] - c[0]) + (p[1] - c[1]) * (p[1] - c[1]) <= c[2] * (1 + 0.0000000001) + 0.0000000001 }
+
+funcion _mg_circ2(a, b) { retornar [(a[0] + b[0]) / 2, (a[1] + b[1]) / 2, ((a[0] - b[0]) * (a[0] - b[0]) + (a[1] - b[1]) * (a[1] - b[1])) / 4] }
+
+/// Círculo mínimo que contiene todos los puntos: {"centro": [x, y], "radio"}.
+funcion malla_circulo_minimo(puntos) {
+    si (longitud(puntos) == 0) { lanzar "malla_geo: no hay puntos" }
+    // Welzl iterativo sobre un orden fijo pero mezclado (reproducible).
+    sea p = []
+    para x en puntos { p.agregar(x) }
+    sea est = 12345
+    sea i = longitud(p) - 1
+    mientras (i > 0) {
+        est = (est * 48271) % 2147483647
+        sea j = est % (i + 1)
+        sea t = p[i]  p[i] = p[j]  p[j] = t
+        i = i - 1
+    }
+    sea c = [p[0][0], p[0][1], 0]
+    i = 1
+    mientras (i < longitud(p)) {
+        si (_mg_dentro_circ(c, p[i]) == falso) {
+            c = [p[i][0], p[i][1], 0]
+            sea j = 0
+            mientras (j < i) {
+                si (_mg_dentro_circ(c, p[j]) == falso) {
+                    c = _mg_circ2(p[i], p[j])
+                    sea k = 0
+                    mientras (k < j) {
+                        si (_mg_dentro_circ(c, p[k]) == falso) {
+                            sea cc = _mg_circun(p[i], p[j], p[k])
+                            si (cc != nulo) { c = cc }
+                        }
+                        k = k + 1
+                    }
+                }
+                j = j + 1
+            }
+        }
+        i = i + 1
+    }
+    retornar {"centro": [c[0], c[1]], "radio": raiz(c[2])}
+}
+
+/// Par de puntos más cercano: {"i", "j", "distancia"} (barrido ordenado).
+funcion malla_par_cercano(puntos) {
+    sea n = longitud(puntos)
+    si (n < 2) { lanzar "malla_geo: se necesitan al menos 2 puntos" }
+    sea idx = []
+    sea i = 0
+    mientras (i < n) { idx.agregar(i)  i = i + 1 }
+    idx = ordenar(idx, funcion(a, b) { retornar puntos[a][0] - puntos[b][0] })
+    sea mejor = nulo
+    sea bi = 0
+    sea bj = 1
+    i = 0
+    mientras (i < n) {
+        sea j = i + 1
+        sea seguir = verdadero
+        mientras (j < n y seguir) {
+            sea a = puntos[idx[i]]
+            sea b = puntos[idx[j]]
+            sea dx = b[0] - a[0]
+            si (mejor != nulo y dx * dx >= mejor) { seguir = falso } sino {
+                sea d = dx * dx + (b[1] - a[1]) * (b[1] - a[1])
+                si (mejor == nulo o d < mejor) { mejor = d  bi = idx[i]  bj = idx[j] }
+            }
+            j = j + 1
+        }
+        i = i + 1
+    }
+    retornar {"i": minimo(bi, bj), "j": maximo(bi, bj), "distancia": raiz(mejor)}
+}
+
+/// Triángulo de la triangulación que contiene el punto (índice o -1).
+funcion malla_localizar(puntos, triangulos, p) {
+    sea i = 0
+    mientras (i < longitud(triangulos)) {
+        sea t = triangulos[i]
+        si (_mg_en_triangulo(p, puntos[t[0]], puntos[t[1]], puntos[t[2]])) { retornar i }
+        i = i + 1
+    }
+    retornar -1
+}
+
+/// Interpola un valor en p con coordenadas baricéntricas sobre la triangulación.
+funcion malla_interpolar(puntos, valores, triangulos, p) {
+    sea k = malla_localizar(puntos, triangulos, p)
+    si (k < 0) { retornar nulo }
+    sea t = triangulos[k]
+    sea a = puntos[t[0]]
+    sea b = puntos[t[1]]
+    sea c = puntos[t[2]]
+    sea total = malla_orientacion(a, b, c)
+    sea wa = malla_orientacion(b, c, p) / total
+    sea wb = malla_orientacion(c, a, p) / total
+    sea wc = 1 - wa - wb
+    retornar wa * valores[t[0]] + wb * valores[t[1]] + wc * valores[t[2]]
+}
