@@ -1,0 +1,616 @@
+// stdlib/recolecta.cfv — navegar sitios como un usuario, sin navegador:
+// sesiones con cookies (RFC 6265: dominio, ruta, expiración, Secure,
+// HttpOnly), redirecciones, URLs relativas (RFC 3986), formularios
+// (leerlos, completarlos y enviarlos, incluido el token CSRF oculto),
+// robots.txt (comodines, Allow/Disallow más específico, Crawl-delay),
+// sitemaps y un rastreador con límite de páginas y espera por servidor.
+// Usa "cosecha" para el HTML. El transporte es reemplazable (pruebas o
+// proxies). Inspirada en Fantoccini / Scrapy (MIT/BSD). En inglés:
+// importar "crawler".
+//
+//   importar "recolecta"
+//   sea s = recolecta_sesion({"agente": "MiBot/1.0"})
+//   sea p = recolecta_get(s, "https://ejemplo.cl/login")
+//   sea f = recolecta_formularios(p)[0]
+//   sea r = recolecta_enviar(s, f, {"usuario": "ana", "clave": "…"})
+//   para a en recolecta_enlaces(r) { … }
+
+importar "cosecha"
+importar "xml"
+
+// ── URLs ──────────────────────────────────────────────────────────────────
+
+/// Partes de una URL: {"esquema", "autoridad", "host", "puerto", "ruta", "consulta", "fragmento"}.
+funcion recolecta_partes(url) {
+    sea u = "" + url
+    sea r = {"esquema": nulo, "autoridad": nulo, "ruta": "", "consulta": nulo, "fragmento": nulo}
+    sea i = texto_indice(u, "#")
+    si (i >= 0) { r["fragmento"] = subcadena(u, i + 1, longitud(u))  u = subcadena(u, 0, i) }
+    i = texto_indice(u, "?")
+    si (i >= 0) { r["consulta"] = subcadena(u, i + 1, longitud(u))  u = subcadena(u, 0, i) }
+    sea dos = texto_indice(u, ":")
+    sea barra = texto_indice(u, "/")
+    si (dos > 0 y (barra < 0 o dos < barra)) {
+        r["esquema"] = texto_minusculas(subcadena(u, 0, dos))
+        u = subcadena(u, dos + 1, longitud(u))
+    }
+    si (texto_empieza_con(u, "//")) {
+        u = subcadena(u, 2, longitud(u))
+        sea j = texto_indice(u, "/")
+        si (j < 0) { r["autoridad"] = u  u = "" } sino { r["autoridad"] = subcadena(u, 0, j)  u = subcadena(u, j, longitud(u)) }
+    }
+    r["ruta"] = u
+    sea host = r["autoridad"]
+    sea puerto = nulo
+    si (host != nulo) {
+        sea at = texto_indice(host, "@")
+        si (at >= 0) { host = subcadena(host, at + 1, longitud(host)) }
+        sea c = texto_indice(host, ":")
+        si (c >= 0 y texto_empieza_con(host, "[") == falso) { puerto = subcadena(host, c + 1, longitud(host))  host = subcadena(host, 0, c) }
+        host = texto_minusculas(host)
+    }
+    r["host"] = host
+    r["puerto"] = puerto
+    retornar r
+}
+
+funcion _rc_quitar_puntos(ruta) {
+    sea entrada = texto_dividir(ruta, "/")
+    sea salida = []
+    sea i = 0
+    mientras (i < longitud(entrada)) {
+        sea seg = entrada[i]
+        si (seg == "..") {
+            si (longitud(salida) > 1) { quitar_ultimo(salida) }
+            si (i == longitud(entrada) - 1) { salida.agregar("") }
+        } sino {
+            si (seg == ".") {
+                si (i == longitud(entrada) - 1) { salida.agregar("") }
+            } sino { salida.agregar(seg) }
+        }
+        i = i + 1
+    }
+    sea r = unir(salida, "/")
+    si (texto_empieza_con(ruta, "/") y texto_empieza_con(r, "/") == falso) { r = "/" + r }
+    retornar r
+}
+
+funcion _rc_armar(p) {
+    sea r = ""
+    si (p["esquema"] != nulo) { r = p["esquema"] + ":" }
+    si (p["autoridad"] != nulo) { r = r + "//" + p["autoridad"] }
+    r = r + p["ruta"]
+    si (p["consulta"] != nulo) { r = r + "?" + p["consulta"] }
+    si (p["fragmento"] != nulo) { r = r + "#" + p["fragmento"] }
+    retornar r
+}
+
+/// Resuelve una referencia relativa contra una base (RFC 3986 §5.2).
+funcion recolecta_resolver(base, rel) {
+    sea b = recolecta_partes(base)
+    sea r = recolecta_partes(texto_recortar("" + rel))
+    sea t = {"fragmento": r["fragmento"]}
+    si (r["esquema"] != nulo) {
+        t["esquema"] = r["esquema"]
+        t["autoridad"] = r["autoridad"]
+        t["ruta"] = _rc_quitar_puntos(r["ruta"])
+        t["consulta"] = r["consulta"]
+    } sino {
+        si (r["autoridad"] != nulo) {
+            t["autoridad"] = r["autoridad"]
+            t["ruta"] = _rc_quitar_puntos(r["ruta"])
+            t["consulta"] = r["consulta"]
+        } sino {
+            si (r["ruta"] == "") {
+                t["ruta"] = b["ruta"]
+                t["consulta"] = r["consulta"] ?? b["consulta"]
+                si (r["consulta"] == nulo) { t["consulta"] = b["consulta"] }
+            } sino {
+                si (texto_empieza_con(r["ruta"], "/")) { t["ruta"] = _rc_quitar_puntos(r["ruta"]) } sino {
+                    sea bp = b["ruta"]
+                    sea fusion = ""
+                    si (b["autoridad"] != nulo y bp == "") { fusion = "/" + r["ruta"] } sino {
+                        sea k = longitud(bp) - 1
+                        mientras (k >= 0 y subcadena(bp, k, k + 1) != "/") { k = k - 1 }
+                        fusion = subcadena(bp, 0, k + 1) + r["ruta"]
+                    }
+                    t["ruta"] = _rc_quitar_puntos(fusion)
+                }
+                t["consulta"] = r["consulta"]
+            }
+            t["autoridad"] = b["autoridad"]
+        }
+        t["esquema"] = b["esquema"]
+    }
+    retornar _rc_armar(t)
+}
+
+// ── Cookies ───────────────────────────────────────────────────────────────
+
+sea _RC_MESES = {"jan": 1, "feb": 2, "mar": 3, "apr": 4, "may": 5, "jun": 6, "jul": 7, "aug": 8, "sep": 9, "oct": 10, "nov": 11, "dec": 12}
+
+funcion _rc_dias(a, m, d) {
+    sea yy = a
+    si (m <= 2) { yy = yy - 1 }
+    sea era = piso(yy / 400)
+    sea yoe = yy - era * 400
+    sea mp = (m + 9) % 12
+    sea doy = piso((153 * mp + 2) / 5) + d - 1
+    sea doe = yoe * 365 + piso(yoe / 4) - piso(yoe / 100) + doy
+    retornar era * 146097 + doe - 719468
+}
+
+/// Fecha HTTP ("Wed, 21 Oct 2026 07:28:00 GMT") → ms; nulo si no se entiende.
+funcion recolecta_fecha_http(t) {
+    sea partes = []
+    para x en texto_dividir(texto_reemplazar(texto_reemplazar("" + t, ",", " "), "-", " "), " ") { si (x != "") { partes.agregar(x) } }
+    sea dia = nulo
+    sea mes = nulo
+    sea anio = nulo
+    sea h = nulo
+    para x en partes {
+        si (texto_indice(x, ":") > 0 y h == nulo) { h = texto_dividir(x, ":") } sino {
+            sea lm = texto_minusculas(subcadena(x, 0, minimo(3, longitud(x))))
+            si (tiene_clave(_RC_MESES, lm) y mes == nulo) { mes = _RC_MESES[lm] } sino {
+                sea n = nulo
+                intentar { n = a_numero(x) } capturar (e) { n = nulo }
+                si (n != nulo) {
+                    si (dia == nulo y n >= 1 y n <= 31 y longitud(x) <= 2) { dia = n } sino { si (anio == nulo) { anio = n } }
+                }
+            }
+        }
+    }
+    si (dia == nulo o mes == nulo o anio == nulo o h == nulo) { retornar nulo }
+    si (anio < 100) {
+        si (anio < 70) { anio = anio + 2000 } sino { anio = anio + 1900 }
+    }
+    retornar ((_rc_dias(anio, mes, dia) * 86400) + a_numero(h[0]) * 3600 + a_numero(h[1]) * 60 + a_numero(h[2] ?? "0")) * 1000
+}
+
+funcion _rc_ahora(s) {
+    si (s["reloj"] != nulo) { retornar s["reloj"]() }
+    retornar tiempo_ms()
+}
+
+funcion _rc_ruta_defecto(ruta) {
+    si (texto_empieza_con(ruta, "/") == falso) { retornar "/" }
+    sea k = longitud(ruta) - 1
+    mientras (k > 0 y subcadena(ruta, k, k + 1) != "/") { k = k - 1 }
+    si (k <= 0) { retornar "/" }
+    retornar subcadena(ruta, 0, k)
+}
+
+/// Guarda una cabecera Set-Cookie recibida desde url.
+funcion recolecta_guardar_cookie(s, url, cabecera) {
+    sea u = recolecta_partes(url)
+    sea partes = texto_dividir("" + cabecera, ";")
+    sea par = texto_recortar(partes[0])
+    sea eq = texto_indice(par, "=")
+    si (eq <= 0) { retornar nulo }
+    sea c = {"nombre": texto_recortar(subcadena(par, 0, eq)), "valor": texto_recortar(subcadena(par, eq + 1, longitud(par))), "dominio": u["host"], "solo_host": verdadero, "ruta": _rc_ruta_defecto(u["ruta"]), "expira": nulo, "segura": falso, "http": falso, "mismo_sitio": nulo}
+    sea i = 1
+    mientras (i < longitud(partes)) {
+        sea a = texto_recortar(partes[i])
+        sea e = texto_indice(a, "=")
+        sea k = texto_minusculas(a)
+        sea v = ""
+        si (e >= 0) { k = texto_minusculas(texto_recortar(subcadena(a, 0, e)))  v = texto_recortar(subcadena(a, e + 1, longitud(a))) }
+        si (k == "domain" y v != "") {
+            sea d = texto_minusculas(v)
+            si (texto_empieza_con(d, ".")) { d = subcadena(d, 1, longitud(d)) }
+            // Debe ser el mismo host o un dominio padre (y no un TLD suelto).
+            si ((u["host"] == d o texto_termina_con(u["host"], "." + d)) y texto_indice(d, ".") > 0) { c["dominio"] = d  c["solo_host"] = falso } sino { retornar nulo }
+        }
+        si (k == "path" y texto_empieza_con(v, "/")) { c["ruta"] = v }
+        si (k == "expires" y c["expira"] == nulo) { c["expira"] = recolecta_fecha_http(v) }
+        si (k == "max-age") {
+            sea n = nulo
+            intentar { n = a_numero(v) } capturar (err) { n = nulo }
+            si (n != nulo) { c["expira"] = _rc_ahora(s) + n * 1000  c["max_age"] = verdadero }
+        }
+        si (k == "secure") { c["segura"] = verdadero }
+        si (k == "httponly") { c["http"] = verdadero }
+        si (k == "samesite") { c["mismo_sitio"] = texto_minusculas(v) }
+        i = i + 1
+    }
+    // __Host- y __Secure- (prefijos de seguridad).
+    si (texto_empieza_con(c["nombre"], "__Secure-") y c["segura"] == falso) { retornar nulo }
+    si (texto_empieza_con(c["nombre"], "__Host-") y (c["segura"] == falso o c["solo_host"] == falso o c["ruta"] != "/")) { retornar nulo }
+    si (c["segura"] y u["esquema"] != "https") { retornar nulo }
+    sea k = c["dominio"] + "|" + c["ruta"] + "|" + c["nombre"]
+    si (c["expira"] != nulo y c["expira"] <= _rc_ahora(s)) { quitar_clave(s["cookies"], k) } sino { s["cookies"][k] = c }
+    retornar c
+}
+
+/// Cabecera Cookie para una URL ("a=1; b=2"), o "".
+funcion recolecta_cookies_para(s, url) {
+    sea u = recolecta_partes(url)
+    sea ahora = _rc_ahora(s)
+    sea l = []
+    para k en claves(s["cookies"]) {
+        sea c = s["cookies"][k]
+        sea vale = verdadero
+        si (c["expira"] != nulo y c["expira"] <= ahora) { vale = falso }
+        si (c["solo_host"]) { si (u["host"] != c["dominio"]) { vale = falso } } sino {
+            si (u["host"] != c["dominio"] y texto_termina_con(u["host"], "." + c["dominio"]) == falso) { vale = falso }
+        }
+        sea ruta = u["ruta"]
+        si (ruta == "") { ruta = "/" }
+        si (ruta != c["ruta"] y (texto_empieza_con(ruta, c["ruta"]) == falso o (texto_termina_con(c["ruta"], "/") == falso y subcadena(ruta, longitud(c["ruta"]), longitud(c["ruta"]) + 1) != "/"))) { vale = falso }
+        si (c["segura"] y u["esquema"] != "https") { vale = falso }
+        si (vale) { l.agregar(c) }
+    }
+    // Rutas más largas primero (RFC 6265 §5.4).
+    l = ordenar(l, funcion(a, b) { retornar longitud(b["ruta"]) - longitud(a["ruta"]) })
+    sea r = []
+    para c en l { r.agregar(c["nombre"] + "=" + c["valor"]) }
+    retornar unir(r, "; ")
+}
+
+funcion recolecta_cookies(s) {
+    sea r = []
+    para k en claves(s["cookies"]) { r.agregar(s["cookies"][k]) }
+    retornar r
+}
+
+// ── Sesión y peticiones ───────────────────────────────────────────────────
+
+funcion _rc_transporte_red(metodo, url, cabeceras, cuerpo) {
+    sea r = http_solicitud(metodo, url, {"cabeceras": cabeceras, "cuerpo": cuerpo, "redirecciones": 0})
+    // Set-Cookie puede venir varias veces: se leen del texto crudo.
+    sea cookies = []
+    para linea en texto_dividir(r["cabeceras_texto"] ?? "", "\n") {
+        sea p = texto_indice(linea, ":")
+        si (p > 0 y texto_minusculas(texto_recortar(subcadena(linea, 0, p))) == "set-cookie") { cookies.agregar(texto_recortar(subcadena(linea, p + 1, longitud(linea)))) }
+    }
+    retornar {"estado": r["estado"], "cabeceras": r["cabeceras"] ?? {}, "cuerpo": r["cuerpo"] ?? "", "set_cookie": cookies}
+}
+
+/// opciones: agente (User-Agent), transporte (f(metodo, url, cabeceras,
+/// cuerpo) → {"estado", "cabeceras", "cuerpo", "set_cookie": [...]}),
+/// max_redirecciones (10), cabeceras (extra), reloj (f → ms).
+funcion recolecta_sesion(opciones) {
+    sea o = opciones ?? {}
+    retornar {"agente": o["agente"] ?? "C-Forge recolecta/1.0", "transporte": o["transporte"] ?? _rc_transporte_red, "max": o["max_redirecciones"] ?? 10, "extra": o["cabeceras"] ?? {}, "cookies": {}, "reloj": o["reloj"] ?? nulo, "historial": []}
+}
+
+/// Petición con cookies y redirecciones. Devuelve {"estado", "url"
+/// (final), "cabeceras", "cuerpo", "doc" (HTML ya leído o nulo)}.
+funcion recolecta_pedir(s, metodo, url, cuerpo, cabeceras) {
+    sea m = texto_mayusculas(metodo)
+    sea u = url
+    sea c = cuerpo
+    sea saltos = 0
+    mientras (verdadero) {
+        sea p = recolecta_partes(u)
+        si (p["esquema"] != "http" y p["esquema"] != "https") { lanzar "recolecta: solo http y https (" + u + ")" }
+        sea cab = {"User-Agent": s["agente"], "Accept": "text/html,application/xhtml+xml,*/*;q=0.8"}
+        para k en claves(s["extra"]) { cab[k] = s["extra"][k] }
+        si (cabeceras != nulo) { para k en claves(cabeceras) { cab[k] = cabeceras[k] } }
+        sea ck = recolecta_cookies_para(s, u)
+        si (ck != "") { cab["Cookie"] = ck }
+        sea r = s["transporte"](m, u, cab, c)
+        para sc en (r["set_cookie"] ?? []) { recolecta_guardar_cookie(s, u, sc) }
+        s["historial"].agregar({"metodo": m, "url": u, "estado": r["estado"]})
+        sea loc = (r["cabeceras"] ?? {})["location"] ?? nulo
+        si (r["estado"] >= 300 y r["estado"] < 400 y loc != nulo) {
+            saltos = saltos + 1
+            si (saltos > s["max"]) { lanzar "recolecta: demasiadas redirecciones desde " + url }
+            u = recolecta_resolver(u, loc)
+            // 303 (y 301/302 tras POST) se repiten como GET sin cuerpo.
+            si (r["estado"] == 303 o ((r["estado"] == 301 o r["estado"] == 302) y m == "POST")) { m = "GET"  c = nulo  cabeceras = nulo }
+        } sino {
+            sea tipo_ = texto_minusculas((r["cabeceras"] ?? {})["content-type"] ?? "")
+            sea doc = nulo
+            si (texto_indice(tipo_, "html") >= 0 o (tipo_ == "" y texto_indice(texto_minusculas(subcadena("" + r["cuerpo"], 0, 200)), "<html") >= 0)) { doc = cosecha_cargar(r["cuerpo"]) }
+            retornar {"estado": r["estado"], "url": u, "cabeceras": r["cabeceras"] ?? {}, "cuerpo": r["cuerpo"], "doc": doc}
+        }
+    }
+}
+
+funcion recolecta_get(s, url, cabeceras) { retornar recolecta_pedir(s, "GET", url, nulo, cabeceras) }
+
+funcion _rc_form(campos) {
+    sea l = []
+    para par en campos {
+        l.agregar(_rc_cod(par[0]) + "=" + _rc_cod(par[1]))
+    }
+    retornar unir(l, "&")
+}
+
+funcion _rc_cod(t) {
+    sea s = "" + t
+    sea r = ""
+    sea hx = "0123456789ABCDEF"
+    sea i = 0
+    mientras (i < longitud(s)) {
+        sea b = byte_en(s, i)
+        si ((b >= 48 y b <= 57) o (b >= 65 y b <= 90) o (b >= 97 y b <= 122) o b == 45 o b == 46 o b == 95 o b == 42) { r = r + subcadena(s, i, i + 1) } sino {
+            si (b == 32) { r = r + "+" } sino { r = r + "%" + subcadena(hx, piso(b / 16), piso(b / 16) + 1) + subcadena(hx, b % 16, b % 16 + 1) }
+        }
+        i = i + 1
+    }
+    retornar r
+}
+
+/// POST de un formulario (mapa o lista de pares).
+funcion recolecta_post(s, url, campos) {
+    sea pares = campos
+    si (tipo(campos) == "mapa") {
+        pares = []
+        para k en claves(campos) { pares.agregar([k, campos[k]]) }
+    }
+    retornar recolecta_pedir(s, "POST", url, _rc_form(pares), {"Content-Type": "application/x-www-form-urlencoded"})
+}
+
+// ── Formularios y enlaces ─────────────────────────────────────────────────
+
+funcion _rc_doc(p) {
+    si (tipo(p) == "mapa" y tiene_clave(p, "doc")) { retornar p["doc"] }
+    retornar p
+}
+
+funcion _rc_base(p, base) {
+    si (base != nulo) { retornar base }
+    si (tipo(p) == "mapa" y tiene_clave(p, "url")) {
+        sea b = cosecha_primero(p["doc"], "base[href]")
+        si (b != nulo) { retornar recolecta_resolver(p["url"], cosecha_attr(b, "href")) }
+        retornar p["url"]
+    }
+    retornar ""
+}
+
+/// Formularios de una página: [{"accion", "metodo", "campos": [[nombre, valor]],
+/// "botones": [...], "id"}]. Los checkbox/radio sin marcar no se incluyen.
+funcion recolecta_formularios(pagina, base) {
+    sea doc = _rc_doc(pagina)
+    sea b = _rc_base(pagina, base)
+    sea r = []
+    para f en cosecha_buscar(doc, "form") {
+        sea accion = cosecha_attr(f, "action") ?? ""
+        sea campos = []
+        sea botones = []
+        para el en cosecha_buscar(f, "input, select, textarea, button") {
+            sea nombre = cosecha_attr(el, "name")
+            si (nombre != nulo y cosecha_attr(el, "disabled") == nulo) {
+                sea tag = el["nombre"]
+                sea t = texto_minusculas(cosecha_attr(el, "type") ?? "text")
+                si (tag == "input") {
+                    si (t == "submit" o t == "image" o t == "button" o t == "reset") { botones.agregar([nombre, cosecha_attr(el, "value") ?? ""]) } sino {
+                        si (t == "checkbox" o t == "radio") {
+                            si (cosecha_attr(el, "checked") != nulo) { campos.agregar([nombre, cosecha_attr(el, "value") ?? "on"]) }
+                        } sino { si (t != "file") { campos.agregar([nombre, cosecha_attr(el, "value") ?? ""]) } }
+                    }
+                }
+                si (tag == "textarea") { campos.agregar([nombre, cosecha_texto(el)]) }
+                si (tag == "select") {
+                    sea elegida = cosecha_primero(el, "option[selected]")
+                    si (elegida == nulo) { elegida = cosecha_primero(el, "option") }
+                    si (elegida != nulo) { campos.agregar([nombre, cosecha_attr(elegida, "value") ?? texto_recortar(cosecha_texto(elegida))]) }
+                }
+                si (tag == "button" y t == "submit") { botones.agregar([nombre, cosecha_attr(el, "value") ?? ""]) }
+            }
+        }
+        r.agregar({"accion": recolecta_resolver(b, accion), "metodo": texto_mayusculas(cosecha_attr(f, "method") ?? "GET"), "campos": campos, "botones": botones, "id": cosecha_attr(f, "id")})
+    }
+    retornar r
+}
+
+/// Completa y envía un formulario: cambios {nombre: valor} reemplaza o agrega.
+funcion recolecta_enviar(s, formulario, cambios, boton) {
+    sea pares = []
+    sea usados = {}
+    para p en formulario["campos"] {
+        si (cambios != nulo y tiene_clave(cambios, p[0])) {
+            si (tiene_clave(usados, p[0]) == falso) { pares.agregar([p[0], cambios[p[0]]])  usados[p[0]] = verdadero }
+        } sino { pares.agregar(p) }
+    }
+    si (cambios != nulo) { para k en claves(cambios) { si (tiene_clave(usados, k) == falso) { pares.agregar([k, cambios[k]]) } } }
+    si (boton != nulo) { para bt en formulario["botones"] { si (bt[0] == boton) { pares.agregar(bt) } } }
+    si (formulario["metodo"] == "POST") { retornar recolecta_pedir(s, "POST", formulario["accion"], _rc_form(pares), {"Content-Type": "application/x-www-form-urlencoded"}) }
+    sea u = formulario["accion"]
+    sea i = texto_indice(u, "?")
+    si (i >= 0) { u = subcadena(u, 0, i) }
+    retornar recolecta_get(s, u + "?" + _rc_form(pares))
+}
+
+/// Enlaces absolutos (sin fragmento, sin repetir) de una página.
+funcion recolecta_enlaces(pagina, base, selector) {
+    sea doc = _rc_doc(pagina)
+    sea b = _rc_base(pagina, base)
+    sea vistos = {}
+    sea r = []
+    para a en cosecha_buscar(doc, selector ?? "a[href]") {
+        sea h = texto_recortar(cosecha_attr(a, "href") ?? "")
+        sea hl = texto_minusculas(h)
+        si (h != "" y texto_empieza_con(h, "#") == falso y texto_empieza_con(hl, "javascript:") == falso y texto_empieza_con(hl, "mailto:") == falso y texto_empieza_con(hl, "tel:") == falso) {
+            sea abs = recolecta_resolver(b, h)
+            sea k = texto_indice(abs, "#")
+            si (k >= 0) { abs = subcadena(abs, 0, k) }
+            si (tiene_clave(vistos, abs) == falso) { vistos[abs] = verdadero  r.agregar(abs) }
+        }
+    }
+    retornar r
+}
+
+// ── robots.txt y sitemaps ─────────────────────────────────────────────────
+
+/// Reglas de robots.txt para un agente: {"reglas": [[permitir, patron]], "espera_s", "sitemaps"}.
+funcion recolecta_robots(texto, agente) {
+    sea ag = texto_minusculas(agente ?? "*")
+    sea grupos = []
+    sea actual = nulo
+    sea ultimo_era_agente = falso
+    sea sitemaps = []
+    para linea0 en texto_dividir("" + texto, "\n") {
+        sea linea = linea0
+        sea h = texto_indice(linea, "#")
+        si (h >= 0) { linea = subcadena(linea, 0, h) }
+        sea p = texto_indice(linea, ":")
+        si (p > 0) {
+            sea k = texto_minusculas(texto_recortar(subcadena(linea, 0, p)))
+            sea v = texto_recortar(subcadena(linea, p + 1, longitud(linea)))
+            si (k == "user-agent") {
+                si (ultimo_era_agente == falso o actual == nulo) {
+                    actual = {"agentes": [], "reglas": [], "espera": nulo}
+                    grupos.agregar(actual)
+                }
+                actual["agentes"].agregar(texto_minusculas(v))
+                ultimo_era_agente = verdadero
+            } sino {
+                ultimo_era_agente = falso
+                si (k == "sitemap") { sitemaps.agregar(v) }
+                si (actual != nulo) {
+                    si (k == "allow" y v != "") { actual["reglas"].agregar([verdadero, v]) }
+                    si (k == "disallow" y v != "") { actual["reglas"].agregar([falso, v]) }
+                    si (k == "crawl-delay") {
+                        intentar { actual["espera"] = a_numero(v) } capturar (e) { }
+                    }
+                }
+            }
+        }
+    }
+    // El grupo con el nombre de agente más específico que coincide; si no, "*".
+    sea elegido = nulo
+    sea largo = -1
+    para g en grupos {
+        para a en g["agentes"] {
+            si (a != "*" y texto_indice(ag, a) >= 0 y longitud(a) > largo) { elegido = g  largo = longitud(a) }
+        }
+    }
+    si (elegido == nulo) { para g en grupos { para a en g["agentes"] { si (a == "*" y elegido == nulo) { elegido = g } } } }
+    si (elegido == nulo) { retornar {"reglas": [], "espera_s": nulo, "sitemaps": sitemaps} }
+    retornar {"reglas": elegido["reglas"], "espera_s": elegido["espera"], "sitemaps": sitemaps}
+}
+
+funcion _rc_patron(patron, ruta) {
+    // * = cualquier cosa; $ al final = fin de la ruta.
+    sea fin = texto_termina_con(patron, "$")
+    sea p = patron
+    si (fin) { p = subcadena(p, 0, longitud(p) - 1) }
+    sea trozos = texto_dividir(p, "*")
+    sea pos = 0
+    sea i = 0
+    mientras (i < longitud(trozos)) {
+        sea t = trozos[i]
+        si (i == 0) {
+            si (texto_empieza_con(ruta, t) == falso) { retornar falso }
+            pos = longitud(t)
+        } sino {
+            sea resto = subcadena(ruta, pos, longitud(ruta))
+            sea k = texto_indice(resto, t)
+            si (t != "" y k < 0) { retornar falso }
+            si (t != "") { pos = pos + k + longitud(t) }
+        }
+        i = i + 1
+    }
+    si (fin) {
+        si (longitud(trozos) > 1 y trozos[longitud(trozos) - 1] == "") { retornar verdadero }
+        retornar texto_termina_con(ruta, trozos[longitud(trozos) - 1]) y (longitud(trozos) > 1 o pos == longitud(ruta))
+    }
+    retornar verdadero
+}
+
+/// ¿Se puede visitar la ruta (o URL)? La regla más larga que coincide gana;
+/// en empate, Allow.
+funcion recolecta_permitido(robots, ruta_o_url) {
+    sea r = "" + ruta_o_url
+    si (texto_indice(r, "://") > 0) {
+        sea p = recolecta_partes(r)
+        r = p["ruta"]
+        si (r == "") { r = "/" }
+        si (p["consulta"] != nulo) { r = r + "?" + p["consulta"] }
+    }
+    sea mejor = nulo
+    sea largo = -1
+    para regla en robots["reglas"] {
+        si (_rc_patron(regla[1], r)) {
+            si (longitud(regla[1]) > largo o (longitud(regla[1]) == largo y regla[0])) { mejor = regla  largo = longitud(regla[1]) }
+        }
+    }
+    retornar mejor == nulo o mejor[0]
+}
+
+/// URLs de un sitemap.xml (o índice de sitemaps): [{"url", "modificado"}].
+funcion recolecta_sitemap(texto) {
+    sea raiz = xml_analizar(texto)
+    sea r = []
+    para n en raiz["hijos"] {
+        si (tipo(n) == "mapa" y (n["nombre"] == "url" o n["nombre"] == "sitemap")) {
+            sea loc = xml_hijo(n, "loc")
+            sea mod = xml_hijo(n, "lastmod")
+            si (loc != nulo) {
+                sea m = nulo
+                si (mod != nulo) { m = texto_recortar(xml_contenido(mod)) }
+                r.agregar({"url": texto_recortar(xml_contenido(loc)), "modificado": m, "indice": n["nombre"] == "sitemap"})
+            }
+        }
+    }
+    retornar r
+}
+
+// ── Rastreador ────────────────────────────────────────────────────────────
+
+/// Recorre en anchura desde una URL. opciones: max_paginas (50),
+/// mismo_host (verdadero), robots (verdadero), filtro (f(url) → bool),
+/// visitar (f(pagina) se llama por cada página), espera_ms (por host).
+/// Devuelve la lista de URLs visitadas.
+funcion recolecta_rastrear(s, inicio, opciones) {
+    sea o = opciones ?? {}
+    sea maxp = o["max_paginas"] ?? 50
+    sea mismo = o["mismo_host"] ?? verdadero
+    sea usar_robots = o["robots"] ?? verdadero
+    sea filtro = o["filtro"] ?? nulo
+    sea visitar = o["visitar"] ?? nulo
+    sea espera = o["espera_ms"] ?? 0
+    sea host0 = recolecta_partes(inicio)["host"]
+    sea cola = [inicio]
+    sea vistos = {}
+    vistos[inicio] = verdadero
+    sea robots = {}
+    sea ultimo = {}
+    sea hechas = []
+    sea i = 0
+    mientras (i < longitud(cola) y longitud(hechas) < maxp) {
+        sea u = cola[i]
+        i = i + 1
+        sea p = recolecta_partes(u)
+        sea ok = verdadero
+        si (usar_robots) {
+            sea base = p["esquema"] + "://" + p["autoridad"]
+            si (tiene_clave(robots, base) == falso) {
+                sea rr = {"reglas": [], "espera_s": nulo, "sitemaps": []}
+                intentar {
+                    sea rp = recolecta_get(s, base + "/robots.txt")
+                    si (rp["estado"] == 200) { rr = recolecta_robots(rp["cuerpo"], s["agente"]) }
+                } capturar (e) { }
+                robots[base] = rr
+            }
+            ok = recolecta_permitido(robots[base], u)
+            si (robots[base]["espera_s"] != nulo) { espera = maximo(espera, robots[base]["espera_s"] * 1000) }
+        }
+        si (ok) {
+            si (espera > 0 y tiene_clave(ultimo, p["host"])) {
+                sea falta = ultimo[p["host"]] + espera - tiempo_ms()
+                si (falta > 0) { dormir(falta) }
+            }
+            ultimo[p["host"]] = tiempo_ms()
+            sea pag = nulo
+            intentar { pag = recolecta_get(s, u) } capturar (e) { pag = nulo }
+            si (pag != nulo) {
+                hechas.agregar(u)
+                si (visitar != nulo) { visitar(pag) }
+                si (pag["doc"] != nulo) {
+                    para l en recolecta_enlaces(pag) {
+                        sea lp = recolecta_partes(l)
+                        sea entra = tiene_clave(vistos, l) == falso
+                        si (entra y mismo y lp["host"] != host0) { entra = falso }
+                        si (entra y filtro != nulo y filtro(l) != verdadero) { entra = falso }
+                        si (entra) { vistos[l] = verdadero  cola.agregar(l) }
+                    }
+                }
+            }
+        }
+    }
+    retornar hechas
+}

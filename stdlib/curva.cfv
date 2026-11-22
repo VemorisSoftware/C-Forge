@@ -1,0 +1,603 @@
+// stdlib/curva.cfv — curva elíptica secp256k1 (Bitcoin, Ethereum): claves
+// públicas comprimidas y no comprimidas, ECDSA con nonce determinista
+// (RFC 6979) y s bajo, firmas DER y compactas de 64/65 bytes, recuperar la
+// clave pública desde una firma, y firmas Schnorr BIP-340 (Taproot).
+// Aritmética de 256 bits en Montgomery con dígitos de 24 bits.
+// ⚠️ No es de tiempo constante: sirve para firmar y verificar en un
+// servidor o una herramienta, pero para custodiar fondos grandes usa un
+// dispositivo de hardware. Inspirada en libsecp256k1 (MIT, solo la idea).
+// En inglés: importar "secp256k1".
+//
+//   importar "curva"
+//   sea priv = curva_privada_aleatoria()
+//   sea pub = curva_publica(priv)                     // 33 bytes (comprimida)
+//   sea firma = curva_firmar(priv, sha256_bytes("hola"))
+//   curva_verificar(pub, sha256_bytes("hola"), firma)  // verdadero
+//
+// Todas las claves, resúmenes y firmas son textos de bytes (usa
+// bytes_de_hex / hex para convertir).
+
+sea _CV_B = 16777216
+sea _CV_K = 11
+
+// ── Enteros de 264 bits (11 dígitos base 2^24, del menos significativo) ──
+
+funcion _cv_de_bytes(b) {
+    sea r = []
+    sea i = 0
+    mientras (i < _CV_K) { r.agregar(0)  i = i + 1 }
+    sea n = longitud(b)
+    i = 0
+    mientras (i < n) {
+        sea v = byte_en(b, n - 1 - i)
+        sea limb = piso(i / 3)
+        si (limb < _CV_K) { r[limb] = r[limb] + v * potencia(256, i % 3) }
+        i = i + 1
+    }
+    retornar r
+}
+
+funcion _cv_a_bytes(a, largo) {
+    sea r = []
+    sea j = 0
+    mientras (j < largo) {
+        sea limb = piso(j / 3)
+        sea v = 0
+        si (limb < longitud(a)) { v = piso(a[limb] / potencia(256, j % 3)) % 256 }
+        r.agregar(_cv_byte(v))
+        j = j + 1
+    }
+    sea s = []
+    j = largo - 1
+    mientras (j >= 0) { s.agregar(r[j])  j = j - 1 }
+    retornar unir(s, "")
+}
+
+funcion _cv_byte(v) { retornar bytes_de_hex(subcadena("0123456789abcdef", piso(v / 16), piso(v / 16) + 1) + subcadena("0123456789abcdef", v % 16, v % 16 + 1)) }
+
+funcion _cv_hex(h) { retornar _cv_de_bytes(bytes_de_hex(h)) }
+
+funcion _cv_cmp(a, b) {
+    sea i = _CV_K - 1
+    mientras (i >= 0) {
+        si (a[i] > b[i]) { retornar 1 }
+        si (a[i] < b[i]) { retornar -1 }
+        i = i - 1
+    }
+    retornar 0
+}
+
+funcion _cv_cero(a) {
+    para x en a { si (x != 0) { retornar falso } }
+    retornar verdadero
+}
+
+funcion _cv_sumar(a, b) {
+    sea r = []
+    sea c = 0
+    sea i = 0
+    mientras (i < _CV_K) {
+        sea v = a[i] + b[i] + c
+        si (v >= _CV_B) { r.agregar(v - _CV_B)  c = 1 } sino { r.agregar(v)  c = 0 }
+        i = i + 1
+    }
+    retornar r
+}
+
+funcion _cv_restar(a, b) {
+    sea r = []
+    sea c = 0
+    sea i = 0
+    mientras (i < _CV_K) {
+        sea v = a[i] - b[i] - c
+        si (v < 0) { r.agregar(v + _CV_B)  c = 1 } sino { r.agregar(v)  c = 0 }
+        i = i + 1
+    }
+    retornar r
+}
+
+funcion _cv_mod_sumar(m, a, b) {
+    sea s = _cv_sumar(a, b)
+    si (_cv_cmp(s, m["n"]) >= 0) { retornar _cv_restar(s, m["n"]) }
+    retornar s
+}
+
+funcion _cv_mod_restar(m, a, b) {
+    si (_cv_cmp(a, b) >= 0) { retornar _cv_restar(a, b) }
+    retornar _cv_restar(_cv_sumar(a, m["n"]), b)
+}
+
+// (x · y) mod 2^24 sin pasar 2^53.
+funcion _cv_mul24(x, y) { retornar ((x % 4096) * y % _CV_B + (piso(x / 4096) * y % 4096) * 4096) % _CV_B }
+
+funcion _cv_mont(m, a, b) {
+    sea n = m["n"]
+    sea ninv = m["ninv"]
+    sea t = []
+    sea i = 0
+    mientras (i < _CV_K + 2) { t.agregar(0)  i = i + 1 }
+    i = 0
+    mientras (i < _CV_K) {
+        sea ai = a[i]
+        sea c = 0
+        sea j = 0
+        mientras (j < _CV_K) {
+            sea v = t[j] + ai * b[j] + c
+            c = piso(v / _CV_B)
+            t[j] = v - c * _CV_B
+            j = j + 1
+        }
+        sea v = t[_CV_K] + c
+        c = piso(v / _CV_B)
+        t[_CV_K] = v - c * _CV_B
+        t[_CV_K + 1] = t[_CV_K + 1] + c
+        sea q = _cv_mul24(t[0], ninv)
+        v = t[0] + q * n[0]
+        c = piso(v / _CV_B)
+        j = 1
+        mientras (j < _CV_K) {
+            v = t[j] + q * n[j] + c
+            c = piso(v / _CV_B)
+            t[j - 1] = v - c * _CV_B
+            j = j + 1
+        }
+        v = t[_CV_K] + c
+        c = piso(v / _CV_B)
+        t[_CV_K - 1] = v - c * _CV_B
+        t[_CV_K] = t[_CV_K + 1] + c
+        t[_CV_K + 1] = 0
+        i = i + 1
+    }
+    sea r = []
+    i = 0
+    mientras (i < _CV_K) { r.agregar(t[i])  i = i + 1 }
+    si (t[_CV_K] > 0 o _cv_cmp(r, n) >= 0) { r = _cv_restar(r, n) }
+    retornar r
+}
+
+funcion _cv_modulo(hex_) {
+    sea n = _cv_hex(hex_)
+    sea x = 1
+    sea it = 0
+    mientras (it < 6) {
+        sea f = (2 - _cv_mul24(n[0], x) + _CV_B) % _CV_B
+        x = _cv_mul24(x, f)
+        it = it + 1
+    }
+    sea m = {"n": n, "ninv": (_CV_B - x) % _CV_B}
+    // R² mod n duplicando 2·264 veces desde 1.
+    sea r = []
+    sea i = 0
+    mientras (i < _CV_K) { r.agregar(0)  i = i + 1 }
+    r[0] = 1
+    i = 0
+    mientras (i < 2 * 24 * _CV_K) {
+        r = _cv_mod_sumar(m, r, r)
+        i = i + 1
+    }
+    m["r2"] = r
+    sea uno = []
+    i = 0
+    mientras (i < _CV_K) { uno.agregar(0)  i = i + 1 }
+    uno[0] = 1
+    m["uno"] = uno
+    m["uno_m"] = _cv_mont(m, uno, r)
+    retornar m
+}
+
+funcion _cv_a_m(m, a) { retornar _cv_mont(m, a, m["r2"]) }
+funcion _cv_de_m(m, a) { retornar _cv_mont(m, a, m["uno"]) }
+
+// a^e (a en Montgomery; e entero normal) → Montgomery.
+funcion _cv_pot(m, a, e) {
+    sea r = m["uno_m"]
+    sea i = _CV_K - 1
+    mientras (i >= 0) {
+        sea bit = 23
+        mientras (bit >= 0) {
+            r = _cv_mont(m, r, r)
+            si (piso(e[i] / potencia(2, bit)) % 2 == 1) { r = _cv_mont(m, r, a) }
+            bit = bit - 1
+        }
+        i = i - 1
+    }
+    retornar r
+}
+
+funcion _cv_inv(m, a) {
+    sea dos = []
+    sea i = 0
+    mientras (i < _CV_K) { dos.agregar(0)  i = i + 1 }
+    dos[0] = 2
+    retornar _cv_pot(m, a, _cv_restar(m["n"], dos))
+}
+
+sea _CV = [nulo]
+
+funcion _cv() {
+    si (_CV[0] != nulo) { retornar _CV[0] }
+    sea p = _cv_modulo("fffffffffffffffffffffffffffffffffffffffffffffffffffffffefffffc2f")
+    sea n = _cv_modulo("fffffffffffffffffffffffffffffffebaaedce6af48a03bbfd25e8cd0364141")
+    sea gx = _cv_hex("79be667ef9dcbbac55a06295ce870b07029bfcdb2dce28d959f2815b16f81798")
+    sea gy = _cv_hex("483ada7726a3c4655da4fbfc0e1108a8fd17b448a68554199c47d08ffb10d4b8")
+    sea siete = []
+    sea i = 0
+    mientras (i < _CV_K) { siete.agregar(0)  i = i + 1 }
+    siete[0] = 7
+    // (p + 1) / 4 para raíces cuadradas.
+    sea raiz_e = _cv_hex("3fffffffffffffffffffffffffffffffffffffffffffffffffffffffbfffff0c")
+    _CV[0] = {"p": p, "n": n, "g": [_cv_a_m(p, gx), _cv_a_m(p, gy), p["uno_m"]], "siete": _cv_a_m(p, siete), "raiz_e": raiz_e, "medio_n": _cv_hex("7fffffffffffffffffffffffffffffff5d576e7357a4501ddfe92f46681b20a0")}
+    retornar _CV[0]
+}
+
+// ── Puntos (coordenadas jacobianas en Montgomery; nulo = infinito) ───────
+
+funcion _cv_doblar(P) {
+    si (P == nulo) { retornar nulo }
+    sea f = _cv()["p"]
+    sea X = P[0]
+    sea Y = P[1]
+    sea Z = P[2]
+    si (_cv_cero(Y)) { retornar nulo }
+    sea YY = _cv_mont(f, Y, Y)
+    sea S = _cv_mont(f, X, YY)
+    S = _cv_mod_sumar(f, S, S)
+    S = _cv_mod_sumar(f, S, S)
+    sea XX = _cv_mont(f, X, X)
+    sea M = _cv_mod_sumar(f, _cv_mod_sumar(f, XX, XX), XX)
+    sea X3 = _cv_mod_restar(f, _cv_mont(f, M, M), _cv_mod_sumar(f, S, S))
+    sea Y4 = _cv_mont(f, YY, YY)
+    sea Y48 = _cv_mod_sumar(f, Y4, Y4)
+    Y48 = _cv_mod_sumar(f, Y48, Y48)
+    Y48 = _cv_mod_sumar(f, Y48, Y48)
+    sea Y3 = _cv_mod_restar(f, _cv_mont(f, M, _cv_mod_restar(f, S, X3)), Y48)
+    sea YZ = _cv_mont(f, Y, Z)
+    retornar [X3, Y3, _cv_mod_sumar(f, YZ, YZ)]
+}
+
+funcion _cv_sumar_p(P, Q) {
+    si (P == nulo) { retornar Q }
+    si (Q == nulo) { retornar P }
+    sea f = _cv()["p"]
+    sea Z1Z1 = _cv_mont(f, P[2], P[2])
+    sea Z2Z2 = _cv_mont(f, Q[2], Q[2])
+    sea U1 = _cv_mont(f, P[0], Z2Z2)
+    sea U2 = _cv_mont(f, Q[0], Z1Z1)
+    sea S1 = _cv_mont(f, P[1], _cv_mont(f, Q[2], Z2Z2))
+    sea S2 = _cv_mont(f, Q[1], _cv_mont(f, P[2], Z1Z1))
+    si (_cv_cmp(U1, U2) == 0) {
+        si (_cv_cmp(S1, S2) != 0) { retornar nulo }
+        retornar _cv_doblar(P)
+    }
+    sea H = _cv_mod_restar(f, U2, U1)
+    sea R = _cv_mod_restar(f, S2, S1)
+    sea HH = _cv_mont(f, H, H)
+    sea HHH = _cv_mont(f, H, HH)
+    sea V = _cv_mont(f, U1, HH)
+    sea X3 = _cv_mod_restar(f, _cv_mod_restar(f, _cv_mont(f, R, R), HHH), _cv_mod_sumar(f, V, V))
+    sea Y3 = _cv_mod_restar(f, _cv_mont(f, R, _cv_mod_restar(f, V, X3)), _cv_mont(f, S1, HHH))
+    sea Z3 = _cv_mont(f, H, _cv_mont(f, P[2], Q[2]))
+    retornar [X3, Y3, Z3]
+}
+
+funcion _cv_por(k, P) {
+    sea R = nulo
+    sea i = _CV_K - 1
+    mientras (i >= 0) {
+        sea bit = 23
+        mientras (bit >= 0) {
+            R = _cv_doblar(R)
+            si (piso(k[i] / potencia(2, bit)) % 2 == 1) { R = _cv_sumar_p(R, P) }
+            bit = bit - 1
+        }
+        i = i - 1
+    }
+    retornar R
+}
+
+// Jacobiano → afín normal [x, y] (enteros, no Montgomery).
+funcion _cv_afin(P) {
+    si (P == nulo) { retornar nulo }
+    sea f = _cv()["p"]
+    sea zi = _cv_inv(f, P[2])
+    sea zi2 = _cv_mont(f, zi, zi)
+    sea x = _cv_mont(f, P[0], zi2)
+    sea y = _cv_mont(f, P[1], _cv_mont(f, zi2, zi))
+    retornar [_cv_de_m(f, x), _cv_de_m(f, y)]
+}
+
+funcion _cv_desde_afin(xy) {
+    sea f = _cv()["p"]
+    retornar [_cv_a_m(f, xy[0]), _cv_a_m(f, xy[1]), f["uno_m"]]
+}
+
+funcion _cv_par(a) { retornar a[0] % 2 == 0 }
+
+// ── Claves ────────────────────────────────────────────────────────────────
+
+funcion _cv_escalar(b) {
+    si (longitud(b) != 32) { lanzar "curva: la clave privada debe tener 32 bytes" }
+    sea k = _cv_de_bytes(b)
+    si (_cv_cero(k) o _cv_cmp(k, _cv()["n"]["n"]) >= 0) { lanzar "curva: clave privada fuera de rango" }
+    retornar k
+}
+
+/// ¿Son 32 bytes válidos como clave privada?
+funcion curva_privada_valida(b) {
+    sea ok = verdadero
+    intentar { _cv_escalar(b) } capturar (e) { ok = falso }
+    retornar ok
+}
+
+funcion curva_privada_aleatoria() {
+    sea b = bytes_aleatorios(32)
+    mientras (curva_privada_valida(b) == falso) { b = bytes_aleatorios(32) }
+    retornar b
+}
+
+funcion _cv_pub_bytes(xy, comprimida) {
+    si (comprimida == falso) { retornar bytes_de_hex("04") + _cv_a_bytes(xy[0], 32) + _cv_a_bytes(xy[1], 32) }
+    sea pref = "03"
+    si (_cv_par(xy[1])) { pref = "02" }
+    retornar bytes_de_hex(pref) + _cv_a_bytes(xy[0], 32)
+}
+
+/// Clave pública: 33 bytes (comprimida, por defecto) o 65 (comprimida = falso).
+funcion curva_publica(priv, comprimida) {
+    sea k = _cv_escalar(priv)
+    retornar _cv_pub_bytes(_cv_afin(_cv_por(k, _cv()["g"])), comprimida != falso)
+}
+
+funcion _cv_punto(pub) {
+    sea c = _cv()
+    sea f = c["p"]
+    si (longitud(pub) == 65 y byte_en(pub, 0) == 4) {
+        sea x = _cv_de_bytes(subcadena(pub, 1, 33))
+        sea y = _cv_de_bytes(subcadena(pub, 33, 65))
+        si (_cv_cmp(x, f["n"]) >= 0 o _cv_cmp(y, f["n"]) >= 0) { lanzar "curva: clave pública inválida" }
+        // y² = x³ + 7
+        sea xm = _cv_a_m(f, x)
+        sea ym = _cv_a_m(f, y)
+        sea der = _cv_mod_sumar(f, _cv_mont(f, _cv_mont(f, xm, xm), xm), c["siete"])
+        si (_cv_cmp(_cv_mont(f, ym, ym), der) != 0) { lanzar "curva: el punto no está en la curva" }
+        retornar [x, y]
+    }
+    si (longitud(pub) == 33 y (byte_en(pub, 0) == 2 o byte_en(pub, 0) == 3)) { retornar _cv_levantar(_cv_de_bytes(subcadena(pub, 1, 33)), byte_en(pub, 0) == 3) }
+    si (longitud(pub) == 32) { retornar _cv_levantar(_cv_de_bytes(pub), falso) }
+    lanzar "curva: clave pública de largo inválido"
+}
+
+// x → punto con y impar o par.
+funcion _cv_levantar(x, impar) {
+    sea c = _cv()
+    sea f = c["p"]
+    si (_cv_cmp(x, f["n"]) >= 0) { lanzar "curva: x fuera de rango" }
+    sea xm = _cv_a_m(f, x)
+    sea yy = _cv_mod_sumar(f, _cv_mont(f, _cv_mont(f, xm, xm), xm), c["siete"])
+    sea ym = _cv_pot(f, yy, c["raiz_e"])
+    si (_cv_cmp(_cv_mont(f, ym, ym), yy) != 0) { lanzar "curva: el punto no está en la curva" }
+    sea y = _cv_de_m(f, ym)
+    si (_cv_par(y) == impar) { y = _cv_restar(f["n"], y) }
+    retornar [x, y]
+}
+
+/// Convierte una clave pública entre comprimida (33) y no comprimida (65).
+funcion curva_convertir(pub, comprimida) { retornar _cv_pub_bytes(_cv_punto(pub), comprimida != falso) }
+
+/// Suma de claves (BIP-32): (a + b) mod n.
+funcion curva_sumar_privadas(a, b) {
+    sea n = _cv()["n"]
+    retornar _cv_a_bytes(_cv_mod_sumar(n, _cv_de_bytes(a), _cv_de_bytes(b)), 32)
+}
+
+/// Punto P + t·G (BIP-32 con claves públicas).
+funcion curva_sumar_publica(pub, t, comprimida) {
+    sea P = _cv_desde_afin(_cv_punto(pub))
+    sea T = _cv_por(_cv_escalar(t), _cv()["g"])
+    sea R = _cv_sumar_p(P, T)
+    si (R == nulo) { lanzar "curva: resultado en el infinito" }
+    retornar _cv_pub_bytes(_cv_afin(R), comprimida != falso)
+}
+
+/// ECDH: x del punto priv·pub (32 bytes).
+funcion curva_compartido(priv, pub) {
+    sea R = _cv_por(_cv_escalar(priv), _cv_desde_afin(_cv_punto(pub)))
+    retornar _cv_a_bytes(_cv_afin(R)[0], 32)
+}
+
+// ── ECDSA ─────────────────────────────────────────────────────────────────
+
+funcion _cv_z(h) {
+    // Primeros 256 bits del resumen, reducidos mod n.
+    sea b = h
+    si (longitud(b) > 32) { b = subcadena(b, 0, 32) }
+    sea z = _cv_de_bytes(b)
+    sea n = _cv()["n"]
+    si (_cv_cmp(z, n["n"]) >= 0) { z = _cv_restar(z, n["n"]) }
+    retornar z
+}
+
+funcion _cv_rfc6979(priv, z) {
+    sea x = _cv_a_bytes(_cv_de_bytes(priv), 32)
+    sea h = _cv_a_bytes(z, 32)
+    sea V = bytes_de_hex("0101010101010101010101010101010101010101010101010101010101010101")
+    sea K = bytes_de_hex("0000000000000000000000000000000000000000000000000000000000000000")
+    K = hmac_sha256_bytes(K, V + bytes_de_hex("00") + x + h)
+    V = hmac_sha256_bytes(K, V)
+    K = hmac_sha256_bytes(K, V + bytes_de_hex("01") + x + h)
+    V = hmac_sha256_bytes(K, V)
+    mientras (verdadero) {
+        V = hmac_sha256_bytes(K, V)
+        sea k = _cv_de_bytes(V)
+        si (_cv_cero(k) == falso y _cv_cmp(k, _cv()["n"]["n"]) < 0) { retornar k }
+        K = hmac_sha256_bytes(K, V + bytes_de_hex("00"))
+        V = hmac_sha256_bytes(K, V)
+    }
+}
+
+/// Firma ECDSA de un resumen de 32 bytes: 64 bytes r ‖ s (s bajo, como
+/// Bitcoin y Ethereum). Determinista (RFC 6979).
+funcion curva_firmar(priv, resumen) { retornar subcadena(curva_firmar_recuperable(priv, resumen), 0, 64) }
+
+/// Como curva_firmar pero con un byte más: el id de recuperación (0–3).
+funcion curva_firmar_recuperable(priv, resumen) {
+    sea c = _cv()
+    sea n = c["n"]
+    sea d = _cv_escalar(priv)
+    sea z = _cv_z(resumen)
+    sea k = _cv_rfc6979(priv, z)
+    sea R = _cv_afin(_cv_por(k, c["g"]))
+    sea r = R[0]
+    sea recid = 0
+    si (_cv_par(R[1]) == falso) { recid = 1 }
+    si (_cv_cmp(r, n["n"]) >= 0) { r = _cv_restar(r, n["n"])  recid = recid + 2 }
+    // s = k⁻¹ (z + r·d) mod n
+    sea km = _cv_a_m(n, k)
+    sea rd = _cv_mont(n, _cv_a_m(n, r), _cv_a_m(n, d))
+    sea s = _cv_mont(n, _cv_inv(n, km), _cv_mod_sumar(n, _cv_a_m(n, z), rd))
+    s = _cv_de_m(n, s)
+    si (_cv_cmp(s, c["medio_n"]) > 0) {
+        s = _cv_restar(n["n"], s)
+        recid = bits_xo(recid, 1)
+    }
+    retornar _cv_a_bytes(r, 32) + _cv_a_bytes(s, 32) + _cv_byte(recid)
+}
+
+funcion _cv_rs(firma) {
+    si (longitud(firma) != 64 y longitud(firma) != 65) { lanzar "curva: la firma debe tener 64 o 65 bytes (usa curva_de_der)" }
+    retornar [_cv_de_bytes(subcadena(firma, 0, 32)), _cv_de_bytes(subcadena(firma, 32, 64))]
+}
+
+/// Verifica una firma ECDSA (64 bytes, o DER con curva_de_der).
+funcion curva_verificar(pub, resumen, firma) {
+    sea c = _cv()
+    sea n = c["n"]
+    sea rs = nulo
+    sea Q = nulo
+    intentar {
+        rs = _cv_rs(firma)
+        Q = _cv_desde_afin(_cv_punto(pub))
+    } capturar (e) { retornar falso }
+    sea r = rs[0]
+    sea s = rs[1]
+    si (_cv_cero(r) o _cv_cero(s) o _cv_cmp(r, n["n"]) >= 0 o _cv_cmp(s, n["n"]) >= 0) { retornar falso }
+    sea w = _cv_inv(n, _cv_a_m(n, s))
+    sea u1 = _cv_de_m(n, _cv_mont(n, _cv_a_m(n, _cv_z(resumen)), w))
+    sea u2 = _cv_de_m(n, _cv_mont(n, _cv_a_m(n, r), w))
+    sea P = _cv_sumar_p(_cv_por(u1, c["g"]), _cv_por(u2, Q))
+    si (P == nulo) { retornar falso }
+    sea x = _cv_afin(P)[0]
+    si (_cv_cmp(x, n["n"]) >= 0) { x = _cv_restar(x, n["n"]) }
+    retornar _cv_cmp(x, r) == 0
+}
+
+/// Recupera la clave pública (33 bytes) desde una firma de 65 bytes.
+funcion curva_recuperar(resumen, firma, comprimida) {
+    si (longitud(firma) != 65) { lanzar "curva: la firma recuperable tiene 65 bytes" }
+    sea c = _cv()
+    sea n = c["n"]
+    sea rs = _cv_rs(firma)
+    sea recid = byte_en(firma, 64)
+    si (recid >= 27) { recid = recid - 27 }
+    si (recid > 3) { lanzar "curva: id de recuperación inválido" }
+    sea x = rs[0]
+    si (recid >= 2) { x = _cv_sumar(x, n["n"]) }
+    sea R = _cv_desde_afin(_cv_levantar(x, recid % 2 == 1))
+    sea ri = _cv_inv(n, _cv_a_m(n, rs[0]))
+    // Q = r⁻¹ (s·R − z·G)
+    sea zneg = _cv_mod_restar(n, n["n"], _cv_z(resumen))
+    si (_cv_cmp(zneg, n["n"]) >= 0) { zneg = _cv_restar(zneg, n["n"]) }
+    sea u1 = _cv_de_m(n, _cv_mont(n, _cv_a_m(n, zneg), ri))
+    sea u2 = _cv_de_m(n, _cv_mont(n, _cv_a_m(n, rs[1]), ri))
+    sea Q = _cv_sumar_p(_cv_por(u1, c["g"]), _cv_por(u2, R))
+    si (Q == nulo) { lanzar "curva: no se pudo recuperar la clave" }
+    retornar _cv_pub_bytes(_cv_afin(Q), comprimida != falso)
+}
+
+funcion _cv_der_entero(b) {
+    sea t = b
+    mientras (longitud(t) > 1 y byte_en(t, 0) == 0 y byte_en(t, 1) < 128) { t = subcadena(t, 1, longitud(t)) }
+    si (byte_en(t, 0) >= 128) { t = bytes_de_hex("00") + t }
+    retornar bytes_de_hex("02") + _cv_byte(longitud(t)) + t
+}
+
+/// Firma de 64 bytes → DER (formato de Bitcoin y X.509).
+funcion curva_a_der(firma) {
+    sea cuerpo = _cv_der_entero(subcadena(firma, 0, 32)) + _cv_der_entero(subcadena(firma, 32, 64))
+    retornar bytes_de_hex("30") + _cv_byte(longitud(cuerpo)) + cuerpo
+}
+
+/// DER → firma de 64 bytes (estricto, como BIP-66).
+funcion curva_de_der(der) {
+    sea n = longitud(der)
+    si (n < 8 o byte_en(der, 0) != 48 o byte_en(der, 1) != n - 2) { lanzar "curva: DER inválido" }
+    sea leer = funcion(i) {
+        si (byte_en(der, i) != 2) { lanzar "curva: DER inválido" }
+        sea l = byte_en(der, i + 1)
+        si (l == 0 o l > 33 o i + 2 + l > n) { lanzar "curva: DER inválido" }
+        sea v = subcadena(der, i + 2, i + 2 + l)
+        si (byte_en(v, 0) >= 128) { lanzar "curva: DER con entero negativo" }
+        si (l > 1 y byte_en(v, 0) == 0 y byte_en(v, 1) < 128) { lanzar "curva: DER con ceros de sobra" }
+        mientras (longitud(v) > 32) { v = subcadena(v, 1, longitud(v)) }
+        mientras (longitud(v) < 32) { v = bytes_de_hex("00") + v }
+        retornar [v, i + 2 + l]
+    }
+    sea a = leer(2)
+    sea b = leer(a[1])
+    si (b[1] != n) { lanzar "curva: DER con bytes de sobra" }
+    retornar a[0] + b[0]
+}
+
+// ── Schnorr BIP-340 ───────────────────────────────────────────────────────
+
+funcion curva_hash_etiquetado(etiqueta, datos) {
+    sea t = sha256_bytes(etiqueta)
+    retornar sha256_bytes(t + t + datos)
+}
+
+/// Clave pública x-only de 32 bytes (Taproot).
+funcion curva_publica_x(priv) { retornar subcadena(curva_publica(priv), 1, 33) }
+
+/// Firma Schnorr de 64 bytes. aux: 32 bytes aleatorios (opcional; ceros si falta).
+funcion curva_schnorr_firmar(priv, mensaje, aux) {
+    sea c = _cv()
+    sea n = c["n"]
+    sea d0 = _cv_escalar(priv)
+    sea P = _cv_afin(_cv_por(d0, c["g"]))
+    sea d = d0
+    si (_cv_par(P[1]) == falso) { d = _cv_restar(n["n"], d0) }
+    sea a = aux ?? bytes_de_hex("0000000000000000000000000000000000000000000000000000000000000000")
+    sea t = bytes_xor(_cv_a_bytes(d, 32), curva_hash_etiquetado("BIP0340/aux", a))
+    sea px = _cv_a_bytes(P[0], 32)
+    sea k0 = _cv_de_bytes(curva_hash_etiquetado("BIP0340/nonce", t + px + mensaje))
+    si (_cv_cmp(k0, n["n"]) >= 0) { k0 = _cv_restar(k0, n["n"]) }
+    si (_cv_cero(k0)) { lanzar "curva: nonce nulo (probabilidad despreciable)" }
+    sea R = _cv_afin(_cv_por(k0, c["g"]))
+    sea k = k0
+    si (_cv_par(R[1]) == falso) { k = _cv_restar(n["n"], k0) }
+    sea rx = _cv_a_bytes(R[0], 32)
+    sea e = _cv_de_bytes(curva_hash_etiquetado("BIP0340/challenge", rx + px + mensaje))
+    si (_cv_cmp(e, n["n"]) >= 0) { e = _cv_restar(e, n["n"]) }
+    sea s = _cv_mod_sumar(n, k, _cv_de_m(n, _cv_mont(n, _cv_a_m(n, e), _cv_a_m(n, d))))
+    retornar rx + _cv_a_bytes(s, 32)
+}
+
+funcion curva_schnorr_verificar(pubx, mensaje, firma) {
+    si (longitud(pubx) != 32 o longitud(firma) != 64) { retornar falso }
+    sea c = _cv()
+    sea n = c["n"]
+    sea P = nulo
+    intentar { P = _cv_levantar(_cv_de_bytes(pubx), falso) } capturar (e) { retornar falso }
+    sea r = _cv_de_bytes(subcadena(firma, 0, 32))
+    sea s = _cv_de_bytes(subcadena(firma, 32, 64))
+    si (_cv_cmp(r, c["p"]["n"]) >= 0 o _cv_cmp(s, n["n"]) >= 0) { retornar falso }
+    sea e = _cv_de_bytes(curva_hash_etiquetado("BIP0340/challenge", subcadena(firma, 0, 32) + pubx + mensaje))
+    si (_cv_cmp(e, n["n"]) >= 0) { e = _cv_restar(e, n["n"]) }
+    // R = s·G − e·P
+    sea eneg = _cv_mod_restar(n, n["n"], e)
+    si (_cv_cmp(eneg, n["n"]) >= 0) { eneg = _cv_restar(eneg, n["n"]) }
+    sea R = _cv_sumar_p(_cv_por(s, c["g"]), _cv_por(eneg, _cv_desde_afin(P)))
+    si (R == nulo) { retornar falso }
+    sea ra = _cv_afin(R)
+    retornar _cv_par(ra[1]) y _cv_cmp(ra[0], r) == 0
+}

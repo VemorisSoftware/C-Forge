@@ -55,6 +55,16 @@ Sitio oficial: [c-forge.org](https://c-forge.org)
   `entidades`/`entities` (ECS con conjuntos dispersos y señales) y
   `federa`/`oidc` (PKCE, state, nonce y validación de ID tokens RS256,
   EdDSA y HS256).
+- **Lote 12 (bilingüe):** `curva`/`secp256k1` (ECDSA RFC 6979, recuperar
+  clave, Schnorr BIP-340; contra python-ecdsa y los vectores oficiales),
+  `semilla`/`hdwallet` (BIP-39 en inglés y español, BIP-32, direcciones
+  P2PKH, bech32 y Taproot), `cadena`/`evm` (Keccak, EIP-55, RLP, ABI,
+  transacciones EIP-155 y EIP-1559 idénticas a eth_account),
+  `apreton`/`noise_protocol` (Noise XX/IK/KK… byte a byte como
+  noiseprotocol), `objetos`/`s3` (SigV4 con los ejemplos de AWS),
+  `llamada`/`protobuf` (.proto, binario como protoc, marcos gRPC),
+  `recolecta`/`crawler` (cookies RFC 6265, formularios, robots.txt,
+  rastreo) y `sensor`/`mqtt` (paquetes MQTT, QoS 2, mini broker).
 - `rastreo`/`glob`: recorrer carpetas y buscar con comodines (`**`, `{a,b}`,
   `[a-z]`). El lenguaje suma `listar_carpeta`, `es_carpeta` y `crear_carpeta`
   (como `mkdir -p`).

@@ -1,0 +1,779 @@
+// stdlib/llamada.cfv — Protocol Buffers y gRPC: lee archivos .proto
+// (proto3 y proto2 básico: mensajes anidados, enums, repeated empaquetado,
+// map<…>, oneof, optional, servicios), codifica y decodifica en binario
+// compatible con protoc (enteros de 64 bits exactos como texto), mapeo a
+// JSON de proto3, y el marco de mensajes de gRPC (5 bytes de prefijo,
+// rutas /paquete.Servicio/Método, estados y trailers). No abre
+// conexiones HTTP/2: entrega los bytes para tu transporte. Inspirada en
+// prost / tonic (Apache). En inglés: importar "protobuf".
+//
+//   importar "llamada"
+//   sea e = llamada_esquema("syntax = \"proto3\"; message Hola { string nombre = 1; int32 edad = 2; }")
+//   sea b = llamada_codificar(e, "Hola", {"nombre": "Ana", "edad": 30})
+//   llamada_decodificar(e, "Hola", b)        // {"nombre": "Ana", "edad": 30}
+
+funcion _ll_byte(v) { retornar bytes_de_hex(subcadena("0123456789abcdef", piso(v / 16), piso(v / 16) + 1) + subcadena("0123456789abcdef", v % 16, v % 16 + 1)) }
+
+// ── Léxico y sintaxis de .proto ──────────────────────────────────────────
+
+funcion _ll_tokens(t) {
+    sea r = []
+    sea i = 0
+    sea n = longitud(t)
+    mientras (i < n) {
+        sea c = subcadena(t, i, i + 1)
+        sea b = byte_en(t, i)
+        si (c == " " o c == "\n" o c == "\t" o c == "\r") { i = i + 1 } sino {
+            si (c == "/" y i + 1 < n y subcadena(t, i + 1, i + 2) == "/") {
+                mientras (i < n y subcadena(t, i, i + 1) != "\n") { i = i + 1 }
+            } sino {
+                si (c == "/" y i + 1 < n y subcadena(t, i + 1, i + 2) == "*") {
+                    sea f = texto_indice(subcadena(t, i + 2, n), "*/")
+                    si (f < 0) { lanzar "llamada: comentario sin cerrar" }
+                    i = i + f + 4
+                } sino {
+                    si (c == "\"" o c == "'") {
+                        sea j = i + 1
+                        sea v = ""
+                        mientras (j < n y subcadena(t, j, j + 1) != c) { v = v + subcadena(t, j, j + 1)  j = j + 1 }
+                        r.agregar({"t": "texto", "v": v})
+                        i = j + 1
+                    } sino {
+                        si ((b >= 65 y b <= 90) o (b >= 97 y b <= 122) o b == 95 o (b >= 48 y b <= 57) o c == "." o c == "-") {
+                            sea j = i
+                            mientras (j < n y ((byte_en(t, j) >= 65 y byte_en(t, j) <= 90) o (byte_en(t, j) >= 97 y byte_en(t, j) <= 122) o byte_en(t, j) == 95 o (byte_en(t, j) >= 48 y byte_en(t, j) <= 57) o subcadena(t, j, j + 1) == "." o (j == i y subcadena(t, j, j + 1) == "-"))) { j = j + 1 }
+                            r.agregar({"t": "id", "v": subcadena(t, i, j)})
+                            i = j
+                        } sino {
+                            r.agregar({"t": "sim", "v": c})
+                            i = i + 1
+                        }
+                    }
+                }
+            }
+        }
+    }
+    r.agregar({"t": "fin", "v": ""})
+    retornar r
+}
+
+funcion _ll_ver(p) { retornar p["toks"][p["i"]]["v"] }
+funcion _ll_tomar(p) {
+    sea v = p["toks"][p["i"]]["v"]
+    p["i"] = p["i"] + 1
+    retornar v
+}
+funcion _ll_esperar(p, v) {
+    sea x = _ll_tomar(p)
+    si (x != v) { lanzar "llamada: se esperaba '" + v + "' y llegó '" + x + "'" }
+}
+
+funcion _ll_saltar_bloque(p) {
+    // Salta { … } con anidamiento (opciones, reserved, etc.).
+    sea nivel = 0
+    mientras (verdadero) {
+        sea v = _ll_tomar(p)
+        si (v == "{") { nivel = nivel + 1 }
+        si (v == "}") {
+            nivel = nivel - 1
+            si (nivel <= 0) { retornar nulo }
+        }
+        si (v == "" ) { lanzar "llamada: bloque sin cerrar" }
+    }
+}
+
+funcion _ll_hasta_pyc(p) {
+    mientras (_ll_ver(p) != ";" y _ll_ver(p) != "") {
+        si (_ll_ver(p) == "[") {
+            mientras (_ll_ver(p) != "]") { _ll_tomar(p) }
+        }
+        _ll_tomar(p)
+    }
+    _ll_esperar(p, ";")
+}
+
+funcion _ll_opciones_campo(p) {
+    sea op = {}
+    si (_ll_ver(p) == "[") {
+        _ll_tomar(p)
+        mientras (_ll_ver(p) != "]") {
+            sea k = _ll_tomar(p)
+            si (k == ",") { k = _ll_tomar(p) }
+            si (_ll_ver(p) == "=") {
+                _ll_tomar(p)
+                op[k] = _ll_tomar(p)
+            }
+        }
+        _ll_tomar(p)
+    }
+    retornar op
+}
+
+funcion _ll_mensaje(p, e, nombre, sintaxis) {
+    sea m = {"nombre": nombre, "campos": [], "por_numero": {}, "por_nombre": {}}
+    e["mensajes"][nombre] = m
+    _ll_esperar(p, "{")
+    sea oneof = nulo
+    mientras (_ll_ver(p) != "}") {
+        sea w = _ll_tomar(p)
+        si (w == ";") { } sino {
+            si (w == "message") { _ll_mensaje(p, e, nombre + "." + _ll_tomar(p), sintaxis) } sino {
+                si (w == "enum") { _ll_enum(p, e, nombre + "." + _ll_tomar(p)) } sino {
+                    si (w == "option" o w == "reserved" o w == "extensions") { _ll_hasta_pyc(p) } sino {
+                        si (w == "oneof") {
+                            oneof = _ll_tomar(p)
+                            _ll_esperar(p, "{")
+                            mientras (_ll_ver(p) != "}") {
+                                si (_ll_ver(p) == "option") { _ll_tomar(p)  _ll_hasta_pyc(p) } sino {
+                                    sea t = _ll_tomar(p)
+                                    _ll_campo(p, m, t, nulo, oneof, sintaxis)
+                                }
+                            }
+                            _ll_tomar(p)
+                            oneof = nulo
+                        } sino {
+                            sea etiqueta = nulo
+                            sea t = w
+                            si (w == "repeated" o w == "optional" o w == "required") {
+                                etiqueta = w
+                                t = _ll_tomar(p)
+                            }
+                            si (t == "map") {
+                                _ll_esperar(p, "<")
+                                sea kt = _ll_tomar(p)
+                                _ll_esperar(p, ",")
+                                sea vt = _ll_tomar(p)
+                                _ll_esperar(p, ">")
+                                _ll_campo(p, m, "map", {"clave": kt, "valor": vt}, nulo, sintaxis)
+                            } sino { _ll_campo(p, m, t, etiqueta, nulo, sintaxis) }
+                        }
+                    }
+                }
+            }
+        }
+    }
+    _ll_tomar(p)
+}
+
+funcion _ll_campo(p, m, t, etiqueta, oneof, sintaxis) {
+    sea nombre = _ll_tomar(p)
+    _ll_esperar(p, "=")
+    sea num = a_numero(_ll_tomar(p))
+    sea op = _ll_opciones_campo(p)
+    _ll_esperar(p, ";")
+    sea c = {"nombre": nombre, "numero": num, "tipo": t, "repetido": falso, "mapa": nulo, "oneof": oneof, "empaquetado": nulo, "opcional": falso}
+    si (t == "map") { c["mapa"] = etiqueta  c["repetido"] = verdadero } sino {
+        si (etiqueta == "repeated") { c["repetido"] = verdadero }
+        si (etiqueta == "optional") { c["opcional"] = verdadero }
+    }
+    si (tiene_clave(op, "packed")) { c["empaquetado"] = op["packed"] == "true" } sino { c["empaquetado"] = sintaxis == "proto3" }
+    si (tiene_clave(op, "json_name")) { c["json"] = op["json_name"] }
+    m["campos"].agregar(c)
+    m["por_numero"]["" + num] = c
+    m["por_nombre"][nombre] = c
+}
+
+funcion _ll_enum(p, e, nombre) {
+    sea en = {"nombre": nombre, "valores": {}, "nombres": {}}
+    e["enums"][nombre] = en
+    _ll_esperar(p, "{")
+    mientras (_ll_ver(p) != "}") {
+        sea w = _ll_tomar(p)
+        si (w == "option" o w == "reserved") { _ll_hasta_pyc(p) } sino {
+            si (w != ";") {
+                _ll_esperar(p, "=")
+                sea v = a_numero(_ll_tomar(p))
+                _ll_opciones_campo(p)
+                _ll_esperar(p, ";")
+                en["valores"][w] = v
+                si (tiene_clave(en["nombres"], "" + v) == falso) { en["nombres"]["" + v] = w }
+            }
+        }
+    }
+    _ll_tomar(p)
+}
+
+/// Lee el texto de un .proto. Devuelve el esquema (mensajes, enums, servicios).
+funcion llamada_esquema(texto) {
+    sea p = {"toks": _ll_tokens("" + texto), "i": 0}
+    sea e = {"paquete": "", "mensajes": {}, "enums": {}, "servicios": {}, "sintaxis": "proto2"}
+    mientras (_ll_ver(p) != "") {
+        sea w = _ll_tomar(p)
+        si (w == "syntax" o w == "edition") {
+            _ll_esperar(p, "=")
+            e["sintaxis"] = _ll_tomar(p)
+            _ll_esperar(p, ";")
+        }
+        si (w == "package") {
+            e["paquete"] = _ll_tomar(p)
+            _ll_esperar(p, ";")
+        }
+        si (w == "import" o w == "option") { _ll_hasta_pyc(p) }
+        si (w == "message") { _ll_mensaje(p, e, _ll_tomar(p), e["sintaxis"]) }
+        si (w == "enum") { _ll_enum(p, e, _ll_tomar(p)) }
+        si (w == "service") {
+            sea nombre = _ll_tomar(p)
+            sea s = {"nombre": nombre, "metodos": {}}
+            _ll_esperar(p, "{")
+            mientras (_ll_ver(p) != "}") {
+                sea x = _ll_tomar(p)
+                si (x == "rpc") {
+                    sea mn = _ll_tomar(p)
+                    _ll_esperar(p, "(")
+                    sea flujo_e = falso
+                    si (_ll_ver(p) == "stream") { _ll_tomar(p)  flujo_e = verdadero }
+                    sea ent = _ll_tomar(p)
+                    _ll_esperar(p, ")")
+                    _ll_esperar(p, "returns")
+                    _ll_esperar(p, "(")
+                    sea flujo_s = falso
+                    si (_ll_ver(p) == "stream") { _ll_tomar(p)  flujo_s = verdadero }
+                    sea sal = _ll_tomar(p)
+                    _ll_esperar(p, ")")
+                    si (_ll_ver(p) == "{") { _ll_saltar_bloque(p) } sino { _ll_esperar(p, ";") }
+                    sea ruta = "/" + nombre + "/" + mn
+                    si (e["paquete"] != "") { ruta = "/" + e["paquete"] + "." + nombre + "/" + mn }
+                    s["metodos"][mn] = {"entrada": ent, "salida": sal, "flujo_entrada": flujo_e, "flujo_salida": flujo_s, "ruta": ruta}
+                } sino { si (x == "option") { _ll_hasta_pyc(p) } }
+            }
+            _ll_tomar(p)
+            e["servicios"][nombre] = s
+        }
+    }
+    retornar e
+}
+
+// Resuelve un nombre de tipo relativo al mensaje actual.
+funcion _ll_resolver(e, desde, t) {
+    sea n = t
+    si (texto_empieza_con(n, ".")) { n = subcadena(n, 1, longitud(n)) }
+    si (e["paquete"] != "" y texto_empieza_con(n, e["paquete"] + ".")) { n = subcadena(n, longitud(e["paquete"]) + 1, longitud(n)) }
+    sea ambito = desde
+    mientras (verdadero) {
+        sea cand = n
+        si (ambito != "") { cand = ambito + "." + n }
+        si (tiene_clave(e["mensajes"], cand)) { retornar {"k": "mensaje", "n": cand} }
+        si (tiene_clave(e["enums"], cand)) { retornar {"k": "enum", "n": cand} }
+        si (ambito == "") { lanzar "llamada: tipo desconocido " + t }
+        sea k = longitud(ambito) - 1
+        mientras (k >= 0 y subcadena(ambito, k, k + 1) != ".") { k = k - 1 }
+        si (k < 0) { ambito = "" } sino { ambito = subcadena(ambito, 0, k) }
+    }
+}
+
+// ── Enteros de 64 bits como [alto, bajo] ─────────────────────────────────
+
+sea _LL_M32 = 4294967296
+
+// Valor (número o texto decimal, con signo) → [hi, lo] en complemento a dos.
+funcion _ll_a64(v) {
+    sea t = "" + v
+    sea neg = texto_empieza_con(t, "-")
+    si (neg) { t = subcadena(t, 1, longitud(t)) }
+    si (texto_indice(t, ".") >= 0 o texto_indice(t, "e") >= 0) { lanzar "llamada: se esperaba un entero, llegó " + v }
+    sea hi = 0
+    sea lo = 0
+    sea i = 0
+    mientras (i < longitud(t)) {
+        sea d = byte_en(t, i) - 48
+        si (d < 0 o d > 9) { lanzar "llamada: entero inválido " + v }
+        sea nlo = lo * 10 + d
+        sea carry = piso(nlo / _LL_M32)
+        lo = nlo - carry * _LL_M32
+        hi = (hi * 10 + carry) % _LL_M32
+        i = i + 1
+    }
+    si (neg y (hi != 0 o lo != 0)) {
+        lo = _LL_M32 - lo
+        hi = _LL_M32 - 1 - hi
+        si (lo == _LL_M32) { lo = 0  hi = (hi + 1) % _LL_M32 }
+    }
+    retornar [hi, lo]
+}
+
+// [hi, lo] → texto decimal (con signo si firmado).
+funcion _ll_de64(x, firmado) {
+    sea hi = x[0]
+    sea lo = x[1]
+    sea neg = firmado y hi >= 2147483648
+    si (neg) {
+        lo = _LL_M32 - lo
+        hi = _LL_M32 - 1 - hi
+        si (lo == _LL_M32) { lo = 0  hi = hi + 1 }
+    }
+    // Si cabe en 2^53, número; si no, texto.
+    si (hi < 2097152) {
+        sea v = hi * _LL_M32 + lo
+        si (neg) { retornar -v }
+        retornar v
+    }
+    sea digitos = []
+    sea partes = [piso(hi / 65536), hi % 65536, piso(lo / 65536), lo % 65536]
+    mientras (partes[0] != 0 o partes[1] != 0 o partes[2] != 0 o partes[3] != 0) {
+        sea r = 0
+        sea k = 0
+        mientras (k < 4) {
+            sea cur = r * 65536 + partes[k]
+            partes[k] = piso(cur / 10)
+            r = cur % 10
+            k = k + 1
+        }
+        digitos.agregar(r)
+    }
+    sea s = ""
+    sea j = longitud(digitos) - 1
+    mientras (j >= 0) { s = s + digitos[j]  j = j - 1 }
+    si (neg) { retornar "-" + s }
+    retornar s
+}
+
+funcion _ll_varint64(x) {
+    sea hi = x[0]
+    sea lo = x[1]
+    sea r = ""
+    mientras (verdadero) {
+        sea b = lo % 128
+        // Desplaza 7 bits a la derecha el par.
+        lo = piso(lo / 128) + (hi % 128) * 33554432
+        hi = piso(hi / 128)
+        si (hi == 0 y lo == 0) { retornar r + _ll_byte(b) }
+        r = r + _ll_byte(b + 128)
+    }
+}
+
+funcion _ll_varint(v) { retornar _ll_varint64([piso(v / _LL_M32), v % _LL_M32]) }
+
+funcion _ll_leer_varint(b, i) {
+    sea hi = 0
+    sea lo = 0
+    sea desp = 0
+    sea j = i
+    mientras (verdadero) {
+        si (j >= longitud(b)) { lanzar "llamada: varint truncado" }
+        si (desp >= 70) { lanzar "llamada: varint demasiado largo" }
+        sea x = byte_en(b, j)
+        sea v = x % 128
+        si (desp < 28) { lo = lo + v * potencia(2, desp) } sino {
+            si (desp == 28) {
+                lo = lo + (v % 16) * 268435456
+                hi = hi + piso(v / 16)
+            } sino { hi = (hi + v * potencia(2, desp - 32)) % _LL_M32 }
+        }
+        j = j + 1
+        desp = desp + 7
+        si (x < 128) { retornar [[hi % _LL_M32, lo], j] }
+    }
+}
+
+funcion _ll_zigzag(v) {
+    // (n << 1) ^ (n >> 63) sobre 64 bits.
+    sea x = _ll_a64(v)
+    sea neg = x[0] >= 2147483648
+    sea hi = (x[0] * 2) % _LL_M32 + piso(x[1] / 2147483648)
+    sea lo = (x[1] * 2) % _LL_M32
+    si (neg) { retornar [_LL_M32 - 1 - hi, _LL_M32 - 1 - lo] }
+    retornar [hi, lo]
+}
+
+funcion _ll_dezigzag(x) {
+    sea impar = x[1] % 2 == 1
+    sea lo = piso(x[1] / 2) + (x[0] % 2) * 2147483648
+    sea hi = piso(x[0] / 2)
+    si (impar) { retornar [_LL_M32 - 1 - hi, _LL_M32 - 1 - lo] }
+    retornar [hi, lo]
+}
+
+funcion _ll_le(v, n) {
+    sea r = ""
+    sea x = v
+    sea i = 0
+    mientras (i < n) { r = r + _ll_byte(x % 256)  x = piso(x / 256)  i = i + 1 }
+    retornar r
+}
+
+funcion _ll_leer_le(b, i, n) {
+    sea v = 0
+    sea k = n - 1
+    mientras (k >= 0) { v = v * 256 + byte_en(b, i + k)  k = k - 1 }
+    retornar v
+}
+
+
+// IEEE 754 a mano (little endian).
+funcion _ll_ieee(v, ancho) {
+    sea bits = 52
+    sea sesgo = 1023
+    sea emax = 2047
+    si (ancho == 4) { bits = 23  sesgo = 127  emax = 255 }
+    sea s = 0
+    sea m = v
+    si (v < 0 o (v == 0 y 1 / v < 0)) { s = 1  m = 0 - v }
+    sea exp = 0
+    sea mant = 0
+    si (m != m) { exp = emax  mant = 1 } sino {
+        si (m > 1.7976931348623157e308) { exp = emax } sino {
+            si (m != 0) {
+                sea e = 0
+                mientras (m >= 2) { m = m / 2  e = e + 1 }
+                mientras (m < 1 y e > 1 - sesgo) { m = m * 2  e = e - 1 }
+                si (m < 1) {
+                    exp = 0
+                    mant = redondear(m * potencia(2, bits))
+                } sino {
+                    exp = e + sesgo
+                    mant = redondear((m - 1) * potencia(2, bits))
+                    si (mant >= potencia(2, bits)) { mant = 0  exp = exp + 1 }
+                }
+                si (exp >= emax) { exp = emax  mant = 0 }
+            }
+        }
+    }
+    // Arma los bytes de menor a mayor.
+    sea total = (s * potencia(2, ancho * 8 - 1 - bits) + exp)
+    sea r = ""
+    sea k = 0
+    sea lo = mant
+    mientras (k < ancho) {
+        // Bits [8k, 8k+8) del número s|exp|mant.
+        sea byte_ = 0
+        si (8 * k + 8 <= bits) { byte_ = piso(lo / potencia(2, 8 * k)) % 256 } sino {
+            si (8 * k >= bits) { byte_ = piso(total / potencia(2, 8 * k - bits)) % 256 } sino {
+                sea parte_m = piso(lo / potencia(2, 8 * k)) % potencia(2, bits - 8 * k)
+                sea parte_e = (total % potencia(2, 8 * k + 8 - bits)) * potencia(2, bits - 8 * k)
+                byte_ = parte_m + parte_e
+            }
+        }
+        r = r + _ll_byte(byte_)
+        k = k + 1
+    }
+    retornar r
+}
+
+funcion _ll_de_ieee(b, ancho) {
+    sea bits = 52
+    sea sesgo = 1023
+    sea emax = 2047
+    si (ancho == 4) { bits = 23  sesgo = 127  emax = 255 }
+    sea alto = byte_en(b, ancho - 1)
+    sea s = 1
+    si (alto >= 128) { s = -1 }
+    sea mant = 0
+    sea k = ancho - 1
+    sea todo = 0
+    // Exponente: bits [bits, bits + ancho*8 - 1 - bits).
+    sea v = 0
+    k = ancho - 1
+    mientras (k >= 0) { v = v * 256 + byte_en(b, k)  k = k - 1 }
+    // v puede pasar 2^53 en double: se separa en partes.
+    sea e = 0
+    si (ancho == 8) {
+        e = (alto % 128) * 16 + piso(byte_en(b, 6) / 16)
+        mant = (byte_en(b, 6) % 16) * 281474976710656
+        k = 5
+        sea m2 = 0
+        mientras (k >= 0) { m2 = m2 * 256 + byte_en(b, k)  k = k - 1 }
+        mant = mant + m2
+    } sino {
+        e = (alto % 128) * 2 + piso(byte_en(b, 2) / 128)
+        mant = (byte_en(b, 2) % 128) * 65536 + byte_en(b, 1) * 256 + byte_en(b, 0)
+    }
+    si (e == emax) {
+        si (mant == 0) { retornar s * 1e308 * 10 }
+        retornar 0 / 0
+    }
+    si (e == 0) { retornar s * mant * potencia(2, 1 - sesgo - bits) }
+    retornar s * (1 + mant / potencia(2, bits)) * potencia(2, e - sesgo)
+}
+
+// ── Codificar ─────────────────────────────────────────────────────────────
+
+sea _LL_VARINT = {"int32": 1, "int64": 1, "uint32": 1, "uint64": 1, "sint32": 1, "sint64": 1, "bool": 1}
+sea _LL_FIJO32 = {"fixed32": 1, "sfixed32": 1, "float": 1}
+sea _LL_FIJO64 = {"fixed64": 1, "sfixed64": 1, "double": 1}
+
+funcion _ll_tipo_cable(e, desde, t) {
+    si (tiene_clave(_LL_VARINT, t)) { retornar 0 }
+    si (tiene_clave(_LL_FIJO64, t)) { retornar 1 }
+    si (tiene_clave(_LL_FIJO32, t)) { retornar 5 }
+    si (t == "string" o t == "bytes") { retornar 2 }
+    si (_ll_resolver(e, desde, t)["k"] == "enum") { retornar 0 }
+    retornar 2
+}
+
+funcion _ll_valor_escalar(e, desde, t, v) {
+    si (t == "int32" o t == "int64" o t == "uint32" o t == "uint64") { retornar _ll_varint64(_ll_a64(v)) }
+    si (t == "sint32" o t == "sint64") { retornar _ll_varint64(_ll_zigzag(v)) }
+    si (t == "bool") {
+        si (v == verdadero) { retornar _ll_byte(1) }
+        retornar _ll_byte(0)
+    }
+    si (t == "fixed32") { retornar _ll_le(v, 4) }
+    si (t == "sfixed32") {
+        si (v < 0) { retornar _ll_le(v + _LL_M32, 4) }
+        retornar _ll_le(v, 4)
+    }
+    si (t == "fixed64" o t == "sfixed64") {
+        sea x = _ll_a64(v)
+        retornar _ll_le(x[1], 4) + _ll_le(x[0], 4)
+    }
+    si (t == "double") { retornar _ll_ieee(v, 8) }
+    si (t == "float") { retornar _ll_ieee(v, 4) }
+    si (t == "string" o t == "bytes") {
+        sea s = "" + v
+        retornar _ll_varint(longitud(s)) + s
+    }
+    sea r = _ll_resolver(e, desde, t)
+    si (r["k"] == "enum") {
+        sea n = v
+        si (tipo(v) == "texto") {
+            si (tiene_clave(e["enums"][r["n"]]["valores"], v) == falso) { lanzar "llamada: valor de enum desconocido " + v }
+            n = e["enums"][r["n"]]["valores"][v]
+        }
+        retornar _ll_varint64(_ll_a64(n))
+    }
+    sea sub = _ll_cod(e, r["n"], v)
+    retornar _ll_varint(longitud(sub)) + sub
+}
+
+funcion _ll_clave(num, cable) { retornar _ll_varint(num * 8 + cable) }
+
+funcion _ll_es_defecto(v) {
+    si (v == nulo) { retornar verdadero }
+    si (v == 0 o v == falso o v == "") { retornar verdadero }
+    si (tipo(v) == "lista" y longitud(v) == 0) { retornar verdadero }
+    retornar falso
+}
+
+funcion _ll_cod(e, nombre, valor) {
+    si (tiene_clave(e["mensajes"], nombre) == falso) { lanzar "llamada: mensaje desconocido " + nombre }
+    sea m = e["mensajes"][nombre]
+    si (tipo(valor) != "mapa") { lanzar "llamada: " + nombre + " espera un mapa" }
+    para k en claves(valor) { si (tiene_clave(m["por_nombre"], k) == falso) { lanzar "llamada: " + nombre + " no tiene el campo " + k } }
+    sea r = ""
+    para c en m["campos"] {
+        sea v = valor[c["nombre"]] ?? nulo
+        sea presente = v != nulo
+        si (presente y e["sintaxis"] == "proto3" y c["oneof"] == nulo y c["opcional"] == falso y c["repetido"] == falso y _ll_es_defecto(v)) {
+            // proto3 no escribe valores por defecto (salvo mensajes).
+            si (_ll_tipo_cable(e, nombre, c["tipo"]) != 2 o c["tipo"] == "string" o c["tipo"] == "bytes") { presente = falso }
+        }
+        si (presente) {
+            si (c["mapa"] != nulo) {
+                para k en claves(v) {
+                    sea kv = k
+                    si (c["mapa"]["clave"] != "string") { kv = a_numero(k) }
+                    si (c["mapa"]["clave"] == "bool") { kv = k == "true" o k == "verdadero" }
+                    sea entrada = _ll_clave(1, _ll_tipo_cable(e, nombre, c["mapa"]["clave"])) + _ll_valor_escalar(e, nombre, c["mapa"]["clave"], kv) + _ll_clave(2, _ll_tipo_cable(e, nombre, c["mapa"]["valor"])) + _ll_valor_escalar(e, nombre, c["mapa"]["valor"], v[k])
+                    r = r + _ll_clave(c["numero"], 2) + _ll_varint(longitud(entrada)) + entrada
+                }
+            } sino {
+                sea cable = _ll_tipo_cable(e, nombre, c["tipo"])
+                si (c["repetido"]) {
+                    si (c["empaquetado"] y cable != 2) {
+                        sea cuerpo = ""
+                        para x en v { cuerpo = cuerpo + _ll_valor_escalar(e, nombre, c["tipo"], x) }
+                        r = r + _ll_clave(c["numero"], 2) + _ll_varint(longitud(cuerpo)) + cuerpo
+                    } sino {
+                        para x en v { r = r + _ll_clave(c["numero"], cable) + _ll_valor_escalar(e, nombre, c["tipo"], x) }
+                    }
+                } sino { r = r + _ll_clave(c["numero"], cable) + _ll_valor_escalar(e, nombre, c["tipo"], v) }
+            }
+        }
+    }
+    retornar r
+}
+
+/// Mensaje → bytes. Enteros de 64 bits: número o texto decimal.
+funcion llamada_codificar(e, mensaje, valor) { retornar _ll_cod(e, _ll_resolver(e, "", mensaje)["n"], valor) }
+
+// ── Decodificar ───────────────────────────────────────────────────────────
+
+funcion _ll_dec_escalar(e, desde, t, cable, b, i) {
+    si (cable == 0) {
+        sea x = _ll_leer_varint(b, i)
+        sea v = x[0]
+        sea r = nulo
+        si (t == "bool") { r = v[1] != 0 o v[0] != 0 }
+        si (t == "int64") { r = _ll_de64(v, verdadero) }
+        si (t == "uint64") { r = _ll_de64(v, falso) }
+        si (t == "uint32") { r = v[1] }
+        si (t == "int32") { r = _ll_de64([0, v[1]], falso)  si (r >= 2147483648) { r = r - _LL_M32 } }
+        si (t == "sint32" o t == "sint64") { r = _ll_de64(_ll_dezigzag(v), verdadero) }
+        si (r == nulo) {
+            sea res = _ll_resolver(e, desde, t)
+            sea n = v[1]
+            si (n >= 2147483648) { n = n - _LL_M32 }
+            r = e["enums"][res["n"]]["nombres"]["" + n] ?? n
+        }
+        retornar [r, x[1]]
+    }
+    si (cable == 5) {
+        si (i + 4 > longitud(b)) { lanzar "llamada: datos truncados" }
+        si (t == "float") { retornar [_ll_de_ieee(subcadena(b, i, i + 4), 4), i + 4] }
+        sea v = _ll_leer_le(b, i, 4)
+        si (t == "sfixed32" y v >= 2147483648) { v = v - _LL_M32 }
+        retornar [v, i + 4]
+    }
+    si (cable == 1) {
+        si (i + 8 > longitud(b)) { lanzar "llamada: datos truncados" }
+        si (t == "double") { retornar [_ll_de_ieee(subcadena(b, i, i + 8), 8), i + 8] }
+        sea x = [_ll_leer_le(b, i + 4, 4), _ll_leer_le(b, i, 4)]
+        retornar [_ll_de64(x, t == "sfixed64"), i + 8]
+    }
+    si (cable == 2) {
+        sea x = _ll_leer_varint(b, i)
+        sea n = x[0][1]
+        sea j = x[1]
+        si (j + n > longitud(b)) { lanzar "llamada: datos truncados" }
+        sea s = subcadena(b, j, j + n)
+        si (t == "string" o t == "bytes") { retornar [s, j + n] }
+        retornar [_ll_dec(e, _ll_resolver(e, desde, t)["n"], s), j + n]
+    }
+    lanzar "llamada: tipo de cable no soportado " + cable
+}
+
+funcion _ll_saltar(b, i, cable) {
+    si (cable == 0) { retornar _ll_leer_varint(b, i)[1] }
+    si (cable == 1) { retornar i + 8 }
+    si (cable == 5) { retornar i + 4 }
+    si (cable == 2) {
+        sea x = _ll_leer_varint(b, i)
+        retornar x[1] + x[0][1]
+    }
+    lanzar "llamada: tipo de cable desconocido " + cable
+}
+
+funcion _ll_dec(e, nombre, b) {
+    sea m = e["mensajes"][nombre]
+    sea r = {}
+    // Valores por defecto de proto3.
+    para c en m["campos"] {
+        si (c["repetido"]) {
+            si (c["mapa"] != nulo) { r[c["nombre"]] = {} } sino { r[c["nombre"]] = [] }
+        } sino {
+            si (e["sintaxis"] == "proto3" y c["oneof"] == nulo y c["opcional"] == falso) {
+                sea t = c["tipo"]
+                si (t == "string" o t == "bytes") { r[c["nombre"]] = "" }
+                si (t == "bool") { r[c["nombre"]] = falso }
+                si (tiene_clave(_LL_VARINT, t) y t != "bool") { r[c["nombre"]] = 0 }
+                si (tiene_clave(_LL_FIJO32, t) o tiene_clave(_LL_FIJO64, t)) { r[c["nombre"]] = 0 }
+                si (tiene_clave(r, c["nombre"]) == falso) {
+                    sea res = _ll_resolver(e, nombre, t)
+                    si (res["k"] == "enum") { r[c["nombre"]] = e["enums"][res["n"]]["nombres"]["0"] ?? 0 }
+                }
+            }
+        }
+    }
+    sea i = 0
+    mientras (i < longitud(b)) {
+        sea k = _ll_leer_varint(b, i)
+        sea num = piso(k[0][1] / 8)
+        sea cable = k[0][1] % 8
+        i = k[1]
+        sea c = m["por_numero"]["" + num] ?? nulo
+        si (c == nulo) { i = _ll_saltar(b, i, cable) } sino {
+            si (c["mapa"] != nulo) {
+                sea x = _ll_leer_varint(b, i)
+                sea fin = x[1] + x[0][1]
+                sea j = x[1]
+                sea kk = nulo
+                sea vv = nulo
+                mientras (j < fin) {
+                    sea kt = _ll_leer_varint(b, j)
+                    sea n2 = piso(kt[0][1] / 8)
+                    sea c2 = kt[0][1] % 8
+                    sea t2 = c["mapa"]["clave"]
+                    si (n2 == 2) { t2 = c["mapa"]["valor"] }
+                    sea d = _ll_dec_escalar(e, nombre, t2, c2, b, kt[1])
+                    si (n2 == 1) { kk = d[0] } sino { vv = d[0] }
+                    j = d[1]
+                }
+                r[c["nombre"]]["" + (kk ?? "")] = vv
+                i = fin
+            } sino {
+                sea cable_esperado = _ll_tipo_cable(e, nombre, c["tipo"])
+                si (c["repetido"] y cable == 2 y cable_esperado != 2) {
+                    // Empaquetado.
+                    sea x = _ll_leer_varint(b, i)
+                    sea fin = x[1] + x[0][1]
+                    sea j = x[1]
+                    mientras (j < fin) {
+                        sea d = _ll_dec_escalar(e, nombre, c["tipo"], cable_esperado, b, j)
+                        r[c["nombre"]].agregar(d[0])
+                        j = d[1]
+                    }
+                    i = fin
+                } sino {
+                    sea d = _ll_dec_escalar(e, nombre, c["tipo"], cable, b, i)
+                    si (c["repetido"]) { r[c["nombre"]].agregar(d[0]) } sino {
+                        si (c["oneof"] != nulo) {
+                            // Solo un campo del oneof queda puesto.
+                            para o_ en m["campos"] { si (o_["oneof"] == c["oneof"] y o_["nombre"] != c["nombre"]) { quitar_clave(r, o_["nombre"]) } }
+                        }
+                        r[c["nombre"]] = d[0]
+                    }
+                    i = d[1]
+                }
+            }
+        }
+    }
+    retornar r
+}
+
+/// Bytes → mapa (con los valores por defecto de proto3).
+funcion llamada_decodificar(e, mensaje, b) { retornar _ll_dec(e, _ll_resolver(e, "", mensaje)["n"], b) }
+
+// ── gRPC ──────────────────────────────────────────────────────────────────
+
+/// Marco gRPC: 1 byte de compresión (0) + largo de 4 bytes + mensaje.
+funcion llamada_marco(mensaje) {
+    sea n = longitud(mensaje)
+    retornar _ll_byte(0) + _ll_byte(piso(n / 16777216) % 256) + _ll_byte(piso(n / 65536) % 256) + _ll_byte(piso(n / 256) % 256) + _ll_byte(n % 256) + mensaje
+}
+
+/// Separa marcos gRPC de un cuerpo: lista de mensajes (bytes).
+funcion llamada_marcos(cuerpo) {
+    sea r = []
+    sea i = 0
+    mientras (i < longitud(cuerpo)) {
+        si (i + 5 > longitud(cuerpo)) { lanzar "llamada: marco gRPC truncado" }
+        si (byte_en(cuerpo, i) != 0) { lanzar "llamada: mensaje gRPC comprimido (no soportado)" }
+        sea n = ((byte_en(cuerpo, i + 1) * 256 + byte_en(cuerpo, i + 2)) * 256 + byte_en(cuerpo, i + 3)) * 256 + byte_en(cuerpo, i + 4)
+        si (i + 5 + n > longitud(cuerpo)) { lanzar "llamada: marco gRPC truncado" }
+        r.agregar(subcadena(cuerpo, i + 5, i + 5 + n))
+        i = i + 5 + n
+    }
+    retornar r
+}
+
+/// Petición unaria lista para HTTP/2: {"ruta", "cabeceras", "cuerpo"}.
+funcion llamada_peticion(e, servicio, metodo, valor) {
+    sea s = e["servicios"][servicio] ?? nulo
+    si (s == nulo) { lanzar "llamada: servicio desconocido " + servicio }
+    sea m = s["metodos"][metodo] ?? nulo
+    si (m == nulo) { lanzar "llamada: método desconocido " + metodo }
+    retornar {"ruta": m["ruta"], "cabeceras": {"content-type": "application/grpc", "te": "trailers"}, "cuerpo": llamada_marco(llamada_codificar(e, m["entrada"], valor)), "salida": m["salida"]}
+}
+
+sea _LL_ESTADOS = ["OK", "CANCELLED", "UNKNOWN", "INVALID_ARGUMENT", "DEADLINE_EXCEEDED", "NOT_FOUND", "ALREADY_EXISTS", "PERMISSION_DENIED", "RESOURCE_EXHAUSTED", "FAILED_PRECONDITION", "ABORTED", "OUT_OF_RANGE", "UNIMPLEMENTED", "INTERNAL", "UNAVAILABLE", "DATA_LOSS", "UNAUTHENTICATED"]
+
+/// Trailers gRPC → {"codigo", "nombre", "mensaje"}.
+funcion llamada_estado(trailers) {
+    sea c = a_numero("" + (trailers["grpc-status"] ?? "2"))
+    sea m = "" + (trailers["grpc-message"] ?? "")
+    // Decodifica %XX.
+    sea r = ""
+    sea hex = ""
+    sea i = 0
+    mientras (i < longitud(m)) {
+        si (byte_en(m, i) == 37 y i + 2 < longitud(m) + 1) { hex = hex + subcadena(m, i + 1, i + 3)  i = i + 3 } sino {
+            si (hex != "") { r = r + bytes_de_hex(hex)  hex = "" }
+            r = r + subcadena(m, i, i + 1)
+            i = i + 1
+        }
+    }
+    si (hex != "") { r = r + bytes_de_hex(hex) }
+    sea nombre = "UNKNOWN"
+    si (c >= 0 y c < longitud(_LL_ESTADOS)) { nombre = _LL_ESTADOS[c] }
+    retornar {"codigo": c, "nombre": nombre, "mensaje": r}
+}
