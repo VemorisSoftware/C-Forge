@@ -1,0 +1,289 @@
+// stdlib/proceso.cfv — flujos de trabajo durables al estilo Temporal: un
+// flujo es una función normal que llama actividades con proceso_actividad;
+// cada resultado queda en un historial de eventos (en memoria o en un
+// archivo JSON), y si el programa se cae o el flujo espera un temporizador
+// o una señal, al reanudar se re-ejecuta el flujo reproduciendo el
+// historial sin repetir las actividades ya hechas. Incluye reintentos con
+// espera exponencial, temporizadores durables, señales, consultas, sagas
+// con compensación y versionado. Idea de Temporal (MIT). En inglés:
+// importar "workflow".
+//
+//   importar "proceso"
+//   sea motor = proceso_motor({"archivo": "flujos.json"})
+//   proceso_registrar(motor, "pedido", funcion(ctx, entrada) {
+//       sea pago = proceso_actividad(ctx, "cobrar", cobrar, [entrada])
+//       proceso_dormir(ctx, 3600000)
+//       retornar proceso_actividad(ctx, "enviar", enviar, [pago])
+//   })
+//   proceso_iniciar(motor, "pedido", "p-1", {"total": 100})
+
+importar "json"
+
+sea _PR_SUSPENDIDO = "__proceso_suspendido__"
+
+/// Motor. opciones: "archivo" (persistencia JSON), "reloj" (función → ms).
+funcion proceso_motor(opciones) {
+    sea op = opciones ?? {}
+    sea m = {"op": op, "flujos": {}, "tipos": {}}
+    sea ar = op["archivo"] ?? nulo
+    si (ar != nulo y existe_archivo(ar)) {
+        sea t = leer_archivo(ar)
+        si (texto_recortar(t) != "") { m["flujos"] = json_parsear(t) }
+    }
+    retornar m
+}
+
+funcion _pr_ahora(m) {
+    sea r = m["op"]["reloj"] ?? nulo
+    si (r != nulo) { retornar r() }
+    retornar tiempo_ms()
+}
+
+funcion _pr_guardar(m) {
+    sea ar = m["op"]["archivo"] ?? nulo
+    si (ar != nulo) { escribir_archivo(ar, json_texto(m["flujos"])) }
+}
+
+/// Registra un tipo de flujo: fn(ctx, entrada) → resultado.
+funcion proceso_registrar(m, nombre, fn) { m["tipos"][nombre] = fn }
+
+/// Inicia un flujo con id único (si ya existe, no lo duplica) y lo avanza.
+funcion proceso_iniciar(m, tipo_flujo, id, entrada) {
+    si (tiene_clave(m["flujos"], id) == falso) {
+        m["flujos"][id] = {"id": id, "tipo": tipo_flujo, "entrada": entrada, "estado": "corriendo", "historial": [], "senales": [], "resultado": nulo, "error": nulo, "despertar": nulo, "consultas": {}, "creado": _pr_ahora(m)}
+        _pr_guardar(m)
+    }
+    retornar proceso_avanzar(m, id)
+}
+
+funcion _pr_ctx(m, f) { retornar {"m": m, "f": f, "i": 0, "compensar": [], "consultas": {}} }
+
+// Siguiente evento del historial (reproducción) o nulo si es nuevo.
+funcion _pr_evento(ctx, clase, nombre) {
+    sea h = ctx["f"]["historial"]
+    sea i = ctx["i"]
+    ctx["i"] = i + 1
+    si (i < longitud(h)) {
+        sea e = h[i]
+        si (e["clase"] != clase o e["nombre"] != nombre) { lanzar "no determinista: el evento " + i + " era " + e["clase"] + " " + e["nombre"] + " y ahora es " + clase + " " + nombre }
+        retornar e
+    }
+    retornar nulo
+}
+
+funcion _pr_anotar(ctx, e) {
+    ctx["f"]["historial"].agregar(e)
+    _pr_guardar(ctx["m"])
+}
+
+funcion _pr_llamar(fn, a) {
+    sea n = longitud(a)
+    si (n == 0) { retornar fn() }
+    si (n == 1) { retornar fn(a[0]) }
+    si (n == 2) { retornar fn(a[0], a[1]) }
+    si (n == 3) { retornar fn(a[0], a[1], a[2]) }
+    si (n == 4) { retornar fn(a[0], a[1], a[2], a[3]) }
+    retornar fn(a[0], a[1], a[2], a[3], a[4])
+}
+
+/// Ejecuta una actividad una sola vez (se reproduce desde el historial).
+/// opciones: "reintentos" (3), "espera_ms" (100), "factor" (2),
+/// "espera_max_ms" (10000), "dormir" (función ms para esperar; por defecto
+/// dormir_ms), "compensar" (función para sagas).
+funcion proceso_actividad(ctx, nombre, fn, args, opciones) {
+    sea op = opciones ?? {}
+    sea e = _pr_evento(ctx, "actividad", nombre)
+    si (e != nulo) {
+        si (e["ok"]) {
+            si ((op["compensar"] ?? nulo) != nulo) { ctx["compensar"].agregar([op["compensar"], e["valor"]]) }
+            retornar e["valor"]
+        }
+        lanzar e["error"]
+    }
+    sea intentos = 1 + (op["reintentos"] ?? 3)
+    sea espera = op["espera_ms"] ?? 100
+    sea k = 0
+    sea ultimo = ""
+    mientras (k < intentos) {
+        sea ok = falso
+        sea valor = nulo
+        intentar {
+            valor = _pr_llamar(fn, args ?? [])
+            ok = verdadero
+        } capturar (err) { ultimo = "" + err }
+        si (ok) {
+            _pr_anotar(ctx, {"clase": "actividad", "nombre": nombre, "ok": verdadero, "valor": valor, "intentos": k + 1})
+            si ((op["compensar"] ?? nulo) != nulo) { ctx["compensar"].agregar([op["compensar"], valor]) }
+            retornar valor
+        }
+        k = k + 1
+        si (k < intentos) {
+            sea d = op["dormir"] ?? nulo
+            si (d != nulo) { d(espera) } sino { dormir(espera) }
+            espera = minimo(espera * (op["factor"] ?? 2), op["espera_max_ms"] ?? 10000)
+        }
+    }
+    _pr_anotar(ctx, {"clase": "actividad", "nombre": nombre, "ok": falso, "error": ultimo, "intentos": k})
+    lanzar ultimo
+}
+
+/// Efecto lateral no determinista (hora, uuid, azar) registrado una vez.
+funcion proceso_efecto(ctx, fn) {
+    sea e = _pr_evento(ctx, "efecto", "efecto")
+    si (e != nulo) { retornar e["valor"] }
+    sea v = fn()
+    _pr_anotar(ctx, {"clase": "efecto", "nombre": "efecto", "valor": v})
+    retornar v
+}
+
+/// Hora del flujo (determinista al reproducir).
+funcion proceso_ahora(ctx) { retornar proceso_efecto(ctx, funcion() { retornar _pr_ahora(ctx["m"]) }) }
+
+/// Temporizador durable: suspende el flujo hasta que pase el tiempo.
+funcion proceso_dormir(ctx, ms) {
+    sea e = _pr_evento(ctx, "temporizador", "dormir")
+    si (e == nulo) {
+        e = {"clase": "temporizador", "nombre": "dormir", "vence": _pr_ahora(ctx["m"]) + ms}
+        _pr_anotar(ctx, e)
+    }
+    si (_pr_ahora(ctx["m"]) < e["vence"]) {
+        ctx["f"]["despertar"] = e["vence"]
+        lanzar _PR_SUSPENDIDO
+    }
+}
+
+/// Espera una señal por nombre. Devuelve su dato. Con tiempo_ms, si vence
+/// antes devuelve nulo.
+funcion proceso_esperar_senal(ctx, nombre, tiempo_ms_max) {
+    sea e = _pr_evento(ctx, "senal", nombre)
+    si (e != nulo y e["llego"]) { retornar e["dato"] }
+    si (e == nulo) {
+        e = {"clase": "senal", "nombre": nombre, "llego": falso, "dato": nulo, "vence": nulo}
+        si (tiempo_ms_max != nulo) { e["vence"] = _pr_ahora(ctx["m"]) + tiempo_ms_max }
+        _pr_anotar(ctx, e)
+    }
+    // ¿Hay una señal pendiente con ese nombre?
+    sea pend = ctx["f"]["senales"]
+    sea i = 0
+    mientras (i < longitud(pend)) {
+        si (pend[i]["nombre"] == nombre) {
+            e["llego"] = verdadero
+            e["dato"] = pend[i]["dato"]
+            sea resto = []
+            sea j = 0
+            mientras (j < longitud(pend)) {
+                si (j != i) { resto.agregar(pend[j]) }
+                j = j + 1
+            }
+            ctx["f"]["senales"] = resto
+            _pr_guardar(ctx["m"])
+            retornar e["dato"]
+        }
+        i = i + 1
+    }
+    si (e["vence"] != nulo y _pr_ahora(ctx["m"]) >= e["vence"]) {
+        e["llego"] = verdadero
+        _pr_guardar(ctx["m"])
+        retornar nulo
+    }
+    si (e["vence"] != nulo) { ctx["f"]["despertar"] = e["vence"] }
+    lanzar _PR_SUSPENDIDO
+}
+
+/// Publica un valor consultable desde afuera (proceso_consultar).
+funcion proceso_publicar(ctx, nombre, valor) { ctx["f"]["consultas"][nombre] = valor }
+
+/// Versionado: devuelve la versión con que se grabó este punto la primera
+/// vez (o "maxima" si es nuevo), para cambiar el código sin romper flujos
+/// en curso.
+funcion proceso_version(ctx, id_cambio, maxima) {
+    sea e = _pr_evento(ctx, "version", id_cambio)
+    si (e != nulo) { retornar e["v"] }
+    _pr_anotar(ctx, {"clase": "version", "nombre": id_cambio, "v": maxima})
+    retornar maxima
+}
+
+/// Saga: ejecuta las compensaciones registradas en orden inverso.
+funcion proceso_compensar(ctx) {
+    sea c = ctx["compensar"]
+    sea i = longitud(c) - 1
+    mientras (i >= 0) {
+        proceso_actividad(ctx, "compensar_" + i, c[i][0], [c[i][1]], {"reintentos": 3, "espera_ms": 0})
+        i = i - 1
+    }
+    ctx["compensar"] = []
+}
+
+/// Re-ejecuta el flujo reproduciendo su historial. Devuelve su estado.
+funcion proceso_avanzar(m, id) {
+    sea f = m["flujos"][id] ?? nulo
+    si (f == nulo) { lanzar "flujo desconocido: " + id }
+    si (f["estado"] != "corriendo" y f["estado"] != "esperando") { retornar proceso_estado(m, id) }
+    sea fn = m["tipos"][f["tipo"]] ?? nulo
+    si (fn == nulo) { lanzar "tipo de flujo no registrado: " + f["tipo"] }
+    sea ctx = _pr_ctx(m, f)
+    f["despertar"] = nulo
+    intentar {
+        sea r = fn(ctx, f["entrada"])
+        f["estado"] = "completado"
+        f["resultado"] = r
+    } capturar (e) {
+        si (("" + e) == _PR_SUSPENDIDO) { f["estado"] = "esperando" } sino {
+            f["estado"] = "fallido"
+            f["error"] = "" + e
+        }
+    }
+    _pr_guardar(m)
+    retornar proceso_estado(m, id)
+}
+
+/// Envía una señal y avanza el flujo.
+funcion proceso_senal(m, id, nombre, dato) {
+    m["flujos"][id]["senales"].agregar({"nombre": nombre, "dato": dato})
+    _pr_guardar(m)
+    retornar proceso_avanzar(m, id)
+}
+
+/// Lee un valor publicado con proceso_publicar.
+funcion proceso_consultar(m, id, nombre) { retornar m["flujos"][id]["consultas"][nombre] ?? nulo }
+
+/// Cancela un flujo.
+funcion proceso_cancelar(m, id) {
+    m["flujos"][id]["estado"] = "cancelado"
+    _pr_guardar(m)
+}
+
+/// Estado público: {"id", "estado", "resultado", "error", "despertar", "pasos"}.
+funcion proceso_estado(m, id) {
+    sea f = m["flujos"][id]
+    retornar {"id": id, "tipo": f["tipo"], "estado": f["estado"], "resultado": f["resultado"], "error": f["error"], "despertar": f["despertar"], "pasos": longitud(f["historial"])}
+}
+
+/// Avanza todos los flujos cuyo temporizador ya venció (o que siguen
+/// corriendo tras una caída). Devuelve cuántos avanzó.
+funcion proceso_tic(m) {
+    sea n = 0
+    para id en claves(m["flujos"]) {
+        sea f = m["flujos"][id]
+        si (f["estado"] == "corriendo" o (f["estado"] == "esperando" y f["despertar"] != nulo y f["despertar"] <= _pr_ahora(m))) {
+            proceso_avanzar(m, id)
+            n = n + 1
+        }
+    }
+    retornar n
+}
+
+/// Lista flujos, opcionalmente filtrados por estado.
+funcion proceso_listar(m, estado) {
+    sea r = []
+    para id en claves(m["flujos"]) { si (estado == nulo o m["flujos"][id]["estado"] == estado) { r.agregar(proceso_estado(m, id)) } }
+    retornar r
+}
+
+/// Bucle de trabajador: avanza flujos vencidos cada intervalo (bloquea).
+funcion proceso_trabajar(m, intervalo_ms) {
+    mientras (verdadero) {
+        proceso_tic(m)
+        dormir(intervalo_ms ?? 1000)
+    }
+}

@@ -1,0 +1,746 @@
+// stdlib/terminal.cfv — interfaces de terminal al estilo Ratatui: un
+// búfer de celdas con colores y estilos, divisiones del área con
+// restricciones (largo, porcentaje, mínimo, máximo, proporción, relleno),
+// widgets (bloque con bordes y título, párrafo con ajuste y alineación,
+// lista con selección y desplazamiento, tabla, medidor, barras, chispa,
+// pestañas), dibujo inmediato por cuadros y salida ANSI que sólo envía lo
+// que cambió. Trae el modo crudo, la pantalla alternativa y la lectura de
+// teclas (flechas, F1–F12, Ctrl, Alt). Inspirada en Ratatui (MIT).
+// En inglés: importar "tui".
+//
+//   importar "terminal"
+//   sea b = terminal_bufer(40, 10)
+//   sea z = terminal_dividir(terminal_area(b), "vertical", [["largo", 3], ["relleno"]])
+//   terminal_bloque(b, z[0], {"titulo": "Hola", "bordes": "redondeados"})
+//   terminal_parrafo(b, z[1], "Texto que se ajusta al ancho…", {"ajustar": verdadero})
+//   escribir(terminal_ansi(b))
+
+importar "unicode"
+
+sea _TM_ESC = caracter(27)
+
+// ══ Búfer ══════════════════════════════════════════════════════════════════
+
+funcion _tm_celda() { retornar {"c": " ", "fg": nulo, "bg": nulo, "m": {}} }
+
+funcion terminal_bufer(ancho, alto) {
+    sea celdas = []
+    sea i = 0
+    mientras (i < ancho * alto) { celdas.agregar(_tm_celda())  i = i + 1 }
+    retornar {"ancho": ancho, "alto": alto, "celdas": celdas}
+}
+
+funcion terminal_area(b) { retornar {"x": 0, "y": 0, "ancho": b["ancho"], "alto": b["alto"]} }
+
+funcion terminal_limpiar(b) {
+    sea i = 0
+    mientras (i < longitud(b["celdas"])) { b["celdas"][i] = _tm_celda()  i = i + 1 }
+}
+
+funcion _tm_estilo_aplicar(cel, e) {
+    si (e == nulo) { retornar nulo }
+    si (tiene_clave(e, "fg")) { cel["fg"] = e["fg"] }
+    si (tiene_clave(e, "bg")) { cel["bg"] = e["bg"] }
+    para k en ["negrita", "tenue", "cursiva", "subrayado", "parpadeo", "invertido", "tachado"] {
+        si (tiene_clave(e, k)) {
+            sea m = {}
+            para x en claves(cel["m"]) { m[x] = cel["m"][x] }
+            si (e[k]) { m[k] = verdadero } sino { si (tiene_clave(m, k)) { quitar_clave(m, k) } }
+            cel["m"] = m
+        }
+    }
+}
+
+funcion _tm_ancho(c) {
+    sea w = unicode_ancho(c)
+    si (w < 1) { retornar 1 }
+    retornar w
+}
+
+/// Escribe texto en (x, y) sin pasar de max_ancho; devuelve la columna
+/// siguiente. Los caracteres anchos (CJK, emoji) ocupan dos celdas.
+funcion terminal_escribir(b, x, y, texto, estilo, max_ancho) {
+    si (y < 0 o y >= b["alto"]) { retornar x }
+    sea limite = b["ancho"]
+    si (max_ancho != nulo) { limite = minimo(limite, x + max_ancho) }
+    sea cx = x
+    para g en unicode_grafemas("" + texto) {
+        sea w = _tm_ancho(g)
+        si (cx + w > limite) { retornar cx }
+        si (cx >= 0) {
+            sea cel = b["celdas"][y * b["ancho"] + cx]
+            cel["c"] = g
+            _tm_estilo_aplicar(cel, estilo)
+            si (w == 2 y cx + 1 < b["ancho"]) {
+                sea sig = b["celdas"][y * b["ancho"] + cx + 1]
+                sig["c"] = ""
+                _tm_estilo_aplicar(sig, estilo)
+            }
+        }
+        cx = cx + w
+    }
+    retornar cx
+}
+
+/// Aplica un estilo a un rectángulo (fondo de un panel, selección…).
+funcion terminal_pintar(b, area, estilo) {
+    sea yy = area["y"]
+    mientras (yy < area["y"] + area["alto"] y yy < b["alto"]) {
+        sea x = area["x"]
+        mientras (x < area["x"] + area["ancho"] y x < b["ancho"]) {
+            _tm_estilo_aplicar(b["celdas"][yy * b["ancho"] + x], estilo)
+            x = x + 1
+        }
+        yy = yy + 1
+    }
+}
+
+/// Celda en (x, y): {"c", "fg", "bg", "m"}.
+funcion terminal_celda(b, x, y) { retornar b["celdas"][y * b["ancho"] + x] }
+
+/// Líneas del búfer como texto plano (para pruebas y registros).
+funcion terminal_texto(b) {
+    sea lineas = []
+    sea yy = 0
+    mientras (yy < b["alto"]) {
+        sea l = ""
+        sea x = 0
+        mientras (x < b["ancho"]) {
+            l = l + b["celdas"][yy * b["ancho"] + x]["c"]
+            x = x + 1
+        }
+        lineas.agregar(l)
+        yy = yy + 1
+    }
+    retornar lineas
+}
+
+// ══ Diseño ═════════════════════════════════════════════════════════════════
+
+/// Divide un área en "vertical" (filas) u "horizontal" (columnas) según
+/// restricciones: ["largo", n], ["porcentaje", p], ["proporcion", a, b],
+/// ["min", n], ["max", n], ["relleno"] (o ["relleno", peso]). opciones:
+/// margen, espacio (entre partes).
+funcion terminal_dividir(area, direccion, restricciones, opciones) {
+    sea o = opciones ?? {}
+    sea m = o["margen"] ?? 0
+    sea a = {"x": area["x"] + m, "y": area["y"] + m, "ancho": maximo(0, area["ancho"] - 2 * m), "alto": maximo(0, area["alto"] - 2 * m)}
+    sea vertical = direccion == "vertical"
+    sea total = a["ancho"]
+    si (vertical) { total = a["alto"] }
+    sea esp = o["espacio"] ?? 0
+    sea n = longitud(restricciones)
+    sea disponible = maximo(0, total - esp * maximo(0, n - 1))
+    sea tam = []
+    sea flexibles = []
+    sea peso_total = 0
+    sea usado = 0
+    sea i = 0
+    mientras (i < n) {
+        sea r = restricciones[i]
+        sea t = r[0]
+        sea v = 0
+        si (t == "largo") { v = r[1] }
+        si (t == "porcentaje") { v = piso(disponible * r[1] / 100) }
+        si (t == "proporcion") { v = piso(disponible * r[1] / r[2]) }
+        si (t == "min") { v = r[1] }
+        si (t == "max") { v = 0 }
+        si (t == "relleno") {
+            v = 0
+            flexibles.agregar(i)
+            peso_total = peso_total + (r[1] ?? 1)
+        }
+        tam.agregar(v)
+        usado = usado + v
+        i = i + 1
+    }
+    // Si no alcanza, se recortan los últimos.
+    si (usado > disponible) {
+        sea exceso = usado - disponible
+        i = n - 1
+        mientras (i >= 0 y exceso > 0) {
+            sea quita = minimo(exceso, tam[i])
+            tam[i] = tam[i] - quita
+            exceso = exceso - quita
+            i = i - 1
+        }
+        usado = disponible
+    }
+    // Lo que sobra va a los flexibles, a "min" y a "max" (hasta su tope).
+    sea sobra = disponible - usado
+    si (longitud(flexibles) == 0) {
+        i = 0
+        mientras (i < n) {
+            sea t = restricciones[i][0]
+            si (t == "min" o t == "max") { flexibles.agregar(i)  peso_total = peso_total + 1 }
+            i = i + 1
+        }
+    }
+    si (longitud(flexibles) > 0 y sobra > 0) {
+        sea repartido = 0
+        sea j = 0
+        mientras (j < longitud(flexibles)) {
+            sea k = flexibles[j]
+            sea peso = 1
+            si (restricciones[k][0] == "relleno") { peso = restricciones[k][1] ?? 1 }
+            sea parte = piso(sobra * peso / peso_total)
+            si (j == longitud(flexibles) - 1) { parte = sobra - repartido }
+            si (restricciones[k][0] == "max") { parte = minimo(parte, restricciones[k][1]) }
+            tam[k] = tam[k] + parte
+            repartido = repartido + parte
+            j = j + 1
+        }
+        // Lo que no tomaron los "max" lo toma el último que no sea "max".
+        sea resto = sobra - repartido
+        si (resto > 0) {
+            j = longitud(flexibles) - 1
+            mientras (j >= 0 y resto > 0) {
+                sea k = flexibles[j]
+                si (restricciones[k][0] != "max") { tam[k] = tam[k] + resto  resto = 0 }
+                j = j - 1
+            }
+        }
+    }
+    sea r = []
+    sea pos = a["x"]
+    si (vertical) { pos = a["y"] }
+    i = 0
+    mientras (i < n) {
+        si (vertical) { r.agregar({"x": a["x"], "y": pos, "ancho": a["ancho"], "alto": tam[i]}) } sino { r.agregar({"x": pos, "y": a["y"], "ancho": tam[i], "alto": a["alto"]}) }
+        pos = pos + tam[i] + esp
+        i = i + 1
+    }
+    retornar r
+}
+
+/// Área interior (sin bordes ni relleno).
+funcion terminal_interior(area, margen) {
+    sea m = margen ?? 1
+    retornar {"x": area["x"] + m, "y": area["y"] + m, "ancho": maximo(0, area["ancho"] - 2 * m), "alto": maximo(0, area["alto"] - 2 * m)}
+}
+
+/// Área centrada de ancho × alto dentro de otra (para diálogos).
+funcion terminal_centrar(area, ancho, alto) {
+    sea w = minimo(ancho, area["ancho"])
+    sea h = minimo(alto, area["alto"])
+    retornar {"x": area["x"] + cociente(area["ancho"] - w, 2), "y": area["y"] + cociente(area["alto"] - h, 2), "ancho": w, "alto": h}
+}
+
+// ══ Widgets ════════════════════════════════════════════════════════════════
+
+sea _TM_BORDES = {
+    "simples": ["┌", "┐", "└", "┘", "─", "│"],
+    "redondeados": ["╭", "╮", "╰", "╯", "─", "│"],
+    "dobles": ["╔", "╗", "╚", "╝", "═", "║"],
+    "gruesos": ["┏", "┓", "┗", "┛", "━", "┃"],
+    "ascii": ["+", "+", "+", "+", "-", "|"]
+}
+
+/// Bloque: bordes, título (izq, centro o der) y fondo. Devuelve el interior.
+/// opciones: bordes ("simples" | "redondeados" | "dobles" | "gruesos" |
+/// "ascii" | "ninguno"), titulo, titulo_alinear, estilo, estilo_borde,
+/// estilo_titulo, relleno.
+funcion terminal_bloque(b, area, opciones) {
+    sea o = opciones ?? {}
+    si (area["ancho"] <= 0 o area["alto"] <= 0) { retornar area }
+    si ((o["estilo"] ?? nulo) != nulo) { terminal_pintar(b, area, o["estilo"]) }
+    sea tipo_b = o["bordes"] ?? "simples"
+    sea interior = area
+    si (tipo_b != "ninguno") {
+        sea ch = _TM_BORDES[tipo_b]
+        sea eb = o["estilo_borde"] ?? nulo
+        sea x0 = area["x"]
+        sea y0 = area["y"]
+        sea x1 = area["x"] + area["ancho"] - 1
+        sea y1 = area["y"] + area["alto"] - 1
+        sea x = x0 + 1
+        mientras (x < x1) {
+            terminal_escribir(b, x, y0, ch[4], eb, 1)
+            terminal_escribir(b, x, y1, ch[4], eb, 1)
+            x = x + 1
+        }
+        sea yy = y0 + 1
+        mientras (yy < y1) {
+            terminal_escribir(b, x0, yy, ch[5], eb, 1)
+            terminal_escribir(b, x1, yy, ch[5], eb, 1)
+            yy = yy + 1
+        }
+        terminal_escribir(b, x0, y0, ch[0], eb, 1)
+        terminal_escribir(b, x1, y0, ch[1], eb, 1)
+        terminal_escribir(b, x0, y1, ch[2], eb, 1)
+        terminal_escribir(b, x1, y1, ch[3], eb, 1)
+        interior = terminal_interior(area, 1)
+    }
+    si ((o["titulo"] ?? nulo) != nulo) {
+        sea t = "" + o["titulo"]
+        sea w = unicode_ancho(t)
+        sea disp = area["ancho"] - 2
+        sea x = area["x"] + 1
+        sea al = o["titulo_alinear"] ?? "izquierda"
+        si (al == "centro") { x = area["x"] + 1 + maximo(0, cociente(disp - w, 2)) }
+        si (al == "derecha") { x = area["x"] + 1 + maximo(0, disp - w) }
+        terminal_escribir(b, x, area["y"], t, o["estilo_titulo"] ?? nulo, disp)
+    }
+    sea r = o["relleno"] ?? 0
+    si (r > 0) { interior = terminal_interior(interior, r) }
+    retornar interior
+}
+
+// Texto con estilos: lista de tramos [texto, estilo] o un texto simple;
+// "\n" corta líneas.
+funcion _tm_lineas(contenido) {
+    sea tramos = contenido
+    si (tipo(contenido) == "texto") { tramos = [[contenido, nulo]] }
+    sea lineas = [[]]
+    para tr en tramos {
+        sea t = tr
+        sea e = nulo
+        si (tipo(tr) == "lista") {
+            t = tr[0]
+            e = tr[1] ?? nulo
+        }
+        sea partes = texto_dividir("" + t, "\n")
+        sea i = 0
+        mientras (i < longitud(partes)) {
+            si (i > 0) { lineas.agregar([]) }
+            si (partes[i] != "") { lineas[longitud(lineas) - 1].agregar([partes[i], e]) }
+            i = i + 1
+        }
+    }
+    retornar lineas
+}
+
+funcion _tm_ancho_linea(l) {
+    sea w = 0
+    para tr en l { w = w + unicode_ancho(tr[0]) }
+    retornar w
+}
+
+// Ajuste por palabras de una línea de tramos a un ancho.
+funcion _tm_ajustar(l, ancho) {
+    sea res = [[]]
+    sea w = 0
+    para tr en l {
+        sea palabras = texto_dividir(tr[0], " ")
+        sea i = 0
+        mientras (i < longitud(palabras)) {
+            sea p = palabras[i]
+            sea sep = ""
+            si (i > 0) { sep = " " }
+            sea wp = unicode_ancho(p)
+            si (w > 0 y w + unicode_ancho(sep) + wp > ancho) {
+                res.agregar([])
+                w = 0
+                sep = ""
+            }
+            // Palabra más larga que el ancho: se corta.
+            mientras (wp > ancho y ancho > 0) {
+                sea corte = unicode_cortar(p, ancho - w, "")
+                si (corte == "") { corte = subcadena(p, 0, 1) }
+                res[longitud(res) - 1].agregar([sep + corte, tr[1]])
+                res.agregar([])
+                w = 0
+                sep = ""
+                p = subcadena(p, longitud(corte), longitud(p))
+                wp = unicode_ancho(p)
+            }
+            si (p != "" o sep != "") {
+                res[longitud(res) - 1].agregar([sep + p, tr[1]])
+                w = w + unicode_ancho(sep) + wp
+            }
+            i = i + 1
+        }
+    }
+    retornar res
+}
+
+/// Párrafo: texto (o tramos [[texto, estilo]…]) con opciones: ajustar
+/// (falso), alinear ("izquierda" | "centro" | "derecha"), desplazar (filas
+/// a saltar), estilo. Devuelve cuántas líneas ocupa el contenido.
+funcion terminal_parrafo(b, area, contenido, opciones) {
+    sea o = opciones ?? {}
+    sea lineas = _tm_lineas(contenido)
+    si (o["ajustar"] ?? falso) {
+        sea aj = []
+        para l en lineas { para x en _tm_ajustar(l, area["ancho"]) { aj.agregar(x) } }
+        lineas = aj
+    }
+    sea salto = o["desplazar"] ?? 0
+    sea yy = 0
+    mientras (yy < area["alto"] y yy + salto < longitud(lineas)) {
+        sea l = lineas[yy + salto]
+        sea w = _tm_ancho_linea(l)
+        sea x = area["x"]
+        si ((o["alinear"] ?? "izquierda") == "centro") { x = area["x"] + maximo(0, cociente(area["ancho"] - w, 2)) }
+        si ((o["alinear"] ?? "izquierda") == "derecha") { x = area["x"] + maximo(0, area["ancho"] - w) }
+        para tr en l {
+            sea e = tr[1] ?? (o["estilo"] ?? nulo)
+            x = terminal_escribir(b, x, area["y"] + yy, tr[0], e, area["x"] + area["ancho"] - x)
+        }
+        yy = yy + 1
+    }
+    retornar longitud(lineas)
+}
+
+/// Lista con selección: estado {"seleccion", "desplazamiento"} (se
+/// actualiza para que la selección siempre se vea). opciones: simbolo
+/// ("> "), estilo_seleccion.
+funcion terminal_lista(b, area, elementos, estado, opciones) {
+    sea o = opciones ?? {}
+    sea st = estado ?? {"seleccion": nulo, "desplazamiento": 0}
+    sea sel = st["seleccion"]
+    sea desp = st["desplazamiento"] ?? 0
+    si (sel != nulo) {
+        si (sel < desp) { desp = sel }
+        si (sel >= desp + area["alto"]) { desp = sel - area["alto"] + 1 }
+    }
+    st["desplazamiento"] = desp
+    sea simbolo = o["simbolo"] ?? "> "
+    sea ancho_sim = unicode_ancho(simbolo)
+    sea i = 0
+    mientras (i < area["alto"] y desp + i < longitud(elementos)) {
+        sea k = desp + i
+        sea yy = area["y"] + i
+        sea x = area["x"]
+        si (sel != nulo) {
+            si (k == sel) { x = terminal_escribir(b, x, yy, simbolo, o["estilo_seleccion"] ?? nulo, area["ancho"]) } sino { x = x + ancho_sim }
+        }
+        sea e = elementos[k]
+        si (tipo(e) == "lista") { e = [e] }
+        para tr en _tm_lineas(e)[0] { x = terminal_escribir(b, x, yy, tr[0], tr[1], area["x"] + area["ancho"] - x) }
+        si (k == sel y (o["estilo_seleccion"] ?? nulo) != nulo) { terminal_pintar(b, {"x": area["x"], "y": yy, "ancho": area["ancho"], "alto": 1}, o["estilo_seleccion"]) }
+        i = i + 1
+    }
+    retornar st
+}
+
+/// Tabla: filas de celdas (texto), anchos (restricciones como en
+/// terminal_dividir), opciones: cabecera ([...]), estilo_cabecera,
+/// espacio (1), seleccion, estilo_seleccion.
+funcion terminal_tabla(b, area, filas, anchos, opciones) {
+    sea o = opciones ?? {}
+    sea cols = terminal_dividir({"x": area["x"], "y": area["y"], "ancho": area["ancho"], "alto": 1}, "horizontal", anchos, {"espacio": o["espacio"] ?? 1})
+    sea yy = area["y"]
+    si ((o["cabecera"] ?? nulo) != nulo) {
+        sea j = 0
+        mientras (j < longitud(cols) y j < longitud(o["cabecera"])) {
+            terminal_escribir(b, cols[j]["x"], yy, "" + o["cabecera"][j], o["estilo_cabecera"] ?? {"negrita": verdadero}, cols[j]["ancho"])
+            j = j + 1
+        }
+        yy = yy + 1
+    }
+    sea i = 0
+    mientras (i < longitud(filas) y yy < area["y"] + area["alto"]) {
+        sea j = 0
+        mientras (j < longitud(cols) y j < longitud(filas[i])) {
+            terminal_escribir(b, cols[j]["x"], yy, "" + filas[i][j], nulo, cols[j]["ancho"])
+            j = j + 1
+        }
+        si ((o["seleccion"] ?? -1) == i y (o["estilo_seleccion"] ?? nulo) != nulo) { terminal_pintar(b, {"x": area["x"], "y": yy, "ancho": area["ancho"], "alto": 1}, o["estilo_seleccion"]) }
+        yy = yy + 1
+        i = i + 1
+    }
+}
+
+/// Medidor: proporción 0–1 con etiqueta centrada ("42%" por defecto).
+funcion terminal_medidor(b, area, proporcion, opciones) {
+    sea o = opciones ?? {}
+    sea p = maximo(0, minimo(1, proporcion))
+    sea etiqueta = o["etiqueta"] ?? ("" + redondear(p * 100) + "%")
+    sea lleno = p * area["ancho"]
+    sea completos = piso(lleno)
+    sea parciales = ["", "▏", "▎", "▍", "▌", "▋", "▊", "▉"]
+    sea yy = area["y"]
+    mientras (yy < area["y"] + area["alto"]) {
+        sea x = 0
+        mientras (x < area["ancho"]) {
+            sea c = " "
+            si (x < completos) { c = "█" }
+            si (x == completos) { c = parciales[piso((lleno - completos) * 8)] }
+            si (c == "") { c = " " }
+            terminal_escribir(b, area["x"] + x, yy, c, o["estilo"] ?? nulo, 1)
+            x = x + 1
+        }
+        yy = yy + 1
+    }
+    sea w = unicode_ancho(etiqueta)
+    terminal_escribir(b, area["x"] + maximo(0, cociente(area["ancho"] - w, 2)), area["y"] + cociente(area["alto"], 2), etiqueta, o["estilo_etiqueta"] ?? nulo, area["ancho"])
+}
+
+/// Chispa (sparkline): valores escalados a la altura con ▁▂▃▄▅▆▇█.
+funcion terminal_chispa(b, area, valores, opciones) {
+    sea o = opciones ?? {}
+    sea niveles = [" ", "▁", "▂", "▃", "▄", "▅", "▆", "▇", "█"]
+    sea maxv = o["maximo"] ?? 0
+    si (maxv == 0) { para v en valores { maxv = maximo(maxv, v) } }
+    si (maxv == 0) { maxv = 1 }
+    sea inicio = maximo(0, longitud(valores) - area["ancho"])
+    sea i = 0
+    mientras (i < area["ancho"] y inicio + i < longitud(valores)) {
+        sea total = valores[inicio + i] / maxv * area["alto"] * 8
+        sea fila = area["alto"] - 1
+        mientras (fila >= 0) {
+            sea nivel = minimo(8, maximo(0, piso(total)))
+            terminal_escribir(b, area["x"] + i, area["y"] + fila, niveles[nivel], o["estilo"] ?? nulo, 1)
+            total = total - 8
+            fila = fila - 1
+        }
+        i = i + 1
+    }
+}
+
+/// Barras verticales: [[etiqueta, valor]…], opciones: ancho_barra (3),
+/// espacio (1), maximo.
+funcion terminal_barras(b, area, datos, opciones) {
+    sea o = opciones ?? {}
+    sea ab = o["ancho_barra"] ?? 3
+    sea esp = o["espacio"] ?? 1
+    sea maxv = o["maximo"] ?? 0
+    si (maxv == 0) { para d en datos { maxv = maximo(maxv, d[1]) } }
+    si (maxv == 0) { maxv = 1 }
+    sea alto = area["alto"] - 1
+    sea niveles = [" ", "▁", "▂", "▃", "▄", "▅", "▆", "▇", "█"]
+    sea i = 0
+    mientras (i < longitud(datos)) {
+        sea x = area["x"] + i * (ab + esp)
+        si (x + ab > area["x"] + area["ancho"]) { romper }
+        sea total = datos[i][1] / maxv * alto * 8
+        sea fila = alto - 1
+        mientras (fila >= 0) {
+            sea nivel = minimo(8, maximo(0, piso(total)))
+            sea k = 0
+            mientras (k < ab) { terminal_escribir(b, x + k, area["y"] + fila, niveles[nivel], o["estilo"] ?? nulo, 1)  k = k + 1 }
+            total = total - 8
+            fila = fila - 1
+        }
+        terminal_escribir(b, x, area["y"] + alto, "" + datos[i][0], o["estilo_etiqueta"] ?? nulo, ab)
+        i = i + 1
+    }
+}
+
+/// Pestañas: títulos con separador " │ " y la elegida resaltada.
+funcion terminal_pestanas(b, area, titulos, elegida, opciones) {
+    sea o = opciones ?? {}
+    sea sep = o["separador"] ?? " │ "
+    sea x = area["x"]
+    sea i = 0
+    mientras (i < longitud(titulos)) {
+        si (i > 0) { x = terminal_escribir(b, x, area["y"], sep, nulo, area["x"] + area["ancho"] - x) }
+        sea e = nulo
+        si (i == elegida) { e = o["estilo_elegida"] ?? {"invertido": verdadero} }
+        x = terminal_escribir(b, x, area["y"], "" + titulos[i], e, area["x"] + area["ancho"] - x)
+        i = i + 1
+    }
+}
+
+// ══ Salida ANSI ════════════════════════════════════════════════════════════
+
+sea _TM_COLORES = {"negro": 0, "rojo": 1, "verde": 2, "amarillo": 3, "azul": 4, "magenta": 5, "cian": 6, "blanco": 7, "gris": 8, "rojo_claro": 9, "verde_claro": 10, "amarillo_claro": 11, "azul_claro": 12, "magenta_claro": 13, "cian_claro": 14, "blanco_claro": 15,
+    "black": 0, "red": 1, "green": 2, "yellow": 3, "blue": 4, "cyan": 6, "white": 7, "gray": 8}
+
+funcion _tm_color(c, fondo) {
+    si (c == nulo) {
+        si (fondo) { retornar "49" }
+        retornar "39"
+    }
+    si (tipo(c) == "texto" y texto_empieza_con(c, "#") y longitud(c) == 7) {
+        sea b = bytes_de_hex(subcadena(c, 1, 7))
+        sea base = "38;2;"
+        si (fondo) { base = "48;2;" }
+        retornar base + byte_en(b, 0) + ";" + byte_en(b, 1) + ";" + byte_en(b, 2)
+    }
+    sea n = c
+    si (tipo(c) == "texto") { n = _TM_COLORES[c] ?? nulo }
+    si (n == nulo) {
+        si (fondo) { retornar "49" }
+        retornar "39"
+    }
+    si (n < 8) {
+        si (fondo) { retornar "" + (40 + n) }
+        retornar "" + (30 + n)
+    }
+    si (n < 16) {
+        si (fondo) { retornar "" + (100 + n - 8) }
+        retornar "" + (90 + n - 8)
+    }
+    si (fondo) { retornar "48;5;" + n }
+    retornar "38;5;" + n
+}
+
+funcion _tm_sgr(cel) {
+    sea p = ["0"]
+    sea codigos = {"negrita": "1", "tenue": "2", "cursiva": "3", "subrayado": "4", "parpadeo": "5", "invertido": "7", "tachado": "9"}
+    para k en ["negrita", "tenue", "cursiva", "subrayado", "parpadeo", "invertido", "tachado"] { si (cel["m"][k] ?? falso) { p.agregar(codigos[k]) } }
+    si (cel["fg"] != nulo) { p.agregar(_tm_color(cel["fg"], falso)) }
+    si (cel["bg"] != nulo) { p.agregar(_tm_color(cel["bg"], verdadero)) }
+    retornar _TM_ESC + "[" + unir(p, ";") + "m"
+}
+
+funcion _tm_clave_estilo(cel) {
+    sea ms = claves(cel["m"])
+    retornar "" + cel["fg"] + "|" + cel["bg"] + "|" + unir(ms, ",")
+}
+
+/// Todo el búfer como ANSI (empieza arriba a la izquierda).
+funcion terminal_ansi(b) {
+    sea partes = [_TM_ESC + "[H"]
+    sea previo = nulo
+    sea yy = 0
+    mientras (yy < b["alto"]) {
+        partes.agregar(_TM_ESC + "[" + (yy + 1) + ";1H")
+        sea x = 0
+        mientras (x < b["ancho"]) {
+            sea cel = b["celdas"][yy * b["ancho"] + x]
+            sea k = _tm_clave_estilo(cel)
+            si (k != previo) {
+                partes.agregar(_tm_sgr(cel))
+                previo = k
+            }
+            partes.agregar(cel["c"])
+            x = x + 1
+        }
+        yy = yy + 1
+    }
+    partes.agregar(_TM_ESC + "[0m")
+    retornar unir(partes, "")
+}
+
+/// Sólo las celdas que cambiaron entre dos búferes del mismo tamaño.
+funcion terminal_diferencia(anterior, actual) {
+    si (anterior == nulo o anterior["ancho"] != actual["ancho"] o anterior["alto"] != actual["alto"]) { retornar _TM_ESC + "[2J" + terminal_ansi(actual) }
+    sea partes = []
+    sea previo = nulo
+    sea ultimo_x = -2
+    sea ultimo_y = -1
+    sea i = 0
+    mientras (i < longitud(actual["celdas"])) {
+        sea a = anterior["celdas"][i]
+        sea c = actual["celdas"][i]
+        si (a["c"] != c["c"] o _tm_clave_estilo(a) != _tm_clave_estilo(c)) {
+            sea x = i % actual["ancho"]
+            sea yy = cociente(i, actual["ancho"])
+            si (yy != ultimo_y o x != ultimo_x + 1) { partes.agregar(_TM_ESC + "[" + (yy + 1) + ";" + (x + 1) + "H") }
+            sea k = _tm_clave_estilo(c)
+            si (k != previo) {
+                partes.agregar(_tm_sgr(c))
+                previo = k
+            }
+            partes.agregar(c["c"])
+            ultimo_x = x
+            ultimo_y = yy
+        }
+        i = i + 1
+    }
+    si (longitud(partes) > 0) { partes.agregar(_TM_ESC + "[0m") }
+    retornar unir(partes, "")
+}
+
+// ══ Terminal real ══════════════════════════════════════════════════════════
+
+funcion __terminal_declaraciones() {
+    extern "libc" funcion system(cmd: texto): entero
+    extern "libc" funcion popen(cmd: texto, modo: texto): puntero
+    extern "libc" funcion pclose(f: puntero): entero
+    extern "libc" funcion fread(buf: puntero, tam: entero, n: entero, f: puntero): entero
+    extern "libc" funcion read(fd: entero, buf: puntero, n: entero): largo
+}
+
+funcion _tm_cmd(c) {
+    sea f = popen(c + " 2>/dev/null", "r")
+    si (f == 0) { retornar "" }
+    sea buf = c_reservar(1024)
+    sea r = ""
+    mientras (verdadero) {
+        sea n = fread(buf, 1, 1024, f)
+        si (n <= 0) { romper }
+        r = r + c_bytes(buf, n)
+    }
+    c_liberar(buf)
+    pclose(f)
+    retornar r
+}
+
+/// [columnas, filas] de la terminal (80×24 si no se sabe).
+funcion terminal_tamano() {
+    sea s = texto_recortar(_tm_cmd("stty size < /dev/tty"))
+    sea p = texto_dividir(s, " ")
+    si (longitud(p) == 2) { retornar [a_numero(p[1]), a_numero(p[0])] }
+    retornar [80, 24]
+}
+
+/// Modo crudo (teclas sin Enter ni eco) y pantalla alternativa.
+funcion terminal_iniciar() {
+    system("stty raw -echo < /dev/tty")
+    escribir(_TM_ESC + "[?1049h" + _TM_ESC + "[?25l" + _TM_ESC + "[2J")
+}
+
+funcion terminal_terminar() {
+    escribir(_TM_ESC + "[0m" + _TM_ESC + "[?25h" + _TM_ESC + "[?1049l")
+    system("stty sane < /dev/tty")
+}
+
+/// Interpreta los bytes de una tecla: {"tecla", "ctrl", "alt"}. tecla es
+/// el carácter o un nombre ("arriba", "enter", "escape", "f5", "retroceso"…).
+funcion terminal_tecla(bytes_) {
+    sea t = "" + bytes_
+    si (t == "") { retornar nulo }
+    sea b0 = byte_en(t, 0)
+    si (t == _TM_ESC) { retornar {"tecla": "escape", "ctrl": falso, "alt": falso} }
+    si (b0 == 27 y longitud(t) >= 3 y (subcadena(t, 1, 2) == "[" o subcadena(t, 1, 2) == "O")) {
+        sea resto = subcadena(t, 2, longitud(t))
+        sea nombres = {"A": "arriba", "B": "abajo", "C": "derecha", "D": "izquierda", "H": "inicio", "F": "fin", "P": "f1", "Q": "f2", "R": "f3", "S": "f4", "Z": "tab_atras"}
+        sea fin_ = subcadena(resto, longitud(resto) - 1, longitud(resto))
+        sea mods = 1
+        si (texto_indice(resto, ";") >= 0) { mods = a_numero(subcadena(resto, texto_indice(resto, ";") + 1, longitud(resto) - 1)) }
+        sea ctrl = mods == 5 o mods == 6 o mods == 7 o mods == 8
+        sea alt = mods == 3 o mods == 4 o mods == 7 o mods == 8
+        si (tiene_clave(nombres, fin_)) { retornar {"tecla": nombres[fin_], "ctrl": ctrl, "alt": alt} }
+        si (fin_ == "~") {
+            sea num = a_numero(texto_dividir(subcadena(resto, 0, longitud(resto) - 1), ";")[0])
+            sea tildes = {"1": "inicio", "2": "insertar", "3": "suprimir", "4": "fin", "5": "repag", "6": "avpag", "7": "inicio", "8": "fin", "15": "f5", "17": "f6", "18": "f7", "19": "f8", "20": "f9", "21": "f10", "23": "f11", "24": "f12"}
+            retornar {"tecla": tildes["" + num] ?? ("~" + num), "ctrl": ctrl, "alt": alt}
+        }
+        retornar {"tecla": "desconocida", "ctrl": falso, "alt": falso}
+    }
+    si (b0 == 27 y longitud(t) == 2) {
+        sea x = terminal_tecla(subcadena(t, 1, 2))
+        x["alt"] = verdadero
+        retornar x
+    }
+    si (b0 == 13 o b0 == 10) { retornar {"tecla": "enter", "ctrl": falso, "alt": falso} }
+    si (b0 == 9) { retornar {"tecla": "tab", "ctrl": falso, "alt": falso} }
+    si (b0 == 127 o b0 == 8) { retornar {"tecla": "retroceso", "ctrl": falso, "alt": falso} }
+    si (b0 < 27 y b0 > 0) { retornar {"tecla": caracter(b0 + 96), "ctrl": verdadero, "alt": falso} }
+    retornar {"tecla": t, "ctrl": falso, "alt": falso}
+}
+
+/// Espera una tecla (en modo crudo) y la interpreta.
+funcion terminal_leer_tecla() {
+    sea buf = c_reservar(32)
+    sea n = read(0, buf, 32)
+    sea t = ""
+    si (n > 0) { t = c_bytes(buf, n) }
+    c_liberar(buf)
+    retornar terminal_tecla(t)
+}
+
+/// Bucle de dibujo: f(búfer, área) dibuja un cuadro; teclas(tecla)
+/// devuelve falso para salir. Sólo se envía lo que cambió entre cuadros.
+funcion terminal_ejecutar(dibujar, teclas) {
+    terminal_iniciar()
+    sea previo = nulo
+    intentar {
+        mientras (verdadero) {
+            sea t = terminal_tamano()
+            sea b = terminal_bufer(t[0], t[1])
+            dibujar(b, terminal_area(b))
+            escribir(terminal_diferencia(previo, b))
+            previo = b
+            si (teclas(terminal_leer_tecla()) == falso) { romper }
+        }
+    } capturar (e) {
+        terminal_terminar()
+        lanzar e
+    }
+    terminal_terminar()
+}

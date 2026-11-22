@@ -1,0 +1,50 @@
+importar "recolector"
+importar "json"
+funcion igual(a, b, q) { afirmar(("" + a) == ("" + b), q + ": [" + a + "] != [" + b + "]") }
+// Analizadores.
+igual(recolector_logfmt("nivel=info msg=\"hola mundo\" ms=12 ok"), {"ms": "12", "msg": "hola mundo", "nivel": "info", "ok": verdadero}, "logfmt")
+sea s5 = recolector_syslog("<165>1 2003-10-11T22:14:15.003Z mymachine.example.com evntslog - ID47 [exampleSDID@32473 iut=\"3\" eventSource=\"Application\"] Una aplicación arrancó")
+igual([s5["severity"], s5["facility"], s5["hostname"], s5["appname"], s5["procid"], s5["msgid"], s5["structured_data"]["exampleSDID@32473"]["iut"], s5["message"]], ["notice", "local4", "mymachine.example.com", "evntslog", nulo, "ID47", "3", "Una aplicación arrancó"], "syslog RFC 5424")
+sea s3 = recolector_syslog("<34>Oct 11 22:14:15 mymachine su[230]: 'su root' failed for lonvick on /dev/pts/8")
+igual([s3["severity"], s3["facility"], s3["appname"], s3["procid"], s3["message"]], ["crit", "auth", "su", "230", "'su root' failed for lonvick on /dev/pts/8"], "syslog RFC 3164")
+sea LL = caracter(123)
+sea RR = caracter(125)
+sea pat = "%" + LL + "ip" + RR + " - - [%" + LL + "fecha" + RR + "] \"%" + LL + "metodo" + RR + " %" + LL + "ruta" + RR + " HTTP/1.1\" %" + LL + "estado:int" + RR + " %" + LL + "bytes:int" + RR
+igual(recolector_patron(pat, "10.0.0.1 - - [22/Nov/2026:10:00:00 -0300] \"GET /api/x HTTP/1.1\" 404 512"), {"bytes": 512, "estado": 404, "fecha": "22/Nov/2026:10:00:00 -0300", "ip": "10.0.0.1", "metodo": "GET", "ruta": "/api/x"}, "patrón")
+igual(recolector_patron(pat, "basura"), nulo, "patrón que no calza")
+// Expresiones.
+sea e = {"nivel": "error", "ms": 120, "usuario": {"id": 7}}
+igual([recolector_evaluar(".nivel == \"error\" && .ms > 100", e), recolector_evaluar("upcase(.nivel) + \"!\"", e), recolector_evaluar(".usuario.id + 1", e), recolector_evaluar(".falta ?? \"defecto\"", e), recolector_evaluar("!exists(.falta)", e)], [verdadero, "ERROR!", 8, "defecto", verdadero], "expresiones")
+igual(recolector_plantilla("logs/" + LL + LL + " nivel " + RR + RR + ".log", e), "logs/error.log", "plantilla")
+// Tubería completa con fuente en memoria, transformaciones y destinos.
+sea p = recolector_nuevo({
+    "sources": {"app": {"type": "lista", "eventos": ["{\"nivel\":\"info\",\"msg\":\"inicio\",\"ms\":5}", "{\"nivel\":\"error\",\"msg\":\"falló la base\",\"ms\":900}", "no es json", "{\"nivel\":\"error\",\"msg\":\"falló la base\",\"ms\":900}", "{\"nivel\":\"warn\",\"msg\":\"lento\",\"ms\":300}"]}},
+    "transforms": {
+        "json": {"type": "parse_json", "inputs": ["app"], "drop_invalid": verdadero},
+        "sin_repetidos": {"type": "dedupe", "inputs": ["json"], "fields": {"match": ["msg"]}},
+        "arreglo": {"type": "remap", "inputs": ["sin_repetidos"], "source": ".nivel = upcase(.nivel)\n.lento = .ms > 200\ndel(.message)\ndel(.timestamp)\ndel(.fuente)\ndel(.source_type)"},
+        "por_nivel": {"type": "route", "inputs": ["arreglo"], "route": {"errores": ".nivel == \"ERROR\"", "avisos": ".nivel == \"WARN\""}},
+        "conteo": {"type": "log_to_metric", "inputs": ["arreglo"], "name": "por_nivel", "tags": ["nivel"], "field": "ms"}
+    },
+    "sinks": {
+        "errores": {"type": "memoria", "inputs": ["por_nivel.errores"]},
+        "otros": {"type": "memoria", "inputs": ["por_nivel._unmatched", "por_nivel.avisos"]},
+        "metricas": {"type": "memoria", "inputs": ["conteo"]}
+    }})
+sea m = recolector_ejecutar(p, {"una_vez": verdadero})
+igual(recolector_salida(p, "errores"), [{"lento": verdadero, "ms": 900, "msg": "falló la base", "nivel": "ERROR"}], "enrutado y remap")
+igual(longitud(recolector_salida(p, "otros")), 2, "no enrutados")
+igual(json_texto(recolector_salida(p, "metricas")), json_texto([{"count": 1, "name": "por_nivel", "sum": 5, "tags": {"nivel": "INFO"}}, {"count": 1, "name": "por_nivel", "sum": 900, "tags": {"nivel": "ERROR"}}, {"count": 1, "name": "por_nivel", "sum": 300, "tags": {"nivel": "WARN"}}]), "métricas")
+igual(m["errores"]["json"], 1, "inválidos contados")
+// Archivo que crece (se sigue desde la última posición) y destino archivo.
+sea ruta = "/tmp/cforge_recolector_" + tiempo_ms() + ".log"
+escribir_archivo(ruta, "a=1\nb=2\n")
+sea salida = ruta + ".out"
+sea q = recolector_nuevo("[sources.f]\ntype = \"archivo\"\ninclude = [\"" + ruta + "\"]\n\n[transforms.kv]\ntype = \"parse_logfmt\"\ninputs = [\"f\"]\n\n[sinks.out]\ntype = \"archivo\"\ninputs = [\"kv\"]\npath = \"" + salida + "\"\nencoding = \"text\"\n")
+recolector_ejecutar(q)
+escribir_archivo(ruta, "a=1\nb=2\nc=3\nincompleta")
+recolector_ejecutar(q)
+igual(leer_archivo(salida), "a=1\nb=2\nc=3\n", "seguir archivo")
+igual(recolector_bulk([{"message": "x", "nivel": "info"}], "logs-" + LL + LL + " nivel " + RR + RR), "{\"index\":{\"_index\":\"logs-info\"}}\n{\"message\":\"x\",\"nivel\":\"info\"}\n", "bulk de Elasticsearch")
+igual(recolector_loki([{"message": "hola", "app": "web"}], {"app": LL + LL + " app " + RR + RR})["streams"][0]["stream"], {"app": "web"}, "Loki")
+mostrar("[OK] recolector")

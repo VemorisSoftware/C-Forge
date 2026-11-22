@@ -1,0 +1,75 @@
+importar "proceso"
+funcion igual(a, b, q) { afirmar(("" + a) == ("" + b), q + ": [" + a + "] != [" + b + "]") }
+sea ahora = [1000]
+sea cuenta = {"cobrar": 0, "enviar": 0, "fallar": 0, "reembolsar": 0}
+sea archivo = "/tmp/cforge_proceso_prueba.json"
+si (existe_archivo(archivo)) { escribir_archivo(archivo, "") }
+funcion cobrar(p) {
+    cuenta["cobrar"] = cuenta["cobrar"] + 1
+    retornar "pago-" + p["total"]
+}
+funcion enviar(x) {
+    cuenta["enviar"] = cuenta["enviar"] + 1
+    retornar "enviado " + x
+}
+funcion inestable(x) {
+    cuenta["fallar"] = cuenta["fallar"] + 1
+    si (cuenta["fallar"] < 3) { lanzar "red caída" }
+    retornar x * 2
+}
+funcion reembolsar(pago) { cuenta["reembolsar"] = cuenta["reembolsar"] + 1 }
+funcion registrar_tipos(m) {
+    proceso_registrar(m, "pedido", funcion(ctx, entrada) {
+        sea pago = proceso_actividad(ctx, "cobrar", cobrar, [entrada])
+        proceso_publicar(ctx, "fase", "cobrado")
+        proceso_dormir(ctx, 60000)
+        sea ok = proceso_esperar_senal(ctx, "aprobar", nulo)
+        proceso_publicar(ctx, "fase", "aprobado")
+        sea n = proceso_actividad(ctx, "doblar", inestable, [ok], {"reintentos": 5, "espera_ms": 10, "dormir": funcion(ms) { ahora[0] = ahora[0] + ms }})
+        retornar proceso_actividad(ctx, "enviar", enviar, [pago + " x" + n])
+    })
+    proceso_registrar(m, "saga", funcion(ctx, entrada) {
+        intentar {
+            proceso_actividad(ctx, "cobrar", cobrar, [entrada], {"compensar": reembolsar})
+            proceso_actividad(ctx, "romper", funcion() { lanzar "sin stock" }, [], {"reintentos": 1, "espera_ms": 0})
+        } capturar (e) {
+            proceso_compensar(ctx)
+            retornar "revertido: " + e
+        }
+    })
+    proceso_registrar(m, "espera", funcion(ctx, entrada) {
+        sea d = proceso_esperar_senal(ctx, "dato", 5000)
+        si (d == nulo) { retornar "venció" }
+        retornar d
+    })
+}
+sea m = proceso_motor({"archivo": archivo, "reloj": funcion() { retornar ahora[0] }})
+registrar_tipos(m)
+sea e = proceso_iniciar(m, "pedido", "p1", {"total": 100})
+igual([e["estado"], e["despertar"], proceso_consultar(m, "p1", "fase")], ["esperando", 61000, "cobrado"], "duerme")
+igual(proceso_tic(m), 0, "aún no vence")
+// "Caída": un motor nuevo lee el archivo y sigue sin repetir cobrar.
+sea m2 = proceso_motor({"archivo": archivo, "reloj": funcion() { retornar ahora[0] }})
+registrar_tipos(m2)
+ahora[0] = 61000
+igual(proceso_tic(m2), 1, "despierta")
+igual([proceso_estado(m2, "p1")["estado"], cuenta["cobrar"]], ["esperando", 1], "espera señal sin repetir")
+sea fin = proceso_senal(m2, "p1", "aprobar", 21)
+igual([fin["estado"], fin["resultado"], cuenta["cobrar"], cuenta["enviar"], cuenta["fallar"]], ["completado", "enviado pago-100 x42", 1, 1, 3], "completo con reintentos")
+igual(proceso_iniciar(m2, "pedido", "p1", {"total": 5})["resultado"], "enviado pago-100 x42", "idempotente")
+// Saga con compensación.
+sea s = proceso_iniciar(m2, "saga", "s1", {"total": 7})
+igual([s["resultado"], cuenta["reembolsar"]], ["revertido: sin stock", 1], "saga")
+// Señal con tiempo límite.
+igual(proceso_iniciar(m2, "espera", "w1", nulo)["estado"], "esperando", "espera con límite")
+igual(proceso_senal(m2, "w1", "dato", "hola")["resultado"], "hola", "señal a tiempo")
+proceso_iniciar(m2, "espera", "w2", nulo)
+ahora[0] = ahora[0] + 6000
+proceso_tic(m2)
+igual(proceso_estado(m2, "w2")["resultado"], "venció", "señal vencida")
+// No determinismo detectado.
+proceso_registrar(m2, "pedido", funcion(ctx, entrada) { retornar proceso_actividad(ctx, "otra", cobrar, [entrada]) })
+m2["flujos"]["p1"]["estado"] = "corriendo"
+igual(texto_indice(proceso_avanzar(m2, "p1")["error"], "no determinista") >= 0, verdadero, "no determinista")
+igual(longitud(proceso_listar(m2, "completado")), 3, "listar")
+mostrar("[OK] proceso")

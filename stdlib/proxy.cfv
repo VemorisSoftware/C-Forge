@@ -1,0 +1,324 @@
+// stdlib/proxy.cfv — proxy inverso y balanceo de carga al estilo Caddy y
+// Pingora: rutas por host, prefijo y método hacia grupos de servidores
+// (upstreams) con políticas round robin, ponderada, menos conexiones, hash
+// de IP o aleatoria; reintentos al siguiente servidor, salud pasiva (se
+// aparta un servidor que falla) y activa (revisión de una ruta), límite de
+// peticiones por cliente, caché de respuestas GET con max-age, cabeceras
+// X-Forwarded-*, quitar cabeceras de salto, reescritura de rutas,
+// respuestas fijas y redirecciones. Inspirada en Caddy (Apache) y Pingora
+// (Apache). En inglés: importar "reverseproxy".
+//
+//   importar "proxy"
+//   sea px = proxy_nuevo({
+//       "upstreams": {"api": {"servidores": ["http://127.0.0.1:8001", "http://127.0.0.1:8002"]}},
+//       "rutas": [{"prefijo": "/api", "upstream": "api", "quitar_prefijo": verdadero}]})
+//   proxy_servir(px, 8080)
+
+sea _PX_SALTO = {"connection": 1, "keep-alive": 1, "proxy-authenticate": 1, "proxy-authorization": 1, "te": 1, "trailer": 1, "transfer-encoding": 1, "upgrade": 1, "proxy-connection": 1}
+
+funcion _px_servidor(s) {
+    si (tipo(s) == "texto") { retornar {"url": s, "peso": 1, "activas": 0, "fallos": 0, "fuera_hasta": 0, "sano": verdadero, "atendidas": 0} }
+    retornar {"url": s["url"], "peso": s["peso"] ?? 1, "activas": 0, "fallos": 0, "fuera_hasta": 0, "sano": verdadero, "atendidas": 0}
+}
+
+/// Proxy. config: upstreams {nombre: {"servidores": [url | {"url", "peso"}],
+/// "politica", "salud": {"ruta", "fallos" (3), "pausa_ms" (10000)}}},
+/// rutas [{"host", "prefijo", "metodos", "upstream", "quitar_prefijo",
+/// "agregar_prefijo", "cabeceras", "quitar_cabeceras", "responder",
+/// "redirigir"}], limite {"por_segundo", "rafaga"}, reintentos (1),
+/// cache (verdadero: respuestas GET con Cache-Control max-age), reloj.
+funcion proxy_nuevo(config) {
+    sea ups = {}
+    para k en claves(config["upstreams"] ?? {}) {
+        sea u = config["upstreams"][k]
+        sea ss = []
+        para s en u["servidores"] ?? [] { ss.agregar(_px_servidor(s)) }
+        ups[k] = {"servidores": ss, "politica": u["politica"] ?? "round_robin", "salud": u["salud"] ?? {}, "turno": 0, "actual_peso": []}
+    }
+    retornar {"c": config, "upstreams": ups, "rutas": config["rutas"] ?? [], "cubetas": {}, "cache": {}, "metricas": {"peticiones": 0, "errores": 0, "limitadas": 0, "cache_aciertos": 0}}
+}
+
+funcion _px_ahora(px) {
+    sea r = px["c"]["reloj"] ?? nulo
+    si (r != nulo) { retornar r() }
+    retornar tiempo_ms()
+}
+
+funcion _px_cab(cab, nombre) {
+    para k en claves(cab ?? {}) { si (texto_minusculas(k) == texto_minusculas(nombre)) { retornar cab[k] } }
+    retornar nulo
+}
+
+funcion _px_disponibles(px, u) {
+    sea ahora = _px_ahora(px)
+    sea r = []
+    para s en u["servidores"] { si (s["sano"] y s["fuera_hasta"] <= ahora) { r.agregar(s) } }
+    retornar r
+}
+
+funcion _px_hash(t) {
+    sea h = 2166136261
+    sea i = 0
+    mientras (i < longitud(t)) {
+        h = bits_xo(h, byte_en(t, i))
+        h = (h * 16777619) % 4294967296
+        i = i + 1
+    }
+    retornar h
+}
+
+// Elige servidor según la política (sin repetir los de "probados").
+funcion _px_elegir(px, u, ip, probados) {
+    sea cand = []
+    para s en _px_disponibles(px, u) { si (tiene_clave(probados, s["url"]) == falso) { cand.agregar(s) } }
+    si (longitud(cand) == 0) { retornar nulo }
+    sea pol = u["politica"]
+    si (pol == "menos_conexiones" o pol == "least_conn") {
+        sea mejor = cand[0]
+        para s en cand { si (s["activas"] / s["peso"] < mejor["activas"] / mejor["peso"]) { mejor = s } }
+        retornar mejor
+    }
+    si (pol == "ip_hash") { retornar cand[_px_hash("" + ip) % longitud(cand)] }
+    si (pol == "aleatoria" o pol == "random") { retornar cand[bytes_leer_entero(bytes_aleatorios(4), 0, 4, 0) % longitud(cand)] }
+    si (pol == "primero" o pol == "first") { retornar cand[0] }
+    si (pol == "ponderada" o pol == "weighted") {
+        // Round robin ponderado suave (como nginx).
+        sea total = 0
+        sea mejor = nulo
+        para s en cand {
+            s["actual"] = (s["actual"] ?? 0) + s["peso"]
+            total = total + s["peso"]
+            si (mejor == nulo o s["actual"] > mejor["actual"]) { mejor = s }
+        }
+        mejor["actual"] = mejor["actual"] - total
+        retornar mejor
+    }
+    // round_robin
+    sea s = cand[u["turno"] % longitud(cand)]
+    u["turno"] = u["turno"] + 1
+    retornar s
+}
+
+funcion _px_ruta_coincide(r, sol) {
+    si ((r["host"] ?? nulo) != nulo) {
+        sea h = texto_minusculas(texto_dividir("" + (_px_cab(sol["cabeceras"], "host") ?? ""), ":")[0])
+        sea patron = texto_minusculas(r["host"])
+        si (texto_empieza_con(patron, "*.")) {
+            si (texto_termina_con(h, subcadena(patron, 1, longitud(patron))) == falso) { retornar falso }
+        } sino { si (h != patron) { retornar falso } }
+    }
+    si ((r["prefijo"] ?? nulo) != nulo) {
+        sea ruta = texto_dividir(sol["ruta"], "?")[0]
+        si (ruta != r["prefijo"] y texto_empieza_con(ruta, texto_reemplazar(r["prefijo"] + "/", "//", "/")) == falso y r["prefijo"] != "/") { retornar falso }
+    }
+    si ((r["metodos"] ?? nulo) != nulo) {
+        sea ok = falso
+        para m en r["metodos"] { si (texto_mayusculas(m) == texto_mayusculas(sol["metodo"])) { ok = verdadero } }
+        si (ok == falso) { retornar falso }
+    }
+    retornar verdadero
+}
+
+funcion _px_permitir(px, ip) {
+    sea lim = px["c"]["limite"] ?? nulo
+    si (lim == nulo) { retornar verdadero }
+    sea ahora = _px_ahora(px)
+    sea cap = lim["rafaga"] ?? lim["por_segundo"]
+    sea c = px["cubetas"]["" + ip] ?? {"fichas": cap, "t": ahora}
+    c["fichas"] = minimo(cap, c["fichas"] + (ahora - c["t"]) * lim["por_segundo"] / 1000)
+    c["t"] = ahora
+    px["cubetas"]["" + ip] = c
+    si (c["fichas"] >= 1) {
+        c["fichas"] = c["fichas"] - 1
+        retornar verdadero
+    }
+    retornar falso
+}
+
+funcion _px_max_age(cc) {
+    si (cc == nulo) { retornar nulo }
+    sea t = texto_minusculas("" + cc)
+    si (texto_indice(t, "no-store") >= 0 o texto_indice(t, "private") >= 0 o texto_indice(t, "no-cache") >= 0) { retornar nulo }
+    sea i = texto_indice(t, "s-maxage=")
+    sea largo = 9
+    si (i < 0) {
+        i = texto_indice(t, "max-age=")
+        largo = 8
+    }
+    si (i < 0) { retornar nulo }
+    sea j = i + largo
+    sea n = ""
+    mientras (j < longitud(t) y texto_indice("0123456789", subcadena(t, j, j + 1)) >= 0) {
+        n = n + subcadena(t, j, j + 1)
+        j = j + 1
+    }
+    si (n == "") { retornar nulo }
+    retornar a_numero(n)
+}
+
+funcion _px_resp(estado, cuerpo, cab) {
+    sea c = cab ?? {}
+    si (tiene_clave(c, "Content-Type") == falso) { c["Content-Type"] = "text/plain; charset=utf-8" }
+    retornar {"estado": estado, "cuerpo": cuerpo, "cabeceras": c}
+}
+
+/// Atiende una solicitud {"metodo", "ruta", "cabeceras", "cuerpo", "ip"}.
+/// transporte(metodo, url, {"cabeceras", "cuerpo"}) → {"estado", "cuerpo",
+/// "cabeceras"} (por defecto http_solicitud). Devuelve {"estado",
+/// "cuerpo", "cabeceras", "servidor"}.
+funcion proxy_manejar(px, solicitud, transporte) {
+    sea sol = solicitud
+    px["metricas"]["peticiones"] = px["metricas"]["peticiones"] + 1
+    sea ip = sol["ip"] ?? "0.0.0.0"
+    si (_px_permitir(px, ip) == falso) {
+        px["metricas"]["limitadas"] = px["metricas"]["limitadas"] + 1
+        retornar _px_resp(429, "Demasiadas peticiones", {"Retry-After": "1"})
+    }
+    sea ruta_def = nulo
+    para r en px["rutas"] { si (ruta_def == nulo y _px_ruta_coincide(r, sol)) { ruta_def = r } }
+    si (ruta_def == nulo) { retornar _px_resp(404, "Sin ruta para " + sol["ruta"], nulo) }
+    si ((ruta_def["responder"] ?? nulo) != nulo) {
+        sea rr = ruta_def["responder"]
+        retornar _px_resp(rr["estado"] ?? 200, rr["cuerpo"] ?? "", rr["cabeceras"] ?? nulo)
+    }
+    si ((ruta_def["redirigir"] ?? nulo) != nulo) {
+        sea destino = ruta_def["redirigir"]
+        si (ruta_def["mantener_ruta"] ?? verdadero) { destino = destino + sol["ruta"] }
+        retornar _px_resp(ruta_def["estado"] ?? 308, "", {"Location": destino})
+    }
+    // Ruta hacia el servidor.
+    sea ruta = sol["ruta"]
+    si ((ruta_def["quitar_prefijo"] ?? falso) y (ruta_def["prefijo"] ?? nulo) != nulo) {
+        ruta = subcadena(ruta, longitud(ruta_def["prefijo"]), longitud(ruta))
+        si (texto_empieza_con(ruta, "/") == falso) { ruta = "/" + ruta }
+    }
+    si ((ruta_def["agregar_prefijo"] ?? nulo) != nulo) { ruta = ruta_def["agregar_prefijo"] + ruta }
+    // Caché.
+    sea usar_cache = (px["c"]["cache"] ?? falso) y texto_mayusculas(sol["metodo"]) == "GET" y _px_cab(sol["cabeceras"], "authorization") == nulo
+    sea clave_cache = ruta_def["upstream"] + " " + ruta
+    si (usar_cache y tiene_clave(px["cache"], clave_cache)) {
+        sea c = px["cache"][clave_cache]
+        si (c["vence"] > _px_ahora(px)) {
+            px["metricas"]["cache_aciertos"] = px["metricas"]["cache_aciertos"] + 1
+            sea cab = {}
+            para k en claves(c["r"]["cabeceras"]) { cab[k] = c["r"]["cabeceras"][k] }
+            cab["X-Cache"] = "HIT"
+            cab["Age"] = "" + piso((_px_ahora(px) - c["t"]) / 1000)
+            retornar {"estado": c["r"]["estado"], "cuerpo": c["r"]["cuerpo"], "cabeceras": cab, "servidor": c["servidor"]}
+        }
+        quitar_clave(px["cache"], clave_cache)
+    }
+    // Cabeceras hacia el servidor.
+    sea cab = {}
+    para k en claves(sol["cabeceras"] ?? {}) { si (tiene_clave(_PX_SALTO, texto_minusculas(k)) == falso) { cab[k] = sol["cabeceras"][k] } }
+    sea xff = _px_cab(sol["cabeceras"], "x-forwarded-for")
+    si (xff != nulo) { cab["X-Forwarded-For"] = xff + ", " + ip } sino { cab["X-Forwarded-For"] = ip }
+    cab["X-Forwarded-Proto"] = sol["esquema"] ?? "http"
+    si (_px_cab(sol["cabeceras"], "host") != nulo) { cab["X-Forwarded-Host"] = _px_cab(sol["cabeceras"], "host") }
+    cab["Via"] = "1.1 c-forge"
+    para k en claves(ruta_def["cabeceras"] ?? {}) { cab[k] = texto_reemplazar("" + ruta_def["cabeceras"][k], caracter(123) + "ip" + caracter(125), ip) }
+    para k en ruta_def["quitar_cabeceras"] ?? [] { para x en claves(cab) { si (texto_minusculas(x) == texto_minusculas(k)) { quitar_clave(cab, x) } } }
+    sea u = px["upstreams"][ruta_def["upstream"]] ?? nulo
+    si (u == nulo) { retornar _px_resp(502, "Upstream desconocido", nulo) }
+    sea envio = transporte
+    si (envio == nulo) { envio = funcion(m, url, o) { retornar http_solicitud(m, url, o) } }
+    sea intentos = 1 + (px["c"]["reintentos"] ?? 1)
+    sea idempotente = texto_mayusculas(sol["metodo"]) == "GET" o texto_mayusculas(sol["metodo"]) == "HEAD" o texto_mayusculas(sol["metodo"]) == "OPTIONS" o texto_mayusculas(sol["metodo"]) == "PUT" o texto_mayusculas(sol["metodo"]) == "DELETE"
+    si (idempotente == falso y (px["c"]["reintentar_todo"] ?? falso) == falso) { intentos = 1 }
+    sea probados = {}
+    sea ultimo_error = "sin servidores disponibles"
+    sea k = 0
+    mientras (k < intentos) {
+        sea s = _px_elegir(px, u, ip, probados)
+        si (s == nulo) { romper }
+        probados[s["url"]] = verdadero
+        s["activas"] = s["activas"] + 1
+        sea r = nulo
+        sea fallo = nulo
+        intentar { r = envio(texto_mayusculas(sol["metodo"]), s["url"] + ruta, {"cabeceras": cab, "cuerpo": sol["cuerpo"] ?? ""}) } capturar (e) { fallo = "" + e }
+        s["activas"] = s["activas"] - 1
+        si (fallo == nulo y r != nulo y r["estado"] != 502 y r["estado"] != 503 y r["estado"] != 504) {
+            s["fallos"] = 0
+            s["atendidas"] = s["atendidas"] + 1
+            sea rc = {}
+            para x en claves(r["cabeceras"] ?? {}) { si (tiene_clave(_PX_SALTO, texto_minusculas(x)) == falso) { rc[x] = r["cabeceras"][x] } }
+            rc["Via"] = "1.1 c-forge"
+            sea resp = {"estado": r["estado"], "cuerpo": r["cuerpo"] ?? "", "cabeceras": rc, "servidor": s["url"]}
+            si (usar_cache y r["estado"] == 200) {
+                sea edad = _px_max_age(_px_cab(rc, "cache-control"))
+                si (edad != nulo y edad > 0) { px["cache"][clave_cache] = {"r": resp, "t": _px_ahora(px), "vence": _px_ahora(px) + edad * 1000, "servidor": s["url"]} }
+            }
+            retornar resp
+        }
+        // Salud pasiva.
+        s["fallos"] = s["fallos"] + 1
+        si (s["fallos"] >= (u["salud"]["fallos"] ?? 3)) {
+            s["fuera_hasta"] = _px_ahora(px) + (u["salud"]["pausa_ms"] ?? 10000)
+            s["fallos"] = 0
+        }
+        si (fallo != nulo) { ultimo_error = fallo } sino { ultimo_error = "el servidor respondió " + r["estado"] }
+        k = k + 1
+    }
+    px["metricas"]["errores"] = px["metricas"]["errores"] + 1
+    retornar _px_resp(502, "Bad Gateway: " + ultimo_error, nulo)
+}
+
+/// Revisa la salud de todos los servidores con su ruta de salud (GET que
+/// debe responder 2xx). Devuelve {upstream: {url: sano}}.
+funcion proxy_revisar_salud(px, transporte) {
+    sea envio = transporte
+    si (envio == nulo) { envio = funcion(m, url, o) { retornar http_solicitud(m, url, o) } }
+    sea r = {}
+    para k en claves(px["upstreams"]) {
+        sea u = px["upstreams"][k]
+        r[k] = {}
+        sea ruta = u["salud"]["ruta"] ?? nulo
+        para s en u["servidores"] {
+            si (ruta != nulo) {
+                sea ok = falso
+                intentar {
+                    sea x = envio("GET", s["url"] + ruta, {"cabeceras": {"User-Agent": "c-forge-proxy"}})
+                    ok = x["estado"] >= 200 y x["estado"] < 300
+                } capturar (e) { ok = falso }
+                s["sano"] = ok
+                si (ok) { s["fuera_hasta"] = 0 }
+            }
+            r[k][s["url"]] = s["sano"] y s["fuera_hasta"] <= _px_ahora(px)
+        }
+    }
+    retornar r
+}
+
+/// Estado de cada servidor: atendidas, activas, sano.
+funcion proxy_estado(px) {
+    sea r = {"metricas": px["metricas"], "upstreams": {}}
+    para k en claves(px["upstreams"]) {
+        r["upstreams"][k] = []
+        para s en px["upstreams"][k]["servidores"] { r["upstreams"][k].agregar({"url": s["url"], "atendidas": s["atendidas"], "activas": s["activas"], "sano": s["sano"] y s["fuera_hasta"] <= _px_ahora(px)}) }
+    }
+    retornar r
+}
+
+/// Agrega o quita servidores en caliente.
+funcion proxy_agregar_servidor(px, upstream, servidor) { px["upstreams"][upstream]["servidores"].agregar(_px_servidor(servidor)) }
+
+funcion proxy_quitar_servidor(px, upstream, url) {
+    sea r = []
+    para s en px["upstreams"][upstream]["servidores"] { si (s["url"] != url) { r.agregar(s) } }
+    px["upstreams"][upstream]["servidores"] = r
+}
+
+/// Servidor HTTP que atiende con el proxy (bloquea).
+funcion proxy_servir(px, puerto) {
+    sea srv = servidor_http_escuchar(puerto)
+    mientras (verdadero) {
+        sea s = servidor_http_solicitud(srv)
+        si (s != nulo) {
+            sea ruta = "" + s["ruta"]
+            sea q = s["query"] ?? nulo
+            si (tipo(q) == "texto" y q != "") { ruta = ruta + "?" + q }
+            sea r = proxy_manejar(px, {"metodo": s["metodo"], "ruta": ruta, "cabeceras": s["cabeceras"] ?? {}, "cuerpo": s["cuerpo"] ?? "", "ip": s["ip"] ?? "0.0.0.0"}, nulo)
+            servidor_http_responder(s["_srv_id"], r["estado"], r["cuerpo"], _px_cab(r["cabeceras"], "content-type") ?? "text/plain")
+        }
+    }
+}

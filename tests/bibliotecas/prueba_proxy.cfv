@@ -1,0 +1,78 @@
+importar "proxy"
+funcion igual(a, b, q) { afirmar(("" + a) == ("" + b), q + ": [" + a + "] != [" + b + "]") }
+// Servidores falsos: el transporte registra cada llamada.
+sea llamadas = []
+sea caidos = {}
+sea ahora = [0]
+sea transporte = funcion(m, url, o) {
+    llamadas.agregar([m, url, o["cabeceras"]])
+    para k en claves(caidos) { si (texto_empieza_con(url, k)) { lanzar "conexión rechazada" } }
+    si (texto_termina_con(url, "/lento")) { retornar {"estado": 503, "cuerpo": "", "cabeceras": {}} }
+    si (texto_indice(url, "/cache") >= 0) { retornar {"estado": 200, "cuerpo": "v" + longitud(llamadas), "cabeceras": {"Cache-Control": "public, max-age=60", "Connection": "keep-alive"}} }
+    retornar {"estado": 200, "cuerpo": url, "cabeceras": {"Content-Type": "text/plain"}}
+}
+sea px = proxy_nuevo({
+    "upstreams": {
+        "api": {"servidores": ["http://a", "http://b", "http://c"], "salud": {"fallos": 1, "pausa_ms": 5000}},
+        "pesos": {"servidores": [{"url": "http://x", "peso": 3}, {"url": "http://y", "peso": 1}], "politica": "ponderada"},
+        "pegajoso": {"servidores": ["http://p1", "http://p2", "http://p3"], "politica": "ip_hash"}
+    },
+    "rutas": [
+        {"host": "estado.local", "responder": {"estado": 200, "cuerpo": "ok"}},
+        {"prefijo": "/viejo", "redirigir": "https://nuevo.cl"},
+        {"prefijo": "/api", "upstream": "api", "quitar_prefijo": verdadero, "cabeceras": {"X-Real-IP": caracter(123) + "ip" + caracter(125)}, "quitar_cabeceras": ["Cookie"]},
+        {"prefijo": "/w", "upstream": "pesos"},
+        {"prefijo": "/s", "upstream": "pegajoso"}
+    ],
+    "reintentos": 2, "cache": verdadero, "reloj": funcion() { retornar ahora[0] }})
+funcion sol(ruta, ip) { retornar {"metodo": "GET", "ruta": ruta, "cabeceras": {"Host": "app.cl", "Cookie": "x=1", "Connection": "close"}, "ip": ip ?? "10.0.0.9"} }
+// Round robin y reescritura.
+sea r1 = proxy_manejar(px, sol("/api/usuarios?id=1"), transporte)
+sea r2 = proxy_manejar(px, sol("/api/usuarios"), transporte)
+sea r3 = proxy_manejar(px, sol("/api/usuarios"), transporte)
+igual([r1["cuerpo"], r2["servidor"], r3["servidor"]], ["http://a/usuarios?id=1", "http://b", "http://c"], "round robin")
+sea cab = llamadas[0][2]
+igual([cab["X-Forwarded-For"], cab["X-Real-IP"], cab["X-Forwarded-Host"], tiene_clave(cab, "Cookie"), tiene_clave(cab, "Connection")], ["10.0.0.9", "10.0.0.9", "app.cl", falso, falso], "cabeceras")
+// Servidor caído: se reintenta en el siguiente y queda apartado.
+caidos["http://a"] = verdadero
+sea r4 = proxy_manejar(px, sol("/api/x"), transporte)
+igual([r4["estado"], r4["servidor"] != "http://a"], [200, verdadero], "reintento")
+igual(proxy_estado(px)["upstreams"]["api"][0]["sano"], falso, "salud pasiva")
+ahora[0] = 6000
+quitar_clave(caidos, "http://a")
+igual(proxy_estado(px)["upstreams"]["api"][0]["sano"], verdadero, "vuelve tras la pausa")
+// Todos caídos: 502.
+caidos["http://"] = verdadero
+igual(proxy_manejar(px, sol("/api/x"), transporte)["estado"], 502, "bad gateway")
+quitar_clave(caidos, "http://")
+ahora[0] = 20000
+// Ponderado: x recibe 3 de cada 4.
+sea cuentas = {"http://x": 0, "http://y": 0}
+sea i = 0
+mientras (i < 8) {
+    sea r = proxy_manejar(px, sol("/w/a"), transporte)
+    cuentas[r["servidor"]] = cuentas[r["servidor"]] + 1
+    i = i + 1
+}
+igual(cuentas, {"http://x": 6, "http://y": 2}, "ponderado")
+// Hash de IP: misma IP, mismo servidor.
+igual(proxy_manejar(px, sol("/s/1", "1.2.3.4"), transporte)["servidor"], proxy_manejar(px, sol("/s/2", "1.2.3.4"), transporte)["servidor"], "ip_hash")
+// Caché con max-age.
+sea c1 = proxy_manejar(px, sol("/api/cache"), transporte)
+sea c2 = proxy_manejar(px, sol("/api/cache"), transporte)
+igual([c1["cuerpo"] == c2["cuerpo"], c2["cabeceras"]["X-Cache"], tiene_clave(c1["cabeceras"], "Connection")], [verdadero, "HIT", falso], "caché")
+ahora[0] = ahora[0] + 61000
+igual(proxy_manejar(px, sol("/api/cache"), transporte)["cabeceras"]["X-Cache"] ?? "MISS", "MISS", "caché vencida")
+// Respuesta fija, redirección y sin ruta.
+sea h = sol("/")
+h["cabeceras"]["Host"] = "estado.local:8080"
+igual(proxy_manejar(px, h, transporte)["cuerpo"], "ok", "por host")
+igual(proxy_manejar(px, sol("/viejo/a"), transporte)["cabeceras"]["Location"], "https://nuevo.cl/viejo/a", "redirección")
+igual(proxy_manejar(px, sol("/nada"), transporte)["estado"], 404, "sin ruta")
+// Límite por cliente.
+sea lim = proxy_nuevo({"upstreams": {"u": {"servidores": ["http://z"]}}, "rutas": [{"prefijo": "/", "upstream": "u"}], "limite": {"por_segundo": 1, "rafaga": 2}, "reloj": funcion() { retornar 0 }})
+igual([proxy_manejar(lim, sol("/a"), transporte)["estado"], proxy_manejar(lim, sol("/a"), transporte)["estado"], proxy_manejar(lim, sol("/a"), transporte)["estado"], proxy_manejar(lim, sol("/a", "otra"), transporte)["estado"]], [200, 200, 429, 200], "límite")
+// Salud activa.
+sea salud = proxy_nuevo({"upstreams": {"u": {"servidores": ["http://s1", "http://s2"], "salud": {"ruta": "/lento"}}}})
+igual(proxy_revisar_salud(salud, transporte)["u"], {"http://s1": falso, "http://s2": falso}, "salud activa")
+mostrar("[OK] proxy")
