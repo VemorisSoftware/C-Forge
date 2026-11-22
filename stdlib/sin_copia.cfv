@@ -1,0 +1,785 @@
+// stdlib/sin_copia.cfv — serialización sin copia compatible con
+// FlatBuffers: lee esquemas .fbs (namespace, enum, struct, table, union,
+// root_type, file_identifier, valores por defecto, atributos id y
+// deprecated), codifica mapas al formato binario de FlatBuffers y lo lee
+// de dos formas: completo a mapas, o perezoso, leyendo solo los campos que
+// se piden directo del búfer (sin copiar ni recorrer el resto). Los búferes
+// se leen con la biblioteca oficial de Python y al revés. Idea y formato de
+// FlatBuffers (Apache). En inglés: importar "flatbuffers".
+//
+//   importar "sin_copia"
+//   sea e = sin_copia_esquema("table Punto { x: float; y: float; nombre: string; } root_type Punto;")
+//   sea b = sin_copia_codificar(e, {"x": 1.5, "y": 2, "nombre": "origen"})
+//   sea p = sin_copia_raiz(e, b)
+//   mostrar(sin_copia_campo(p, "nombre"))
+
+sea _SC_ESCALARES = {"bool": [1, "u"], "byte": [1, "s"], "int8": [1, "s"], "ubyte": [1, "u"], "uint8": [1, "u"], "short": [2, "s"], "int16": [2, "s"], "ushort": [2, "u"], "uint16": [2, "u"],
+    "int": [4, "s"], "int32": [4, "s"], "uint": [4, "u"], "uint32": [4, "u"], "float": [4, "f"], "float32": [4, "f"], "long": [8, "s"], "int64": [8, "s"], "ulong": [8, "u"], "uint64": [8, "u"],
+    "double": [8, "f"], "float64": [8, "f"]}
+
+// ---------- esquema ----------
+
+funcion _sc_tokens(t) {
+    sea r = []
+    sea i = 0
+    sea n = longitud(t)
+    mientras (i < n) {
+        sea c = subcadena(t, i, i + 1)
+        si (c == " " o c == "\n" o c == "\t" o c == "\r") { i = i + 1 }
+        sino si (c == "/" y subcadena(t, i + 1, i + 2) == "/") {
+            mientras (i < n y subcadena(t, i, i + 1) != "\n") { i = i + 1 }
+        } sino si (c == "/" y subcadena(t, i + 1, i + 2) == "*") {
+            sea j = texto_indice(subcadena(t, i + 2, n), "*/")
+            si (j < 0) { i = n } sino { i = i + 2 + j + 2 }
+        } sino si (c == "\"") {
+            sea j = i + 1
+            mientras (j < n y subcadena(t, j, j + 1) != "\"") {
+                si (subcadena(t, j, j + 1) == "\\") { j = j + 1 }
+                j = j + 1
+            }
+            r.agregar({"k": "texto", "v": subcadena(t, i + 1, j)})
+            i = j + 1
+        } sino si (texto_indice("{}[]():;,=", c) >= 0) {
+            r.agregar({"k": "p", "v": c})
+            i = i + 1
+        } sino {
+            sea j = i
+            mientras (j < n y texto_indice(" \n\t\r{}[]():;,=\"/", subcadena(t, j, j + 1)) < 0) { j = j + 1 }
+            r.agregar({"k": "id", "v": subcadena(t, i, j)})
+            i = j
+        }
+    }
+    retornar r
+}
+
+/// Lee un esquema .fbs. Devuelve {"tipos": {nombre: def}, "raiz",
+/// "identificador"}.
+funcion sin_copia_esquema(texto) {
+    sea tk = _sc_tokens(texto)
+    sea i = [0]
+    sea ver = funcion() {
+        si (i[0] >= longitud(tk)) { retornar {"k": "fin", "v": ""} }
+        retornar tk[i[0]]
+    }
+    sea tomar = funcion() {
+        sea x = ver()
+        i[0] = i[0] + 1
+        retornar x["v"]
+    }
+    sea esperar = funcion(v) {
+        sea x = tomar()
+        si (x != v) { lanzar "fbs: se esperaba '" + v + "' y llegó '" + x + "'" }
+    }
+    sea atributos = funcion() {
+        sea at = {}
+        si (ver()["v"] == "(") {
+            tomar()
+            mientras (ver()["v"] != ")") {
+                sea nombre = tomar()
+                sea valor = verdadero
+                si (ver()["v"] == ":") {
+                    tomar()
+                    valor = tomar()
+                }
+                at[nombre] = valor
+                si (ver()["v"] == ",") { tomar() }
+            }
+            tomar()
+        }
+        retornar at
+    }
+    sea e = {"tipos": {}, "raiz": nulo, "identificador": nulo, "espacio": ""}
+    sea orden = []
+    mientras (ver()["k"] != "fin") {
+        sea pal = tomar()
+        si (pal == "namespace") {
+            sea partes = []
+            mientras (ver()["v"] != ";") { partes.agregar(tomar()) }
+            tomar()
+            e["espacio"] = unir(partes, "")
+        } sino si (pal == "include" o pal == "attribute" o pal == "file_extension") {
+            mientras (ver()["v"] != ";") { tomar() }
+            tomar()
+        } sino si (pal == "root_type") {
+            e["raiz"] = tomar()
+            esperar(";")
+        } sino si (pal == "file_identifier") {
+            e["identificador"] = tomar()
+            esperar(";")
+        } sino si (pal == "enum" o pal == "union") {
+            sea nombre = tomar()
+            sea base = "ubyte"
+            si (ver()["v"] == ":") {
+                tomar()
+                base = tomar()
+            }
+            atributos()
+            esperar("{")
+            sea valores = {}
+            sea nombres = {}
+            sea lista = []
+            sea siguiente = 0
+            si (pal == "union") { siguiente = 1 }
+            mientras (ver()["v"] != "}") {
+                sea v = tomar()
+                si (ver()["v"] == ":") {
+                    // union { alias: Tipo }
+                    tomar()
+                    v = tomar()
+                }
+                sea num = siguiente
+                si (ver()["v"] == "=") {
+                    tomar()
+                    num = a_numero(tomar())
+                }
+                valores[v] = num
+                nombres["" + num] = v
+                lista.agregar(v)
+                siguiente = num + 1
+                si (ver()["v"] == ",") { tomar() }
+            }
+            tomar()
+            si (pal == "union") {
+                valores["NONE"] = 0
+                nombres["0"] = "NONE"
+            }
+            e["tipos"][nombre] = {"k": pal, "base": base, "valores": valores, "nombres": nombres, "lista": lista}
+        } sino si (pal == "table" o pal == "struct") {
+            sea nombre = tomar()
+            atributos()
+            esperar("{")
+            sea campos = []
+            mientras (ver()["v"] != "}") {
+                sea fn = tomar()
+                esperar(":")
+                sea tipo_c = nulo
+                si (ver()["v"] == "[") {
+                    tomar()
+                    sea interno = tomar()
+                    sea fijo = nulo
+                    si (ver()["v"] == ":") {
+                        tomar()
+                        fijo = a_numero(tomar())
+                    }
+                    esperar("]")
+                    tipo_c = {"vector": interno, "fijo": fijo}
+                } sino { tipo_c = tomar() }
+                sea defecto = nulo
+                si (ver()["v"] == "=") {
+                    tomar()
+                    defecto = tomar()
+                }
+                sea at = atributos()
+                esperar(";")
+                campos.agregar({"nombre": fn, "tipo": tipo_c, "defecto": defecto, "at": at})
+            }
+            tomar()
+            e["tipos"][nombre] = {"k": pal, "campos": campos}
+            orden.agregar(nombre)
+        } sino si (pal == ";") { } sino { lanzar "fbs: no entiendo '" + pal + "'" }
+    }
+    // Ids de campos y diseño de structs.
+    para n en orden {
+        sea d = e["tipos"][n]
+        si (d["k"] == "table") {
+            sea id = 0
+            para c en d["campos"] {
+                sea es_union = _sc_def(e, c["tipo"])["k"] == "union"
+                si ((c["at"]["id"] ?? nulo) != nulo) {
+                    id = a_numero(c["at"]["id"])
+                    si (es_union) { id = id - 1 }
+                }
+                si (es_union) {
+                    c["id_tipo"] = id
+                    id = id + 1
+                }
+                c["id"] = id
+                id = id + 1
+            }
+        }
+    }
+    para n en orden { si (e["tipos"][n]["k"] == "struct") { _sc_disenar_struct(e, n) } }
+    retornar e
+}
+
+funcion _sc_alinear_a(n, a) {
+    si (n % a == 0) { retornar n }
+    retornar n + a - n % a
+}
+
+// Calcula offsets, tamaño y alineación de un struct.
+funcion _sc_disenar_struct(e, n) {
+    sea d = e["tipos"][n]
+    si ((d["tam"] ?? nulo) != nulo) { retornar d }
+    sea pos = 0
+    sea alin = 1
+    para c en d["campos"] {
+        sea ta = _sc_tam_inline(e, c["tipo"])
+        pos = _sc_alinear_a(pos, ta[1])
+        c["off"] = pos
+        pos = pos + ta[0]
+        alin = maximo(alin, ta[1])
+    }
+    d["tam"] = _sc_alinear_a(pos, alin)
+    d["alin"] = alin
+    retornar d
+}
+
+// [tamaño, alineación] de un tipo guardado en línea (escalar, enum, struct, arreglo fijo).
+funcion _sc_tam_inline(e, t) {
+    si (tipo(t) == "mapa") {
+        sea x = _sc_tam_inline(e, t["vector"])
+        retornar [x[0] * t["fijo"], x[1]]
+    }
+    si (tiene_clave(_SC_ESCALARES, t)) { retornar [_SC_ESCALARES[t][0], _SC_ESCALARES[t][0]] }
+    sea d = e["tipos"][t] ?? nulo
+    si (d == nulo) { lanzar "fbs: tipo desconocido " + t }
+    si (d["k"] == "enum" o d["k"] == "union") { retornar _sc_tam_inline(e, d["base"]) }
+    si (d["k"] == "struct") {
+        _sc_disenar_struct(e, t)
+        retornar [d["tam"], d["alin"]]
+    }
+    retornar [4, 4]
+}
+
+// ---------- IEEE 754 ----------
+
+funcion _sc_ieee(v, ancho) {
+    sea bits = 52
+    sea sesgo = 1023
+    sea emax = 2047
+    si (ancho == 4) {
+        bits = 23
+        sesgo = 127
+        emax = 255
+    }
+    sea s = 0
+    sea m = v
+    si (v < 0 o (v == 0 y ("" + v) == "-0")) {
+        s = 1
+        m = 0 - v
+    }
+    sea ex = 0
+    sea mant = 0
+    si (m != m) {
+        ex = emax
+        mant = 1
+    } sino si (m > 1.7976931348623157e308) { ex = emax } sino si (m != 0) {
+        sea k = 0
+        mientras (m >= 2) {
+            m = m / 2
+            k = k + 1
+        }
+        mientras (m < 1 y k > 1 - sesgo) {
+            m = m * 2
+            k = k - 1
+        }
+        si (m < 1) { mant = redondear(m * potencia(2, bits)) } sino {
+            ex = k + sesgo
+            mant = redondear((m - 1) * potencia(2, bits))
+            si (mant >= potencia(2, bits)) {
+                mant = 0
+                ex = ex + 1
+            }
+        }
+        si (ex >= emax) {
+            ex = emax
+            mant = 0
+        }
+    }
+    // Bytes little endian: mantisa (bits) | exponente | signo.
+    sea r = []
+    si (ancho == 4) {
+        sea total = s * 2147483648 + ex * 8388608 + mant
+        sea k = 0
+        mientras (k < 4) {
+            r.agregar(total % 256)
+            total = piso(total / 256)
+            k = k + 1
+        }
+    } sino {
+        // 52 bits de mantisa: 6 bytes y medio.
+        sea lo = mant % 281474976710656
+        sea hi4 = piso(mant / 281474976710656)
+        sea k = 0
+        mientras (k < 6) {
+            r.agregar(lo % 256)
+            lo = piso(lo / 256)
+            k = k + 1
+        }
+        r.agregar((ex % 16) * 16 + hi4)
+        r.agregar(s * 128 + piso(ex / 16))
+    }
+    retornar r
+}
+
+funcion _sc_de_ieee(b, p, ancho) {
+    sea alto = byte_en(b, p + ancho - 1)
+    sea s = 1
+    si (alto >= 128) { s = -1 }
+    sea ex = 0
+    sea mant = 0
+    sea bits = 52
+    sea sesgo = 1023
+    sea emax = 2047
+    si (ancho == 8) {
+        ex = (alto % 128) * 16 + piso(byte_en(b, p + 6) / 16)
+        mant = (byte_en(b, p + 6) % 16) * 281474976710656
+        sea k = 5
+        sea m2 = 0
+        mientras (k >= 0) {
+            m2 = m2 * 256 + byte_en(b, p + k)
+            k = k - 1
+        }
+        mant = mant + m2
+    } sino {
+        bits = 23
+        sesgo = 127
+        emax = 255
+        ex = (alto % 128) * 2 + piso(byte_en(b, p + 2) / 128)
+        mant = (byte_en(b, p + 2) % 128) * 65536 + byte_en(b, p + 1) * 256 + byte_en(b, p)
+    }
+    si (ex == emax) {
+        si (mant == 0) { retornar s * 1e308 * 10 }
+        retornar 0 / 0
+    }
+    si (ex == 0) { retornar s * mant * potencia(2, 1 - sesgo - bits) }
+    retornar s * (1 + mant / potencia(2, bits)) * potencia(2, ex - sesgo)
+}
+
+// ---------- codificador ----------
+// El búfer es una lista de bytes (enteros) que se va completando hacia
+// adelante; los hijos quedan después de sus padres (offsets positivos).
+
+funcion _sc_rellenar(buf, a) { mientras (longitud(buf) % a != 0) { buf.agregar(0) } }
+
+funcion _sc_poner_int(buf, pos, v, n) {
+    sea x = v
+    sea neg = x < 0
+    si (neg) { x = 0 - x - 1 }
+    sea k = 0
+    mientras (k < n) {
+        sea byte_ = x % 256
+        si (neg) { byte_ = 255 - byte_ }
+        si (pos + k < longitud(buf)) { buf[pos + k] = byte_ } sino { buf.agregar(byte_) }
+        x = piso(x / 256)
+        k = k + 1
+    }
+}
+
+funcion _sc_escalar_num(e, t, v) {
+    sea d = nulo
+    si (tipo(t) == "texto") { d = e["tipos"][t] ?? nulo }
+    si (d != nulo y d["k"] == "enum") {
+        si (tipo(v) == "texto") {
+            si (tiene_clave(d["valores"], v) == falso) { lanzar "fbs: valor de enum desconocido " + v }
+            retornar d["valores"][v]
+        }
+        retornar v
+    }
+    si (v == verdadero) { retornar 1 }
+    si (v == falso) { retornar 0 }
+    retornar v
+}
+
+funcion _sc_base(e, t) {
+    si (tiene_clave(_SC_ESCALARES, t)) { retornar t }
+    retornar _sc_base(e, e["tipos"][t]["base"])
+}
+
+funcion _sc_poner_escalar(buf, pos, e, t, v) {
+    sea b = _sc_base(e, t)
+    sea info = _SC_ESCALARES[b]
+    sea num = _sc_escalar_num(e, t, v)
+    si (info[1] == "f") {
+        sea bs = _sc_ieee(num, info[0])
+        sea k = 0
+        mientras (k < info[0]) {
+            si (pos + k < longitud(buf)) { buf[pos + k] = bs[k] } sino { buf.agregar(bs[k]) }
+            k = k + 1
+        }
+    } sino { _sc_poner_int(buf, pos, piso(num), info[0]) }
+}
+
+funcion _sc_poner_struct(buf, pos, e, t, v) {
+    sea d = e["tipos"][t]
+    // Ceros de relleno.
+    sea k = longitud(buf)
+    mientras (k < pos + d["tam"]) {
+        buf.agregar(0)
+        k = k + 1
+    }
+    para c en d["campos"] {
+        sea x = v[c["nombre"]] ?? 0
+        _sc_poner_inline(buf, pos + c["off"], e, c["tipo"], x)
+    }
+}
+
+funcion _sc_poner_inline(buf, pos, e, t, v) {
+    si (tipo(t) == "mapa") {
+        sea ta = _sc_tam_inline(e, t["vector"])
+        sea i = 0
+        mientras (i < t["fijo"]) {
+            sea x = 0
+            si (i < longitud(v ?? [])) { x = v[i] }
+            _sc_poner_inline(buf, pos + i * ta[0], e, t["vector"], x)
+            i = i + 1
+        }
+        retornar nulo
+    }
+    sea d = e["tipos"][t] ?? nulo
+    si (d != nulo y d["k"] == "struct") { _sc_poner_struct(buf, pos, e, t, v) } sino { _sc_poner_escalar(buf, pos, e, t, v) }
+}
+
+funcion _sc_def(e, t) {
+    si (tipo(t) != "texto") { retornar {"k": ""} }
+    retornar e["tipos"][t] ?? {"k": ""}
+}
+
+funcion _sc_es_inline(e, t) {
+    si (tipo(t) == "mapa") { retornar t["fijo"] != nulo }
+    si (tiene_clave(_SC_ESCALARES, t)) { retornar verdadero }
+    si (t == "string") { retornar falso }
+    sea d = e["tipos"][t]
+    retornar d["k"] == "enum" o d["k"] == "struct"
+}
+
+funcion _sc_defecto(e, c) {
+    sea t = c["tipo"]
+    si (c["defecto"] == nulo) {
+        si (tipo(t) == "texto" y tiene_clave(_SC_ESCALARES, t)) {
+            si (t == "bool") { retornar falso }
+            retornar 0
+        }
+        sea d = _sc_def(e, t)
+        si (d["k"] == "enum") {
+            retornar d["nombres"]["0"] ?? 0
+        }
+        retornar nulo
+    }
+    sea x = c["defecto"]
+    si (x == "true") { retornar verdadero }
+    si (x == "false") { retornar falso }
+    sea d = _sc_def(e, t)
+    si (d["k"] == "enum") { retornar x }
+    retornar a_numero(x)
+}
+
+// Escribe un objeto (no en línea) al final del búfer y devuelve su posición.
+funcion _sc_objeto(buf, e, t, v) {
+    si (t == "string") {
+        sea s = "" + v
+        _sc_rellenar(buf, 4)
+        sea p = longitud(buf)
+        _sc_poner_int(buf, p, longitud(s), 4)
+        sea i = 0
+        mientras (i < longitud(s)) {
+            buf.agregar(byte_en(s, i))
+            i = i + 1
+        }
+        buf.agregar(0)
+        retornar p
+    }
+    si (tipo(t) == "mapa") { retornar _sc_vector(buf, e, t["vector"], v) }
+    retornar _sc_tabla(buf, e, t, v)
+}
+
+funcion _sc_vector(buf, e, interno, v) {
+    sea n = longitud(v)
+    si (interno == "ubyte" y tipo(v) == "texto") {
+        // Bytes como texto.
+        _sc_rellenar(buf, 4)
+        sea p = longitud(buf)
+        _sc_poner_int(buf, p, n, 4)
+        sea i = 0
+        mientras (i < n) {
+            buf.agregar(byte_en(v, i))
+            i = i + 1
+        }
+        retornar p
+    }
+    si (_sc_es_inline(e, interno)) {
+        sea ta = _sc_tam_inline(e, interno)
+        // Los elementos deben quedar alineados: el largo va justo antes.
+        mientras ((longitud(buf) + 4) % maximo(4, ta[1]) != 0) { buf.agregar(0) }
+        sea p = longitud(buf)
+        _sc_poner_int(buf, p, n, 4)
+        sea i = 0
+        mientras (i < n) {
+            _sc_poner_inline(buf, p + 4 + i * ta[0], e, interno, v[i])
+            i = i + 1
+        }
+        retornar p
+    }
+    _sc_rellenar(buf, 4)
+    sea p = longitud(buf)
+    _sc_poner_int(buf, p, n, 4)
+    sea i = 0
+    mientras (i < n) {
+        _sc_poner_int(buf, p + 4 + i * 4, 0, 4)
+        i = i + 1
+    }
+    i = 0
+    mientras (i < n) {
+        sea hijo = _sc_objeto(buf, e, interno, v[i])
+        sea loc = p + 4 + i * 4
+        _sc_poner_int(buf, loc, hijo - loc, 4)
+        i = i + 1
+    }
+    retornar p
+}
+
+funcion _sc_tabla(buf, e, t, v) {
+    sea d = e["tipos"][t] ?? nulo
+    si (d == nulo o d["k"] != "table") { lanzar "fbs: no es una tabla: " + t }
+    // Campos presentes: [id, tamaño, alineación, campo, valor, en_linea].
+    sea pres = []
+    sea max_id = -1
+    para c en d["campos"] {
+        si ((c["at"]["deprecated"] ?? falso) == falso) {
+            sea x = v[c["nombre"]] ?? nulo
+            sea tu = _sc_def(e, c["tipo"])
+            si (tipo(c["tipo"]) == "texto" y tu["k"] == "union") {
+                sea nt = v[c["nombre"] + "_type"] ?? nulo
+                si (x != nulo y nt != nulo y nt != "NONE") {
+                    pres.agregar({"id": c["id_tipo"], "tam": 1, "alin": 1, "c": {"tipo": "ubyte"}, "v": tu["valores"][nt], "linea": verdadero})
+                    pres.agregar({"id": c["id"], "tam": 4, "alin": 4, "c": {"tipo": nt}, "v": x, "linea": falso})
+                    max_id = maximo(max_id, c["id"])
+                }
+            } sino si (x != nulo) {
+                si (_sc_es_inline(e, c["tipo"])) {
+                    sea def = _sc_defecto(e, c)
+                    sea igual_def = falso
+                    si (def != nulo y tipo(x) != "mapa" y tipo(x) != "lista") {
+                        igual_def = ("" + _sc_escalar_num(e, c["tipo"], x)) == ("" + _sc_escalar_num(e, c["tipo"], def))
+                    }
+                    si (igual_def == falso o (c["at"]["required"] ?? falso)) {
+                        sea ta = _sc_tam_inline(e, c["tipo"])
+                        pres.agregar({"id": c["id"], "tam": ta[0], "alin": ta[1], "c": c, "v": x, "linea": verdadero})
+                        max_id = maximo(max_id, c["id"])
+                    }
+                } sino {
+                    pres.agregar({"id": c["id"], "tam": 4, "alin": 4, "c": c, "v": x, "linea": falso})
+                    max_id = maximo(max_id, c["id"])
+                }
+            } sino si (c["at"]["required"] ?? falso) { lanzar "fbs: falta el campo obligatorio " + c["nombre"] }
+        }
+    }
+    // Ordena por tamaño (mayor primero) para minimizar relleno.
+    pres = ordenar(pres, funcion(a, b) { retornar b["tam"] - a["tam"] })
+    sea alin_t = 4
+    sea off = 4
+    para f en pres {
+        off = _sc_alinear_a(off, f["alin"])
+        f["off"] = off
+        off = off + f["tam"]
+        alin_t = maximo(alin_t, f["alin"])
+    }
+    sea tam_t = off
+    sea nslots = max_id + 1
+    sea tam_vt = 4 + 2 * nslots
+    // Relleno para que la tabla (después del vtable) quede alineada.
+    mientras ((longitud(buf) + tam_vt) % alin_t != 0) { buf.agregar(0) }
+    sea pvt = longitud(buf)
+    _sc_poner_int(buf, pvt, tam_vt, 2)
+    _sc_poner_int(buf, pvt + 2, tam_t, 2)
+    sea k = 0
+    mientras (k < nslots) {
+        _sc_poner_int(buf, pvt + 4 + 2 * k, 0, 2)
+        k = k + 1
+    }
+    para f en pres { _sc_poner_int(buf, pvt + 4 + 2 * f["id"], f["off"], 2) }
+    sea pt = longitud(buf)
+    _sc_poner_int(buf, pt, pt - pvt, 4)
+    k = pt + 4
+    mientras (k < pt + tam_t) {
+        buf.agregar(0)
+        k = k + 1
+    }
+    para f en pres { si (f["linea"]) { _sc_poner_inline(buf, pt + f["off"], e, f["c"]["tipo"], f["v"]) } }
+    para f en pres {
+        si (f["linea"] == falso) {
+            sea hijo = _sc_objeto(buf, e, f["c"]["tipo"], f["v"])
+            sea loc = pt + f["off"]
+            _sc_poner_int(buf, loc, hijo - loc, 4)
+        }
+    }
+    retornar pt
+}
+
+/// Codifica un mapa con el tipo raíz (o `tipo_raiz`). Devuelve bytes.
+funcion sin_copia_codificar(esquema, valor, tipo_raiz) {
+    sea t = tipo_raiz ?? esquema["raiz"]
+    si (t == nulo) { lanzar "fbs: falta root_type" }
+    sea buf = [0, 0, 0, 0]
+    si (esquema["identificador"] != nulo) {
+        sea id = esquema["identificador"]
+        sea i = 0
+        mientras (i < 4) {
+            buf.agregar(byte_en(id, i))
+            i = i + 1
+        }
+    }
+    sea p = _sc_tabla(buf, esquema, t, valor)
+    _sc_poner_int(buf, 0, p, 4)
+    _sc_rellenar(buf, 8)
+    sea partes = []
+    para x en buf { partes.agregar(bytes_entero(x, 1, 0)) }
+    retornar unir(partes, "")
+}
+
+// ---------- lector ----------
+
+funcion _sc_leer_int(b, p, n, con_signo) {
+    sea v = bytes_leer_entero(b, p, n, 1)
+    si (con_signo y v >= potencia(2, n * 8 - 1)) { v = v - potencia(2, n * 8) }
+    retornar v
+}
+
+funcion _sc_leer_escalar(e, b, p, t) {
+    sea base = _sc_base(e, t)
+    sea info = _SC_ESCALARES[base]
+    sea v = nulo
+    si (info[1] == "f") { v = _sc_de_ieee(b, p, info[0]) } sino { v = _sc_leer_int(b, p, info[0], info[1] == "s") }
+    si (base == "bool") { retornar v != 0 }
+    sea d = e["tipos"][t] ?? nulo
+    si (d != nulo y d["k"] == "enum") { retornar d["nombres"]["" + v] ?? v }
+    retornar v
+}
+
+funcion _sc_leer_inline(e, b, p, t) {
+    si (tipo(t) == "mapa") {
+        sea ta = _sc_tam_inline(e, t["vector"])
+        sea r = []
+        sea i = 0
+        mientras (i < t["fijo"]) {
+            r.agregar(_sc_leer_inline(e, b, p + i * ta[0], t["vector"]))
+            i = i + 1
+        }
+        retornar r
+    }
+    sea d = e["tipos"][t] ?? nulo
+    si (d != nulo y d["k"] == "struct") {
+        sea r = {}
+        para c en d["campos"] { r[c["nombre"]] = _sc_leer_inline(e, b, p + c["off"], c["tipo"]) }
+        retornar r
+    }
+    retornar _sc_leer_escalar(e, b, p, t)
+}
+
+/// Raíz perezosa: un acceso a la tabla raíz sin decodificar nada.
+funcion sin_copia_raiz(esquema, bytes_, tipo_raiz) {
+    retornar {"e": esquema, "b": bytes_, "p": _sc_leer_int(bytes_, 0, 4, falso), "t": tipo_raiz ?? esquema["raiz"]}
+}
+
+/// ¿El búfer tiene el identificador de archivo dado?
+funcion sin_copia_identificador(bytes_) { retornar subcadena(bytes_, 4, 8) }
+
+funcion _sc_campo_pos(obj, c, id) {
+    sea b = obj["b"]
+    sea vt = obj["p"] - _sc_leer_int(b, obj["p"], 4, verdadero)
+    sea tam_vt = _sc_leer_int(b, vt, 2, falso)
+    si (4 + 2 * id >= tam_vt) { retornar 0 }
+    retornar _sc_leer_int(b, vt + 4 + 2 * id, 2, falso)
+}
+
+funcion _sc_valor_objeto(e, b, loc, t) {
+    sea p = loc + _sc_leer_int(b, loc, 4, falso)
+    si (t == "string") {
+        sea n = _sc_leer_int(b, p, 4, falso)
+        retornar subcadena(b, p + 4, p + 4 + n)
+    }
+    si (tipo(t) == "mapa") { retornar {"vector": verdadero, "e": e, "b": b, "p": p, "t": t["vector"], "n": _sc_leer_int(b, p, 4, falso)} }
+    retornar {"e": e, "b": b, "p": p, "t": t}
+}
+
+/// Lee un campo de un objeto perezoso: escalares, textos y structs se
+/// devuelven ya leídos; tablas y vectores como accesos perezosos.
+funcion sin_copia_campo(obj, nombre) {
+    sea e = obj["e"]
+    sea d = e["tipos"][obj["t"]]
+    sea c = nulo
+    para x en d["campos"] { si (x["nombre"] == nombre) { c = x } }
+    sea es_tipo_union = falso
+    si (c == nulo y texto_termina_con(nombre, "_type")) {
+        sea base = subcadena(nombre, 0, longitud(nombre) - 5)
+        para x en d["campos"] { si (x["nombre"] == base) { c = x } }
+        es_tipo_union = c != nulo
+    }
+    si (c == nulo) { lanzar "fbs: " + obj["t"] + " no tiene el campo " + nombre }
+    sea tu = _sc_def(e, c["tipo"])
+    si (tipo(c["tipo"]) == "texto" y tu["k"] == "union") {
+        sea ot = _sc_campo_pos(obj, c, c["id_tipo"])
+        sea nt = 0
+        si (ot != 0) { nt = byte_en(obj["b"], obj["p"] + ot) }
+        sea nombre_t = tu["nombres"]["" + nt] ?? "NONE"
+        si (es_tipo_union) { retornar nombre_t }
+        si (nt == 0) { retornar nulo }
+        sea ov = _sc_campo_pos(obj, c, c["id"])
+        si (ov == 0) { retornar nulo }
+        retornar _sc_valor_objeto(e, obj["b"], obj["p"] + ov, nombre_t)
+    }
+    sea o = _sc_campo_pos(obj, c, c["id"])
+    si (o == 0) {
+        si (_sc_es_inline(e, c["tipo"])) { retornar _sc_defecto(e, c) }
+        retornar nulo
+    }
+    si (_sc_es_inline(e, c["tipo"])) { retornar _sc_leer_inline(e, obj["b"], obj["p"] + o, c["tipo"]) }
+    retornar _sc_valor_objeto(e, obj["b"], obj["p"] + o, c["tipo"])
+}
+
+/// ¿El campo está presente en el búfer?
+funcion sin_copia_tiene(obj, nombre) {
+    para c en obj["e"]["tipos"][obj["t"]]["campos"] { si (c["nombre"] == nombre) { retornar _sc_campo_pos(obj, c, c["id"]) != 0 } }
+    retornar falso
+}
+
+/// Largo de un vector perezoso.
+funcion sin_copia_largo(v) { retornar v["n"] }
+
+/// Elemento i de un vector perezoso.
+funcion sin_copia_elemento(v, i) {
+    si (i < 0 o i >= v["n"]) { lanzar "fbs: índice fuera del vector" }
+    sea e = v["e"]
+    si (_sc_es_inline(e, v["t"])) {
+        sea ta = _sc_tam_inline(e, v["t"])
+        retornar _sc_leer_inline(e, v["b"], v["p"] + 4 + i * ta[0], v["t"])
+    }
+    retornar _sc_valor_objeto(e, v["b"], v["p"] + 4 + i * 4, v["t"])
+}
+
+/// Convierte un acceso perezoso (tabla o vector) a mapas y listas.
+funcion sin_copia_a_mapa(obj) {
+    si (tipo(obj) != "mapa" o (tiene_clave(obj, "b") == falso)) { retornar obj }
+    si (obj["vector"] ?? falso) {
+        sea r = []
+        si (obj["t"] == "ubyte") { retornar subcadena(obj["b"], obj["p"] + 4, obj["p"] + 4 + obj["n"]) }
+        sea i = 0
+        mientras (i < obj["n"]) {
+            r.agregar(sin_copia_a_mapa(sin_copia_elemento(obj, i)))
+            i = i + 1
+        }
+        retornar r
+    }
+    sea r = {}
+    sea d = obj["e"]["tipos"][obj["t"]]
+    para c en d["campos"] {
+        si ((c["at"]["deprecated"] ?? falso) == falso) {
+            sea tu = _sc_def(obj["e"], c["tipo"])
+            si (tipo(c["tipo"]) == "texto" y tu["k"] == "union") {
+                sea nt = sin_copia_campo(obj, c["nombre"] + "_type")
+                si (nt != "NONE") {
+                    r[c["nombre"] + "_type"] = nt
+                    r[c["nombre"]] = sin_copia_a_mapa(sin_copia_campo(obj, c["nombre"]))
+                }
+            } sino {
+                sea x = sin_copia_campo(obj, c["nombre"])
+                si (x != nulo) { r[c["nombre"]] = sin_copia_a_mapa(x) }
+            }
+        }
+    }
+    retornar r
+}
+
+/// Decodifica todo el búfer a mapas.
+funcion sin_copia_decodificar(esquema, bytes_, tipo_raiz) { retornar sin_copia_a_mapa(sin_copia_raiz(esquema, bytes_, tipo_raiz)) }

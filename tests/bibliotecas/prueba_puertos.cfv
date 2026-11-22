@@ -1,0 +1,86 @@
+importar "puertos"
+importar "xml"
+funcion igual(a, b, q) { afirmar(("" + a) == ("" + b), q + ": [" + a + "] != [" + b + "]") }
+// SSDP.
+sea ms = puertos_msearch(nulo, 2)
+igual([texto_empieza_con(ms, "M-SEARCH * HTTP/1.1\r\n"), texto_indice(ms, "ST: urn:schemas-upnp-org:device:InternetGatewayDevice:1\r\n") > 0, texto_termina_con(ms, "\r\n\r\n")], [verdadero, verdadero, verdadero], "m-search")
+sea resp = puertos_ssdp_leer("HTTP/1.1 200 OK\r\nCACHE-CONTROL: max-age=120\r\nST: urn:schemas-upnp-org:device:InternetGatewayDevice:1\r\nUSN: uuid:abc::urn:x\r\nLocation: http://192.168.1.1:5000/rootDesc.xml\r\nSERVER: OpenWRT/18 UPnP/1.1 MiniUPnPd/2.1\r\n\r\n")
+igual([resp["estado"], resp["cabeceras"]["location"], resp["cabeceras"]["server"]], [200, "http://192.168.1.1:5000/rootDesc.xml", "OpenWRT/18 UPnP/1.1 MiniUPnPd/2.1"], "respuesta ssdp")
+// Descripción como la de MiniUPnPd: el servicio WAN está anidado.
+sea DESC = "<?xml version=\"1.0\"?><root xmlns=\"urn:schemas-upnp-org:device-1-0\"><specVersion><major>1</major><minor>0</minor></specVersion><device><deviceType>urn:schemas-upnp-org:device:InternetGatewayDevice:1</deviceType><friendlyName>Router</friendlyName><manufacturer>OpenWrt</manufacturer><modelName>Router modelo X</modelName><serviceList><service><serviceType>urn:schemas-upnp-org:service:Layer3Forwarding:1</serviceType><controlURL>/ctl/L3F</controlURL></service></serviceList><deviceList><device><deviceType>urn:schemas-upnp-org:device:WANDevice:1</deviceType><deviceList><device><deviceType>urn:schemas-upnp-org:device:WANConnectionDevice:1</deviceType><serviceList><service><serviceType>urn:schemas-upnp-org:service:WANIPConnection:1</serviceType><serviceId>urn:upnp-org:serviceId:WANIPConn1</serviceId><controlURL>/ctl/IPConn</controlURL><eventSubURL>/evt/IPConn</eventSubURL><SCPDURL>/WANIPCn.xml</SCPDURL></service></serviceList></device></deviceList></device></deviceList></device></root>"
+// Router falso: registra cada SOAP y responde como MiniUPnPd.
+sea llamadas = []
+sea mapeos = {}
+funcion respuesta(accion, cuerpo) { retornar {"estado": 200, "cabeceras": {}, "cuerpo": "<?xml version=\"1.0\"?><s:Envelope xmlns:s=\"http://schemas.xmlsoap.org/soap/envelope/\"><s:Body><u:" + accion + "Response xmlns:u=\"urn:schemas-upnp-org:service:WANIPConnection:1\">" + cuerpo + "</u:" + accion + "Response></s:Body></s:Envelope>"} }
+funcion falla(cod, des) { retornar {"estado": 500, "cabeceras": {}, "cuerpo": "<?xml version=\"1.0\"?><s:Envelope xmlns:s=\"http://schemas.xmlsoap.org/soap/envelope/\"><s:Body><s:Fault><faultcode>s:Client</faultcode><faultstring>UPnPError</faultstring><detail><UPnPError xmlns=\"urn:schemas-upnp-org:control-1-0\"><errorCode>" + cod + "</errorCode><errorDescription>" + des + "</errorDescription></UPnPError></detail></s:Fault></s:Body></s:Envelope>"} }
+sea transporte = funcion(m, url, o) {
+    si (m == "GET") { retornar {"estado": 200, "cabeceras": {}, "cuerpo": DESC} }
+    sea accion = texto_dividir(o["cabeceras"]["SOAPAction"], "#")[1]
+    accion = subcadena(accion, 0, longitud(accion) - 1)
+    llamadas.agregar([url, accion])
+    sea x = xml_analizar(o["cuerpo"])
+    sea args = {}
+    para a en xml_buscar(x, "u:" + accion)[0]["hijos"] { args[a["nombre"]] = xml_contenido(a) }
+    si (accion == "GetExternalIPAddress") { retornar respuesta(accion, "<NewExternalIPAddress>203.0.113.9</NewExternalIPAddress>") }
+    si (accion == "AddPortMapping") {
+        mapeos[args["NewExternalPort"] + "/" + args["NewProtocol"]] = args
+        retornar respuesta(accion, "")
+    }
+    si (accion == "DeletePortMapping") {
+        si (tiene_clave(mapeos, args["NewExternalPort"] + "/" + args["NewProtocol"]) == falso) { retornar falla(714, "NoSuchEntryInArray") }
+        quitar_clave(mapeos, args["NewExternalPort"] + "/" + args["NewProtocol"])
+        retornar respuesta(accion, "")
+    }
+    si (accion == "GetSpecificPortMappingEntry") {
+        sea mp = mapeos[args["NewExternalPort"] + "/" + args["NewProtocol"]] ?? nulo
+        si (mp == nulo) { retornar falla(714, "NoSuchEntryInArray") }
+        retornar respuesta(accion, "<NewInternalPort>" + mp["NewInternalPort"] + "</NewInternalPort><NewInternalClient>" + mp["NewInternalClient"] + "</NewInternalClient><NewEnabled>1</NewEnabled><NewPortMappingDescription>" + xml_escapar(mp["NewPortMappingDescription"]) + "</NewPortMappingDescription><NewLeaseDuration>" + mp["NewLeaseDuration"] + "</NewLeaseDuration>")
+    }
+    si (accion == "GetGenericPortMappingEntry") {
+        sea ks = ordenar(claves(mapeos))
+        sea i = a_numero(args["NewPortMappingIndex"])
+        si (i >= longitud(ks)) { retornar falla(713, "SpecifiedArrayIndexInvalid") }
+        sea mp = mapeos[ks[i]]
+        retornar respuesta(accion, "<NewRemoteHost></NewRemoteHost><NewExternalPort>" + mp["NewExternalPort"] + "</NewExternalPort><NewProtocol>" + mp["NewProtocol"] + "</NewProtocol><NewInternalPort>" + mp["NewInternalPort"] + "</NewInternalPort><NewInternalClient>" + mp["NewInternalClient"] + "</NewInternalClient><NewEnabled>1</NewEnabled><NewPortMappingDescription>" + xml_escapar(mp["NewPortMappingDescription"]) + "</NewPortMappingDescription><NewLeaseDuration>0</NewLeaseDuration>")
+    }
+    retornar falla(401, "Invalid Action")
+}
+sea gw = puertos_describir("http://192.168.1.1:5000/rootDesc.xml", nulo, {"transporte": transporte})
+igual([gw["servicio"], gw["control"], gw["modelo"], gw["ip_router"]], ["urn:schemas-upnp-org:service:WANIPConnection:1", "http://192.168.1.1:5000/ctl/IPConn", "Router modelo X", "192.168.1.1"], "descripción")
+igual(puertos_ip_externa(gw), "203.0.113.9", "ip externa")
+puertos_abrir(gw, 8080, 80, "tcp", "Servidor & web", 3600, "192.168.1.50")
+puertos_abrir(gw, 9000, 9000, "UDP", "Juego", 0, "192.168.1.50")
+igual(mapeos["8080/TCP"]["NewPortMappingDescription"], "Servidor & web", "escape en SOAP")
+igual(puertos_consultar(gw, 8080, "TCP"), {"activo": verdadero, "descripcion": "Servidor & web", "duracion": 3600, "interno": 80, "ip": "192.168.1.50"}, "consultar")
+igual(longitud(puertos_listar(gw, nulo)), 2, "listar")
+puertos_cerrar(gw, 8080, "TCP")
+igual(puertos_consultar(gw, 8080, "TCP"), nulo, "cerrado")
+sea err = ""
+intentar { puertos_cerrar(gw, 1, "TCP") } capturar (e) { err = "" + e }
+igual(err, "upnp: DeletePortMapping falló (714 NoSuchEntryInArray)", "error del router")
+igual(llamadas[0], ["http://192.168.1.1:5000/ctl/IPConn", "GetExternalIPAddress"], "url de control")
+// Sobre SOAP.
+sea sobre = puertos_soap("urn:schemas-upnp-org:service:WANIPConnection:1", "DeletePortMapping", [["NewExternalPort", 80]])
+igual(texto_indice(sobre, "<u:DeletePortMapping xmlns:u=\"urn:schemas-upnp-org:service:WANIPConnection:1\"><NewExternalPort>80</NewExternalPort></u:DeletePortMapping>") > 0, verdadero, "sobre")
+// NAT-PMP (RFC 6886).
+funcion hex(t) {
+    sea r = []
+    sea i = 0
+    mientras (i < longitud(t)) {
+        sea b = byte_en(t, i)
+        r.agregar(subcadena("0123456789abcdef", piso(b / 16), piso(b / 16) + 1) + subcadena("0123456789abcdef", b % 16, b % 16 + 1))
+        i = i + 1
+    }
+    retornar unir(r, "")
+}
+igual(hex(puertos_natpmp_peticion(nulo, 0, 0, 0)), "0000", "pedir ip")
+igual(hex(puertos_natpmp_peticion("TCP", 8080, 80, 7200)), "000200001f90005000001c20", "mapear tcp")
+sea b = funcion(l) {
+    sea r = []
+    para x en l { r.agregar(bytes_entero(x, 1, 0)) }
+    retornar unir(r, "")
+}
+igual(puertos_natpmp_respuesta(b([0, 128, 0, 0, 0, 0, 1, 0, 203, 0, 113, 9])), {"codigo": 0, "ip": "203.0.113.9", "op": 0, "segundos": 256}, "respuesta ip")
+igual(puertos_natpmp_respuesta(b([0, 130, 0, 0, 0, 0, 0, 5, 31, 144, 0, 80, 0, 0, 28, 32])), {"codigo": 0, "duracion": 7200, "externo": 80, "interno": 8080, "op": 2, "segundos": 5}, "respuesta mapeo")
+igual(puertos_natpmp_respuesta(b([0, 129, 0, 2, 0, 0, 0, 1]))["error"], "no autorizado", "error natpmp")
+mostrar("[OK] puertos")

@@ -1,0 +1,519 @@
+// stdlib/serie.cfv — puertos serie al estilo serialport de Node: abrir un
+// puerto (Arduino, ESP32, módems, lectores) con velocidad, bits de datos,
+// paridad, bits de parada y control de flujo; leer y escribir sin bloquear;
+// listar puertos; y analizadores de tramas: por delimitador (líneas), por
+// longitud fija, por byte inicial y final, SLIP, COBS y Modbus RTU (CRC-16
+// y funciones 1 a 6, 15 y 16). En Linux y macOS usa termios por libc.
+// Inspirada en node-serialport (MIT). En inglés: importar "serialport".
+//
+//   importar "serie"
+//   sea p = serie_abrir("/dev/ttyACM0", {"velocidad": 115200})
+//   serie_escribir(p, "LED 1\n")
+//   para l en serie_lineas(p, 2000) { mostrar(l) }
+//   serie_cerrar(p)
+
+funcion __serie_declaraciones() {
+    extern "libc" funcion open(ruta: texto, banderas: entero, modo: entero): entero
+    extern "libc" funcion close(fd: entero): entero
+    extern "libc" funcion read(fd: entero, buf: puntero, n: entero): largo
+    extern "libc" funcion write(fd: entero, datos: texto, n: entero): largo
+    extern "libc" funcion tcgetattr(fd: entero, t: puntero): entero
+    extern "libc" funcion tcsetattr(fd: entero, accion: entero, t: puntero): entero
+    extern "libc" funcion cfmakeraw(t: puntero): entero
+    extern "libc" funcion cfsetispeed(t: puntero, v: largo): entero
+    extern "libc" funcion cfsetospeed(t: puntero, v: largo): entero
+    extern "libc" funcion tcflush(fd: entero, cola: entero): entero
+    extern "libc" funcion tcdrain(fd: entero): entero
+    extern "libc" funcion posix_openpt(banderas: entero): entero
+    extern "libc" funcion grantpt(fd: entero): entero
+    extern "libc" funcion unlockpt(fd: entero): entero
+    extern "libc" funcion ptsname(fd: entero): puntero
+    extern "libc" funcion fcntl(fd: entero, cmd: entero, arg: entero): entero
+}
+
+funcion _se_linux() { retornar existe_archivo("/proc/meminfo") }
+
+// Constantes por sistema.
+funcion _se_k() {
+    si (_se_linux()) {
+        retornar {"O_RDWR": 2, "O_NOCTTY": 256, "O_NONBLOCK": 2048, "ancho": 4, "cflag": 8, "cc": 17, "VMIN": 6, "VTIME": 5, "tam": 64,
+            "CSIZE": 48, "CS5": 0, "CS6": 16, "CS7": 32, "CS8": 48, "CSTOPB": 64, "CREAD": 128, "PARENB": 256, "PARODD": 512, "CLOCAL": 2048, "CRTSCTS": 2147483648, "CMSPAR": 1073741824,
+            "iflag": 0, "IXON": 1024, "IXOFF": 4096, "TCSANOW": 0, "TCIOFLUSH": 2}
+    }
+    retornar {"O_RDWR": 2, "O_NOCTTY": 131072, "O_NONBLOCK": 4, "ancho": 8, "cflag": 16, "cc": 32, "VMIN": 16, "VTIME": 17, "tam": 80,
+        "CSIZE": 768, "CS5": 0, "CS6": 256, "CS7": 512, "CS8": 768, "CSTOPB": 1024, "CREAD": 2048, "PARENB": 4096, "PARODD": 8192, "CLOCAL": 32768, "CRTSCTS": 196608, "CMSPAR": 0,
+        "iflag": 0, "IXON": 512, "IXOFF": 1024, "TCSANOW": 0, "TCIOFLUSH": 3}
+}
+
+sea _SE_BAUD_LINUX = {"0": 0, "50": 1, "75": 2, "110": 3, "134": 4, "150": 5, "200": 6, "300": 7, "600": 8, "1200": 9, "1800": 10, "2400": 11, "4800": 12, "9600": 13, "19200": 14, "38400": 15,
+    "57600": 4097, "115200": 4098, "230400": 4099, "460800": 4100, "500000": 4101, "576000": 4102, "921600": 4103, "1000000": 4104, "1152000": 4105, "1500000": 4106, "2000000": 4107, "2500000": 4108, "3000000": 4109, "3500000": 4110, "4000000": 4111}
+
+/// Código de velocidad para cfsetispeed (en macOS es el número mismo).
+funcion serie_codigo_velocidad(v) {
+    si (_se_linux() == falso) { retornar v }
+    sea c = _SE_BAUD_LINUX["" + v] ?? nulo
+    si (c == nulo) { lanzar "velocidad no soportada en Linux: " + v }
+    retornar c
+}
+
+// Cambia un byte dentro de la estructura (little endian, por palabras de 32 bits).
+funcion _se_poner_byte(t, off, v) {
+    sea base = off - off % 4
+    sea w = c_leer32(t, base)
+    si (w < 0) { w = w + 4294967296 }
+    sea f = potencia(2, (off % 4) * 8)
+    w = w - bits_y(w, 255 * f) + v * f
+    si (w >= 2147483648) { w = w - 4294967296 }
+    c_escribir32(t, base, w)
+}
+
+funcion _se_leer_flag(t, off, ancho) {
+    si (ancho == 4) { retornar c_leer32(t, off) }
+    retornar c_leer64(t, off)
+}
+
+funcion _se_escribir_flag(t, off, ancho, v) {
+    si (ancho == 4) { c_escribir32(t, off, v) } sino { c_escribir64(t, off, v) }
+}
+
+/// Valor de c_cflag para la configuración (útil para probar sin puerto).
+funcion serie_cflag(base, opciones, k) {
+    sea op = opciones ?? {}
+    sea kk = k ?? _se_k()
+    sea c = base - bits_y(base, kk["CSIZE"] + kk["CSTOPB"] + kk["PARENB"] + kk["PARODD"] + kk["CRTSCTS"] + kk["CMSPAR"])
+    sea datos = op["datos"] ?? 8
+    si (datos == 5) { c = c + kk["CS5"] } sino si (datos == 6) { c = c + kk["CS6"] } sino si (datos == 7) { c = c + kk["CS7"] } sino { c = c + kk["CS8"] }
+    si ((op["parada"] ?? 1) == 2) { c = c + kk["CSTOPB"] }
+    sea par = op["paridad"] ?? "ninguna"
+    si (par == "par" o par == "even") { c = c + kk["PARENB"] }
+    si (par == "impar" o par == "odd") { c = c + kk["PARENB"] + kk["PARODD"] }
+    si (par == "marca" o par == "mark") { c = c + kk["PARENB"] + kk["PARODD"] + kk["CMSPAR"] }
+    si (par == "espacio" o par == "space") { c = c + kk["PARENB"] + kk["CMSPAR"] }
+    si ((op["rtscts"] ?? falso)) { c = c + kk["CRTSCTS"] }
+    c = bits_o(c, kk["CREAD"] + kk["CLOCAL"])
+    retornar c
+}
+
+/// Abre un puerto. opciones: "velocidad" (9600), "datos" (8), "paridad"
+/// ("ninguna", "par", "impar", "marca", "espacio"), "parada" (1 o 2),
+/// "rtscts", "xonxoff", "vaciar" (verdadero: descarta lo pendiente).
+funcion serie_abrir(ruta, opciones) {
+    sea op = opciones ?? {}
+    sea k = _se_k()
+    sea fd = open(ruta, k["O_RDWR"] + k["O_NOCTTY"] + k["O_NONBLOCK"], 0)
+    si (fd < 0) { lanzar "no se pudo abrir el puerto " + ruta }
+    sea t = c_reservar(k["tam"] + 64)
+    si (tcgetattr(fd, t) != 0) {
+        c_liberar(t)
+        close(fd)
+        lanzar "no es un puerto serie: " + ruta
+    }
+    cfmakeraw(t)
+    sea vel = serie_codigo_velocidad(op["velocidad"] ?? 9600)
+    cfsetispeed(t, vel)
+    cfsetospeed(t, vel)
+    sea ancho = k["ancho"]
+    _se_escribir_flag(t, k["cflag"], ancho, serie_cflag(_se_leer_flag(t, k["cflag"], ancho), op, k))
+    si (op["xonxoff"] ?? falso) { _se_escribir_flag(t, k["iflag"], ancho, bits_o(_se_leer_flag(t, k["iflag"], ancho), k["IXON"] + k["IXOFF"])) }
+    // Lectura sin bloqueo: VMIN 0, VTIME 0.
+    _se_poner_byte(t, k["cc"] + k["VMIN"], 0)
+    _se_poner_byte(t, k["cc"] + k["VTIME"], 0)
+    si (tcsetattr(fd, k["TCSANOW"], t) != 0) {
+        c_liberar(t)
+        close(fd)
+        lanzar "no se pudo configurar " + ruta
+    }
+    c_liberar(t)
+    si (op["vaciar"] ?? verdadero) { tcflush(fd, k["TCIOFLUSH"]) }
+    retornar {"fd": fd, "ruta": ruta, "op": op, "buf": c_reservar(4096), "pendiente": "", "abierto": verdadero}
+}
+
+/// Escribe texto o bytes. Devuelve los bytes escritos.
+funcion serie_escribir(p, datos) {
+    sea d = "" + datos
+    sea total = 0
+    sea intentos = 0
+    mientras (total < longitud(d) y intentos < 2000) {
+        sea resto = subcadena(d, total, longitud(d))
+        sea n = write(p["fd"], resto, longitud(resto))
+        si (n > 0) { total = total + n } sino {
+            dormir(1)
+            intentos = intentos + 1
+        }
+    }
+    retornar total
+}
+
+/// Espera a que salga todo lo escrito.
+funcion serie_drenar(p) { tcdrain(p["fd"]) }
+
+/// Lee lo disponible ahora (texto de bytes, puede ser "").
+funcion serie_leer(p) {
+    sea partes = [p["pendiente"]]
+    p["pendiente"] = ""
+    mientras (verdadero) {
+        sea n = read(p["fd"], p["buf"], 4096)
+        si (n <= 0) { romper }
+        partes.agregar(c_bytes(p["buf"], n))
+    }
+    retornar unir(partes, "")
+}
+
+/// Lee hasta tener `n` bytes o vencer el tiempo (ms).
+funcion serie_leer_exacto(p, n, tiempo_max) {
+    sea fin = tiempo_ms() + (tiempo_max ?? 1000)
+    sea acum = ""
+    mientras (longitud(acum) < n y tiempo_ms() < fin) {
+        sea x = serie_leer(p)
+        si (x == "") { dormir(1) } sino { acum = acum + x }
+    }
+    si (longitud(acum) > n) {
+        p["pendiente"] = subcadena(acum, n, longitud(acum)) + p["pendiente"]
+        acum = subcadena(acum, 0, n)
+    }
+    retornar acum
+}
+
+/// Lee una línea (sin el delimitador) o nulo si vence el tiempo.
+funcion serie_leer_linea(p, tiempo_max, delimitador) {
+    sea del_ = delimitador ?? "\n"
+    sea fin = tiempo_ms() + (tiempo_max ?? 1000)
+    sea acum = ""
+    mientras (verdadero) {
+        sea i = texto_indice(acum, del_)
+        si (i >= 0) {
+            p["pendiente"] = subcadena(acum, i + longitud(del_), longitud(acum)) + p["pendiente"]
+            sea l = subcadena(acum, 0, i)
+            si (del_ == "\n" y texto_termina_con(l, "\r")) { l = subcadena(l, 0, longitud(l) - 1) }
+            retornar l
+        }
+        si (tiempo_ms() >= fin) {
+            p["pendiente"] = acum + p["pendiente"]
+            retornar nulo
+        }
+        sea x = serie_leer(p)
+        si (x == "") { dormir(1) } sino { acum = acum + x }
+    }
+}
+
+/// Todas las líneas que lleguen durante `ms` milisegundos.
+funcion serie_lineas(p, ms) {
+    sea fin = tiempo_ms() + ms
+    sea r = []
+    mientras (tiempo_ms() < fin) {
+        sea l = serie_leer_linea(p, fin - tiempo_ms(), nulo)
+        si (l != nulo) { r.agregar(l) }
+    }
+    retornar r
+}
+
+/// Descarta lo pendiente de entrada y salida.
+funcion serie_vaciar(p) {
+    tcflush(p["fd"], _se_k()["TCIOFLUSH"])
+    p["pendiente"] = ""
+}
+
+funcion serie_cerrar(p) {
+    si (p["abierto"]) {
+        close(p["fd"])
+        c_liberar(p["buf"])
+        p["abierto"] = falso
+    }
+}
+
+/// Lista puertos probables: [{"ruta", "tipo"}].
+funcion serie_listar() {
+    sea r = []
+    para n en listar_carpeta("/dev") {
+        sea tipo_p = nulo
+        si (texto_empieza_con(n, "ttyUSB")) { tipo_p = "usb" }
+        sino si (texto_empieza_con(n, "ttyACM")) { tipo_p = "acm" }
+        sino si (texto_empieza_con(n, "ttyAMA") o texto_empieza_con(n, "serial")) { tipo_p = "placa" }
+        sino si (texto_empieza_con(n, "cu.")) { tipo_p = "usb" }
+        sino si (texto_empieza_con(n, "ttyS") y longitud(n) <= 6) { tipo_p = "uart" }
+        si (tipo_p != nulo) { r.agregar({"ruta": "/dev/" + n, "tipo": tipo_p}) }
+    }
+    retornar r
+}
+
+/// Par de pseudo terminales para pruebas: {"maestro": puerto, "esclavo": ruta}.
+funcion serie_pty() {
+    sea k = _se_k()
+    sea fd = posix_openpt(k["O_RDWR"] + k["O_NOCTTY"])
+    si (fd < 0) { lanzar "posix_openpt falló" }
+    grantpt(fd)
+    unlockpt(fd)
+    sea nombre = c_texto(ptsname(fd))
+    // El maestro sin bloqueo y en modo crudo.
+    sea t = c_reservar(k["tam"] + 64)
+    tcgetattr(fd, t)
+    cfmakeraw(t)
+    tcsetattr(fd, k["TCSANOW"], t)
+    c_liberar(t)
+    fcntl(fd, 4, k["O_RDWR"] + k["O_NONBLOCK"])
+    sea m = {"fd": fd, "ruta": "pty-maestro", "op": {}, "buf": c_reservar(4096), "pendiente": "", "abierto": verdadero}
+    retornar {"maestro": m, "esclavo": nombre}
+}
+
+// ---------- analizadores de tramas ----------
+// Un analizador acumula bytes con serie_alimentar y devuelve tramas listas.
+
+/// Analizador. tipo: "delimitador" ({"delimitador": "\n", "incluir": falso}),
+/// "longitud" ({"longitud": n}), "inicio_fin" ({"inicio", "fin"}), "slip",
+/// "cobs".
+funcion serie_analizador(tipo_a, opciones) { retornar {"t": tipo_a, "o": opciones ?? {}, "buf": "", "dentro": falso} }
+
+funcion serie_alimentar(a, datos) {
+    a["buf"] = a["buf"] + datos
+    sea r = []
+    sea t = a["t"]
+    sea o = a["o"]
+    si (t == "delimitador" o t == "lineas") {
+        sea d = o["delimitador"] ?? "\n"
+        mientras (verdadero) {
+            sea i = texto_indice(a["buf"], d)
+            si (i < 0) { romper }
+            sea fin = i
+            si (o["incluir"] ?? falso) { fin = i + longitud(d) }
+            r.agregar(subcadena(a["buf"], 0, fin))
+            a["buf"] = subcadena(a["buf"], i + longitud(d), longitud(a["buf"]))
+        }
+    } sino si (t == "longitud") {
+        sea n = o["longitud"]
+        mientras (longitud(a["buf"]) >= n) {
+            r.agregar(subcadena(a["buf"], 0, n))
+            a["buf"] = subcadena(a["buf"], n, longitud(a["buf"]))
+        }
+    } sino si (t == "inicio_fin") {
+        mientras (verdadero) {
+            sea i = texto_indice(a["buf"], o["inicio"])
+            si (i < 0) {
+                a["buf"] = ""
+                romper
+            }
+            sea resto = subcadena(a["buf"], i + longitud(o["inicio"]), longitud(a["buf"]))
+            sea j = texto_indice(resto, o["fin"])
+            si (j < 0) {
+                a["buf"] = subcadena(a["buf"], i, longitud(a["buf"]))
+                romper
+            }
+            r.agregar(subcadena(resto, 0, j))
+            a["buf"] = subcadena(resto, j + longitud(o["fin"]), longitud(resto))
+        }
+    } sino si (t == "slip") {
+        sea fin = bytes_entero(192, 1, 0)
+        mientras (verdadero) {
+            sea i = texto_indice(a["buf"], fin)
+            si (i < 0) { romper }
+            sea trama = subcadena(a["buf"], 0, i)
+            a["buf"] = subcadena(a["buf"], i + 1, longitud(a["buf"]))
+            si (trama != "") { r.agregar(serie_slip_decodificar(trama)) }
+        }
+    } sino si (t == "cobs") {
+        sea cero = bytes_entero(0, 1, 0)
+        mientras (verdadero) {
+            sea i = texto_indice(a["buf"], cero)
+            si (i < 0) { romper }
+            sea trama = subcadena(a["buf"], 0, i)
+            a["buf"] = subcadena(a["buf"], i + 1, longitud(a["buf"]))
+            si (trama != "") { r.agregar(serie_cobs_decodificar(trama)) }
+        }
+    } sino { lanzar "analizador desconocido: " + t }
+    retornar r
+}
+
+funcion _se_b(n) { retornar bytes_entero(n, 1, 0) }
+
+/// SLIP (RFC 1055): codifica una trama con END al final.
+funcion serie_slip_codificar(datos) {
+    sea r = []
+    sea i = 0
+    mientras (i < longitud(datos)) {
+        sea b = byte_en(datos, i)
+        si (b == 192) { r.agregar(_se_b(219) + _se_b(220)) }
+        sino si (b == 219) { r.agregar(_se_b(219) + _se_b(221)) }
+        sino { r.agregar(_se_b(b)) }
+        i = i + 1
+    }
+    retornar unir(r, "") + _se_b(192)
+}
+
+funcion serie_slip_decodificar(datos) {
+    sea r = []
+    sea i = 0
+    mientras (i < longitud(datos)) {
+        sea b = byte_en(datos, i)
+        si (b == 219 y i + 1 < longitud(datos)) {
+            sea s = byte_en(datos, i + 1)
+            si (s == 220) { r.agregar(_se_b(192)) } sino si (s == 221) { r.agregar(_se_b(219)) } sino { r.agregar(_se_b(s)) }
+            i = i + 2
+        } sino si (b == 192) { i = i + 1 } sino {
+            r.agregar(_se_b(b))
+            i = i + 1
+        }
+    }
+    retornar unir(r, "")
+}
+
+/// COBS: codifica sin ceros; agrega el 0 delimitador si `delimitar`.
+funcion serie_cobs_codificar(datos, delimitar) {
+    sea r = []
+    sea bloque = []
+    sea i = 0
+    mientras (i <= longitud(datos)) {
+        sea fin = i == longitud(datos)
+        sea b = 0
+        si (fin == falso) { b = byte_en(datos, i) }
+        si (fin o b == 0) {
+            r.agregar(_se_b(longitud(bloque) + 1))
+            para x en bloque { r.agregar(_se_b(x)) }
+            bloque = []
+        } sino {
+            bloque.agregar(b)
+            si (longitud(bloque) == 254) {
+                r.agregar(_se_b(255))
+                para x en bloque { r.agregar(_se_b(x)) }
+                bloque = []
+                // Un bloque lleno no implica cero; si es el último byte no se agrega otro bloque vacío.
+                si (i + 1 == longitud(datos)) {
+                    si (delimitar ?? verdadero) { retornar unir(r, "") + _se_b(0) }
+                    retornar unir(r, "")
+                }
+            }
+        }
+        i = i + 1
+    }
+    si (delimitar ?? verdadero) { r.agregar(_se_b(0)) }
+    retornar unir(r, "")
+}
+
+funcion serie_cobs_decodificar(datos) {
+    sea r = []
+    sea i = 0
+    sea n = longitud(datos)
+    si (n > 0 y byte_en(datos, n - 1) == 0) { n = n - 1 }
+    mientras (i < n) {
+        sea c = byte_en(datos, i)
+        si (c == 0) { lanzar "cobs: cero inesperado" }
+        sea j = 1
+        mientras (j < c y i + j < n) {
+            r.agregar(_se_b(byte_en(datos, i + j)))
+            j = j + 1
+        }
+        i = i + c
+        si (c < 255 y i < n) { r.agregar(_se_b(0)) }
+    }
+    retornar unir(r, "")
+}
+
+// ---------- Modbus RTU ----------
+
+/// CRC-16/MODBUS de un texto de bytes.
+funcion serie_crc_modbus(datos) {
+    sea crc = 65535
+    sea i = 0
+    mientras (i < longitud(datos)) {
+        crc = bits_xo(crc, byte_en(datos, i))
+        sea k = 0
+        mientras (k < 8) {
+            si (crc % 2 == 1) { crc = bits_xo(piso(crc / 2), 40961) } sino { crc = piso(crc / 2) }
+            k = k + 1
+        }
+        i = i + 1
+    }
+    retornar crc
+}
+
+funcion _se_u16(v) { retornar bytes_entero(v, 2, 0) }
+
+funcion _se_con_crc(t) {
+    sea c = serie_crc_modbus(t)
+    retornar t + _se_b(c % 256) + _se_b(piso(c / 256))
+}
+
+/// Petición Modbus RTU. funcion_m: 1 (bobinas), 2 (entradas), 3
+/// (registros de retención), 4 (registros de entrada), 5 (escribir bobina),
+/// 6 (escribir registro), 15 (bobinas), 16 (registros). valor: cantidad
+/// para 1-4, valor para 5/6, lista para 15/16.
+funcion serie_modbus_peticion(unidad, funcion_m, direccion, valor) {
+    sea t = _se_b(unidad) + _se_b(funcion_m) + _se_u16(direccion)
+    si (funcion_m >= 1 y funcion_m <= 4) { t = t + _se_u16(valor) }
+    sino si (funcion_m == 5) {
+        si (valor == verdadero o valor == 1) { t = t + _se_u16(65280) } sino { t = t + _se_u16(0) }
+    } sino si (funcion_m == 6) { t = t + _se_u16(valor % 65536) }
+    sino si (funcion_m == 15) {
+        sea n = longitud(valor)
+        sea nb = piso((n + 7) / 8)
+        t = t + _se_u16(n) + _se_b(nb)
+        sea k = 0
+        mientras (k < nb) {
+            sea b = 0
+            sea j = 0
+            mientras (j < 8) {
+                sea idx = k * 8 + j
+                si (idx < n y (valor[idx] == verdadero o valor[idx] == 1)) { b = b + potencia(2, j) }
+                j = j + 1
+            }
+            t = t + _se_b(b)
+            k = k + 1
+        }
+    } sino si (funcion_m == 16) {
+        t = t + _se_u16(longitud(valor)) + _se_b(longitud(valor) * 2)
+        para v en valor { t = t + _se_u16(v % 65536) }
+    } sino { lanzar "función modbus no soportada: " + funcion_m }
+    retornar _se_con_crc(t)
+}
+
+/// Interpreta una respuesta Modbus RTU. Devuelve {"unidad", "funcion",
+/// "valores" | "direccion"/"valor" | "error" (código de excepción)}.
+/// cantidad: cuántas bobinas se pidieron (para 1 y 2).
+funcion serie_modbus_respuesta(datos, cantidad) {
+    si (longitud(datos) < 5) { lanzar "modbus: respuesta corta" }
+    sea cuerpo = subcadena(datos, 0, longitud(datos) - 2)
+    sea crc = byte_en(datos, longitud(datos) - 2) + byte_en(datos, longitud(datos) - 1) * 256
+    si (crc != serie_crc_modbus(cuerpo)) { lanzar "modbus: CRC inválido" }
+    sea u = byte_en(datos, 0)
+    sea f = byte_en(datos, 1)
+    si (f >= 128) { retornar {"unidad": u, "funcion": f - 128, "error": byte_en(datos, 2)} }
+    si (f == 1 o f == 2) {
+        sea nb = byte_en(datos, 2)
+        sea vals = []
+        sea k = 0
+        mientras (k < nb * 8 y (cantidad == nulo o k < cantidad)) {
+            vals.agregar(piso(byte_en(datos, 3 + piso(k / 8)) / potencia(2, k % 8)) % 2 == 1)
+            k = k + 1
+        }
+        retornar {"unidad": u, "funcion": f, "valores": vals}
+    }
+    si (f == 3 o f == 4) {
+        sea nb = byte_en(datos, 2)
+        sea vals = []
+        sea k = 0
+        mientras (k < nb) {
+            vals.agregar(byte_en(datos, 3 + k) * 256 + byte_en(datos, 4 + k))
+            k = k + 2
+        }
+        retornar {"unidad": u, "funcion": f, "valores": vals}
+    }
+    retornar {"unidad": u, "funcion": f, "direccion": byte_en(datos, 2) * 256 + byte_en(datos, 3), "valor": byte_en(datos, 4) * 256 + byte_en(datos, 5)}
+}
+
+/// Hace una petición Modbus por el puerto y espera la respuesta.
+/// opciones: "tiempo_ms" (1000), "descartar" (verdadero: tira lo que
+/// hubiera llegado antes de la petición).
+funcion serie_modbus(p, unidad, funcion_m, direccion, valor, opciones) {
+    sea op = opciones ?? {}
+    sea tiempo_max = op["tiempo_ms"] ?? 1000
+    si (op["descartar"] ?? verdadero) { serie_leer(p) }
+    serie_escribir(p, serie_modbus_peticion(unidad, funcion_m, direccion, valor))
+    // Largo esperado.
+    sea cab = serie_leer_exacto(p, 3, tiempo_max)
+    si (longitud(cab) < 3) { lanzar "modbus: sin respuesta" }
+    sea f = byte_en(cab, 1)
+    sea resto = 0
+    si (f >= 128) { resto = 2 } sino si (f <= 4) { resto = byte_en(cab, 2) + 2 } sino { resto = 5 }
+    sea r = cab + serie_leer_exacto(p, resto, tiempo_max)
+    sea cant = nulo
+    si (funcion_m == 1 o funcion_m == 2) { cant = valor }
+    retornar serie_modbus_respuesta(r, cant)
+}

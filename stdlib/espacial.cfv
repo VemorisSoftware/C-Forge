@@ -1,0 +1,376 @@
+// stdlib/espacial.cfv — audio 3D al estilo OpenAL: un oyente y fuentes con
+// posición, velocidad y dirección; los seis modelos de distancia de OpenAL
+// (inversa, lineal y exponencial, con y sin límite), conos de dirección,
+// efecto Doppler con la fórmula de OpenAL 1.1, paneo estéreo de potencia
+// constante con retardo entre oídos y sombra de la cabeza, reverberación
+// Schroeder por envío, y mezcla a muestras o a PCM de 16 bits listo para
+// "audio" o para guardar como WAV. Idea de OpenAL Soft (LGPL; solo la idea,
+// las fórmulas vienen de la especificación pública de OpenAL 1.1).
+// En inglés: importar "audio3d".
+//
+//   importar "espacial"
+//   sea ctx = espacial_contexto({"tasa": 44100})
+//   sea f = espacial_fuente(ctx, sonido_tono(440, 1000), {"posicion": [3, 0, 0], "bucle": verdadero})
+//   espacial_reproducir(f)
+//   sea pcm = espacial_pcm(ctx, 4410)   // 0,1 s estéreo
+
+sea _ES_PI = 3.141592653589793
+
+funcion _es_resta(a, b) { retornar [a[0] - b[0], a[1] - b[1], a[2] - b[2]] }
+funcion _es_suma(a, b) { retornar [a[0] + b[0], a[1] + b[1], a[2] + b[2]] }
+funcion _es_escala(a, k) { retornar [a[0] * k, a[1] * k, a[2] * k] }
+funcion _es_punto(a, b) { retornar a[0] * b[0] + a[1] * b[1] + a[2] * b[2] }
+funcion _es_cruz(a, b) { retornar [a[1] * b[2] - a[2] * b[1], a[2] * b[0] - a[0] * b[2], a[0] * b[1] - a[1] * b[0]] }
+funcion _es_largo(a) { retornar raiz(_es_punto(a, a)) }
+funcion _es_unidad(a) {
+    sea l = _es_largo(a)
+    si (l == 0) { retornar [0, 0, 0] }
+    retornar _es_escala(a, 1 / l)
+}
+
+funcion _es_acos(x) {
+    sea v = maximo(0 - 1, minimo(1, x))
+    si (v >= 1) { retornar 0 }
+    si (v <= 0 - 1) { retornar _ES_PI }
+    retornar _ES_PI / 2 - arcotangente(v / raiz(1 - v * v))
+}
+
+funcion _es_atan2(yy, xx) {
+    si (xx > 0) { retornar arcotangente(yy / xx) }
+    si (xx < 0 y yy >= 0) { retornar arcotangente(yy / xx) + _ES_PI }
+    si (xx < 0) { retornar arcotangente(yy / xx) - _ES_PI }
+    si (yy > 0) { retornar _ES_PI / 2 }
+    si (yy < 0) { retornar 0 - _ES_PI / 2 }
+    retornar 0
+}
+
+/// Contexto. opciones: "tasa" (44100), "modelo" ("inversa_limitada",
+/// "inversa", "lineal", "lineal_limitada", "exponencial",
+/// "exponencial_limitada", "ninguno"), "doppler" (1), "velocidad_sonido"
+/// (343.3), "reverb" {"ganancia", "tamano" (0..1), "amortiguar" (0..1)},
+/// "itd" (verdadero: retardo entre oídos), "sombra" (verdadero).
+funcion espacial_contexto(opciones) {
+    sea op = opciones ?? {}
+    sea ctx = {"tasa": op["tasa"] ?? 44100, "modelo": op["modelo"] ?? "inversa_limitada", "doppler": op["doppler"] ?? 1, "velocidad_sonido": op["velocidad_sonido"] ?? 343.3,
+        "itd": op["itd"] ?? verdadero, "sombra": op["sombra"] ?? verdadero, "fuentes": [],
+        "oyente": {"posicion": [0, 0, 0], "velocidad": [0, 0, 0], "adelante": [0, 0, 0 - 1], "arriba": [0, 1, 0], "ganancia": 1}, "reverb": nulo}
+    si ((op["reverb"] ?? nulo) != nulo) { espacial_reverb(ctx, op["reverb"]) }
+    retornar ctx
+}
+
+/// Configura el oyente: "posicion", "velocidad", "adelante", "arriba", "ganancia".
+funcion espacial_oyente(ctx, valores) { para k en claves(valores) { ctx["oyente"][k] = valores[k] } }
+
+// Convierte un sonido {"tasa", "canales", "pcm"} o una lista de muestras
+// (-1..1) a una lista mono de flotantes.
+funcion _es_muestras(s, tasa_ctx) {
+    si (tipo(s) == "lista") { retornar {"m": s, "tasa": tasa_ctx} }
+    sea canales = s["canales"] ?? 1
+    sea n = longitud(s["pcm"]) / 2 / canales
+    sea r = []
+    sea i = 0
+    mientras (i < n) {
+        sea suma = 0
+        sea c = 0
+        mientras (c < canales) {
+            suma = suma + pcm_muestra(s["pcm"], i * canales + c)
+            c = c + 1
+        }
+        r.agregar(suma / canales / 32768)
+        i = i + 1
+    }
+    retornar {"m": r, "tasa": s["tasa"] ?? tasa_ctx}
+}
+
+/// Fuente. opciones: "posicion", "velocidad", "direccion" ([0,0,0] =
+/// omnidireccional), "ganancia" (1), "ganancia_min" (0), "ganancia_max"
+/// (1), "tono" (1), "bucle", "relativa" (posición relativa al oyente),
+/// "distancia_ref" (1), "distancia_max" (infinita), "rolloff" (1),
+/// "cono_interno" (360), "cono_externo" (360), "ganancia_externa" (0),
+/// "envio_reverb" (0..1).
+funcion espacial_fuente(ctx, sonido, opciones) {
+    sea op = opciones ?? {}
+    sea d = _es_muestras(sonido, ctx["tasa"])
+    sea f = {"muestras": d["m"], "tasa": d["tasa"], "pos": 0, "estado": "inicial", "retardo": [], "filtro": [0, 0], "ganancia_previa": nulo,
+        "posicion": op["posicion"] ?? [0, 0, 0], "velocidad": op["velocidad"] ?? [0, 0, 0], "direccion": op["direccion"] ?? [0, 0, 0],
+        "ganancia": op["ganancia"] ?? 1, "ganancia_min": op["ganancia_min"] ?? 0, "ganancia_max": op["ganancia_max"] ?? 1, "tono": op["tono"] ?? 1,
+        "bucle": op["bucle"] ?? falso, "relativa": op["relativa"] ?? falso, "distancia_ref": op["distancia_ref"] ?? 1, "distancia_max": op["distancia_max"] ?? 1e30,
+        "rolloff": op["rolloff"] ?? 1, "cono_interno": op["cono_interno"] ?? 360, "cono_externo": op["cono_externo"] ?? 360, "ganancia_externa": op["ganancia_externa"] ?? 0,
+        "envio_reverb": op["envio_reverb"] ?? 0}
+    ctx["fuentes"].agregar(f)
+    retornar f
+}
+
+/// Cambia propiedades de una fuente (las mismas claves de espacial_fuente).
+funcion espacial_ajustar(f, valores) { para k en claves(valores) { f[k] = valores[k] } }
+
+funcion espacial_reproducir(f) {
+    si (f["estado"] == "detenida" o f["estado"] == "inicial") { f["pos"] = 0 }
+    f["estado"] = "sonando"
+}
+funcion espacial_pausar(f) { si (f["estado"] == "sonando") { f["estado"] = "pausada" } }
+funcion espacial_detener(f) {
+    f["estado"] = "detenida"
+    f["pos"] = 0
+}
+funcion espacial_estado(f) { retornar f["estado"] }
+
+/// Quita fuentes detenidas del contexto.
+funcion espacial_limpiar(ctx) {
+    sea r = []
+    para f en ctx["fuentes"] { si (f["estado"] != "detenida") { r.agregar(f) } }
+    ctx["fuentes"] = r
+}
+
+// Posición de la fuente en coordenadas del mundo.
+funcion _es_pos_mundo(ctx, f) {
+    si (f["relativa"]) { retornar _es_suma(ctx["oyente"]["posicion"], f["posicion"]) }
+    retornar f["posicion"]
+}
+
+/// Atenuación por distancia según el modelo del contexto (fórmulas de
+/// OpenAL 1.1).
+funcion espacial_atenuacion(modelo, distancia, ref, maxd, rolloff) {
+    sea d = distancia
+    si (modelo == "ninguno") { retornar 1 }
+    si (texto_termina_con(modelo, "_limitada")) { d = maximo(ref, minimo(d, maxd)) }
+    si (modelo == "inversa" o modelo == "inversa_limitada") {
+        si (ref + rolloff * (d - ref) <= 0) { retornar 1 }
+        retornar ref / (ref + rolloff * (d - ref))
+    }
+    si (modelo == "lineal" o modelo == "lineal_limitada") {
+        d = minimo(d, maxd)
+        si (maxd == ref) { retornar 1 }
+        retornar maximo(0, 1 - rolloff * (d - ref) / (maxd - ref))
+    }
+    si (modelo == "exponencial" o modelo == "exponencial_limitada") {
+        si (d <= 0 o ref <= 0) { retornar 1 }
+        retornar potencia(d / ref, 0 - rolloff)
+    }
+    lanzar "modelo de distancia desconocido: " + modelo
+}
+
+/// Ganancia del cono: ángulo (grados) entre la dirección de la fuente y
+/// el oyente.
+funcion espacial_cono(angulo, interno, externo, ganancia_externa) {
+    si (angulo <= interno / 2) { retornar 1 }
+    si (angulo <= externo / 2) { retornar 1 + (ganancia_externa - 1) * (angulo - interno / 2) / ((externo - interno) / 2) }
+    retornar ganancia_externa
+}
+
+/// Factor de tono por Doppler (OpenAL 1.1).
+funcion espacial_doppler(ctx, f) {
+    si (ctx["doppler"] == 0) { retornar 1 }
+    sea ol = ctx["oyente"]
+    sea sl = _es_resta(ol["posicion"], _es_pos_mundo(ctx, f))
+    sea l = _es_largo(sl)
+    si (l == 0) { retornar 1 }
+    sea ss = ctx["velocidad_sonido"]
+    sea df = ctx["doppler"]
+    sea vls = _es_punto(ol["velocidad"], sl) / l
+    sea vss = _es_punto(f["velocidad"], sl) / l
+    vls = minimo(vls, ss / df)
+    vss = minimo(vss, ss / df)
+    retornar (ss - df * vls) / (ss - df * vss)
+}
+
+/// Cálculo espacial de una fuente: {"ganancia", "distancia", "azimut"
+/// (radianes, 0 adelante, + derecha), "elevacion", "izquierda", "derecha",
+/// "tono"}.
+funcion espacial_calcular(ctx, f) {
+    sea ol = ctx["oyente"]
+    sea pos = _es_pos_mundo(ctx, f)
+    sea v = _es_resta(pos, ol["posicion"])
+    sea dist = _es_largo(v)
+    sea g = f["ganancia"] * espacial_atenuacion(ctx["modelo"], dist, f["distancia_ref"], f["distancia_max"], f["rolloff"])
+    // Cono.
+    si (_es_largo(f["direccion"]) > 0 y dist > 0) {
+        sea ang = _es_acos(_es_punto(_es_unidad(f["direccion"]), _es_escala(v, 0 - 1 / dist))) * 180 / _ES_PI
+        g = g * espacial_cono(ang, f["cono_interno"], f["cono_externo"], f["ganancia_externa"])
+    }
+    g = maximo(f["ganancia_min"], minimo(f["ganancia_max"], g)) * ol["ganancia"]
+    // Marco del oyente.
+    sea adelante = _es_unidad(ol["adelante"])
+    sea derecha = _es_unidad(_es_cruz(adelante, ol["arriba"]))
+    sea arriba = _es_cruz(derecha, adelante)
+    sea x = _es_punto(v, derecha)
+    sea yy = _es_punto(v, arriba)
+    sea z = _es_punto(v, adelante)
+    sea az = 0
+    sea el = 0
+    si (dist > 0) {
+        az = _es_atan2(x, z)
+        el = _es_atan2(yy, raiz(x * x + z * z))
+    }
+    // Paneo de potencia constante con el seno del azimut (delante y atrás
+    // se oyen iguales, como en OpenAL sin HRTF).
+    sea p = seno(az) * coseno(el)
+    sea ang_pan = (p + 1) * _ES_PI / 4
+    retornar {"ganancia": g, "distancia": dist, "azimut": az, "elevacion": el, "izquierda": coseno(ang_pan), "derecha": seno(ang_pan), "tono": f["tono"] * espacial_doppler(ctx, f), "pan": p}
+}
+
+/// Reverberación Schroeder (4 peines + 2 pasatodo). opciones: "ganancia"
+/// (0.3), "tamano" (0.5), "amortiguar" (0.3). nulo la desactiva.
+funcion espacial_reverb(ctx, opciones) {
+    si (opciones == nulo) {
+        ctx["reverb"] = nulo
+        retornar nulo
+    }
+    sea esc = ctx["tasa"] / 44100
+    sea tam = opciones["tamano"] ?? 0.5
+    sea peines = []
+    para largo en [1116, 1188, 1277, 1356] {
+        sea n = maximo(1, piso(largo * esc * (0.5 + tam)))
+        sea b = []
+        sea i = 0
+        mientras (i < n) {
+            b.agregar(0)
+            i = i + 1
+        }
+        peines.agregar({"b": b, "i": 0, "f": 0})
+    }
+    sea pasa = []
+    para largo en [556, 441] {
+        sea n = maximo(1, piso(largo * esc))
+        sea b = []
+        sea i = 0
+        mientras (i < n) {
+            b.agregar(0)
+            i = i + 1
+        }
+        pasa.agregar({"b": b, "i": 0})
+    }
+    ctx["reverb"] = {"ganancia": opciones["ganancia"] ?? 0.3, "realimentacion": 0.7 + 0.28 * tam, "amortiguar": opciones["amortiguar"] ?? 0.3, "peines": peines, "pasa": pasa}
+}
+
+funcion _es_reverb_muestra(r, x) {
+    sea s = 0
+    para c en r["peines"] {
+        sea y = c["b"][c["i"]]
+        c["f"] = y * (1 - r["amortiguar"]) + c["f"] * r["amortiguar"]
+        c["b"][c["i"]] = x + c["f"] * r["realimentacion"]
+        c["i"] = (c["i"] + 1) % longitud(c["b"])
+        s = s + y
+    }
+    s = s / 4
+    para a en r["pasa"] {
+        sea bv = a["b"][a["i"]]
+        sea y = bv - s
+        a["b"][a["i"]] = s + bv * 0.5
+        a["i"] = (a["i"] + 1) % longitud(a["b"])
+        s = y
+    }
+    retornar s
+}
+
+/// Mezcla `cuadros` cuadros estéreo de todas las fuentes que suenan.
+/// Devuelve [izquierda, derecha] como listas de flotantes (-1..1 aprox.).
+funcion espacial_mezclar(ctx, cuadros) {
+    sea iz = []
+    sea de = []
+    sea envio = []
+    sea k = 0
+    mientras (k < cuadros) {
+        iz.agregar(0)
+        de.agregar(0)
+        envio.agregar(0)
+        k = k + 1
+    }
+    sea tasa = ctx["tasa"]
+    // Retardo máximo entre oídos ≈ 0,66 ms.
+    sea itd_max = 0.00066 * tasa
+    para f en ctx["fuentes"] {
+        si (f["estado"] == "sonando") {
+            sea c = espacial_calcular(ctx, f)
+            sea paso = c["tono"] * f["tasa"] / tasa
+            sea n = longitud(f["muestras"])
+            // Interpola la ganancia desde el bloque anterior para evitar clics.
+            sea g0 = f["ganancia_previa"] ?? [c["ganancia"] * c["izquierda"], c["ganancia"] * c["derecha"]]
+            sea g1 = [c["ganancia"] * c["izquierda"], c["ganancia"] * c["derecha"]]
+            f["ganancia_previa"] = g1
+            sea retardo = 0
+            si (ctx["itd"]) { retardo = piso(absoluto(c["pan"]) * itd_max) }
+            // Sombra: filtro paso bajo de un polo en el oído lejano.
+            sea alfa = 1
+            si (ctx["sombra"]) { alfa = 1 - 0.6 * absoluto(c["pan"]) }
+            sea lejano_der = c["pan"] < 0
+            sea hist = f["retardo"]
+            sea i = 0
+            mientras (i < cuadros y f["estado"] == "sonando") {
+                sea pos = f["pos"]
+                sea a = piso(pos)
+                sea fr = pos - a
+                sea s0 = f["muestras"][a]
+                sea s1 = 0
+                si (a + 1 < n) { s1 = f["muestras"][a + 1] } sino si (f["bucle"]) { s1 = f["muestras"][0] }
+                sea x = s0 + (s1 - s0) * fr
+                sea t = i / cuadros
+                sea gl = g0[0] + (g1[0] - g0[0]) * t
+                sea gr = g0[1] + (g1[1] - g0[1]) * t
+                // Oído cercano sin retardo; lejano con retardo y filtro.
+                hist.agregar(x)
+                sea xd = 0
+                si (longitud(hist) > retardo) { xd = hist[longitud(hist) - 1 - retardo] }
+                f["filtro"][0] = f["filtro"][0] + alfa * (xd - f["filtro"][0])
+                sea lejos = f["filtro"][0]
+                si (lejano_der) {
+                    iz[i] = iz[i] + x * gl
+                    de[i] = de[i] + lejos * gr
+                } sino {
+                    iz[i] = iz[i] + lejos * gl
+                    de[i] = de[i] + x * gr
+                }
+                envio[i] = envio[i] + x * c["ganancia"] * f["envio_reverb"]
+                f["pos"] = pos + paso
+                si (f["pos"] >= n) {
+                    si (f["bucle"] y n > 0) { f["pos"] = f["pos"] - n * piso(f["pos"] / n) } sino {
+                        f["estado"] = "detenida"
+                        f["pos"] = 0
+                    }
+                }
+                i = i + 1
+            }
+            // Mantiene solo la historia necesaria para el retardo.
+            si (longitud(hist) > retardo + 1) {
+                sea h2 = []
+                sea j = longitud(hist) - retardo - 1
+                mientras (j < longitud(hist)) {
+                    h2.agregar(hist[j])
+                    j = j + 1
+                }
+                f["retardo"] = h2
+            }
+        }
+    }
+    sea r = ctx["reverb"]
+    si (r != nulo) {
+        sea i = 0
+        mientras (i < cuadros) {
+            sea w = _es_reverb_muestra(r, envio[i]) * r["ganancia"]
+            iz[i] = iz[i] + w
+            de[i] = de[i] + w
+            i = i + 1
+        }
+    }
+    retornar [iz, de]
+}
+
+/// Mezcla a PCM estéreo de 16 bits intercalado (con recorte suave).
+funcion espacial_pcm(ctx, cuadros) {
+    sea m = espacial_mezclar(ctx, cuadros)
+    sea r = []
+    sea i = 0
+    mientras (i < cuadros) {
+        para c en [m[0][i], m[1][i]] {
+            sea v = c
+            si (v > 1) { v = 1 }
+            si (v < 0 - 1) { v = 0 - 1 }
+            r.agregar(piso(v * 32767))
+        }
+        i = i + 1
+    }
+    retornar pcm_de_lista(r)
+}
+
+/// Renderiza `ms` milisegundos a un sonido estéreo {"tasa", "canales", "pcm"}.
+funcion espacial_renderizar(ctx, ms) { retornar {"tasa": ctx["tasa"], "canales": 2, "pcm": espacial_pcm(ctx, piso(ctx["tasa"] * ms / 1000))} }

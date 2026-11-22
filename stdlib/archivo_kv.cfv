@@ -1,0 +1,675 @@
+// stdlib/archivo_kv.cfv — almacén clave-valor en disco con árbol LSM al
+// estilo RocksDB/LevelDB: registro de escritura previa (WAL) con CRC para
+// sobrevivir caídas, memtable en memoria, tablas ordenadas inmutables
+// (SSTable) con índice disperso y filtro de Bloom, compactación por
+// niveles, lotes atómicos, números de secuencia con instantáneas de
+// lectura, iteración ordenada por rango o prefijo y combinadores
+// (contadores, agregar a listas). Las lecturas de tablas usan pread para
+// no cargar archivos completos. Idea de RocksDB (Apache/GPL; solo la idea).
+// En inglés: importar "kvstore".
+//
+//   importar "archivo_kv"
+//   sea db = kv_abrir("datos.kv", nulo)
+//   kv_poner(db, "usuario:1", "Ana")
+//   mostrar(kv_obtener(db, "usuario:1"))
+//   para par en kv_rango(db, {"prefijo": "usuario:"}) { mostrar(par[0] + " = " + par[1]) }
+//   kv_cerrar(db)
+
+funcion __archivo_kv_declaraciones() {
+    extern "libc" funcion open(ruta: texto, banderas: entero, modo: entero): entero
+    extern "libc" funcion close(fd: entero): entero
+    extern "libc" funcion write(fd: entero, datos: texto, n: entero): largo
+    extern "libc" funcion pread(fd: entero, buf: puntero, n: entero, desde: largo): largo
+    extern "libc" funcion fsync(fd: entero): entero
+    extern "libc" funcion unlink(ruta: texto): entero
+    extern "libc" funcion rename(a: texto, b: texto): entero
+    extern "libc" funcion mkdir(ruta: texto, modo: entero): entero
+    extern "libc" funcion rmdir(ruta: texto): entero
+}
+
+funcion _kv_linux() { retornar existe_archivo("/proc/meminfo") }
+funcion _kv_banderas_anexar() {
+    // O_WRONLY | O_CREAT | O_APPEND
+    si (_kv_linux()) { retornar 1 + 64 + 1024 }
+    retornar 1 + 512 + 8
+}
+
+// ---------- codificación ----------
+
+funcion _kv_b(n) { retornar bytes_entero(n, 1, 0) }
+
+funcion _kv_varint(n) {
+    sea r = []
+    sea v = n
+    mientras (v >= 128) {
+        r.agregar(_kv_b(v % 128 + 128))
+        v = piso(v / 128)
+    }
+    r.agregar(_kv_b(v))
+    retornar unir(r, "")
+}
+
+// Lee un varint: [valor, siguiente posición].
+funcion _kv_leer_varint(t, p) {
+    sea v = 0
+    sea f = 1
+    sea i = p
+    mientras (verdadero) {
+        sea b = byte_en(t, i)
+        v = v + (b % 128) * f
+        i = i + 1
+        si (b < 128) { retornar [v, i] }
+        f = f * 128
+    }
+}
+
+sea _KV_CRC = nulo
+funcion _kv_crc(t) {
+    si (_KV_CRC == nulo) {
+        sea tab = []
+        sea i = 0
+        mientras (i < 256) {
+            sea c = i
+            sea k = 0
+            mientras (k < 8) {
+                si (c % 2 == 1) { c = bits_xo(piso(c / 2), 3988292384) } sino { c = piso(c / 2) }
+                k = k + 1
+            }
+            tab.agregar(c)
+            i = i + 1
+        }
+        _KV_CRC = tab
+    }
+    sea c = 4294967295
+    sea i = 0
+    mientras (i < longitud(t)) {
+        c = bits_xo(_KV_CRC[bits_xo(c, byte_en(t, i)) % 256], piso(c / 256))
+        i = i + 1
+    }
+    retornar bits_xo(c, 4294967295)
+}
+
+funcion _kv_u32(n) { retornar bytes_entero(n, 4, 0) }
+funcion _kv_leer_u32(t, p) { retornar byte_en(t, p) * 16777216 + byte_en(t, p + 1) * 65536 + byte_en(t, p + 2) * 256 + byte_en(t, p + 3) }
+
+// Entrada: tipo (1 poner, 0 borrar), secuencia, clave, valor.
+funcion _kv_entrada(tipo_e, sec, clave, valor) {
+    sea v = valor ?? ""
+    retornar _kv_b(tipo_e) + _kv_varint(sec) + _kv_varint(longitud(clave)) + clave + _kv_varint(longitud(v)) + v
+}
+
+funcion _kv_leer_entrada(t, p) {
+    sea tipo_e = byte_en(t, p)
+    sea s = _kv_leer_varint(t, p + 1)
+    sea kl = _kv_leer_varint(t, s[1])
+    sea clave = subcadena(t, kl[1], kl[1] + kl[0])
+    sea vl = _kv_leer_varint(t, kl[1] + kl[0])
+    sea valor = subcadena(t, vl[1], vl[1] + vl[0])
+    retornar [{"tipo": tipo_e, "sec": s[0], "clave": clave, "valor": valor}, vl[1] + vl[0]]
+}
+
+// ---------- archivos ----------
+
+funcion _kv_unir(a, b) { retornar a + "/" + b }
+
+funcion _kv_leer_rango(ruta, desde, n) {
+    sea fd = open(ruta, 0, 0)
+    si (fd < 0) { lanzar "kv: no se pudo abrir " + ruta }
+    sea buf = c_reservar(n + 1)
+    sea leido = pread(fd, buf, n, desde)
+    sea r = ""
+    si (leido > 0) { r = c_bytes(buf, leido) }
+    c_liberar(buf)
+    close(fd)
+    retornar r
+}
+
+funcion _kv_tamano(ruta) {
+    si (existe_archivo(ruta) == falso) { retornar 0 }
+    retornar longitud(leer_archivo(ruta))
+}
+
+// ---------- filtro de Bloom ----------
+
+funcion _kv_hash(t, semilla) {
+    sea h = 2166136261 + semilla * 16777619
+    sea i = 0
+    mientras (i < longitud(t)) {
+        h = bits_xo(h, byte_en(t, i))
+        h = (h * 16777619) % 4294967296
+        i = i + 1
+    }
+    retornar h
+}
+
+funcion _kv_bloom_nuevo(n, bits_por_clave) {
+    sea m = maximo(64, n * bits_por_clave)
+    sea bytes_ = []
+    sea i = 0
+    mientras (i < piso((m + 7) / 8)) {
+        bytes_.agregar(0)
+        i = i + 1
+    }
+    retornar {"m": piso((m + 7) / 8) * 8, "k": maximo(1, minimo(30, redondear(bits_por_clave * 0.69))), "b": bytes_}
+}
+
+funcion _kv_bloom_poner(f, clave) {
+    sea h1 = _kv_hash(clave, 0)
+    sea h2 = _kv_hash(clave, 1)
+    sea i = 0
+    mientras (i < f["k"]) {
+        sea bit = (h1 + i * h2) % f["m"]
+        sea byte_i = piso(bit / 8)
+        sea masc = potencia(2, bit % 8)
+        si (piso(f["b"][byte_i] / masc) % 2 == 0) { f["b"][byte_i] = f["b"][byte_i] + masc }
+        i = i + 1
+    }
+}
+
+funcion _kv_bloom_quizas(bytes_, k, clave) {
+    sea m = longitud(bytes_) * 8
+    si (m == 0) { retornar verdadero }
+    sea h1 = _kv_hash(clave, 0)
+    sea h2 = _kv_hash(clave, 1)
+    sea i = 0
+    mientras (i < k) {
+        sea bit = (h1 + i * h2) % m
+        si (piso(byte_en(bytes_, piso(bit / 8)) / potencia(2, bit % 8)) % 2 == 0) { retornar falso }
+        i = i + 1
+    }
+    retornar verdadero
+}
+
+// ---------- SSTable ----------
+// Formato: bloques de entradas ordenadas | índice (clave primera de cada
+// bloque → posición, largo) | bloom | pie de 24 bytes: pos índice, largo
+// índice, pos bloom, largo bloom, k, magia "CFKV".
+
+funcion _kv_escribir_tabla(ruta, entradas, tam_bloque) {
+    sea partes = []
+    sea pos = 0
+    sea indice = []
+    sea bloque = []
+    sea bloque_tam = 0
+    sea primera = nulo
+    sea bloom = _kv_bloom_nuevo(longitud(entradas), 10)
+    para e en entradas {
+        _kv_bloom_poner(bloom, e["clave"])
+        si (primera == nulo) { primera = e["clave"] }
+        sea x = _kv_entrada(e["tipo"], e["sec"], e["clave"], e["valor"])
+        bloque.agregar(x)
+        bloque_tam = bloque_tam + longitud(x)
+        si (bloque_tam >= tam_bloque) {
+            sea d = unir(bloque, "")
+            sea b = _kv_u32(_kv_crc(d)) + d
+            partes.agregar(b)
+            indice.agregar(_kv_varint(longitud(primera)) + primera + _kv_varint(pos) + _kv_varint(longitud(b)))
+            pos = pos + longitud(b)
+            bloque = []
+            bloque_tam = 0
+            primera = nulo
+        }
+    }
+    si (longitud(bloque) > 0) {
+        sea d = unir(bloque, "")
+        sea b = _kv_u32(_kv_crc(d)) + d
+        partes.agregar(b)
+        indice.agregar(_kv_varint(longitud(primera)) + primera + _kv_varint(pos) + _kv_varint(longitud(b)))
+        pos = pos + longitud(b)
+    }
+    sea ult = ""
+    si (longitud(entradas) > 0) { ult = entradas[longitud(entradas) - 1]["clave"] }
+    sea idx = _kv_varint(longitud(indice)) + unir(indice, "") + _kv_varint(longitud(ult)) + ult
+    sea bl = []
+    para x en bloom["b"] { bl.agregar(_kv_b(x)) }
+    sea blt = unir(bl, "")
+    partes.agregar(idx)
+    partes.agregar(blt)
+    partes.agregar(_kv_u32(pos) + _kv_u32(longitud(idx)) + _kv_u32(pos + longitud(idx)) + _kv_u32(longitud(blt)) + _kv_u32(bloom["k"]) + "CFKV")
+    sea tmp = ruta + ".tmp"
+    escribir_archivo(tmp, unir(partes, ""))
+    rename(tmp, ruta)
+}
+
+funcion _kv_abrir_tabla(ruta) {
+    sea tam = _kv_tamano(ruta)
+    sea pie = _kv_leer_rango(ruta, tam - 24, 24)
+    si (subcadena(pie, 20, 24) != "CFKV") { lanzar "kv: tabla dañada " + ruta }
+    sea pi = _kv_leer_u32(pie, 0)
+    sea li = _kv_leer_u32(pie, 4)
+    sea pb = _kv_leer_u32(pie, 8)
+    sea lb = _kv_leer_u32(pie, 12)
+    sea k = _kv_leer_u32(pie, 16)
+    sea idx = _kv_leer_rango(ruta, pi, li)
+    sea n = _kv_leer_varint(idx, 0)
+    sea p = n[1]
+    sea bloques = []
+    sea i = 0
+    mientras (i < n[0]) {
+        sea kl = _kv_leer_varint(idx, p)
+        sea clave = subcadena(idx, kl[1], kl[1] + kl[0])
+        sea po = _kv_leer_varint(idx, kl[1] + kl[0])
+        sea la = _kv_leer_varint(idx, po[1])
+        bloques.agregar({"primera": clave, "pos": po[0], "largo": la[0]})
+        p = la[1]
+        i = i + 1
+    }
+    sea ul = _kv_leer_varint(idx, p)
+    retornar {"ruta": ruta, "bloques": bloques, "ultima": subcadena(idx, ul[1], ul[1] + ul[0]), "bloom": _kv_leer_rango(ruta, pb, lb), "k": k, "cache": {}}
+}
+
+funcion _kv_bloque(t, i) {
+    si (tiene_clave(t["cache"], "" + i)) { retornar t["cache"]["" + i] }
+    sea b = t["bloques"][i]
+    sea crudo = _kv_leer_rango(t["ruta"], b["pos"], b["largo"])
+    sea d = subcadena(crudo, 4, longitud(crudo))
+    si (_kv_leer_u32(crudo, 0) != _kv_crc(d)) { lanzar "kv: CRC de bloque no coincide en " + t["ruta"] }
+    sea es = []
+    sea p = 0
+    mientras (p < longitud(d)) {
+        sea x = _kv_leer_entrada(d, p)
+        es.agregar(x[0])
+        p = x[1]
+    }
+    // Caché pequeña de bloques recientes.
+    si (longitud(claves(t["cache"])) > 64) { t["cache"] = {} }
+    t["cache"]["" + i] = es
+    retornar es
+}
+
+// Versiones de una clave en la tabla (más nueva primero), hasta sec_max.
+funcion _kv_tabla_buscar(t, clave, sec_max) {
+    si (longitud(t["bloques"]) == 0) { retornar nulo }
+    si (clave < t["bloques"][0]["primera"] o clave > t["ultima"]) { retornar nulo }
+    si (_kv_bloom_quizas(t["bloom"], t["k"], clave) == falso) { retornar nulo }
+    // Búsqueda binaria del bloque.
+    sea a = 0
+    sea b = longitud(t["bloques"]) - 1
+    mientras (a < b) {
+        sea m = piso((a + b + 1) / 2)
+        si (t["bloques"][m]["primera"] <= clave) { a = m } sino { b = m - 1 }
+    }
+    // La clave puede seguir en bloques siguientes (varias versiones).
+    sea i = a
+    // Retrocede si el bloque empieza justo con la clave (versiones en el anterior).
+    mientras (i > 0 y t["bloques"][i]["primera"] == clave) { i = i - 1 }
+    mientras (i < longitud(t["bloques"])) {
+        si (t["bloques"][i]["primera"] > clave) { retornar nulo }
+        para e en _kv_bloque(t, i) { si (e["clave"] == clave y e["sec"] <= sec_max) { retornar e } }
+        i = i + 1
+    }
+    retornar nulo
+}
+
+funcion _kv_tabla_todas(t) {
+    sea r = []
+    sea i = 0
+    mientras (i < longitud(t["bloques"])) {
+        para e en _kv_bloque(t, i) { r.agregar(e) }
+        i = i + 1
+    }
+    retornar r
+}
+
+// ---------- base ----------
+
+funcion _kv_manifiesto(db) {
+    sea l = []
+    para nivel en db["niveles"] {
+        sea x = []
+        para t en nivel { x.agregar(t["nombre"]) }
+        l.agregar(unir(x, ","))
+    }
+    sea txt = "sec=" + db["sec"] + "\nsig=" + db["siguiente"] + "\n" + unir(l, "\n") + "\n"
+    escribir_archivo(_kv_unir(db["dir"], "MANIFIESTO.tmp"), txt)
+    rename(_kv_unir(db["dir"], "MANIFIESTO.tmp"), _kv_unir(db["dir"], "MANIFIESTO"))
+}
+
+/// Abre (o crea) una base en la carpeta `ruta`. opciones: "memtable_bytes"
+/// (4 MB), "bloque_bytes" (4096), "tablas_l0" (4: compacta al llegar),
+/// "factor_nivel" (10), "sincronizar" (falso: fsync en cada escritura),
+/// "combinar" (función(clave, valor_actual, operando) → nuevo valor).
+funcion kv_abrir(ruta, opciones) {
+    sea op = opciones ?? {}
+    si (existe_archivo(ruta) == falso) { mkdir(ruta, 493) }
+    sea db = {"dir": ruta, "op": op, "mem": {}, "mem_bytes": 0, "sec": 0, "siguiente": 1, "niveles": [[], [], [], [], [], [], []], "instantaneas": {}, "fd_wal": -1, "abierta": verdadero,
+        "estadisticas": {"escrituras": 0, "lecturas": 0, "vaciados": 0, "compactaciones": 0, "bloom_evito": 0}}
+    sea man = _kv_unir(ruta, "MANIFIESTO")
+    si (existe_archivo(man)) {
+        sea ls = texto_dividir(leer_archivo(man), "\n")
+        db["sec"] = a_numero(subcadena(ls[0], 4, longitud(ls[0])))
+        db["siguiente"] = a_numero(subcadena(ls[1], 4, longitud(ls[1])))
+        sea n = 0
+        mientras (n < 7 y n + 2 < longitud(ls)) {
+            para nombre en texto_dividir(ls[n + 2], ",") {
+                si (nombre != "") {
+                    sea t = _kv_abrir_tabla(_kv_unir(ruta, nombre))
+                    t["nombre"] = nombre
+                    db["niveles"][n].agregar(t)
+                }
+            }
+            n = n + 1
+        }
+    }
+    // Reproduce el WAL.
+    sea wal = _kv_unir(ruta, "wal.log")
+    si (existe_archivo(wal)) {
+        sea d = leer_archivo(wal)
+        sea p = 0
+        mientras (p + 8 <= longitud(d)) {
+            sea largo = _kv_leer_u32(d, p)
+            sea crc = _kv_leer_u32(d, p + 4)
+            si (p + 8 + largo > longitud(d)) { romper }
+            sea reg = subcadena(d, p + 8, p + 8 + largo)
+            // Un registro incompleto o dañado al final es una escritura cortada: se ignora.
+            si (_kv_crc(reg) != crc) { romper }
+            sea q = 0
+            mientras (q < longitud(reg)) {
+                sea x = _kv_leer_entrada(reg, q)
+                _kv_mem_poner(db, x[0])
+                si (x[0]["sec"] > db["sec"]) { db["sec"] = x[0]["sec"] }
+                q = x[1]
+            }
+            p = p + 8 + largo
+        }
+    }
+    db["fd_wal"] = open(wal, _kv_banderas_anexar(), 420)
+    retornar db
+}
+
+funcion _kv_mem_poner(db, e) {
+    sea l = db["mem"][e["clave"]] ?? nulo
+    si (l == nulo) {
+        l = []
+        db["mem"][e["clave"]] = l
+    }
+    // Más nueva primero.
+    sea nl = [e]
+    para x en l { nl.agregar(x) }
+    db["mem"][e["clave"]] = nl
+    db["mem_bytes"] = db["mem_bytes"] + longitud(e["clave"]) + longitud(e["valor"] ?? "") + 16
+}
+
+/// Aplica un lote atómico: lista de ["poner", clave, valor] |
+/// ["borrar", clave] | ["combinar", clave, operando].
+funcion kv_lote(db, ops) {
+    si (db["abierta"] == falso) { lanzar "kv: base cerrada" }
+    sea es = []
+    para o en ops {
+        db["sec"] = db["sec"] + 1
+        sea c = "" + o[1]
+        si (o[0] == "poner") { es.agregar({"tipo": 1, "sec": db["sec"], "clave": c, "valor": "" + o[2]}) }
+        sino si (o[0] == "borrar") { es.agregar({"tipo": 0, "sec": db["sec"], "clave": c, "valor": ""}) }
+        sino si (o[0] == "combinar") {
+            sea fn = db["op"]["combinar"] ?? nulo
+            si (fn == nulo) { lanzar "kv: falta la opción combinar" }
+            // Lee el valor visible (incluye las entradas previas del mismo lote).
+            sea actual = kv_obtener(db, c)
+            para x en es { si (x["clave"] == c) { si (x["tipo"] == 1) { actual = x["valor"] } sino { actual = nulo } } }
+            es.agregar({"tipo": 1, "sec": db["sec"], "clave": c, "valor": "" + fn(c, actual, o[2])})
+        } sino { lanzar "kv: operación desconocida " + o[0] }
+    }
+    sea partes = []
+    para e en es { partes.agregar(_kv_entrada(e["tipo"], e["sec"], e["clave"], e["valor"])) }
+    sea reg = unir(partes, "")
+    sea marco = _kv_u32(longitud(reg)) + _kv_u32(_kv_crc(reg)) + reg
+    write(db["fd_wal"], marco, longitud(marco))
+    si (db["op"]["sincronizar"] ?? falso) { fsync(db["fd_wal"]) }
+    para e en es { _kv_mem_poner(db, e) }
+    db["estadisticas"]["escrituras"] = db["estadisticas"]["escrituras"] + longitud(es)
+    si (db["mem_bytes"] >= (db["op"]["memtable_bytes"] ?? 4194304)) { kv_vaciar(db) }
+}
+
+funcion kv_poner(db, clave, valor) { kv_lote(db, [["poner", clave, valor]]) }
+funcion kv_borrar(db, clave) { kv_lote(db, [["borrar", clave]]) }
+funcion kv_combinar(db, clave, operando) { kv_lote(db, [["combinar", clave, operando]]) }
+
+funcion _kv_buscar(db, clave, sec_max) {
+    sea l = db["mem"][clave] ?? nulo
+    si (l != nulo) { para e en l { si (e["sec"] <= sec_max) { retornar e } } }
+    // L0: de la más nueva a la más vieja; los demás niveles no se solapan.
+    sea n = 0
+    mientras (n < longitud(db["niveles"])) {
+        sea nivel = db["niveles"][n]
+        sea mejor = nulo
+        sea i = longitud(nivel) - 1
+        mientras (i >= 0) {
+            sea e = _kv_tabla_buscar(nivel[i], clave, sec_max)
+            si (e != nulo y (mejor == nulo o e["sec"] > mejor["sec"])) { mejor = e }
+            i = i - 1
+        }
+        si (mejor != nulo) { retornar mejor }
+        n = n + 1
+    }
+    retornar nulo
+}
+
+/// Valor de una clave o nulo. instantanea: de kv_instantanea.
+funcion kv_obtener(db, clave, instantanea) {
+    db["estadisticas"]["lecturas"] = db["estadisticas"]["lecturas"] + 1
+    sea sec_max = db["sec"]
+    si (instantanea != nulo) { sec_max = instantanea["sec"] }
+    sea e = _kv_buscar(db, "" + clave, sec_max)
+    si (e == nulo o e["tipo"] == 0) { retornar nulo }
+    retornar e["valor"]
+}
+
+funcion kv_existe(db, clave) { retornar kv_obtener(db, clave, nulo) != nulo }
+
+/// Instantánea: lecturas consistentes aunque sigan las escrituras.
+funcion kv_instantanea(db) {
+    sea s = {"sec": db["sec"], "id": "" + db["sec"] + "-" + longitud(claves(db["instantaneas"]))}
+    db["instantaneas"][s["id"]] = s["sec"]
+    retornar s
+}
+
+funcion kv_soltar(db, s) { quitar_clave(db["instantaneas"], s["id"]) }
+
+funcion _kv_min_instantanea(db) {
+    sea m = db["sec"]
+    para k en claves(db["instantaneas"]) { si (db["instantaneas"][k] < m) { m = db["instantaneas"][k] } }
+    retornar m
+}
+
+// Ordena entradas por (clave asc, sec desc).
+funcion _kv_ordenar(es) {
+    retornar ordenar(es, funcion(a, b) {
+        si (a["clave"] < b["clave"]) { retornar -1 }
+        si (a["clave"] > b["clave"]) { retornar 1 }
+        retornar b["sec"] - a["sec"]
+    })
+}
+
+// Quita versiones viejas que ninguna instantánea necesita y, si es el
+// último nivel, los borrados.
+funcion _kv_podar(db, es, fondo) {
+    sea min_s = _kv_min_instantanea(db)
+    sea r = []
+    sea i = 0
+    mientras (i < longitud(es)) {
+        sea clave = es[i]["clave"]
+        sea visto_viejo = falso
+        mientras (i < longitud(es) y es[i]["clave"] == clave) {
+            sea e = es[i]
+            si (e["sec"] > min_s) { r.agregar(e) } sino si (visto_viejo == falso) {
+                visto_viejo = verdadero
+                si ((e["tipo"] == 0 y fondo) == falso) { r.agregar(e) }
+            }
+            i = i + 1
+        }
+    }
+    retornar r
+}
+
+funcion _kv_nueva_tabla(db, es, nivel) {
+    sea nombre = "t" + db["siguiente"] + ".sst"
+    db["siguiente"] = db["siguiente"] + 1
+    sea ruta = _kv_unir(db["dir"], nombre)
+    _kv_escribir_tabla(ruta, es, db["op"]["bloque_bytes"] ?? 4096)
+    sea t = _kv_abrir_tabla(ruta)
+    t["nombre"] = nombre
+    db["niveles"][nivel].agregar(t)
+}
+
+/// Pasa la memtable a una tabla de nivel 0 y vacía el WAL.
+funcion kv_vaciar(db) {
+    si (longitud(claves(db["mem"])) == 0) { retornar nulo }
+    sea es = []
+    para k en claves(db["mem"]) { para e en db["mem"][k] { es.agregar(e) } }
+    es = _kv_podar(db, _kv_ordenar(es), falso)
+    _kv_nueva_tabla(db, es, 0)
+    _kv_manifiesto(db)
+    db["mem"] = {}
+    db["mem_bytes"] = 0
+    close(db["fd_wal"])
+    unlink(_kv_unir(db["dir"], "wal.log"))
+    db["fd_wal"] = open(_kv_unir(db["dir"], "wal.log"), _kv_banderas_anexar(), 420)
+    db["estadisticas"]["vaciados"] = db["estadisticas"]["vaciados"] + 1
+    si (longitud(db["niveles"][0]) >= (db["op"]["tablas_l0"] ?? 4)) { kv_compactar(db, 0) }
+}
+
+funcion _kv_bytes_nivel(nivel) {
+    sea s = 0
+    para t en nivel { s = s + _kv_tamano(t["ruta"]) }
+    retornar s
+}
+
+/// Compacta el nivel n con el n+1 (todo junto si n es nulo).
+funcion kv_compactar(db, n) {
+    si (n == nulo) {
+        kv_vaciar(db)
+        sea k = 0
+        mientras (k < longitud(db["niveles"]) - 1) {
+            si (longitud(db["niveles"][k]) > 0) { kv_compactar(db, k) }
+            k = k + 1
+        }
+        retornar nulo
+    }
+    sea destino = minimo(n + 1, longitud(db["niveles"]) - 1)
+    sea fuentes = []
+    para t en db["niveles"][n] { fuentes.agregar(t) }
+    si (destino != n) { para t en db["niveles"][destino] { fuentes.agregar(t) } }
+    sea es = []
+    para t en fuentes { para e en _kv_tabla_todas(t) { es.agregar(e) } }
+    // ¿Hay niveles más profundos con datos? Si no, se pueden tirar los borrados.
+    sea fondo = verdadero
+    sea k = destino + 1
+    mientras (k < longitud(db["niveles"])) {
+        si (longitud(db["niveles"][k]) > 0) { fondo = falso }
+        k = k + 1
+    }
+    es = _kv_podar(db, _kv_ordenar(es), fondo)
+    db["niveles"][n] = []
+    db["niveles"][destino] = []
+    // Divide en tablas de hasta ~2 MB sin partir una clave.
+    sea lim = db["op"]["tabla_bytes"] ?? 2097152
+    sea actual = []
+    sea tam = 0
+    sea i = 0
+    mientras (i < longitud(es)) {
+        actual.agregar(es[i])
+        tam = tam + longitud(es[i]["clave"]) + longitud(es[i]["valor"]) + 8
+        si (tam >= lim y (i + 1 == longitud(es) o es[i + 1]["clave"] != es[i]["clave"])) {
+            _kv_nueva_tabla(db, actual, destino)
+            actual = []
+            tam = 0
+        }
+        i = i + 1
+    }
+    si (longitud(actual) > 0) { _kv_nueva_tabla(db, actual, destino) }
+    _kv_manifiesto(db)
+    para t en fuentes { unlink(t["ruta"]) }
+    db["estadisticas"]["compactaciones"] = db["estadisticas"]["compactaciones"] + 1
+    // Si el nivel destino creció demasiado, baja otra vez.
+    sea limite = 10485760 * potencia(db["op"]["factor_nivel"] ?? 10, destino - 1)
+    si (destino < longitud(db["niveles"]) - 1 y _kv_bytes_nivel(db["niveles"][destino]) > limite) { kv_compactar(db, destino) }
+}
+
+/// Pares [clave, valor] ordenados. opciones: "desde" (incluido), "hasta"
+/// (excluido), "prefijo", "limite", "inverso", "instantanea".
+funcion kv_rango(db, opciones) {
+    sea op = opciones ?? {}
+    sea sec_max = db["sec"]
+    si ((op["instantanea"] ?? nulo) != nulo) { sec_max = op["instantanea"]["sec"] }
+    sea desde = op["desde"] ?? nulo
+    sea hasta = op["hasta"] ?? nulo
+    sea pre = op["prefijo"] ?? nulo
+    sea dentro = funcion(c) {
+        si (desde != nulo y c < desde) { retornar falso }
+        si (hasta != nulo y c >= hasta) { retornar falso }
+        si (pre != nulo y texto_empieza_con(c, pre) == falso) { retornar falso }
+        retornar verdadero
+    }
+    sea mejor = {}
+    sea ver = funcion(e) {
+        si (e["sec"] <= sec_max y dentro(e["clave"])) {
+            sea m = mejor[e["clave"]] ?? nulo
+            si (m == nulo o e["sec"] > m["sec"]) { mejor[e["clave"]] = e }
+        }
+    }
+    para k en claves(db["mem"]) { para e en db["mem"][k] { ver(e) } }
+    para nivel en db["niveles"] {
+        para t en nivel {
+            // Salta tablas fuera del rango.
+            sea usar = verdadero
+            si (longitud(t["bloques"]) == 0) { usar = falso }
+            sino {
+                si (hasta != nulo y t["bloques"][0]["primera"] >= hasta) { usar = falso }
+                si (desde != nulo y t["ultima"] < desde) { usar = falso }
+            }
+            si (usar) {
+                sea i = 0
+                mientras (i < longitud(t["bloques"])) {
+                    sea sig = nulo
+                    si (i + 1 < longitud(t["bloques"])) { sig = t["bloques"][i + 1]["primera"] }
+                    sea saltar = (desde != nulo y sig != nulo y sig < desde) o (hasta != nulo y t["bloques"][i]["primera"] >= hasta)
+                    si (pre != nulo y sig != nulo y sig < pre) { saltar = verdadero }
+                    si (saltar == falso) { para e en _kv_bloque(t, i) { ver(e) } }
+                    i = i + 1
+                }
+            }
+        }
+    }
+    sea ks = ordenar(claves(mejor))
+    si (op["inverso"] ?? falso) { ks = lista_invertir(ks) }
+    sea r = []
+    para k en ks {
+        si (mejor[k]["tipo"] == 1) {
+            r.agregar([k, mejor[k]["valor"]])
+            si ((op["limite"] ?? nulo) != nulo y longitud(r) >= op["limite"]) { retornar r }
+        }
+    }
+    retornar r
+}
+
+/// Cantidad de claves vivas (recorre todo).
+funcion kv_contar(db, opciones) { retornar longitud(kv_rango(db, opciones)) }
+
+/// Estadísticas y archivos por nivel.
+funcion kv_estado(db) {
+    sea niveles = []
+    para n en db["niveles"] { niveles.agregar(longitud(n)) }
+    retornar {"secuencia": db["sec"], "memtable_claves": longitud(claves(db["mem"])), "tablas_por_nivel": niveles, "estadisticas": db["estadisticas"]}
+}
+
+/// Cierra: vacía la memtable a disco y cierra el WAL.
+funcion kv_cerrar(db) {
+    si (db["abierta"]) {
+        kv_vaciar(db)
+        close(db["fd_wal"])
+        db["abierta"] = falso
+    }
+}
+
+/// Cierra sin vaciar (simula una caída, para pruebas).
+funcion kv_soltar_sin_vaciar(db) {
+    close(db["fd_wal"])
+    db["abierta"] = falso
+}
+
+/// Borra la base entera (todos sus archivos).
+funcion kv_destruir(ruta) {
+    si (existe_archivo(ruta) == falso) { retornar nulo }
+    para n en listar_carpeta(ruta) { unlink(_kv_unir(ruta, n)) }
+    rmdir(ruta)
+}

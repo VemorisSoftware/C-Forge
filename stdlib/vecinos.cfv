@@ -1,0 +1,505 @@
+// stdlib/vecinos.cfv — descubrimiento de servicios en la red local con
+// mDNS y DNS-SD al estilo Zeroconf/Bonjour/Avahi: codifica y decodifica
+// mensajes DNS (compresión de nombres, A, AAAA, PTR, SRV, TXT, bit de
+// caché y de respuesta unicast), arma anuncios y respuestas de servicios
+// ("_http._tcp.local."), responde preguntas sobre servicios propios y
+// busca servicios con consultas unicast heredadas a 224.0.0.251:5353 (no
+// hace falta unirse al grupo multicast para preguntar). Idea de
+// python-zeroconf (LGPL; solo la idea) y del RFC 6762/6763. En inglés:
+// importar "zeroconf".
+//
+//   importar "vecinos"
+//   para s en vecinos_buscar("_http._tcp.local.", 1500) { mostrar(s["nombre"] + " " + s["direcciones"][0] + ":" + s["puerto"]) }
+
+sea _VC_TIPOS = {"1": "A", "2": "NS", "5": "CNAME", "12": "PTR", "13": "HINFO", "16": "TXT", "28": "AAAA", "33": "SRV", "47": "NSEC", "255": "ANY"}
+sea _VC_NUM = {"A": 1, "NS": 2, "CNAME": 5, "PTR": 12, "HINFO": 13, "TXT": 16, "AAAA": 28, "SRV": 33, "NSEC": 47, "ANY": 255}
+
+funcion _vc_b(n) { retornar bytes_entero(n, 1, 0) }
+funcion _vc_u16(n) { retornar bytes_entero(n, 2, 0) }
+funcion _vc_u32(n) { retornar bytes_entero(n, 4, 0) }
+funcion _vc_l16(t, p) { retornar byte_en(t, p) * 256 + byte_en(t, p + 1) }
+funcion _vc_l32(t, p) { retornar _vc_l16(t, p) * 65536 + _vc_l16(t, p + 2) }
+
+funcion _vc_normal(n) {
+    si (texto_termina_con(n, ".")) { retornar n }
+    retornar n + "."
+}
+
+// Divide un nombre en etiquetas, respetando "\." escapado.
+funcion _vc_etiquetas(nombre) {
+    sea r = []
+    sea actual = ""
+    sea i = 0
+    sea n = _vc_normal(nombre)
+    mientras (i < longitud(n)) {
+        sea c = subcadena(n, i, i + 1)
+        si (c == "\\" y i + 1 < longitud(n)) {
+            actual = actual + subcadena(n, i + 1, i + 2)
+            i = i + 2
+        } sino si (c == ".") {
+            si (actual != "") { r.agregar(actual) }
+            actual = ""
+            i = i + 1
+        } sino {
+            actual = actual + c
+            i = i + 1
+        }
+    }
+    si (actual != "") { r.agregar(actual) }
+    retornar r
+}
+
+funcion _vc_escapar(e) { retornar texto_reemplazar(texto_reemplazar(e, "\\", "\\\\"), ".", "\\.") }
+
+// Codifica un nombre con compresión (tabla: sufijo en minúsculas → posición).
+funcion _vc_nombre(nombre, pos, tabla) {
+    sea et = _vc_etiquetas(nombre)
+    sea r = []
+    sea p = pos
+    sea i = 0
+    mientras (i < longitud(et)) {
+        sea suf = []
+        sea j = i
+        mientras (j < longitud(et)) {
+            suf.agregar(_vc_escapar(et[j]))
+            j = j + 1
+        }
+        sea clave = texto_minusculas(unir(suf, "."))
+        si (tiene_clave(tabla, clave)) {
+            r.agregar(_vc_u16(49152 + tabla[clave]))
+            retornar unir(r, "")
+        }
+        si (p < 16384) { tabla[clave] = p }
+        sea e = et[i]
+        si (longitud(e) > 63) { lanzar "dns: etiqueta de más de 63 bytes" }
+        r.agregar(_vc_b(longitud(e)) + e)
+        p = p + 1 + longitud(e)
+        i = i + 1
+    }
+    r.agregar(_vc_b(0))
+    retornar unir(r, "")
+}
+
+// Lee un nombre: [nombre, siguiente posición].
+funcion _vc_leer_nombre(t, p) {
+    sea et = []
+    sea i = p
+    sea fin = -1
+    sea saltos = 0
+    mientras (verdadero) {
+        si (i >= longitud(t)) { lanzar "dns: nombre truncado" }
+        sea l = byte_en(t, i)
+        si (l == 0) {
+            si (fin < 0) { fin = i + 1 }
+            romper
+        }
+        si (l >= 192) {
+            si (fin < 0) { fin = i + 2 }
+            i = (l - 192) * 256 + byte_en(t, i + 1)
+            saltos = saltos + 1
+            si (saltos > 64) { lanzar "dns: bucle de compresión" }
+        } sino {
+            et.agregar(_vc_escapar(subcadena(t, i + 1, i + 1 + l)))
+            i = i + 1 + l
+        }
+    }
+    retornar [unir(et, ".") + ".", fin]
+}
+
+funcion _vc_ip4(ip) {
+    sea r = []
+    para x en texto_dividir(ip, ".") { r.agregar(_vc_b(a_numero(x))) }
+    retornar unir(r, "")
+}
+
+funcion _vc_ip6(ip) {
+    sea partes = texto_dividir(ip, "::")
+    sea izq = []
+    sea der = []
+    si (partes[0] != "") { izq = texto_dividir(partes[0], ":") }
+    si (longitud(partes) > 1 y partes[1] != "") { der = texto_dividir(partes[1], ":") }
+    sea grupos = []
+    para g en izq { grupos.agregar(g) }
+    sea k = 0
+    mientras (k < 8 - longitud(izq) - longitud(der)) {
+        grupos.agregar("0")
+        k = k + 1
+    }
+    para g en der { grupos.agregar(g) }
+    sea r = []
+    para g en grupos {
+        sea v = 0
+        sea i = 0
+        mientras (i < longitud(g)) {
+            v = v * 16 + texto_indice("0123456789abcdef", texto_minusculas(subcadena(g, i, i + 1)))
+            i = i + 1
+        }
+        r.agregar(_vc_u16(v))
+    }
+    retornar unir(r, "")
+}
+
+funcion _vc_hex4(v) {
+    sea h = "0123456789abcdef"
+    sea r = ""
+    sea x = v
+    si (x == 0) { retornar "0" }
+    mientras (x > 0) {
+        r = subcadena(h, x % 16, x % 16 + 1) + r
+        x = piso(x / 16)
+    }
+    retornar r
+}
+
+funcion _vc_leer_ip6(t, p) {
+    sea g = []
+    sea i = 0
+    mientras (i < 8) {
+        g.agregar(_vc_l16(t, p + i * 2))
+        i = i + 1
+    }
+    // Comprime la racha de ceros más larga.
+    sea mejor = -1
+    sea largo_mejor = 1
+    i = 0
+    mientras (i < 8) {
+        si (g[i] == 0) {
+            sea j = i
+            mientras (j < 8 y g[j] == 0) { j = j + 1 }
+            si (j - i > largo_mejor) {
+                mejor = i
+                largo_mejor = j - i
+            }
+            i = j
+        } sino { i = i + 1 }
+    }
+    sea r = []
+    i = 0
+    mientras (i < 8) {
+        si (i == mejor) {
+            si (i == 0) { r.agregar("") }
+            r.agregar("")
+            i = i + largo_mejor
+            si (i == 8) { r.agregar("") }
+        } sino {
+            r.agregar(_vc_hex4(g[i]))
+            i = i + 1
+        }
+    }
+    retornar unir(r, ":")
+}
+
+/// Codifica TXT: mapa {clave: valor} o lista de textos.
+funcion vecinos_txt(datos) {
+    sea r = []
+    si (tipo(datos) == "lista") { para x en datos { r.agregar(_vc_b(longitud(x)) + x) } } sino {
+        para k en ordenar(claves(datos ?? {})) {
+            sea v = datos[k]
+            sea e = k
+            si (v != verdadero) { e = k + "=" + v }
+            r.agregar(_vc_b(longitud(e)) + e)
+        }
+    }
+    si (longitud(r) == 0) { retornar _vc_b(0) }
+    retornar unir(r, "")
+}
+
+funcion _vc_leer_txt(t, p, n) {
+    sea r = {}
+    sea i = p
+    mientras (i < p + n) {
+        sea l = byte_en(t, i)
+        sea e = subcadena(t, i + 1, i + 1 + l)
+        si (e != "") {
+            sea k = texto_indice(e, "=")
+            si (k < 0) { r[e] = verdadero } sino { r[subcadena(e, 0, k)] = subcadena(e, k + 1, longitud(e)) }
+        }
+        i = i + 1 + l
+    }
+    retornar r
+}
+
+// Codifica un registro.
+funcion _vc_registro(r, pos, tabla) {
+    sea t = r["tipo"]
+    sea num = _VC_NUM[t] ?? r["tipo_num"]
+    sea clase = r["clase"] ?? 1
+    si (r["flush"] ?? falso) { clase = clase + 32768 }
+    sea cab = _vc_nombre(r["nombre"], pos, tabla)
+    sea inicio_datos = pos + longitud(cab) + 10
+    sea datos = ""
+    si (t == "A") { datos = _vc_ip4(r["datos"]) }
+    sino si (t == "AAAA") { datos = _vc_ip6(r["datos"]) }
+    sino si (t == "PTR" o t == "CNAME" o t == "NS") { datos = _vc_nombre(r["datos"], inicio_datos, tabla) }
+    sino si (t == "SRV") {
+        sea d = r["datos"]
+        // El objetivo de SRV no se comprime al escribir (RFC 2782), pero mDNS lo permite; se comprime.
+        datos = _vc_u16(d["prioridad"] ?? 0) + _vc_u16(d["peso"] ?? 0) + _vc_u16(d["puerto"]) + _vc_nombre(d["objetivo"], inicio_datos + 6, tabla)
+    } sino si (t == "TXT") { datos = vecinos_txt(r["datos"]) }
+    sino si (t == "HINFO") { datos = _vc_b(longitud(r["datos"][0])) + r["datos"][0] + _vc_b(longitud(r["datos"][1])) + r["datos"][1] }
+    sino { datos = "" + (r["crudo"] ?? "") }
+    retornar cab + _vc_u16(num) + _vc_u16(clase) + _vc_u32(r["ttl"] ?? 120) + _vc_u16(longitud(datos)) + datos
+}
+
+/// Codifica un mensaje DNS. m: {"id", "respuesta", "autoritativa",
+/// "preguntas": [{"nombre", "tipo", "unicast"}], "respuestas",
+/// "autoridad", "adicionales": [{"nombre", "tipo", "ttl", "flush", "datos"}]}.
+funcion vecinos_codificar(m) {
+    sea banderas = 0
+    si (m["respuesta"] ?? falso) { banderas = banderas + 32768 }
+    si (m["autoritativa"] ?? (m["respuesta"] ?? falso)) { banderas = banderas + 1024 }
+    si (m["recursion"] ?? falso) { banderas = banderas + 256 }
+    sea qs = m["preguntas"] ?? []
+    sea an = m["respuestas"] ?? []
+    sea ns = m["autoridad"] ?? []
+    sea ad = m["adicionales"] ?? []
+    sea partes = [_vc_u16(m["id"] ?? 0) + _vc_u16(banderas) + _vc_u16(longitud(qs)) + _vc_u16(longitud(an)) + _vc_u16(longitud(ns)) + _vc_u16(longitud(ad))]
+    sea pos = 12
+    sea tabla = {}
+    para q en qs {
+        sea clase = q["clase"] ?? 1
+        si (q["unicast"] ?? falso) { clase = clase + 32768 }
+        sea x = _vc_nombre(q["nombre"], pos, tabla) + _vc_u16(_VC_NUM[q["tipo"] ?? "ANY"]) + _vc_u16(clase)
+        partes.agregar(x)
+        pos = pos + longitud(x)
+    }
+    para lista en [an, ns, ad] {
+        para r en lista {
+            sea x = _vc_registro(r, pos, tabla)
+            partes.agregar(x)
+            pos = pos + longitud(x)
+        }
+    }
+    retornar unir(partes, "")
+}
+
+/// Decodifica un mensaje DNS.
+funcion vecinos_decodificar(t) {
+    si (longitud(t) < 12) { lanzar "dns: mensaje corto" }
+    sea fl = _vc_l16(t, 2)
+    sea m = {"id": _vc_l16(t, 0), "respuesta": fl >= 32768, "autoritativa": piso(fl / 1024) % 2 == 1, "codigo": fl % 16, "preguntas": [], "respuestas": [], "autoridad": [], "adicionales": []}
+    sea nq = _vc_l16(t, 4)
+    sea cuentas = [_vc_l16(t, 6), _vc_l16(t, 8), _vc_l16(t, 10)]
+    sea p = 12
+    sea i = 0
+    mientras (i < nq) {
+        sea n = _vc_leer_nombre(t, p)
+        sea tp = _vc_l16(t, n[1])
+        sea cl = _vc_l16(t, n[1] + 2)
+        m["preguntas"].agregar({"nombre": n[0], "tipo": _VC_TIPOS["" + tp] ?? ("" + tp), "unicast": cl >= 32768, "clase": cl % 32768})
+        p = n[1] + 4
+        i = i + 1
+    }
+    sea secciones = ["respuestas", "autoridad", "adicionales"]
+    sea s = 0
+    mientras (s < 3) {
+        i = 0
+        mientras (i < cuentas[s]) {
+            sea n = _vc_leer_nombre(t, p)
+            sea q = n[1]
+            sea tp = _vc_l16(t, q)
+            sea cl = _vc_l16(t, q + 2)
+            sea ttl = _vc_l32(t, q + 4)
+            sea largo = _vc_l16(t, q + 8)
+            sea d0 = q + 10
+            sea tn = _VC_TIPOS["" + tp] ?? ("" + tp)
+            sea datos = nulo
+            si (tn == "A") { datos = "" + byte_en(t, d0) + "." + byte_en(t, d0 + 1) + "." + byte_en(t, d0 + 2) + "." + byte_en(t, d0 + 3) }
+            sino si (tn == "AAAA") { datos = _vc_leer_ip6(t, d0) }
+            sino si (tn == "PTR" o tn == "CNAME" o tn == "NS") { datos = _vc_leer_nombre(t, d0)[0] }
+            sino si (tn == "SRV") { datos = {"prioridad": _vc_l16(t, d0), "peso": _vc_l16(t, d0 + 2), "puerto": _vc_l16(t, d0 + 4), "objetivo": _vc_leer_nombre(t, d0 + 6)[0]} }
+            sino si (tn == "TXT") { datos = _vc_leer_txt(t, d0, largo) }
+            sino { datos = subcadena(t, d0, d0 + largo) }
+            m[secciones[s]].agregar({"nombre": n[0], "tipo": tn, "clase": cl % 32768, "flush": cl >= 32768, "ttl": ttl, "datos": datos})
+            p = d0 + largo
+            i = i + 1
+        }
+        s = s + 1
+    }
+    retornar m
+}
+
+// ---------- servicios ----------
+
+/// Define un servicio. s: {"instancia" ("Mi impresora"), "tipo"
+/// ("_ipp._tcp"), "dominio" ("local"), "puerto", "equipo" ("mipc.local."),
+/// "direcciones" (["192.168.1.5", "fe80::1"]), "txt" ({"ruta": "/"}),
+/// "ttl" (120; 4500 para PTR)}.
+funcion vecinos_servicio(s) {
+    sea dom = s["dominio"] ?? "local"
+    sea tipo_s = _vc_normal(s["tipo"] + "." + dom)
+    sea completo = _vc_escapar(s["instancia"]) + "." + tipo_s
+    retornar {"instancia": s["instancia"], "tipo": tipo_s, "nombre": completo, "puerto": s["puerto"], "equipo": _vc_normal(s["equipo"] ?? ("cforge." + dom)),
+        "direcciones": s["direcciones"] ?? [], "txt": s["txt"] ?? {}, "ttl": s["ttl"] ?? 120, "subtipos": s["subtipos"] ?? []}
+}
+
+funcion _vc_reg_servicio(sv, cuales, ttl_cero) {
+    sea t = funcion(x) {
+        si (ttl_cero) { retornar 0 }
+        retornar x
+    }
+    sea r = {}
+    r["PTR"] = {"nombre": sv["tipo"], "tipo": "PTR", "ttl": t(4500), "datos": sv["nombre"]}
+    r["SRV"] = {"nombre": sv["nombre"], "tipo": "SRV", "ttl": t(sv["ttl"]), "flush": verdadero, "datos": {"prioridad": 0, "peso": 0, "puerto": sv["puerto"], "objetivo": sv["equipo"]}}
+    r["TXT"] = {"nombre": sv["nombre"], "tipo": "TXT", "ttl": t(4500), "flush": verdadero, "datos": sv["txt"]}
+    sea dirs = []
+    para ip en sv["direcciones"] {
+        si (texto_indice(ip, ":") >= 0) { dirs.agregar({"nombre": sv["equipo"], "tipo": "AAAA", "ttl": t(sv["ttl"]), "flush": verdadero, "datos": ip}) } sino { dirs.agregar({"nombre": sv["equipo"], "tipo": "A", "ttl": t(sv["ttl"]), "flush": verdadero, "datos": ip}) }
+    }
+    r["dirs"] = dirs
+    sea partes = texto_dividir(sv["tipo"], ".")
+    r["enum"] = {"nombre": "_services._dns-sd._udp." + partes[longitud(partes) - 2] + ".", "tipo": "PTR", "ttl": t(4500), "datos": sv["tipo"]}
+    retornar r
+}
+
+/// Anuncio (respuesta no solicitada) de un servicio. ttl_cero: para
+/// despedirse ("goodbye").
+funcion vecinos_anuncio(servicio, ttl_cero) {
+    sea r = _vc_reg_servicio(servicio, nulo, ttl_cero ?? falso)
+    sea an = [r["PTR"], r["SRV"], r["TXT"]]
+    para d en r["dirs"] { an.agregar(d) }
+    retornar vecinos_codificar({"id": 0, "respuesta": verdadero, "respuestas": an})
+}
+
+/// Responde un paquete de preguntas con los servicios propios. Devuelve
+/// bytes o nulo si no hay nada que contestar. Mantiene el id de la
+/// consulta si es unicast heredada.
+funcion vecinos_responder(servicios, paquete) {
+    sea q = nulo
+    intentar { q = vecinos_decodificar(paquete) } capturar (e) { retornar nulo }
+    si (q["respuesta"]) { retornar nulo }
+    sea an = []
+    sea ad = []
+    sea vistos = {}
+    sea poner = funcion(lista, r) {
+        sea k = r["nombre"] + "|" + r["tipo"] + "|" + ("" + r["datos"])
+        si (tiene_clave(vistos, k) == falso) {
+            vistos[k] = verdadero
+            lista.agregar(r)
+        }
+    }
+    para p en q["preguntas"] {
+        sea n = texto_minusculas(p["nombre"])
+        para sv en servicios {
+            sea r = _vc_reg_servicio(sv, nulo, falso)
+            sea cualquiera = p["tipo"] == "ANY"
+            si (n == texto_minusculas(r["enum"]["nombre"]) y (p["tipo"] == "PTR" o cualquiera)) { poner(an, r["enum"]) }
+            si (n == texto_minusculas(sv["tipo"]) y (p["tipo"] == "PTR" o cualquiera)) {
+                poner(an, r["PTR"])
+                poner(ad, r["SRV"])
+                poner(ad, r["TXT"])
+                para d en r["dirs"] { poner(ad, d) }
+            }
+            si (n == texto_minusculas(sv["nombre"])) {
+                si (p["tipo"] == "SRV" o cualquiera) {
+                    poner(an, r["SRV"])
+                    para d en r["dirs"] { poner(ad, d) }
+                }
+                si (p["tipo"] == "TXT" o cualquiera) { poner(an, r["TXT"]) }
+            }
+            si (n == texto_minusculas(sv["equipo"])) { para d en r["dirs"] { si (cualquiera o p["tipo"] == d["tipo"]) { poner(an, d) } } }
+        }
+    }
+    si (longitud(an) == 0) { retornar nulo }
+    retornar vecinos_codificar({"id": q["id"], "respuesta": verdadero, "respuestas": an, "adicionales": ad})
+}
+
+/// Pregunta mDNS.
+funcion vecinos_pregunta(nombre, tipo_r, id) { retornar vecinos_codificar({"id": id ?? 0, "preguntas": [{"nombre": nombre, "tipo": tipo_r ?? "PTR"}]}) }
+
+/// Reúne servicios de una lista de mensajes decodificados: [{"nombre",
+/// "instancia", "tipo", "equipo", "puerto", "direcciones", "txt"}].
+funcion vecinos_reunir(mensajes, tipo_s) {
+    sea ptr = {}
+    sea srv = {}
+    sea txt = {}
+    sea dirs = {}
+    para m en mensajes {
+        sea todos = []
+        para r en m["respuestas"] { todos.agregar(r) }
+        para r en m["adicionales"] { todos.agregar(r) }
+        para r en todos {
+            sea n = texto_minusculas(r["nombre"])
+            si (r["tipo"] == "PTR" y (tipo_s == nulo o n == texto_minusculas(_vc_normal(tipo_s)))) { si (r["ttl"] > 0) { ptr[r["datos"]] = r["nombre"] } sino { quitar_clave(ptr, r["datos"]) } }
+            si (r["tipo"] == "SRV") { srv[n] = r["datos"] }
+            si (r["tipo"] == "TXT") { txt[n] = r["datos"] }
+            si (r["tipo"] == "A" o r["tipo"] == "AAAA") {
+                si (tiene_clave(dirs, n) == falso) { dirs[n] = [] }
+                si (lista_contiene(dirs[n], r["datos"]) == falso) { dirs[n].agregar(r["datos"]) }
+            }
+        }
+    }
+    sea r = []
+    para nombre en ordenar(claves(ptr)) {
+        sea k = texto_minusculas(nombre)
+        sea s = srv[k] ?? nulo
+        sea inst = _vc_leer_instancia(nombre, ptr[nombre])
+        sea x = {"nombre": nombre, "instancia": inst, "tipo": ptr[nombre], "equipo": nulo, "puerto": nulo, "direcciones": [], "txt": txt[k] ?? {}}
+        si (s != nulo) {
+            x["equipo"] = s["objetivo"]
+            x["puerto"] = s["puerto"]
+            x["direcciones"] = dirs[texto_minusculas(s["objetivo"])] ?? []
+        }
+        r.agregar(x)
+    }
+    retornar r
+}
+
+funcion _vc_leer_instancia(nombre, tipo_s) {
+    sea base = nombre
+    si (texto_termina_con(texto_minusculas(nombre), "." + texto_minusculas(tipo_s))) { base = subcadena(nombre, 0, longitud(nombre) - longitud(tipo_s) - 1) }
+    retornar texto_reemplazar(texto_reemplazar(base, "\\.", "."), "\\\\", "\\")
+}
+
+/// Busca servicios de un tipo en la red local durante `ms` milisegundos
+/// (consulta unicast heredada: las respuestas llegan a nuestro puerto).
+/// destino: dirección y puerto ("224.0.0.251", 5353 por defecto).
+funcion vecinos_buscar(tipo_s, ms, destino, puerto) {
+    sea sock = udp_crear(0)
+    sea q = vecinos_codificar({"id": 4242, "preguntas": [{"nombre": _vc_normal(tipo_s), "tipo": "PTR"}]})
+    udp_enviar(sock, destino ?? "224.0.0.251", puerto ?? 5353, q)
+    sea mensajes = []
+    sea fin = tiempo_ms() + (ms ?? 1500)
+    sea reenvio = tiempo_ms() + 250
+    mientras (tiempo_ms() < fin) {
+        sea r = udp_recibir(sock)
+        si (r != nulo) {
+            intentar {
+                sea m = vecinos_decodificar(r["datos"])
+                si (m["respuesta"]) {
+                    mensajes.agregar(m)
+                }
+            } capturar (e) { }
+        } sino {
+            si (tiempo_ms() > reenvio) {
+                udp_enviar(sock, destino ?? "224.0.0.251", puerto ?? 5353, q)
+                reenvio = fin + 1
+            }
+            dormir(10)
+        }
+    }
+    udp_cerrar(sock)
+    retornar vecinos_reunir(mensajes, tipo_s)
+}
+
+/// Responde preguntas en un socket propio durante `ms` (o para siempre si
+/// es nulo). Útil con un puerto unicast; para el grupo 5353 el sistema debe
+/// permitir unirse al multicast.
+funcion vecinos_atender(servicios, puerto, ms) {
+    sea sock = udp_crear(puerto)
+    sea fin = nulo
+    si (ms != nulo) { fin = tiempo_ms() + ms }
+    sea n = 0
+    mientras (fin == nulo o tiempo_ms() < fin) {
+        sea r = udp_recibir(sock)
+        si (r != nulo) {
+            sea resp = vecinos_responder(servicios, r["datos"])
+            si (resp != nulo) {
+                udp_enviar(sock, r["origen"], r["puerto"], resp)
+                n = n + 1
+            }
+        } sino { dormir(5) }
+    }
+    udp_cerrar(sock)
+    retornar n
+}
