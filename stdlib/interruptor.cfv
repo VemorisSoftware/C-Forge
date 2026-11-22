@@ -1,0 +1,121 @@
+// stdlib/interruptor.cfv — banderas de funcionalidad (feature flags) y
+// pruebas A/B: encendido/apagado, despliegue gradual por porcentaje
+// (estable: el mismo usuario siempre cae igual), reglas por atributos y
+// variantes con pesos. Inspirada en OpenFeature/Unleash (Apache). En
+// inglés: importar "flags".
+//
+//   importar "interruptor"
+//   sea f = interruptor_nuevo()
+//   interruptor_definir(f, "nuevo_pago", {"porcentaje": 20, "reglas": [{"atributo": "pais", "en": ["CL"]}]})
+//   interruptor_definir(f, "boton", {"variantes": {"azul": 50, "verde": 50}})
+//   interruptor_activo(f, "nuevo_pago", {"id": "u1", "pais": "CL"})
+//   interruptor_variante(f, "boton", {"id": "u1"})          // "azul" o "verde", siempre el mismo
+//
+// Una bandera no definida está apagada (y su variante es "control").
+
+importar "json"
+importar "crypto"
+
+funcion interruptor_nuevo() { retornar {"banderas": {}, "forzadas": {}} }
+
+/// opciones: activo (verdadero), porcentaje (100), reglas [{atributo, en |
+/// igual | mayor | menor}], usuarios (lista de ids siempre dentro),
+/// variantes {nombre: peso}.
+funcion interruptor_definir(f, nombre, opciones) {
+    sea o = opciones ?? {}
+    sea b = {"activo": verdadero, "porcentaje": 100, "reglas": [], "usuarios": [], "variantes": nulo}
+    sea en = {"enabled": "activo", "percentage": "porcentaje", "rules": "reglas", "users": "usuarios", "variants": "variantes"}
+    para k en claves(o) {
+        si (tiene_clave(en, k)) { b[en[k]] = o[k] } sino { b[k] = o[k] }
+    }
+    sea reglas = []
+    para r en b["reglas"] {
+        sea x = {}
+        para k en claves(r) {
+            sea nk = k
+            si (k == "attribute") { nk = "atributo" }
+            si (k == "in") { nk = "en" }
+            si (k == "equals") { nk = "igual" }
+            si (k == "gt") { nk = "mayor" }
+            si (k == "lt") { nk = "menor" }
+            x[nk] = r[k]
+        }
+        reglas.agregar(x)
+    }
+    b["reglas"] = reglas
+    si (b["porcentaje"] < 0 o b["porcentaje"] > 100) { lanzar "interruptor: porcentaje entre 0 y 100" }
+    f["banderas"][nombre] = b
+    retornar f
+}
+
+/// Fuerza un valor (para pruebas o un interruptor de emergencia).
+funcion interruptor_forzar(f, nombre, valor) {
+    f["forzadas"][nombre] = valor
+    retornar f
+}
+
+/// Cubeta estable 0–9999 para (bandera, usuario).
+funcion interruptor_cubeta(nombre, id) {
+    sea h = sha256(nombre + ":" + id)
+    retornar bytes_leer_entero(bytes_de_hex(subcadena(h, 0, 8)), 0, 4, 0) % 10000
+}
+
+funcion _it_regla(r, ctx) {
+    si (tiene_clave(ctx, r["atributo"]) == falso) { retornar falso }
+    sea v = ctx[r["atributo"]]
+    si (tiene_clave(r, "en")) {
+        para x en r["en"] { si (x == v) { retornar verdadero } }
+        retornar falso
+    }
+    si (tiene_clave(r, "igual")) { retornar v == r["igual"] }
+    si (tiene_clave(r, "mayor")) { retornar v > r["mayor"] }
+    si (tiene_clave(r, "menor")) { retornar v < r["menor"] }
+    retornar falso
+}
+
+funcion interruptor_activo(f, nombre, contexto) {
+    sea ctx = contexto ?? {}
+    si (tiene_clave(f["forzadas"], nombre)) { retornar f["forzadas"][nombre] != falso }
+    si (tiene_clave(f["banderas"], nombre) == falso) { retornar falso }
+    sea b = f["banderas"][nombre]
+    si (b["activo"] == falso) { retornar falso }
+    sea id = ""
+    si (tiene_clave(ctx, "id")) { id = "" + ctx["id"] }
+    para u en b["usuarios"] { si ("" + u == id) { retornar verdadero } }
+    para r en b["reglas"] { si (_it_regla(r, ctx) == falso) { retornar falso } }
+    si (b["porcentaje"] >= 100) { retornar verdadero }
+    si (id == "") { retornar falso }
+    retornar interruptor_cubeta(nombre, id) < b["porcentaje"] * 100
+}
+
+/// Variante para el usuario según los pesos (o "control" si está apagada).
+funcion interruptor_variante(f, nombre, contexto) {
+    sea ctx = contexto ?? {}
+    si (tiene_clave(f["forzadas"], nombre)) {
+        sea v = f["forzadas"][nombre]
+        si (tipo(v) == "texto") { retornar v }
+    }
+    si (interruptor_activo(f, nombre, ctx) == falso) { retornar "control" }
+    sea b = f["banderas"][nombre]
+    si (b["variantes"] == nulo) { retornar "activo" }
+    sea total = 0
+    para k en claves(b["variantes"]) { total = total + b["variantes"][k] }
+    si (total <= 0) { retornar "control" }
+    sea id = ""
+    si (tiene_clave(ctx, "id")) { id = "" + ctx["id"] }
+    sea x = interruptor_cubeta(nombre + "#variante", id) * total / 10000
+    sea acc = 0
+    para k en claves(b["variantes"]) {
+        acc = acc + b["variantes"][k]
+        si (x < acc) { retornar k }
+    }
+    retornar claves(b["variantes"])[longitud(claves(b["variantes"])) - 1]
+}
+
+/// Carga banderas desde JSON: {"nombre": opciones, …}.
+funcion interruptor_desde_json(texto) {
+    sea f = interruptor_nuevo()
+    sea d = json_parsear(texto)
+    para k en claves(d) { interruptor_definir(f, k, d[k]) }
+    retornar f
+}

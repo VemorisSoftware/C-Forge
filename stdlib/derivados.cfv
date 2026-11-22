@@ -1,0 +1,225 @@
+// stdlib/derivados.cfv — finanzas cuantitativas: opciones europeas
+// (Black–Scholes con griegas y volatilidad implícita), opciones americanas
+// (árbol binomial), bonos (precio, rendimiento, duración, convexidad), VAN,
+// TIR y pagos de préstamos. Inspirada en QuantLib (BSD). En inglés:
+// importar "quant".
+//
+//   importar "derivados"
+//   derivados_black_scholes("call", 100, 100, 1, 0.05, 0.2)   // {"precio": 10.45, "delta", "gamma", "vega", "theta", "rho"}
+//   derivados_vol_implicita("call", 10.45, 100, 100, 1, 0.05) // ≈ 0.2
+//   derivados_tir([-1000, 300, 400, 500])
+//
+// Tasas en decimal anual (0.05 = 5 %), tiempo en años.
+
+// Normal estándar: densidad y distribución acumulada (error < 1e-14,
+// algoritmo de Hart / West).
+funcion derivados_normal_pdf(x) { retornar exponencial(0 - x * x / 2) / raiz(2 * pi()) }
+
+funcion derivados_normal_cdf(x) {
+    sea z = absoluto(x)
+    sea c = 0
+    si (z <= 37) {
+        sea e = exponencial(0 - z * z / 2)
+        si (z < 7.07106781186547) {
+            sea n = ((((((0.0352624965998911 * z + 0.700383064443688) * z + 6.37396220353165) * z + 33.912866078383) * z + 112.079291497871) * z + 221.213596169931) * z + 220.206867912376)
+            sea d = (((((((0.0883883476483184 * z + 1.75566716318264) * z + 16.064177579207) * z + 86.7807322029461) * z + 296.564248779674) * z + 637.333633378831) * z + 793.826512519948) * z + 440.413735824752)
+            c = e * n / d
+        } sino {
+            sea b = z + 0.65
+            b = z + 4 / b
+            b = z + 3 / b
+            b = z + 2 / b
+            b = z + 1 / b
+            c = e / b / 2.506628274631
+        }
+    }
+    si (x > 0) { retornar 1 - c }
+    retornar c
+}
+
+funcion _dv_tipo(t) {
+    sea x = texto_minusculas("" + t)
+    si (x == "call" o x == "compra") { retornar 1 }
+    si (x == "put" o x == "venta") { retornar -1 }
+    lanzar "derivados: tipo \"call\" o \"put\""
+}
+
+/// Black–Scholes–Merton (q = rendimiento por dividendos, 0 por defecto).
+/// theta por año; vega y rho por 1 (multiplica por 0.01 para 1 %).
+funcion derivados_black_scholes(tipo_o, S, K, T, r, sigma, q) {
+    sea w = _dv_tipo(tipo_o)
+    sea div = q ?? 0
+    si (S <= 0 o K <= 0 o sigma <= 0 o T <= 0) {
+        si (T <= 0) { retornar {"precio": maximo(0, w * (S - K)), "delta": 0, "gamma": 0, "vega": 0, "theta": 0, "rho": 0} }
+        lanzar "derivados: S, K y sigma deben ser positivos"
+    }
+    sea rt = raiz(T)
+    sea d1 = (logaritmo(S / K) + (r - div + sigma * sigma / 2) * T) / (sigma * rt)
+    sea d2 = d1 - sigma * rt
+    sea dr = exponencial(0 - r * T)
+    sea dq = exponencial(0 - div * T)
+    sea precio = w * (S * dq * derivados_normal_cdf(w * d1) - K * dr * derivados_normal_cdf(w * d2))
+    sea pdf = derivados_normal_pdf(d1)
+    retornar {
+        "precio": precio,
+        "delta": w * dq * derivados_normal_cdf(w * d1),
+        "gamma": dq * pdf / (S * sigma * rt),
+        "vega": S * dq * pdf * rt,
+        "theta": 0 - S * dq * pdf * sigma / (2 * rt) - w * r * K * dr * derivados_normal_cdf(w * d2) + w * div * S * dq * derivados_normal_cdf(w * d1),
+        "rho": w * K * T * dr * derivados_normal_cdf(w * d2),
+        "d1": d1, "d2": d2
+    }
+}
+
+/// Volatilidad implícita (Newton con respaldo de bisección).
+funcion derivados_vol_implicita(tipo_o, precio, S, K, T, r, q) {
+    sea lo = 0.0001
+    sea hi = 5
+    sea s = 0.2
+    sea it = 0
+    mientras (it < 100) {
+        sea bs = derivados_black_scholes(tipo_o, S, K, T, r, s, q)
+        sea dif = bs["precio"] - precio
+        si (absoluto(dif) < 0.00000001) { retornar s }
+        si (dif > 0) { hi = s } sino { lo = s }
+        sea nuevo = s - dif / bs["vega"]
+        si (bs["vega"] < 0.00000001 o nuevo <= lo o nuevo >= hi) { nuevo = (lo + hi) / 2 }
+        s = nuevo
+        it = it + 1
+    }
+    si (absoluto(derivados_black_scholes(tipo_o, S, K, T, r, s, q)["precio"] - precio) > 0.0001) { lanzar "derivados: no se encontró una volatilidad para ese precio" }
+    retornar s
+}
+
+/// Árbol binomial de Cox–Ross–Rubinstein (americana = puede ejercerse antes).
+funcion derivados_binomial(tipo_o, S, K, T, r, sigma, pasos, americana) {
+    sea w = _dv_tipo(tipo_o)
+    sea n = pasos ?? 200
+    sea dt = T / n
+    sea u = exponencial(sigma * raiz(dt))
+    sea d = 1 / u
+    sea p = (exponencial(r * dt) - d) / (u - d)
+    sea desc = exponencial(0 - r * dt)
+    sea v = []
+    sea i = 0
+    mientras (i <= n) { v.agregar(maximo(0, w * (S * potencia(u, n - i) * potencia(d, i) - K)))  i = i + 1 }
+    sea paso = n - 1
+    mientras (paso >= 0) {
+        i = 0
+        mientras (i <= paso) {
+            sea cont = desc * (p * v[i] + (1 - p) * v[i + 1])
+            si (americana == verdadero) { cont = maximo(cont, w * (S * potencia(u, paso - i) * potencia(d, i) - K)) }
+            v[i] = cont
+            i = i + 1
+        }
+        paso = paso - 1
+    }
+    retornar v[0]
+}
+
+/// Valor actual neto con flujos al final de cada periodo (el primero en t=0).
+funcion derivados_van(tasa, flujos) {
+    sea s = 0
+    sea i = 0
+    mientras (i < longitud(flujos)) { s = s + flujos[i] / potencia(1 + tasa, i)  i = i + 1 }
+    retornar s
+}
+
+/// Tasa interna de retorno (Newton + bisección en [−0.99, 10]).
+funcion derivados_tir(flujos) {
+    sea lo = -0.99
+    sea hi = 10
+    si ((derivados_van(lo, flujos) > 0) == (derivados_van(hi, flujos) > 0)) { lanzar "derivados: la TIR no existe (los flujos no cambian de signo)" }
+    sea it = 0
+    mientras (it < 200) {
+        sea m = (lo + hi) / 2
+        sea v = derivados_van(m, flujos)
+        si (absoluto(v) < 0.0000001) { retornar m }
+        si ((v > 0) == (derivados_van(lo, flujos) > 0)) { lo = m } sino { hi = m }
+        it = it + 1
+    }
+    retornar (lo + hi) / 2
+}
+
+/// Precio de un bono por cada 100 de nominal. cupon y rendimiento anuales;
+/// frecuencia = pagos por año (2 = semestral).
+funcion derivados_bono_precio(cupon, rendimiento, anios, frecuencia, nominal) {
+    sea f = frecuencia ?? 1
+    sea vn = nominal ?? 100
+    sea n = redondear(anios * f, 0)
+    sea c = vn * cupon / f
+    sea y = rendimiento / f
+    sea s = 0
+    sea k = 1
+    mientras (k <= n) { s = s + c / potencia(1 + y, k)  k = k + 1 }
+    retornar s + vn / potencia(1 + y, n)
+}
+
+/// Rendimiento al vencimiento para un precio dado.
+funcion derivados_bono_rendimiento(precio, cupon, anios, frecuencia, nominal) {
+    sea lo = -0.5
+    sea hi = 2
+    sea it = 0
+    mientras (it < 200) {
+        sea m = (lo + hi) / 2
+        si (derivados_bono_precio(cupon, m, anios, frecuencia, nominal) > precio) { lo = m } sino { hi = m }
+        it = it + 1
+    }
+    retornar (lo + hi) / 2
+}
+
+/// Duración de Macaulay, modificada y convexidad (en años).
+funcion derivados_bono_duracion(cupon, rendimiento, anios, frecuencia, nominal) {
+    sea f = frecuencia ?? 1
+    sea vn = nominal ?? 100
+    sea n = redondear(anios * f, 0)
+    sea c = vn * cupon / f
+    sea y = rendimiento / f
+    sea precio = 0
+    sea pt = 0
+    sea conv = 0
+    sea k = 1
+    mientras (k <= n) {
+        sea flujo = c
+        si (k == n) { flujo = c + vn }
+        sea vp = flujo / potencia(1 + y, k)
+        precio = precio + vp
+        pt = pt + k * vp
+        conv = conv + k * (k + 1) * vp
+        k = k + 1
+    }
+    sea mac = pt / precio / f
+    retornar {"macaulay": mac, "modificada": mac / (1 + y), "convexidad": conv / (precio * potencia(1 + y, 2) * f * f), "precio": precio}
+}
+
+/// Cuota fija de un préstamo (sistema francés).
+funcion derivados_cuota(monto, tasa_anual, meses) {
+    sea i = tasa_anual / 12
+    si (i == 0) { retornar monto / meses }
+    retornar monto * i / (1 - potencia(1 + i, 0 - meses))
+}
+
+/// Tabla de amortización: [{"mes", "cuota", "interes", "capital", "saldo"}].
+funcion derivados_amortizacion(monto, tasa_anual, meses) {
+    sea c = derivados_cuota(monto, tasa_anual, meses)
+    sea saldo = monto
+    sea r = []
+    sea m = 1
+    mientras (m <= meses) {
+        sea interes = saldo * tasa_anual / 12
+        sea capital = c - interes
+        saldo = saldo - capital
+        si (m == meses) { saldo = 0 }
+        r.agregar({"mes": m, "cuota": c, "interes": interes, "capital": capital, "saldo": saldo})
+        m = m + 1
+    }
+    retornar r
+}
+
+/// Interés compuesto: valor futuro con aportes periódicos al final de cada periodo.
+funcion derivados_valor_futuro(inicial, tasa, periodos, aporte) {
+    sea a = aporte ?? 0
+    sea vf = inicial * potencia(1 + tasa, periodos)
+    si (tasa == 0) { retornar vf + a * periodos }
+    retornar vf + a * (potencia(1 + tasa, periodos) - 1) / tasa
+}
