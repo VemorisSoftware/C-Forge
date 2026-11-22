@@ -1,0 +1,653 @@
+// stdlib/carga3d.cfv — carga y guarda modelos 3D glTF 2.0 (.gltf con .bin
+// o datos base64, y .glb binario) al estilo tinyobjloader/cgltf: accesores
+// con todos los tipos de componente, normalizados, con paso (byteStride) y
+// dispersos (sparse); mallas y primitivas (triángulos, tiras y abanicos);
+// materiales PBR; jerarquía de nodos con matriz o TRS y transformaciones
+// del mundo; cámaras; animaciones (muestreadores y canales) y pieles. Las
+// primitivas salen como mallas de "modelo" ({"posiciones", "normales",
+// "uvs", "indices"}). También aplana una escena a una sola malla y exporta
+// mallas a .glb válido. Idea de tinyobjloader y cgltf (MIT). En inglés:
+// importar "gltf".
+//
+//   importar "carga3d"
+//   sea m = carga3d_cargar("robot.glb")
+//   sea todo = carga3d_aplanar(m, nulo)     // una malla en coordenadas del mundo
+//   escribir_archivo("copia.glb", carga3d_glb([{"malla": todo, "nombre": "robot"}], nulo))
+
+importar "json"
+importar "base64"
+importar "modelo"
+
+// ---------- números ----------
+
+funcion _c3_de_ieee32(b, p) {
+    sea alto = byte_en(b, p + 3)
+    sea s = 1
+    si (alto >= 128) { s = -1 }
+    sea ex = (alto % 128) * 2 + piso(byte_en(b, p + 2) / 128)
+    sea mant = (byte_en(b, p + 2) % 128) * 65536 + byte_en(b, p + 1) * 256 + byte_en(b, p)
+    si (ex == 255) {
+        si (mant == 0) { retornar s * 1e308 * 10 }
+        retornar 0 / 0
+    }
+    si (ex == 0) { retornar s * mant * potencia(2, 0 - 149) }
+    retornar s * (1 + mant / 8388608) * potencia(2, ex - 127)
+}
+
+funcion _c3_ieee32(v) {
+    sea s = 0
+    sea m = v
+    si (v < 0) {
+        s = 1
+        m = 0 - v
+    }
+    sea ex = 0
+    sea mant = 0
+    si (m != 0) {
+        sea k = 0
+        mientras (m >= 2) {
+            m = m / 2
+            k = k + 1
+        }
+        mientras (m < 1 y k > -126) {
+            m = m * 2
+            k = k - 1
+        }
+        si (m < 1) { mant = redondear(m * 8388608) } sino {
+            ex = k + 127
+            mant = redondear((m - 1) * 8388608)
+            si (mant >= 8388608) {
+                mant = 0
+                ex = ex + 1
+            }
+        }
+        si (ex >= 255) {
+            ex = 255
+            mant = 0
+        }
+    }
+    retornar bytes_entero(s * 2147483648 + ex * 8388608 + mant, 4, 1)
+}
+
+sea _C3_COMP = {"5120": [1, "s"], "5121": [1, "u"], "5122": [2, "s"], "5123": [2, "u"], "5125": [4, "u"], "5126": [4, "f"]}
+sea _C3_TIPO = {"SCALAR": 1, "VEC2": 2, "VEC3": 3, "VEC4": 4, "MAT2": 4, "MAT3": 9, "MAT4": 16}
+
+funcion _c3_leer_comp(b, p, comp, normalizado) {
+    sea c = _C3_COMP["" + comp]
+    si (c[1] == "f") { retornar _c3_de_ieee32(b, p) }
+    sea v = bytes_leer_entero(b, p, c[0], 1)
+    si (c[1] == "s" y v >= potencia(2, c[0] * 8 - 1)) { v = v - potencia(2, c[0] * 8) }
+    si (normalizado) {
+        si (c[1] == "u") { retornar v / (potencia(2, c[0] * 8) - 1) }
+        retornar maximo(0 - 1, v / (potencia(2, c[0] * 8 - 1) - 1))
+    }
+    retornar v
+}
+
+// ---------- lectura ----------
+
+// Datos de un búfer (bin del GLB, data URI o archivo externo).
+funcion _c3_bufer(g, i, ctx) {
+    si (tiene_clave(ctx["cache"], "" + i)) { retornar ctx["cache"]["" + i] }
+    sea bf = g["buffers"][i]
+    sea d = nulo
+    sea uri = bf["uri"] ?? nulo
+    si (uri == nulo) { d = ctx["bin"] }
+    sino si (texto_empieza_con(uri, "data:")) { d = base64_decodificar(subcadena(uri, texto_indice(uri, ",") + 1, longitud(uri))) }
+    sino {
+        sea r = ctx["resolver"]
+        si (r == nulo) { lanzar "gltf: búfer externo sin resolver: " + uri }
+        d = r(_c3_url_decodificar(uri))
+    }
+    si (d == nulo) { lanzar "gltf: falta el búfer " + i }
+    ctx["cache"]["" + i] = d
+    retornar d
+}
+
+funcion _c3_url_decodificar(t) {
+    si (texto_indice(t, "%") < 0) { retornar t }
+    sea r = []
+    sea i = 0
+    mientras (i < longitud(t)) {
+        sea c = subcadena(t, i, i + 1)
+        si (c == "%" y i + 2 < longitud(t) + 1) {
+            sea h = texto_minusculas(subcadena(t, i + 1, i + 3))
+            r.agregar(bytes_entero(texto_indice("0123456789abcdef", subcadena(h, 0, 1)) * 16 + texto_indice("0123456789abcdef", subcadena(h, 1, 2)), 1, 0))
+            i = i + 3
+        } sino {
+            r.agregar(c)
+            i = i + 1
+        }
+    }
+    retornar unir(r, "")
+}
+
+// Lee un accesor: lista de elementos (números si SCALAR, si no listas).
+funcion _c3_accesor(g, i, ctx) {
+    si (tiene_clave(ctx["acc"], "" + i)) { retornar ctx["acc"]["" + i] }
+    sea a = g["accessors"][i]
+    sea n = a["count"]
+    sea nc = _C3_TIPO[a["type"]]
+    sea comp = a["componentType"]
+    sea tam_c = _C3_COMP["" + comp][0]
+    sea norm = a["normalized"] ?? falso
+    sea r = []
+    si ((a["bufferView"] ?? nulo) != nulo) {
+        sea bv = g["bufferViews"][a["bufferView"]]
+        sea d = _c3_bufer(g, bv["buffer"], ctx)
+        sea base = (bv["byteOffset"] ?? 0) + (a["byteOffset"] ?? 0)
+        sea paso = bv["byteStride"] ?? (nc * tam_c)
+        sea k = 0
+        mientras (k < n) {
+            sea p = base + k * paso
+            si (nc == 1) { r.agregar(_c3_leer_comp(d, p, comp, norm)) } sino {
+                sea x = []
+                sea j = 0
+                mientras (j < nc) {
+                    x.agregar(_c3_leer_comp(d, p + j * tam_c, comp, norm))
+                    j = j + 1
+                }
+                r.agregar(x)
+            }
+            k = k + 1
+        }
+    } sino {
+        sea k = 0
+        mientras (k < n) {
+            si (nc == 1) { r.agregar(0) } sino {
+                sea x = []
+                sea j = 0
+                mientras (j < nc) {
+                    x.agregar(0)
+                    j = j + 1
+                }
+                r.agregar(x)
+            }
+            k = k + 1
+        }
+    }
+    // Disperso: reemplaza algunos elementos.
+    sea sp = a["sparse"] ?? nulo
+    si (sp != nulo) {
+        sea ib = g["bufferViews"][sp["indices"]["bufferView"]]
+        sea id = _c3_bufer(g, ib["buffer"], ctx)
+        sea ip = (ib["byteOffset"] ?? 0) + (sp["indices"]["byteOffset"] ?? 0)
+        sea ic = sp["indices"]["componentType"]
+        sea vb = g["bufferViews"][sp["values"]["bufferView"]]
+        sea vd = _c3_bufer(g, vb["buffer"], ctx)
+        sea vp = (vb["byteOffset"] ?? 0) + (sp["values"]["byteOffset"] ?? 0)
+        sea k = 0
+        mientras (k < sp["count"]) {
+            sea idx = _c3_leer_comp(id, ip + k * _C3_COMP["" + ic][0], ic, falso)
+            si (nc == 1) { r[idx] = _c3_leer_comp(vd, vp + k * tam_c, comp, norm) } sino {
+                sea x = []
+                sea j = 0
+                mientras (j < nc) {
+                    x.agregar(_c3_leer_comp(vd, vp + (k * nc + j) * tam_c, comp, norm))
+                    j = j + 1
+                }
+                r[idx] = x
+            }
+            k = k + 1
+        }
+    }
+    ctx["acc"]["" + i] = r
+    retornar r
+}
+
+// Índices de triángulos según el modo (4 lista, 5 tira, 6 abanico).
+funcion _c3_triangulos(ind, modo) {
+    si (modo == 4) { retornar ind }
+    sea r = []
+    sea k = 2
+    mientras (k < longitud(ind)) {
+        si (modo == 5) {
+            si (k % 2 == 0) {
+                r.agregar(ind[k - 2])
+                r.agregar(ind[k - 1])
+            } sino {
+                r.agregar(ind[k - 1])
+                r.agregar(ind[k - 2])
+            }
+            r.agregar(ind[k])
+        } sino si (modo == 6) {
+            r.agregar(ind[0])
+            r.agregar(ind[k - 1])
+            r.agregar(ind[k])
+        }
+        k = k + 1
+    }
+    retornar r
+}
+
+funcion _c3_primitiva(g, p, ctx) {
+    sea at = p["attributes"]
+    sea pos = _c3_accesor(g, at["POSITION"], ctx)
+    sea n = longitud(pos)
+    sea m = malla_nueva()
+    para v en pos {
+        m["posiciones"].agregar(v[0])
+        m["posiciones"].agregar(v[1])
+        m["posiciones"].agregar(v[2])
+    }
+    sea con_normales = (at["NORMAL"] ?? nulo) != nulo
+    si (con_normales) { para v en _c3_accesor(g, at["NORMAL"], ctx) {
+        m["normales"].agregar(v[0])
+        m["normales"].agregar(v[1])
+        m["normales"].agregar(v[2])
+    } }
+    si ((at["TEXCOORD_0"] ?? nulo) != nulo) { para v en _c3_accesor(g, at["TEXCOORD_0"], ctx) {
+        m["uvs"].agregar(v[0])
+        m["uvs"].agregar(v[1])
+    } } sino {
+        sea k = 0
+        mientras (k < n) {
+            m["uvs"].agregar(0)
+            m["uvs"].agregar(0)
+            k = k + 1
+        }
+    }
+    sea extra = {}
+    para nombre en claves(at) {
+        si (nombre != "POSITION" y nombre != "NORMAL" y nombre != "TEXCOORD_0") { extra[nombre] = _c3_accesor(g, at[nombre], ctx) }
+    }
+    sea modo = p["mode"] ?? 4
+    sea ind = []
+    si ((p["indices"] ?? nulo) != nulo) { ind = _c3_accesor(g, p["indices"], ctx) } sino {
+        sea k = 0
+        mientras (k < n) {
+            ind.agregar(k)
+            k = k + 1
+        }
+    }
+    si (modo >= 4) { m["indices"] = _c3_triangulos(ind, modo) } sino { m["indices"] = ind }
+    si (con_normales == falso y modo >= 4) {
+        sea k = 0
+        mientras (k < n * 3) {
+            m["normales"].agregar(0)
+            k = k + 1
+        }
+        malla_calcular_normales(m)
+    }
+    sea objetivos = []
+    para t en p["targets"] ?? [] {
+        sea o = {}
+        para nombre en claves(t) { o[nombre] = _c3_accesor(g, t[nombre], ctx) }
+        objetivos.agregar(o)
+    }
+    retornar {"malla": m, "material": p["material"] ?? nulo, "modo": modo, "atributos": extra, "objetivos": objetivos}
+}
+
+// ---------- matrices (columna mayor, como glTF) ----------
+
+funcion _c3_identidad() { retornar [1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1] }
+
+funcion _c3_mul(a, b) {
+    sea r = []
+    sea c = 0
+    mientras (c < 4) {
+        sea f = 0
+        mientras (f < 4) {
+            r.agregar(a[f] * b[c * 4] + a[4 + f] * b[c * 4 + 1] + a[8 + f] * b[c * 4 + 2] + a[12 + f] * b[c * 4 + 3])
+            f = f + 1
+        }
+        c = c + 1
+    }
+    retornar r
+}
+
+/// Matriz local de un nodo (matrix o T·R·S).
+funcion carga3d_matriz_nodo(nodo) {
+    si ((nodo["matrix"] ?? nulo) != nulo) { retornar nodo["matrix"] }
+    sea t = nodo["translation"] ?? [0, 0, 0]
+    sea q = nodo["rotation"] ?? [0, 0, 0, 1]
+    sea s = nodo["scale"] ?? [1, 1, 1]
+    sea x = q[0]
+    sea yy = q[1]
+    sea z = q[2]
+    sea w = q[3]
+    retornar [(1 - 2 * (yy * yy + z * z)) * s[0], (2 * (x * yy + z * w)) * s[0], (2 * (x * z - yy * w)) * s[0], 0,
+        (2 * (x * yy - z * w)) * s[1], (1 - 2 * (x * x + z * z)) * s[1], (2 * (yy * z + x * w)) * s[1], 0,
+        (2 * (x * z + yy * w)) * s[2], (2 * (yy * z - x * w)) * s[2], (1 - 2 * (x * x + yy * yy)) * s[2], 0,
+        t[0], t[1], t[2], 1]
+}
+
+funcion _c3_punto(m, x, yy, z) { retornar [m[0] * x + m[4] * yy + m[8] * z + m[12], m[1] * x + m[5] * yy + m[9] * z + m[13], m[2] * x + m[6] * yy + m[10] * z + m[14]] }
+
+// Matriz normal: inversa traspuesta de la parte 3×3.
+funcion _c3_normal3(m) {
+    sea a = m[0]
+    sea b = m[4]
+    sea c = m[8]
+    sea d = m[1]
+    sea e = m[5]
+    sea f = m[9]
+    sea g = m[2]
+    sea h = m[6]
+    sea i = m[10]
+    sea det = a * (e * i - f * h) - b * (d * i - f * g) + c * (d * h - e * g)
+    si (det == 0) { retornar [1, 0, 0, 0, 1, 0, 0, 0, 1] }
+    // Cofactores / det (eso ya es la inversa traspuesta), por filas.
+    retornar [(e * i - f * h) / det, (0 - (d * i - f * g)) / det, (d * h - e * g) / det,
+        (0 - (b * i - c * h)) / det, (a * i - c * g) / det, (0 - (a * h - b * g)) / det,
+        (b * f - c * e) / det, (0 - (a * f - c * d)) / det, (a * e - b * d) / det]
+}
+
+// ---------- api ----------
+
+/// Lee un glTF (texto JSON) o un GLB (bytes). opciones: "resolver"
+/// (función uri → bytes para búferes externos).
+funcion carga3d_gltf(datos, opciones) {
+    sea op = opciones ?? {}
+    sea texto_json = datos
+    sea bin = nulo
+    si (subcadena(datos, 0, 4) == "glTF") {
+        sea version = bytes_leer_entero(datos, 4, 4, 1)
+        si (version != 2) { lanzar "gltf: solo GLB versión 2" }
+        sea total = bytes_leer_entero(datos, 8, 4, 1)
+        sea p = 12
+        texto_json = nulo
+        mientras (p + 8 <= minimo(total, longitud(datos))) {
+            sea largo = bytes_leer_entero(datos, p, 4, 1)
+            sea tipo_t = subcadena(datos, p + 4, p + 8)
+            sea cuerpo = subcadena(datos, p + 8, p + 8 + largo)
+            si (tipo_t == "JSON") { texto_json = cuerpo }
+            si (tipo_t == "BIN" + bytes_entero(0, 1, 0)) { bin = cuerpo }
+            p = p + 8 + largo
+        }
+        si (texto_json == nulo) { lanzar "gltf: GLB sin JSON" }
+    }
+    sea g = json_parsear(texto_json)
+    sea v = (g["asset"] ?? {})["version"] ?? "2.0"
+    si (texto_empieza_con("" + v, "2") == falso) { lanzar "gltf: versión no soportada " + v }
+    sea ctx = {"bin": bin, "resolver": op["resolver"] ?? nulo, "cache": {}, "acc": {}}
+    sea mallas = []
+    para me en g["meshes"] ?? [] {
+        sea prims = []
+        para p en me["primitives"] { prims.agregar(_c3_primitiva(g, p, ctx)) }
+        mallas.agregar({"nombre": me["name"] ?? "", "primitivas": prims, "pesos": me["weights"] ?? []})
+    }
+    sea materiales = []
+    para mt en g["materials"] ?? [] {
+        sea pbr = mt["pbrMetallicRoughness"] ?? {}
+        materiales.agregar({"nombre": mt["name"] ?? "", "color_base": pbr["baseColorFactor"] ?? [1, 1, 1, 1], "metalico": pbr["metallicFactor"] ?? 1, "rugosidad": pbr["roughnessFactor"] ?? 1,
+            "textura_base": (pbr["baseColorTexture"] ?? {})["index"] ?? nulo, "textura_normal": (mt["normalTexture"] ?? {})["index"] ?? nulo, "emisivo": mt["emissiveFactor"] ?? [0, 0, 0],
+            "alfa": mt["alphaMode"] ?? "OPAQUE", "corte_alfa": mt["alphaCutoff"] ?? 0.5, "doble_cara": mt["doubleSided"] ?? falso})
+    }
+    sea nodos = []
+    para n en g["nodes"] ?? [] { nodos.agregar({"nombre": n["name"] ?? "", "hijos": n["children"] ?? [], "malla": n["mesh"] ?? nulo, "camara": n["camera"] ?? nulo, "piel": n["skin"] ?? nulo, "local": carga3d_matriz_nodo(n)}) }
+    // Imágenes: bytes embebidos o URI.
+    sea imagenes = []
+    para im en g["images"] ?? [] {
+        sea x = {"nombre": im["name"] ?? "", "tipo": im["mimeType"] ?? "", "uri": im["uri"] ?? nulo, "datos": nulo}
+        si ((im["bufferView"] ?? nulo) != nulo) {
+            sea bv = g["bufferViews"][im["bufferView"]]
+            sea d = _c3_bufer(g, bv["buffer"], ctx)
+            x["datos"] = subcadena(d, bv["byteOffset"] ?? 0, (bv["byteOffset"] ?? 0) + bv["byteLength"])
+        } sino si (x["uri"] != nulo y texto_empieza_con(x["uri"], "data:")) { x["datos"] = base64_decodificar(subcadena(x["uri"], texto_indice(x["uri"], ",") + 1, longitud(x["uri"]))) }
+        imagenes.agregar(x)
+    }
+    sea animaciones = []
+    para an en g["animations"] ?? [] {
+        sea muestras = []
+        para s en an["samplers"] { muestras.agregar({"tiempos": _c3_accesor(g, s["input"], ctx), "valores": _c3_accesor(g, s["output"], ctx), "interpolacion": s["interpolation"] ?? "LINEAR"}) }
+        sea canales = []
+        para c en an["channels"] { canales.agregar({"muestreo": c["sampler"], "nodo": c["target"]["node"] ?? nulo, "ruta": c["target"]["path"]}) }
+        animaciones.agregar({"nombre": an["name"] ?? "", "muestreos": muestras, "canales": canales})
+    }
+    sea pieles = []
+    para sk en g["skins"] ?? [] {
+        sea inv = []
+        si ((sk["inverseBindMatrices"] ?? nulo) != nulo) { inv = _c3_accesor(g, sk["inverseBindMatrices"], ctx) }
+        pieles.agregar({"nombre": sk["name"] ?? "", "articulaciones": sk["joints"], "inversas": inv, "esqueleto": sk["skeleton"] ?? nulo})
+    }
+    sea escenas = []
+    para es en g["scenes"] ?? [] { escenas.agregar({"nombre": es["name"] ?? "", "nodos": es["nodes"] ?? []}) }
+    si (longitud(escenas) == 0 y longitud(nodos) > 0) {
+        // Sin escenas: las raíces son los nodos que nadie tiene como hijo.
+        sea hijos = {}
+        para n en nodos { para h en n["hijos"] { hijos["" + h] = verdadero } }
+        sea raices = []
+        sea k = 0
+        mientras (k < longitud(nodos)) {
+            si (tiene_clave(hijos, "" + k) == falso) { raices.agregar(k) }
+            k = k + 1
+        }
+        escenas.agregar({"nombre": "", "nodos": raices})
+    }
+    sea r = {"mallas": mallas, "materiales": materiales, "nodos": nodos, "escenas": escenas, "escena": g["scene"] ?? 0, "imagenes": imagenes, "texturas": g["textures"] ?? [],
+        "camaras": g["cameras"] ?? [], "animaciones": animaciones, "pieles": pieles, "extensiones_usadas": g["extensionsUsed"] ?? [], "generador": (g["asset"] ?? {})["generator"] ?? ""}
+    carga3d_mundo(r)
+    retornar r
+}
+
+/// Calcula "mundo" (matriz global) de cada nodo de todas las escenas.
+funcion carga3d_mundo(m) {
+    sea visitar = nulo
+    visitar = funcion(i, padre) {
+        sea n = m["nodos"][i]
+        n["mundo"] = _c3_mul(padre, n["local"])
+        para h en n["hijos"] { visitar(h, n["mundo"]) }
+    }
+    para es en m["escenas"] { para i en es["nodos"] { visitar(i, _c3_identidad()) } }
+}
+
+/// Carga desde un archivo .gltf o .glb (los .bin se buscan al lado).
+funcion carga3d_cargar(ruta, opciones) {
+    sea op = opciones ?? {}
+    sea carpeta = ""
+    sea i = longitud(ruta) - 1
+    mientras (i >= 0 y subcadena(ruta, i, i + 1) != "/") { i = i - 1 }
+    si (i >= 0) { carpeta = subcadena(ruta, 0, i + 1) }
+    si ((op["resolver"] ?? nulo) == nulo) { op["resolver"] = funcion(uri) { retornar leer_archivo(carpeta + uri) } }
+    retornar carga3d_gltf(leer_archivo(ruta), op)
+}
+
+/// Aplana una escena (o la por defecto) a una sola malla en coordenadas
+/// del mundo. Devuelve la malla con "materiales_por_triangulo".
+funcion carga3d_aplanar(m, escena) {
+    sea r = malla_nueva()
+    r["materiales_por_triangulo"] = []
+    sea es = m["escenas"][escena ?? m["escena"]] ?? nulo
+    si (es == nulo) { retornar r }
+    sea visitar = nulo
+    visitar = funcion(i) {
+        sea n = m["nodos"][i]
+        si (n["malla"] != nulo) {
+            sea mw = n["mundo"]
+            sea nm = _c3_normal3(mw)
+            para p en m["mallas"][n["malla"]]["primitivas"] {
+                si (p["modo"] >= 4) {
+                    sea base = longitud(r["posiciones"]) / 3
+                    sea ps = p["malla"]["posiciones"]
+                    sea ns = p["malla"]["normales"]
+                    sea k = 0
+                    mientras (k < longitud(ps)) {
+                        sea q = _c3_punto(mw, ps[k], ps[k + 1], ps[k + 2])
+                        r["posiciones"].agregar(q[0])
+                        r["posiciones"].agregar(q[1])
+                        r["posiciones"].agregar(q[2])
+                        sea nx = nm[0] * ns[k] + nm[1] * ns[k + 1] + nm[2] * ns[k + 2]
+                        sea ny = nm[3] * ns[k] + nm[4] * ns[k + 1] + nm[5] * ns[k + 2]
+                        sea nz = nm[6] * ns[k] + nm[7] * ns[k + 1] + nm[8] * ns[k + 2]
+                        sea l = raiz(nx * nx + ny * ny + nz * nz)
+                        si (l == 0) { l = 1 }
+                        r["normales"].agregar(nx / l)
+                        r["normales"].agregar(ny / l)
+                        r["normales"].agregar(nz / l)
+                        k = k + 3
+                    }
+                    para u en p["malla"]["uvs"] { r["uvs"].agregar(u) }
+                    // Si el determinante es negativo, se invierte el orden de los triángulos.
+                    sea espejo = mw[0] * (mw[5] * mw[10] - mw[9] * mw[6]) - mw[4] * (mw[1] * mw[10] - mw[9] * mw[2]) + mw[8] * (mw[1] * mw[6] - mw[5] * mw[2]) < 0
+                    sea ind = p["malla"]["indices"]
+                    k = 0
+                    mientras (k + 2 < longitud(ind)) {
+                        r["indices"].agregar(base + ind[k])
+                        si (espejo) {
+                            r["indices"].agregar(base + ind[k + 2])
+                            r["indices"].agregar(base + ind[k + 1])
+                        } sino {
+                            r["indices"].agregar(base + ind[k + 1])
+                            r["indices"].agregar(base + ind[k + 2])
+                        }
+                        r["materiales_por_triangulo"].agregar(p["material"])
+                        k = k + 3
+                    }
+                }
+            }
+        }
+        para h en n["hijos"] { visitar(h) }
+    }
+    para i en es["nodos"] { visitar(i) }
+    retornar r
+}
+
+/// Valor de un canal de animación en el tiempo t (LINEAR, STEP; las
+/// rotaciones con slerp).
+funcion carga3d_muestrear(m, animacion, canal, t) {
+    sea an = m["animaciones"][animacion]
+    sea c = an["canales"][canal]
+    sea s = an["muestreos"][c["muestreo"]]
+    sea ts = s["tiempos"]
+    sea vs = s["valores"]
+    sea cubica = s["interpolacion"] == "CUBICSPLINE"
+    sea val = funcion(k) {
+        si (cubica) { retornar vs[k * 3 + 1] }
+        retornar vs[k]
+    }
+    si (t <= ts[0]) { retornar val(0) }
+    si (t >= ts[longitud(ts) - 1]) { retornar val(longitud(ts) - 1) }
+    sea k = 0
+    mientras (k + 1 < longitud(ts) y ts[k + 1] < t) { k = k + 1 }
+    si (s["interpolacion"] == "STEP") { retornar val(k) }
+    sea u = (t - ts[k]) / (ts[k + 1] - ts[k])
+    sea a = val(k)
+    sea b = val(k + 1)
+    si (tipo(a) != "lista") { retornar a + (b - a) * u }
+    si (c["ruta"] == "rotation") {
+        sea d = a[0] * b[0] + a[1] * b[1] + a[2] * b[2] + a[3] * b[3]
+        sea bb = b
+        si (d < 0) {
+            d = 0 - d
+            bb = [0 - b[0], 0 - b[1], 0 - b[2], 0 - b[3]]
+        }
+        sea wa = 1 - u
+        sea wb = u
+        si (d < 0.9995) {
+            // slerp
+            sea th = arcotangente(raiz(1 - d * d) / d)
+            sea sn = seno(th)
+            wa = seno((1 - u) * th) / sn
+            wb = seno(u * th) / sn
+        }
+        sea r = [a[0] * wa + bb[0] * wb, a[1] * wa + bb[1] * wb, a[2] * wa + bb[2] * wb, a[3] * wa + bb[3] * wb]
+        sea l = raiz(r[0] * r[0] + r[1] * r[1] + r[2] * r[2] + r[3] * r[3])
+        retornar [r[0] / l, r[1] / l, r[2] / l, r[3] / l]
+    }
+    sea r = []
+    sea j = 0
+    mientras (j < longitud(a)) {
+        r.agregar(a[j] + (b[j] - a[j]) * u)
+        j = j + 1
+    }
+    retornar r
+}
+
+// ---------- exportar ----------
+
+/// Exporta mallas a GLB. mallas: [{"malla", "nombre", "material":
+/// {"color_base", "metalico", "rugosidad", "doble_cara"}, "traslacion",
+/// "rotacion", "escala"}]. opciones: "generador".
+funcion carga3d_glb(mallas, opciones) {
+    sea op = opciones ?? {}
+    sea bin = []
+    sea largo_bin = [0]
+    sea vistas = []
+    sea accesores = []
+    sea agregar_vista = funcion(datos, objetivo) {
+        mientras (largo_bin[0] % 4 != 0) {
+            bin.agregar(bytes_entero(0, 1, 0))
+            largo_bin[0] = largo_bin[0] + 1
+        }
+        vistas.agregar({"buffer": 0, "byteOffset": largo_bin[0], "byteLength": longitud(datos), "target": objetivo})
+        bin.agregar(datos)
+        largo_bin[0] = largo_bin[0] + longitud(datos)
+        retornar longitud(vistas) - 1
+    }
+    sea flotantes = funcion(l, nc, objetivo, con_limites) {
+        sea partes = []
+        para x en l { partes.agregar(_c3_ieee32(x)) }
+        sea v = agregar_vista(unir(partes, ""), objetivo)
+        sea tipos = ["", "SCALAR", "VEC2", "VEC3", "VEC4"]
+        sea a = {"bufferView": v, "componentType": 5126, "count": longitud(l) / nc, "type": tipos[nc]}
+        si (con_limites) {
+            sea mn = []
+            sea mx = []
+            sea j = 0
+            mientras (j < nc) {
+                mn.agregar(1e308)
+                mx.agregar(0 - 1e308)
+                j = j + 1
+            }
+            sea k = 0
+            mientras (k < longitud(l)) {
+                // Los límites deben coincidir con los valores ya redondeados a float32.
+                sea f = _c3_de_ieee32(_c3_ieee32(l[k]), 0)
+                si (f < mn[k % nc]) { mn[k % nc] = f }
+                si (f > mx[k % nc]) { mx[k % nc] = f }
+                k = k + 1
+            }
+            a["min"] = mn
+            a["max"] = mx
+        }
+        accesores.agregar(a)
+        retornar longitud(accesores) - 1
+    }
+    sea meshes = []
+    sea nodes = []
+    sea mats = []
+    para x en mallas {
+        sea ma = x["malla"]
+        sea at = {"POSITION": flotantes(ma["posiciones"], 3, 34962, verdadero)}
+        si (longitud(ma["normales"] ?? []) == longitud(ma["posiciones"])) { at["NORMAL"] = flotantes(ma["normales"], 3, 34962, falso) }
+        si (longitud(ma["uvs"] ?? []) * 3 == longitud(ma["posiciones"]) * 2 y longitud(ma["uvs"]) > 0) { at["TEXCOORD_0"] = flotantes(ma["uvs"], 2, 34962, falso) }
+        sea prim = {"attributes": at, "mode": 4}
+        si (longitud(ma["indices"] ?? []) > 0) {
+            sea partes = []
+            para i en ma["indices"] { partes.agregar(bytes_entero(i, 4, 1)) }
+            sea v = agregar_vista(unir(partes, ""), 34963)
+            accesores.agregar({"bufferView": v, "componentType": 5125, "count": longitud(ma["indices"]), "type": "SCALAR"})
+            prim["indices"] = longitud(accesores) - 1
+        }
+        si ((x["material"] ?? nulo) != nulo) {
+            sea mt = x["material"]
+            mats.agregar({"name": mt["nombre"] ?? "", "pbrMetallicRoughness": {"baseColorFactor": mt["color_base"] ?? [1, 1, 1, 1], "metallicFactor": mt["metalico"] ?? 0, "roughnessFactor": mt["rugosidad"] ?? 1}, "doubleSided": mt["doble_cara"] ?? falso})
+            prim["material"] = longitud(mats) - 1
+        }
+        meshes.agregar({"name": x["nombre"] ?? "", "primitives": [prim]})
+        sea nodo = {"mesh": longitud(meshes) - 1, "name": x["nombre"] ?? ""}
+        si ((x["traslacion"] ?? nulo) != nulo) { nodo["translation"] = x["traslacion"] }
+        si ((x["rotacion"] ?? nulo) != nulo) { nodo["rotation"] = x["rotacion"] }
+        si ((x["escala"] ?? nulo) != nulo) { nodo["scale"] = x["escala"] }
+        nodes.agregar(nodo)
+    }
+    sea raices = []
+    sea k = 0
+    mientras (k < longitud(nodes)) {
+        raices.agregar(k)
+        k = k + 1
+    }
+    mientras (largo_bin[0] % 4 != 0) {
+        bin.agregar(bytes_entero(0, 1, 0))
+        largo_bin[0] = largo_bin[0] + 1
+    }
+    sea g = {"asset": {"version": "2.0", "generator": op["generador"] ?? "C-Forge carga3d"}, "scene": 0, "scenes": [{"nodes": raices}], "nodes": nodes, "meshes": meshes,
+        "accessors": accesores, "bufferViews": vistas, "buffers": [{"byteLength": largo_bin[0]}]}
+    si (longitud(mats) > 0) { g["materials"] = mats }
+    sea js = json_texto(g)
+    mientras (longitud(js) % 4 != 0) { js = js + " " }
+    sea datos_bin = unir(bin, "")
+    sea total = 12 + 8 + longitud(js) + 8 + longitud(datos_bin)
+    retornar "glTF" + bytes_entero(2, 4, 1) + bytes_entero(total, 4, 1) + bytes_entero(longitud(js), 4, 1) + "JSON" + js + bytes_entero(longitud(datos_bin), 4, 1) + "BIN" + bytes_entero(0, 1, 0) + datos_bin
+}

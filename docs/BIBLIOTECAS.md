@@ -135,11 +135,11 @@ Estado: ✅ ya existe en C-Forge · 🔗 se usa hoy vía `cforge bindgen`,
 
 | # | Nombre | Para qué | Inspiración | Estado |
 |---|---|---|---|---|
-| 97 | `archivo_kv` | Clave-valor en disco | RocksDB | 🛠 |
+| 97 | `archivo_kv` / `kvstore` | Clave-valor en disco | RocksDB | ✅ `archivo_kv` |
 | 98 | `analitica` | SQL analítico embebido | DuckDB | 🔗 |
 | 99 | `cofre` | Base embebida ACID | sled, redb | 🛠 |
 | 100 | `paquete_bin` / `msgpack` | Serialización binaria compacta | MessagePack | ✅ `paquete_bin` |
-| 101 | `sin_copia` | Serialización zero-copy | FlatBuffers | 🛠 |
+| 101 | `sin_copia` / `flatbuffers` | Serialización zero-copy | FlatBuffers | ✅ `sin_copia` |
 | 102 | `columnas` | Formato columnar | Arrow, Parquet | 🛠 |
 | 103 | `hoja` / `xlsx` | Hojas de cálculo .xlsx | libxlsxwriter | ✅ `hoja` |
 | 104 | `documento` / `pdf` | PDF: crear, leer y firmar | PDFium, lopdf | ✅ `documento` |
@@ -176,15 +176,15 @@ Estado: ✅ ya existe en C-Forge · 🔗 se usa hoy vía `cforge bindgen`,
 | # | Nombre | Para qué | Inspiración | Estado |
 |---|---|---|---|---|
 | 127 | `sonido` | Reproducir y capturar audio | miniaudio | ✅ `audio` |
-| 128 | `mezcla` | Mezclador y decodificadores | Rodio | ✅ WAV · 🛠 MP3/OGG/FLAC |
+| 128 | `mezcla` / `mixer` | Mezclador y decodificadores | Rodio | ✅ WAV · `mezcla` (FLAC y mezcla) · 🛠 MP3/OGG |
 | 129 | `estudio` | Audio en tiempo real | PortAudio | 🔗 |
 | 130 | `entidades` / `entities` | ECS de alto rendimiento | EnTT | ✅ `entidades` |
 | 131 | `navegacion` / `navmesh` | Pathfinding y NavMesh | Recast & Detour | ✅ `navegacion` |
-| 132 | `serie` | Puertos serie (Arduino) | serialport | 🛠 |
+| 132 | `serie` / `serialport` | Puertos serie (Arduino) | serialport | ✅ `serie` |
 | 133 | `mando` | Dispositivos USB HID | hidapi | 🔗 |
 | 134 | `pines` | GPIO, I2C y SPI | rppal | 🛠 |
 | 135 | `rebote` | Física 2D determinista | Chipmunk2D | ✅ `fisica2d` |
-| 136 | `espacial` | Audio 3D | OpenAL | 🛠 |
+| 136 | `espacial` / `audio3d` | Audio 3D | OpenAL | ✅ `espacial` |
 
 ### G. Sistema, CLI y compiladores
 
@@ -264,7 +264,7 @@ Estado: ✅ ya existe en C-Forge · 🔗 se usa hoy vía `cforge bindgen`,
 | 191 | `esqueleto` | Animación por huesos 2D | Spine | 🛠 |
 | 192 | `multitud` / `crowd` | Simulación de multitudes | DetourCrowd | ✅ `multitud` |
 | 193 | `ruido` / `noise` | Terrenos procedurales | FastNoiseLite | ✅ `ruido` |
-| 194 | `carga3d` | Cargar OBJ y glTF | tinyobjloader | ✅ `modelo` (OBJ) · 🛠 glTF |
+| 194 | `carga3d` / `gltf` | Cargar OBJ y glTF | tinyobjloader | ✅ `modelo` (OBJ) · `carga3d` (glTF) |
 | 195 | `grafica` / `chart` | Gráficas en tiempo real | ImPlot | ✅ `grafica` |
 | 196 | `dialogo` / `dialogue` | Narrativa interactiva | ink, YarnSpinner | ✅ `dialogo` |
 
@@ -333,7 +333,7 @@ Estado: ✅ ya existe en C-Forge · 🔗 se usa hoy vía `cforge bindgen`,
 | 245 | `socket_web` | WebSocket RFC 6455 | Tungstenite | ✅ `red` |
 | 246 | `correo` / `mailer` | Enviar correos con DKIM | Lettre | ✅ `correo` |
 | 247 | `bandeja` / `mailbox` | Leer correo IMAP/POP3 | IMAP | ✅ `bandeja` |
-| 248 | `vecinos` | Descubrimiento mDNS | Zeroconf | 🛠 |
-| 249 | `puertos` | Abrir puertos en el router | UPnP | 🛠 |
+| 248 | `vecinos` / `zeroconf` | Descubrimiento mDNS | Zeroconf | ✅ `vecinos` |
+| 249 | `puertos` / `portmap` | Abrir puertos en el router | UPnP | ✅ `puertos` |
 | 250 | `usb` | USB de bajo nivel | libusb | 🔗 |
 | 251 | `alerta` / `errors` | Reportes de errores en producción | Sentry | ✅ `alerta` |

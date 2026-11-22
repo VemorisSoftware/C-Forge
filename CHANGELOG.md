@@ -65,6 +65,18 @@ Sitio oficial: [c-forge.org](https://c-forge.org)
   `llamada`/`protobuf` (.proto, binario como protoc, marcos gRPC),
   `recolecta`/`crawler` (cookies RFC 6265, formularios, robots.txt,
   rastreo) y `sensor`/`mqtt` (paquetes MQTT, QoS 2, mini broker).
+- Lote 17 de bibliotecas (con alias en inglés y pruebas en ambos idiomas):
+  `espacial`/`audio3d` (audio 3D con los modelos de distancia, conos y
+  Doppler de OpenAL 1.1, paneo con retardo entre oídos y reverberación),
+  `mezcla`/`mixer` (FLAC propio para leer y escribir, probado contra
+  ffmpeg, y mezcla de pistas con fundidos, paneo y remuestreo),
+  `serie`/`serialport` (puertos serie por termios, analizadores de tramas,
+  SLIP, COBS y Modbus RTU), `archivo_kv`/`kvstore` (clave-valor en disco
+  con árbol LSM, WAL, Bloom, compactación e instantáneas),
+  `sin_copia`/`flatbuffers` (esquemas .fbs y formato FlatBuffers, leído y
+  escrito igual que la biblioteca oficial), `carga3d`/`gltf` (glTF 2.0 y
+  GLB, con salida que pasa el validador de Khronos), `vecinos`/`zeroconf`
+  (mDNS y DNS-SD) y `puertos`/`portmap` (UPnP IGD y NAT-PMP).
 - Lote 16 de bibliotecas (con alias en inglés y pruebas en ambos idiomas):
   `compacta`/`compress` (zstd completo para descomprimir con FSE, Huffman,
   diccionarios y varios marcos; LZ4 de bloque y marco; Snappy; gzip con

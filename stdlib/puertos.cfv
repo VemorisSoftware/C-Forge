@@ -1,0 +1,285 @@
+// stdlib/puertos.cfv — abrir puertos en el router al estilo miniupnpc y
+// NAT-PMP: descubre la puerta de enlace UPnP IGD con SSDP (M-SEARCH a
+// 239.255.255.250:1900), lee su descripción XML, encuentra el servicio
+// WANIPConnection o WANPPPConnection y llama por SOAP a
+// GetExternalIPAddress, AddPortMapping, DeletePortMapping,
+// GetSpecificPortMappingEntry y GetGenericPortMappingEntry. También habla
+// NAT-PMP (RFC 6886) con el router en el puerto 5351: dirección externa
+// y mapeos UDP/TCP con duración. Idea de miniupnpc (BSD). En inglés:
+// importar "portmap".
+//
+//   importar "puertos"
+//   sea gw = puertos_descubrir(2000)
+//   puertos_abrir(gw, 8080, 8080, "TCP", "Mi servidor", 3600)
+//   mostrar(puertos_ip_externa(gw))
+
+importar "xml"
+
+sea _PT_TIPOS_SERVICIO = ["urn:schemas-upnp-org:service:WANIPConnection:2", "urn:schemas-upnp-org:service:WANIPConnection:1", "urn:schemas-upnp-org:service:WANPPPConnection:1"]
+
+// ---------- SSDP ----------
+
+/// Mensaje M-SEARCH para buscar puertas de enlace.
+funcion puertos_msearch(objetivo, espera_s) {
+    retornar "M-SEARCH * HTTP/1.1\r\nHOST: 239.255.255.250:1900\r\nMAN: \"ssdp:discover\"\r\nMX: " + (espera_s ?? 2) + "\r\nST: " + (objetivo ?? "urn:schemas-upnp-org:device:InternetGatewayDevice:1") + "\r\n\r\n"
+}
+
+/// Lee una respuesta SSDP: {"estado", "cabeceras" (minúsculas)}.
+funcion puertos_ssdp_leer(t) {
+    sea ls = texto_dividir(texto_reemplazar(t, "\r\n", "\n"), "\n")
+    sea cab = {}
+    sea i = 1
+    mientras (i < longitud(ls)) {
+        sea k = texto_indice(ls[i], ":")
+        si (k > 0) { cab[texto_minusculas(texto_recortar(subcadena(ls[i], 0, k)))] = texto_recortar(subcadena(ls[i], k + 1, longitud(ls[i]))) }
+        i = i + 1
+    }
+    sea partes = texto_dividir(ls[0], " ")
+    sea estado = 0
+    si (longitud(partes) > 1 y texto_empieza_con(partes[0], "HTTP")) { estado = a_numero(partes[1]) }
+    retornar {"estado": estado, "cabeceras": cab, "inicio": ls[0]}
+}
+
+funcion _pt_http(op) {
+    sea t = op["transporte"] ?? nulo
+    si (t != nulo) { retornar t }
+    retornar funcion(m, url, o) { retornar http_solicitud(m, url, o) }
+}
+
+// Base de una URL: "http://host:puerto".
+funcion _pt_base(url) {
+    sea i = texto_indice(url, "://")
+    sea resto = subcadena(url, i + 3, longitud(url))
+    sea j = texto_indice(resto, "/")
+    si (j < 0) { retornar url }
+    retornar subcadena(url, 0, i + 3 + j)
+}
+
+funcion _pt_host(url) {
+    sea b = _pt_base(url)
+    sea h = subcadena(b, texto_indice(b, "://") + 3, longitud(b))
+    retornar texto_dividir(h, ":")[0]
+}
+
+funcion _pt_absoluta(base, url_base, ruta) {
+    si (texto_empieza_con(ruta, "http://") o texto_empieza_con(ruta, "https://")) { retornar ruta }
+    sea b = url_base ?? base
+    si (texto_termina_con(b, "/")) { b = subcadena(b, 0, longitud(b) - 1) }
+    si (texto_empieza_con(ruta, "/") == falso) { ruta = "/" + ruta }
+    retornar _pt_base(b) + ruta
+}
+
+/// Lee la descripción XML de un dispositivo y devuelve la puerta de
+/// enlace {"control", "servicio", "ubicacion", "modelo", "fabricante"} o
+/// nulo si no tiene servicio WAN.
+funcion puertos_describir(ubicacion, xml_texto_desc, opciones) {
+    sea op = opciones ?? {}
+    sea txt = xml_texto_desc
+    si (txt == nulo) {
+        sea r = _pt_http(op)("GET", ubicacion, {"cabeceras": {}})
+        si (r["estado"] != 200) { retornar nulo }
+        txt = r["cuerpo"]
+    }
+    sea x = xml_analizar(txt)
+    sea url_base = nulo
+    sea ub = xml_hijo(x, "URLBase")
+    si (ub != nulo) { url_base = texto_recortar(xml_contenido(ub)) }
+    sea modelo = ""
+    sea fabricante = ""
+    sea d = xml_hijo(x, "device")
+    si (d != nulo) {
+        modelo = xml_contenido(xml_hijo(d, "modelName")) ?? ""
+        fabricante = xml_contenido(xml_hijo(d, "manufacturer")) ?? ""
+    }
+    para tipo_s en _PT_TIPOS_SERVICIO {
+        para s en xml_buscar(x, "service") {
+            si (texto_recortar(xml_contenido(xml_hijo(s, "serviceType")) ?? "") == tipo_s) {
+                retornar {"ubicacion": ubicacion, "servicio": tipo_s, "control": _pt_absoluta(ubicacion, url_base, texto_recortar(xml_contenido(xml_hijo(s, "controlURL")))), "modelo": modelo, "fabricante": fabricante,
+                    "transporte": op["transporte"] ?? nulo, "tipo": "upnp", "ip_router": _pt_host(ubicacion)}
+            }
+        }
+    }
+    retornar nulo
+}
+
+/// Busca la puerta de enlace UPnP en la red durante `ms`. Devuelve la
+/// primera que tenga servicio WAN, o nulo.
+funcion puertos_descubrir(ms, opciones) {
+    sea op = opciones ?? {}
+    sea sock = udp_crear(0)
+    para st en ["urn:schemas-upnp-org:device:InternetGatewayDevice:1", "urn:schemas-upnp-org:service:WANIPConnection:1", "upnp:rootdevice"] { udp_enviar(sock, op["destino"] ?? "239.255.255.250", op["puerto"] ?? 1900, puertos_msearch(st, 2)) }
+    sea fin = tiempo_ms() + (ms ?? 2000)
+    sea vistos = {}
+    mientras (tiempo_ms() < fin) {
+        sea r = udp_recibir(sock)
+        si (r != nulo) {
+            sea m = puertos_ssdp_leer(r["datos"])
+            sea loc = m["cabeceras"]["location"] ?? nulo
+            si (m["estado"] == 200 y loc != nulo y tiene_clave(vistos, loc) == falso) {
+                vistos[loc] = verdadero
+                sea gw = nulo
+                intentar { gw = puertos_describir(loc, nulo, op) } capturar (e) { gw = nulo }
+                si (gw != nulo) {
+                    udp_cerrar(sock)
+                    retornar gw
+                }
+            }
+        } sino { dormir(10) }
+    }
+    udp_cerrar(sock)
+    retornar nulo
+}
+
+// ---------- SOAP ----------
+
+/// Sobre SOAP para una acción.
+funcion puertos_soap(servicio, accion, args) {
+    sea partes = []
+    para par en args { partes.agregar("<" + par[0] + ">" + xml_escapar("" + par[1]) + "</" + par[0] + ">") }
+    retornar "<?xml version=\"1.0\"?>\r\n<s:Envelope xmlns:s=\"http://schemas.xmlsoap.org/soap/envelope/\" s:encodingStyle=\"http://schemas.xmlsoap.org/soap/encoding/\"><s:Body><u:" + accion + " xmlns:u=\"" + servicio + "\">" + unir(partes, "") + "</u:" + accion + "></s:Body></s:Envelope>\r\n"
+}
+
+// Valores devueltos por una respuesta SOAP (o error UPnP).
+funcion puertos_soap_leer(t) {
+    sea x = xml_analizar(t)
+    sea cuerpo = nulo
+    para h en x["hijos"] { si (tipo(h) == "mapa" y texto_termina_con(h["nombre"], "Body")) { cuerpo = h } }
+    si (cuerpo == nulo) { lanzar "upnp: respuesta SOAP sin cuerpo" }
+    sea r = {}
+    para h en cuerpo["hijos"] {
+        si (tipo(h) == "mapa") {
+            si (texto_termina_con(h["nombre"], "Fault")) {
+                sea cod = xml_buscar(h, "errorCode")
+                sea des = xml_buscar(h, "errorDescription")
+                sea c = nulo
+                si (longitud(cod) > 0) { c = a_numero(texto_recortar(xml_contenido(cod[0]))) }
+                sea dtxt = ""
+                si (longitud(des) > 0) { dtxt = xml_contenido(des[0]) }
+                retornar {"error": c, "descripcion": dtxt}
+            }
+            para a en h["hijos"] { si (tipo(a) == "mapa") { r[a["nombre"]] = xml_contenido(a) ?? "" } }
+        }
+    }
+    retornar r
+}
+
+funcion _pt_llamar(gw, accion, args) {
+    sea cuerpo = puertos_soap(gw["servicio"], accion, args)
+    sea r = _pt_http(gw)("POST", gw["control"], {"cuerpo": cuerpo, "tipo": "text/xml; charset=\"utf-8\"", "cabeceras": {"SOAPAction": "\"" + gw["servicio"] + "#" + accion + "\""}})
+    sea v = puertos_soap_leer(r["cuerpo"])
+    si ((v["error"] ?? nulo) != nulo) { lanzar "upnp: " + accion + " falló (" + v["error"] + " " + v["descripcion"] + ")" }
+    retornar v
+}
+
+/// Dirección IP pública según el router.
+funcion puertos_ip_externa(gw) {
+    si (gw["tipo"] == "natpmp") { retornar puertos_natpmp_ip(gw) }
+    retornar _pt_llamar(gw, "GetExternalIPAddress", [])["NewExternalIPAddress"]
+}
+
+/// Abre (mapea) un puerto. protocolo "TCP" o "UDP". ip_interna: la de
+/// este equipo (si es nulo se toma de "ip_local" de la puerta de enlace).
+funcion puertos_abrir(gw, externo, interno, protocolo, descripcion, duracion_s, ip_interna) {
+    si (gw["tipo"] == "natpmp") { retornar puertos_natpmp_mapear(gw, protocolo, interno, externo, duracion_s ?? 7200) }
+    sea ip = ip_interna ?? (gw["ip_local"] ?? nulo)
+    si (ip == nulo) { lanzar "upnp: falta la IP interna" }
+    _pt_llamar(gw, "AddPortMapping", [["NewRemoteHost", ""], ["NewExternalPort", externo], ["NewProtocol", texto_mayusculas(protocolo)], ["NewInternalPort", interno], ["NewInternalClient", ip],
+        ["NewEnabled", 1], ["NewPortMappingDescription", descripcion ?? "C-Forge"], ["NewLeaseDuration", duracion_s ?? 0]])
+    retornar {"externo": externo, "interno": interno, "protocolo": texto_mayusculas(protocolo), "ip": ip}
+}
+
+/// Cierra un mapeo.
+funcion puertos_cerrar(gw, externo, protocolo) {
+    si (gw["tipo"] == "natpmp") { retornar puertos_natpmp_mapear(gw, protocolo, externo, 0, 0) }
+    _pt_llamar(gw, "DeletePortMapping", [["NewRemoteHost", ""], ["NewExternalPort", externo], ["NewProtocol", texto_mayusculas(protocolo)]])
+    retornar verdadero
+}
+
+/// Datos de un mapeo existente o nulo.
+funcion puertos_consultar(gw, externo, protocolo) {
+    sea v = nulo
+    intentar { v = _pt_llamar(gw, "GetSpecificPortMappingEntry", [["NewRemoteHost", ""], ["NewExternalPort", externo], ["NewProtocol", texto_mayusculas(protocolo)]]) } capturar (e) { retornar nulo }
+    retornar {"interno": a_numero(v["NewInternalPort"] ?? "0"), "ip": v["NewInternalClient"] ?? "", "activo": (v["NewEnabled"] ?? "0") == "1", "descripcion": v["NewPortMappingDescription"] ?? "", "duracion": a_numero(v["NewLeaseDuration"] ?? "0")}
+}
+
+/// Lista los mapeos del router (hasta `maximo`).
+funcion puertos_listar(gw, maximo) {
+    sea r = []
+    sea i = 0
+    mientras (i < (maximo ?? 128)) {
+        sea v = nulo
+        intentar { v = _pt_llamar(gw, "GetGenericPortMappingEntry", [["NewPortMappingIndex", i]]) } capturar (e) { retornar r }
+        r.agregar({"externo": a_numero(v["NewExternalPort"] ?? "0"), "protocolo": v["NewProtocol"] ?? "", "interno": a_numero(v["NewInternalPort"] ?? "0"), "ip": v["NewInternalClient"] ?? "",
+            "descripcion": v["NewPortMappingDescription"] ?? "", "duracion": a_numero(v["NewLeaseDuration"] ?? "0")})
+        i = i + 1
+    }
+    retornar r
+}
+
+// ---------- NAT-PMP ----------
+
+funcion _pt_b(n) { retornar bytes_entero(n, 1, 0) }
+
+/// Petición NAT-PMP: dirección externa (op 0) o mapeo (op 1 UDP, 2 TCP).
+funcion puertos_natpmp_peticion(protocolo, interno, externo, duracion_s) {
+    si (protocolo == nulo) { retornar _pt_b(0) + _pt_b(0) }
+    sea op = 2
+    si (texto_mayusculas(protocolo) == "UDP") { op = 1 }
+    retornar _pt_b(0) + _pt_b(op) + bytes_entero(0, 2, 0) + bytes_entero(interno, 2, 0) + bytes_entero(externo, 2, 0) + bytes_entero(duracion_s, 4, 0)
+}
+
+sea _PT_NATPMP_ERRORES = {"1": "versión no soportada", "2": "no autorizado", "3": "falla de red", "4": "sin recursos", "5": "operación no soportada"}
+
+/// Lee una respuesta NAT-PMP.
+funcion puertos_natpmp_respuesta(t) {
+    si (longitud(t) < 8) { lanzar "natpmp: respuesta corta" }
+    sea op = byte_en(t, 1)
+    sea cod = bytes_leer_entero(t, 2, 2, 0)
+    sea r = {"op": op - 128, "codigo": cod, "segundos": bytes_leer_entero(t, 4, 4, 0)}
+    si (cod != 0) { r["error"] = _PT_NATPMP_ERRORES["" + cod] ?? ("código " + cod) }
+    si (op == 128 y longitud(t) >= 12) { r["ip"] = "" + byte_en(t, 8) + "." + byte_en(t, 9) + "." + byte_en(t, 10) + "." + byte_en(t, 11) }
+    si (op > 128 y longitud(t) >= 16) {
+        r["interno"] = bytes_leer_entero(t, 8, 2, 0)
+        r["externo"] = bytes_leer_entero(t, 10, 2, 0)
+        r["duracion"] = bytes_leer_entero(t, 12, 4, 0)
+    }
+    retornar r
+}
+
+/// Puerta de enlace NAT-PMP en la IP del router.
+funcion puertos_natpmp(ip_router, puerto) { retornar {"tipo": "natpmp", "ip_router": ip_router, "puerto": puerto ?? 5351} }
+
+// Envía con reintentos (250 ms, duplicando, como pide el RFC).
+funcion _pt_natpmp_enviar(gw, pet) {
+    sea sock = udp_crear(0)
+    sea espera = 250
+    sea intento = 0
+    mientras (intento < 4) {
+        udp_enviar(sock, gw["ip_router"], gw["puerto"], pet)
+        sea fin = tiempo_ms() + espera
+        mientras (tiempo_ms() < fin) {
+            sea r = udp_recibir(sock)
+            si (r != nulo) {
+                udp_cerrar(sock)
+                retornar puertos_natpmp_respuesta(r["datos"])
+            }
+            dormir(5)
+        }
+        espera = espera * 2
+        intento = intento + 1
+    }
+    udp_cerrar(sock)
+    lanzar "natpmp: el router no responde"
+}
+
+funcion puertos_natpmp_ip(gw) {
+    sea r = _pt_natpmp_enviar(gw, puertos_natpmp_peticion(nulo, 0, 0, 0))
+    si (r["codigo"] != 0) { lanzar "natpmp: " + r["error"] }
+    retornar r["ip"]
+}
+
+funcion puertos_natpmp_mapear(gw, protocolo, interno, externo, duracion_s) {
+    sea r = _pt_natpmp_enviar(gw, puertos_natpmp_peticion(protocolo, interno, externo, duracion_s))
+    si (r["codigo"] != 0) { lanzar "natpmp: " + r["error"] }
+    retornar r
+}

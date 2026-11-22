@@ -1,0 +1,1099 @@
+// stdlib/mezcla.cfv — decodificador y codificador FLAC propios y un
+// mezclador de pistas al estilo Rodio: FLAC completo para leer (STREAMINFO,
+// VORBIS_COMMENT, subtramas constante, literal, fija y LPC, residuo Rice y
+// Rice2 por particiones, bits desperdiciados, estéreo izquierda/lado,
+// derecha/lado y medio/lado, 8 a 24 bits, verificación CRC-8 y CRC-16) y
+// para escribir (predictor fijo de orden 0 a 4 elegido por bloque, Rice
+// con particiones y estéreo medio/lado), más fuentes encadenables:
+// ganancia, paneo, velocidad, remuestreo, fundidos, recorte, repetición,
+// concatenación y mezcla, con salida a PCM de 16 bits y WAV. Idea de Rodio
+// (MIT/Apache). En inglés: importar "mixer".
+//
+//   importar "mezcla"
+//   sea s = mezcla_flac_decodificar(leer_archivo("tema.flac"))
+//   sea m = mezcla_mezclar([mezcla_ganancia(s, 0.8), mezcla_fundido(otra, 0, 500)])
+//   escribir_archivo("salida.wav", mezcla_wav(m))
+
+importar "base64"
+
+// ---------- lector de bits ----------
+
+funcion _mz_lector(d, inicio) { retornar {"d": d, "p": inicio * 8, "n": longitud(d) * 8} }
+
+funcion _mz_bits(r, n) {
+    sea v = 0
+    sea k = 0
+    mientras (k < n) {
+        sea p = r["p"]
+        si (p >= r["n"]) { lanzar "flac: datos truncados" }
+        // Lee de a byte cuando está alineado.
+        si (p % 8 == 0 y n - k >= 8) {
+            v = v * 256 + byte_en(r["d"], p / 8)
+            r["p"] = p + 8
+            k = k + 8
+        } sino {
+            sea b = byte_en(r["d"], piso(p / 8))
+            v = v * 2 + (piso(b / potencia(2, 7 - p % 8)) % 2)
+            r["p"] = p + 1
+            k = k + 1
+        }
+    }
+    retornar v
+}
+
+funcion _mz_con_signo(v, n) {
+    si (n > 0 y v >= potencia(2, n - 1)) { retornar v - potencia(2, n) }
+    retornar v
+}
+
+funcion _mz_unario(r) {
+    sea n = 0
+    mientras (_mz_bits(r, 1) == 0) { n = n + 1 }
+    retornar n
+}
+
+funcion _mz_alinear(r) { si (r["p"] % 8 != 0) { r["p"] = r["p"] + 8 - r["p"] % 8 } }
+
+// Número UTF-8 extendido de las cabeceras de trama.
+funcion _mz_utf8(r) {
+    sea b = _mz_bits(r, 8)
+    si (b < 128) { retornar b }
+    sea extra = 0
+    sea m = 64
+    mientras (b % (m * 2) >= m y m >= 1) {
+        extra = extra + 1
+        m = m / 2
+    }
+    sea v = b % m
+    sea k = 0
+    mientras (k < extra) {
+        v = v * 64 + _mz_bits(r, 8) % 64
+        k = k + 1
+    }
+    retornar v
+}
+
+// ---------- CRC ----------
+
+sea _MZ_CRC8 = nulo
+sea _MZ_CRC16 = nulo
+
+funcion _mz_tablas() {
+    si (_MZ_CRC8 != nulo) { retornar nulo }
+    sea t8 = []
+    sea t16 = []
+    sea i = 0
+    mientras (i < 256) {
+        sea c = i
+        sea k = 0
+        mientras (k < 8) {
+            si (c >= 128) { c = bits_xo((c * 2) % 256, 7) } sino { c = (c * 2) % 256 }
+            k = k + 1
+        }
+        t8.agregar(c)
+        sea c2 = i * 256
+        k = 0
+        mientras (k < 8) {
+            si (c2 >= 32768) { c2 = bits_xo((c2 * 2) % 65536, 32773) } sino { c2 = (c2 * 2) % 65536 }
+            k = k + 1
+        }
+        t16.agregar(c2)
+        i = i + 1
+    }
+    _MZ_CRC8 = t8
+    _MZ_CRC16 = t16
+}
+
+funcion _mz_crc8(d, a, b) {
+    _mz_tablas()
+    sea c = 0
+    sea i = a
+    mientras (i < b) {
+        c = _MZ_CRC8[bits_xo(c, byte_en(d, i))]
+        i = i + 1
+    }
+    retornar c
+}
+
+funcion _mz_crc16(d, a, b) {
+    _mz_tablas()
+    sea c = 0
+    sea i = a
+    mientras (i < b) {
+        c = bits_xo((c * 256) % 65536, _MZ_CRC16[bits_xo(piso(c / 256), byte_en(d, i))])
+        i = i + 1
+    }
+    retornar c
+}
+
+// ---------- decodificador ----------
+
+funcion _mz_residuo(r, orden, tam_bloque, salida) {
+    sea metodo = _mz_bits(r, 2)
+    sea ancho_param = 4
+    sea escape = 15
+    si (metodo == 1) {
+        ancho_param = 5
+        escape = 31
+    } sino si (metodo > 1) { lanzar "flac: método de residuo reservado" }
+    sea orden_part = _mz_bits(r, 4)
+    sea particiones = potencia(2, orden_part)
+    sea p = 0
+    mientras (p < particiones) {
+        sea n = tam_bloque / particiones
+        si (p == 0) { n = n - orden }
+        sea param = _mz_bits(r, ancho_param)
+        sea k = 0
+        si (param == escape) {
+            sea nb = _mz_bits(r, 5)
+            mientras (k < n) {
+                salida.agregar(_mz_con_signo(_mz_bits(r, nb), nb))
+                k = k + 1
+            }
+        } sino {
+            sea pot = potencia(2, param)
+            mientras (k < n) {
+                sea q = _mz_unario(r)
+                sea u = q * pot + _mz_bits(r, param)
+                si (u % 2 == 0) { salida.agregar(u / 2) } sino { salida.agregar(0 - (u + 1) / 2) }
+                k = k + 1
+            }
+        }
+        p = p + 1
+    }
+}
+
+sea _MZ_FIJOS = [[], [1], [2, 0 - 1], [3, 0 - 3, 1], [4, 0 - 6, 4, 0 - 1]]
+
+funcion _mz_subtrama(r, tam, bps) {
+    si (_mz_bits(r, 1) != 0) { lanzar "flac: bit de relleno de subtrama" }
+    sea tipo_s = _mz_bits(r, 6)
+    sea desperdicio = 0
+    si (_mz_bits(r, 1) == 1) { desperdicio = 1 + _mz_unario(r) }
+    sea b = bps - desperdicio
+    sea m = []
+    si (tipo_s == 0) {
+        sea v = _mz_con_signo(_mz_bits(r, b), b)
+        sea i = 0
+        mientras (i < tam) {
+            m.agregar(v)
+            i = i + 1
+        }
+    } sino si (tipo_s == 1) {
+        sea i = 0
+        mientras (i < tam) {
+            m.agregar(_mz_con_signo(_mz_bits(r, b), b))
+            i = i + 1
+        }
+    } sino si (tipo_s >= 8 y tipo_s <= 12) {
+        sea orden = tipo_s - 8
+        sea i = 0
+        mientras (i < orden) {
+            m.agregar(_mz_con_signo(_mz_bits(r, b), b))
+            i = i + 1
+        }
+        _mz_residuo(r, orden, tam, m)
+        sea c = _MZ_FIJOS[orden]
+        i = orden
+        mientras (i < tam) {
+            sea s = m[i]
+            sea j = 0
+            mientras (j < orden) {
+                s = s + c[j] * m[i - 1 - j]
+                j = j + 1
+            }
+            m[i] = s
+            i = i + 1
+        }
+    } sino si (tipo_s >= 32) {
+        sea orden = tipo_s - 31
+        sea i = 0
+        mientras (i < orden) {
+            m.agregar(_mz_con_signo(_mz_bits(r, b), b))
+            i = i + 1
+        }
+        sea prec = _mz_bits(r, 4) + 1
+        si (prec == 16) { lanzar "flac: precisión LPC inválida" }
+        sea corr = _mz_con_signo(_mz_bits(r, 5), 5)
+        sea coef = []
+        i = 0
+        mientras (i < orden) {
+            coef.agregar(_mz_con_signo(_mz_bits(r, prec), prec))
+            i = i + 1
+        }
+        _mz_residuo(r, orden, tam, m)
+        sea div = potencia(2, corr)
+        i = orden
+        mientras (i < tam) {
+            sea s = 0
+            sea j = 0
+            mientras (j < orden) {
+                s = s + coef[j] * m[i - 1 - j]
+                j = j + 1
+            }
+            m[i] = m[i] + piso(s / div)
+            i = i + 1
+        }
+    } sino { lanzar "flac: tipo de subtrama reservado " + tipo_s }
+    si (desperdicio > 0) {
+        sea f = potencia(2, desperdicio)
+        sea i = 0
+        mientras (i < tam) {
+            m[i] = m[i] * f
+            i = i + 1
+        }
+    }
+    retornar m
+}
+
+sea _MZ_TAMANOS = [0, 192, 576, 1152, 2304, 4608, 0, 0, 256, 512, 1024, 2048, 4096, 8192, 16384, 32768]
+sea _MZ_TASAS = [0, 88200, 176400, 192000, 8000, 16000, 22050, 24000, 32000, 44100, 48000, 96000]
+sea _MZ_BPS = [0, 8, 12, 0, 16, 20, 24, 32]
+
+/// Información de un FLAC sin decodificar el audio: {"tasa", "canales",
+/// "bits", "muestras", "md5", "etiquetas", "bloque_min", "bloque_max"}.
+funcion mezcla_flac_info(datos) {
+    si (subcadena(datos, 0, 4) != "fLaC") { lanzar "flac: falta la marca fLaC" }
+    sea p = 4
+    sea info = {"etiquetas": {}, "vendedor": ""}
+    sea ultimo = falso
+    mientras (ultimo == falso) {
+        sea h = byte_en(datos, p)
+        ultimo = h >= 128
+        sea tipo_b = h % 128
+        sea largo = byte_en(datos, p + 1) * 65536 + byte_en(datos, p + 2) * 256 + byte_en(datos, p + 3)
+        sea c = p + 4
+        si (tipo_b == 0) {
+            sea r = _mz_lector(datos, c)
+            info["bloque_min"] = _mz_bits(r, 16)
+            info["bloque_max"] = _mz_bits(r, 16)
+            info["trama_min"] = _mz_bits(r, 24)
+            info["trama_max"] = _mz_bits(r, 24)
+            info["tasa"] = _mz_bits(r, 20)
+            info["canales"] = _mz_bits(r, 3) + 1
+            info["bits"] = _mz_bits(r, 5) + 1
+            info["muestras"] = _mz_bits(r, 36)
+            sea md5 = []
+            sea k = 0
+            mientras (k < 16) {
+                sea x = _mz_bits(r, 8)
+                md5.agregar(subcadena("0123456789abcdef", piso(x / 16), piso(x / 16) + 1) + subcadena("0123456789abcdef", x % 16, x % 16 + 1))
+                k = k + 1
+            }
+            info["md5"] = unir(md5, "")
+        } sino si (tipo_b == 4) {
+            sea le = funcion(q) { retornar byte_en(datos, q) + byte_en(datos, q + 1) * 256 + byte_en(datos, q + 2) * 65536 + byte_en(datos, q + 3) * 16777216 }
+            sea lv = le(c)
+            info["vendedor"] = subcadena(datos, c + 4, c + 4 + lv)
+            sea q = c + 4 + lv
+            sea n = le(q)
+            q = q + 4
+            sea k = 0
+            mientras (k < n) {
+                sea l = le(q)
+                sea e = subcadena(datos, q + 4, q + 4 + l)
+                sea igual_en = texto_indice(e, "=")
+                si (igual_en > 0) { info["etiquetas"][texto_mayusculas(subcadena(e, 0, igual_en))] = subcadena(e, igual_en + 1, longitud(e)) }
+                q = q + 4 + l
+                k = k + 1
+            }
+        }
+        p = c + largo
+    }
+    info["inicio_audio"] = p
+    retornar info
+}
+
+/// Decodifica un FLAC. opciones: "verificar_crc" (verdadero). Devuelve un
+/// sonido {"tasa", "canales", "bits", "pcm" (16 bits intercalado),
+/// "muestras" (listas por canal con los valores originales), "etiquetas"}.
+funcion mezcla_flac_decodificar(datos, opciones) {
+    sea op = opciones ?? {}
+    sea info = mezcla_flac_info(datos)
+    sea canales = []
+    sea c = 0
+    mientras (c < info["canales"]) {
+        canales.agregar([])
+        c = c + 1
+    }
+    sea r = _mz_lector(datos, info["inicio_audio"])
+    sea total = longitud(datos)
+    mientras (r["p"] / 8 + 2 < total) {
+        sea inicio = r["p"] / 8
+        sea sinc = _mz_bits(r, 14)
+        si (sinc != 16382) { lanzar "flac: sincronía perdida en el byte " + inicio }
+        _mz_bits(r, 1)
+        _mz_bits(r, 1)
+        sea cod_tam = _mz_bits(r, 4)
+        sea cod_tasa = _mz_bits(r, 4)
+        sea asig = _mz_bits(r, 4)
+        sea cod_bps = _mz_bits(r, 3)
+        _mz_bits(r, 1)
+        _mz_utf8(r)
+        sea tam = _MZ_TAMANOS[cod_tam]
+        si (cod_tam == 6) { tam = _mz_bits(r, 8) + 1 }
+        si (cod_tam == 7) { tam = _mz_bits(r, 16) + 1 }
+        si (cod_tasa == 12) { _mz_bits(r, 8) }
+        si (cod_tasa == 13 o cod_tasa == 14) { _mz_bits(r, 16) }
+        sea fin_cab = r["p"] / 8
+        sea crc8 = _mz_bits(r, 8)
+        si ((op["verificar_crc"] ?? verdadero) y crc8 != _mz_crc8(datos, inicio, fin_cab)) { lanzar "flac: CRC-8 de cabecera no coincide" }
+        sea bps = info["bits"]
+        si (cod_bps != 0) { bps = _MZ_BPS[cod_bps] }
+        sea nc = asig + 1
+        si (asig >= 8) { nc = 2 }
+        sea sub = []
+        sea k = 0
+        mientras (k < nc) {
+            sea b = bps
+            // El canal lado lleva un bit más.
+            si ((asig == 8 y k == 1) o (asig == 9 y k == 0) o (asig == 10 y k == 1)) { b = bps + 1 }
+            sub.agregar(_mz_subtrama(r, tam, b))
+            k = k + 1
+        }
+        _mz_alinear(r)
+        sea fin = r["p"] / 8
+        sea crc16 = _mz_bits(r, 16)
+        si ((op["verificar_crc"] ?? verdadero) y crc16 != _mz_crc16(datos, inicio, fin)) { lanzar "flac: CRC-16 de trama no coincide" }
+        sea i = 0
+        si (asig == 8) {
+            mientras (i < tam) {
+                sub[1][i] = sub[0][i] - sub[1][i]
+                i = i + 1
+            }
+        } sino si (asig == 9) {
+            mientras (i < tam) {
+                sub[0][i] = sub[0][i] + sub[1][i]
+                i = i + 1
+            }
+        } sino si (asig == 10) {
+            mientras (i < tam) {
+                sea lado = sub[1][i]
+                sea medio = sub[0][i] * 2 + lado % 2
+                si (lado < 0 y lado % 2 != 0) { medio = sub[0][i] * 2 + 1 }
+                sub[0][i] = (medio + lado) / 2
+                sub[1][i] = (medio - lado) / 2
+                i = i + 1
+            }
+        }
+        k = 0
+        mientras (k < nc) {
+            para v en sub[k] { canales[k].agregar(v) }
+            k = k + 1
+        }
+    }
+    // PCM 16 bits intercalado.
+    sea n = longitud(canales[0])
+    sea desplazar = potencia(2, absoluto(info["bits"] - 16))
+    sea plano = []
+    sea i = 0
+    mientras (i < n) {
+        para ch en canales {
+            sea v = ch[i]
+            si (info["bits"] > 16) { v = piso(v / desplazar) }
+            si (info["bits"] < 16) { v = v * desplazar }
+            plano.agregar(v)
+        }
+        i = i + 1
+    }
+    retornar {"tasa": info["tasa"], "canales": info["canales"], "bits": info["bits"], "pcm": pcm_de_lista(plano), "muestras": canales, "etiquetas": info["etiquetas"]}
+}
+
+/// MD5 (hex) de las muestras en little endian, como el de STREAMINFO.
+funcion mezcla_md5_muestras(canales, bits) {
+    sea ancho = piso((bits + 7) / 8)
+    sea crudo = []
+    sea n = longitud(canales[0])
+    sea i = 0
+    mientras (i < n) {
+        para ch en canales {
+            sea v = ch[i]
+            si (v < 0) { v = v + potencia(2, ancho * 8) }
+            crudo.agregar(bytes_entero(v, ancho, 1))
+        }
+        i = i + 1
+    }
+    retornar md5(unir(crudo, ""))
+}
+
+/// Decodifica y comprueba el MD5 de STREAMINFO: {"valido", "md5", "calculado"}.
+funcion mezcla_flac_verificar(datos) {
+    sea info = mezcla_flac_info(datos)
+    sea s = mezcla_flac_decodificar(datos, nulo)
+    sea m = mezcla_md5_muestras(s["muestras"], info["bits"])
+    retornar {"valido": m == info["md5"] o info["md5"] == "00000000000000000000000000000000", "md5": info["md5"], "calculado": m}
+}
+
+// ---------- codificador ----------
+
+funcion _mz_escritor() { retornar {"bytes": [], "acc": 0, "n": 0} }
+
+funcion _mz_poner(w, v, n) {
+    // v sin signo de n bits (n <= 32).
+    sea k = n - 1
+    mientras (k >= 0) {
+        sea bit = piso(v / potencia(2, k)) % 2
+        w["acc"] = w["acc"] * 2 + bit
+        w["n"] = w["n"] + 1
+        si (w["n"] == 8) {
+            w["bytes"].agregar(w["acc"])
+            w["acc"] = 0
+            w["n"] = 0
+        }
+        k = k - 1
+    }
+}
+
+funcion _mz_poner_signo(w, v, n) {
+    si (v < 0) { _mz_poner(w, v + potencia(2, n), n) } sino { _mz_poner(w, v, n) }
+}
+
+funcion _mz_poner_unario(w, q) {
+    sea k = 0
+    mientras (k < q) {
+        _mz_poner(w, 0, 1)
+        k = k + 1
+    }
+    _mz_poner(w, 1, 1)
+}
+
+funcion _mz_rellenar(w) { si (w["n"] > 0) { _mz_poner(w, 0, 8 - w["n"]) } }
+
+funcion _mz_a_texto(lista) {
+    sea partes = []
+    para b en lista { partes.agregar(bytes_entero(b, 1, 0)) }
+    retornar unir(partes, "")
+}
+
+funcion _mz_utf8_poner(w, v) {
+    si (v < 128) {
+        _mz_poner(w, v, 8)
+        retornar nulo
+    }
+    sea bytes_ = []
+    sea x = v
+    sea max_primero = 32
+    sea n = 1
+    mientras (x >= max_primero) {
+        bytes_.agregar(128 + x % 64)
+        x = piso(x / 64)
+        n = n + 1
+        max_primero = max_primero / 2
+    }
+    sea pre = 256 - potencia(2, 8 - n)
+    _mz_poner(w, pre + x, 8)
+    sea i = longitud(bytes_) - 1
+    mientras (i >= 0) {
+        _mz_poner(w, bytes_[i], 8)
+        i = i - 1
+    }
+}
+
+// Mejor parámetro Rice para una lista de residuos (por la media).
+funcion _mz_param(res, a, b) {
+    sea suma = 0
+    sea i = a
+    mientras (i < b) {
+        sea v = res[i]
+        si (v < 0) { suma = suma + (0 - v) * 2 - 1 } sino { suma = suma + v * 2 }
+        i = i + 1
+    }
+    sea n = b - a
+    si (n == 0) { retornar [0, 0] }
+    sea mejor = 0
+    sea costo_mejor = -1
+    sea k = 0
+    mientras (k <= 14) {
+        // costo estimado: n*(k+1) + suma / 2^k
+        sea costo = n * (k + 1) + piso(suma / potencia(2, k))
+        si (costo_mejor < 0 o costo < costo_mejor) {
+            costo_mejor = costo
+            mejor = k
+        }
+        k = k + 1
+    }
+    retornar [mejor, costo_mejor]
+}
+
+funcion _mz_residuo_cod(w, res, orden, tam) {
+    // Elige el orden de partición (0..4) con menor costo.
+    sea mejor_po = 0
+    sea mejor_c = -1
+    sea po = 0
+    mientras (po <= 6) {
+        sea parts = potencia(2, po)
+        si (tam % parts != 0 o tam / parts <= orden) { romper }
+        sea c = 0
+        sea p = 0
+        mientras (p < parts) {
+            sea a = p * tam / parts
+            sea b = (p + 1) * tam / parts
+            si (p == 0) { a = orden }
+            c = c + _mz_param(res, a, b)[1] + 4
+            p = p + 1
+        }
+        si (mejor_c < 0 o c < mejor_c) {
+            mejor_c = c
+            mejor_po = po
+        }
+        po = po + 1
+    }
+    _mz_poner(w, 0, 2)
+    _mz_poner(w, mejor_po, 4)
+    sea parts = potencia(2, mejor_po)
+    sea p = 0
+    mientras (p < parts) {
+        sea a = p * tam / parts
+        sea b = (p + 1) * tam / parts
+        si (p == 0) { a = orden }
+        sea k = _mz_param(res, a, b)[0]
+        _mz_poner(w, k, 4)
+        sea pot = potencia(2, k)
+        sea i = a
+        mientras (i < b) {
+            sea v = res[i]
+            sea u = v * 2
+            si (v < 0) { u = (0 - v) * 2 - 1 }
+            _mz_poner_unario(w, piso(u / pot))
+            si (k > 0) { _mz_poner(w, u % pot, k) }
+            i = i + 1
+        }
+        p = p + 1
+    }
+}
+
+funcion _mz_subtrama_cod(w, m, bps) {
+    sea tam = longitud(m)
+    // ¿Constante?
+    sea constante = verdadero
+    para v en m { si (v != m[0]) { constante = falso } }
+    si (constante) {
+        _mz_poner(w, 0, 8)
+        _mz_poner_signo(w, m[0], bps)
+        retornar nulo
+    }
+    // Elige el orden fijo con menor suma absoluta de residuos.
+    sea mejor = 0
+    sea mejor_s = -1
+    sea mejor_res = nulo
+    sea orden = 0
+    mientras (orden <= 4 y orden < tam) {
+        sea c = _MZ_FIJOS[orden]
+        sea res = []
+        sea i = 0
+        sea s = 0
+        mientras (i < tam) {
+            si (i < orden) { res.agregar(0) } sino {
+                sea pred = 0
+                sea j = 0
+                mientras (j < orden) {
+                    pred = pred + c[j] * m[i - 1 - j]
+                    j = j + 1
+                }
+                sea r = m[i] - pred
+                res.agregar(r)
+                s = s + absoluto(r)
+            }
+            i = i + 1
+        }
+        si (mejor_s < 0 o s < mejor_s) {
+            mejor_s = s
+            mejor = orden
+            mejor_res = res
+        }
+        orden = orden + 1
+    }
+    _mz_poner(w, 0, 1)
+    _mz_poner(w, 8 + mejor, 6)
+    _mz_poner(w, 0, 1)
+    sea i = 0
+    mientras (i < mejor) {
+        _mz_poner_signo(w, m[i], bps)
+        i = i + 1
+    }
+    _mz_residuo_cod(w, mejor_res, mejor, tam)
+}
+
+/// Codifica a FLAC. sonido: {"tasa", "canales", "pcm"} (16 bits) o
+/// {"tasa", "bits", "muestras": [canal0, canal1, ...]}. opciones:
+/// "bloque" (4096), "etiquetas" {"TITLE": ...}.
+funcion mezcla_flac_codificar(sonido, opciones) {
+    sea op = opciones ?? {}
+    sea tasa = sonido["tasa"]
+    sea bits = sonido["bits"] ?? 16
+    sea canales = sonido["muestras"] ?? nulo
+    si (canales == nulo) {
+        sea nc = sonido["canales"] ?? 1
+        canales = []
+        sea c = 0
+        mientras (c < nc) {
+            canales.agregar([])
+            c = c + 1
+        }
+        sea total = longitud(sonido["pcm"]) / 2
+        sea i = 0
+        mientras (i < total) {
+            canales[i % nc].agregar(pcm_muestra(sonido["pcm"], i))
+            i = i + 1
+        }
+        bits = 16
+    }
+    sea nc = longitud(canales)
+    si (nc < 1 o nc > 8) { lanzar "flac: de 1 a 8 canales" }
+    sea n = longitud(canales[0])
+    sea bloque = op["bloque"] ?? 4096
+    sea md5_hex = mezcla_md5_muestras(canales, bits)
+    // Tramas.
+    sea tramas = []
+    sea min_t = -1
+    sea max_t = 0
+    sea num = 0
+    sea pos = 0
+    mientras (pos < n) {
+        sea tam = minimo(bloque, n - pos)
+        sea w = _mz_escritor()
+        _mz_poner(w, 16382, 14)
+        _mz_poner(w, 0, 2)
+        sea cod_tam = 7
+        si (tam == 4096) { cod_tam = 12 } sino si (tam == 1152) { cod_tam = 3 } sino si (tam <= 256) { cod_tam = 6 }
+        _mz_poner(w, cod_tam, 4)
+        _mz_poner(w, 0, 4)
+        // Estéreo: elige independiente o medio/lado.
+        sea sub = []
+        sea k = 0
+        mientras (k < nc) {
+            sea x = []
+            sea j = 0
+            mientras (j < tam) {
+                x.agregar(canales[k][pos + j])
+                j = j + 1
+            }
+            sub.agregar(x)
+            k = k + 1
+        }
+        sea asig = nc - 1
+        si (nc == 2) {
+            sea medio = []
+            sea lado = []
+            sea si_ = 0
+            sea sm = 0
+            sea j = 0
+            mientras (j < tam) {
+                sea l = sub[0][j]
+                sea r = sub[1][j]
+                medio.agregar(piso((l + r) / 2))
+                lado.agregar(l - r)
+                j = j + 1
+            }
+            // Heurística: energía de diferencias de primer orden.
+            j = 1
+            mientras (j < tam) {
+                si_ = si_ + absoluto(sub[0][j] - sub[0][j - 1]) + absoluto(sub[1][j] - sub[1][j - 1])
+                sm = sm + absoluto(medio[j] - medio[j - 1]) + absoluto(lado[j] - lado[j - 1])
+                j = j + 1
+            }
+            si (sm < si_) {
+                asig = 10
+                sub = [medio, lado]
+            }
+        }
+        _mz_poner(w, asig, 4)
+        sea cod_bps = 0
+        si (bits == 8) { cod_bps = 1 } sino si (bits == 12) { cod_bps = 2 } sino si (bits == 16) { cod_bps = 4 } sino si (bits == 20) { cod_bps = 5 } sino si (bits == 24) { cod_bps = 6 }
+        _mz_poner(w, cod_bps, 3)
+        _mz_poner(w, 0, 1)
+        _mz_utf8_poner(w, num)
+        si (cod_tam == 6) { _mz_poner(w, tam - 1, 8) }
+        si (cod_tam == 7) { _mz_poner(w, tam - 1, 16) }
+        sea cab = _mz_a_texto(w["bytes"])
+        _mz_poner(w, _mz_crc8(cab, 0, longitud(cab)), 8)
+        k = 0
+        mientras (k < longitud(sub)) {
+            sea b = bits
+            si (asig == 10 y k == 1) { b = bits + 1 }
+            _mz_subtrama_cod(w, sub[k], b)
+            k = k + 1
+        }
+        _mz_rellenar(w)
+        sea cuerpo = _mz_a_texto(w["bytes"])
+        sea crc = _mz_crc16(cuerpo, 0, longitud(cuerpo))
+        sea trama = cuerpo + bytes_entero(crc, 2, 0)
+        tramas.agregar(trama)
+        si (min_t < 0 o longitud(trama) < min_t) { min_t = longitud(trama) }
+        si (longitud(trama) > max_t) { max_t = longitud(trama) }
+        pos = pos + tam
+        num = num + 1
+    }
+    // STREAMINFO.
+    sea w = _mz_escritor()
+    sea bmin = bloque
+    si (n < bloque) { bmin = maximo(16, n) }
+    _mz_poner(w, minimo(bmin, bloque), 16)
+    _mz_poner(w, minimo(maximo(16, n), bloque), 16)
+    _mz_poner(w, maximo(0, min_t), 24)
+    _mz_poner(w, max_t, 24)
+    _mz_poner(w, tasa, 20)
+    _mz_poner(w, nc - 1, 3)
+    _mz_poner(w, bits - 1, 5)
+    _mz_poner(w, piso(n / 4294967296), 4)
+    _mz_poner(w, n % 4294967296, 32)
+    sea i = 0
+    mientras (i < 32) {
+        _mz_poner(w, _mz_hex(subcadena(md5_hex, i, i + 2)), 8)
+        i = i + 2
+    }
+    sea info = _mz_a_texto(w["bytes"])
+    sea etiquetas = op["etiquetas"] ?? nulo
+    sea salida = ["fLaC"]
+    sea ultimo_info = 128
+    si (etiquetas != nulo) { ultimo_info = 0 }
+    salida.agregar(bytes_entero(ultimo_info, 1, 0) + bytes_entero(longitud(info), 3, 0) + info)
+    si (etiquetas != nulo) {
+        sea vend = "C-Forge mezcla"
+        sea partes = [bytes_entero(longitud(vend), 4, 1), vend, bytes_entero(longitud(claves(etiquetas)), 4, 1)]
+        para k2 en claves(etiquetas) {
+            sea e = k2 + "=" + etiquetas[k2]
+            partes.agregar(bytes_entero(longitud(e), 4, 1))
+            partes.agregar(e)
+        }
+        sea vc = unir(partes, "")
+        salida.agregar(bytes_entero(128 + 4, 1, 0) + bytes_entero(longitud(vc), 3, 0) + vc)
+    }
+    para t en tramas { salida.agregar(t) }
+    retornar unir(salida, "")
+}
+
+// ---------- fuentes y mezclador ----------
+// Una fuente es {"tasa", "canales", "c": [listas de flotantes -1..1]}.
+
+/// Convierte un sonido {"tasa", "canales", "pcm"} a fuente.
+funcion mezcla_fuente(sonido) {
+    si ((sonido["c"] ?? nulo) != nulo) { retornar sonido }
+    sea nc = sonido["canales"] ?? 1
+    sea c = []
+    sea k = 0
+    mientras (k < nc) {
+        c.agregar([])
+        k = k + 1
+    }
+    sea total = longitud(sonido["pcm"]) / 2
+    sea i = 0
+    mientras (i < total) {
+        c[i % nc].agregar(pcm_muestra(sonido["pcm"], i) / 32768)
+        i = i + 1
+    }
+    retornar {"tasa": sonido["tasa"], "canales": nc, "c": c}
+}
+
+/// Fuente desde listas de muestras flotantes por canal.
+funcion mezcla_desde_muestras(canales, tasa) { retornar {"tasa": tasa, "canales": longitud(canales), "c": canales} }
+
+/// Silencio de `ms` milisegundos.
+funcion mezcla_silencio(ms, tasa, canales) {
+    sea n = piso(tasa * ms / 1000)
+    sea c = []
+    sea k = 0
+    mientras (k < (canales ?? 2)) {
+        sea x = []
+        sea i = 0
+        mientras (i < n) {
+            x.agregar(0)
+            i = i + 1
+        }
+        c.agregar(x)
+        k = k + 1
+    }
+    retornar {"tasa": tasa, "canales": canales ?? 2, "c": c}
+}
+
+funcion _mz_mapear(f, fn) {
+    sea s = mezcla_fuente(f)
+    sea c = []
+    sea k = 0
+    para ch en s["c"] {
+        sea x = []
+        sea i = 0
+        mientras (i < longitud(ch)) {
+            x.agregar(fn(ch[i], i, k))
+            i = i + 1
+        }
+        c.agregar(x)
+        k = k + 1
+    }
+    retornar {"tasa": s["tasa"], "canales": s["canales"], "c": c}
+}
+
+funcion mezcla_cuadros(f) { retornar longitud(mezcla_fuente(f)["c"][0]) }
+funcion mezcla_duracion_ms(f) { retornar mezcla_cuadros(f) * 1000 / mezcla_fuente(f)["tasa"] }
+
+/// Multiplica por una ganancia lineal.
+funcion mezcla_ganancia(f, g) { retornar _mz_mapear(f, funcion(v, i, k) { retornar v * g }) }
+
+/// Ganancia en decibelios.
+funcion mezcla_db(f, db) { retornar mezcla_ganancia(f, potencia(10, db / 20)) }
+
+/// A mono (promedio) o a estéreo (duplica).
+funcion mezcla_canales(f, n) {
+    sea s = mezcla_fuente(f)
+    si (s["canales"] == n) { retornar s }
+    sea mono = s["c"][0]
+    si (s["canales"] > 1) {
+        mono = []
+        sea i = 0
+        mientras (i < longitud(s["c"][0])) {
+            sea t = 0
+            para ch en s["c"] { t = t + ch[i] }
+            mono.agregar(t / s["canales"])
+            i = i + 1
+        }
+    }
+    sea c = []
+    sea k = 0
+    mientras (k < n) {
+        c.agregar(mono)
+        k = k + 1
+    }
+    retornar {"tasa": s["tasa"], "canales": n, "c": c}
+}
+
+/// Paneo estéreo de potencia constante, -1 izquierda … 1 derecha.
+funcion mezcla_panear(f, pan) {
+    sea s = mezcla_canales(f, 2)
+    sea a = (maximo(0 - 1, minimo(1, pan)) + 1) * 3.141592653589793 / 4
+    sea gl = coseno(a) * 1.4142135623730951
+    sea gr = seno(a) * 1.4142135623730951
+    retornar _mz_mapear(s, funcion(v, i, k) { si (k == 0) { retornar v * minimo(1, gl) } retornar v * minimo(1, gr) })
+}
+
+/// Remuestrea a otra tasa (interpolación lineal).
+funcion mezcla_remuestrear(f, tasa) {
+    sea s = mezcla_fuente(f)
+    si (s["tasa"] == tasa) { retornar s }
+    sea r = s["tasa"] / tasa
+    sea n = piso(longitud(s["c"][0]) / r)
+    sea c = []
+    para ch en s["c"] {
+        sea x = []
+        sea i = 0
+        mientras (i < n) {
+            sea p = i * r
+            sea a = piso(p)
+            sea fr = p - a
+            sea v0 = ch[a]
+            sea v1 = v0
+            si (a + 1 < longitud(ch)) { v1 = ch[a + 1] }
+            x.agregar(v0 + (v1 - v0) * fr)
+            i = i + 1
+        }
+        c.agregar(x)
+    }
+    retornar {"tasa": tasa, "canales": s["canales"], "c": c}
+}
+
+/// Cambia la velocidad (y el tono): 2 = el doble de rápido.
+funcion mezcla_velocidad(f, factor) {
+    sea s = mezcla_fuente(f)
+    sea t = mezcla_remuestrear({"tasa": s["tasa"] * factor, "canales": s["canales"], "c": s["c"]}, s["tasa"])
+    retornar t
+}
+
+/// Recorta entre desde_ms y hasta_ms (nulo = hasta el final).
+funcion mezcla_recortar(f, desde_ms, hasta_ms) {
+    sea s = mezcla_fuente(f)
+    sea a = piso(desde_ms * s["tasa"] / 1000)
+    sea b = longitud(s["c"][0])
+    si (hasta_ms != nulo) { b = minimo(b, piso(hasta_ms * s["tasa"] / 1000)) }
+    sea c = []
+    para ch en s["c"] {
+        sea x = []
+        sea i = a
+        mientras (i < b) {
+            x.agregar(ch[i])
+            i = i + 1
+        }
+        c.agregar(x)
+    }
+    retornar {"tasa": s["tasa"], "canales": s["canales"], "c": c}
+}
+
+/// Fundido de entrada y salida (milisegundos).
+funcion mezcla_fundido(f, entrada_ms, salida_ms) {
+    sea s = mezcla_fuente(f)
+    sea n = longitud(s["c"][0])
+    sea ne = piso((entrada_ms ?? 0) * s["tasa"] / 1000)
+    sea ns = piso((salida_ms ?? 0) * s["tasa"] / 1000)
+    retornar _mz_mapear(s, funcion(v, i, k) {
+        sea g = 1
+        si (ne > 0 y i < ne) { g = i / ne }
+        si (ns > 0 y i >= n - ns) { g = g * (n - i) / ns }
+        retornar v * g
+    })
+}
+
+/// Concatena fuentes (se adaptan a la tasa y canales de la primera).
+funcion mezcla_concatenar(fuentes) {
+    sea base = mezcla_fuente(fuentes[0])
+    sea c = []
+    para ch en base["c"] { c.agregar([]) }
+    para f en fuentes {
+        sea s = mezcla_canales(mezcla_remuestrear(f, base["tasa"]), base["canales"])
+        sea k = 0
+        para ch en s["c"] {
+            para v en ch { c[k].agregar(v) }
+            k = k + 1
+        }
+    }
+    retornar {"tasa": base["tasa"], "canales": base["canales"], "c": c}
+}
+
+/// Repite una fuente n veces.
+funcion mezcla_repetir(f, n) {
+    sea l = []
+    sea i = 0
+    mientras (i < n) {
+        l.agregar(f)
+        i = i + 1
+    }
+    retornar mezcla_concatenar(l)
+}
+
+/// Retrasa una fuente agregando silencio al inicio.
+funcion mezcla_retrasar(f, ms) {
+    sea s = mezcla_fuente(f)
+    retornar mezcla_concatenar([mezcla_silencio(ms, s["tasa"], s["canales"]), s])
+}
+
+/// Mezcla (suma) fuentes; cada elemento puede ser una fuente o
+/// {"fuente", "inicio_ms", "ganancia", "pan"}. opciones: "tasa",
+/// "canales" (2), "normalizar" (falso: si pasa de 1, baja el volumen).
+funcion mezcla_mezclar(pistas, opciones) {
+    sea op = opciones ?? {}
+    sea tasa = op["tasa"] ?? nulo
+    sea nc = op["canales"] ?? 2
+    sea listas = []
+    para p en pistas {
+        sea f = p
+        sea inicio = 0
+        si ((p["fuente"] ?? nulo) != nulo) {
+            f = p["fuente"]
+            inicio = p["inicio_ms"] ?? 0
+            si ((p["ganancia"] ?? nulo) != nulo) { f = mezcla_ganancia(f, p["ganancia"]) }
+            si ((p["pan"] ?? nulo) != nulo) { f = mezcla_panear(f, p["pan"]) }
+        }
+        f = mezcla_fuente(f)
+        si (tasa == nulo) { tasa = f["tasa"] }
+        f = mezcla_canales(mezcla_remuestrear(f, tasa), nc)
+        listas.agregar([f, piso(inicio * tasa / 1000)])
+    }
+    sea n = 0
+    para x en listas { n = maximo(n, x[1] + longitud(x[0]["c"][0])) }
+    sea c = []
+    sea k = 0
+    mientras (k < nc) {
+        sea z = []
+        sea i = 0
+        mientras (i < n) {
+            z.agregar(0)
+            i = i + 1
+        }
+        c.agregar(z)
+        k = k + 1
+    }
+    para x en listas {
+        k = 0
+        mientras (k < nc) {
+            sea ch = x[0]["c"][k]
+            sea i = 0
+            mientras (i < longitud(ch)) {
+                c[k][x[1] + i] = c[k][x[1] + i] + ch[i]
+                i = i + 1
+            }
+            k = k + 1
+        }
+    }
+    sea r = {"tasa": tasa, "canales": nc, "c": c}
+    si (op["normalizar"] ?? falso) {
+        sea pico = mezcla_pico(r)
+        si (pico > 1) { r = mezcla_ganancia(r, 1 / pico) }
+    }
+    retornar r
+}
+
+/// Pico absoluto (0..).
+funcion mezcla_pico(f) {
+    sea p = 0
+    para ch en mezcla_fuente(f)["c"] { para v en ch { si (absoluto(v) > p) { p = absoluto(v) } } }
+    retornar p
+}
+
+/// Valor RMS.
+funcion mezcla_rms(f) {
+    sea s = 0
+    sea n = 0
+    para ch en mezcla_fuente(f)["c"] { para v en ch {
+        s = s + v * v
+        n = n + 1
+    } }
+    si (n == 0) { retornar 0 }
+    retornar raiz(s / n)
+}
+
+/// Normaliza el pico a `pico` (1 por defecto).
+funcion mezcla_normalizar(f, pico) {
+    sea p = mezcla_pico(f)
+    si (p == 0) { retornar mezcla_fuente(f) }
+    retornar mezcla_ganancia(f, (pico ?? 1) / p)
+}
+
+/// A sonido PCM de 16 bits {"tasa", "canales", "pcm"} (recorta en ±1).
+funcion mezcla_pcm(f) {
+    sea s = mezcla_fuente(f)
+    sea n = longitud(s["c"][0])
+    sea r = []
+    sea i = 0
+    mientras (i < n) {
+        para ch en s["c"] {
+            sea v = ch[i]
+            si (v > 1) { v = 1 }
+            si (v < 0 - 1) { v = 0 - 1 }
+            r.agregar(redondear(v * 32767))
+        }
+        i = i + 1
+    }
+    retornar {"tasa": s["tasa"], "canales": s["canales"], "pcm": pcm_de_lista(r)}
+}
+
+/// A bytes de un archivo WAV de 16 bits.
+funcion mezcla_wav(f) {
+    sea p = mezcla_pcm(f)
+    retornar wav_codificar(p["pcm"], p["tasa"], p["canales"])
+}
+
+/// Lee WAV o FLAC (detecta por la cabecera) como fuente.
+funcion mezcla_abrir(datos) {
+    si (subcadena(datos, 0, 4) == "fLaC") {
+        sea s = mezcla_flac_decodificar(datos, nulo)
+        sea c = []
+        sea esc = potencia(2, s["bits"] - 1)
+        para ch en s["muestras"] {
+            sea x = []
+            para v en ch { x.agregar(v / esc) }
+            c.agregar(x)
+        }
+        retornar {"tasa": s["tasa"], "canales": s["canales"], "c": c}
+    }
+    sea r = wav_decodificar(datos)
+    retornar mezcla_fuente({"tasa": r[0], "canales": r[1], "pcm": r[2]})
+}
+
+funcion _mz_hex(t) {
+    sea v = 0
+    sea i = 0
+    mientras (i < longitud(t)) {
+        sea d = texto_indice("0123456789abcdef", texto_minusculas(subcadena(t, i, i + 1)))
+        si (d < 0) { retornar v }
+        v = v * 16 + d
+        i = i + 1
+    }
+    retornar v
+}
