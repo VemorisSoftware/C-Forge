@@ -1,0 +1,792 @@
+// stdlib/consulta_archivos.cfv — SQL sobre CSV, JSON y tablas en memoria:
+// SELECT con expresiones y alias, WHERE (AND/OR/NOT, LIKE, IN, BETWEEN,
+// IS NULL), JOIN / LEFT JOIN, GROUP BY con COUNT/SUM/AVG/MIN/MAX,
+// HAVING, ORDER BY, LIMIT/OFFSET, DISTINCT y parámetros (?) para no
+// concatenar textos del usuario. Solo lectura: no hay forma de modificar
+// ni borrar archivos desde una consulta. Inspirada en DataFusion / DuckDB
+// (Apache/MIT). En inglés: importar "sqlfiles".
+//
+//   importar "consulta_archivos"
+//   sea c = consulta_nueva()
+//   consulta_registrar_csv(c, "ventas", leer_archivo("ventas.csv"))
+//   consulta_sql(c, "SELECT region, SUM(monto) AS total FROM ventas WHERE monto > ? GROUP BY region ORDER BY total DESC", [100])
+//   // → {"columnas": ["region", "total"], "filas": [{…}, …]}
+
+importar "tabla"
+importar "json"
+
+funcion consulta_nueva() { retornar {"tablas": {}} }
+
+/// Registra filas (lista de mapas) o una tabla de "tabla" con un nombre.
+funcion consulta_registrar(c, nombre, datos) {
+    sea filas = datos
+    sea cols = nulo
+    si (tipo(datos) == "mapa" y tiene_clave(datos, "filas")) { filas = datos["filas"]  cols = datos["columnas"] }
+    si (cols == nulo) {
+        cols = []
+        sea vistos = {}
+        para f en filas { para k en claves(f) { si (tiene_clave(vistos, k) == falso) { vistos[k] = verdadero  cols.agregar(k) } } }
+    }
+    c["tablas"][texto_minusculas(nombre)] = {"columnas": cols, "filas": filas}
+    retornar c
+}
+
+funcion consulta_registrar_csv(c, nombre, texto, separador) { retornar consulta_registrar(c, nombre, tabla_desde_csv(texto, separador)) }
+
+/// JSON: una lista de objetos, o JSON Lines (un objeto por línea).
+funcion consulta_registrar_json(c, nombre, texto) {
+    sea t = texto_recortar("" + texto)
+    sea filas = []
+    si (texto_empieza_con(t, "[")) { filas = json_parsear(t) } sino {
+        para l en texto_dividir(t, "\n") { si (texto_recortar(l) != "") { filas.agregar(json_parsear(l)) } }
+    }
+    retornar consulta_registrar(c, nombre, filas)
+}
+
+funcion consulta_tablas(c) { retornar claves(c["tablas"]) }
+
+// ── Léxico ────────────────────────────────────────────────────────────────
+
+sea _CQ_CLAVES = {"select": 1, "from": 1, "where": 1, "group": 1, "by": 1, "having": 1, "order": 1, "limit": 1, "offset": 1, "and": 1, "or": 1, "not": 1, "as": 1, "asc": 1, "desc": 1, "join": 1, "left": 1, "inner": 1, "on": 1, "like": 1, "ilike": 1, "in": 1, "is": 1, "null": 1, "true": 1, "false": 1, "between": 1, "distinct": 1, "case": 1, "when": 1, "then": 1, "else": 1, "end": 1}
+
+funcion _cq_lexico(sql) {
+    sea s = "" + sql
+    sea r = []
+    sea i = 0
+    sea n = longitud(s)
+    sea param = 0
+    mientras (i < n) {
+        sea c = subcadena(s, i, i + 1)
+        sea b = byte_en(s, i)
+        si (c == " " o c == "\n" o c == "\t" o c == "\r") { i = i + 1 } sino {
+            si (c == "-" y i + 1 < n y subcadena(s, i + 1, i + 2) == "-") {
+                mientras (i < n y subcadena(s, i, i + 1) != "\n") { i = i + 1 }
+            } sino {
+                si (c == "'") {
+                    sea v = ""
+                    i = i + 1
+                    sea cerrado = falso
+                    mientras (i < n y cerrado == falso) {
+                        sea d = subcadena(s, i, i + 1)
+                        si (d == "'") {
+                            si (i + 1 < n y subcadena(s, i + 1, i + 2) == "'") { v = v + "'"  i = i + 2 } sino { cerrado = verdadero  i = i + 1 }
+                        } sino { v = v + d  i = i + 1 }
+                    }
+                    si (cerrado == falso) { lanzar "consulta: texto sin cerrar" }
+                    r.agregar({"t": "texto", "v": v})
+                } sino {
+                    si (c == "\"" o c == "`") {
+                        sea fin = texto_indice(subcadena(s, i + 1, n), c)
+                        si (fin < 0) { lanzar "consulta: identificador sin cerrar" }
+                        r.agregar({"t": "id", "v": subcadena(s, i + 1, i + 1 + fin)})
+                        i = i + fin + 2
+                    } sino {
+                        si (b >= 48 y b <= 57) {
+                            sea j = i
+                            mientras (j < n y ((byte_en(s, j) >= 48 y byte_en(s, j) <= 57) o subcadena(s, j, j + 1) == ".")) { j = j + 1 }
+                            r.agregar({"t": "num", "v": a_numero(subcadena(s, i, j))})
+                            i = j
+                        } sino {
+                            si ((b >= 65 y b <= 90) o (b >= 97 y b <= 122) o b == 95 o b >= 128) {
+                                sea j = i
+                                mientras (j < n y ((byte_en(s, j) >= 65 y byte_en(s, j) <= 90) o (byte_en(s, j) >= 97 y byte_en(s, j) <= 122) o (byte_en(s, j) >= 48 y byte_en(s, j) <= 57) o byte_en(s, j) == 95 o byte_en(s, j) >= 128)) { j = j + 1 }
+                                sea w = subcadena(s, i, j)
+                                si (tiene_clave(_CQ_CLAVES, texto_minusculas(w))) { r.agregar({"t": "kw", "v": texto_minusculas(w)}) } sino { r.agregar({"t": "id", "v": w}) }
+                                i = j
+                            } sino {
+                                sea dos = subcadena(s, i, i + 2)
+                                si (dos == "<=" o dos == ">=" o dos == "<>" o dos == "!=" o dos == "||") {
+                                    r.agregar({"t": "op", "v": dos})
+                                    i = i + 2
+                                } sino {
+                                    si (c == "?") {
+                                        r.agregar({"t": "param", "v": param})
+                                        param = param + 1
+                                    } sino {
+                                        si (texto_indice("(),.*+-/%=<>", c) < 0) { lanzar "consulta: carácter inesperado '" + c + "'" }
+                                        r.agregar({"t": "op", "v": c})
+                                    }
+                                    i = i + 1
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+    r.agregar({"t": "fin", "v": ""})
+    retornar r
+}
+
+// ── Sintaxis ──────────────────────────────────────────────────────────────
+
+funcion _cq_ver(p) { retornar p["toks"][p["i"]] }
+funcion _cq_avanzar(p) {
+    sea t = p["toks"][p["i"]]
+    p["i"] = p["i"] + 1
+    retornar t
+}
+funcion _cq_es(p, t, v) {
+    sea x = _cq_ver(p)
+    retornar x["t"] == t y x["v"] == v
+}
+funcion _cq_acepta(p, t, v) {
+    si (_cq_es(p, t, v)) { _cq_avanzar(p)  retornar verdadero }
+    retornar falso
+}
+funcion _cq_espera(p, t, v) {
+    si (_cq_acepta(p, t, v) == falso) { lanzar "consulta: se esperaba '" + v + "' cerca de '" + _cq_ver(p)["v"] + "'" }
+}
+
+funcion _cq_expr(p) { retornar _cq_o(p) }
+
+funcion _cq_o(p) {
+    sea a = _cq_y(p)
+    mientras (_cq_acepta(p, "kw", "or")) { a = {"k": "bin", "op": "or", "a": a, "b": _cq_y(p)} }
+    retornar a
+}
+
+funcion _cq_y(p) {
+    sea a = _cq_no(p)
+    mientras (_cq_acepta(p, "kw", "and")) { a = {"k": "bin", "op": "and", "a": a, "b": _cq_no(p)} }
+    retornar a
+}
+
+funcion _cq_no(p) {
+    si (_cq_acepta(p, "kw", "not")) { retornar {"k": "no", "a": _cq_no(p)} }
+    retornar _cq_cmp(p)
+}
+
+funcion _cq_cmp(p) {
+    sea a = _cq_suma(p)
+    sea t = _cq_ver(p)
+    si (t["t"] == "op" y (t["v"] == "=" o t["v"] == "!=" o t["v"] == "<>" o t["v"] == "<" o t["v"] == ">" o t["v"] == "<=" o t["v"] == ">=")) {
+        _cq_avanzar(p)
+        sea op = t["v"]
+        si (op == "<>") { op = "!=" }
+        retornar {"k": "bin", "op": op, "a": a, "b": _cq_suma(p)}
+    }
+    sea negar = falso
+    si (_cq_es(p, "kw", "not")) {
+        sea sig = p["toks"][p["i"] + 1]
+        si (sig["t"] == "kw" y (sig["v"] == "like" o sig["v"] == "in" o sig["v"] == "between" o sig["v"] == "ilike")) { _cq_avanzar(p)  negar = verdadero }
+    }
+    sea r = nulo
+    si (_cq_acepta(p, "kw", "like")) { r = {"k": "like", "a": a, "b": _cq_suma(p), "ci": falso} }
+    si (r == nulo y _cq_acepta(p, "kw", "ilike")) { r = {"k": "like", "a": a, "b": _cq_suma(p), "ci": verdadero} }
+    si (r == nulo y _cq_acepta(p, "kw", "in")) {
+        _cq_espera(p, "op", "(")
+        sea l = [_cq_expr(p)]
+        mientras (_cq_acepta(p, "op", ",")) { l.agregar(_cq_expr(p)) }
+        _cq_espera(p, "op", ")")
+        r = {"k": "in", "a": a, "l": l}
+    }
+    si (r == nulo y _cq_acepta(p, "kw", "between")) {
+        sea lo = _cq_suma(p)
+        _cq_espera(p, "kw", "and")
+        r = {"k": "between", "a": a, "lo": lo, "hi": _cq_suma(p)}
+    }
+    si (r == nulo y _cq_acepta(p, "kw", "is")) {
+        sea neg2 = _cq_acepta(p, "kw", "not")
+        _cq_espera(p, "kw", "null")
+        r = {"k": "esnulo", "a": a}
+        si (neg2) { r = {"k": "no", "a": r} }
+    }
+    si (r == nulo) { retornar a }
+    si (negar) { retornar {"k": "no", "a": r} }
+    retornar r
+}
+
+funcion _cq_suma(p) {
+    sea a = _cq_mul(p)
+    sea seguir = verdadero
+    mientras (seguir) {
+        sea t = _cq_ver(p)
+        si (t["t"] == "op" y (t["v"] == "+" o t["v"] == "-" o t["v"] == "||")) {
+            _cq_avanzar(p)
+            a = {"k": "bin", "op": t["v"], "a": a, "b": _cq_mul(p)}
+        } sino { seguir = falso }
+    }
+    retornar a
+}
+
+funcion _cq_mul(p) {
+    sea a = _cq_unario(p)
+    sea seguir = verdadero
+    mientras (seguir) {
+        sea t = _cq_ver(p)
+        si (t["t"] == "op" y (t["v"] == "*" o t["v"] == "/" o t["v"] == "%")) {
+            _cq_avanzar(p)
+            a = {"k": "bin", "op": t["v"], "a": a, "b": _cq_unario(p)}
+        } sino { seguir = falso }
+    }
+    retornar a
+}
+
+funcion _cq_unario(p) {
+    si (_cq_acepta(p, "op", "-")) { retornar {"k": "bin", "op": "-", "a": {"k": "lit", "v": 0}, "b": _cq_unario(p)} }
+    retornar _cq_primario(p)
+}
+
+sea _CQ_AGREGADOS = {"count": 1, "sum": 1, "avg": 1, "min": 1, "max": 1}
+
+funcion _cq_primario(p) {
+    sea t = _cq_avanzar(p)
+    si (t["t"] == "num" o t["t"] == "texto") { retornar {"k": "lit", "v": t["v"]} }
+    si (t["t"] == "param") { retornar {"k": "param", "i": t["v"]} }
+    si (t["t"] == "kw" y t["v"] == "null") { retornar {"k": "lit", "v": nulo} }
+    si (t["t"] == "kw" y t["v"] == "true") { retornar {"k": "lit", "v": verdadero} }
+    si (t["t"] == "kw" y t["v"] == "false") { retornar {"k": "lit", "v": falso} }
+    si (t["t"] == "op" y t["v"] == "(") {
+        sea e = _cq_expr(p)
+        _cq_espera(p, "op", ")")
+        retornar e
+    }
+    si (t["t"] == "kw" y t["v"] == "case") {
+        sea casos = []
+        sea otro = {"k": "lit", "v": nulo}
+        mientras (_cq_acepta(p, "kw", "when")) {
+            sea cond = _cq_expr(p)
+            _cq_espera(p, "kw", "then")
+            casos.agregar([cond, _cq_expr(p)])
+        }
+        si (_cq_acepta(p, "kw", "else")) { otro = _cq_expr(p) }
+        _cq_espera(p, "kw", "end")
+        retornar {"k": "case", "casos": casos, "otro": otro}
+    }
+    si (t["t"] == "op" y t["v"] == "*") { retornar {"k": "todo"} }
+    si (t["t"] == "id") {
+        si (_cq_acepta(p, "op", "(")) {
+            sea nombre = texto_minusculas(t["v"])
+            sea args = []
+            sea distinto = falso
+            si (tiene_clave(_CQ_AGREGADOS, nombre)) { distinto = _cq_acepta(p, "kw", "distinct") }
+            si (_cq_acepta(p, "op", ")") == falso) {
+                si (_cq_acepta(p, "op", "*")) { args.agregar({"k": "todo"}) } sino {
+                    args.agregar(_cq_expr(p))
+                    mientras (_cq_acepta(p, "op", ",")) { args.agregar(_cq_expr(p)) }
+                }
+                _cq_espera(p, "op", ")")
+            }
+            si (tiene_clave(_CQ_AGREGADOS, nombre)) { retornar {"k": "agg", "f": nombre, "a": args[0] ?? {"k": "todo"}, "distinto": distinto} }
+            retornar {"k": "fn", "f": nombre, "args": args}
+        }
+        si (_cq_acepta(p, "op", ".")) {
+            sea c = _cq_avanzar(p)
+            si (c["t"] == "op" y c["v"] == "*") { retornar {"k": "todo", "tabla": texto_minusculas(t["v"])} }
+            retornar {"k": "col", "tabla": texto_minusculas(t["v"]), "c": c["v"]}
+        }
+        retornar {"k": "col", "tabla": nulo, "c": t["v"]}
+    }
+    lanzar "consulta: no esperaba '" + t["v"] + "'"
+}
+
+funcion _cq_nombre_tabla(p) {
+    sea t = _cq_avanzar(p)
+    si (t["t"] != "id" y t["t"] != "texto") { lanzar "consulta: se esperaba el nombre de una tabla" }
+    sea alias = texto_minusculas(t["v"])
+    _cq_acepta(p, "kw", "as")
+    si (_cq_ver(p)["t"] == "id") { alias = texto_minusculas(_cq_avanzar(p)["v"]) }
+    retornar {"tabla": texto_minusculas(t["v"]), "alias": alias}
+}
+
+funcion _cq_parsear(sql) {
+    sea p = {"toks": _cq_lexico(sql), "i": 0}
+    _cq_espera(p, "kw", "select")
+    sea q = {"distinto": _cq_acepta(p, "kw", "distinct"), "cols": [], "desde": nulo, "unir": [], "donde": nulo, "grupo": [], "tener": nulo, "orden": [], "limite": nulo, "salto": 0}
+    sea seguir = verdadero
+    mientras (seguir) {
+        sea e = _cq_expr(p)
+        sea alias = nulo
+        si (_cq_acepta(p, "kw", "as")) { alias = _cq_avanzar(p)["v"] } sino {
+            si (_cq_ver(p)["t"] == "id") { alias = _cq_avanzar(p)["v"] }
+        }
+        q["cols"].agregar({"e": e, "alias": alias})
+        seguir = _cq_acepta(p, "op", ",")
+    }
+    si (_cq_acepta(p, "kw", "from")) {
+        q["desde"] = _cq_nombre_tabla(p)
+        sea mas = verdadero
+        mientras (mas) {
+            sea izq = falso
+            si (_cq_acepta(p, "kw", "left")) { izq = verdadero }
+            si (izq == falso) { _cq_acepta(p, "kw", "inner") }
+            si (_cq_acepta(p, "kw", "join")) {
+                sea t = _cq_nombre_tabla(p)
+                _cq_espera(p, "kw", "on")
+                t["on"] = _cq_expr(p)
+                t["izquierda"] = izq
+                q["unir"].agregar(t)
+            } sino {
+                si (izq) { lanzar "consulta: se esperaba JOIN después de LEFT" }
+                mas = falso
+            }
+        }
+    }
+    si (_cq_acepta(p, "kw", "where")) { q["donde"] = _cq_expr(p) }
+    si (_cq_acepta(p, "kw", "group")) {
+        _cq_espera(p, "kw", "by")
+        q["grupo"].agregar(_cq_expr(p))
+        mientras (_cq_acepta(p, "op", ",")) { q["grupo"].agregar(_cq_expr(p)) }
+    }
+    si (_cq_acepta(p, "kw", "having")) { q["tener"] = _cq_expr(p) }
+    si (_cq_acepta(p, "kw", "order")) {
+        _cq_espera(p, "kw", "by")
+        sea mas = verdadero
+        mientras (mas) {
+            sea e = _cq_expr(p)
+            sea desc = falso
+            si (_cq_acepta(p, "kw", "desc")) { desc = verdadero } sino { _cq_acepta(p, "kw", "asc") }
+            q["orden"].agregar({"e": e, "desc": desc})
+            mas = _cq_acepta(p, "op", ",")
+        }
+    }
+    si (_cq_acepta(p, "kw", "limit")) {
+        sea t = _cq_avanzar(p)
+        si (t["t"] != "num" y t["t"] != "param") { lanzar "consulta: LIMIT espera un número" }
+        q["limite"] = t
+        si (_cq_acepta(p, "kw", "offset")) { q["salto"] = _cq_avanzar(p) }
+    }
+    si (_cq_ver(p)["t"] != "fin") { lanzar "consulta: sobra '" + _cq_ver(p)["v"] + "' al final" }
+    retornar q
+}
+
+// ── Evaluación ────────────────────────────────────────────────────────────
+
+funcion _cq_cmp_val(a, b) {
+    si (a == nulo o b == nulo) { retornar nulo }
+    si (tipo(a) == "numero" y tipo(b) == "numero") {
+        si (a < b) { retornar -1 }
+        si (a > b) { retornar 1 }
+        retornar 0
+    }
+    sea x = "" + a
+    sea z = "" + b
+    si (x < z) { retornar -1 }
+    si (x > z) { retornar 1 }
+    retornar 0
+}
+
+funcion _cq_like(v, patron, ci) {
+    sea t = "" + v
+    sea pt = "" + patron
+    si (ci) { t = texto_minusculas(t)  pt = texto_minusculas(pt) }
+    // Programación dinámica sobre % y _.
+    sea n = longitud(t)
+    sea m = longitud(pt)
+    sea prev = [verdadero]
+    sea j = 0
+    mientras (j < m) {
+        prev.agregar(prev[j] y subcadena(pt, j, j + 1) == "%")
+        j = j + 1
+    }
+    sea i = 1
+    mientras (i <= n) {
+        sea fila = [falso]
+        j = 1
+        mientras (j <= m) {
+            sea c = subcadena(pt, j - 1, j)
+            sea v2 = falso
+            si (c == "%") { v2 = fila[j - 1] o prev[j] } sino {
+                si (c == "_" o c == subcadena(t, i - 1, i)) { v2 = prev[j - 1] }
+            }
+            fila.agregar(v2)
+            j = j + 1
+        }
+        prev = fila
+        i = i + 1
+    }
+    retornar prev[m]
+}
+
+funcion _cq_col(fila, e) {
+    si (e["tabla"] != nulo) {
+        sea k = e["tabla"] + "." + e["c"]
+        si (tiene_clave(fila, k)) { retornar fila[k] }
+        lanzar "consulta: no existe la columna " + e["tabla"] + "." + e["c"]
+    }
+    si (tiene_clave(fila, e["c"])) { retornar fila[e["c"]] }
+    // Sin calificar: busca "x.col" único.
+    sea hallado = nulo
+    sea veces = 0
+    para k en claves(fila) {
+        si (texto_termina_con(k, "." + e["c"])) { hallado = fila[k]  veces = veces + 1 }
+    }
+    si (veces == 1) { retornar hallado }
+    si (veces > 1) { lanzar "consulta: la columna " + e["c"] + " es ambigua (usa tabla.columna)" }
+    lanzar "consulta: no existe la columna " + e["c"]
+}
+
+funcion _cq_eval(e, fila, ctx) {
+    sea k = e["k"]
+    si (k == "lit") { retornar e["v"] }
+    si (k == "param") {
+        si (e["i"] >= longitud(ctx["params"])) { lanzar "consulta: falta el parámetro " + (e["i"] + 1) }
+        retornar ctx["params"][e["i"]]
+    }
+    si (k == "col") { retornar _cq_col(fila, e) }
+    si (k == "agg") {
+        sea clave = json_texto(e)
+        si (fila == nulo o tiene_clave(fila, "\u0001" + clave) == falso) { lanzar "consulta: función de agregado fuera de GROUP BY o SELECT" }
+        retornar fila["\u0001" + clave]
+    }
+    si (k == "no") {
+        sea v = _cq_eval(e["a"], fila, ctx)
+        si (v == nulo) { retornar nulo }
+        retornar v != verdadero
+    }
+    si (k == "esnulo") { retornar _cq_eval(e["a"], fila, ctx) == nulo }
+    si (k == "like") {
+        sea v = _cq_eval(e["a"], fila, ctx)
+        si (v == nulo) { retornar nulo }
+        retornar _cq_like(v, _cq_eval(e["b"], fila, ctx), e["ci"])
+    }
+    si (k == "in") {
+        sea v = _cq_eval(e["a"], fila, ctx)
+        si (v == nulo) { retornar nulo }
+        para x en e["l"] { si (_cq_cmp_val(v, _cq_eval(x, fila, ctx)) == 0) { retornar verdadero } }
+        retornar falso
+    }
+    si (k == "between") {
+        sea v = _cq_eval(e["a"], fila, ctx)
+        sea a = _cq_cmp_val(v, _cq_eval(e["lo"], fila, ctx))
+        sea b = _cq_cmp_val(v, _cq_eval(e["hi"], fila, ctx))
+        si (a == nulo o b == nulo) { retornar nulo }
+        retornar a >= 0 y b <= 0
+    }
+    si (k == "case") {
+        para c en e["casos"] { si (_cq_eval(c[0], fila, ctx) == verdadero) { retornar _cq_eval(c[1], fila, ctx) } }
+        retornar _cq_eval(e["otro"], fila, ctx)
+    }
+    si (k == "fn") { retornar _cq_funcion(e, fila, ctx) }
+    si (k == "bin") {
+        sea op = e["op"]
+        si (op == "and") {
+            sea a = _cq_eval(e["a"], fila, ctx)
+            si (a == falso) { retornar falso }
+            sea b = _cq_eval(e["b"], fila, ctx)
+            si (b == falso) { retornar falso }
+            si (a == nulo o b == nulo) { retornar nulo }
+            retornar verdadero
+        }
+        si (op == "or") {
+            sea a = _cq_eval(e["a"], fila, ctx)
+            si (a == verdadero) { retornar verdadero }
+            sea b = _cq_eval(e["b"], fila, ctx)
+            si (b == verdadero) { retornar verdadero }
+            si (a == nulo o b == nulo) { retornar nulo }
+            retornar falso
+        }
+        sea a = _cq_eval(e["a"], fila, ctx)
+        sea b = _cq_eval(e["b"], fila, ctx)
+        si (op == "||") {
+            si (a == nulo o b == nulo) { retornar nulo }
+            retornar "" + a + b
+        }
+        si (a == nulo o b == nulo) { retornar nulo }
+        si (op == "=" o op == "!=" o op == "<" o op == ">" o op == "<=" o op == ">=") {
+            sea c = _cq_cmp_val(a, b)
+            si (op == "=") { retornar c == 0 }
+            si (op == "!=") { retornar c != 0 }
+            si (op == "<") { retornar c < 0 }
+            si (op == ">") { retornar c > 0 }
+            si (op == "<=") { retornar c <= 0 }
+            retornar c >= 0
+        }
+        si (tipo(a) != "numero" o tipo(b) != "numero") { lanzar "consulta: '" + op + "' necesita números" }
+        si (op == "+") { retornar a + b }
+        si (op == "-") { retornar a - b }
+        si (op == "*") { retornar a * b }
+        si (op == "/") {
+            si (b == 0) { retornar nulo }
+            retornar a / b
+        }
+        si (op == "%") {
+            si (b == 0) { retornar nulo }
+            retornar a % b
+        }
+    }
+    si (k == "todo") { lanzar "consulta: * solo va en SELECT o COUNT(*)" }
+    lanzar "consulta: expresión desconocida"
+}
+
+funcion _cq_funcion(e, fila, ctx) {
+    sea f = e["f"]
+    sea a = []
+    para x en e["args"] { a.agregar(_cq_eval(x, fila, ctx)) }
+    sea n = longitud(a)
+    si (f == "coalesce" o f == "ifnull") {
+        para v en a { si (v != nulo) { retornar v } }
+        retornar nulo
+    }
+    si (n == 0) { lanzar "consulta: " + f + "() necesita argumentos" }
+    si (a[0] == nulo y f != "nullif") { retornar nulo }
+    si (f == "lower") { retornar texto_minusculas("" + a[0]) }
+    si (f == "upper") { retornar texto_mayusculas("" + a[0]) }
+    si (f == "length") { retornar longitud("" + a[0]) }
+    si (f == "trim") { retornar texto_recortar("" + a[0]) }
+    si (f == "abs") { retornar absoluto(a[0]) }
+    si (f == "round") {
+        si (n > 1) { retornar redondear(a[0], a[1]) }
+        retornar redondear(a[0])
+    }
+    si (f == "floor") { retornar piso(a[0]) }
+    si (f == "ceil") { retornar techo(a[0]) }
+    si (f == "substr" o f == "substring") {
+        sea t = "" + a[0]
+        sea ini = maximo(0, a[1] - 1)
+        sea fin = longitud(t)
+        si (n > 2) { fin = minimo(fin, ini + a[2]) }
+        retornar subcadena(t, minimo(ini, longitud(t)), fin)
+    }
+    si (f == "replace") { retornar texto_reemplazar("" + a[0], "" + a[1], "" + a[2]) }
+    si (f == "nullif") {
+        si (_cq_cmp_val(a[0], a[1]) == 0) { retornar nulo }
+        retornar a[0]
+    }
+    si (f == "cast_number" o f == "number") {
+        sea v = nulo
+        intentar { v = a_numero("" + a[0]) } capturar (err) { v = nulo }
+        retornar v
+    }
+    si (f == "text") { retornar "" + a[0] }
+    lanzar "consulta: función desconocida " + f + "()"
+}
+
+// Recorre la expresión buscando agregados.
+funcion _cq_aggs(e, r) {
+    si (e == nulo o tipo(e) != "mapa") { retornar r }
+    si (e["k"] == "agg") {
+        r.agregar(e)
+        retornar r
+    }
+    para k en ["a", "b", "lo", "hi", "otro"] { si (tiene_clave(e, k)) { _cq_aggs(e[k], r) } }
+    si (tiene_clave(e, "l")) { para x en e["l"] { _cq_aggs(x, r) } }
+    si (tiene_clave(e, "args")) { para x en e["args"] { _cq_aggs(x, r) } }
+    si (tiene_clave(e, "casos")) { para c en e["casos"] { _cq_aggs(c[0], r)  _cq_aggs(c[1], r) } }
+    retornar r
+}
+
+funcion _cq_fuente(c, t) {
+    si (tiene_clave(c["tablas"], t["tabla"]) == falso) { lanzar "consulta: no existe la tabla " + t["tabla"] }
+    sea tb = c["tablas"][t["tabla"]]
+    sea r = []
+    para f en tb["filas"] {
+        sea g = {}
+        para col en tb["columnas"] { g[t["alias"] + "." + col] = f[col] ?? nulo }
+        r.agregar(g)
+    }
+    retornar {"filas": r, "columnas": tb["columnas"], "alias": t["alias"]}
+}
+
+funcion _cq_nombre_col(item, i) {
+    si (item["alias"] != nulo) { retornar item["alias"] }
+    sea e = item["e"]
+    si (e["k"] == "col") { retornar e["c"] }
+    si (e["k"] == "agg") {
+        si (e["a"]["k"] == "col") { retornar e["f"] + "_" + e["a"]["c"] }
+        retornar e["f"]
+    }
+    si (e["k"] == "fn") { retornar e["f"] }
+    retornar "col" + (i + 1)
+}
+
+/// Ejecuta una consulta. params: lista para los "?" (en orden).
+/// Devuelve {"columnas": [...], "filas": [mapas]}.
+funcion consulta_sql(c, sql, params) {
+    sea q = _cq_parsear(sql)
+    sea ctx = {"params": params ?? []}
+    // FROM y JOIN.
+    sea filas = [{}]
+    sea fuentes = []
+    si (q["desde"] != nulo) {
+        sea f = _cq_fuente(c, q["desde"])
+        fuentes.agregar(f)
+        filas = f["filas"]
+        para j en q["unir"] {
+            sea d = _cq_fuente(c, j)
+            fuentes.agregar(d)
+            sea nuevas = []
+            para a en filas {
+                sea hubo = falso
+                para b en d["filas"] {
+                    sea m = {}
+                    para k en claves(a) { m[k] = a[k] }
+                    para k en claves(b) { m[k] = b[k] }
+                    si (_cq_eval(j["on"], m, ctx) == verdadero) { nuevas.agregar(m)  hubo = verdadero }
+                }
+                si (hubo == falso y j["izquierda"]) {
+                    sea m = {}
+                    para k en claves(a) { m[k] = a[k] }
+                    para col en d["columnas"] { m[d["alias"] + "." + col] = nulo }
+                    nuevas.agregar(m)
+                }
+            }
+            filas = nuevas
+        }
+    }
+    // WHERE.
+    si (q["donde"] != nulo) {
+        si (longitud(_cq_aggs(q["donde"], [])) > 0) { lanzar "consulta: no se puede usar un agregado en WHERE (usa HAVING)" }
+        sea r = []
+        para f en filas { si (_cq_eval(q["donde"], f, ctx) == verdadero) { r.agregar(f) } }
+        filas = r
+    }
+    // Expande * en columnas.
+    sea items = []
+    para it en q["cols"] {
+        si (it["e"]["k"] == "todo") {
+            para fu en fuentes {
+                si ((it["e"]["tabla"] ?? nulo) == nulo o it["e"]["tabla"] == fu["alias"]) {
+                    para col en fu["columnas"] { items.agregar({"e": {"k": "col", "tabla": fu["alias"], "c": col}, "alias": col}) }
+                }
+            }
+        } sino { items.agregar(it) }
+    }
+    // Agregados y GROUP BY.
+    sea aggs = []
+    para it en items { _cq_aggs(it["e"], aggs) }
+    _cq_aggs(q["tener"], aggs)
+    para ob en q["orden"] { _cq_aggs(ob["e"], aggs) }
+    si (longitud(aggs) > 0 o longitud(q["grupo"]) > 0) {
+        sea grupos = {}
+        sea orden = []
+        para f en filas {
+            sea partes = []
+            para g en q["grupo"] { partes.agregar(json_texto(_cq_eval(g, f, ctx))) }
+            sea kg = unir(partes, "\u0001")
+            si (tiene_clave(grupos, kg) == falso) { grupos[kg] = []  orden.agregar(kg) }
+            grupos[kg].agregar(f)
+        }
+        si (longitud(orden) == 0 y longitud(q["grupo"]) == 0) { grupos[""] = []  orden.agregar("") }
+        sea r = []
+        para kg en orden {
+            sea fs = grupos[kg]
+            sea base = {}
+            si (longitud(fs) > 0) { para k en claves(fs[0]) { base[k] = fs[0][k] } }
+            para ag en aggs {
+                sea vals = []
+                sea vistos = {}
+                para f en fs {
+                    sea v = 1
+                    si (ag["a"]["k"] != "todo") { v = _cq_eval(ag["a"], f, ctx) }
+                    si (v != nulo) {
+                        si (ag["distinto"]) {
+                            sea kv = json_texto(v)
+                            si (tiene_clave(vistos, kv) == falso) { vistos[kv] = verdadero  vals.agregar(v) }
+                        } sino { vals.agregar(v) }
+                    }
+                }
+                sea res = nulo
+                si (ag["f"] == "count") { res = longitud(vals) }
+                si (longitud(vals) > 0) {
+                    si (ag["f"] == "sum" o ag["f"] == "avg") {
+                        sea s = 0
+                        para v en vals {
+                            si (tipo(v) != "numero") { lanzar "consulta: " + texto_mayusculas(ag["f"]) + " necesita números" }
+                            s = s + v
+                        }
+                        res = s
+                        si (ag["f"] == "avg") { res = s / longitud(vals) }
+                    }
+                    si (ag["f"] == "min" o ag["f"] == "max") {
+                        res = vals[0]
+                        para v en vals {
+                            si (ag["f"] == "min" y _cq_cmp_val(v, res) < 0) { res = v }
+                            si (ag["f"] == "max" y _cq_cmp_val(v, res) > 0) { res = v }
+                        }
+                    }
+                }
+                base["\u0001" + json_texto(ag)] = res
+            }
+            r.agregar(base)
+        }
+        filas = r
+        si (q["tener"] != nulo) {
+            sea h = []
+            para f en filas { si (_cq_eval(q["tener"], f, ctx) == verdadero) { h.agregar(f) } }
+            filas = h
+        }
+    }
+    // Proyección (conserva la fila para ORDER BY por columnas no elegidas).
+    sea nombres = []
+    sea i = 0
+    mientras (i < longitud(items)) { nombres.agregar(_cq_nombre_col(items[i], i))  i = i + 1 }
+    sea pares = []
+    para f en filas {
+        sea salida = {}
+        i = 0
+        mientras (i < longitud(items)) { salida[nombres[i]] = _cq_eval(items[i]["e"], f, ctx)  i = i + 1 }
+        sea ext = {}
+        para k en claves(f) { ext[k] = f[k] }
+        para k en claves(salida) { ext[k] = salida[k] }
+        pares.agregar([salida, ext])
+    }
+    si (q["distinto"]) {
+        sea vistos = {}
+        sea r = []
+        para p en pares {
+            sea kk = []
+            para nm en nombres { kk.agregar(json_texto(p[0][nm])) }
+            sea k = unir(kk, "\u0001")
+            si (tiene_clave(vistos, k) == falso) { vistos[k] = verdadero  r.agregar(p) }
+        }
+        pares = r
+    }
+    si (longitud(q["orden"]) > 0) {
+        sea claves_orden = []
+        para p en pares {
+            sea ks = []
+            para ob en q["orden"] {
+                sea e = ob["e"]
+                sea v = nulo
+                // ORDER BY 2 = segunda columna del SELECT.
+                si (e["k"] == "lit" y tipo(e["v"]) == "numero") { v = p[0][nombres[e["v"] - 1]] } sino {
+                    si (e["k"] == "col" y e["tabla"] == nulo y tiene_clave(p[0], e["c"])) { v = p[0][e["c"]] } sino { v = _cq_eval(e, p[1], ctx) }
+                }
+                ks.agregar(v)
+            }
+            claves_orden.agregar([ks, p])
+        }
+        claves_orden = ordenar(claves_orden, funcion(a, b) {
+            sea j = 0
+            mientras (j < longitud(q["orden"])) {
+                sea x = a[0][j]
+                sea z = b[0][j]
+                sea cmp = 0
+                si (x == nulo y z != nulo) { cmp = 1 }
+                si (x != nulo y z == nulo) { cmp = -1 }
+                si (x != nulo y z != nulo) { cmp = _cq_cmp_val(x, z) }
+                si (q["orden"][j]["desc"]) { cmp = -cmp }
+                si (cmp != 0) { retornar cmp }
+                j = j + 1
+            }
+            retornar 0
+        })
+        pares = []
+        para x en claves_orden { pares.agregar(x[1]) }
+    }
+    sea salto = 0
+    si (tipo(q["salto"]) == "mapa") {
+        si (q["salto"]["t"] == "param") { salto = ctx["params"][q["salto"]["v"]] } sino { salto = q["salto"]["v"] }
+    }
+    sea limite = nulo
+    si (q["limite"] != nulo) {
+        si (q["limite"]["t"] == "param") { limite = ctx["params"][q["limite"]["v"]] } sino { limite = q["limite"]["v"] }
+    }
+    sea r = []
+    i = salto
+    mientras (i < longitud(pares) y (limite == nulo o longitud(r) < limite)) { r.agregar(pares[i][0])  i = i + 1 }
+    retornar {"columnas": nombres, "filas": r}
+}
+
+/// Atajo: la primera columna de la primera fila (o nulo).
+funcion consulta_valor(c, sql, params) {
+    sea r = consulta_sql(c, sql, params)
+    si (longitud(r["filas"]) == 0) { retornar nulo }
+    retornar r["filas"][0][r["columnas"][0]]
+}
+
+/// Resultado → texto con bordes (usa "tabla").
+funcion consulta_texto(r, limite) { retornar tabla_texto(r, limite) }

@@ -33,6 +33,28 @@ Sitio oficial: [c-forge.org](https://c-forge.org)
   (bandadas y multitudes sin choques), `grafica`/`chart` (líneas, barras,
   torta y dispersión en SVG), `secretos`/`secrets` (valores cifrados en JSON
   y .env) y `alerta`/`errors` (reporte de errores compatible con Sentry).
+- **Lote 10 (bilingüe):** `estadistica`/`stats` (t de Student, Welch,
+  pareada, χ², ANOVA, Pearson, intervalos; contra SciPy), `gradiente`/
+  `autograd` (autodiferenciación en modo reverso, redes con Adam o SGD),
+  `vela`/`trees` (árboles, bosques aleatorios, Naive Bayes gaussiano y de
+  texto), `hibrida`/`hybrid` (BM25 + vectores con RRF, para RAG), `molde`/
+  `serde` (serialización con esquema a JSON, CSV, query string y binario,
+  con migraciones), `genoma`/`bio` (FASTA/FASTQ, traducción, ORFs,
+  Needleman–Wunsch y Smith–Waterman), `registro`/`logging` (fachada con
+  niveles por jerarquía, destinos, rotación y contexto) y `planilla`/`pivot`
+  (pivote, melt, ventanas móviles, rangos; contra Pandas).
+- **Lote 11 (bilingüe):** `codigo_qr`/`qrcode` (QR 1–40 idéntico a
+  python-qrcode, EAN-13, UPC-A y Code 128; leídos con ZXing),
+  `panal`/`hexgrid` (hexágonos de igual área en todo el planeta, sin
+  costura en el antimeridiano, y grillas planas con A*), `malla_geo`/
+  `geometry2d` (Delaunay como SciPy, Voronoi, orejas, recorte, Welzl),
+  `unicode`/`unicode_en` (NFC/NFD, mayúsculas con ß e İ, grafemas, ancho y
+  orden en español), `agenda`/`schedule` (zonas TZif y POSIX, cron que
+  respeta el cambio de hora; contra Python zoneinfo), `consulta_archivos`/
+  `sqlfiles` (SQL con JOIN, GROUP BY y parámetros sobre CSV y JSON),
+  `entidades`/`entities` (ECS con conjuntos dispersos y señales) y
+  `federa`/`oidc` (PKCE, state, nonce y validación de ID tokens RS256,
+  EdDSA y HS256).
 - `rastreo`/`glob`: recorrer carpetas y buscar con comodines (`**`, `{a,b}`,
   `[a-z]`). El lenguaje suma `listar_carpeta`, `es_carpeta` y `crear_carpeta`
   (como `mkdir -p`).

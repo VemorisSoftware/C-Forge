@@ -1,0 +1,308 @@
+// stdlib/genoma.cfv — bioinformática: leer FASTA y FASTQ, complemento
+// reverso, contenido GC, traducción de ADN a proteína (código genético
+// estándar, 6 marcos de lectura), marcos abiertos (ORF), k-meros, búsqueda
+// de motivos (con IUPAC) y alineamiento global (Needleman–Wunsch) y local
+// (Smith–Waterman). Inspirada en rust-bio / Biopython (MIT/BSD). En
+// inglés: importar "bio".
+//
+//   importar "genoma"
+//   sea r = genoma_fasta(leer_archivo("secuencias.fa"))    // [{"id", "descripcion", "secuencia"}]
+//   genoma_traducir("ATGGCCATTGTAATGGGCCGCTGA")             // "MAIVMGR*"
+//   genoma_alinear("GATTACA", "GCATGCU")                    // {"a", "b", "puntaje"}
+
+/// FASTA → lista de registros.
+funcion genoma_fasta(texto) {
+    sea r = []
+    sea actual = nulo
+    sea partes = []
+    para linea0 en texto_dividir("" + texto, "\n") {
+        sea linea = texto_recortar(linea0)
+        si (texto_empieza_con(linea, ">")) {
+            si (actual != nulo) { actual["secuencia"] = unir(partes, "")  r.agregar(actual) }
+            sea cab = subcadena(linea, 1, longitud(linea))
+            sea sp = texto_indice(cab, " ")
+            si (sp < 0) { actual = {"id": cab, "descripcion": ""} } sino { actual = {"id": subcadena(cab, 0, sp), "descripcion": texto_recortar(subcadena(cab, sp + 1, longitud(cab)))} }
+            partes = []
+        } sino {
+            si (linea != "" y texto_empieza_con(linea, ";") == falso) {
+                si (actual == nulo) { lanzar "genoma: el FASTA debe empezar con '>'" }
+                partes.agregar(texto_mayusculas(texto_reemplazar(linea, " ", "")))
+            }
+        }
+    }
+    si (actual != nulo) { actual["secuencia"] = unir(partes, "")  r.agregar(actual) }
+    retornar r
+}
+
+/// Registros → FASTA (líneas de 60).
+funcion genoma_escribir_fasta(registros, ancho) {
+    sea w = ancho ?? 60
+    sea l = []
+    para x en registros {
+        sea cab = ">" + x["id"]
+        si (tiene_clave(x, "descripcion") y x["descripcion"] != "") { cab = cab + " " + x["descripcion"] }
+        l.agregar(cab)
+        sea s = x["secuencia"]
+        sea i = 0
+        mientras (i < longitud(s)) { l.agregar(subcadena(s, i, minimo(longitud(s), i + w)))  i = i + w }
+    }
+    retornar unir(l, "\n") + "\n"
+}
+
+/// FASTQ → [{"id", "secuencia", "calidad": [phred…]}] (Phred+33).
+funcion genoma_fastq(texto) {
+    sea l = []
+    para x en texto_dividir("" + texto, "\n") { si (texto_recortar(x) != "") { l.agregar(texto_recortar(x)) } }
+    si (longitud(l) % 4 != 0) { lanzar "genoma: FASTQ incompleto (se esperan bloques de 4 líneas)" }
+    sea r = []
+    sea i = 0
+    mientras (i < longitud(l)) {
+        si (texto_empieza_con(l[i], "@") == falso o texto_empieza_con(l[i + 2], "+") == falso) { lanzar "genoma: FASTQ mal formado cerca de la línea " + (i + 1) }
+        si (longitud(l[i + 1]) != longitud(l[i + 3])) { lanzar "genoma: la calidad no mide lo mismo que la secuencia en " + l[i] }
+        sea q = []
+        sea k = 0
+        mientras (k < longitud(l[i + 3])) { q.agregar(byte_en(l[i + 3], k) - 33)  k = k + 1 }
+        sea cab = subcadena(l[i], 1, longitud(l[i]))
+        sea sp = texto_indice(cab, " ")
+        si (sp >= 0) { cab = subcadena(cab, 0, sp) }
+        r.agregar({"id": cab, "secuencia": texto_mayusculas(l[i + 1]), "calidad": q})
+        i = i + 4
+    }
+    retornar r
+}
+
+sea _GN_COMP = {"A": "T", "T": "A", "G": "C", "C": "G", "U": "A", "N": "N", "R": "Y", "Y": "R", "S": "S", "W": "W", "K": "M", "M": "K", "B": "V", "V": "B", "D": "H", "H": "D"}
+
+funcion genoma_complemento_reverso(s) {
+    sea t = texto_mayusculas("" + s)
+    sea r = []
+    sea i = longitud(t) - 1
+    mientras (i >= 0) {
+        sea c = subcadena(t, i, i + 1)
+        si (tiene_clave(_GN_COMP, c) == falso) { lanzar "genoma: base desconocida " + c }
+        r.agregar(_GN_COMP[c])
+        i = i - 1
+    }
+    retornar unir(r, "")
+}
+
+/// Proporción de G y C (0 a 1).
+funcion genoma_gc(s) {
+    sea t = texto_mayusculas("" + s)
+    si (longitud(t) == 0) { retornar 0 }
+    sea n = 0
+    para c en texto_dividir(t, "") { si (c == "G" o c == "C" o c == "S") { n = n + 1 } }
+    retornar n / longitud(t)
+}
+
+funcion genoma_conteo(s) {
+    sea r = {}
+    para c en texto_dividir(texto_mayusculas("" + s), "") { r[c] = (r[c] ?? 0) + 1 }
+    retornar r
+}
+
+sea _GN_BASES = "TCAG"
+sea _GN_AA = "FFLLSSSSYY**CC*WLLLLPPPPHHQQRRRRIIIMTTTTNNKKSSRRVVVVAAAADDEEGGGG"
+
+/// Traduce ADN/ARN a proteína (código estándar; "*" = parada; "X" = codón ambiguo).
+funcion genoma_traducir(s, hasta_parada) {
+    sea t = texto_reemplazar(texto_mayusculas("" + s), "U", "T")
+    sea r = []
+    sea i = 0
+    mientras (i + 3 <= longitud(t)) {
+        sea a = texto_indice(_GN_BASES, subcadena(t, i, i + 1))
+        sea b = texto_indice(_GN_BASES, subcadena(t, i + 1, i + 2))
+        sea c = texto_indice(_GN_BASES, subcadena(t, i + 2, i + 3))
+        sea aa = "X"
+        si (a >= 0 y b >= 0 y c >= 0) {
+            sea k = a * 16 + b * 4 + c
+            aa = subcadena(_GN_AA, k, k + 1)
+        }
+        si (hasta_parada == verdadero y aa == "*") { retornar unir(r, "") }
+        r.agregar(aa)
+        i = i + 3
+    }
+    retornar unir(r, "")
+}
+
+/// Los 6 marcos de lectura: {"+1", "+2", "+3", "-1", "-2", "-3"}.
+funcion genoma_marcos(s) {
+    sea t = texto_mayusculas("" + s)
+    sea rc = genoma_complemento_reverso(t)
+    retornar {"+1": genoma_traducir(t), "+2": genoma_traducir(subcadena(t, 1, longitud(t))), "+3": genoma_traducir(subcadena(t, 2, longitud(t))), "-1": genoma_traducir(rc), "-2": genoma_traducir(subcadena(rc, 1, longitud(rc))), "-3": genoma_traducir(subcadena(rc, 2, longitud(rc)))}
+}
+
+/// Marcos abiertos de lectura (ATG … parada) de al menos min_aa aminoácidos
+/// en ambas hebras: [{"hebra", "inicio", "fin", "proteina"}] (posiciones en la hebra +).
+funcion genoma_orfs(s, min_aa) {
+    sea t = texto_mayusculas("" + s)
+    sea n = longitud(t)
+    sea minimo_aa = min_aa ?? 30
+    sea r = []
+    para hebra en ["+", "-"] {
+        sea sec = t
+        si (hebra == "-") { sec = genoma_complemento_reverso(t) }
+        sea marco = 0
+        mientras (marco < 3) {
+            sea i = marco
+            mientras (i + 3 <= n) {
+                si (subcadena(sec, i, i + 3) == "ATG") {
+                    sea j = i
+                    sea fin = -1
+                    mientras (j + 3 <= n y fin < 0) {
+                        sea cod = subcadena(sec, j, j + 3)
+                        si (cod == "TAA" o cod == "TAG" o cod == "TGA") { fin = j + 3 }
+                        j = j + 3
+                    }
+                    si (fin > 0) {
+                        sea prot = genoma_traducir(subcadena(sec, i, fin), verdadero)
+                        si (longitud(prot) >= minimo_aa) {
+                            si (hebra == "+") { r.agregar({"hebra": "+", "inicio": i, "fin": fin, "proteina": prot}) } sino { r.agregar({"hebra": "-", "inicio": n - fin, "fin": n - i, "proteina": prot}) }
+                        }
+                        i = fin
+                    } sino { i = n }
+                } sino { i = i + 3 }
+            }
+            marco = marco + 1
+        }
+    }
+    retornar r
+}
+
+/// Frecuencias de k-meros.
+funcion genoma_kmeros(s, k) {
+    sea t = texto_mayusculas("" + s)
+    sea r = {}
+    sea i = 0
+    mientras (i + k <= longitud(t)) {
+        sea x = subcadena(t, i, i + k)
+        r[x] = (r[x] ?? 0) + 1
+        i = i + 1
+    }
+    retornar r
+}
+
+sea _GN_IUPAC = {"A": "A", "C": "C", "G": "G", "T": "TU", "U": "TU", "R": "AG", "Y": "CTU", "S": "GC", "W": "ATU", "K": "GTU", "M": "AC", "B": "CGTU", "D": "AGTU", "H": "ACTU", "V": "ACG", "N": "ACGTU"}
+
+/// Posiciones donde aparece el motivo (admite códigos IUPAC como N o R).
+funcion genoma_buscar(s, motivo) {
+    sea t = texto_mayusculas("" + s)
+    sea m = texto_mayusculas("" + motivo)
+    sea r = []
+    sea i = 0
+    mientras (i + longitud(m) <= longitud(t)) {
+        sea ok = verdadero
+        sea j = 0
+        mientras (j < longitud(m) y ok) {
+            sea p = subcadena(m, j, j + 1)
+            sea c = subcadena(t, i + j, i + j + 1)
+            si (tiene_clave(_GN_IUPAC, p)) { si (texto_indice(_GN_IUPAC[p], c) < 0) { ok = falso } } sino { si (p != c) { ok = falso } }
+            j = j + 1
+        }
+        si (ok) { r.agregar(i) }
+        i = i + 1
+    }
+    retornar r
+}
+
+funcion _gn_op(o, k, d) {
+    si (o != nulo) { si (tiene_clave(o, k)) { retornar o[k] } }
+    retornar d
+}
+
+/// Alineamiento global (Needleman–Wunsch) o local (local = verdadero, Smith–Waterman).
+/// opciones: coincide (1), distinto (-1), hueco (-1). Devuelve {"a", "b", "puntaje", "identidad"}.
+funcion genoma_alinear(a, b, opciones) {
+    sea x = texto_mayusculas("" + a)
+    sea y = texto_mayusculas("" + b)
+    sea mc = _gn_op(opciones, "coincide", 1)
+    sea md = _gn_op(opciones, "distinto", -1)
+    sea gp = _gn_op(opciones, "hueco", -1)
+    sea local = _gn_op(opciones, "local", falso)
+    sea n = longitud(x)
+    sea m = longitud(y)
+    si (n * m > 25000000) { lanzar "genoma: secuencias demasiado largas para alinear en memoria" }
+    sea H = []
+    sea i = 0
+    mientras (i <= n) {
+        sea fila = []
+        sea j = 0
+        mientras (j <= m) {
+            si (local) { fila.agregar(0) } sino { fila.agregar(i * gp + j * gp) }
+            j = j + 1
+        }
+        H.agregar(fila)
+        i = i + 1
+    }
+    sea mejor = 0
+    sea mi = 0
+    sea mj = 0
+    i = 1
+    mientras (i <= n) {
+        sea j = 1
+        mientras (j <= m) {
+            sea s = md
+            si (subcadena(x, i - 1, i) == subcadena(y, j - 1, j)) { s = mc }
+            sea v = maximo(H[i - 1][j - 1] + s, maximo(H[i - 1][j] + gp, H[i][j - 1] + gp))
+            si (local) { v = maximo(0, v) }
+            H[i][j] = v
+            si (local y v > mejor) { mejor = v  mi = i  mj = j }
+            j = j + 1
+        }
+        i = i + 1
+    }
+    si (local == falso) { mi = n  mj = m  mejor = H[n][m] }
+    sea ra = []
+    sea rb = []
+    i = mi
+    sea j = mj
+    mientras ((i > 0 o j > 0) y (local == falso o H[i][j] > 0)) {
+        sea hecho = falso
+        si (i > 0 y j > 0) {
+            sea s = md
+            si (subcadena(x, i - 1, i) == subcadena(y, j - 1, j)) { s = mc }
+            si (H[i][j] == H[i - 1][j - 1] + s) {
+                ra.agregar(subcadena(x, i - 1, i))
+                rb.agregar(subcadena(y, j - 1, j))
+                i = i - 1
+                j = j - 1
+                hecho = verdadero
+            }
+        }
+        si (hecho == falso) {
+            si (i > 0 y H[i][j] == H[i - 1][j] + gp) {
+                ra.agregar(subcadena(x, i - 1, i))
+                rb.agregar("-")
+                i = i - 1
+            } sino {
+                ra.agregar("-")
+                rb.agregar(subcadena(y, j - 1, j))
+                j = j - 1
+            }
+        }
+    }
+    sea sa = ""
+    sea sb = ""
+    sea k = longitud(ra) - 1
+    sea iguales = 0
+    mientras (k >= 0) {
+        sa = sa + ra[k]
+        sb = sb + rb[k]
+        si (ra[k] == rb[k]) { iguales = iguales + 1 }
+        k = k - 1
+    }
+    sea id = 0
+    si (longitud(sa) > 0) { id = iguales / longitud(sa) }
+    retornar {"a": sa, "b": sb, "puntaje": mejor, "identidad": id}
+}
+
+/// Peso molecular aproximado de una proteína (Da, masas promedio).
+funcion genoma_peso_proteina(p) {
+    sea m = {"A": 89.09, "R": 174.20, "N": 132.12, "D": 133.10, "C": 121.16, "E": 147.13, "Q": 146.15, "G": 75.07, "H": 155.16, "I": 131.17, "L": 131.17, "K": 146.19, "M": 149.21, "F": 165.19, "P": 115.13, "S": 105.09, "T": 119.12, "W": 204.23, "Y": 181.19, "V": 117.15}
+    sea s = 18.02
+    sea n = 0
+    para c en texto_dividir(texto_mayusculas("" + p), "") {
+        si (tiene_clave(m, c)) { s = s + m[c] - 18.02  n = n + 1 }
+    }
+    retornar s
+}

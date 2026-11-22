@@ -1,0 +1,366 @@
+// stdlib/panal.cfv — índice hexagonal del planeta: divide la Tierra en
+// hexágonos de igual área (16 resoluciones, de ~4 millones de km² a ~1 m²),
+// da el id de la celda de un punto, su centro y su borde, vecinos, anillos,
+// discos, distancia en celdas, padre/hijos y cubrir un polígono. Útil para
+// agrupar viajes, calor de pedidos o zonas de reparto. Grilla propia sobre
+// la proyección cilíndrica de igual área de Lambert (los ids NO son de H3;
+// solo la idea). Para grillas planas (juegos) usa panal_plano_*. En inglés:
+// importar "hexgrid".
+//
+//   importar "panal"
+//   sea c = panal_celda(-33.4489, -70.6693, 8)        // "8:…:…"
+//   panal_centro(c)                                    // [lat, lon]
+//   panal_disco(c, 1)                                  // la celda y sus 6 vecinas
+//   panal_area_km2(8)
+
+sea _PN_R = 6371.0072
+sea _PN_AREA0 = 4250000
+sea _PN_PI = 3.141592653589793
+
+funcion _pn_columnas(res) {
+    si (res < 0 o res > 15 o piso(res) != res) { lanzar "panal: la resolución va de 0 a 15" }
+    // Área del hexágono = 3√3/2 · s²; cada resolución divide el área por 7.
+    // El lado se ajusta para que una vuelta al ecuador tenga N columnas
+    // exactas: así la grilla se cierra sin costura en el antimeridiano.
+    sea nominal = raiz(_PN_AREA0 / potencia(7, res) / (1.5 * raiz(3)))
+    retornar maximo(1, redondear(2 * _PN_PI * _PN_R / (raiz(3) * nominal)))
+}
+
+funcion _pn_lado(res) { retornar 2 * _PN_PI * _PN_R / (raiz(3) * _pn_columnas(res)) }
+
+/// Área de una celda (km²) a una resolución; todas iguales.
+funcion panal_area_km2(res) {
+    sea s = _pn_lado(res)
+    retornar 1.5 * raiz(3) * s * s
+}
+
+/// Distancia aproximada entre centros de celdas vecinas (km).
+funcion panal_lado_km(res) { retornar _pn_lado(res) * raiz(3) }
+
+funcion _pn_redondear(q, r) {
+    sea x = q
+    sea z = r
+    sea yv = -x - z
+    sea rx = redondear(x)
+    sea ry = redondear(yv)
+    sea rz = redondear(z)
+    sea dx = absoluto(rx - x)
+    sea dy = absoluto(ry - yv)
+    sea dz = absoluto(rz - z)
+    si (dx > dy y dx > dz) { rx = -ry - rz } sino {
+        si (dy > dz) { ry = -rx - rz } sino { rz = -rx - ry }
+    }
+    retornar [rx + 0, rz + 0]
+}
+
+funcion _pn_proy(lat, lon) {
+    sea l = lon
+    mientras (l < -180) { l = l + 360 }
+    mientras (l >= 180) { l = l - 360 }
+    retornar [_PN_R * l * _PN_PI / 180, _PN_R * seno(lat * _PN_PI / 180)]
+}
+
+funcion _pn_desproy(x, yv) {
+    sea s = yv / _PN_R
+    si (s > 1) { s = 1 }
+    si (s < -1) { s = -1 }
+    sea lon = x / _PN_R * 180 / _PN_PI
+    mientras (lon < -180) { lon = lon + 360 }
+    mientras (lon >= 180) { lon = lon - 360 }
+    retornar [arcoseno(s) * 180 / _PN_PI, lon]
+}
+
+funcion _pn_id(res, q, r) {
+    // Normaliza q para que el centro caiga en [-180°, 180°).
+    sea n = _pn_columnas(res)
+    sea x = q + r / 2
+    sea k = piso((x + n / 2) / n)
+    retornar res + ":" + (q - k * n) + ":" + r
+}
+
+/// Partes de un id: {"res", "q", "r"}.
+funcion panal_partes(id) {
+    sea p = texto_dividir("" + id, ":")
+    si (longitud(p) != 3) { lanzar "panal: id inválido " + id }
+    sea r = nulo
+    intentar { r = {"res": a_numero(p[0]), "q": a_numero(p[1]), "r": a_numero(p[2])} } capturar (e) { lanzar "panal: id inválido " + id }
+    _pn_lado(r["res"])
+    retornar r
+}
+
+/// Celda que contiene el punto (latitud, longitud en grados).
+funcion panal_celda(lat, lon, res) {
+    si (lat < -90 o lat > 90) { lanzar "panal: latitud fuera de rango" }
+    sea s = _pn_lado(res)
+    sea p = _pn_proy(lat, lon)
+    sea q = (raiz(3) / 3 * p[0] - p[1] / 3) / s
+    sea r = (2 / 3 * p[1]) / s
+    sea c = _pn_redondear(q, r)
+    retornar _pn_id(res, c[0], c[1])
+}
+
+funcion _pn_xy(res, q, r) {
+    sea s = _pn_lado(res)
+    retornar [s * (raiz(3) * q + raiz(3) / 2 * r), s * 1.5 * r]
+}
+
+/// Centro de la celda como [lat, lon].
+funcion panal_centro(id) {
+    sea p = panal_partes(id)
+    sea xy = _pn_xy(p["res"], p["q"], p["r"])
+    retornar _pn_desproy(xy[0], xy[1])
+}
+
+/// Borde de la celda: 6 vértices [lat, lon] (cerrado: el primero se repite).
+funcion panal_borde(id) {
+    sea p = panal_partes(id)
+    sea s = _pn_lado(p["res"])
+    sea c = _pn_xy(p["res"], p["q"], p["r"])
+    sea r = []
+    sea k = 0
+    mientras (k <= 6) {
+        sea ang = (60 * (k % 6) - 30) * _PN_PI / 180
+        r.agregar(_pn_desproy(c[0] + s * coseno(ang), c[1] + s * seno(ang)))
+        k = k + 1
+    }
+    retornar r
+}
+
+sea _PN_DIR = [[1, 0], [1, -1], [0, -1], [-1, 0], [-1, 1], [0, 1]]
+
+/// Las 6 vecinas.
+funcion panal_vecinos(id) {
+    sea p = panal_partes(id)
+    sea r = []
+    para d en _PN_DIR { r.agregar(_pn_id(p["res"], p["q"] + d[0], p["r"] + d[1])) }
+    retornar r
+}
+
+/// Celdas a exactamente k pasos (k = 0 es la celda misma).
+funcion panal_anillo(id, k) {
+    sea p = panal_partes(id)
+    si (k == 0) { retornar [_pn_id(p["res"], p["q"], p["r"])] }
+    sea q = p["q"] + _PN_DIR[4][0] * k
+    sea r = p["r"] + _PN_DIR[4][1] * k
+    sea res = []
+    sea vistos = {}
+    sea i = 0
+    mientras (i < 6) {
+        sea j = 0
+        mientras (j < k) {
+            sea c = _pn_id(p["res"], q, r)
+            si (tiene_clave(vistos, c) == falso) { vistos[c] = verdadero  res.agregar(c) }
+            q = q + _PN_DIR[i][0]
+            r = r + _PN_DIR[i][1]
+            j = j + 1
+        }
+        i = i + 1
+    }
+    retornar res
+}
+
+/// Todas las celdas a k pasos o menos (1 + 3k(k+1) celdas).
+funcion panal_disco(id, k) {
+    sea r = []
+    sea i = 0
+    mientras (i <= k) {
+        para c en panal_anillo(id, i) { r.agregar(c) }
+        i = i + 1
+    }
+    retornar r
+}
+
+/// Distancia en celdas entre dos ids de la misma resolución (rodeando el
+/// planeta si es más corto).
+funcion panal_distancia(a, b) {
+    sea x = panal_partes(a)
+    sea yv = panal_partes(b)
+    si (x["res"] != yv["res"]) { lanzar "panal: las celdas tienen resoluciones distintas" }
+    sea n = _pn_columnas(x["res"])
+    sea dr = x["r"] - yv["r"]
+    sea mejor = nulo
+    para m en [-1, 0, 1] {
+        sea dq = x["q"] - yv["q"] + m * n
+        sea d = (absoluto(dq) + absoluto(dr) + absoluto(dq + dr)) / 2
+        si (mejor == nulo o d < mejor) { mejor = d }
+    }
+    retornar mejor
+}
+
+/// Celda padre (la que contiene el centro, una resolución menos).
+funcion panal_padre(id, res) {
+    sea p = panal_partes(id)
+    sea objetivo = res ?? (p["res"] - 1)
+    si (objetivo < 0 o objetivo > p["res"]) { lanzar "panal: resolución de padre inválida" }
+    sea c = panal_centro(id)
+    retornar panal_celda(c[0], c[1], objetivo)
+}
+
+/// Celdas hijas: las de la resolución siguiente cuyo padre es esta.
+funcion panal_hijos(id) {
+    sea p = panal_partes(id)
+    si (p["res"] >= 15) { lanzar "panal: la resolución 15 no tiene hijos" }
+    sea c = panal_centro(id)
+    sea centro = panal_celda(c[0], c[1], p["res"] + 1)
+    sea r = []
+    para h en panal_disco(centro, 2) { si (panal_padre(h) == _pn_id(p["res"], p["q"], p["r"])) { r.agregar(h) } }
+    retornar r
+}
+
+funcion _pn_dentro(lat, lon, poligono) {
+    sea dentro = falso
+    sea n = longitud(poligono)
+    sea j = n - 1
+    sea i = 0
+    mientras (i < n) {
+        sea a = poligono[i]
+        sea b = poligono[j]
+        si (((a[0] > lat) != (b[0] > lat)) y (lon < (b[1] - a[1]) * (lat - a[0]) / (b[0] - a[0]) + a[1])) { dentro = dentro == falso }
+        j = i
+        i = i + 1
+    }
+    retornar dentro
+}
+
+/// Celdas cuyo centro está dentro del polígono ([[lat, lon], …]).
+funcion panal_cubrir(poligono, res) {
+    si (longitud(poligono) < 3) { lanzar "panal: el polígono necesita al menos 3 puntos" }
+    sea minlat = 90
+    sea maxlat = -90
+    sea minlon = 180
+    sea maxlon = -180
+    para p en poligono {
+        minlat = minimo(minlat, p[0])  maxlat = maximo(maxlat, p[0])
+        minlon = minimo(minlon, p[1])  maxlon = maximo(maxlon, p[1])
+    }
+    sea a = _pn_proy(minlat, minlon)
+    sea b = _pn_proy(maxlat, maxlon)
+    sea s = _pn_lado(res)
+    sea cantidad = ((b[0] - a[0]) / (s * raiz(3)) + 2) * ((b[1] - a[1]) / (s * 1.5) + 2)
+    si (cantidad > 200000) { lanzar "panal: demasiadas celdas; usa una resolución menor" }
+    sea r = []
+    sea vistos = {}
+    sea yv = a[1] - s
+    mientras (yv <= b[1] + s) {
+        sea x = a[0] - s
+        mientras (x <= b[0] + s) {
+            sea ll = _pn_desproy(x, yv)
+            sea c = panal_celda(ll[0], ll[1], res)
+            si (tiene_clave(vistos, c) == falso) {
+                vistos[c] = verdadero
+                sea cc = panal_centro(c)
+                si (_pn_dentro(cc[0], cc[1], poligono)) { r.agregar(c) }
+            }
+            x = x + s * raiz(3) / 2
+        }
+        yv = yv + s * 0.75
+    }
+    retornar r
+}
+
+/// Cuenta puntos por celda: [[lat, lon], …] → {id: n}.
+funcion panal_agrupar(puntos, res) {
+    sea r = {}
+    para p en puntos {
+        sea c = panal_celda(p[0], p[1], res)
+        r[c] = (r[c] ?? 0) + 1
+    }
+    retornar r
+}
+
+/// GeoJSON (FeatureCollection) de celdas, con propiedades opcionales por id.
+funcion panal_geojson(ids, propiedades) {
+    sea f = []
+    para id en ids {
+        sea anillo = []
+        para v en panal_borde(id) { anillo.agregar([v[1], v[0]]) }
+        sea pr = {"id": id}
+        si (propiedades != nulo) { si (tiene_clave(propiedades, id)) { pr["valor"] = propiedades[id] } }
+        f.agregar({"type": "Feature", "properties": pr, "geometry": {"type": "Polygon", "coordinates": [anillo]}})
+    }
+    retornar json_texto({"type": "FeatureCollection", "features": f})
+}
+
+// ── Grilla hexagonal plana (juegos, tableros) ────────────────────────────
+// Coordenadas axiales [q, r], hexágonos con punta arriba.
+
+funcion panal_plano_de_pixel(x, yv, tamano) {
+    retornar _pn_redondear((raiz(3) / 3 * x - yv / 3) / tamano, (2 / 3 * yv) / tamano)
+}
+
+funcion panal_plano_a_pixel(h, tamano) { retornar [tamano * (raiz(3) * h[0] + raiz(3) / 2 * h[1]), tamano * 1.5 * h[1]] }
+
+funcion panal_plano_distancia(a, b) {
+    sea dq = a[0] - b[0]
+    sea dr = a[1] - b[1]
+    retornar (absoluto(dq) + absoluto(dr) + absoluto(dq + dr)) / 2
+}
+
+funcion panal_plano_vecinos(h) {
+    sea r = []
+    para d en _PN_DIR { r.agregar([h[0] + d[0], h[1] + d[1]]) }
+    retornar r
+}
+
+/// Hexágonos en la línea recta entre a y b.
+funcion panal_plano_linea(a, b) {
+    sea n = panal_plano_distancia(a, b)
+    sea r = []
+    sea i = 0
+    mientras (i <= n) {
+        sea t = 0
+        si (n > 0) { t = i / n }
+        r.agregar(_pn_redondear(a[0] + (b[0] - a[0]) * t + 0.000001, a[1] + (b[1] - a[1]) * t + 0.000001))
+        i = i + 1
+    }
+    retornar r
+}
+
+/// Camino más corto (A*) evitando bloqueados ({"q,r": verdadero}); nulo si no hay.
+funcion panal_plano_camino(a, b, bloqueados, limite) {
+    sea clave = funcion(h) { retornar h[0] + "," + h[1] }
+    sea max = limite ?? 10000
+    sea abiertos = [[panal_plano_distancia(a, b), 0, a]]
+    sea de = {}
+    sea costo = {}
+    costo[clave(a)] = 0
+    sea pasos = 0
+    mientras (longitud(abiertos) > 0 y pasos < max) {
+        pasos = pasos + 1
+        sea mi = 0
+        sea i = 1
+        mientras (i < longitud(abiertos)) { si (abiertos[i][0] < abiertos[mi][0]) { mi = i }  i = i + 1 }
+        sea actual = abiertos[mi][2]
+        sea g = abiertos[mi][1]
+        sea resto = []
+        i = 0
+        mientras (i < longitud(abiertos)) { si (i != mi) { resto.agregar(abiertos[i]) }  i = i + 1 }
+        abiertos = resto
+        si (actual[0] == b[0] y actual[1] == b[1]) {
+            sea camino = [actual]
+            sea k = clave(actual)
+            mientras (tiene_clave(de, k)) {
+                camino.agregar(de[k])
+                k = clave(de[k])
+            }
+            sea r = []
+            i = longitud(camino) - 1
+            mientras (i >= 0) { r.agregar(camino[i])  i = i - 1 }
+            retornar r
+        }
+        si (g <= (costo[clave(actual)] ?? g)) {
+            para v en panal_plano_vecinos(actual) {
+                sea kv = clave(v)
+                si ((bloqueados ?? {})[kv] ?? falso) { } sino {
+                    sea ng = g + 1
+                    si (tiene_clave(costo, kv) == falso o ng < costo[kv]) {
+                        costo[kv] = ng
+                        de[kv] = actual
+                        abiertos.agregar([ng + panal_plano_distancia(v, b), ng, v])
+                    }
+                }
+            }
+        }
+    }
+    retornar nulo
+}

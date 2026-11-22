@@ -1,0 +1,363 @@
+// stdlib/entidades.cfv — ECS de alto rendimiento al estilo EnTT: cada
+// componente vive en un "conjunto disperso" (arreglo denso + índice), así
+// recorrer es lineal sin buscar en mapas, agregar y quitar son O(1) y las
+// vistas recorren el componente más chico. Ids con generación (un id viejo
+// nunca apunta a una entidad nueva), señales al poner/quitar componentes,
+// ordenar un componente, órdenes diferidas dentro de sistemas, eventos,
+// recursos y guardar/cargar en JSON. Para un ECS más simple ver "elenco".
+// Inspirada en EnTT (MIT). En inglés: importar "entities".
+//
+//   importar "entidades"
+//   sea m = entidades_mundo()
+//   sea e = entidades_crear(m, {"pos": {"x": 0, "y": 0}, "vel": {"x": 1, "y": 0}})
+//   entidades_cada(m, ["pos", "vel"], funcion(e, c) { c[0]["x"] = c[0]["x"] + c[1]["x"] })
+//   entidades_sistema(m, "mover", ["pos", "vel"], funcion(m, e, c, dt) { … })
+//   entidades_paso(m, 1 / 60)
+
+importar "json"
+
+sea _EN_BITS = 1048576
+
+funcion entidades_mundo() {
+    retornar {"gen": [], "libres": [], "vivas": 0, "pools": {}, "sistemas": [], "pendientes": [], "en_paso": 0, "eventos": {}, "eventos_nuevos": {}, "recursos": {}, "cuadro": 0, "senales": {}}
+}
+
+funcion _en_indice(e) { retornar e % _EN_BITS }
+funcion _en_gen(e) { retornar piso(e / _EN_BITS) }
+
+/// ¿Sigue viva? (falso si se destruyó, aunque su lugar se reuse).
+funcion entidades_viva(m, e) {
+    si (tipo(e) != "numero") { retornar falso }
+    sea i = _en_indice(e)
+    retornar i < longitud(m["gen"]) y m["gen"][i] == _en_gen(e)
+}
+
+funcion _en_exigir(m, e) { si (entidades_viva(m, e) == falso) { lanzar "entidades: la entidad " + e + " no existe (¿ya se destruyó?)" } }
+
+funcion _en_pool(m, nombre) {
+    si (tiene_clave(m["pools"], nombre) == falso) { m["pools"][nombre] = {"denso": [], "datos": [], "disperso": []} }
+    retornar m["pools"][nombre]
+}
+
+funcion _en_reservar(m) {
+    si (longitud(m["libres"]) > 0) {
+        sea i = m["libres"][longitud(m["libres"]) - 1]
+        quitar_ultimo(m["libres"])
+        m["gen"][i] = -m["gen"][i] + 1
+        m["vivas"] = m["vivas"] + 1
+        retornar m["gen"][i] * _EN_BITS + i
+    }
+    si (longitud(m["gen"]) >= _EN_BITS) { lanzar "entidades: demasiadas entidades" }
+    m["gen"].agregar(1)
+    m["vivas"] = m["vivas"] + 1
+    retornar _EN_BITS + longitud(m["gen"]) - 1
+}
+
+// Índice disperso: lista por índice de entidad (-1 = no está).
+funcion _en_pos(p, i) {
+    si (i < longitud(p["disperso"])) { retornar p["disperso"][i] }
+    retornar -1
+}
+
+funcion _en_fijar(p, i, pos) {
+    mientras (longitud(p["disperso"]) <= i) { p["disperso"].agregar(-1) }
+    p["disperso"][i] = pos
+}
+
+funcion _en_senal(m, tipo_, nombre, e, datos) {
+    sea k = tipo_ + ":" + nombre
+    si (tiene_clave(m["senales"], k)) { para f en m["senales"][k] { f(m, e, datos) } }
+}
+
+funcion _en_poner_ya(m, e, nombre, datos) {
+    sea p = _en_pool(m, nombre)
+    sea k = _en_indice(e)
+    sea d = datos ?? {}
+    si (_en_pos(p, k) >= 0) {
+        p["datos"][_en_pos(p, k)] = d
+        _en_senal(m, "cambio", nombre, e, d)
+    } sino {
+        _en_fijar(p, k, longitud(p["denso"]))
+        p["denso"].agregar(e)
+        p["datos"].agregar(d)
+        _en_senal(m, "poner", nombre, e, d)
+    }
+}
+
+funcion _en_quitar_ya(m, e, nombre) {
+    si (tiene_clave(m["pools"], nombre) == falso) { retornar falso }
+    sea p = m["pools"][nombre]
+    sea k = _en_indice(e)
+    sea pos = _en_pos(p, k)
+    si (pos < 0) { retornar falso }
+    sea datos = p["datos"][pos]
+    // Intercambia con el último y saca el último (O(1)).
+    sea ult = longitud(p["denso"]) - 1
+    si (pos != ult) {
+        sea otro = p["denso"][ult]
+        p["denso"][pos] = otro
+        p["datos"][pos] = p["datos"][ult]
+        p["disperso"][_en_indice(otro)] = pos
+    }
+    quitar_ultimo(p["denso"])
+    quitar_ultimo(p["datos"])
+    p["disperso"][k] = -1
+    _en_senal(m, "quitar", nombre, e, datos)
+    retornar verdadero
+}
+
+funcion _en_destruir_ya(m, e) {
+    si (entidades_viva(m, e) == falso) { retornar falso }
+    para n en claves(m["pools"]) { _en_quitar_ya(m, e, n) }
+    sea i = _en_indice(e)
+    m["gen"][i] = -m["gen"][i]
+    m["libres"].agregar(i)
+    m["vivas"] = m["vivas"] - 1
+    retornar verdadero
+}
+
+/// Crea una entidad. Dentro de un sistema los componentes llegan al terminar
+/// el sistema, pero el id ya es válido.
+funcion entidades_crear(m, componentes) {
+    sea e = _en_reservar(m)
+    si (componentes != nulo) {
+        para k en claves(componentes) {
+            si (m["en_paso"] > 0) { m["pendientes"].agregar({"op": "poner", "e": e, "n": k, "d": componentes[k]}) } sino { _en_poner_ya(m, e, k, componentes[k]) }
+        }
+    }
+    retornar e
+}
+
+funcion entidades_destruir(m, e) {
+    si (m["en_paso"] > 0) {
+        m["pendientes"].agregar({"op": "destruir", "e": e})
+        retornar entidades_viva(m, e)
+    }
+    retornar _en_destruir_ya(m, e)
+}
+
+funcion entidades_poner(m, e, nombre, datos) {
+    _en_exigir(m, e)
+    si (m["en_paso"] > 0) { m["pendientes"].agregar({"op": "poner", "e": e, "n": nombre, "d": datos}) } sino { _en_poner_ya(m, e, nombre, datos) }
+    retornar datos
+}
+
+funcion entidades_quitar(m, e, nombre) {
+    si (m["en_paso"] > 0) {
+        m["pendientes"].agregar({"op": "quitar", "e": e, "n": nombre})
+        retornar entidades_tiene(m, e, nombre)
+    }
+    retornar _en_quitar_ya(m, e, nombre)
+}
+
+funcion entidades_tiene(m, e, nombre) {
+    si (entidades_viva(m, e) == falso o tiene_clave(m["pools"], nombre) == falso) { retornar falso }
+    retornar _en_pos(m["pools"][nombre], _en_indice(e)) >= 0
+}
+
+funcion entidades_obtener(m, e, nombre) {
+    si (entidades_tiene(m, e, nombre) == falso) { retornar nulo }
+    sea p = m["pools"][nombre]
+    retornar p["datos"][_en_pos(p, _en_indice(e))]
+}
+
+funcion entidades_cantidad(m) { retornar m["vivas"] }
+
+/// Cuántas entidades tienen un componente.
+funcion entidades_cuantas(m, nombre) {
+    si (tiene_clave(m["pools"], nombre) == falso) { retornar 0 }
+    retornar longitud(m["pools"][nombre]["denso"])
+}
+
+funcion entidades_componentes(m, e) {
+    sea r = {}
+    para n en claves(m["pools"]) { si (entidades_tiene(m, e, n)) { r[n] = entidades_obtener(m, e, n) } }
+    retornar r
+}
+
+/// Vista: llama f(e, [datos de cada componente en el orden pedido]) por cada
+/// entidad con todos `con` y ninguno de `sin`. Recorre el componente más
+/// chico, en su orden denso (ver entidades_ordenar).
+funcion entidades_cada(m, con, f, sin) {
+    si (longitud(con) == 0) { retornar 0 }
+    sea pools = []
+    sea base = nulo
+    para n en con {
+        si (tiene_clave(m["pools"], n) == falso) { retornar 0 }
+        sea p = m["pools"][n]
+        pools.agregar(p)
+        si (base == nulo o longitud(p["denso"]) < longitud(base["denso"])) { base = p }
+    }
+    sea excluidos = []
+    si (sin != nulo) { para n en sin { si (tiene_clave(m["pools"], n)) { excluidos.agregar(m["pools"][n]) } } }
+    // Copia del denso: quitar durante el recorrido no salta entidades.
+    sea lista = []
+    para e en base["denso"] { lista.agregar(e) }
+    sea n = 0
+    para e en lista {
+        sea k = _en_indice(e)
+        sea datos = []
+        sea ok = entidades_viva(m, e)
+        para p en pools {
+            si (ok) {
+                sea pos = _en_pos(p, k)
+                si (pos < 0) { ok = falso } sino { datos.agregar(p["datos"][pos]) }
+            }
+        }
+        si (ok) { para p en excluidos { si (_en_pos(p, k) >= 0) { ok = falso } } }
+        si (ok) {
+            f(e, datos)
+            n = n + 1
+        }
+    }
+    retornar n
+}
+
+/// Como entidades_cada pero devuelve [[e, {"comp": datos}], …].
+funcion entidades_consultar(m, con, sin) {
+    sea r = []
+    entidades_cada(m, con, funcion(e, datos) {
+        sea c = {}
+        sea i = 0
+        mientras (i < longitud(con)) { c[con[i]] = datos[i]  i = i + 1 }
+        r.agregar([e, c])
+    }, sin)
+    retornar r
+}
+
+/// Ordena el arreglo denso de un componente con comparador(a, b) sobre sus
+/// datos: las vistas que lo recorren siguen ese orden (p. ej. por "z").
+funcion entidades_ordenar(m, nombre, comparador) {
+    si (tiene_clave(m["pools"], nombre) == falso) { retornar nulo }
+    sea p = m["pools"][nombre]
+    sea pares = []
+    sea i = 0
+    mientras (i < longitud(p["denso"])) { pares.agregar([p["denso"][i], p["datos"][i]])  i = i + 1 }
+    pares = ordenar(pares, funcion(a, b) { retornar comparador(a[1], b[1]) })
+    p["denso"] = []
+    p["datos"] = []
+    p["disperso"] = []
+    para x en pares {
+        _en_fijar(p, _en_indice(x[0]), longitud(p["denso"]))
+        p["denso"].agregar(x[0])
+        p["datos"].agregar(x[1])
+    }
+}
+
+/// Señales: f(m, e, datos) al poner, cambiar o quitar un componente.
+/// tipo: "poner" | "cambio" | "quitar".
+funcion entidades_al(m, tipo_, nombre, f) {
+    sea t = tipo_
+    si (t == "add" o t == "construct") { t = "poner" }
+    si (t == "update") { t = "cambio" }
+    si (t == "remove" o t == "destroy") { t = "quitar" }
+    sea k = t + ":" + nombre
+    si (tiene_clave(m["senales"], k) == falso) { m["senales"][k] = [] }
+    m["senales"][k].agregar(f)
+}
+
+/// Sistema: f(m, e, {"comp": datos}, dt) por entidad (o una vez con e = nulo
+/// si con = []). opciones: sin, fase (menor antes), cada (cada N cuadros).
+funcion entidades_sistema(m, nombre, con, f, opciones) {
+    sea fase = 0
+    sea sin = []
+    sea cada = 1
+    si (opciones != nulo) {
+        fase = opciones["fase"] ?? (opciones["stage"] ?? 0)
+        sin = opciones["sin"] ?? (opciones["without"] ?? [])
+        cada = opciones["cada"] ?? (opciones["every"] ?? 1)
+    }
+    m["sistemas"].agregar({"nombre": nombre, "con": con, "sin": sin, "f": f, "fase": fase, "cada": cada, "activo": verdadero, "orden": longitud(m["sistemas"])})
+    m["sistemas"] = ordenar(m["sistemas"], funcion(a, b) {
+        si (a["fase"] != b["fase"]) { retornar a["fase"] - b["fase"] }
+        retornar a["orden"] - b["orden"]
+    })
+}
+
+funcion entidades_activar(m, nombre, activo) { para s en m["sistemas"] { si (s["nombre"] == nombre) { s["activo"] = activo } } }
+
+/// Aplica las órdenes diferidas (entidades_paso lo hace solo).
+funcion entidades_aplicar(m) {
+    mientras (longitud(m["pendientes"]) > 0) {
+        sea l = m["pendientes"]
+        m["pendientes"] = []
+        para x en l {
+            si (x["op"] == "destruir") { _en_destruir_ya(m, x["e"]) }
+            si (x["op"] == "poner" y entidades_viva(m, x["e"])) { _en_poner_ya(m, x["e"], x["n"], x["d"]) }
+            si (x["op"] == "quitar") { _en_quitar_ya(m, x["e"], x["n"]) }
+        }
+    }
+}
+
+/// Un cuadro: corre los sistemas en orden; los eventos emitidos en este
+/// cuadro se leen en el siguiente.
+funcion entidades_paso(m, dt) {
+    m["eventos"] = m["eventos_nuevos"]
+    m["eventos_nuevos"] = {}
+    para s en m["sistemas"] {
+        si (s["activo"] y m["cuadro"] % s["cada"] == 0) {
+            m["en_paso"] = m["en_paso"] + 1
+            sea error = nulo
+            intentar {
+                si (longitud(s["con"]) == 0) { s["f"](m, nulo, nulo, dt) } sino {
+                    sea con = s["con"]
+                    entidades_cada(m, con, funcion(e, datos) {
+                        sea c = {}
+                        sea i = 0
+                        mientras (i < longitud(con)) { c[con[i]] = datos[i]  i = i + 1 }
+                        s["f"](m, e, c, dt)
+                    }, s["sin"])
+                }
+            } capturar (e) { error = e }
+            m["en_paso"] = m["en_paso"] - 1
+            entidades_aplicar(m)
+            si (error != nulo) { lanzar "entidades: el sistema " + s["nombre"] + " falló: " + error }
+        }
+    }
+    m["cuadro"] = m["cuadro"] + 1
+}
+
+funcion entidades_emitir(m, tipo_, datos) {
+    si (tiene_clave(m["eventos_nuevos"], tipo_) == falso) { m["eventos_nuevos"][tipo_] = [] }
+    m["eventos_nuevos"][tipo_].agregar(datos)
+}
+
+funcion entidades_eventos(m, tipo_) { retornar m["eventos"][tipo_] ?? [] }
+
+funcion entidades_recurso(m, nombre, valor) {
+    si (valor != nulo) { m["recursos"][nombre] = valor }
+    retornar m["recursos"][nombre] ?? nulo
+}
+
+/// Estado a JSON (entidades, componentes y recursos; no sistemas ni señales).
+funcion entidades_guardar(m) {
+    sea comps = {}
+    para n en claves(m["pools"]) {
+        sea p = m["pools"][n]
+        comps[n] = {"e": p["denso"], "d": p["datos"]}
+    }
+    retornar json_texto({"gen": m["gen"], "libres": m["libres"], "vivas": m["vivas"], "comps": comps, "recursos": m["recursos"], "cuadro": m["cuadro"]})
+}
+
+funcion entidades_cargar(m, texto) {
+    sea d = json_parsear(texto)
+    m["gen"] = d["gen"]
+    m["libres"] = d["libres"]
+    m["vivas"] = d["vivas"]
+    m["recursos"] = d["recursos"]
+    m["cuadro"] = d["cuadro"]
+    m["pendientes"] = []
+    m["pools"] = {}
+    para n en claves(d["comps"]) {
+        sea p = _en_pool(m, n)
+        sea i = 0
+        mientras (i < longitud(d["comps"][n]["e"])) {
+            sea e = d["comps"][n]["e"][i]
+            _en_fijar(p, _en_indice(e), longitud(p["denso"]))
+            p["denso"].agregar(e)
+            p["datos"].agregar(d["comps"][n]["d"][i])
+            i = i + 1
+        }
+    }
+    retornar m
+}

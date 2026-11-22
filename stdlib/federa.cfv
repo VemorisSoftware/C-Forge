@@ -1,0 +1,474 @@
+// stdlib/federa.cfv — OAuth 2.0 y OpenID Connect hechos bien: PKCE (S256),
+// state y nonce aleatorios, URL de autorización codificada, cuerpo del
+// canje de código y del refresco, descubrimiento (.well-known), y
+// validación completa del ID token: firma RS256/RS384/RS512 con JWKS,
+// EdDSA (Ed25519) o HS256, y los claims iss, aud, azp, exp, nbf, iat y
+// nonce con tolerancia de reloj. No hace HTTP: entrega lo que hay que
+// enviar y valida lo que vuelve (úsala con tu cliente HTTP). Inspirada en
+// oauth2-rs / openidconnect-rs (MIT/Apache). En inglés: importar "oidc".
+//
+//   importar "federa"
+//   sea p = federa_pkce()
+//   sea s = federa_aleatorio()
+//   sea url = federa_url_autorizacion({"autorizacion": "https://accounts.google.com/o/oauth2/v2/auth",
+//       "cliente": "abc", "redireccion": "https://app/cb", "alcance": "openid email", "estado": s, "desafio": p["desafio"]})
+//   // … en el callback: federa_cuerpo_canje(config, codigo, p["verificador"]) → POST al token endpoint
+//   sea claims = federa_validar_id_token(id_token, {"jwks": jwks, "emisor": "https://accounts.google.com", "audiencia": "abc", "nonce": n})
+
+importar "base64"
+importar "json"
+
+// ── base64url ─────────────────────────────────────────────────────────────
+
+funcion federa_b64url(t) { retornar texto_reemplazar(texto_reemplazar(texto_reemplazar(base64_codificar(t), "+", "-"), "/", "_"), "=", "") }
+
+funcion federa_b64url_decodificar(s) {
+    sea t = texto_reemplazar(texto_reemplazar("" + s, "-", "+"), "_", "/")
+    mientras (longitud(t) % 4 != 0) { t = t + "=" }
+    sea r = nulo
+    intentar { r = base64_decodificar(t) } capturar (e) { lanzar "federa: base64url inválido" }
+    retornar r
+}
+
+/// Texto aleatorio seguro (base64url) para state, nonce, etc.
+funcion federa_aleatorio(bytes) { retornar federa_b64url(bytes_aleatorios(bytes ?? 32)) }
+
+/// PKCE (RFC 7636): {"verificador", "desafio", "metodo": "S256"}.
+funcion federa_pkce() {
+    sea v = federa_aleatorio(48)
+    retornar {"verificador": v, "desafio": federa_b64url(sha256_bytes(v)), "metodo": "S256"}
+}
+
+funcion federa_codificar(s) {
+    sea t = "" + s
+    sea r = ""
+    sea hx = "0123456789ABCDEF"
+    sea i = 0
+    mientras (i < longitud(t)) {
+        sea b = byte_en(t, i)
+        si ((b >= 48 y b <= 57) o (b >= 65 y b <= 90) o (b >= 97 y b <= 122) o b == 45 o b == 46 o b == 95 o b == 126) { r = r + subcadena(t, i, i + 1) } sino { r = r + "%" + subcadena(hx, piso(b / 16), piso(b / 16) + 1) + subcadena(hx, b % 16, b % 16 + 1) }
+        i = i + 1
+    }
+    retornar r
+}
+
+funcion _fd_form(pares) {
+    sea l = []
+    para p en pares { si (p[1] != nulo) { l.agregar(federa_codificar(p[0]) + "=" + federa_codificar(p[1])) } }
+    retornar unir(l, "&")
+}
+
+funcion _fd_op(c, k, k2) {
+    si (tiene_clave(c, k)) { retornar c[k] }
+    si (tiene_clave(c, k2)) { retornar c[k2] }
+    retornar nulo
+}
+
+/// URL a la que se envía al usuario. config: autorizacion, cliente,
+/// redireccion, alcance ("openid"), estado, nonce, desafio (PKCE), extra (mapa).
+funcion federa_url_autorizacion(c) {
+    sea base = _fd_op(c, "autorizacion", "authorization_endpoint")
+    si (base == nulo) { lanzar "federa: falta la URL de autorización" }
+    si (texto_empieza_con(base, "https://") == falso y texto_empieza_con(base, "http://localhost") == falso) { lanzar "federa: la URL de autorización debe ser https" }
+    sea estado = _fd_op(c, "estado", "state")
+    si (estado == nulo) { lanzar "federa: falta el state (usa federa_aleatorio())" }
+    sea pares = [["response_type", "code"], ["client_id", _fd_op(c, "cliente", "client_id")], ["redirect_uri", _fd_op(c, "redireccion", "redirect_uri")], ["scope", _fd_op(c, "alcance", "scope") ?? "openid"], ["state", estado], ["nonce", _fd_op(c, "nonce", "nonce")]]
+    sea desafio = _fd_op(c, "desafio", "code_challenge")
+    si (desafio != nulo) { pares.agregar(["code_challenge", desafio])  pares.agregar(["code_challenge_method", "S256"]) }
+    sea extra = _fd_op(c, "extra", "extra")
+    si (extra != nulo) { para k en claves(extra) { pares.agregar([k, extra[k]]) } }
+    sea sep = "?"
+    si (texto_indice(base, "?") >= 0) { sep = "&" }
+    retornar base + sep + _fd_form(pares)
+}
+
+/// Lee los parámetros del callback (?code=…&state=…) y verifica el state
+/// en tiempo constante. Devuelve {"codigo"} o lanza con el error del proveedor.
+funcion federa_callback(consulta, estado_esperado) {
+    sea t = "" + consulta
+    sea q = texto_indice(t, "?")
+    si (q >= 0) { t = subcadena(t, q + 1, longitud(t)) }
+    sea p = {}
+    para par en texto_dividir(t, "&") {
+        sea i = texto_indice(par, "=")
+        si (i > 0) {
+            sea v = texto_reemplazar(subcadena(par, i + 1, longitud(par)), "+", " ")
+            // Decodifica %XX.
+            sea r = ""
+            sea hex = ""
+            sea k = 0
+            mientras (k < longitud(v)) {
+                si (byte_en(v, k) == 37 y k + 2 < longitud(v) + 1) {
+                    hex = hex + subcadena(v, k + 1, k + 3)
+                    k = k + 3
+                } sino {
+                    si (hex != "") { r = r + bytes_de_hex(hex)  hex = "" }
+                    r = r + subcadena(v, k, k + 1)
+                    k = k + 1
+                }
+            }
+            si (hex != "") { r = r + bytes_de_hex(hex) }
+            p[subcadena(par, 0, i)] = r
+        }
+    }
+    si (tiene_clave(p, "error")) { lanzar "federa: el proveedor respondió " + p["error"] + ": " + (p["error_description"] ?? "") }
+    si (tiene_clave(p, "state") == falso o comparar_seguro(p["state"], "" + estado_esperado) == falso) { lanzar "federa: el state no coincide (posible CSRF)" }
+    si (tiene_clave(p, "code") == falso) { lanzar "federa: falta el código" }
+    retornar {"codigo": p["code"], "estado": p["state"]}
+}
+
+/// Cuerpo (application/x-www-form-urlencoded) para canjear el código.
+funcion federa_cuerpo_canje(c, codigo, verificador) {
+    retornar _fd_form([["grant_type", "authorization_code"], ["code", codigo], ["redirect_uri", _fd_op(c, "redireccion", "redirect_uri")], ["client_id", _fd_op(c, "cliente", "client_id")], ["client_secret", _fd_op(c, "secreto", "client_secret")], ["code_verifier", verificador]])
+}
+
+funcion federa_cuerpo_refresco(c, refresco) {
+    retornar _fd_form([["grant_type", "refresh_token"], ["refresh_token", refresco], ["client_id", _fd_op(c, "cliente", "client_id")], ["client_secret", _fd_op(c, "secreto", "client_secret")], ["scope", _fd_op(c, "alcance", "scope")]])
+}
+
+/// Respuesta del token endpoint (JSON) → {"acceso", "refresco", "id_token",
+/// "tipo", "vence_ms", "alcance"}; lanza si trae "error".
+funcion federa_respuesta_token(texto, ahora_ms) {
+    sea d = json_parsear("" + texto)
+    si (tiene_clave(d, "error")) { lanzar "federa: el canje falló: " + d["error"] + " " + (d["error_description"] ?? "") }
+    si (tiene_clave(d, "access_token") == falso) { lanzar "federa: la respuesta no trae access_token" }
+    sea ahora = ahora_ms ?? tiempo_ms()
+    sea vence = nulo
+    si (tiene_clave(d, "expires_in")) { vence = ahora + d["expires_in"] * 1000 }
+    retornar {"acceso": d["access_token"], "refresco": d["refresh_token"] ?? nulo, "id_token": d["id_token"] ?? nulo, "tipo": d["token_type"] ?? "Bearer", "vence_ms": vence, "alcance": d["scope"] ?? nulo}
+}
+
+/// ¿Conviene refrescar? (faltan menos de margen_s segundos, 60 por defecto).
+funcion federa_por_vencer(tokens, ahora_ms, margen_s) {
+    si (tokens["vence_ms"] == nulo) { retornar falso }
+    retornar (ahora_ms ?? tiempo_ms()) + (margen_s ?? 60) * 1000 >= tokens["vence_ms"]
+}
+
+/// Documento de descubrimiento (.well-known/openid-configuration) → config.
+funcion federa_descubrimiento(texto) {
+    sea d = json_parsear("" + texto)
+    para k en ["issuer", "authorization_endpoint", "token_endpoint", "jwks_uri"] { si (tiene_clave(d, k) == falso) { lanzar "federa: el descubrimiento no trae " + k } }
+    retornar {"emisor": d["issuer"], "autorizacion": d["authorization_endpoint"], "token": d["token_endpoint"], "jwks_uri": d["jwks_uri"], "userinfo": d["userinfo_endpoint"] ?? nulo, "fin_sesion": d["end_session_endpoint"] ?? nulo, "algoritmos": d["id_token_signing_alg_values_supported"] ?? []}
+}
+
+// ── JWT ───────────────────────────────────────────────────────────────────
+
+/// Separa un JWT sin verificar: {"cabecera", "carga", "firma", "firmado"}.
+funcion federa_jwt(token) {
+    sea p = texto_dividir("" + token, ".")
+    si (longitud(p) != 3) { lanzar "federa: el JWT debe tener 3 partes" }
+    sea cab = nulo
+    sea carga = nulo
+    intentar {
+        cab = json_parsear(federa_b64url_decodificar(p[0]))
+        carga = json_parsear(federa_b64url_decodificar(p[1]))
+    } capturar (e) { lanzar "federa: JWT mal formado" }
+    si (tipo(cab) != "mapa" o tipo(carga) != "mapa") { lanzar "federa: JWT mal formado" }
+    retornar {"cabecera": cab, "carga": carga, "firma": federa_b64url_decodificar(p[2]), "firmado": p[0] + "." + p[1]}
+}
+
+// Enteros grandes en base 2^24 (little endian) con Montgomery.
+sea _FD_B = 16777216
+
+funcion _fd_bn(bytes_) {
+    sea r = []
+    sea n = longitud(bytes_)
+    sea i = n - 1
+    mientras (i >= 0) {
+        sea v = byte_en(bytes_, i)
+        sea j = n - 1 - i
+        sea limb = piso(j / 3)
+        mientras (longitud(r) <= limb) { r.agregar(0) }
+        r[limb] = r[limb] + v * potencia(256, j % 3)
+        i = i - 1
+    }
+    mientras (longitud(r) > 1 y r[longitud(r) - 1] == 0) {
+        sea c = []
+        sea k = 0
+        mientras (k < longitud(r) - 1) { c.agregar(r[k])  k = k + 1 }
+        r = c
+    }
+    retornar r
+}
+
+funcion _fd_bytes(a, largo) {
+    sea r = []
+    sea j = 0
+    mientras (j < largo) {
+        sea limb = piso(j / 3)
+        sea v = 0
+        si (limb < longitud(a)) { v = piso(a[limb] / potencia(256, j % 3)) % 256 }
+        r.agregar(v)
+        j = j + 1
+    }
+    sea s = []
+    j = largo - 1
+    mientras (j >= 0) { s.agregar(r[j])  j = j - 1 }
+    retornar s
+}
+
+funcion _fd_mont(a, b, n, ninv) {
+    sea k = longitud(n)
+    sea t = []
+    sea i = 0
+    mientras (i < k + 2) { t.agregar(0)  i = i + 1 }
+    i = 0
+    mientras (i < k) {
+        sea ai = a[i] ?? 0
+        sea c = 0
+        sea j = 0
+        mientras (j < k) {
+            sea v = t[j] + ai * (b[j] ?? 0) + c
+            c = piso(v / _FD_B)
+            t[j] = v - c * _FD_B
+            j = j + 1
+        }
+        sea v = t[k] + c
+        c = piso(v / _FD_B)
+        t[k] = v - c * _FD_B
+        t[k + 1] = t[k + 1] + c
+        // (t[0]*ninv) puede pasar 2^53: se hace en dos mitades.
+        sea m = ((t[0] * (ninv % 4096)) % _FD_B + ((t[0] * piso(ninv / 4096)) % 4096) * 4096) % _FD_B
+        v = t[0] + m * n[0]
+        c = piso(v / _FD_B)
+        j = 1
+        mientras (j < k) {
+            v = t[j] + m * n[j] + c
+            c = piso(v / _FD_B)
+            t[j - 1] = v - c * _FD_B
+            j = j + 1
+        }
+        v = t[k] + c
+        c = piso(v / _FD_B)
+        t[k - 1] = v - c * _FD_B
+        t[k] = t[k + 1] + c
+        t[k + 1] = 0
+        i = i + 1
+    }
+    // Resta final si t >= n.
+    sea mayor = t[k] > 0
+    si (mayor == falso) {
+        sea j = k - 1
+        sea decidido = falso
+        mientras (j >= 0 y decidido == falso) {
+            si (t[j] > n[j]) { mayor = verdadero  decidido = verdadero }
+            si (t[j] < n[j]) { decidido = verdadero }
+            j = j - 1
+        }
+        si (decidido == falso) { mayor = verdadero }
+    }
+    sea r = []
+    i = 0
+    mientras (i < k) { r.agregar(t[i])  i = i + 1 }
+    si (mayor) {
+        sea pr = 0
+        i = 0
+        mientras (i < k) {
+            sea v = r[i] - n[i] - pr
+            si (v < 0) { v = v + _FD_B  pr = 1 } sino { pr = 0 }
+            r[i] = v
+            i = i + 1
+        }
+    }
+    retornar r
+}
+
+// x mod n por restas desplazadas (solo para R² mod n, una vez).
+funcion _fd_r2(n) {
+    // Calcula 2^(2·24·k) mod n duplicando y restando.
+    sea k = longitud(n)
+    sea r = []
+    sea i = 0
+    mientras (i < k) { r.agregar(0)  i = i + 1 }
+    r[0] = 1
+    sea pasos = 2 * 24 * k
+    i = 0
+    mientras (i < pasos) {
+        // r = 2r mod n
+        sea c = 0
+        sea j = 0
+        mientras (j < k) {
+            sea v = r[j] * 2 + c
+            c = piso(v / _FD_B)
+            r[j] = v - c * _FD_B
+            j = j + 1
+        }
+        sea mayor = c > 0
+        si (mayor == falso) {
+            j = k - 1
+            sea decidido = falso
+            mientras (j >= 0 y decidido == falso) {
+                si (r[j] > n[j]) { mayor = verdadero  decidido = verdadero }
+                si (r[j] < n[j]) { decidido = verdadero }
+                j = j - 1
+            }
+            si (decidido == falso) { mayor = verdadero }
+        }
+        si (mayor) {
+            sea pr = 0
+            j = 0
+            mientras (j < k) {
+                sea v = r[j] - n[j] - pr
+                si (v < 0) { v = v + _FD_B  pr = 1 } sino { pr = 0 }
+                r[j] = v
+                j = j + 1
+            }
+        }
+        i = i + 1
+    }
+    retornar r
+}
+
+/// m^e mod n con bytes big-endian; devuelve bytes (lista) de largo de n.
+funcion _fd_modexp(m_bytes, e_bytes, n_bytes) {
+    sea n = _fd_bn(n_bytes)
+    si (n[0] % 2 == 0) { lanzar "federa: módulo RSA par" }
+    // ninv = -n^-1 mod 2^24 (Newton).
+    sea x = 1
+    sea it = 0
+    mientras (it < 6) {
+        // x = x * (2 - n0*x) mod 2^24, sin pasar 2^53.
+        sea nx = ((n[0] % 4096) * x % _FD_B + (piso(n[0] / 4096) * x % 4096) * 4096) % _FD_B
+        sea f = (2 - nx + _FD_B) % _FD_B
+        x = ((x % 4096) * f % _FD_B + (piso(x / 4096) * f % 4096) * 4096) % _FD_B
+        it = it + 1
+    }
+    sea ninv = (_FD_B - x) % _FD_B
+    sea r2 = _fd_r2(n)
+    sea m = _fd_bn(m_bytes)
+    mientras (longitud(m) < longitud(n)) { m.agregar(0) }
+    sea mm = _fd_mont(m, r2, n, ninv)
+    sea uno = [1]
+    sea acc = _fd_mont(uno, r2, n, ninv)
+    // Exponente bit a bit (de más a menos significativo).
+    sea i = 0
+    mientras (i < longitud(e_bytes)) {
+        sea b = byte_en(e_bytes, i)
+        sea bit = 7
+        mientras (bit >= 0) {
+            acc = _fd_mont(acc, acc, n, ninv)
+            si (piso(b / potencia(2, bit)) % 2 == 1) { acc = _fd_mont(acc, mm, n, ninv) }
+            bit = bit - 1
+        }
+        i = i + 1
+    }
+    sea res = _fd_mont(acc, [1], n, ninv)
+    retornar _fd_bytes(res, longitud(n_bytes))
+}
+
+sea _FD_DIGEST = {"RS256": "3031300d060960864801650304020105000420", "RS384": "3041300d060960864801650304020205000430", "RS512": "3051300d060960864801650304020305000440"}
+
+funcion _fd_resumen(alg, t) {
+    si (alg == "RS256") { retornar sha256_bytes(t) }
+    si (alg == "RS384") { retornar bytes_de_hex(sha384(t)) }
+    retornar sha512_bytes(t)
+}
+
+/// Verifica una firma RSA PKCS#1 v1.5 (n y e como bytes big-endian).
+funcion federa_rsa_verificar(n_bytes, e_bytes, mensaje, firma, alg) {
+    sea a = alg ?? "RS256"
+    si (tiene_clave(_FD_DIGEST, a) == falso) { lanzar "federa: algoritmo RSA no soportado " + a }
+    si (longitud(n_bytes) < 256) { lanzar "federa: clave RSA demasiado corta (mínimo 2048 bits)" }
+    si (longitud(firma) != longitud(n_bytes)) { retornar falso }
+    sea em = _fd_modexp(firma, e_bytes, n_bytes)
+    sea esperado = bytes_de_hex(_FD_DIGEST[a]) + _fd_resumen(a, mensaje)
+    sea k = longitud(n_bytes)
+    sea t = longitud(esperado)
+    si (em[0] != 0 o em[1] != 1) { retornar falso }
+    sea i = 2
+    mientras (i < k - t - 1) {
+        si (em[i] != 255) { retornar falso }
+        i = i + 1
+    }
+    si (em[k - t - 1] != 0) { retornar falso }
+    sea dif = 0
+    i = 0
+    mientras (i < t) {
+        si (em[k - t + i] != byte_en(esperado, i)) { dif = dif + 1 }
+        i = i + 1
+    }
+    retornar dif == 0
+}
+
+funcion _fd_buscar_clave(jwks, cab) {
+    sea claves_ = jwks
+    si (tipo(jwks) == "texto") { claves_ = json_parsear(jwks) }
+    si (tipo(claves_) == "mapa") { claves_ = claves_["keys"] ?? [] }
+    sea kid = cab["kid"] ?? nulo
+    sea candidatas = []
+    para k en claves_ {
+        si ((k["use"] ?? "sig") == "sig" y (kid == nulo o (k["kid"] ?? nulo) == kid)) { candidatas.agregar(k) }
+    }
+    si (longitud(candidatas) == 0) { lanzar "federa: no hay una clave en el JWKS para kid " + kid }
+    retornar candidatas
+}
+
+/// Verifica solo la firma de un JWT contra un JWKS (o un secreto para HS256).
+/// Devuelve el JWT separado; lanza si la firma no es válida.
+funcion federa_verificar_firma(token, opciones) {
+    sea j = federa_jwt(token)
+    sea alg = j["cabecera"]["alg"] ?? ""
+    sea permitidos = opciones["algoritmos"] ?? (opciones["algorithms"] ?? ["RS256", "RS384", "RS512", "EdDSA", "HS256"])
+    sea ok_alg = falso
+    para a en permitidos { si (a == alg) { ok_alg = verdadero } }
+    si (ok_alg == falso o alg == "none") { lanzar "federa: algoritmo no permitido: " + alg }
+    si (alg == "HS256") {
+        sea secreto = opciones["secreto"] ?? (opciones["secret"] ?? nulo)
+        si (secreto == nulo) { lanzar "federa: HS256 necesita el secreto" }
+        si (comparar_seguro(hmac_sha256_bytes(secreto, j["firmado"]), j["firma"]) == falso) { lanzar "federa: firma inválida" }
+        retornar j
+    }
+    sea jwks = opciones["jwks"] ?? nulo
+    si (jwks == nulo) { lanzar "federa: falta el JWKS" }
+    para k en _fd_buscar_clave(jwks, j["cabecera"]) {
+        si (texto_empieza_con(alg, "RS") y (k["kty"] ?? "") == "RSA") {
+            si (federa_rsa_verificar(federa_b64url_decodificar(k["n"]), federa_b64url_decodificar(k["e"]), j["firmado"], j["firma"], alg)) { retornar j }
+        }
+        si (alg == "EdDSA" y (k["kty"] ?? "") == "OKP" y (k["crv"] ?? "") == "Ed25519") {
+            si (ed25519_verificar(federa_b64url_decodificar(k["x"]), j["firmado"], j["firma"])) { retornar j }
+        }
+    }
+    lanzar "federa: firma inválida"
+}
+
+/// Valida un ID token de OpenID Connect. opciones: jwks (o secreto), emisor,
+/// audiencia (cliente), nonce, ahora_ms, tolerancia_s (60), edad_max_s
+/// (para auth_time), algoritmos. Devuelve los claims.
+funcion federa_validar_id_token(token, opciones) {
+    sea j = federa_verificar_firma(token, opciones)
+    sea c = j["carga"]
+    sea ahora = piso((opciones["ahora_ms"] ?? tiempo_ms()) / 1000)
+    sea tol = opciones["tolerancia_s"] ?? 60
+    sea emisor = opciones["emisor"] ?? (opciones["issuer"] ?? nulo)
+    si (emisor == nulo) { lanzar "federa: falta el emisor esperado" }
+    si ((c["iss"] ?? nulo) != emisor) { lanzar "federa: emisor inesperado " + (c["iss"] ?? "(ninguno)") }
+    sea aud = opciones["audiencia"] ?? (opciones["audience"] ?? nulo)
+    si (aud == nulo) { lanzar "federa: falta la audiencia esperada (tu client_id)" }
+    sea auds = c["aud"] ?? []
+    si (tipo(auds) == "texto") { auds = [auds] }
+    sea esta = falso
+    para a en auds { si (a == aud) { esta = verdadero } }
+    si (esta == falso) { lanzar "federa: el token no es para esta audiencia" }
+    si (longitud(auds) > 1 y (c["azp"] ?? nulo) != aud) { lanzar "federa: azp no coincide con el cliente" }
+    si (tiene_clave(c, "exp") == falso) { lanzar "federa: el token no trae exp" }
+    si (ahora > c["exp"] + tol) { lanzar "federa: el token venció" }
+    si (tiene_clave(c, "nbf") y ahora + tol < c["nbf"]) { lanzar "federa: el token todavía no es válido" }
+    si (tiene_clave(c, "iat") y c["iat"] > ahora + tol) { lanzar "federa: iat está en el futuro" }
+    sea nonce = opciones["nonce"] ?? nulo
+    si (nonce != nulo) {
+        si (tiene_clave(c, "nonce") == falso o comparar_seguro(c["nonce"], nonce) == falso) { lanzar "federa: el nonce no coincide (posible repetición)" }
+    }
+    sea edad = opciones["edad_max_s"] ?? (opciones["max_age"] ?? nulo)
+    si (edad != nulo) {
+        si (tiene_clave(c, "auth_time") == falso) { lanzar "federa: falta auth_time" }
+        si (ahora - c["auth_time"] > edad + tol) { lanzar "federa: la sesión es demasiado antigua" }
+    }
+    retornar c
+}
+
+/// URL para cerrar sesión en el proveedor (RP-initiated logout).
+funcion federa_url_salida(fin_sesion, id_token, redireccion, estado) {
+    sea sep = "?"
+    si (texto_indice(fin_sesion, "?") >= 0) { sep = "&" }
+    retornar fin_sesion + sep + _fd_form([["id_token_hint", id_token], ["post_logout_redirect_uri", redireccion], ["state", estado]])
+}
