@@ -1,0 +1,356 @@
+// stdlib/tabla.cfv — tablas de datos (DataFrames): filtrar, ordenar,
+// agrupar con agregaciones, unir, columnas calculadas, describir y CSV.
+// Inspirada en Polars / Pandas (MIT/BSD). En inglés: importar "dataframe".
+//
+//   importar "tabla"
+//   sea t = tabla_desde_csv(leer_archivo("ventas.csv"))
+//   sea r = tabla_agrupar(tabla_filtrar(t, funcion(f) { retornar f["monto"] > 0 }),
+//                         ["region"], {"total": ["monto", "suma"], "n": ["monto", "cuenta"]})
+//   mostrar(tabla_texto(tabla_ordenar(r, "total", verdadero)))
+//
+// Representación: {"columnas": [nombres], "filas": [mapas]}. Las funciones
+// devuelven tablas nuevas (no modifican la original).
+
+importar "csv"
+importar "vitrina"
+
+funcion _tb(columnas, filas) { retornar {"columnas": columnas, "filas": filas} }
+
+/// Desde una lista de mapas (columnas en orden de aparición).
+funcion tabla_de(filas) {
+    sea cols = []
+    sea vistas = {}
+    para f en filas { para k en claves(f) { si (tiene_clave(vistas, k) == falso) { vistas[k] = verdadero  cols.agregar(k) } } }
+    sea r = []
+    para f en filas {
+        sea g = {}
+        para c en cols { si (tiene_clave(f, c)) { g[c] = f[c] } sino { g[c] = nulo } }
+        r.agregar(g)
+    }
+    retornar _tb(cols, r)
+}
+
+/// Desde columnas: {"a": [1, 2], "b": ["x", "y"]} (mismo largo).
+funcion tabla_columnas(mapa, orden) {
+    sea cols = orden ?? claves(mapa)
+    sea n = nulo
+    para c en cols {
+        si (n == nulo) { n = longitud(mapa[c]) }
+        si (longitud(mapa[c]) != n) { lanzar "tabla: las columnas deben tener el mismo largo" }
+    }
+    sea filas = []
+    sea i = 0
+    mientras (i < (n ?? 0)) {
+        sea f = {}
+        para c en cols { f[c] = mapa[c][i] }
+        filas.agregar(f)
+        i = i + 1
+    }
+    retornar _tb(cols, filas)
+}
+
+funcion _tb_valor(t) {
+    si (t == "") { retornar nulo }
+    sea v = nulo
+    intentar { v = a_numero(t) } capturar (e) { v = nulo }
+    si (v != nulo) { retornar v }
+    si (texto_minusculas(t) == "verdadero" o texto_minusculas(t) == "true") { retornar verdadero }
+    si (texto_minusculas(t) == "falso" o texto_minusculas(t) == "false") { retornar falso }
+    retornar t
+}
+
+/// CSV con cabecera → tabla (números y booleanos se convierten; vacío = nulo).
+funcion tabla_desde_csv(texto, separador, convertir) {
+    sea filas = csv_leer(texto, separador)
+    si (longitud(filas) == 0) { retornar _tb([], []) }
+    sea cols = filas[0]
+    sea r = []
+    sea i = 1
+    mientras (i < longitud(filas)) {
+        sea f = {}
+        sea j = 0
+        mientras (j < longitud(cols)) {
+            sea v = nulo
+            si (j < longitud(filas[i])) { v = filas[i][j] }
+            si (convertir != falso y v != nulo) { v = _tb_valor(v) }
+            f[cols[j]] = v
+            j = j + 1
+        }
+        r.agregar(f)
+        i = i + 1
+    }
+    retornar _tb(cols, r)
+}
+
+/// Tabla → CSV (seguro contra fórmulas de Excel si seguro = verdadero).
+funcion tabla_csv(t, separador, seguro) {
+    sea filas = [t["columnas"]]
+    para f en t["filas"] {
+        sea l = []
+        para c en t["columnas"] {
+            sea v = f[c]
+            si (v == nulo) { l.agregar("") } sino { l.agregar("" + v) }
+        }
+        filas.agregar(l)
+    }
+    si (seguro == verdadero) { retornar csv_escribir_seguro(filas, separador) }
+    retornar csv_escribir(filas, separador)
+}
+
+funcion tabla_filas(t) { retornar t["filas"] }
+funcion tabla_nombres(t) { retornar t["columnas"] }
+funcion tabla_largo(t) { retornar longitud(t["filas"]) }
+
+funcion _tb_hay(t, c) {
+    para x en t["columnas"] { si (x == c) { retornar verdadero } }
+    lanzar "tabla: no existe la columna " + c
+}
+
+funcion tabla_columna(t, c) {
+    _tb_hay(t, c)
+    sea r = []
+    para f en t["filas"] { r.agregar(f[c]) }
+    retornar r
+}
+
+funcion tabla_seleccionar(t, cols) {
+    para c en cols { _tb_hay(t, c) }
+    sea r = []
+    para f en t["filas"] {
+        sea g = {}
+        para c en cols { g[c] = f[c] }
+        r.agregar(g)
+    }
+    retornar _tb(cols, r)
+}
+
+funcion tabla_renombrar(t, cambios) {
+    sea cols = []
+    para c en t["columnas"] { si (tiene_clave(cambios, c)) { cols.agregar(cambios[c]) } sino { cols.agregar(c) } }
+    sea r = []
+    para f en t["filas"] {
+        sea g = {}
+        sea i = 0
+        mientras (i < longitud(cols)) { g[cols[i]] = f[t["columnas"][i]]  i = i + 1 }
+        r.agregar(g)
+    }
+    retornar _tb(cols, r)
+}
+
+funcion tabla_filtrar(t, f) {
+    sea r = []
+    para fila en t["filas"] { si (f(fila) == verdadero) { r.agregar(fila) } }
+    retornar _tb(t["columnas"], r)
+}
+
+/// Columna calculada f(fila) (o reemplaza si existe).
+funcion tabla_calcular(t, nombre, f) {
+    sea cols = []
+    sea esta = falso
+    para c en t["columnas"] { cols.agregar(c)  si (c == nombre) { esta = verdadero } }
+    si (esta == falso) { cols.agregar(nombre) }
+    sea r = []
+    para fila en t["filas"] {
+        sea g = {}
+        para c en t["columnas"] { g[c] = fila[c] }
+        g[nombre] = f(fila)
+        r.agregar(g)
+    }
+    retornar _tb(cols, r)
+}
+
+funcion _tb_comparar(a, b) {
+    si (a == nulo y b == nulo) { retornar 0 }
+    si (a == nulo) { retornar 1 }
+    si (b == nulo) { retornar -1 }
+    si (tipo(a) == "numero" y tipo(b) == "numero") { retornar a - b }
+    sea x = "" + a
+    sea y = "" + b
+    si (x < y) { retornar -1 }
+    si (x > y) { retornar 1 }
+    retornar 0
+}
+
+/// Ordena por una columna o una lista de columnas (estable; nulos al final).
+funcion tabla_ordenar(t, columnas, descendente) {
+    sea cols = columnas
+    si (tipo(columnas) == "texto") { cols = [columnas] }
+    para c en cols { _tb_hay(t, c) }
+    sea signo = 1
+    si (descendente == verdadero) { signo = -1 }
+    sea r = ordenar(t["filas"], funcion(a, b) {
+        para c en cols {
+            sea d = _tb_comparar(a[c], b[c])
+            si (d != 0) {
+                si (a[c] == nulo o b[c] == nulo) { retornar d }
+                retornar d * signo
+            }
+        }
+        retornar 0
+    })
+    retornar _tb(t["columnas"], r)
+}
+
+funcion tabla_cabeza(t, n) {
+    sea r = []
+    sea i = 0
+    mientras (i < minimo(n ?? 5, longitud(t["filas"]))) { r.agregar(t["filas"][i])  i = i + 1 }
+    retornar _tb(t["columnas"], r)
+}
+
+funcion _tb_agregar(valores, op) {
+    sea nums = []
+    para v en valores { si (v != nulo) { nums.agregar(v) } }
+    si (op == "cuenta" o op == "count") { retornar longitud(nums) }
+    si (op == "unicos" o op == "nunique") {
+        sea vistos = {}
+        para v en nums { vistos["" + v] = verdadero }
+        retornar longitud(claves(vistos))
+    }
+    si (op == "lista" o op == "list") { retornar nums }
+    si (op == "primero" o op == "first") { si (longitud(nums) == 0) { retornar nulo }  retornar nums[0] }
+    si (op == "ultimo" o op == "last") { si (longitud(nums) == 0) { retornar nulo }  retornar nums[longitud(nums) - 1] }
+    si (longitud(nums) == 0) { retornar nulo }
+    si (op == "suma" o op == "sum") {
+        sea s = 0
+        para v en nums { s = s + v }
+        retornar s
+    }
+    si (op == "media" o op == "mean") {
+        sea s = 0
+        para v en nums { s = s + v }
+        retornar s / longitud(nums)
+    }
+    si (op == "min" o op == "max") {
+        sea m = nums[0]
+        para v en nums {
+            si (op == "min" y _tb_comparar(v, m) < 0) { m = v }
+            si (op == "max" y _tb_comparar(v, m) > 0) { m = v }
+        }
+        retornar m
+    }
+    lanzar "tabla: agregación desconocida " + op
+}
+
+/// Agrupa por columnas y calcula: {"nueva": ["columna", "suma"|"media"|
+/// "cuenta"|"min"|"max"|"primero"|"ultimo"|"unicos"|"lista"]}.
+funcion tabla_agrupar(t, por, agregaciones) {
+    para c en por { _tb_hay(t, c) }
+    sea grupos = {}
+    sea orden = []
+    para f en t["filas"] {
+        sea partes = []
+        para c en por { partes.agregar(_tb_clave(f[c])) }
+        sea k = unir(partes, caracter(31))
+        si (tiene_clave(grupos, k) == falso) { grupos[k] = []  orden.agregar(k) }
+        grupos[k].agregar(f)
+    }
+    sea cols = []
+    para c en por { cols.agregar(c) }
+    para a en claves(agregaciones) { cols.agregar(a) }
+    sea r = []
+    para k en orden {
+        sea filas = grupos[k]
+        sea g = {}
+        para c en por { g[c] = filas[0][c] }
+        para a en claves(agregaciones) {
+            sea col = agregaciones[a][0]
+            _tb_hay(t, col)
+            sea vals = []
+            para f en filas { vals.agregar(f[col]) }
+            g[a] = _tb_agregar(vals, agregaciones[a][1])
+        }
+        r.agregar(g)
+    }
+    retornar _tb(cols, r)
+}
+
+funcion _tb_clave(v) {
+    si (v == nulo) { retornar "∅" }
+    retornar tipo(v) + ":" + v
+}
+
+/// Une por una columna común. tipo: "interna" (por defecto) o "izquierda".
+funcion tabla_unir(a, b, clave, como) {
+    _tb_hay(a, clave)
+    _tb_hay(b, clave)
+    sea modo = como ?? "interna"
+    si (modo == "inner") { modo = "interna" }
+    si (modo == "left") { modo = "izquierda" }
+    sea indice = {}
+    para f en b["filas"] {
+        sea k = _tb_clave(f[clave])
+        si (tiene_clave(indice, k) == falso) { indice[k] = [] }
+        indice[k].agregar(f)
+    }
+    sea cols = []
+    para c en a["columnas"] { cols.agregar(c) }
+    sea extra = []
+    para c en b["columnas"] {
+        si (c != clave) {
+            sea nombre = c
+            para x en a["columnas"] { si (x == c) { nombre = c + "_2" } }
+            extra.agregar([c, nombre])
+            cols.agregar(nombre)
+        }
+    }
+    sea r = []
+    para f en a["filas"] {
+        sea k = _tb_clave(f[clave])
+        si (tiene_clave(indice, k)) {
+            para g en indice[k] {
+                sea n = {}
+                para c en a["columnas"] { n[c] = f[c] }
+                para e en extra { n[e[1]] = g[e[0]] }
+                r.agregar(n)
+            }
+        } sino {
+            si (modo == "izquierda") {
+                sea n = {}
+                para c en a["columnas"] { n[c] = f[c] }
+                para e en extra { n[e[1]] = nulo }
+                r.agregar(n)
+            }
+        }
+    }
+    retornar _tb(cols, r)
+}
+
+/// Estadísticas de las columnas numéricas.
+funcion tabla_describir(t) {
+    sea filas = []
+    para c en t["columnas"] {
+        sea nums = []
+        sea es_num = verdadero
+        para f en t["filas"] {
+            si (f[c] != nulo) { si (tipo(f[c]) == "numero") { nums.agregar(f[c]) } sino { es_num = falso } }
+        }
+        si (es_num y longitud(nums) > 0) {
+            sea s = 0
+            para v en nums { s = s + v }
+            sea m = s / longitud(nums)
+            sea v2 = 0
+            para v en nums { v2 = v2 + (v - m) * (v - m) }
+            sea d = 0
+            si (longitud(nums) > 1) { d = raiz(v2 / (longitud(nums) - 1)) }
+            filas.agregar({"columna": c, "n": longitud(nums), "nulos": longitud(t["filas"]) - longitud(nums), "media": redondear(m, 4), "desviacion": redondear(d, 4), "min": _tb_agregar(nums, "min"), "max": _tb_agregar(nums, "max")})
+        }
+    }
+    retornar _tb(["columna", "n", "nulos", "media", "desviacion", "min", "max"], filas)
+}
+
+/// Tabla con bordes para la terminal (las primeras "limite" filas).
+funcion tabla_texto(t, limite) {
+    sea n = minimo(limite ?? 20, longitud(t["filas"]))
+    sea filas = []
+    sea i = 0
+    mientras (i < n) {
+        sea l = []
+        para c en t["columnas"] { l.agregar(t["filas"][i][c]) }
+        filas.agregar(l)
+        i = i + 1
+    }
+    sea r = vitrina_tabla(t["columnas"], filas)
+    si (longitud(t["filas"]) > n) { r = r + "\n… " + (longitud(t["filas"]) - n) + " filas más" }
+    retornar r
+}

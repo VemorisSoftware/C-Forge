@@ -33,8 +33,8 @@ Estado: ✅ ya existe en C-Forge · 🔗 se usa hoy vía `cforge bindgen`,
 | 14 | `orden` / `cli` | Argumentos de línea de comandos | Clap | ✅ `orden` |
 | 15 | `mensajero` | Cliente HTTP | Reqwest | ✅ `red` |
 | 16 | `portico` | Framework web | Axum, Actix | ✅ `web` (básico) |
-| 17 | `tabla` | DataFrames | Polars | 🛠 |
-| 18 | `elenco` | Entidad-Componente-Sistema | Bevy ECS | 🛠 |
+| 17 | `tabla` / `dataframe` | DataFrames | Polars | ✅ `tabla` |
+| 18 | `elenco` / `ecs` | Entidad-Componente-Sistema | Bevy ECS | ✅ `elenco` |
 | 19 | `blindaje` | TLS y cripto puras | Ring, Rustls | ✅ `crypto` · 🛠 TLS propio |
 | 20 | `patron` | Expresiones regulares sin ReDoS | regex (Rust) | ✅ `regex` |
 | 21 | `consulta` | Consultas perezosas sobre colecciones | LINQ | ✅ `colecciones` (parcial) |
@@ -51,7 +51,7 @@ Estado: ✅ ya existe en C-Forge · 🔗 se usa hoy vía `cforge bindgen`,
 | 32 | `formatos` | JSON, XML, CSV y YAML | Jackson | ✅ JSON · 🛠 resto |
 | 33 | `registro` | Registro de eventos desacoplado | SLF4J, Logback | 🛠 |
 | 34 | `reloj` / `cron` | Tareas programadas (cron) | Quartz | ✅ `reloj` |
-| 35 | `indice` | Búsqueda de texto completo | Lucene | 🛠 |
+| 35 | `indice` / `search` | Búsqueda de texto completo | Lucene | ✅ `indice` |
 | 36 | `prueba` | Pruebas y aserciones | JUnit | ✅ `cforge test` + `afirmar` |
 | 37 | `esquema` / `schema` | Validación de esquemas | Zod | ✅ `esquema` |
 | 38 | `ruta` | Framework web con middlewares | Express, Hono | ✅ `web` (básico) |
@@ -81,12 +81,12 @@ Estado: ✅ ya existe en C-Forge · 🔗 se usa hoy vía `cforge bindgen`,
 | 55 | `vision` | Visión por computadora | OpenCV | 🔗 |
 | 56 | `vela` | Machine learning ligero | Candle | 🛠 |
 | 57 | `fichas` | Tokenización (BPE, WordPiece) | Tokenizers | ✅ `nlp` (básico) · 🛠 |
-| 58 | `vecindad` | Búsqueda vectorial | FAISS | 🛠 |
-| 59 | `aprende` | ML clásico | scikit-learn | 🛠 |
+| 58 | `vecindad` / `vectors` | Búsqueda vectorial | FAISS | ✅ `vecindad` |
+| 59 | `aprende` / `ml` | ML clásico | scikit-learn | ✅ `aprende` |
 | 60 | `lector` | OCR | Tesseract | 🔗 |
 | 61 | `oido` | Voz a texto | Whisper.cpp | 🔗 |
 | 62 | `prediccion` | Entrenar y predecir | ML.NET | 🔗 `dotnet` |
-| 63 | `numerica` | Estadística y FFT | Math.NET | 🛠 |
+| 63 | `numerica` / `numeric` | Estadística y FFT | Math.NET | ✅ `numerica` |
 | 64 | `simbolo` | Matemáticas simbólicas | SymPy | 🛠 |
 | 65 | `estadistica` | Algoritmos estadísticos | linfa | 🛠 |
 | 66 | `hibrida` | Búsqueda vectorial + texto | Qdrant, Tantivy | 🛠 |
@@ -96,7 +96,7 @@ Estado: ✅ ya existe en C-Forge · 🔗 se usa hoy vía `cforge bindgen`,
 | # | Nombre | Para qué | Inspiración | Estado |
 |---|---|---|---|---|
 | 67 | `lienzo` | Motor gráfico 2D | Skia | ✅ `graficos` |
-| 68 | `flex` | Layout Flexbox | Yoga | 🛠 |
+| 68 | `flex` / `flexbox` | Layout Flexbox | Yoga | ✅ `flex` |
 | 69 | `escritorio` | GUI de escritorio con estilos | Avalonia | 🛠 |
 | 70 | `cristal` | Apps de escritorio con WebView | Tauri | 🛠 |
 | 71 | `nativa` | GUI reactiva nativa | Iced, egui | 🛠 |
@@ -192,7 +192,7 @@ Estado: ✅ ya existe en C-Forge · 🔗 se usa hoy vía `cforge bindgen`,
 |---|---|---|---|---|
 | 137 | `terminal` | Apps de interfaz en terminal | Ratatui | 🛠 |
 | 138 | `progreso` / `progress` | Barras de progreso | Indicatif | ✅ `progreso` |
-| 139 | `pregunta` | Prompts interactivos | Dialoguer | 🛠 |
+| 139 | `pregunta` / `prompt` | Prompts interactivos | Dialoguer | ✅ `pregunta` |
 | 140 | `vigia` | Vigilar cambios en archivos | Notify | 🛠 |
 | 141 | `rastreo` | Búsqueda recursiva con comodines | Walkdir, Glob | 🛠 |
 | 142 | `sistema` | CPU, RAM y procesos | sysinfo | 🛠 |
