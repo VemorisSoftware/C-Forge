@@ -18,6 +18,26 @@ Sitio oficial: [c-forge.org](https://c-forge.org)
   JSON, sin inyección de líneas), `resiste`/`resilience` (reintentos con
   espera exponencial y cortacircuitos) y `plantilla`/`template` (`{{ }}`
   escapado, `#si`/`#if`, `#cada`/`#each`). Pruebas en español e inglés.
+- **Lote 8 (bilingüe):** `traza`/`tracing` (spans, W3C traceparent, OTLP),
+  `cobro`/`payments` (idempotencia, webhooks firmados, estados de pago),
+  `ciencia`/`science` (Nelder–Mead, Levenberg–Marquardt, splines, RK4),
+  `simbolo`/`symbolic` (derivadas, simplificación, LaTeX), `astro`/`astronomy`
+  (salida y puesta del sol, fases de la Luna, estaciones), `archivador`/
+  `archive` (ZIP y TAR contra zip slip y bombas), `hoja`/`xlsx` (crear
+  .xlsx) y `lee_excel`/`read_xlsx` (leer .xlsx); probados contra unzip, tar
+  y openpyxl.
+- **Lote 9 (bilingüe):** `fourier`/`fft` (cualquier largo, espectros,
+  filtros, convolución), `sobre`/`envelope` (cifrado a claves públicas o con
+  contraseña, por bloques), `mensaje_bancario`/`iso8583` (ISO 8583 con PAN
+  enmascarado), `infra`/`hcl` (configuración estilo HCL), `multitud`/`crowd`
+  (bandadas y multitudes sin choques), `grafica`/`chart` (líneas, barras,
+  torta y dispersión en SVG), `secretos`/`secrets` (valores cifrados en JSON
+  y .env) y `alerta`/`errors` (reporte de errores compatible con Sentry).
+- `rastreo`/`glob`: recorrer carpetas y buscar con comodines (`**`, `{a,b}`,
+  `[a-z]`). El lenguaje suma `listar_carpeta`, `es_carpeta` y `crear_carpeta`
+  (como `mkdir -p`).
+- **Textos:** una coma fuera de paréntesis dentro de una llave tampoco
+  interpola, así los globs (`"*.{cfv,txt}"`) se escriben tal cual.
 - **Lote 6 (bilingüe):** `regla`/`validator` (formularios campo a campo,
   RUT chileno), `permisos`/`rbac` (roles con herencia, dominios, denegar y
   condiciones ABAC), `interruptor`/`flags` (feature flags con despliegue

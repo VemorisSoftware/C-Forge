@@ -1,0 +1,502 @@
+// stdlib/simbolo.cfv — matemática simbólica: analiza expresiones, las
+// simplifica, deriva, sustituye, evalúa y las vuelve a escribir (también en
+// LaTeX). Inspirada en SymPy (BSD). En inglés: importar "symbolic".
+//
+//   importar "simbolo"
+//   sea e = simbolo_leer("x^2 * sen(x) + 3*x")
+//   simbolo_texto(simbolo_derivar(e, "x"))     // "2*x*sen(x) + x^2*cos(x) + 3"
+//   simbolo_evaluar(e, {"x": 2})
+//   simbolo_latex(e)                           // "x^{2} \sin(x) + 3 x"
+//
+// Funciones: sen/sin, cos, tan, exp, ln/log, raiz/sqrt, abs. Constantes: pi, e.
+
+sea _SB_FUN = {"sen": "sen", "sin": "sen", "cos": "cos", "tan": "tan", "exp": "exp", "ln": "ln", "log": "ln", "raiz": "raiz", "sqrt": "raiz", "abs": "abs"}
+
+funcion _sb_n(v) { retornar ["num", v] }
+funcion _sb_es_num(e, v) { retornar e[0] == "num" y (v == nulo o e[1] == v) }
+
+// ── Lector (descenso recursivo) ───────────────────────────────────────────
+
+funcion _sb_fichas(t) {
+    sea r = []
+    sea i = 0
+    mientras (i < longitud(t)) {
+        sea c = subcadena(t, i, i + 1)
+        sea b = byte_en(t, i)
+        si (c == " " o c == "\t") { i = i + 1 } sino {
+            si ((b >= 48 y b <= 57) o c == ".") {
+                sea j = i
+                mientras (j < longitud(t) y ((byte_en(t, j) >= 48 y byte_en(t, j) <= 57) o subcadena(t, j, j + 1) == ".")) { j = j + 1 }
+                r.agregar(["num", a_numero(subcadena(t, i, j))])
+                i = j
+            } sino {
+                si ((b >= 97 y b <= 122) o (b >= 65 y b <= 90) o c == "_") {
+                    sea j = i
+                    mientras (j < longitud(t) y ((byte_en(t, j) >= 97 y byte_en(t, j) <= 122) o (byte_en(t, j) >= 65 y byte_en(t, j) <= 90) o (byte_en(t, j) >= 48 y byte_en(t, j) <= 57) o subcadena(t, j, j + 1) == "_")) { j = j + 1 }
+                    r.agregar(["id", subcadena(t, i, j)])
+                    i = j
+                } sino {
+                    si (texto_indice("+-*/^(),", c) < 0) { lanzar "simbolo: carácter inesperado '" + c + "' en la posición " + (i + 1) }
+                    r.agregar(["op", c])
+                    i = i + 1
+                }
+            }
+        }
+    }
+    retornar r
+}
+
+funcion _sb_ver(st) {
+    si (st["i"] < longitud(st["f"])) { retornar st["f"][st["i"]] }
+    retornar ["fin", ""]
+}
+
+funcion _sb_es_op(st, o) {
+    sea f = _sb_ver(st)
+    retornar f[0] == "op" y f[1] == o
+}
+
+funcion _sb_suma(st) {
+    sea e = _sb_producto(st)
+    mientras (_sb_es_op(st, "+") o _sb_es_op(st, "-")) {
+        sea o = _sb_ver(st)[1]
+        st["i"] = st["i"] + 1
+        sea d = _sb_producto(st)
+        si (o == "+") { e = ["+", e, d] } sino { e = ["+", e, ["*", _sb_n(-1), d]] }
+    }
+    retornar e
+}
+
+funcion _sb_producto(st) {
+    sea e = _sb_unario(st)
+    sea seguir = verdadero
+    mientras (seguir) {
+        si (_sb_es_op(st, "*") o _sb_es_op(st, "/")) {
+            sea o = _sb_ver(st)[1]
+            st["i"] = st["i"] + 1
+            sea d = _sb_unario(st)
+            si (o == "*") { e = ["*", e, d] } sino { e = ["*", e, ["^", d, _sb_n(-1)]] }
+        } sino {
+            // Multiplicación implícita: "2x", "3(x+1)", "x sen(x)".
+            sea f = _sb_ver(st)
+            si (f[0] == "id" o f[0] == "num" o (f[0] == "op" y f[1] == "(")) { e = ["*", e, _sb_unario(st)] } sino { seguir = falso }
+        }
+    }
+    retornar e
+}
+
+funcion _sb_unario(st) {
+    si (_sb_es_op(st, "-")) {
+        st["i"] = st["i"] + 1
+        retornar ["*", _sb_n(-1), _sb_unario(st)]
+    }
+    si (_sb_es_op(st, "+")) { st["i"] = st["i"] + 1  retornar _sb_unario(st) }
+    retornar _sb_potencia(st)
+}
+
+funcion _sb_potencia(st) {
+    sea b = _sb_atomo(st)
+    si (_sb_es_op(st, "^")) {
+        st["i"] = st["i"] + 1
+        retornar ["^", b, _sb_unario(st)]
+    }
+    retornar b
+}
+
+funcion _sb_atomo(st) {
+    sea f = _sb_ver(st)
+    st["i"] = st["i"] + 1
+    si (f[0] == "num") { retornar _sb_n(f[1]) }
+    si (f[0] == "id") {
+        si (tiene_clave(_SB_FUN, f[1]) y _sb_es_op(st, "(")) {
+            st["i"] = st["i"] + 1
+            sea a = _sb_suma(st)
+            si (_sb_es_op(st, ")") == falso) { lanzar "simbolo: falta ')' después de " + f[1] }
+            st["i"] = st["i"] + 1
+            retornar ["fn", _SB_FUN[f[1]], a]
+        }
+        si (f[1] == "pi") { retornar ["const", "pi"] }
+        si (f[1] == "e") { retornar ["const", "e"] }
+        retornar ["var", f[1]]
+    }
+    si (f[0] == "op" y f[1] == "(") {
+        sea e = _sb_suma(st)
+        si (_sb_es_op(st, ")") == falso) { lanzar "simbolo: falta ')'" }
+        st["i"] = st["i"] + 1
+        retornar e
+    }
+    si (f[0] == "fin") { lanzar "simbolo: la expresión termina antes de tiempo" }
+    lanzar "simbolo: no se esperaba '" + f[1] + "'"
+}
+
+/// Texto → expresión simplificada.
+funcion simbolo_leer(texto) {
+    sea st = {"f": _sb_fichas("" + texto), "i": 0}
+    si (longitud(st["f"]) == 0) { lanzar "simbolo: expresión vacía" }
+    sea e = _sb_suma(st)
+    si (st["i"] < longitud(st["f"])) { lanzar "simbolo: sobra '" + _sb_ver(st)[1] + "'" }
+    retornar simbolo_simplificar(e)
+}
+
+// ── Simplificación ────────────────────────────────────────────────────────
+
+// Aplana sumas y productos anidados.
+funcion _sb_terminos(e, op, r) {
+    si (e[0] == op) { _sb_terminos(e[1], op, r)  _sb_terminos(e[2], op, r) } sino { r.agregar(e) }
+    retornar r
+}
+
+funcion _sb_armar(op, l, neutro) {
+    si (longitud(l) == 0) { retornar _sb_n(neutro) }
+    sea e = l[0]
+    sea i = 1
+    mientras (i < longitud(l)) { e = [op, e, l[i]]  i = i + 1 }
+    retornar e
+}
+
+funcion _sb_clave(e) { retornar simbolo_texto(e) }
+
+// Separa coeficiente numérico y resto de un término.
+funcion _sb_coef(t) {
+    sea fs = _sb_terminos(t, "*", [])
+    sea c = 1
+    sea resto = []
+    para f en fs { si (f[0] == "num") { c = c * f[1] } sino { resto.agregar(f) } }
+    retornar [c, _sb_armar("*", resto, 1)]
+}
+
+funcion simbolo_simplificar(e) {
+    sea t = e[0]
+    si (t == "num" o t == "var" o t == "const") { retornar e }
+    si (t == "fn") {
+        sea a = simbolo_simplificar(e[2])
+        si (a[0] == "num") {
+            si (e[1] == "exp" y a[1] == 0) { retornar _sb_n(1) }
+            si ((e[1] == "sen" o e[1] == "tan") y a[1] == 0) { retornar _sb_n(0) }
+            si (e[1] == "cos" y a[1] == 0) { retornar _sb_n(1) }
+            si (e[1] == "ln" y a[1] == 1) { retornar _sb_n(0) }
+            si (e[1] == "raiz" y a[1] >= 0 y piso(raiz(a[1])) == raiz(a[1])) { retornar _sb_n(raiz(a[1])) }
+            si (e[1] == "abs") { retornar _sb_n(absoluto(a[1])) }
+        }
+        si (e[1] == "ln" y a[0] == "fn" y a[1] == "exp") { retornar a[2] }
+        si (e[1] == "exp" y a[0] == "fn" y a[1] == "ln") { retornar a[2] }
+        si (e[1] == "ln" y a[0] == "const" y a[1] == "e") { retornar _sb_n(1) }
+        retornar ["fn", e[1], a]
+    }
+    si (t == "^") {
+        sea b = simbolo_simplificar(e[1])
+        sea x = simbolo_simplificar(e[2])
+        si (_sb_es_num(x, 0)) { retornar _sb_n(1) }
+        si (_sb_es_num(x, 1)) { retornar b }
+        si (_sb_es_num(b, 0)) { retornar _sb_n(0) }
+        si (_sb_es_num(b, 1)) { retornar _sb_n(1) }
+        si (b[0] == "num" y x[0] == "num") {
+            si (b[1] != 0 y (x[1] >= 0 o piso(x[1]) == x[1])) {
+                sea v = potencia(b[1], x[1])
+                si (x[1] >= 0 o piso(1 / v) != 1 / v o absoluto(v) >= 1) {
+                    si (piso(v) == v o x[1] < 0) {
+                        si (piso(v) == v) { retornar _sb_n(v) }
+                    }
+                }
+            }
+        }
+        si (b[0] == "^" y x[0] == "num" y b[2][0] == "num") { retornar simbolo_simplificar(["^", b[1], _sb_n(b[2][1] * x[1])]) }
+        retornar ["^", b, x]
+    }
+    si (t == "*") {
+        sea fs = []
+        para f en _sb_terminos(e, "*", []) { para g en _sb_terminos(simbolo_simplificar(f), "*", []) { fs.agregar(g) } }
+        sea c = 1
+        // Junta potencias de la misma base: x * x^2 → x^3.
+        sea exps = {}
+        sea bases = {}
+        sea orden = []
+        para f en fs {
+            si (f[0] == "num") { c = c * f[1] } sino {
+                sea base = f
+                sea ex = _sb_n(1)
+                si (f[0] == "^") { base = f[1]  ex = f[2] }
+                sea k = _sb_clave(base)
+                si (tiene_clave(exps, k)) { exps[k] = simbolo_simplificar(["+", exps[k], ex]) } sino { exps[k] = ex  bases[k] = base  orden.agregar(k) }
+            }
+        }
+        si (c == 0) { retornar _sb_n(0) }
+        sea resto = []
+        para k en orden {
+            sea p = simbolo_simplificar(["^", bases[k], exps[k]])
+            si (_sb_es_num(p, 1) == falso) {
+                si (p[0] == "num") { c = c * p[1] } sino { resto.agregar(p) }
+            }
+        }
+        // Números primero, luego en orden estable.
+        resto = ordenar(resto, funcion(a, b) {
+            sea pa = 1
+            sea pb = 1
+            si (a[0] == "^" y a[2][0] == "num" y a[2][1] < 0) { pa = 2 }
+            si (b[0] == "^" y b[2][0] == "num" y b[2][1] < 0) { pb = 2 }
+            retornar pa - pb
+        })
+        si (c != 1 o longitud(resto) == 0) { resto.insertar(0, _sb_n(c)) }
+        retornar _sb_armar("*", resto, 1)
+    }
+    si (t == "+") {
+        sea ts = []
+        para f en _sb_terminos(e, "+", []) { para g en _sb_terminos(simbolo_simplificar(f), "+", []) { ts.agregar(g) } }
+        sea constante = 0
+        sea coef = {}
+        sea forma = {}
+        sea orden = []
+        para x en ts {
+            si (x[0] == "num") { constante = constante + x[1] } sino {
+                sea cr = _sb_coef(x)
+                sea k = _sb_clave(cr[1])
+                si (tiene_clave(coef, k)) { coef[k] = coef[k] + cr[0] } sino { coef[k] = cr[0]  forma[k] = cr[1]  orden.agregar(k) }
+            }
+        }
+        sea r = []
+        para k en orden {
+            si (coef[k] != 0) {
+                si (coef[k] == 1) { r.agregar(forma[k]) } sino { r.agregar(simbolo_simplificar(["*", _sb_n(coef[k]), forma[k]])) }
+            }
+        }
+        si (constante != 0 o longitud(r) == 0) { r.agregar(_sb_n(constante)) }
+        retornar _sb_armar("+", r, 0)
+    }
+    retornar e
+}
+
+// ── Derivadas ─────────────────────────────────────────────────────────────
+
+funcion _sb_d(e, x) {
+    sea t = e[0]
+    si (t == "num" o t == "const") { retornar _sb_n(0) }
+    si (t == "var") {
+        si (e[1] == x) { retornar _sb_n(1) }
+        retornar _sb_n(0)
+    }
+    si (t == "+") { retornar ["+", _sb_d(e[1], x), _sb_d(e[2], x)] }
+    si (t == "*") { retornar ["+", ["*", _sb_d(e[1], x), e[2]], ["*", e[1], _sb_d(e[2], x)]] }
+    si (t == "^") {
+        sea b = e[1]
+        sea n = e[2]
+        si (simbolo_contiene(n, x) == falso) { retornar ["*", ["*", n, ["^", b, ["+", n, _sb_n(-1)]]], _sb_d(b, x)] }
+        // d(b^n) = b^n · (n' ln b + n b'/b)
+        retornar ["*", e, ["+", ["*", _sb_d(n, x), ["fn", "ln", b]], ["*", ["*", n, _sb_d(b, x)], ["^", b, _sb_n(-1)]]]]
+    }
+    si (t == "fn") {
+        sea a = e[2]
+        sea da = _sb_d(a, x)
+        sea f = e[1]
+        si (f == "sen") { retornar ["*", ["fn", "cos", a], da] }
+        si (f == "cos") { retornar ["*", ["*", _sb_n(-1), ["fn", "sen", a]], da] }
+        si (f == "tan") { retornar ["*", ["^", ["fn", "cos", a], _sb_n(-2)], da] }
+        si (f == "exp") { retornar ["*", e, da] }
+        si (f == "ln") { retornar ["*", ["^", a, _sb_n(-1)], da] }
+        si (f == "raiz") { retornar ["*", ["*", _sb_n(0.5), ["^", a, _sb_n(-0.5)]], da] }
+        si (f == "abs") { retornar ["*", ["*", a, ["^", ["fn", "abs", a], _sb_n(-1)]], da] }
+    }
+    lanzar "simbolo: no sé derivar " + t
+}
+
+/// Derivada respecto de x (n veces).
+funcion simbolo_derivar(e, x, n) {
+    sea r = e
+    sea k = 0
+    mientras (k < (n ?? 1)) { r = simbolo_simplificar(_sb_d(r, x))  k = k + 1 }
+    retornar r
+}
+
+funcion simbolo_contiene(e, x) {
+    si (e[0] == "var") { retornar e[1] == x }
+    si (e[0] == "num" o e[0] == "const") { retornar falso }
+    si (e[0] == "fn") { retornar simbolo_contiene(e[2], x) }
+    retornar simbolo_contiene(e[1], x) o simbolo_contiene(e[2], x)
+}
+
+/// Variables libres, en orden alfabético.
+funcion simbolo_variables(e) {
+    sea m = {}
+    sea pila = [e]
+    mientras (longitud(pila) > 0) {
+        sea x = pila[longitud(pila) - 1]
+        sea nueva = []
+        sea i = 0
+        mientras (i < longitud(pila) - 1) { nueva.agregar(pila[i])  i = i + 1 }
+        pila = nueva
+        si (x[0] == "var") { m[x[1]] = verdadero }
+        si (x[0] == "fn") { pila.agregar(x[2]) }
+        si (x[0] == "+" o x[0] == "*" o x[0] == "^") { pila.agregar(x[1])  pila.agregar(x[2]) }
+    }
+    retornar claves(m)
+}
+
+/// Reemplaza variables por expresiones (o números).
+funcion simbolo_sustituir(e, cambios) {
+    si (e[0] == "var") {
+        si (tiene_clave(cambios, e[1])) {
+            sea v = cambios[e[1]]
+            si (tipo(v) == "numero") { retornar _sb_n(v) }
+            si (tipo(v) == "texto") { retornar simbolo_leer(v) }
+            retornar v
+        }
+        retornar e
+    }
+    si (e[0] == "num" o e[0] == "const") { retornar e }
+    si (e[0] == "fn") { retornar simbolo_simplificar(["fn", e[1], simbolo_sustituir(e[2], cambios)]) }
+    retornar simbolo_simplificar([e[0], simbolo_sustituir(e[1], cambios), simbolo_sustituir(e[2], cambios)])
+}
+
+funcion simbolo_evaluar(e, valores) {
+    sea t = e[0]
+    si (t == "num") { retornar e[1] }
+    si (t == "const") {
+        si (e[1] == "pi") { retornar pi() }
+        retornar exponencial(1)
+    }
+    si (t == "var") {
+        si (valores == nulo o tiene_clave(valores, e[1]) == falso) { lanzar "simbolo: falta el valor de " + e[1] }
+        retornar valores[e[1]]
+    }
+    si (t == "+") { retornar simbolo_evaluar(e[1], valores) + simbolo_evaluar(e[2], valores) }
+    si (t == "*") { retornar simbolo_evaluar(e[1], valores) * simbolo_evaluar(e[2], valores) }
+    si (t == "^") { retornar potencia(simbolo_evaluar(e[1], valores), simbolo_evaluar(e[2], valores)) }
+    sea a = simbolo_evaluar(e[2], valores)
+    sea f = e[1]
+    si (f == "sen") { retornar seno(a) }
+    si (f == "cos") { retornar coseno(a) }
+    si (f == "tan") { retornar tangente(a) }
+    si (f == "exp") { retornar exponencial(a) }
+    si (f == "ln") { retornar logaritmo(a) }
+    si (f == "raiz") { retornar raiz(a) }
+    retornar absoluto(a)
+}
+
+// ── Escritura ─────────────────────────────────────────────────────────────
+
+funcion _sb_num_texto(v) {
+    si (piso(v) == v) { retornar "" + piso(v) }
+    retornar "" + v
+}
+
+funcion _sb_prec(e) {
+    si (e[0] == "+") { retornar 1 }
+    si (e[0] == "*") { retornar 2 }
+    si (e[0] == "num" y e[1] < 0) { retornar 2 }
+    si (e[0] == "^") { retornar 3 }
+    retornar 4
+}
+
+funcion _sb_txt(e, latex) {
+    sea t = e[0]
+    si (t == "num") { retornar _sb_num_texto(e[1]) }
+    si (t == "var") { retornar e[1] }
+    si (t == "const") {
+        si (latex y e[1] == "pi") { retornar "\\pi" }
+        retornar e[1]
+    }
+    si (t == "fn") {
+        sea nombre = e[1]
+        si (latex) {
+            si (nombre == "raiz") { retornar "\\sqrt" + caracter(123) + _sb_txt(e[2], latex) + caracter(125) }
+            sea l = {"sen": "\\sin", "cos": "\\cos", "tan": "\\tan", "exp": "\\exp", "ln": "\\ln", "abs": "\\operatorname" + caracter(123) + "abs" + caracter(125)}
+            retornar l[nombre] + "(" + _sb_txt(e[2], latex) + ")"
+        }
+        retornar nombre + "(" + _sb_txt(e[2], latex) + ")"
+    }
+    si (t == "+") {
+        sea ts = _sb_terminos(e, "+", [])
+        sea r = _sb_txt(ts[0], latex)
+        sea i = 1
+        mientras (i < longitud(ts)) {
+            sea x = ts[i]
+            sea cr = _sb_coef(x)
+            si (cr[0] < 0) {
+                sea pos = cr[1]
+                si (cr[0] != -1) { pos = simbolo_simplificar(["*", _sb_n(0 - cr[0]), cr[1]]) }
+                si (x[0] == "num") { pos = _sb_n(0 - x[1]) }
+                r = r + " - " + _sb_txt(pos, latex)
+            } sino { r = r + " + " + _sb_txt(x, latex) }
+            i = i + 1
+        }
+        retornar r
+    }
+    si (t == "*") {
+        sea fs = _sb_terminos(e, "*", [])
+        // Fracción: factores con exponente negativo van abajo.
+        sea arriba = []
+        sea abajo = []
+        para f en fs {
+            si (f[0] == "^" y f[2][0] == "num" y f[2][1] < 0) {
+                si (f[2][1] == -1) { abajo.agregar(f[1]) } sino { abajo.agregar(["^", f[1], _sb_n(0 - f[2][1])]) }
+            } sino { arriba.agregar(f) }
+        }
+        sea pinta = funcion(l) {
+            si (longitud(l) == 0) { retornar "1" }
+            sea partes = []
+            sea i = 0
+            mientras (i < longitud(l)) {
+                sea f = l[i]
+                sea s = _sb_txt(f, latex)
+                si (_sb_prec(f) < 2 o (i > 0 y f[0] == "num" y f[1] < 0)) { s = "(" + s + ")" }
+                si (i == 0 y f[0] == "num" y f[1] == -1 y longitud(l) > 1) { partes.agregar("-") } sino { partes.agregar(s) }
+                i = i + 1
+            }
+            sea sep = "*"
+            si (latex) { sep = " " }
+            sea r = ""
+            i = 0
+            mientras (i < longitud(partes)) {
+                si (i == 0) { r = partes[i] } sino {
+                    si (partes[i - 1] == "-") { r = r + partes[i] } sino { r = r + sep + partes[i] }
+                }
+                i = i + 1
+            }
+            retornar r
+        }
+        si (longitud(abajo) == 0) { retornar pinta(arriba) }
+        si (latex) {
+            sea num = pinta(arriba)
+            si (longitud(arriba) == 1) { num = _sb_txt(arriba[0], latex) }
+            sea dn = pinta(abajo)
+            si (longitud(abajo) == 1) { dn = _sb_txt(abajo[0], latex) }
+            retornar "\\frac" + caracter(123) + num + caracter(125) + caracter(123) + dn + caracter(125)
+        }
+        sea den = pinta(abajo)
+        si (longitud(abajo) > 1 o (_sb_prec(abajo[0]) < 3 y _sb_prec(abajo[0]) >= 2)) { den = "(" + den + ")" }
+        retornar pinta(arriba) + "/" + den
+    }
+    si (t == "^" y e[2][0] == "num" y e[2][1] < 0) { retornar _sb_txt(["*", _sb_n(1), e], latex) }
+    si (t == "^") {
+        sea b = _sb_txt(e[1], latex)
+        si (_sb_prec(e[1]) <= 3 o (e[1][0] == "num" y e[1][1] < 0)) { b = "(" + b + ")" }
+        si (latex) { retornar b + "^" + caracter(123) + _sb_txt(e[2], latex) + caracter(125) }
+        sea x = _sb_txt(e[2], latex)
+        si (_sb_prec(e[2]) < 4) { x = "(" + x + ")" }
+        retornar b + "^" + x
+    }
+    retornar "?"
+}
+
+funcion simbolo_texto(e) { retornar _sb_txt(e, falso) }
+funcion simbolo_latex(e) { retornar _sb_txt(e, verdadero) }
+
+/// Integral definida numérica de la expresión en x (Simpson).
+funcion simbolo_integrar(e, x, a, b, n) {
+    sea pasos = n ?? 1000
+    si (pasos % 2 == 1) { pasos = pasos + 1 }
+    sea h = (b - a) / pasos
+    sea f = funcion(v) {
+        sea m = {}
+        m[x] = v
+        retornar simbolo_evaluar(e, m)
+    }
+    sea s = f(a) + f(b)
+    sea i = 1
+    mientras (i < pasos) {
+        sea peso = 4
+        si (i % 2 == 0) { peso = 2 }
+        s = s + peso * f(a + i * h)
+        i = i + 1
+    }
+    retornar s * h / 3
+}

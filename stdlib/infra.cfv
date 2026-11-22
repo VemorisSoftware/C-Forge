@@ -1,0 +1,291 @@
+// stdlib/infra.cfv — lenguaje de configuración estilo HCL (Terraform):
+// bloques con etiquetas, atributos, listas, mapas, comentarios (#, //, /* */),
+// textos con ${var.x} y "heredocs" <<EOF. Lee a datos y vuelve a escribir.
+// Inspirada en HCL (MPL: solo la idea). En inglés: importar "hcl".
+//
+//   servidor "web" {
+//     puerto = 8080
+//     etiquetas = ["api", "publico"]
+//     entorno = { MODO = "prod" }
+//   }
+//
+//   importar "infra"
+//   sea c = infra_leer(texto, {"var": {"region": "sa-east-1"}})
+//   c["servidor"]["web"]["puerto"]     // 8080
+//
+// Los bloques con etiquetas se anidan por etiqueta; si un bloque se repite
+// sin etiqueta, queda como lista.
+
+funcion _hc_falla(st, msg) {
+    sea l = 1
+    sea c = 1
+    sea i = 0
+    mientras (i < st["i"] y i < longitud(st["t"])) {
+        si (byte_en(st["t"], i) == 10) { l = l + 1  c = 1 } sino { c = c + 1 }
+        i = i + 1
+    }
+    lanzar "infra: línea " + l + ", columna " + c + ": " + msg
+}
+
+funcion _hc_ver(st) { retornar subcadena(st["t"], st["i"], st["i"] + 1) }
+
+// Salta espacios y comentarios; nl = verdadero también salta saltos de línea.
+funcion _hc_blancos(st, nl) {
+    sea seguir = verdadero
+    mientras (seguir y st["i"] < longitud(st["t"])) {
+        sea c = _hc_ver(st)
+        si (c == " " o c == "\t" o c == "\r" o (nl y c == "\n")) { st["i"] = st["i"] + 1 } sino {
+            si (c == "#" o subcadena(st["t"], st["i"], st["i"] + 2) == "//") {
+                mientras (st["i"] < longitud(st["t"]) y _hc_ver(st) != "\n") { st["i"] = st["i"] + 1 }
+            } sino {
+                si (subcadena(st["t"], st["i"], st["i"] + 2) == "/*") {
+                    sea f = texto_indice(subcadena(st["t"], st["i"] + 2, longitud(st["t"])), "*/")
+                    si (f < 0) { _hc_falla(st, "comentario sin cerrar") }
+                    st["i"] = st["i"] + 2 + f + 2
+                } sino { seguir = falso }
+            }
+        }
+    }
+}
+
+funcion _hc_es_id(c, primero) {
+    si (c == "") { retornar falso }
+    sea b = byte_en(c, 0)
+    si ((b >= 97 y b <= 122) o (b >= 65 y b <= 90) o c == "_" o b >= 128) { retornar verdadero }
+    si (primero) { retornar falso }
+    retornar (b >= 48 y b <= 57) o c == "-"
+}
+
+funcion _hc_id(st) {
+    sea ini = st["i"]
+    si (_hc_es_id(_hc_ver(st), verdadero) == falso) { _hc_falla(st, "se esperaba un nombre") }
+    mientras (_hc_es_id(_hc_ver(st), falso)) { st["i"] = st["i"] + 1 }
+    retornar subcadena(st["t"], ini, st["i"])
+}
+
+funcion _hc_ruta(ctx, ruta) {
+    sea v = ctx
+    para p en texto_dividir(ruta, ".") {
+        si (tipo(v) != "mapa" o tiene_clave(v, p) == falso) { retornar nulo }
+        v = v[p]
+    }
+    retornar v
+}
+
+funcion _hc_interpolar(st, s) {
+    si (texto_indice(s, "${") < 0) { retornar s }
+    sea r = ""
+    sea i = 0
+    mientras (i < longitud(s)) {
+        si (subcadena(s, i, i + 3) == "$${") { r = r + "${"  i = i + 3 } sino {
+            si (subcadena(s, i, i + 2) == "${") {
+                sea f = texto_indice(subcadena(s, i, longitud(s)), caracter(125))
+                si (f < 0) { _hc_falla(st, "falta } en la interpolación") }
+                sea ruta = texto_recortar(subcadena(s, i + 2, i + f))
+                sea v = _hc_ruta(st["ctx"], ruta)
+                si (v == nulo) { _hc_falla(st, "variable desconocida " + ruta) }
+                r = r + v
+                i = i + f + 1
+            } sino { r = r + subcadena(s, i, i + 1)  i = i + 1 }
+        }
+    }
+    retornar r
+}
+
+funcion _hc_texto(st) {
+    st["i"] = st["i"] + 1
+    sea r = ""
+    mientras (verdadero) {
+        si (st["i"] >= longitud(st["t"])) { _hc_falla(st, "texto sin cerrar") }
+        sea c = _hc_ver(st)
+        si (c == "\"") { st["i"] = st["i"] + 1  retornar _hc_interpolar(st, r) }
+        si (c == "\n") { _hc_falla(st, "salto de línea dentro de un texto (usa <<EOF)") }
+        si (c == "\\") {
+            sea e = subcadena(st["t"], st["i"] + 1, st["i"] + 2)
+            si (e == "n") { r = r + "\n" } sino { si (e == "t") { r = r + "\t" } sino { r = r + e } }
+            st["i"] = st["i"] + 2
+        } sino { r = r + c  st["i"] = st["i"] + 1 }
+    }
+}
+
+funcion _hc_valor(st) {
+    _hc_blancos(st, verdadero)
+    sea c = _hc_ver(st)
+    si (c == "\"") { retornar _hc_texto(st) }
+    si (subcadena(st["t"], st["i"], st["i"] + 2) == "<<") {
+        st["i"] = st["i"] + 2
+        sea recortar = falso
+        si (_hc_ver(st) == "-") { recortar = verdadero  st["i"] = st["i"] + 1 }
+        sea marca = _hc_id(st)
+        sea fl = texto_indice(subcadena(st["t"], st["i"], longitud(st["t"])), "\n")
+        st["i"] = st["i"] + fl + 1
+        sea lineas = []
+        sea seguir = verdadero
+        mientras (seguir) {
+            si (st["i"] >= longitud(st["t"])) { _hc_falla(st, "heredoc sin " + marca) }
+            sea f = texto_indice(subcadena(st["t"], st["i"], longitud(st["t"])), "\n")
+            si (f < 0) { f = longitud(st["t"]) - st["i"] }
+            sea linea = subcadena(st["t"], st["i"], st["i"] + f)
+            st["i"] = st["i"] + f + 1
+            si (texto_recortar(linea) == marca) { seguir = falso } sino { lineas.agregar(linea) }
+        }
+        si (recortar) {
+            sea min = 999
+            para l en lineas {
+                si (texto_recortar(l) != "") {
+                    sea k = 0
+                    mientras (k < longitud(l) y (subcadena(l, k, k + 1) == " " o subcadena(l, k, k + 1) == "\t")) { k = k + 1 }
+                    min = minimo(min, k)
+                }
+            }
+            sea r = []
+            para l en lineas { si (longitud(l) >= min) { r.agregar(subcadena(l, min, longitud(l))) } sino { r.agregar(texto_recortar(l)) } }
+            lineas = r
+        }
+        retornar _hc_interpolar(st, unir(lineas, "\n") + "\n")
+    }
+    si (c == "[") {
+        st["i"] = st["i"] + 1
+        sea l = []
+        _hc_blancos(st, verdadero)
+        mientras (_hc_ver(st) != "]") {
+            l.agregar(_hc_valor(st))
+            _hc_blancos(st, verdadero)
+            si (_hc_ver(st) == ",") { st["i"] = st["i"] + 1  _hc_blancos(st, verdadero) } sino {
+                si (_hc_ver(st) != "]") { _hc_falla(st, "se esperaba , o ]") }
+            }
+        }
+        st["i"] = st["i"] + 1
+        retornar l
+    }
+    si (c == caracter(123)) {
+        st["i"] = st["i"] + 1
+        sea m = {}
+        _hc_blancos(st, verdadero)
+        mientras (_hc_ver(st) != caracter(125)) {
+            sea k = nulo
+            si (_hc_ver(st) == "\"") { k = _hc_texto(st) } sino { k = _hc_id(st) }
+            _hc_blancos(st, falso)
+            si (_hc_ver(st) != "=" y _hc_ver(st) != ":") { _hc_falla(st, "se esperaba = en el mapa") }
+            st["i"] = st["i"] + 1
+            m[k] = _hc_valor(st)
+            _hc_blancos(st, verdadero)
+            si (_hc_ver(st) == ",") { st["i"] = st["i"] + 1  _hc_blancos(st, verdadero) }
+            si (st["i"] >= longitud(st["t"])) { _hc_falla(st, "mapa sin cerrar") }
+        }
+        st["i"] = st["i"] + 1
+        retornar m
+    }
+    // Número, booleano, nulo o referencia a variable.
+    sea ini = st["i"]
+    mientras (st["i"] < longitud(st["t"]) y texto_indice(" \t\r\n,]})#", _hc_ver(st)) < 0) { st["i"] = st["i"] + 1 }
+    sea p = subcadena(st["t"], ini, st["i"])
+    si (p == "") { _hc_falla(st, "se esperaba un valor") }
+    si (p == "true" o p == "verdadero") { retornar verdadero }
+    si (p == "false" o p == "falso") { retornar falso }
+    si (p == "null" o p == "nulo") { retornar nulo }
+    sea n = nulo
+    intentar { n = a_numero(p) } capturar (e) { n = nulo }
+    si (n != nulo) { retornar n }
+    sea v = _hc_ruta(st["ctx"], p)
+    si (v == nulo) {
+        st["i"] = ini
+        _hc_falla(st, "valor desconocido " + p)
+    }
+    retornar v
+}
+
+funcion _hc_cuerpo(st, cierre) {
+    sea r = {}
+    mientras (verdadero) {
+        _hc_blancos(st, verdadero)
+        si (st["i"] >= longitud(st["t"])) {
+            si (cierre) { _hc_falla(st, "falta }") }
+            retornar r
+        }
+        si (_hc_ver(st) == caracter(125)) {
+            si (cierre == falso) { _hc_falla(st, "} de más") }
+            st["i"] = st["i"] + 1
+            retornar r
+        }
+        sea nombre = _hc_id(st)
+        _hc_blancos(st, falso)
+        si (_hc_ver(st) == "=") {
+            st["i"] = st["i"] + 1
+            si (tiene_clave(r, nombre)) { _hc_falla(st, "atributo repetido " + nombre) }
+            r[nombre] = _hc_valor(st)
+        } sino {
+            sea etiquetas = []
+            mientras (_hc_ver(st) == "\"" o _hc_es_id(_hc_ver(st), verdadero)) {
+                si (_hc_ver(st) == "\"") { etiquetas.agregar(_hc_texto(st)) } sino { etiquetas.agregar(_hc_id(st)) }
+                _hc_blancos(st, falso)
+            }
+            si (_hc_ver(st) != caracter(123)) { _hc_falla(st, "se esperaba = o { después de " + nombre) }
+            st["i"] = st["i"] + 1
+            sea cuerpo = _hc_cuerpo(st, verdadero)
+            si (longitud(etiquetas) == 0) {
+                si (tiene_clave(r, nombre)) {
+                    si (tipo(r[nombre]) == "lista") { r[nombre].agregar(cuerpo) } sino { r[nombre] = [r[nombre], cuerpo] }
+                } sino { r[nombre] = cuerpo }
+            } sino {
+                si (tiene_clave(r, nombre) == falso) { r[nombre] = {} }
+                sea dest = r[nombre]
+                sea k = 0
+                mientras (k < longitud(etiquetas) - 1) {
+                    si (tiene_clave(dest, etiquetas[k]) == falso) { dest[etiquetas[k]] = {} }
+                    dest = dest[etiquetas[k]]
+                    k = k + 1
+                }
+                sea ult = etiquetas[longitud(etiquetas) - 1]
+                si (tiene_clave(dest, ult)) { _hc_falla(st, "bloque repetido " + nombre + " " + unir(etiquetas, " ")) }
+                dest[ult] = cuerpo
+            }
+        }
+    }
+}
+
+/// Texto HCL → mapa. contexto: variables para ${…} y referencias (p. ej. {"var": {…}}).
+funcion infra_leer(texto, contexto) {
+    sea st = {"t": "" + texto, "i": 0, "ctx": contexto ?? {}}
+    retornar _hc_cuerpo(st, falso)
+}
+
+funcion _hc_escribir_valor(v, sangria) {
+    si (v == nulo) { retornar "null" }
+    si (v == verdadero) { retornar "true" }
+    si (v == falso) { retornar "false" }
+    sea t = tipo(v)
+    si (t == "numero") { retornar "" + v }
+    si (t == "texto") {
+        sea s = texto_reemplazar(texto_reemplazar(texto_reemplazar(texto_reemplazar(v, "\\", "\\\\"), "\"", "\\\""), "\n", "\\n"), "${", "$${")
+        retornar "\"" + s + "\""
+    }
+    si (t == "lista") {
+        sea partes = []
+        para x en v { partes.agregar(_hc_escribir_valor(x, sangria)) }
+        retornar "[" + unir(partes, ", ") + "]"
+    }
+    sea l = [caracter(123)]
+    para k en claves(v) { l.agregar(sangria + "  " + _hc_clave(k) + " = " + _hc_escribir_valor(v[k], sangria + "  ")) }
+    l.agregar(sangria + caracter(125))
+    retornar unir(l, "\n")
+}
+
+funcion _hc_clave(k) {
+    sea ok = _hc_es_id(subcadena(k, 0, 1), verdadero)
+    para c en texto_dividir(k, "") { si (_hc_es_id(c, falso) == falso) { ok = falso } }
+    si (ok) { retornar k }
+    retornar "\"" + k + "\""
+}
+
+/// Mapa → HCL (los mapas de primer nivel se escriben como bloques).
+funcion infra_texto(datos) {
+    sea l = []
+    para k en claves(datos) {
+        sea v = datos[k]
+        si (tipo(v) == "mapa") {
+            l.agregar(_hc_clave(k) + " " + _hc_escribir_valor(v, ""))
+        } sino { l.agregar(_hc_clave(k) + " = " + _hc_escribir_valor(v, "")) }
+    }
+    retornar unir(l, "\n") + "\n"
+}

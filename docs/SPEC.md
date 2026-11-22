@@ -41,7 +41,8 @@ Nada marcado como 📐 debe aparecer en c-forge.org como si ya existiera.
   (`"Hola {nombre}"`, `"{(a + b)}"`); cualquier otra llave es literal, así
   JSON (`"{\"a\": 1}"`) y GLSL (`"main() {"`) no necesitan escapes. Una
   llave doble nunca interpola: `"{{nombre}}"` queda literal (plantillas), y
-  tampoco una llave con `:` o `;` dentro (`"a{color:red}"`, `"{a: 1}"`). `\{` y
+  tampoco una llave con `:` o `;` dentro (`"a{color:red}"`, `"{a: 1}"`) ni con
+  una coma fuera de paréntesis (`"*.{cfv,txt}"`). `\{` y
   `\}` siguen siendo llaves literales. Escapes: `\n`, `\t`, `\"`, `\\`.
 - Números decimales (`42`, `3.14`) y con exponente (`1e5`, `2.5e-3`, `6.02E+23`).
 
