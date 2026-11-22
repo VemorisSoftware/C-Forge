@@ -1,0 +1,197 @@
+// stdlib/dinero.cfv — aritmética decimal exacta para dinero (sin errores de
+// punto flotante: 0.1 + 0.2 == 0.3). Inspirada en rust_decimal / BigDecimal
+// (MIT/Apache). Un monto es {unidades, escala}: 12.34 → 1234 con escala 2.
+// Redondeo bancario (mitad al par) por defecto; también hacia arriba.
+//
+//   importar "dinero"
+//   sea total = dinero_sumar(dinero("0.10"), dinero("0.20"))
+//   mostrar(dinero_texto(total))                          // "0.30"
+//   mostrar(dinero_texto(dinero_por(dinero("19.99"), dinero("3"))))   // "59.97"
+//   mostrar(dinero_formato(dinero("1234567.5"), 2, ".", ","))         // "1.234.567,50"
+
+sea _DINERO_MAX = 9007199254740991
+
+funcion _dinero(u, e) {
+    si (u > _DINERO_MAX o u < 0 - _DINERO_MAX) { lanzar "dinero: desbordamiento (más de 15 cifras significativas)" }
+    retornar {"u": u, "e": e}
+}
+
+/// "12.34", "-0.5", 7 → monto exacto.
+funcion dinero(v) {
+    si (tipo(v) == "mapa") { retornar v }
+    sea t = texto_recortar("" + v)
+    si (tipo(v) == "numero" y texto_indice(t, "e") >= 0) { lanzar "dinero: usa texto para montos con exponente" }
+    sea signo = 1
+    si (subcadena(t, 0, 1) == "-") {
+        signo = 0 - 1
+        t = subcadena(t, 1, longitud(t))
+    } sino { si (subcadena(t, 0, 1) == "+") { t = subcadena(t, 1, longitud(t)) } }
+    sea punto = texto_indice(t, ".")
+    sea entera = t
+    sea frac = ""
+    si (punto >= 0) {
+        entera = subcadena(t, 0, punto)
+        frac = subcadena(t, punto + 1, longitud(t))
+    }
+    si (longitud(entera) == 0 y longitud(frac) == 0) { lanzar "dinero: monto vacío" }
+    sea u = 0
+    para c en texto_dividir(entera + frac, "") {
+        sea d = texto_indice("0123456789", c)
+        si (d < 0) { lanzar "dinero: monto inválido: " + v }
+        u = u * 10 + d
+        si (u > _DINERO_MAX) { lanzar "dinero: desbordamiento (más de 15 cifras significativas)" }
+    }
+    retornar _dinero(signo * u, longitud(frac))
+}
+
+funcion _dinero_escalar(a, e) {
+    sea u = a["u"]
+    sea k = a["e"]
+    mientras (k < e) {
+        u = u * 10
+        k = k + 1
+    }
+    retornar _dinero(u, e)
+}
+
+funcion _dinero_igualar(a, b) {
+    sea e = a["e"]
+    si (b["e"] > e) { e = b["e"] }
+    retornar [_dinero_escalar(a, e), _dinero_escalar(b, e)]
+}
+
+funcion dinero_sumar(a, b) {
+    sea p = _dinero_igualar(dinero(a), dinero(b))
+    retornar _dinero(p[0]["u"] + p[1]["u"], p[0]["e"])
+}
+
+funcion dinero_restar(a, b) {
+    sea p = _dinero_igualar(dinero(a), dinero(b))
+    retornar _dinero(p[0]["u"] - p[1]["u"], p[0]["e"])
+}
+
+funcion dinero_por(a, b) {
+    sea x = dinero(a)
+    sea y = dinero(b)
+    sea u = x["u"] * y["u"]
+    si (u > _DINERO_MAX o u < 0 - _DINERO_MAX) { lanzar "dinero: desbordamiento en la multiplicación" }
+    retornar _dinero(u, x["e"] + y["e"])
+}
+
+/// Redondea a "decimales" (modo "par" = bancario, "arriba" = mitad hacia arriba).
+funcion dinero_redondear(a, decimales, modo) {
+    sea x = dinero(a)
+    si (x["e"] <= decimales) { retornar _dinero_escalar(x, decimales) }
+    sea div = potencia(10, x["e"] - decimales)
+    sea u = x["u"]
+    sea negativo = u < 0
+    si (negativo) { u = 0 - u }
+    sea q = cociente(u, div)
+    sea resto = u - q * div
+    // Sin decimales binarios: se compara 2·resto con el divisor.
+    si (resto * 2 > div o (resto * 2 == div y (modo == "arriba" o q % 2 == 1))) { q = q + 1 }
+    si (negativo) { q = 0 - q }
+    retornar _dinero(q, decimales)
+}
+
+/// a / b con "decimales" de resultado (redondeo bancario).
+funcion dinero_dividir(a, b, decimales) {
+    sea x = dinero(a)
+    sea y = dinero(b)
+    si (y["u"] == 0) { lanzar "dinero: división por cero" }
+    sea d = decimales ?? 2
+    // x/y = (ux / uy) * 10^(ey - ex); se calcula con 2 cifras extra y se redondea.
+    sea extra = d + 2 + y["e"] - x["e"]
+    sea num = x["u"]
+    sea den = y["u"]
+    mientras (extra > 0) {
+        num = num * 10
+        extra = extra - 1
+    }
+    mientras (extra < 0) {
+        den = den * 10
+        extra = extra + 1
+    }
+    si (num > _DINERO_MAX o num < 0 - _DINERO_MAX) { lanzar "dinero: desbordamiento en la división" }
+    sea negativo = (num < 0) != (den < 0)
+    si (num < 0) { num = 0 - num }
+    si (den < 0) { den = 0 - den }
+    sea q = cociente(num, den)
+    si (negativo) { q = 0 - q }
+    retornar dinero_redondear(_dinero(q, d + 2), d, "par")
+}
+
+/// -1, 0 o 1.
+funcion dinero_comparar(a, b) {
+    sea p = _dinero_igualar(dinero(a), dinero(b))
+    si (p[0]["u"] < p[1]["u"]) { retornar 0 - 1 }
+    si (p[0]["u"] > p[1]["u"]) { retornar 1 }
+    retornar 0
+}
+
+funcion dinero_igual(a, b) { retornar dinero_comparar(a, b) == 0 }
+
+/// Reparte un monto en n partes que suman exactamente el total (los centavos
+/// que sobran van a las primeras partes).
+funcion dinero_repartir(a, n, decimales) {
+    sea d = decimales ?? 2
+    sea x = dinero_redondear(a, d, "par")
+    sea base = cociente(absoluto(x["u"]), n)
+    sea sobra = absoluto(x["u"]) - base * n
+    sea signo = 1
+    si (x["u"] < 0) { signo = 0 - 1 }
+    sea r = []
+    sea i = 0
+    mientras (i < n) {
+        sea u = base
+        si (i < sobra) { u = u + 1 }
+        r.agregar(_dinero(signo * u, d))
+        i = i + 1
+    }
+    retornar r
+}
+
+/// "1234.50"
+funcion dinero_texto(a) {
+    sea x = dinero(a)
+    sea u = x["u"]
+    sea signo = ""
+    si (u < 0) {
+        signo = "-"
+        u = 0 - u
+    }
+    sea t = "" + u
+    si (x["e"] == 0) { retornar signo + t }
+    mientras (longitud(t) <= x["e"]) { t = "0" + t }
+    retornar signo + subcadena(t, 0, longitud(t) - x["e"]) + "." + subcadena(t, longitud(t) - x["e"], longitud(t))
+}
+
+/// Con separadores: dinero_formato(m, 2, ".", ",") → "1.234.567,50".
+funcion dinero_formato(a, decimales, miles, coma) {
+    sea t = dinero_texto(dinero_redondear(a, decimales ?? 2, "par"))
+    sea signo = ""
+    si (subcadena(t, 0, 1) == "-") {
+        signo = "-"
+        t = subcadena(t, 1, longitud(t))
+    }
+    sea p = texto_indice(t, ".")
+    sea entera = t
+    sea frac = ""
+    si (p >= 0) {
+        entera = subcadena(t, 0, p)
+        frac = subcadena(t, p + 1, longitud(t))
+    }
+    sea grupos = []
+    mientras (longitud(entera) > 3) {
+        grupos.agregar(subcadena(entera, longitud(entera) - 3, longitud(entera)))
+        entera = subcadena(entera, 0, longitud(entera) - 3)
+    }
+    sea r = entera
+    sea i = longitud(grupos) - 1
+    mientras (i >= 0) {
+        r = r + (miles ?? ",") + grupos[i]
+        i = i - 1
+    }
+    si (longitud(frac) > 0) { r = r + (coma ?? ".") + frac }
+    retornar signo + r
+}

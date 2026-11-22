@@ -2,6 +2,16 @@
 
 Sitio oficial: [c-forge.org](https://c-forge.org)
 
+## Sin publicar
+
+- **Bibliotecas del ecosistema (lote 1):** `tinta` (colores ANSI, NO_COLOR),
+  `ident` (UUID v4/v7, ULID, NanoID), `csv` (RFC 4180, exportación segura
+  contra fórmulas), `progreso` (barras y spinners) y `dinero` (decimales
+  exactos, redondeo bancario, reparto sin perder centavos). Pruebas en
+  `tests/bibliotecas` (normal y `--release`).
+- Nuevas funciones del lenguaje: `escribir(v)` (sin salto de línea) y
+  `variable_entorno(nombre)`.
+
 ## 4.9.0 — 2026-11-21
 
 - **Java dentro de C-Forge** (`importar "java"`, JNI): `java_iniciar`,
