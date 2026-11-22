@@ -1,0 +1,151 @@
+// stdlib/hoja.cfv — crear planillas Excel (.xlsx) que abren en Excel,
+// LibreOffice, Numbers y Google Sheets: varias hojas, números, textos,
+// booleanos, fechas, fórmulas, negrita en la cabecera, anchos de columna,
+// fila fija y filtro. Inspirada en libxlsxwriter (BSD). En inglés:
+// importar "xlsx".
+//
+//   importar "hoja"
+//   sea libro = hoja_libro()
+//   sea h = hoja_agregar(libro, "Ventas")
+//   hoja_filas(h, [["Producto", "Precio", "Cantidad", "Total"], ["Café", 2500, 3, "=B2*C2"]], {"cabecera": verdadero})
+//   hoja_anchos(h, [20, 12, 10, 12])
+//   escribir_archivo("ventas.xlsx", hoja_xlsx(libro))
+//
+// Un texto que empieza con "=" es fórmula; para escribir el texto tal cual
+// usa {"texto": "=hola"}. Fechas: {"fecha_ms": ms}.
+
+importar "archivador"
+importar "xml"
+
+funcion hoja_libro() { retornar {"hojas": [], "nombres": {}} }
+
+funcion hoja_agregar(libro, nombre) {
+    sea n = "" + nombre
+    si (longitud(n) == 0 o longitud(n) > 31) { lanzar "hoja: el nombre debe tener entre 1 y 31 caracteres" }
+    para c en ["\\", "/", "?", "*", "[", "]", ":"] { si (texto_indice(n, c) >= 0) { lanzar "hoja: el nombre no puede tener " + c } }
+    si (tiene_clave(libro["nombres"], texto_minusculas(n))) { lanzar "hoja: ya existe la hoja " + n }
+    sea h = {"nombre": n, "filas": [], "anchos": [], "cabecera": falso, "fija": 0, "filtro": falso}
+    libro["hojas"].agregar(h)
+    libro["nombres"][texto_minusculas(n)] = verdadero
+    retornar h
+}
+
+funcion _hj_op(o, k, d) {
+    si (o != nulo) { si (tiene_clave(o, k)) { retornar o[k] } }
+    retornar d
+}
+
+/// Agrega filas. opciones: cabecera (la primera en negrita, fija y con filtro).
+funcion hoja_filas(h, filas, opciones) {
+    para f en filas { h["filas"].agregar(f) }
+    si (_hj_op(opciones, "cabecera", falso)) {
+        h["cabecera"] = verdadero
+        h["fija"] = 1
+        h["filtro"] = verdadero
+    }
+    retornar h
+}
+
+funcion hoja_anchos(h, anchos) { h["anchos"] = anchos  retornar h }
+
+/// Columna en letras: 0 → A, 25 → Z, 26 → AA.
+funcion hoja_columna(i) {
+    sea r = ""
+    sea n = i + 1
+    mientras (n > 0) {
+        sea m = (n - 1) % 26
+        r = subcadena("ABCDEFGHIJKLMNOPQRSTUVWXYZ", m, m + 1) + r
+        n = cociente(n - 1, 26)
+    }
+    retornar r
+}
+
+funcion _hj_celda(ref, v, negrita) {
+    sea s = ""
+    si (negrita) { s = " s=\"1\"" }
+    si (v == nulo) { retornar "" }
+    si (tipo(v) == "numero") {
+        retornar "<c r=\"" + ref + "\"" + s + "><v>" + v + "</v></c>"
+    }
+    si (tipo(v) == "booleano") {
+        sea b = "0"
+        si (v) { b = "1" }
+        retornar "<c r=\"" + ref + "\"" + s + " t=\"b\"><v>" + b + "</v></c>"
+    }
+    si (tipo(v) == "mapa") {
+        si (tiene_clave(v, "fecha_ms")) {
+            // Serial de Excel: días desde 1899-12-30.
+            sea serial = v["fecha_ms"] / 86400000 + 25569
+            sea est = " s=\"2\""
+            si (negrita) { est = " s=\"1\"" }
+            retornar "<c r=\"" + ref + "\"" + est + "><v>" + serial + "</v></c>"
+        }
+        si (tiene_clave(v, "texto")) { retornar "<c r=\"" + ref + "\"" + s + " t=\"inlineStr\"><is><t xml:space=\"preserve\">" + xml_escapar(v["texto"]) + "</t></is></c>" }
+        si (tiene_clave(v, "formula")) { retornar "<c r=\"" + ref + "\"" + s + "><f>" + xml_escapar(v["formula"]) + "</f></c>" }
+    }
+    sea t = "" + v
+    si (texto_empieza_con(t, "=") y longitud(t) > 1) { retornar "<c r=\"" + ref + "\"" + s + "><f>" + xml_escapar(subcadena(t, 1, longitud(t))) + "</f></c>" }
+    retornar "<c r=\"" + ref + "\"" + s + " t=\"inlineStr\"><is><t xml:space=\"preserve\">" + xml_escapar(t) + "</t></is></c>"
+}
+
+funcion _hj_hoja(h) {
+    sea l = ["<?xml version=\"1.0\" encoding=\"UTF-8\" standalone=\"yes\"?>", "<worksheet xmlns=\"http://schemas.openxmlformats.org/spreadsheetml/2006/main\">"]
+    sea max_c = 0
+    para f en h["filas"] { max_c = maximo(max_c, longitud(f)) }
+    si (h["fija"] > 0) { l.agregar("<sheetViews><sheetView workbookViewId=\"0\"><pane ySplit=\"" + h["fija"] + "\" topLeftCell=\"A" + (h["fija"] + 1) + "\" activePane=\"bottomLeft\" state=\"frozen\"/></sheetView></sheetViews>") }
+    si (longitud(h["anchos"]) > 0) {
+        l.agregar("<cols>")
+        sea i = 0
+        mientras (i < longitud(h["anchos"])) {
+            l.agregar("<col min=\"" + (i + 1) + "\" max=\"" + (i + 1) + "\" width=\"" + h["anchos"][i] + "\" customWidth=\"1\"/>")
+            i = i + 1
+        }
+        l.agregar("</cols>")
+    }
+    l.agregar("<sheetData>")
+    sea r = 0
+    mientras (r < longitud(h["filas"])) {
+        sea f = h["filas"][r]
+        sea celdas = []
+        sea c = 0
+        mientras (c < longitud(f)) {
+            celdas.agregar(_hj_celda(hoja_columna(c) + (r + 1), f[c], h["cabecera"] y r == 0))
+            c = c + 1
+        }
+        l.agregar("<row r=\"" + (r + 1) + "\">" + unir(celdas, "") + "</row>")
+        r = r + 1
+    }
+    l.agregar("</sheetData>")
+    si (h["filtro"] y max_c > 0 y longitud(h["filas"]) > 0) { l.agregar("<autoFilter ref=\"A1:" + hoja_columna(max_c - 1) + longitud(h["filas"]) + "\"/>") }
+    l.agregar("</worksheet>")
+    retornar unir(l, "")
+}
+
+/// Bytes del .xlsx.
+funcion hoja_xlsx(libro) {
+    si (longitud(libro["hojas"]) == 0) { lanzar "hoja: el libro no tiene hojas" }
+    sea tipos = ["<?xml version=\"1.0\" encoding=\"UTF-8\" standalone=\"yes\"?><Types xmlns=\"http://schemas.openxmlformats.org/package/2006/content-types\"><Default Extension=\"rels\" ContentType=\"application/vnd.openxmlformats-package.relationships+xml\"/><Default Extension=\"xml\" ContentType=\"application/xml\"/><Override PartName=\"/xl/workbook.xml\" ContentType=\"application/vnd.openxmlformats-officedocument.spreadsheetml.sheet.main+xml\"/><Override PartName=\"/xl/styles.xml\" ContentType=\"application/vnd.openxmlformats-officedocument.spreadsheetml.styles+xml\"/>"]
+    sea hojas_wb = []
+    sea rels = []
+    sea entradas = []
+    sea i = 0
+    mientras (i < longitud(libro["hojas"])) {
+        sea n = i + 1
+        tipos.agregar("<Override PartName=\"/xl/worksheets/sheet" + n + ".xml\" ContentType=\"application/vnd.openxmlformats-officedocument.spreadsheetml.worksheet+xml\"/>")
+        hojas_wb.agregar("<sheet name=\"" + xml_escapar(libro["hojas"][i]["nombre"]) + "\" sheetId=\"" + n + "\" r:id=\"rId" + n + "\"/>")
+        rels.agregar("<Relationship Id=\"rId" + n + "\" Type=\"http://schemas.openxmlformats.org/officeDocument/2006/relationships/worksheet\" Target=\"worksheets/sheet" + n + ".xml\"/>")
+        entradas.agregar({"nombre": "xl/worksheets/sheet" + n + ".xml", "datos": _hj_hoja(libro["hojas"][i])})
+        i = i + 1
+    }
+    tipos.agregar("</Types>")
+    rels.agregar("<Relationship Id=\"rId" + (longitud(libro["hojas"]) + 1) + "\" Type=\"http://schemas.openxmlformats.org/officeDocument/2006/relationships/styles\" Target=\"styles.xml\"/>")
+    sea base = [
+        {"nombre": "[Content_Types].xml", "datos": unir(tipos, "")},
+        {"nombre": "_rels/.rels", "datos": "<?xml version=\"1.0\" encoding=\"UTF-8\" standalone=\"yes\"?><Relationships xmlns=\"http://schemas.openxmlformats.org/package/2006/relationships\"><Relationship Id=\"rId1\" Type=\"http://schemas.openxmlformats.org/officeDocument/2006/relationships/officeDocument\" Target=\"xl/workbook.xml\"/></Relationships>"},
+        {"nombre": "xl/workbook.xml", "datos": "<?xml version=\"1.0\" encoding=\"UTF-8\" standalone=\"yes\"?><workbook xmlns=\"http://schemas.openxmlformats.org/spreadsheetml/2006/main\" xmlns:r=\"http://schemas.openxmlformats.org/officeDocument/2006/relationships\"><sheets>" + unir(hojas_wb, "") + "</sheets></workbook>"},
+        {"nombre": "xl/_rels/workbook.xml.rels", "datos": "<?xml version=\"1.0\" encoding=\"UTF-8\" standalone=\"yes\"?><Relationships xmlns=\"http://schemas.openxmlformats.org/package/2006/relationships\">" + unir(rels, "") + "</Relationships>"},
+        {"nombre": "xl/styles.xml", "datos": "<?xml version=\"1.0\" encoding=\"UTF-8\" standalone=\"yes\"?><styleSheet xmlns=\"http://schemas.openxmlformats.org/spreadsheetml/2006/main\"><numFmts count=\"1\"><numFmt numFmtId=\"164\" formatCode=\"yyyy-mm-dd hh:mm\"/></numFmts><fonts count=\"2\"><font><sz val=\"11\"/><name val=\"Calibri\"/></font><font><b/><sz val=\"11\"/><name val=\"Calibri\"/></font></fonts><fills count=\"2\"><fill><patternFill patternType=\"none\"/></fill><fill><patternFill patternType=\"gray125\"/></fill></fills><borders count=\"1\"><border><left/><right/><top/><bottom/><diagonal/></border></borders><cellStyleXfs count=\"1\"><xf numFmtId=\"0\" fontId=\"0\" fillId=\"0\" borderId=\"0\"/></cellStyleXfs><cellXfs count=\"3\"><xf numFmtId=\"0\" fontId=\"0\" fillId=\"0\" borderId=\"0\" xfId=\"0\"/><xf numFmtId=\"0\" fontId=\"1\" fillId=\"0\" borderId=\"0\" xfId=\"0\" applyFont=\"1\"/><xf numFmtId=\"164\" fontId=\"0\" fillId=\"0\" borderId=\"0\" xfId=\"0\" applyNumberFormat=\"1\"/></cellXfs><cellStyles count=\"1\"><cellStyle name=\"Normal\" xfId=\"0\" builtinId=\"0\"/></cellStyles></styleSheet>"}
+    ]
+    para e en entradas { base.agregar(e) }
+    retornar archivador_zip(base, verdadero)
+}

@@ -1,0 +1,262 @@
+// stdlib/archivador.cfv — archivos ZIP y TAR seguros: crear y leer en
+// memoria, con compresión DEFLATE propia. Protegido contra "zip slip"
+// (rutas con ../ o absolutas), bombas de compresión (límite de tamaño y de
+// razón) y CRC alterado. Inspirada en libarchive (BSD). En inglés:
+// importar "archive".
+//
+//   importar "archivador"
+//   sea z = archivador_zip([{"nombre": "hola.txt", "datos": "Hola"}, {"nombre": "img/logo.png", "datos": png}])
+//   escribir_archivo("paquete.zip", z)
+//   para e en archivador_leer_zip(leer_archivo("paquete.zip")) { mostrar(e["nombre"]) }
+//
+// Entrada: {"nombre", "datos", "fecha_ms"?}. Salida de lectura: además
+// "tamano", "comprimido", "es_carpeta".
+
+funcion _ar_le(n, ancho) { retornar bytes_entero(n, ancho, 1) }
+funcion _ar_lee(b, pos, ancho) { retornar bytes_leer_entero(b, pos, ancho, 1) }
+
+/// Ruta segura: sin "..", sin absolutas ni letras de unidad, con "/".
+funcion archivador_ruta_segura(ruta) {
+    sea r = texto_reemplazar("" + ruta, "\\", "/")
+    si (texto_empieza_con(r, "/") o (longitud(r) > 1 y subcadena(r, 1, 2) == ":")) { retornar falso }
+    para p en texto_dividir(r, "/") { si (p == "..") { retornar falso } }
+    si (texto_indice(r, bytes_entero(0, 1, 0)) >= 0) { retornar falso }
+    retornar r != ""
+}
+
+// Fecha y hora de MS-DOS (resolución 2 s) desde ms UTC.
+funcion _ar_dos(ms) {
+    sea dias = cociente(ms, 86400000)
+    sea seg = cociente(ms - dias * 86400000, 1000)
+    sea z = dias + 719468
+    sea era = cociente(z, 146097)
+    sea doe = z - era * 146097
+    sea yoe = cociente(doe - cociente(doe, 1460) + cociente(doe, 36524) - cociente(doe, 146096), 365)
+    sea doy = doe - (365 * yoe + cociente(yoe, 4) - cociente(yoe, 100))
+    sea mp = cociente(5 * doy + 2, 153)
+    sea d = doy - cociente(153 * mp + 2, 5) + 1
+    sea m = mp + 3
+    si (m > 12) { m = m - 12 }
+    sea a = yoe + era * 400
+    si (m <= 2) { a = a + 1 }
+    si (a < 1980) { retornar [0, 33] }
+    retornar [cociente(seg, 3600) * 2048 + cociente(seg % 3600, 60) * 32 + cociente(seg % 60, 2), (a - 1980) * 512 + m * 32 + d]
+}
+
+// DEFLATE crudo (sin cabecera ni adler de zlib).
+funcion _ar_deflate(datos) {
+    sea z = zlib_comprimir(datos, 6)
+    retornar subcadena(z, 2, longitud(z) - 4)
+}
+
+funcion _ar_crc(datos) {
+    sea c = crc32(datos)
+    si (c < 0) { c = c + 4294967296 }
+    retornar c % 4294967296
+}
+
+/// Crea un ZIP. comprimir = falso guarda sin comprimir (método 0).
+funcion archivador_zip(entradas, comprimir) {
+    sea locales = []
+    sea central = []
+    sea offset = 0
+    sea ahora = cfv_fecha_ahora_ms()
+    para e en entradas {
+        sea nombre = "" + e["nombre"]
+        si (archivador_ruta_segura(nombre) == falso) { lanzar "archivador: ruta insegura " + nombre }
+        sea datos = "" + (e["datos"] ?? "")
+        sea crc = _ar_crc(datos)
+        sea metodo = 8
+        sea cuerpo = datos
+        si (comprimir == falso o longitud(datos) < 64) { metodo = 0 } sino {
+            cuerpo = _ar_deflate(datos)
+            si (longitud(cuerpo) >= longitud(datos)) { metodo = 0  cuerpo = datos }
+        }
+        sea fecha = ahora
+        si (tiene_clave(e, "fecha_ms")) { fecha = e["fecha_ms"] }
+        sea dos = _ar_dos(fecha)
+        // Bit 11: nombre en UTF-8.
+        sea comun = _ar_le(20, 2) + _ar_le(2048, 2) + _ar_le(metodo, 2) + _ar_le(dos[0], 2) + _ar_le(dos[1], 2) + _ar_le(crc, 4) + _ar_le(longitud(cuerpo), 4) + _ar_le(longitud(datos), 4) + _ar_le(longitud(nombre), 2) + _ar_le(0, 2)
+        sea local = bytes_de_hex("504b0304") + comun + nombre + cuerpo
+        locales.agregar(local)
+        central.agregar(bytes_de_hex("504b0102") + _ar_le(20, 2) + comun + _ar_le(0, 2) + _ar_le(0, 2) + _ar_le(0, 2) + _ar_le(0, 4) + _ar_le(offset, 4) + nombre)
+        offset = offset + longitud(local)
+    }
+    sea dir = unir(central, "")
+    sea fin = bytes_de_hex("504b0506") + _ar_le(0, 2) + _ar_le(0, 2) + _ar_le(longitud(entradas), 2) + _ar_le(longitud(entradas), 2) + _ar_le(longitud(dir), 4) + _ar_le(offset, 4) + _ar_le(0, 2)
+    retornar unir(locales, "") + dir + fin
+}
+
+funcion _ar_op(o, k, d) {
+    si (o != nulo) { si (tiene_clave(o, k)) { retornar o[k] } }
+    retornar d
+}
+
+/// Lee un ZIP desde el directorio central. opciones: max_total (512 MB),
+/// max_razon (200: más que eso es sospechoso de bomba), solo (lista de nombres).
+funcion archivador_leer_zip(zip, opciones) {
+    sea max_total = _ar_op(opciones, "max_total", 536870912)
+    sea max_razon = _ar_op(opciones, "max_razon", 200)
+    sea solo = _ar_op(opciones, "solo", nulo)
+    sea n = longitud(zip)
+    // Fin del directorio central: busca hacia atrás (comentario ≤ 64 KB).
+    sea eocd = -1
+    sea i = n - 22
+    sea tope = maximo(0, n - 22 - 65535)
+    mientras (i >= tope y eocd < 0) {
+        si (subcadena(zip, i, i + 4) == bytes_de_hex("504b0506")) { eocd = i }
+        i = i - 1
+    }
+    si (eocd < 0) { lanzar "archivador: no es un ZIP (falta el directorio central)" }
+    sea cuantos = _ar_lee(zip, eocd + 10, 2)
+    sea pos = _ar_lee(zip, eocd + 16, 4)
+    si (pos + 46 > n) { lanzar "archivador: ZIP dañado" }
+    sea r = []
+    sea total = 0
+    sea k = 0
+    mientras (k < cuantos) {
+        si (pos + 46 > n o subcadena(zip, pos, pos + 4) != bytes_de_hex("504b0102")) { lanzar "archivador: ZIP dañado (directorio central)" }
+        sea metodo = _ar_lee(zip, pos + 10, 2)
+        sea crc = _ar_lee(zip, pos + 16, 4)
+        sea comp = _ar_lee(zip, pos + 20, 4)
+        sea tam = _ar_lee(zip, pos + 24, 4)
+        sea ln = _ar_lee(zip, pos + 28, 2)
+        sea le = _ar_lee(zip, pos + 30, 2)
+        sea lc = _ar_lee(zip, pos + 32, 2)
+        sea off = _ar_lee(zip, pos + 42, 4)
+        sea nombre = subcadena(zip, pos + 46, pos + 46 + ln)
+        pos = pos + 46 + ln + le + lc
+        k = k + 1
+        sea es_carpeta = texto_termina_con(nombre, "/")
+        sea quiero = verdadero
+        si (solo != nulo) {
+            quiero = falso
+            para s en solo { si (s == nombre) { quiero = verdadero } }
+        }
+        si (quiero) {
+            si (archivador_ruta_segura(nombre) == falso) { lanzar "archivador: ruta insegura en el ZIP: " + nombre }
+            total = total + tam
+            si (total > max_total) { lanzar "archivador: el contenido supera " + max_total + " bytes" }
+            si (tam > 1048576 y comp > 0 y tam / comp > max_razon) { lanzar "archivador: razón de compresión sospechosa en " + nombre }
+            si (off + 30 > n o subcadena(zip, off, off + 4) != bytes_de_hex("504b0304")) { lanzar "archivador: ZIP dañado (entrada local)" }
+            sea ini = off + 30 + _ar_lee(zip, off + 26, 2) + _ar_lee(zip, off + 28, 2)
+            si (ini + comp > n) { lanzar "archivador: ZIP truncado" }
+            sea bruto = subcadena(zip, ini, ini + comp)
+            sea datos = ""
+            si (metodo == 0) { datos = bruto } sino {
+                si (metodo != 8) { lanzar "archivador: método de compresión no soportado (" + metodo + ") en " + nombre }
+                datos = inflar(bruto, tam + 1)
+            }
+            si (longitud(datos) != tam) { lanzar "archivador: tamaño incorrecto en " + nombre }
+            si (_ar_crc(datos) != crc) { lanzar "archivador: CRC incorrecto en " + nombre }
+            r.agregar({"nombre": nombre, "datos": datos, "tamano": tam, "comprimido": comp, "es_carpeta": es_carpeta})
+        }
+    }
+    retornar r
+}
+
+/// Una entrada del ZIP (o nulo).
+funcion archivador_zip_archivo(zip, nombre) {
+    sea r = archivador_leer_zip(zip, {"solo": [nombre]})
+    si (longitud(r) == 0) { retornar nulo }
+    retornar r[0]["datos"]
+}
+
+funcion _ar_octal(n, ancho) {
+    sea s = ""
+    sea x = n
+    si (x == 0) { s = "0" }
+    mientras (x > 0) { s = (x % 8) + s  x = cociente(x, 8) }
+    mientras (longitud(s) < ancho - 1) { s = "0" + s }
+    retornar s + bytes_entero(0, 1, 0)
+}
+
+funcion _ar_campo(t, ancho) {
+    sea s = "" + t
+    si (longitud(s) > ancho) { lanzar "archivador: nombre demasiado largo para TAR: " + t }
+    mientras (longitud(s) < ancho) { s = s + bytes_entero(0, 1, 0) }
+    retornar s
+}
+
+/// Crea un TAR (formato ustar). Combínalo con zlib para .tar.gz no; para
+/// eso usa gzip aparte.
+funcion archivador_tar(entradas) {
+    sea partes = []
+    sea ahora = cociente(cfv_fecha_ahora_ms(), 1000)
+    para e en entradas {
+        sea nombre = "" + e["nombre"]
+        si (archivador_ruta_segura(nombre) == falso) { lanzar "archivador: ruta insegura " + nombre }
+        sea datos = "" + (e["datos"] ?? "")
+        sea fecha = ahora
+        si (tiene_clave(e, "fecha_ms")) { fecha = cociente(e["fecha_ms"], 1000) }
+        sea prefijo = ""
+        si (longitud(nombre) > 100) {
+            sea corte = -1
+            sea i = 0
+            mientras (i < longitud(nombre)) { si (subcadena(nombre, i, i + 1) == "/" y i <= 155 y longitud(nombre) - i - 1 <= 100) { corte = i }  i = i + 1 }
+            si (corte < 0) { lanzar "archivador: nombre demasiado largo para TAR: " + nombre }
+            prefijo = subcadena(nombre, 0, corte)
+            nombre = subcadena(nombre, corte + 1, longitud(nombre))
+        }
+        sea cab = _ar_campo(nombre, 100) + _ar_octal(420, 8) + _ar_octal(0, 8) + _ar_octal(0, 8) + _ar_octal(longitud(datos), 12) + _ar_octal(fecha, 12) + "        " + "0" + _ar_campo("", 100) + "ustar" + bytes_entero(0, 1, 0) + "00" + _ar_campo("", 32) + _ar_campo("", 32) + _ar_octal(0, 8) + _ar_octal(0, 8) + _ar_campo(prefijo, 155) + _ar_campo("", 12)
+        sea suma = 0
+        sea i = 0
+        mientras (i < 512) { suma = suma + byte_en(cab, i)  i = i + 1 }
+        sea ch = _ar_octal(suma, 7) + " "
+        cab = subcadena(cab, 0, 148) + ch + subcadena(cab, 156, 512)
+        partes.agregar(cab)
+        partes.agregar(datos)
+        sea relleno = (512 - longitud(datos) % 512) % 512
+        partes.agregar(texto_repetir(bytes_entero(0, 1, 0), relleno))
+    }
+    partes.agregar(texto_repetir(bytes_entero(0, 1, 0), 1024))
+    retornar unir(partes, "")
+}
+
+funcion _ar_de_octal(t) {
+    sea n = 0
+    para c en texto_dividir(t, "") {
+        sea d = texto_indice("01234567", c)
+        si (d >= 0) { n = n * 8 + d }
+    }
+    retornar n
+}
+
+funcion _ar_cadena(t) {
+    sea p = texto_indice(t, bytes_entero(0, 1, 0))
+    si (p < 0) { retornar t }
+    retornar subcadena(t, 0, p)
+}
+
+/// Lee un TAR (ustar/GNU básico). Verifica sumas y rutas.
+funcion archivador_leer_tar(tar, opciones) {
+    sea max_total = _ar_op(opciones, "max_total", 536870912)
+    sea r = []
+    sea pos = 0
+    sea total = 0
+    mientras (pos + 512 <= longitud(tar)) {
+        sea cab = subcadena(tar, pos, pos + 512)
+        si (cab == texto_repetir(bytes_entero(0, 1, 0), 512)) { retornar r }
+        sea suma = 0
+        sea i = 0
+        mientras (i < 512) {
+            si (i >= 148 y i < 156) { suma = suma + 32 } sino { suma = suma + byte_en(cab, i) }
+            i = i + 1
+        }
+        si (suma != _ar_de_octal(subcadena(cab, 148, 156))) { lanzar "archivador: TAR dañado (suma de cabecera)" }
+        sea nombre = _ar_cadena(subcadena(cab, 0, 100))
+        sea prefijo = _ar_cadena(subcadena(cab, 345, 500))
+        si (prefijo != "") { nombre = prefijo + "/" + nombre }
+        sea tam = _ar_de_octal(subcadena(cab, 124, 136))
+        sea tipo_e = subcadena(cab, 156, 157)
+        total = total + tam
+        si (total > max_total) { lanzar "archivador: el contenido supera " + max_total + " bytes" }
+        si (pos + 512 + tam > longitud(tar)) { lanzar "archivador: TAR truncado" }
+        si (tipo_e == "0" o tipo_e == bytes_entero(0, 1, 0) o tipo_e == "5") {
+            si (archivador_ruta_segura(nombre) == falso) { lanzar "archivador: ruta insegura en el TAR: " + nombre }
+            r.agregar({"nombre": nombre, "datos": subcadena(tar, pos + 512, pos + 512 + tam), "tamano": tam, "es_carpeta": tipo_e == "5"})
+        }
+        pos = pos + 512 + tam + (512 - tam % 512) % 512
+    }
+    retornar r
+}

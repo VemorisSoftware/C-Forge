@@ -1,0 +1,205 @@
+// stdlib/sobre.cfv — cifrar archivos y mensajes: con una clave pública
+// (X25519, sin compartir secretos) o con una contraseña (PBKDF2), usando
+// ChaCha20-Poly1305 por bloques de 64 KB con el último bloque marcado (no se
+// puede truncar ni reordenar sin que se note). Varios destinatarios por
+// sobre. Inspirada en age (BSD); formato propio "cforge-sobre/1", no
+// compatible con age. En inglés: importar "envelope".
+//
+//   importar "sobre"
+//   sea yo = sobre_claves()                                  // {"secreta", "publica"} (texto)
+//   sea s = sobre_cifrar(datos, [yo["publica"], otra_publica])
+//   sobre_descifrar(s, yo["secreta"])
+//   sea c = sobre_cifrar_clave(datos, "frase larga y secreta")
+//   sobre_descifrar_clave(c, "frase larga y secreta")
+
+importar "base64"
+
+sea _SO_MAGIA = "cforge-sobre/1\n"
+sea _SO_BLOQUE = 65536
+
+funcion _so_b64(t) { retornar texto_reemplazar(base64_codificar(t), "=", "") }
+funcion _so_de_b64(t) {
+    sea s = "" + t
+    mientras (longitud(s) % 4 != 0) { s = s + "=" }
+    retornar base64_decodificar(s)
+}
+
+/// Par de claves en texto: "SOBRE-SECRETA-…" y "sobre1…".
+funcion sobre_claves() {
+    sea s = bytes_aleatorios(32)
+    retornar {"secreta": "SOBRE-SECRETA-" + texto_mayusculas(hex_de_bytes(s)), "publica": "sobre1" + hex_de_bytes(x25519_base(s))}
+}
+
+funcion _so_secreta(t) {
+    sea x = texto_recortar("" + t)
+    si (texto_empieza_con(x, "SOBRE-SECRETA-") == falso o longitud(x) != 78) { lanzar "sobre: clave secreta inválida" }
+    retornar bytes_de_hex(texto_minusculas(subcadena(x, 14, 78)))
+}
+
+funcion _so_publica(t) {
+    sea x = texto_recortar("" + t)
+    si (texto_empieza_con(x, "sobre1") == falso o longitud(x) != 70) { lanzar "sobre: clave pública inválida: " + t }
+    retornar bytes_de_hex(subcadena(x, 6, 70))
+}
+
+funcion sobre_publica_de(secreta) { retornar "sobre1" + hex_de_bytes(x25519_base(_so_secreta(secreta))) }
+
+funcion _so_ceros(n) { retornar texto_repetir(bytes_entero(0, 1, 0), n) }
+
+// Cuerpo: nonce base de 11 bytes + contador (4) + bandera de último (1) → 12+.
+funcion _so_cuerpo(clave, datos) {
+    sea partes = []
+    sea n = longitud(datos)
+    sea k = 0
+    sea pos = 0
+    sea seguir = verdadero
+    mientras (seguir) {
+        sea fin = minimo(n, pos + _SO_BLOQUE)
+        sea ultimo = fin >= n
+        sea bandera = 0
+        si (ultimo) { bandera = 1 }
+        sea nonce = bytes_entero(0, 1, 0) + bytes_entero(0, 2, 0) + bytes_entero(k, 8, 0) + bytes_entero(bandera, 1, 0)
+        partes.agregar(chacha20_poly1305_cifrar(clave, nonce, subcadena(datos, pos, fin), ""))
+        pos = fin
+        k = k + 1
+        si (ultimo) { seguir = falso }
+    }
+    retornar unir(partes, "")
+}
+
+funcion _so_abrir_cuerpo(clave, cuerpo) {
+    sea partes = []
+    sea pos = 0
+    sea k = 0
+    sea total = longitud(cuerpo)
+    sea seguir = verdadero
+    mientras (seguir) {
+        si (pos >= total) { lanzar "sobre: datos truncados" }
+        sea fin = minimo(total, pos + _SO_BLOQUE + 16)
+        sea ultimo = fin >= total
+        sea bandera = 0
+        si (ultimo) { bandera = 1 }
+        sea nonce = bytes_entero(0, 1, 0) + bytes_entero(0, 2, 0) + bytes_entero(k, 8, 0) + bytes_entero(bandera, 1, 0)
+        sea texto = nulo
+        intentar { texto = chacha20_poly1305_descifrar(clave, nonce, subcadena(cuerpo, pos, fin), "") } capturar (e) { lanzar "sobre: datos alterados o clave incorrecta" }
+        partes.agregar(texto)
+        pos = fin
+        k = k + 1
+        si (ultimo) { seguir = falso }
+    }
+    retornar unir(partes, "")
+}
+
+funcion _so_armar(lineas, clave_archivo, datos) {
+    sea cab = _SO_MAGIA + unir(lineas, "\n") + "\n"
+    sea mac = hmac_sha256_bytes(hkdf_sha256(clave_archivo, "", "cabecera", 32), cab)
+    sea sal = bytes_aleatorios(16)
+    sea clave = hkdf_sha256(clave_archivo, sal, "cuerpo", 32)
+    retornar cab + "--- " + _so_b64(mac) + "\n" + sal + _so_cuerpo(clave, datos)
+}
+
+/// Cifra para uno o más destinatarios (claves públicas "sobre1…").
+funcion sobre_cifrar(datos, destinatarios) {
+    si (longitud(destinatarios) == 0) { lanzar "sobre: falta al menos un destinatario" }
+    sea clave_archivo = bytes_aleatorios(16)
+    sea lineas = []
+    para d en destinatarios {
+        sea pub = _so_publica(d)
+        sea efimera = bytes_aleatorios(32)
+        sea epub = x25519_base(efimera)
+        sea compartido = x25519(efimera, pub)
+        si (compartido == _so_ceros(32)) { lanzar "sobre: clave pública inválida" }
+        sea envoltura = hkdf_sha256(compartido, epub + pub, "x25519", 32)
+        lineas.agregar("-> x25519 " + _so_b64(epub) + " " + _so_b64(chacha20_poly1305_cifrar(envoltura, _so_ceros(12), clave_archivo, "")))
+    }
+    retornar _so_armar(lineas, clave_archivo, "" + datos)
+}
+
+/// Cifra con contraseña (PBKDF2-SHA256, 200 000 vueltas por defecto).
+funcion sobre_cifrar_clave(datos, contrasena, vueltas) {
+    si (longitud("" + contrasena) < 8) { lanzar "sobre: la contraseña debe tener al menos 8 caracteres" }
+    sea n = vueltas ?? 200000
+    sea clave_archivo = bytes_aleatorios(16)
+    sea sal = bytes_aleatorios(16)
+    sea envoltura = pbkdf2_sha256("" + contrasena, sal, n, 32)
+    sea linea = "-> clave " + n + " " + _so_b64(sal) + " " + _so_b64(chacha20_poly1305_cifrar(envoltura, _so_ceros(12), clave_archivo, ""))
+    retornar _so_armar([linea], clave_archivo, "" + datos)
+}
+
+funcion _so_partir(sobre) {
+    sea s = "" + sobre
+    si (texto_empieza_con(s, _SO_MAGIA) == falso) { lanzar "sobre: no es un sobre cforge-sobre/1" }
+    sea fin = texto_indice(s, "\n--- ")
+    si (fin < 0) { lanzar "sobre: cabecera incompleta" }
+    sea fin_mac = texto_indice(subcadena(s, fin + 5, longitud(s)), "\n")
+    si (fin_mac < 0) { lanzar "sobre: cabecera incompleta" }
+    sea cab = subcadena(s, 0, fin + 1)
+    sea mac = _so_de_b64(subcadena(s, fin + 5, fin + 5 + fin_mac))
+    sea resto = subcadena(s, fin + 5 + fin_mac + 1, longitud(s))
+    sea lineas = texto_dividir(subcadena(cab, longitud(_SO_MAGIA), longitud(cab) - 1), "\n")
+    si (longitud(resto) < 16 + 16) { lanzar "sobre: datos truncados" }
+    retornar {"cabecera": cab, "mac": mac, "lineas": lineas, "sal": subcadena(resto, 0, 16), "cuerpo": subcadena(resto, 16, longitud(resto))}
+}
+
+funcion _so_terminar(p, clave_archivo) {
+    sea esperado = hmac_sha256_bytes(hkdf_sha256(clave_archivo, "", "cabecera", 32), p["cabecera"])
+    si (esperado != p["mac"]) { lanzar "sobre: cabecera alterada" }
+    retornar _so_abrir_cuerpo(hkdf_sha256(clave_archivo, p["sal"], "cuerpo", 32), p["cuerpo"])
+}
+
+/// Descifra con la clave secreta propia.
+funcion sobre_descifrar(sobre, secreta) {
+    sea p = _so_partir(sobre)
+    sea s = _so_secreta(secreta)
+    sea pub = x25519_base(s)
+    para l en p["lineas"] {
+        sea x = texto_dividir(l, " ")
+        si (longitud(x) == 4 y x[0] == "->" y x[1] == "x25519") {
+            sea epub = _so_de_b64(x[2])
+            si (longitud(epub) == 32) {
+                sea compartido = x25519(s, epub)
+                sea envoltura = hkdf_sha256(compartido, epub + pub, "x25519", 32)
+                sea clave_archivo = nulo
+                intentar { clave_archivo = chacha20_poly1305_descifrar(envoltura, _so_ceros(12), _so_de_b64(x[3]), "") } capturar (e) { clave_archivo = nulo }
+                si (clave_archivo != nulo) { retornar _so_terminar(p, clave_archivo) }
+            }
+        }
+    }
+    lanzar "sobre: esta clave no es destinataria del sobre"
+}
+
+funcion sobre_descifrar_clave(sobre, contrasena) {
+    sea p = _so_partir(sobre)
+    para l en p["lineas"] {
+        sea x = texto_dividir(l, " ")
+        si (longitud(x) == 5 y x[0] == "->" y x[1] == "clave") {
+            sea n = a_numero(x[2])
+            si (n > 10000000) { lanzar "sobre: demasiadas vueltas de PBKDF2 (posible ataque)" }
+            sea envoltura = pbkdf2_sha256("" + contrasena, _so_de_b64(x[3]), n, 32)
+            sea clave_archivo = nulo
+            intentar { clave_archivo = chacha20_poly1305_descifrar(envoltura, _so_ceros(12), _so_de_b64(x[4]), "") } capturar (e) { lanzar "sobre: contraseña incorrecta" }
+            retornar _so_terminar(p, clave_archivo)
+        }
+    }
+    lanzar "sobre: no fue cifrado con contraseña"
+}
+
+/// Versión armada en texto (para pegar en un correo o en un repositorio).
+funcion sobre_armar(sobre) {
+    sea b = base64_codificar(sobre)
+    sea l = ["-----BEGIN CFORGE SOBRE-----"]
+    sea i = 0
+    mientras (i < longitud(b)) { l.agregar(subcadena(b, i, minimo(longitud(b), i + 64)))  i = i + 64 }
+    l.agregar("-----END CFORGE SOBRE-----")
+    retornar unir(l, "\n") + "\n"
+}
+
+funcion sobre_desarmar(texto) {
+    sea t = texto_recortar("" + texto)
+    si (texto_empieza_con(t, "-----BEGIN CFORGE SOBRE-----") == falso) { lanzar "sobre: no es un sobre armado" }
+    sea lineas = texto_dividir(t, "\n")
+    sea b = ""
+    sea i = 1
+    mientras (i < longitud(lineas) - 1) { b = b + texto_recortar(lineas[i])  i = i + 1 }
+    retornar base64_decodificar(b)
+}

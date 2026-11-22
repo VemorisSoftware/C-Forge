@@ -1,0 +1,190 @@
+// stdlib/lee_excel.cfv — leer planillas .xlsx (Excel, LibreOffice, Google
+// Sheets): hojas, textos compartidos, números, booleanos, fechas y el
+// último valor calculado de las fórmulas. Inspirada en Calamine (MIT). En
+// inglés: importar "read_xlsx".
+//
+//   importar "lee_excel"
+//   sea libro = lee_excel_abrir(leer_archivo("ventas.xlsx"))
+//   lee_excel_hojas(libro)                       // ["Ventas", "Resumen"]
+//   sea filas = lee_excel_filas(libro, "Ventas") // [["Producto", "Precio"], ["Café", 2500]]
+//   lee_excel_registros(libro, "Ventas")         // [{"Producto": "Café", "Precio": 2500}]
+//
+// Las fechas salen como número de serie de Excel; lee_excel_fecha_ms lo
+// pasa a milisegundos UTC.
+
+importar "archivador"
+importar "xml"
+
+funcion _le_ruta(base, destino) {
+    si (texto_empieza_con(destino, "/")) { retornar subcadena(destino, 1, longitud(destino)) }
+    sea partes = texto_dividir(base, "/")
+    sea r = []
+    sea i = 0
+    mientras (i < longitud(partes) - 1) { r.agregar(partes[i])  i = i + 1 }
+    para p en texto_dividir(destino, "/") {
+        si (p == "..") {
+            sea c = []
+            sea k = 0
+            mientras (k < longitud(r) - 1) { c.agregar(r[k])  k = k + 1 }
+            r = c
+        } sino { si (p != ".") { r.agregar(p) } }
+    }
+    retornar unir(r, "/")
+}
+
+funcion _le_xml(archivos, nombre) {
+    si (tiene_clave(archivos, nombre) == falso) { retornar nulo }
+    retornar xml_analizar(archivos[nombre])
+}
+
+/// Abre el .xlsx (bytes). Lanza si no es una planilla válida.
+funcion lee_excel_abrir(bytes) {
+    sea archivos = {}
+    para e en archivador_leer_zip(bytes, {"max_total": 268435456}) { archivos[e["nombre"]] = e["datos"] }
+    si (tiene_clave(archivos, "xl/workbook.xml") == falso) { lanzar "lee_excel: no es un .xlsx (falta xl/workbook.xml)" }
+    sea wb = xml_analizar(archivos["xl/workbook.xml"])
+    sea rels = {}
+    sea r = _le_xml(archivos, "xl/_rels/workbook.xml.rels")
+    si (r != nulo) { para x en xml_buscar(r, "Relationship") { rels[x["atributos"]["Id"]] = _le_ruta("xl/workbook.xml", x["atributos"]["Target"]) } }
+    sea hojas = []
+    para s en xml_buscar(wb, "sheet") {
+        sea rid = nulo
+        para k en claves(s["atributos"]) { si (texto_termina_con(k, ":id")) { rid = s["atributos"][k] } }
+        sea ruta = "xl/worksheets/sheet" + (longitud(hojas) + 1) + ".xml"
+        si (rid != nulo y tiene_clave(rels, rid)) { ruta = rels[rid] }
+        hojas.agregar({"nombre": s["atributos"]["name"], "ruta": ruta})
+    }
+    sea compartidos = []
+    sea ss = _le_xml(archivos, "xl/sharedStrings.xml")
+    si (ss != nulo) {
+        para si_ in xml_buscar(ss, "si") {
+            // Texto enriquecido: concatena los <t> (ignora <rPh> fonéticos).
+            sea partes = []
+            para h en si_["hijos"] {
+                si (tipo(h) == "mapa") {
+                    si (h["nombre"] == "t") { partes.agregar(xml_contenido(h)) }
+                    si (h["nombre"] == "r") { para t en xml_buscar(h, "t") { partes.agregar(xml_contenido(t)) } }
+                }
+            }
+            compartidos.agregar(unir(partes, ""))
+        }
+    }
+    // Estilos con formato de fecha.
+    sea fechas = {}
+    sea st = _le_xml(archivos, "xl/styles.xml")
+    si (st != nulo) {
+        sea propios = {}
+        para f en xml_buscar(st, "numFmt") {
+            sea codigo = texto_minusculas(f["atributos"]["formatCode"])
+            si ((texto_indice(codigo, "y") >= 0 o texto_indice(codigo, "d") >= 0) y texto_indice(codigo, "[") < 0) { propios[f["atributos"]["numFmtId"]] = verdadero }
+        }
+        sea xfs = xml_hijo(st, "cellXfs")
+        si (xfs != nulo) {
+            sea i = 0
+            para x en xfs["hijos"] {
+                si (tipo(x) == "mapa") {
+                    sea id = x["atributos"]["numFmtId"] ?? "0"
+                    sea n = a_numero(id)
+                    si ((n >= 14 y n <= 22) o (n >= 45 y n <= 47) o tiene_clave(propios, id)) { fechas["" + i] = verdadero }
+                    i = i + 1
+                }
+            }
+        }
+    }
+    retornar {"archivos": archivos, "hojas": hojas, "compartidos": compartidos, "fechas": fechas}
+}
+
+funcion lee_excel_hojas(libro) {
+    sea r = []
+    para h en libro["hojas"] { r.agregar(h["nombre"]) }
+    retornar r
+}
+
+// "BC12" → [columna 0-based, fila 0-based]
+funcion _le_ref(ref) {
+    sea c = 0
+    sea i = 0
+    mientras (i < longitud(ref) y texto_indice("ABCDEFGHIJKLMNOPQRSTUVWXYZ", subcadena(ref, i, i + 1)) >= 0) {
+        c = c * 26 + texto_indice("ABCDEFGHIJKLMNOPQRSTUVWXYZ", subcadena(ref, i, i + 1)) + 1
+        i = i + 1
+    }
+    retornar [c - 1, a_numero(subcadena(ref, i, longitud(ref))) - 1]
+}
+
+/// Filas de la hoja (por nombre o índice) como listas; los huecos son nulo.
+/// opciones: fechas_ms (verdadero = convierte las celdas con formato de fecha a ms).
+funcion lee_excel_filas(libro, hoja, opciones) {
+    sea h = nulo
+    si (tipo(hoja) == "numero") { h = libro["hojas"][hoja] } sino {
+        para x en libro["hojas"] { si (x["nombre"] == hoja) { h = x } }
+    }
+    si (h == nulo) { lanzar "lee_excel: no existe la hoja " + hoja }
+    si (tiene_clave(libro["archivos"], h["ruta"]) == falso) { lanzar "lee_excel: falta " + h["ruta"] }
+    sea fechas_ms = falso
+    si (opciones != nulo) { si (tiene_clave(opciones, "fechas_ms")) { fechas_ms = opciones["fechas_ms"] } }
+    sea doc = xml_analizar(libro["archivos"][h["ruta"]])
+    sea filas = []
+    sea siguiente_fila = 0
+    para row en xml_buscar(doc, "row") {
+        sea ri = siguiente_fila
+        si (tiene_clave(row["atributos"], "r")) { ri = a_numero(row["atributos"]["r"]) - 1 }
+        mientras (longitud(filas) <= ri) { filas.agregar([]) }
+        sea fila = filas[ri]
+        sea col = 0
+        para c en row["hijos"] {
+            si (tipo(c) == "mapa" y c["nombre"] == "c") {
+                sea a = c["atributos"]
+                si (tiene_clave(a, "r")) { col = _le_ref(a["r"])[0] }
+                sea t = a["t"] ?? "n"
+                sea v = xml_hijo(c, "v")
+                sea valor = nulo
+                si (t == "inlineStr") { valor = xml_contenido(xml_hijo(c, "is")) } sino {
+                    si (v != nulo) {
+                        sea txt = xml_contenido(v)
+                        si (t == "s") { valor = libro["compartidos"][a_numero(txt)] }
+                        si (t == "b") { valor = txt == "1" }
+                        si (t == "str" o t == "e") { valor = txt }
+                        si (t == "n") {
+                            valor = a_numero(txt)
+                            si (fechas_ms y tiene_clave(a, "s")) { si (tiene_clave(libro["fechas"], a["s"])) { valor = lee_excel_fecha_ms(valor) } }
+                        }
+                    }
+                }
+                mientras (longitud(fila) < col) { fila.agregar(nulo) }
+                si (longitud(fila) == col) { fila.agregar(valor) } sino { fila[col] = valor }
+                col = col + 1
+            }
+        }
+        siguiente_fila = ri + 1
+    }
+    retornar filas
+}
+
+/// Con la primera fila como cabecera: lista de mapas.
+funcion lee_excel_registros(libro, hoja, opciones) {
+    sea filas = lee_excel_filas(libro, hoja, opciones)
+    si (longitud(filas) == 0) { retornar [] }
+    sea cab = filas[0]
+    sea r = []
+    sea i = 1
+    mientras (i < longitud(filas)) {
+        sea m = {}
+        sea vacia = verdadero
+        sea j = 0
+        mientras (j < longitud(cab)) {
+            si (cab[j] != nulo) {
+                sea v = nulo
+                si (j < longitud(filas[i])) { v = filas[i][j] }
+                si (v != nulo) { vacia = falso }
+                m["" + cab[j]] = v
+            }
+            j = j + 1
+        }
+        si (vacia == falso) { r.agregar(m) }
+        i = i + 1
+    }
+    retornar r
+}
+
+/// Número de serie de Excel (sistema 1900) → ms UTC.
+funcion lee_excel_fecha_ms(serial) { retornar redondear((serial - 25569) * 86400000, 0) }

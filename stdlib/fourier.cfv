@@ -1,0 +1,215 @@
+// stdlib/fourier.cfv — procesamiento de señales con FFT: cualquier largo
+// (Bluestein para no potencias de 2), FFT real, ventanas (Hann, Hamming,
+// Blackman), espectro de potencia con frecuencias, espectrograma,
+// convolución y correlación rápidas, filtros pasa bajos/altos y detección
+// de la frecuencia dominante. Inspirada en FFTW (GPL: solo la idea). En
+// inglés: importar "fft".
+//
+//   importar "fourier"
+//   sea e = fourier_espectro(muestras, 44100, "hann")   // {"frecuencias", "magnitudes"}
+//   fourier_dominante(muestras, 44100)                  // 440.0 Hz
+//   fourier_convolucion([1, 2, 3], [0, 1, 0.5])
+
+importar "numerica"
+
+funcion _fo_c(x) {
+    si (tipo(x) == "lista") { retornar [x[0], x[1]] }
+    retornar [x, 0]
+}
+
+funcion _fo_potencia2(n) { retornar n > 0 y numerica_rellenar(_fo_ceros(n)) != nulo y longitud(numerica_rellenar(_fo_ceros(n))) == n }
+
+funcion _fo_ceros(n) {
+    sea r = []
+    sea i = 0
+    mientras (i < n) { r.agregar(0)  i = i + 1 }
+    retornar r
+}
+
+funcion _fo_es_p2(n) {
+    sea p = 1
+    mientras (p < n) { p = p * 2 }
+    retornar p == n
+}
+
+/// FFT de cualquier largo (complejos [re, im] o reales).
+funcion fourier_fft(xs, inversa) {
+    sea n = longitud(xs)
+    si (n == 0) { retornar [] }
+    sea a = []
+    para x en xs { a.agregar(_fo_c(x)) }
+    si (_fo_es_p2(n)) {
+        si (inversa == verdadero) { retornar numerica_ifft(a) }
+        retornar numerica_fft(a)
+    }
+    // Bluestein: convolución con chirp en un largo potencia de 2.
+    sea signo = -1
+    si (inversa == verdadero) { signo = 1 }
+    sea m = 1
+    mientras (m < 2 * n - 1) { m = m * 2 }
+    sea w = []
+    sea k = 0
+    mientras (k < n) {
+        sea ang = signo * pi() * ((k * k) % (2 * n)) / n
+        w.agregar([coseno(ang), seno(ang)])
+        k = k + 1
+    }
+    sea A = []
+    sea B = []
+    k = 0
+    mientras (k < m) { A.agregar([0, 0])  B.agregar([0, 0])  k = k + 1 }
+    k = 0
+    mientras (k < n) {
+        A[k] = [a[k][0] * w[k][0] - a[k][1] * w[k][1], a[k][0] * w[k][1] + a[k][1] * w[k][0]]
+        B[k] = [w[k][0], 0 - w[k][1]]
+        si (k > 0) { B[m - k] = [w[k][0], 0 - w[k][1]] }
+        k = k + 1
+    }
+    sea FA = numerica_fft(A)
+    sea FB = numerica_fft(B)
+    sea P = []
+    k = 0
+    mientras (k < m) {
+        P.agregar([FA[k][0] * FB[k][0] - FA[k][1] * FB[k][1], FA[k][0] * FB[k][1] + FA[k][1] * FB[k][0]])
+        k = k + 1
+    }
+    sea C = numerica_ifft(P)
+    sea r = []
+    k = 0
+    mientras (k < n) {
+        sea v = [C[k][0] * w[k][0] - C[k][1] * w[k][1], C[k][0] * w[k][1] + C[k][1] * w[k][0]]
+        si (inversa == verdadero) { v = [v[0] / n, v[1] / n] }
+        r.agregar(v)
+        k = k + 1
+    }
+    retornar r
+}
+
+funcion fourier_ifft(xs) { retornar fourier_fft(xs, verdadero) }
+
+/// Ventana de largo n: "hann", "hamming", "blackman" o "rectangular".
+funcion fourier_ventana(nombre, n) {
+    sea r = []
+    sea i = 0
+    mientras (i < n) {
+        sea x = 1
+        sea t = 2 * pi() * i / maximo(1, n - 1)
+        si (nombre == "hann") { x = 0.5 - 0.5 * coseno(t) }
+        si (nombre == "hamming") { x = 0.54 - 0.46 * coseno(t) }
+        si (nombre == "blackman") { x = 0.42 - 0.5 * coseno(t) + 0.08 * coseno(2 * t) }
+        r.agregar(x)
+        i = i + 1
+    }
+    retornar r
+}
+
+/// Espectro de amplitud de una señal real: frecuencias de 0 a Nyquist.
+funcion fourier_espectro(xs, tasa, ventana) {
+    sea n = longitud(xs)
+    sea w = fourier_ventana(ventana ?? "rectangular", n)
+    sea suma_w = 0
+    para v en w { suma_w = suma_w + v }
+    sea x = []
+    sea i = 0
+    mientras (i < n) { x.agregar(xs[i] * w[i])  i = i + 1 }
+    sea F = fourier_fft(x)
+    sea frec = []
+    sea mag = []
+    i = 0
+    mientras (i <= cociente(n, 2)) {
+        sea m = raiz(F[i][0] * F[i][0] + F[i][1] * F[i][1]) / suma_w
+        si (i > 0 y i < n - i) { m = m * 2 }
+        frec.agregar(i * tasa / n)
+        mag.agregar(m)
+        i = i + 1
+    }
+    retornar {"frecuencias": frec, "magnitudes": mag}
+}
+
+/// Frecuencia dominante (Hz) con interpolación parabólica del pico.
+funcion fourier_dominante(xs, tasa) {
+    sea e = fourier_espectro(xs, tasa, "hann")
+    sea m = e["magnitudes"]
+    sea k = 1
+    sea i = 2
+    mientras (i < longitud(m)) { si (m[i] > m[k]) { k = i }  i = i + 1 }
+    si (k <= 0 o k >= longitud(m) - 1) { retornar e["frecuencias"][k] }
+    sea a = logaritmo(m[k - 1] + 0.0000000001)
+    sea b = logaritmo(m[k] + 0.0000000001)
+    sea c = logaritmo(m[k + 1] + 0.0000000001)
+    sea d = 0.5 * (a - c) / (a - 2 * b + c)
+    retornar (k + d) * tasa / longitud(xs)
+}
+
+/// Espectrograma: lista de espectros por ventana (tamano, salto).
+funcion fourier_espectrograma(xs, tasa, tamano, salto) {
+    sea r = []
+    sea pos = 0
+    mientras (pos + tamano <= longitud(xs)) {
+        sea trozo = []
+        sea i = pos
+        mientras (i < pos + tamano) { trozo.agregar(xs[i])  i = i + 1 }
+        r.agregar({"tiempo": pos / tasa, "magnitudes": fourier_espectro(trozo, tasa, "hann")["magnitudes"]})
+        pos = pos + (salto ?? tamano)
+    }
+    retornar r
+}
+
+/// Convolución lineal (largo n + m − 1) vía FFT.
+funcion fourier_convolucion(a, b) {
+    sea n = longitud(a) + longitud(b) - 1
+    sea m = 1
+    mientras (m < n) { m = m * 2 }
+    sea A = []
+    sea B = []
+    sea i = 0
+    mientras (i < m) {
+        si (i < longitud(a)) { A.agregar(a[i]) } sino { A.agregar(0) }
+        si (i < longitud(b)) { B.agregar(b[i]) } sino { B.agregar(0) }
+        i = i + 1
+    }
+    sea FA = numerica_fft(A)
+    sea FB = numerica_fft(B)
+    sea P = []
+    i = 0
+    mientras (i < m) { P.agregar([FA[i][0] * FB[i][0] - FA[i][1] * FB[i][1], FA[i][0] * FB[i][1] + FA[i][1] * FB[i][0]])  i = i + 1 }
+    sea C = numerica_ifft(P)
+    sea r = []
+    i = 0
+    mientras (i < n) { r.agregar(redondear(C[i][0], 10))  i = i + 1 }
+    retornar r
+}
+
+/// Correlación cruzada (para alinear señales o detectar ecos).
+funcion fourier_correlacion(a, b) {
+    sea invertida = []
+    sea i = longitud(b) - 1
+    mientras (i >= 0) { invertida.agregar(b[i])  i = i - 1 }
+    retornar fourier_convolucion(a, invertida)
+}
+
+/// Filtro por FFT: tipo "bajo" (deja pasar < corte) o "alto" (> corte).
+funcion fourier_filtrar(xs, tasa, corte, tipo_f) {
+    sea n = longitud(xs)
+    sea F = fourier_fft(xs)
+    sea i = 0
+    mientras (i < n) {
+        sea f = minimo(i, n - i) * tasa / n
+        sea quitar = falso
+        si ((tipo_f ?? "bajo") == "bajo" o tipo_f == "low") { quitar = f > corte } sino { quitar = f < corte }
+        si (quitar) { F[i] = [0, 0] }
+        i = i + 1
+    }
+    sea r = []
+    para c en fourier_ifft(F) { r.agregar(c[0]) }
+    retornar r
+}
+
+/// Tono de prueba: seno de frecuencia f durante segundos.
+funcion fourier_tono(f, tasa, segundos, amplitud) {
+    sea n = redondear(tasa * segundos, 0)
+    sea r = []
+    sea i = 0
+    mientras (i < n) { r.agregar((amplitud ?? 1) * seno(2 * pi() * f * i / tasa))  i = i + 1 }
+    retornar r
+}

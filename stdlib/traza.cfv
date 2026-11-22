@@ -1,0 +1,183 @@
+// stdlib/traza.cfv — trazas distribuidas al estilo OpenTelemetry: spans
+// anidados con atributos, eventos y estado; propagación W3C (cabecera
+// traceparent) entre servicios; muestreo; exportación a JSON OTLP. Inspirada
+// en OpenTelemetry (Apache). En inglés: importar "tracing".
+//
+//   importar "traza"
+//   sea t = traza_nuevo("tienda-api")
+//   traza_span(t, "GET /pedidos", funcion(s) {
+//       traza_atributo(s, "http.method", "GET")
+//       traza_span(t, "db.consulta", funcion(s2) { … })
+//   })
+//   sea cab = traza_propagar(t)               // {"traceparent": "00-…-…-01"}
+//   escribir_archivo("trazas.json", traza_otlp(t))
+
+importar "json"
+
+funcion _tz_hex(n) { retornar hex_de_bytes(bytes_aleatorios(n)) }
+
+/// muestreo: fracción 0–1 de trazas que se guardan (1 por defecto).
+funcion traza_nuevo(servicio, muestreo) {
+    retornar {"servicio": servicio, "terminados": [], "pila": [], "muestreo": muestreo ?? 1, "reloj": nulo, "padre_remoto": nulo}
+}
+
+funcion traza_con_reloj(t, reloj) { t["reloj"] = reloj  retornar t }
+
+funcion _tz_ahora(t) {
+    si (t["reloj"] != nulo) { retornar t["reloj"]() }
+    retornar cfv_fecha_ahora_ms()
+}
+
+/// Continúa una traza recibida (cabecera traceparent de W3C).
+funcion traza_continuar(t, cabeceras) {
+    sea v = nulo
+    para k en claves(cabeceras) { si (texto_minusculas(k) == "traceparent") { v = cabeceras[k] } }
+    si (v == nulo) { retornar falso }
+    sea p = texto_dividir(texto_recortar("" + v), "-")
+    si (longitud(p) != 4 o p[0] != "00" o longitud(p[1]) != 32 o longitud(p[2]) != 16 o longitud(p[3]) != 2) { retornar falso }
+    para parte en [p[1], p[2], p[3]] { para c en texto_dividir(parte, "") { si (texto_indice("0123456789abcdef", c) < 0) { retornar falso } } }
+    si (p[1] == texto_repetir("0", 32) o p[2] == texto_repetir("0", 16)) { retornar falso }
+    t["padre_remoto"] = {"traza": p[1], "span": p[2], "muestreado": p[3] == "01"}
+    retornar verdadero
+}
+
+/// Abre un span; ciérralo con traza_terminar (o usa traza_span con una función).
+funcion traza_iniciar(t, nombre, atributos) {
+    sea traza_id = nulo
+    sea padre = nulo
+    sea muestreado = verdadero
+    si (longitud(t["pila"]) > 0) {
+        sea arriba = t["pila"][longitud(t["pila"]) - 1]
+        traza_id = arriba["traza"]
+        padre = arriba["id"]
+        muestreado = arriba["muestreado"]
+    } sino {
+        si (t["padre_remoto"] != nulo) {
+            traza_id = t["padre_remoto"]["traza"]
+            padre = t["padre_remoto"]["span"]
+            muestreado = t["padre_remoto"]["muestreado"]
+        } sino {
+            traza_id = _tz_hex(16)
+            muestreado = aleatorio() < t["muestreo"]
+        }
+    }
+    sea s = {"traza": traza_id, "id": _tz_hex(8), "padre": padre, "nombre": nombre, "inicio": _tz_ahora(t), "fin": nulo, "atributos": {}, "eventos": [], "estado": "sin_definir", "mensaje": nulo, "muestreado": muestreado}
+    si (atributos != nulo) { para k en claves(atributos) { s["atributos"][k] = atributos[k] } }
+    t["pila"].agregar(s)
+    retornar s
+}
+
+funcion traza_atributo(s, clave, valor) { s["atributos"][clave] = valor  retornar s }
+
+funcion traza_evento(s, nombre, atributos, t) {
+    sea ms = cfv_fecha_ahora_ms()
+    si (t != nulo) { ms = _tz_ahora(t) }
+    s["eventos"].agregar({"nombre": nombre, "ms": ms, "atributos": atributos ?? {}})
+    retornar s
+}
+
+/// estado: "ok" o "error" (con mensaje).
+funcion traza_estado(s, estado, mensaje) {
+    s["estado"] = estado
+    s["mensaje"] = mensaje
+    retornar s
+}
+
+funcion traza_terminar(t, s) {
+    s["fin"] = _tz_ahora(t)
+    sea nueva = []
+    para x en t["pila"] { si (x["id"] != s["id"]) { nueva.agregar(x) } }
+    t["pila"] = nueva
+    si (s["muestreado"]) { t["terminados"].agregar(s) }
+    retornar s
+}
+
+/// Ejecuta f(span) dentro de un span; un error lo marca y se relanza.
+funcion traza_span(t, nombre, f, atributos) {
+    sea s = traza_iniciar(t, nombre, atributos)
+    sea r = nulo
+    intentar { r = f(s) } capturar (e) {
+        traza_estado(s, "error", "" + e)
+        traza_evento(s, "exception", {"exception.message": "" + e}, t)
+        traza_terminar(t, s)
+        lanzar e
+    }
+    si (s["estado"] == "sin_definir") { s["estado"] = "ok" }
+    traza_terminar(t, s)
+    retornar r
+}
+
+/// Cabeceras para la siguiente llamada HTTP (del span activo).
+funcion traza_propagar(t) {
+    si (longitud(t["pila"]) == 0) { retornar {} }
+    sea s = t["pila"][longitud(t["pila"]) - 1]
+    sea f = "00"
+    si (s["muestreado"]) { f = "01" }
+    retornar {"traceparent": "00-" + s["traza"] + "-" + s["id"] + "-" + f}
+}
+
+funcion traza_spans(t) { retornar t["terminados"] }
+
+funcion _tz_valor(v) {
+    si (tipo(v) == "booleano") { retornar {"boolValue": v} }
+    si (tipo(v) == "numero") {
+        si (piso(v) == v) { retornar {"intValue": "" + v} }
+        retornar {"doubleValue": v}
+    }
+    retornar {"stringValue": "" + v}
+}
+
+funcion _tz_attrs(m) {
+    sea r = []
+    para k en claves(m) { r.agregar({"key": k, "value": _tz_valor(m[k])}) }
+    retornar r
+}
+
+/// JSON en el formato OTLP/HTTP (ExportTraceServiceRequest).
+funcion traza_otlp(t) {
+    sea spans = []
+    para s en t["terminados"] {
+        sea codigo = 0
+        si (s["estado"] == "ok") { codigo = 1 }
+        si (s["estado"] == "error") { codigo = 2 }
+        sea x = {"traceId": s["traza"], "spanId": s["id"], "name": s["nombre"], "kind": 1, "startTimeUnixNano": "" + s["inicio"] + "000000", "endTimeUnixNano": "" + s["fin"] + "000000", "attributes": _tz_attrs(s["atributos"]), "status": {"code": codigo}}
+        si (s["padre"] != nulo) { x["parentSpanId"] = s["padre"] }
+        si (s["mensaje"] != nulo) { x["status"]["message"] = s["mensaje"] }
+        si (longitud(s["eventos"]) > 0) {
+            sea ev = []
+            para e en s["eventos"] { ev.agregar({"name": e["nombre"], "timeUnixNano": "" + e["ms"] + "000000", "attributes": _tz_attrs(e["atributos"])}) }
+            x["events"] = ev
+        }
+        spans.agregar(x)
+    }
+    retornar json_texto({"resourceSpans": [{"resource": {"attributes": [{"key": "service.name", "value": {"stringValue": t["servicio"]}}]}, "scopeSpans": [{"scope": {"name": "c-forge.traza"}, "spans": spans}]}]})
+}
+
+/// Árbol legible en la terminal con duraciones.
+funcion traza_texto(t) {
+    sea por_padre = {}
+    sea raices = []
+    para s en t["terminados"] {
+        si (s["padre"] == nulo) { raices.agregar(s) } sino {
+            si (tiene_clave(por_padre, s["padre"]) == falso) { por_padre[s["padre"]] = [] }
+            por_padre[s["padre"]].agregar(s)
+        }
+    }
+    // Un padre remoto (o no muestreado) también es raíz.
+    sea ids = {}
+    para s en t["terminados"] { ids[s["id"]] = verdadero }
+    para s en t["terminados"] { si (s["padre"] != nulo y tiene_clave(ids, s["padre"]) == falso) { raices.agregar(s) } }
+    sea l = []
+    sea dibujar = nulo
+    dibujar = funcion(s, prefijo) {
+        sea marca = ""
+        si (s["estado"] == "error") { marca = " ✗ " + s["mensaje"] }
+        l.agregar(prefijo + s["nombre"] + " (" + (s["fin"] - s["inicio"]) + " ms)" + marca)
+        si (tiene_clave(por_padre, s["id"])) {
+            sea hijos = ordenar(por_padre[s["id"]], funcion(a, b) { retornar a["inicio"] - b["inicio"] })
+            para h en hijos { dibujar(h, prefijo + "  ") }
+        }
+    }
+    para r en ordenar(raices, funcion(a, b) { retornar a["inicio"] - b["inicio"] }) { dibujar(r, "") }
+    retornar unir(l, "\n")
+}

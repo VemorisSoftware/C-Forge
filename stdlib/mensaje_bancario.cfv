@@ -1,0 +1,212 @@
+// stdlib/mensaje_bancario.cfv — mensajes ISO 8583 (autorizaciones de
+// tarjetas, POS, cajeros): armar y leer con mapa de bits primario y
+// secundario, campos fijos y variables (LLVAR/LLLVAR), formato ASCII y
+// definición de campos ampliable. Enmascara el PAN al mostrar. Inspirada en
+// jPOS (AGPL: solo la idea). En inglés: importar "iso8583".
+//
+//   importar "mensaje_bancario"
+//   sea m = mensaje_bancario_armar("0200", {"2": "4111111111111111", "3": "000000", "4": 12990, "11": "123", "41": "TERM0001"})
+//   sea r = mensaje_bancario_leer(m)                 // {"mti", "campos"}
+//   mensaje_bancario_texto(r)                        // con el PAN enmascarado
+//
+// Tipos: "n" numérico, "an"/"ans" texto, "b" binario (en hex); largo fijo o
+// "ll"/"lll" variable. Basado en ISO 8583:1987.
+
+sea _MB_CAMPOS = {
+    "2": ["n", "ll", 19, "PAN"], "3": ["n", 6, 0, "Código de proceso"], "4": ["n", 12, 0, "Monto"],
+    "7": ["n", 10, 0, "Fecha y hora de transmisión"], "11": ["n", 6, 0, "STAN"], "12": ["n", 6, 0, "Hora local"],
+    "13": ["n", 4, 0, "Fecha local"], "14": ["n", 4, 0, "Vencimiento"], "18": ["n", 4, 0, "Tipo de comercio (MCC)"],
+    "22": ["n", 3, 0, "Modo de entrada"], "23": ["n", 3, 0, "Número de tarjeta (PSN)"], "25": ["n", 2, 0, "Condición del POS"],
+    "32": ["n", "ll", 11, "Institución adquirente"], "35": ["z", "ll", 37, "Pista 2"], "37": ["an", 12, 0, "Referencia (RRN)"],
+    "38": ["an", 6, 0, "Código de autorización"], "39": ["an", 2, 0, "Código de respuesta"], "41": ["ans", 8, 0, "Terminal"],
+    "42": ["ans", 15, 0, "Comercio"], "43": ["ans", 40, 0, "Nombre y ubicación"], "48": ["ans", "lll", 999, "Datos adicionales"],
+    "49": ["n", 3, 0, "Moneda"], "52": ["b", 16, 0, "PIN cifrado"], "54": ["ans", "lll", 120, "Montos adicionales"],
+    "55": ["b", "lll", 999, "Datos EMV"], "60": ["ans", "lll", 999, "Privado"], "70": ["n", 3, 0, "Código de gestión de red"],
+    "90": ["n", 42, 0, "Datos originales"], "102": ["ans", "ll", 28, "Cuenta 1"], "128": ["b", 16, 0, "MAC"]
+}
+
+sea _MB_RESPUESTAS = {"00": "aprobada", "01": "llamar al emisor", "03": "comercio inválido", "05": "no aprobar", "12": "transacción inválida", "13": "monto inválido", "14": "tarjeta inválida", "30": "error de formato", "41": "tarjeta perdida", "43": "tarjeta robada", "51": "fondos insuficientes", "54": "tarjeta vencida", "55": "PIN incorrecto", "57": "transacción no permitida", "61": "excede el límite", "62": "tarjeta restringida", "65": "excede la frecuencia", "75": "demasiados intentos de PIN", "91": "emisor no disponible", "96": "falla del sistema"}
+
+/// Agrega o redefine campos: {"62": ["ans", "lll", 999, "Mi campo"]}.
+funcion mensaje_bancario_definir(campos) { para k en claves(campos) { _MB_CAMPOS["" + k] = campos[k] } }
+
+funcion _mb_def(n) {
+    si (tiene_clave(_MB_CAMPOS, "" + n) == falso) { lanzar "mensaje_bancario: el campo " + n + " no está definido (usa mensaje_bancario_definir)" }
+    retornar _MB_CAMPOS["" + n]
+}
+
+funcion _mb_validar(n, d, v) {
+    sea t = d[0]
+    si (t == "n") { para c en texto_dividir(v, "") { si (texto_indice("0123456789", c) < 0) { lanzar "mensaje_bancario: el campo " + n + " solo admite dígitos" } } }
+    si (t == "b") { para c en texto_dividir(texto_minusculas(v), "") { si (texto_indice("0123456789abcdef", c) < 0) { lanzar "mensaje_bancario: el campo " + n + " es binario (hex)" } } }
+    si (t == "an") { para c en texto_dividir(v, "") { si (texto_indice("0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz ", c) < 0) { lanzar "mensaje_bancario: el campo " + n + " es alfanumérico" } } }
+}
+
+funcion _mb_bitmap(bits) {
+    sea r = ""
+    sea i = 0
+    mientras (i < longitud(bits)) {
+        sea v = 0
+        sea k = 0
+        mientras (k < 4) {
+            v = v * 2
+            si (bits[i + k]) { v = v + 1 }
+            k = k + 1
+        }
+        r = r + subcadena("0123456789ABCDEF", v, v + 1)
+        i = i + 4
+    }
+    retornar r
+}
+
+/// Arma el mensaje (texto ASCII): MTI + mapa(s) de bits en hex + campos.
+funcion mensaje_bancario_armar(mti, campos) {
+    si (longitud("" + mti) != 4) { lanzar "mensaje_bancario: el MTI tiene 4 dígitos" }
+    sea nums = []
+    para k en claves(campos) {
+        sea n = a_numero("" + k)
+        si (n < 2 o n > 128) { lanzar "mensaje_bancario: campo fuera de rango " + k }
+        nums.agregar(n)
+    }
+    nums = ordenar(nums, funcion(a, b) { retornar a - b })
+    sea secundario = falso
+    para n en nums { si (n > 64) { secundario = verdadero } }
+    sea bits = []
+    sea i = 0
+    mientras (i < 128) { bits.agregar(falso)  i = i + 1 }
+    si (secundario) { bits[0] = verdadero }
+    para n en nums { bits[n - 1] = verdadero }
+    sea r = "" + mti + _mb_bitmap(_mb_tramo(bits, 0, 64))
+    si (secundario) { r = r + _mb_bitmap(_mb_tramo(bits, 64, 128)) }
+    para n en nums {
+        sea d = _mb_def(n)
+        sea v = "" + campos["" + n]
+        _mb_validar(n, d, v)
+        si (d[1] == "ll" o d[1] == "lll") {
+            si (longitud(v) > d[2]) { lanzar "mensaje_bancario: el campo " + n + " admite hasta " + d[2] + " caracteres" }
+            sea ancho = 2
+            si (d[1] == "lll") { ancho = 3 }
+            sea l = "" + longitud(v)
+            mientras (longitud(l) < ancho) { l = "0" + l }
+            r = r + l + v
+        } sino {
+            sea largo = d[1]
+            si (d[0] == "b") { largo = d[1] }
+            si (longitud(v) > largo) { lanzar "mensaje_bancario: el campo " + n + " mide " + largo }
+            // Numéricos se rellenan con ceros a la izquierda; textos con espacios a la derecha.
+            si (d[0] == "n") { mientras (longitud(v) < largo) { v = "0" + v } } sino { mientras (longitud(v) < largo) { v = v + " " } }
+            r = r + v
+        }
+    }
+    retornar r
+}
+
+funcion _mb_tramo(l, a, b) {
+    sea r = []
+    sea i = a
+    mientras (i < b) { r.agregar(l[i])  i = i + 1 }
+    retornar r
+}
+
+funcion _mb_bits(hex) {
+    sea r = []
+    para c en texto_dividir(texto_mayusculas(hex), "") {
+        sea v = texto_indice("0123456789ABCDEF", c)
+        si (v < 0) { lanzar "mensaje_bancario: mapa de bits inválido" }
+        r.agregar(v >= 8)  r.agregar(v % 8 >= 4)  r.agregar(v % 4 >= 2)  r.agregar(v % 2 == 1)
+    }
+    retornar r
+}
+
+/// Lee un mensaje ASCII → {"mti", "campos": {número: valor}}.
+funcion mensaje_bancario_leer(texto) {
+    sea t = "" + texto
+    si (longitud(t) < 20) { lanzar "mensaje_bancario: mensaje demasiado corto" }
+    sea mti = subcadena(t, 0, 4)
+    sea bits = _mb_bits(subcadena(t, 4, 20))
+    sea pos = 20
+    si (bits[0]) {
+        si (longitud(t) < 36) { lanzar "mensaje_bancario: falta el mapa secundario" }
+        para b en _mb_bits(subcadena(t, 20, 36)) { bits.agregar(b) }
+        pos = 36
+    }
+    sea campos = {}
+    sea n = 2
+    mientras (n <= longitud(bits)) {
+        si (bits[n - 1]) {
+            sea d = _mb_def(n)
+            sea largo = 0
+            si (d[1] == "ll" o d[1] == "lll") {
+                sea ancho = 2
+                si (d[1] == "lll") { ancho = 3 }
+                si (pos + ancho > longitud(t)) { lanzar "mensaje_bancario: mensaje truncado en el campo " + n }
+                largo = a_numero(subcadena(t, pos, pos + ancho))
+                si (largo > d[2]) { lanzar "mensaje_bancario: el campo " + n + " declara " + largo + " (máximo " + d[2] + ")" }
+                pos = pos + ancho
+            } sino { largo = d[1] }
+            si (pos + largo > longitud(t)) { lanzar "mensaje_bancario: mensaje truncado en el campo " + n }
+            sea v = subcadena(t, pos, pos + largo)
+            si (d[0] != "n" y d[0] != "b" y (d[1] != "ll" y d[1] != "lll")) {
+                mientras (texto_termina_con(v, " ")) { v = subcadena(v, 0, longitud(v) - 1) }
+            }
+            campos["" + n] = v
+            pos = pos + largo
+        }
+        n = n + 1
+    }
+    si (pos != longitud(t)) { lanzar "mensaje_bancario: sobran " + (longitud(t) - pos) + " caracteres" }
+    retornar {"mti": mti, "campos": campos}
+}
+
+/// PAN enmascarado: 411111******1111.
+funcion mensaje_bancario_enmascarar(pan) {
+    sea p = "" + pan
+    si (longitud(p) < 13) { retornar texto_repetir("*", longitud(p)) }
+    retornar subcadena(p, 0, 6) + texto_repetir("*", longitud(p) - 10) + subcadena(p, longitud(p) - 4, longitud(p))
+}
+
+/// Descripción legible (PAN y pista 2 enmascarados; PIN y EMV ocultos).
+funcion mensaje_bancario_texto(m) {
+    sea l = ["MTI " + m["mti"]]
+    sea nums = []
+    para k en claves(m["campos"]) { nums.agregar(a_numero(k)) }
+    para n en ordenar(nums, funcion(a, b) { retornar a - b }) {
+        sea v = m["campos"]["" + n]
+        si (n == 2) { v = mensaje_bancario_enmascarar(v) }
+        si (n == 35 o n == 52 o n == 55) { v = "<" + longitud(v) + " caracteres ocultos>" }
+        sea d = _mb_def(n)
+        sea extra = ""
+        si (n == 39 y tiene_clave(_MB_RESPUESTAS, v)) { extra = " (" + _MB_RESPUESTAS[v] + ")" }
+        l.agregar("  " + n + " " + d[3] + ": " + v + extra)
+    }
+    retornar unir(l, "\n")
+}
+
+/// MTI de respuesta (0200 → 0210, 0800 → 0810).
+funcion mensaje_bancario_respuesta_mti(mti) {
+    sea m = "" + mti
+    sea t = a_numero(subcadena(m, 2, 3))
+    retornar subcadena(m, 0, 2) + (t + 1) + subcadena(m, 3, 4)
+}
+
+/// Algoritmo de Luhn (dígito verificador de tarjetas).
+funcion mensaje_bancario_luhn(pan) {
+    sea s = 0
+    sea doble = falso
+    sea p = "" + pan
+    sea i = longitud(p) - 1
+    mientras (i >= 0) {
+        sea d = texto_indice("0123456789", subcadena(p, i, i + 1))
+        si (d < 0) { retornar falso }
+        si (doble) { d = d * 2  si (d > 9) { d = d - 9 } }
+        s = s + d
+        doble = doble == falso
+        i = i - 1
+    }
+    retornar longitud(p) >= 12 y s % 10 == 0
+}
+
+funcion mensaje_bancario_codigo(codigo) {
+    si (tiene_clave(_MB_RESPUESTAS, "" + codigo)) { retornar _MB_RESPUESTAS["" + codigo] }
+    retornar "desconocido"
+}
