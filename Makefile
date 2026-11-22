@@ -218,6 +218,12 @@ stdlib-check: build
 	(cd $$dir && CFORGE_STDLIB=$(CURDIR)/stdlib $(CURDIR)/$(TARGET) $(CURDIR)/tests/db/completa.cfv) | grep -q '^\[OK\]' || { echo "  ✗ tests/db/completa"; exit 1; }; \
 	rm -rf $$dir; \
 	echo "  ✓ db: SQLite (CRUD, ?N y :nombre, BLOB, transacciones anidadas, pool, inyección bloqueada)"; \
+	for b in tests/bibliotecas/*.cfv; do \
+		CFORGE_STDLIB=./stdlib ./$(TARGET) $$b | grep -q '^\[OK\]' || { echo "  ✗ $$b"; exit 1; }; \
+		CFORGE_STDLIB=./stdlib ./$(TARGET) build $$b --release -o /tmp/cforge-biblioteca >/dev/null; \
+		/tmp/cforge-biblioteca | grep -q '^\[OK\]' || { echo "  ✗ $$b (--release)"; exit 1; }; \
+	done; rm -f /tmp/cforge-biblioteca; \
+	echo "  ✓ bibliotecas del ecosistema: $$(ls tests/bibliotecas/*.cfv | wc -l | tr -d ' ') módulos (normal y --release)"; \
 	for suite in graficos juego; do \
 		CFORGE_STDLIB=./stdlib ./$(TARGET) tests/$$suite/prueba.cfv | diff -u tests/$$suite/prueba.salida - || { echo "  ✗ tests/$$suite"; exit 1; }; \
 		CFORGE_STDLIB=./stdlib ./$(TARGET) build tests/$$suite/prueba.cfv --release -o /tmp/cforge-$$suite >/dev/null; \
