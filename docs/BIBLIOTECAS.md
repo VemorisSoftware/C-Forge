@@ -6,6 +6,10 @@ la columna «Inspiración» sirve para revisar la licencia antes de portar
 (MIT, BSD, Apache, zlib: sí, conservando el aviso; GPL/LGPL: solo vía
 `bindgen`, sin copiar código).
 
+**Regla bilingüe:** cada biblioteca nace con nombre y funciones en español
+y en inglés (`importar "dinero"` / `import "money"`), con pruebas en los dos
+idiomas.
+
 Estado: ✅ ya existe en C-Forge · 🔗 se usa hoy vía `cforge bindgen`,
 `extern "npm:…"`, `importar "java"` o `importar "dotnet"` · 🛠 por construir.
 
@@ -58,7 +62,7 @@ Estado: ✅ ya existe en C-Forge · 🔗 se usa hoy vía `cforge bindgen`,
 | 43 | `modelo_db` | Esquemas y consultas limpias | Prisma, Drizzle | 🛠 |
 | 44 | `escena` | 3D sobre WebGL | Three.js | ✅ `gl` / `modelo` (básico) |
 | 45 | `cosecha` | HTML con selectores CSS | Cheerio | 🛠 |
-| 46 | `tinta` | Colores en la terminal | Chalk | ✅ `tinta` |
+| 46 | `tinta` / `ink` | Colores en la terminal | Chalk | ✅ `tinta` |
 | 47 | `matriz` | Arreglos multidimensionales | NumPy | 🛠 |
 | 48 | `planilla` | Análisis de datos tabulares | Pandas | 🛠 |
 | 49 | `api_rapida` | APIs con documentación automática | FastAPI | 🛠 |
@@ -187,7 +191,7 @@ Estado: ✅ ya existe en C-Forge · 🔗 se usa hoy vía `cforge bindgen`,
 | # | Nombre | Para qué | Inspiración | Estado |
 |---|---|---|---|---|
 | 137 | `terminal` | Apps de interfaz en terminal | Ratatui | 🛠 |
-| 138 | `progreso` | Barras de progreso | Indicatif | ✅ `progreso` |
+| 138 | `progreso` / `progress` | Barras de progreso | Indicatif | ✅ `progreso` |
 | 139 | `pregunta` | Prompts interactivos | Dialoguer | 🛠 |
 | 140 | `vigia` | Vigilar cambios en archivos | Notify | 🛠 |
 | 141 | `rastreo` | Búsqueda recursiva con comodines | Walkdir, Glob | 🛠 |
@@ -275,7 +279,7 @@ Estado: ✅ ya existe en C-Forge · 🔗 se usa hoy vía `cforge bindgen`,
 | 201 | `composicion` | Composición tipográfica de PDFs | Typst | 🛠 |
 | 202 | `conversor` | Conversión entre formatos de documento | Pandoc | 🛠 |
 | 203 | `lee_excel` | Leer .xlsx/.ods | Calamine | 🛠 |
-| 204 | `dinero` | Decimales exactos | rust_decimal | ✅ `dinero` |
+| 204 | `dinero` / `money` | Decimales exactos | rust_decimal | ✅ `dinero` |
 | 205 | `indicadores` | Análisis técnico (RSI, MACD) | TA-Lib | 🛠 |
 | 206 | `derivados` | Valoración de opciones y bonos | QuantLib | 🛠 |
 | 207 | `mensaje_bancario` | ISO 8583 y FIX | ISO 8583, FIX | 🛠 |
@@ -321,7 +325,7 @@ Estado: ✅ ya existe en C-Forge · 🔗 se usa hoy vía `cforge bindgen`,
 | 237 | `teclado` | Simular teclado y ratón | Enigo | 🛠 |
 | 238 | `recolecta` | Extracción web con sesiones | Fantoccini | 🛠 |
 | 239 | `agenda` | Cron con zonas horarias | tokio-cron | 🛠 |
-| 240 | `ident` | UUID, ULID y NanoID | uuid, ulid | ✅ `ident` |
+| 240 | `ident` / `ids` | UUID, ULID y NanoID | uuid, ulid | ✅ `ident` |
 | 241 | `telefono` | Números telefónicos | libphonenumber | 🛠 |
 | 242 | `unicode` | Normalización y ordenamiento | ICU | 🛠 |
 | 243 | `buscador` | Búsqueda full-text | Tantivy | 🛠 |
