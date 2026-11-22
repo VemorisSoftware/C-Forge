@@ -28,7 +28,7 @@ Estado: ✅ ya existe en C-Forge · 🔗 se usa hoy vía `cforge bindgen`,
 | 9 | `inercia` | Física 2D y 3D | Box2D, Bullet | ✅ `fisica2d` / `fisica3d` (básica) |
 | 10 | `fotograma` | Audio y video | FFmpeg | ✅ audio PCM/WAV · 🔗 video |
 | 11 | `marea` | Runtime asíncrono para servidores | Tokio | 🛠 |
-| 12 | `molde` | Serialización universal | Serde | 🛠 |
+| 12 | `molde` / `serde` | Serialización universal | Serde | ✅ `molde` |
 | 13 | `enjambre` | Paralelismo de datos | Rayon | 🛠 |
 | 14 | `orden` / `cli` | Argumentos de línea de comandos | Clap | ✅ `orden` |
 | 15 | `mensajero` | Cliente HTTP | Reqwest | ✅ `red` |
@@ -49,7 +49,7 @@ Estado: ✅ ya existe en C-Forge · 🔗 se usa hoy vía `cforge bindgen`,
 | 30 | `torrente` | Red asíncrona de alto tráfico | Netty | 🛠 |
 | 31 | `caja` | Colecciones avanzadas y cachés | Guava | ✅ `colecciones` · 🛠 cachés |
 | 32 | `formatos` | JSON, XML, CSV y YAML | Jackson | ✅ JSON · 🛠 resto |
-| 33 | `registro` | Registro de eventos desacoplado | SLF4J, Logback | 🛠 |
+| 33 | `registro` / `logging` | Registro de eventos desacoplado | SLF4J, Logback | ✅ `registro` |
 | 34 | `reloj` / `cron` | Tareas programadas (cron) | Quartz | ✅ `reloj` |
 | 35 | `indice` / `search` | Búsqueda de texto completo | Lucene | ✅ `indice` |
 | 36 | `prueba` | Pruebas y aserciones | JUnit | ✅ `cforge test` + `afirmar` |
@@ -64,10 +64,10 @@ Estado: ✅ ya existe en C-Forge · 🔗 se usa hoy vía `cforge bindgen`,
 | 45 | `cosecha` / `scrape` | HTML con selectores CSS | Cheerio | ✅ `cosecha` |
 | 46 | `tinta` / `ink` | Colores en la terminal | Chalk | ✅ `tinta` |
 | 47 | `matriz` / `ndarray` | Arreglos multidimensionales | NumPy | ✅ `matriz` |
-| 48 | `planilla` | Análisis de datos tabulares | Pandas | 🛠 |
+| 48 | `planilla` / `pivot` | Análisis de datos tabulares | Pandas | ✅ `planilla` |
 | 49 | `api_rapida` | APIs con documentación automática | FastAPI | 🛠 |
 | 50 | `vitrina` / `rich` | Interfaces ricas en terminal | Rich | ✅ `vitrina` |
-| 51 | `gradiente` | Tensores con autodiferenciación | PyTorch | 🛠 |
+| 51 | `gradiente` / `autograd` | Tensores con autodiferenciación | PyTorch | ✅ `gradiente` |
 
 ## Bloque 2 — Áreas
 
@@ -79,7 +79,7 @@ Estado: ✅ ya existe en C-Forge · 🔗 se usa hoy vía `cforge bindgen`,
 | 53 | `cerebro` | Ejecutar modelos entrenados | ONNX Runtime | 🔗 |
 | 54 | `algebra` | Álgebra lineal | Eigen | ✅ `matematica` (básica) · 🛠 |
 | 55 | `vision` | Visión por computadora | OpenCV | 🔗 |
-| 56 | `vela` | Machine learning ligero | Candle | 🛠 |
+| 56 | `vela` / `trees` | Machine learning ligero | Candle | ✅ `vela` |
 | 57 | `fichas` | Tokenización (BPE, WordPiece) | Tokenizers | ✅ `nlp` (básico) · 🛠 |
 | 58 | `vecindad` / `vectors` | Búsqueda vectorial | FAISS | ✅ `vecindad` |
 | 59 | `aprende` / `ml` | ML clásico | scikit-learn | ✅ `aprende` |
@@ -88,8 +88,8 @@ Estado: ✅ ya existe en C-Forge · 🔗 se usa hoy vía `cforge bindgen`,
 | 62 | `prediccion` | Entrenar y predecir | ML.NET | 🔗 `dotnet` |
 | 63 | `numerica` / `numeric` | Estadística y FFT | Math.NET | ✅ `numerica` |
 | 64 | `simbolo` / `symbolic` | Matemáticas simbólicas | SymPy | ✅ `simbolo` |
-| 65 | `estadistica` | Algoritmos estadísticos | linfa | 🛠 |
-| 66 | `hibrida` | Búsqueda vectorial + texto | Qdrant, Tantivy | 🛠 |
+| 65 | `estadistica` / `stats` | Algoritmos estadísticos | linfa | ✅ `estadistica` |
+| 66 | `hibrida` / `hybrid` | Búsqueda vectorial + texto | Qdrant, Tantivy | ✅ `hibrida` |
 
 ### B. Interfaces gráficas y diseño
 
@@ -244,7 +244,7 @@ Estado: ✅ ya existe en C-Forge · 🔗 se usa hoy vía `cforge bindgen`,
 | 176 | `cuaternion` | Álgebra lineal y transformaciones | nalgebra | ✅ `matematica` (básica) · 🛠 |
 | 177 | `astro` / `astronomy` | Órbitas y efemérides | NOVAS | ✅ `astro` |
 | 178 | `molecula` | Quimioinformática | RDKit | 🔗 |
-| 179 | `genoma` | Bioinformática | Rust-Bio | 🛠 |
+| 179 | `genoma` / `bio` | Bioinformática | Rust-Bio | ✅ `genoma` |
 | 180 | `cientifica` | Funciones especiales y EDO | GSL | 🔗 |
 | 181 | `grafos` | Grafos y rutas | petgraph | ✅ `algoritmos` (BFS, DFS, Dijkstra) · 🛠 A* |
 

@@ -1,0 +1,280 @@
+// stdlib/gradiente.cfv — diferenciación automática (modo reverso) y redes
+// neuronales pequeñas: valores que recuerdan cómo se calcularon, gradientes
+// con un solo "atras", capas densas, activaciones, pérdidas y optimizadores
+// SGD y Adam. Inspirada en micrograd / PyTorch (MIT/BSD). En inglés:
+// importar "autograd".
+//
+//   importar "gradiente"
+//   sea x = gradiente_valor(2)
+//   sea y = gradiente_suma(gradiente_mul(x, x), gradiente_mul(gradiente_valor(3), x))   // x² + 3x
+//   gradiente_atras(y)
+//   x["grad"]                                     // 7
+//
+//   sea red = gradiente_red([2, 8, 1], "tanh")
+//   gradiente_entrenar(red, X, y, {"epocas": 500, "tasa": 0.05})
+//   gradiente_predecir(red, [0.5, -1])
+
+// Identificadores únicos de nodos (globales: sobreviven entre llamadas).
+sea _GR_ID = [0]
+
+funcion gradiente_valor(v, padres, op, derivadas) {
+    retornar {"v": v, "grad": 0, "padres": padres ?? [], "derivadas": derivadas ?? [], "op": op ?? ""}
+}
+
+funcion _gr_v(x) {
+    si (tipo(x) == "numero") { retornar gradiente_valor(x) }
+    retornar x
+}
+
+funcion gradiente_suma(a, b) {
+    sea x = _gr_v(a)
+    sea y = _gr_v(b)
+    retornar gradiente_valor(x["v"] + y["v"], [x, y], "+", [1, 1])
+}
+funcion gradiente_resta(a, b) {
+    sea x = _gr_v(a)
+    sea y = _gr_v(b)
+    retornar gradiente_valor(x["v"] - y["v"], [x, y], "-", [1, -1])
+}
+funcion gradiente_mul(a, b) {
+    sea x = _gr_v(a)
+    sea y = _gr_v(b)
+    retornar gradiente_valor(x["v"] * y["v"], [x, y], "*", [y["v"], x["v"]])
+}
+funcion gradiente_div(a, b) {
+    sea x = _gr_v(a)
+    sea y = _gr_v(b)
+    retornar gradiente_valor(x["v"] / y["v"], [x, y], "/", [1 / y["v"], 0 - x["v"] / (y["v"] * y["v"])])
+}
+funcion gradiente_pot(a, n) {
+    sea x = _gr_v(a)
+    retornar gradiente_valor(potencia(x["v"], n), [x], "^", [n * potencia(x["v"], n - 1)])
+}
+funcion gradiente_exp(a) {
+    sea x = _gr_v(a)
+    sea e = exponencial(x["v"])
+    retornar gradiente_valor(e, [x], "exp", [e])
+}
+funcion gradiente_log(a) {
+    sea x = _gr_v(a)
+    retornar gradiente_valor(logaritmo(x["v"]), [x], "log", [1 / x["v"]])
+}
+funcion gradiente_tanh(a) {
+    sea x = _gr_v(a)
+    sea e = exponencial(2 * x["v"])
+    sea t = (e - 1) / (e + 1)
+    si (x["v"] > 20) { t = 1 }
+    si (x["v"] < -20) { t = -1 }
+    retornar gradiente_valor(t, [x], "tanh", [1 - t * t])
+}
+funcion gradiente_relu(a) {
+    sea x = _gr_v(a)
+    si (x["v"] > 0) { retornar gradiente_valor(x["v"], [x], "relu", [1]) }
+    retornar gradiente_valor(0, [x], "relu", [0])
+}
+funcion gradiente_sigmoide(a) {
+    sea x = _gr_v(a)
+    sea s = 1 / (1 + exponencial(0 - x["v"]))
+    retornar gradiente_valor(s, [x], "sigmoide", [s * (1 - s)])
+}
+
+/// Propaga gradientes desde y (dy/dy = 1) hacia todas sus entradas.
+funcion gradiente_atras(y) {
+    // Orden topológico iterativo.
+    sea orden = []
+    sea visto = {}
+    sea pila = [[y, falso]]
+    sea id_de = funcion(n) {
+        si (tiene_clave(n, "_id") == falso) { _GR_ID[0] = _GR_ID[0] + 1  n["_id"] = _GR_ID[0] }
+        retornar "" + n["_id"]
+    }
+    mientras (longitud(pila) > 0) {
+        sea top = pila[longitud(pila) - 1]
+        sea r = []
+        sea i = 0
+        mientras (i < longitud(pila) - 1) { r.agregar(pila[i])  i = i + 1 }
+        pila = r
+        sea n = top[0]
+        sea k = id_de(n)
+        si (top[1]) { orden.agregar(n) } sino {
+            si (tiene_clave(visto, k) == falso) {
+                visto[k] = verdadero
+                pila.agregar([n, verdadero])
+                para p en n["padres"] { si (tiene_clave(visto, id_de(p)) == falso) { pila.agregar([p, falso]) } }
+            }
+        }
+    }
+    y["grad"] = 1
+    sea j = longitud(orden) - 1
+    mientras (j >= 0) {
+        sea n = orden[j]
+        sea q = 0
+        mientras (q < longitud(n["padres"])) {
+            n["padres"][q]["grad"] = n["padres"][q]["grad"] + n["derivadas"][q] * n["grad"]
+            q = q + 1
+        }
+        j = j - 1
+    }
+    retornar y
+}
+
+// ── Redes densas ─────────────────────────────────────────────────────────
+
+funcion _gr_azar(estado) {
+    estado[0] = (estado[0] * 48271) % 2147483647
+    retornar (estado[0] - 1) / 2147483646
+}
+
+/// Red densa: tamaños [entradas, ocultas…, salidas]; activación de las
+/// capas ocultas ("tanh", "relu" o "sigmoide"); la salida es lineal (o
+/// "sigmoide" con salida = "sigmoide").
+funcion gradiente_red(tamanos, activacion, semilla, salida) {
+    sea est = [piso(absoluto(semilla ?? 42)) % 2147483646 + 1]
+    sea capas = []
+    sea c = 0
+    mientras (c < longitud(tamanos) - 1) {
+        sea n_in = tamanos[c]
+        sea n_out = tamanos[c + 1]
+        sea escala = raiz(2 / (n_in + n_out))
+        sea W = []
+        sea b = []
+        sea oo = 0
+        mientras (oo < n_out) {
+            sea fila = []
+            sea i = 0
+            mientras (i < n_in) { fila.agregar(gradiente_valor((_gr_azar(est) * 2 - 1) * escala * 1.7))  i = i + 1 }
+            W.agregar(fila)
+            b.agregar(gradiente_valor(0))
+            oo = oo + 1
+        }
+        capas.agregar({"W": W, "b": b})
+        c = c + 1
+    }
+    retornar {"capas": capas, "activacion": activacion ?? "tanh", "salida": salida ?? "lineal", "adam": nulo}
+}
+
+funcion _gr_activar(nombre, x) {
+    si (nombre == "relu") { retornar gradiente_relu(x) }
+    si (nombre == "sigmoide" o nombre == "sigmoid") { retornar gradiente_sigmoide(x) }
+    retornar gradiente_tanh(x)
+}
+
+/// Pasada hacia adelante con valores diferenciables.
+funcion gradiente_adelante(red, x) {
+    sea a = []
+    para v en x { a.agregar(_gr_v(v)) }
+    sea c = 0
+    mientras (c < longitud(red["capas"])) {
+        sea capa = red["capas"][c]
+        sea nuevo = []
+        sea oo = 0
+        mientras (oo < longitud(capa["W"])) {
+            sea s = capa["b"][oo]
+            sea i = 0
+            mientras (i < longitud(a)) { s = gradiente_suma(s, gradiente_mul(capa["W"][oo][i], a[i]))  i = i + 1 }
+            si (c < longitud(red["capas"]) - 1) { s = _gr_activar(red["activacion"], s) } sino {
+                si (red["salida"] == "sigmoide" o red["salida"] == "sigmoid") { s = gradiente_sigmoide(s) }
+            }
+            nuevo.agregar(s)
+            oo = oo + 1
+        }
+        a = nuevo
+        c = c + 1
+    }
+    retornar a
+}
+
+funcion gradiente_parametros(red) {
+    sea r = []
+    para capa en red["capas"] {
+        para fila en capa["W"] { para w en fila { r.agregar(w) } }
+        para b en capa["b"] { r.agregar(b) }
+    }
+    retornar r
+}
+
+/// Predicción (números) para una entrada.
+funcion gradiente_predecir(red, x) {
+    sea r = []
+    para v en gradiente_adelante(red, x) { r.agregar(v["v"]) }
+    si (longitud(r) == 1) { retornar r[0] }
+    retornar r
+}
+
+/// Entrena con error cuadrático medio (o entropía cruzada binaria si la
+/// salida es sigmoide). opciones: epocas (200), tasa (0.01), optimizador
+/// ("adam" | "sgd"), lote (todos). Devuelve la lista de pérdidas por época.
+funcion gradiente_entrenar(red, X, y, opciones) {
+    sea oo = opciones ?? {}
+    sea epocas = oo["epocas"] ?? (oo["epochs"] ?? 200)
+    sea tasa = oo["tasa"] ?? (oo["rate"] ?? 0.01)
+    sea opt = oo["optimizador"] ?? (oo["optimizer"] ?? "adam")
+    sea params = gradiente_parametros(red)
+    sea m = []
+    sea v = []
+    para p en params { m.agregar(0)  v.agregar(0) }
+    sea perdidas = []
+    sea t = 0
+    sea ep = 0
+    mientras (ep < epocas) {
+        para p en params { p["grad"] = 0 }
+        sea total = gradiente_valor(0)
+        sea i = 0
+        mientras (i < longitud(X)) {
+            sea salida = gradiente_adelante(red, X[i])
+            sea objetivo = y[i]
+            si (tipo(objetivo) != "lista") { objetivo = [objetivo] }
+            sea k = 0
+            mientras (k < longitud(salida)) {
+                si (red["salida"] == "sigmoide" o red["salida"] == "sigmoid") {
+                    sea pr = gradiente_suma(gradiente_mul(salida[k], 0.999998), 0.000001)
+                    sea uno_menos = gradiente_resta(1, pr)
+                    total = gradiente_resta(total, gradiente_suma(gradiente_mul(objetivo[k], gradiente_log(pr)), gradiente_mul(1 - objetivo[k], gradiente_log(uno_menos))))
+                } sino {
+                    sea d = gradiente_resta(salida[k], objetivo[k])
+                    total = gradiente_suma(total, gradiente_mul(d, d))
+                }
+                k = k + 1
+            }
+            i = i + 1
+        }
+        sea perdida = gradiente_div(total, longitud(X))
+        gradiente_atras(perdida)
+        perdidas.agregar(perdida["v"])
+        t = t + 1
+        sea q = 0
+        mientras (q < longitud(params)) {
+            sea g = params[q]["grad"]
+            si (opt == "sgd") { params[q]["v"] = params[q]["v"] - tasa * g } sino {
+                m[q] = 0.9 * m[q] + 0.1 * g
+                v[q] = 0.999 * v[q] + 0.001 * g * g
+                sea mh = m[q] / (1 - potencia(0.9, t))
+                sea vh = v[q] / (1 - potencia(0.999, t))
+                params[q]["v"] = params[q]["v"] - tasa * mh / (raiz(vh) + 0.00000001)
+            }
+            // Corta el grafo viejo para no acumular memoria.
+            params[q]["padres"] = []
+            params[q]["derivadas"] = []
+            q = q + 1
+        }
+        ep = ep + 1
+    }
+    retornar perdidas
+}
+
+/// Gradiente numérico de f (lista de números → número), para verificar.
+funcion gradiente_numerico(f, xs, h) {
+    sea paso = h ?? 0.000001
+    sea r = []
+    sea i = 0
+    mientras (i < longitud(xs)) {
+        sea a = []
+        sea b = []
+        para x en xs { a.agregar(x)  b.agregar(x) }
+        a[i] = a[i] + paso
+        b[i] = b[i] - paso
+        r.agregar((f(a) - f(b)) / (2 * paso))
+        i = i + 1
+    }
+    retornar r
+}

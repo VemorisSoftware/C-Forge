@@ -1,0 +1,537 @@
+// stdlib/molde.cfv — serialización con molde: describes la forma de tus
+// datos una vez (tipos, renombres, valores por defecto, campos que se
+// omiten, versiones con migraciones) y conviertes en ambos sentidos a
+// JSON, CSV, query strings o binario. Los errores dicen la ruta exacta
+// ("pedido.items[2].cantidad: se esperaba entero"). Inspirada en Serde
+// (MIT/Apache). En inglés: importar "serde".
+//
+//   importar "molde"
+//   sea Item = molde_registro({"sku": "texto", "cantidad": "entero"})
+//   sea Pedido = molde_registro({"id": "entero", "cliente_nombre": "texto",
+//       "items": molde_lista(Item), "nota": molde_opcional("texto")}, {"renombrar": "camel"})
+//   sea p = molde_desde_json(Pedido, "{\"id\": 1, \"clienteNombre\": \"Ana\", \"items\": []}")
+//   molde_a_json(Pedido, p)
+
+importar "paquete_bin"
+importar "json"
+
+// ── Constructores de moldes ───────────────────────────────────────────────
+
+funcion _md(tipo_) { retornar {"molde": tipo_} }
+
+funcion _md_norm(m) {
+    si (tipo(m) == "texto") {
+        sea t = m
+        sea trad = {"string": "texto", "int": "entero", "integer": "entero", "number": "numero", "float": "numero", "bool": "booleano", "boolean": "booleano", "any": "cualquiera", "date": "fecha"}
+        si (tiene_clave(trad, t)) { t = trad[t] }
+        si (t == "texto" o t == "entero" o t == "numero" o t == "booleano" o t == "cualquiera" o t == "fecha") { retornar _md(t) }
+        lanzar "molde: tipo desconocido " + m
+    }
+    si (tipo(m) == "mapa" y tiene_clave(m, "molde")) { retornar m }
+    si (tipo(m) == "mapa") { retornar molde_registro(m) }
+    lanzar "molde: molde inválido"
+}
+
+funcion molde_lista(elemento) {
+    sea m = _md("lista")
+    m["elemento"] = _md_norm(elemento)
+    retornar m
+}
+
+funcion molde_mapa(valor) {
+    sea m = _md("mapa")
+    m["valor"] = _md_norm(valor)
+    retornar m
+}
+
+funcion molde_opcional(interior) {
+    sea m = _md_norm(interior)
+    sea c = {}
+    para k en claves(m) { c[k] = m[k] }
+    c["opcional"] = verdadero
+    retornar c
+}
+
+funcion molde_defecto(interior, valor) {
+    sea c = molde_opcional(interior)
+    c["defecto"] = valor
+    c["tiene_defecto"] = verdadero
+    retornar c
+}
+
+/// Enumeración: solo se aceptan estos valores.
+funcion molde_enum(valores) {
+    sea m = _md("enum")
+    m["valores"] = valores
+    retornar m
+}
+
+/// Unión etiquetada: {"tipo": "tarjeta", ...} elige el molde según la etiqueta.
+funcion molde_union(etiqueta, variantes) {
+    sea m = _md("union")
+    m["etiqueta"] = etiqueta
+    sea v = {}
+    para k en claves(variantes) { v[k] = _md_norm(variantes[k]) }
+    m["variantes"] = v
+    retornar m
+}
+
+/// Tipo propio con funciones de ida y vuelta.
+funcion molde_propio(nombre, a_dato, desde_dato) {
+    sea m = _md("propio")
+    m["nombre"] = nombre
+    m["a"] = a_dato
+    m["desde"] = desde_dato
+    retornar m
+}
+
+/// Registro con campos. opciones: renombrar ("camel" | "pascal" | "kebab" |
+/// "mayusculas" | "snake"), estricto (rechaza campos desconocidos), version.
+/// Por campo: molde_campo(molde, {"nombre": "otroNombre", "omitir": verdadero,
+/// "omitir_si_nulo": verdadero, "alias": [...]}).
+funcion molde_registro(campos, opciones) {
+    sea m = _md("registro")
+    sea cs = []
+    para k en claves(campos) {
+        sea c = campos[k]
+        si (tipo(c) == "mapa" y tiene_clave(c, "_campo")) { cs.agregar({"nombre": k, "molde": c["molde_"], "opc": c["opc"]}) } sino { cs.agregar({"nombre": k, "molde": _md_norm(c), "opc": {}}) }
+    }
+    m["campos"] = cs
+    m["renombrar"] = nulo
+    m["estricto"] = falso
+    si (opciones != nulo) {
+        si (tiene_clave(opciones, "renombrar")) { m["renombrar"] = opciones["renombrar"] }
+        si (tiene_clave(opciones, "rename")) { m["renombrar"] = opciones["rename"] }
+        si (tiene_clave(opciones, "estricto")) { m["estricto"] = opciones["estricto"] }
+        si (tiene_clave(opciones, "strict")) { m["estricto"] = opciones["strict"] }
+    }
+    retornar m
+}
+
+funcion molde_campo(molde_, opciones) {
+    retornar {"_campo": verdadero, "molde_": _md_norm(molde_), "opc": opciones ?? {}}
+}
+
+// ── Renombres ─────────────────────────────────────────────────────────────
+
+funcion _md_partes(nombre) {
+    sea r = []
+    sea actual = ""
+    sea cs = texto_dividir(nombre, "")
+    sea i = 0
+    mientras (i < longitud(cs)) {
+        sea c = cs[i]
+        sea b = byte_en(c, 0)
+        si (c == "_" o c == "-" o c == " ") {
+            si (actual != "") { r.agregar(actual)  actual = "" }
+        } sino {
+            si (b >= 65 y b <= 90 y actual != "") {
+                sea ant = byte_en(cs[i - 1], 0)
+                sea sig_min = falso
+                si (i + 1 < longitud(cs)) { sig_min = byte_en(cs[i + 1], 0) >= 97 y byte_en(cs[i + 1], 0) <= 122 }
+                si ((ant >= 97 y ant <= 122) o (ant >= 48 y ant <= 57) o sig_min) { r.agregar(actual)  actual = "" }
+            }
+            actual = actual + texto_minusculas(c)
+        }
+        i = i + 1
+    }
+    si (actual != "") { r.agregar(actual) }
+    retornar r
+}
+
+funcion _md_cap(p) { retornar texto_mayusculas(subcadena(p, 0, 1)) + subcadena(p, 1, longitud(p)) }
+
+/// Convierte un nombre al estilo pedido.
+funcion molde_renombrar(nombre, estilo) {
+    sea p = _md_partes(nombre)
+    si (estilo == nulo o estilo == "snake") { retornar unir(p, "_") }
+    si (estilo == "kebab") { retornar unir(p, "-") }
+    si (estilo == "mayusculas" o estilo == "upper") { retornar texto_mayusculas(unir(p, "_")) }
+    sea r = ""
+    sea i = 0
+    mientras (i < longitud(p)) {
+        si (i == 0 y estilo == "camel") { r = r + p[i] } sino { r = r + _md_cap(p[i]) }
+        i = i + 1
+    }
+    si (estilo == "camel" o estilo == "pascal") { retornar r }
+    lanzar "molde: estilo de nombre desconocido " + estilo
+}
+
+funcion _md_externo(m, c) {
+    si (tiene_clave(c["opc"], "nombre")) { retornar c["opc"]["nombre"] }
+    si (m["renombrar"] == nulo) { retornar c["nombre"] }
+    retornar molde_renombrar(c["nombre"], m["renombrar"])
+}
+
+// ── Ida: dato interno → dato serializable ────────────────────────────────
+
+funcion _md_err(ruta, msg) { lanzar "molde: " + ruta + ": " + msg }
+
+funcion _md_hijo(ruta, k) {
+    si (ruta == "") { retornar k }
+    retornar ruta + "." + k
+}
+
+funcion _md_a(m, v, ruta) {
+    si (v == nulo) {
+        si (m["opcional"] ?? falso) { retornar nulo }
+        _md_err(ruta, "falta el valor")
+    }
+    sea t = m["molde"]
+    si (t == "cualquiera") { retornar v }
+    si (t == "propio") { retornar m["a"](v) }
+    si (t == "fecha") {
+        si (tipo(v) == "numero") { retornar v }
+        retornar "" + v
+    }
+    si (t == "lista") {
+        si (tipo(v) != "lista") { _md_err(ruta, "se esperaba lista") }
+        sea r = []
+        sea i = 0
+        mientras (i < longitud(v)) { r.agregar(_md_a(m["elemento"], v[i], ruta + "[" + i + "]"))  i = i + 1 }
+        retornar r
+    }
+    si (t == "mapa") {
+        si (tipo(v) != "mapa") { _md_err(ruta, "se esperaba mapa") }
+        sea r = {}
+        para k en claves(v) { r[k] = _md_a(m["valor"], v[k], _md_hijo(ruta, k)) }
+        retornar r
+    }
+    si (t == "union") {
+        sea e = v[m["etiqueta"]] ?? nulo
+        si (e == nulo o tiene_clave(m["variantes"], "" + e) == falso) { _md_err(ruta, "variante desconocida " + e) }
+        sea r = _md_a(m["variantes"]["" + e], v, ruta)
+        r[m["etiqueta"]] = e
+        retornar r
+    }
+    si (t == "registro") {
+        si (tipo(v) != "mapa") { _md_err(ruta, "se esperaba registro") }
+        sea r = {}
+        para c en m["campos"] {
+            si ((c["opc"]["omitir"] ?? falso) == falso) {
+                sea x = v[c["nombre"]] ?? nulo
+                si (x == nulo y (c["molde"]["tiene_defecto"] ?? falso)) { x = c["molde"]["defecto"] }
+                sea s = _md_a(c["molde"], x, _md_hijo(ruta, c["nombre"]))
+                si (s != nulo o (c["opc"]["omitir_si_nulo"] ?? falso) == falso) { r[_md_externo(m, c)] = s }
+            }
+        }
+        retornar r
+    }
+    retornar _md_comprobar(m, v, ruta)
+}
+
+funcion _md_comprobar(m, v, ruta) {
+    sea t = m["molde"]
+    si (t == "texto") {
+        si (tipo(v) != "texto") { _md_err(ruta, "se esperaba texto") }
+        retornar v
+    }
+    si (t == "entero") {
+        si (tipo(v) != "numero" o piso(v) != v) { _md_err(ruta, "se esperaba entero") }
+        retornar v
+    }
+    si (t == "numero") {
+        si (tipo(v) != "numero") { _md_err(ruta, "se esperaba número") }
+        retornar v
+    }
+    si (t == "booleano") {
+        si (v != verdadero y v != falso) { _md_err(ruta, "se esperaba booleano") }
+        retornar v
+    }
+    si (t == "enum") {
+        para x en m["valores"] { si (x == v) { retornar v } }
+        _md_err(ruta, "valor no permitido " + v)
+    }
+    _md_err(ruta, "molde desconocido " + t)
+}
+
+// ── Vuelta: dato serializado → dato interno ──────────────────────────────
+
+funcion _md_coercer(m, v, ruta, laxo) {
+    sea t = m["molde"]
+    si (laxo y tipo(v) == "texto") {
+        si (t == "entero" o t == "numero") {
+            sea n = nulo
+            intentar { n = a_numero(texto_recortar(v)) } capturar (e) { _md_err(ruta, "se esperaba número, llegó \"" + v + "\"") }
+            retornar _md_comprobar(m, n, ruta)
+        }
+        si (t == "booleano") {
+            sea x = texto_minusculas(texto_recortar(v))
+            si (x == "true" o x == "verdadero" o x == "1" o x == "si" o x == "sí") { retornar verdadero }
+            si (x == "false" o x == "falso" o x == "0" o x == "no" o x == "") { retornar falso }
+            _md_err(ruta, "se esperaba booleano, llegó \"" + v + "\"")
+        }
+    }
+    retornar _md_comprobar(m, v, ruta)
+}
+
+funcion _md_desde(m, v, ruta, laxo) {
+    si (laxo y v == nulo y m["molde"] == "lista" y (m["tiene_defecto"] ?? falso) == falso) { retornar [] }
+    si (v == nulo o (laxo y v == "" y m["molde"] != "texto")) {
+        si (m["tiene_defecto"] ?? falso) { retornar m["defecto"] }
+        si (m["opcional"] ?? falso) { retornar nulo }
+        _md_err(ruta, "falta el valor")
+    }
+    sea t = m["molde"]
+    si (t == "cualquiera") { retornar v }
+    si (t == "propio") {
+        sea r = nulo
+        intentar { r = m["desde"](v) } capturar (e) { _md_err(ruta, "" + e) }
+        retornar r
+    }
+    si (t == "fecha") { retornar v }
+    si (t == "lista") {
+        si (tipo(v) != "lista") { _md_err(ruta, "se esperaba lista") }
+        sea r = []
+        sea i = 0
+        mientras (i < longitud(v)) { r.agregar(_md_desde(m["elemento"], v[i], ruta + "[" + i + "]", laxo))  i = i + 1 }
+        retornar r
+    }
+    si (t == "mapa") {
+        si (tipo(v) != "mapa") { _md_err(ruta, "se esperaba mapa") }
+        sea r = {}
+        para k en claves(v) { r[k] = _md_desde(m["valor"], v[k], _md_hijo(ruta, k), laxo) }
+        retornar r
+    }
+    si (t == "union") {
+        si (tipo(v) != "mapa") { _md_err(ruta, "se esperaba registro") }
+        sea e = v[m["etiqueta"]] ?? nulo
+        si (e == nulo o tiene_clave(m["variantes"], "" + e) == falso) { _md_err(ruta, "variante desconocida " + e) }
+        sea r = _md_desde(m["variantes"]["" + e], v, ruta, laxo)
+        r[m["etiqueta"]] = e
+        retornar r
+    }
+    si (t == "registro") {
+        si (tipo(v) != "mapa") { _md_err(ruta, "se esperaba registro") }
+        sea r = {}
+        sea conocidos = {}
+        para c en m["campos"] {
+            sea ext = _md_externo(m, c)
+            conocidos[ext] = verdadero
+            sea x = nulo
+            si (tiene_clave(v, ext)) { x = v[ext] } sino {
+                para a en (c["opc"]["alias"] ?? []) {
+                    conocidos[a] = verdadero
+                    si (x == nulo y tiene_clave(v, a)) { x = v[a] }
+                }
+            }
+            si ((c["opc"]["omitir"] ?? falso) y x == nulo) {
+                si (c["molde"]["tiene_defecto"] ?? falso) { r[c["nombre"]] = c["molde"]["defecto"] } sino { r[c["nombre"]] = nulo }
+            } sino {
+                r[c["nombre"]] = _md_desde(c["molde"], x, _md_hijo(ruta, ext), laxo)
+            }
+        }
+        si (m["estricto"]) {
+            para k en claves(v) { si (tiene_clave(conocidos, k) == falso) { _md_err(_md_hijo(ruta, k), "campo desconocido") } }
+        }
+        retornar r
+    }
+    retornar _md_coercer(m, v, ruta, laxo)
+}
+
+// ── API pública ───────────────────────────────────────────────────────────
+
+/// Valida y convierte a la forma externa (con renombres) sin serializar.
+funcion molde_a_dato(m, v) { retornar _md_a(_md_norm(m), v, "") }
+
+/// Desde la forma externa (ya parseada) a la interna, validando.
+funcion molde_desde_dato(m, d) { retornar _md_desde(_md_norm(m), d, "", falso) }
+
+funcion molde_a_json(m, v, con_sangria) {
+    sea d = molde_a_dato(m, v)
+    si (con_sangria == verdadero) { retornar json_bonito(d) }
+    retornar json_texto(d)
+}
+
+funcion molde_desde_json(m, texto) {
+    sea d = nulo
+    intentar { d = json_parsear(texto) } capturar (e) { lanzar "molde: JSON inválido: " + e }
+    retornar molde_desde_dato(m, d)
+}
+
+/// ¿Valida? Devuelve {"ok": verdadero} o {"ok": falso, "error": "…"}.
+funcion molde_validar(m, v) {
+    sea r = {"ok": verdadero}
+    intentar { molde_a_dato(m, v) } capturar (e) { r = {"ok": falso, "error": "" + e} }
+    retornar r
+}
+
+funcion _md_csv_campo(s) {
+    si (texto_indice(s, ",") >= 0 o texto_indice(s, "\"") >= 0 o texto_indice(s, "\n") >= 0) { retornar "\"" + texto_reemplazar(s, "\"", "\"\"") + "\"" }
+    retornar s
+}
+
+funcion _md_csv_filas(texto) {
+    sea filas = []
+    sea fila = []
+    sea campo = ""
+    sea comillas = falso
+    sea i = 0
+    sea n = longitud(texto)
+    mientras (i < n) {
+        sea c = subcadena(texto, i, i + 1)
+        si (comillas) {
+            si (c == "\"") {
+                si (i + 1 < n y subcadena(texto, i + 1, i + 2) == "\"") { campo = campo + "\""  i = i + 1 } sino { comillas = falso }
+            } sino { campo = campo + c }
+        } sino {
+            si (c == "\"") { comillas = verdadero } sino {
+                si (c == ",") { fila.agregar(campo)  campo = "" } sino {
+                    si (c == "\n") {
+                        fila.agregar(campo)
+                        filas.agregar(fila)
+                        fila = []
+                        campo = ""
+                    } sino { si (c != "\r") { campo = campo + c } }
+                }
+            }
+        }
+        i = i + 1
+    }
+    si (campo != "" o longitud(fila) > 0) { fila.agregar(campo)  filas.agregar(fila) }
+    retornar filas
+}
+
+/// Lista de registros → CSV (los campos anidados van como JSON).
+funcion molde_a_csv(m, lista) {
+    sea mm = _md_norm(m)
+    si (mm["molde"] != "registro") { lanzar "molde: CSV necesita un molde de registro" }
+    sea cab = []
+    para c en mm["campos"] { si ((c["opc"]["omitir"] ?? falso) == falso) { cab.agregar(_md_externo(mm, c)) } }
+    sea l = [unir(cab, ",")]
+    sea i = 0
+    mientras (i < longitud(lista)) {
+        sea d = _md_a(mm, lista[i], "[" + i + "]")
+        sea partes = []
+        para k en cab {
+            sea x = d[k] ?? nulo
+            si (x == nulo) { partes.agregar("") } sino {
+                si (tipo(x) == "texto") { partes.agregar(_md_csv_campo(x)) } sino { partes.agregar(_md_csv_campo(json_texto(x))) }
+            }
+        }
+        l.agregar(unir(partes, ","))
+        i = i + 1
+    }
+    retornar unir(l, "\n") + "\n"
+}
+
+/// CSV → lista de registros validados (convierte textos a números/booleanos;
+/// las celdas de listas o registros se leen como JSON).
+funcion molde_desde_csv(m, texto) {
+    sea mm = _md_norm(m)
+    si (mm["molde"] != "registro") { lanzar "molde: CSV necesita un molde de registro" }
+    sea filas = _md_csv_filas("" + texto)
+    si (longitud(filas) == 0) { retornar [] }
+    sea cab = filas[0]
+    sea tipos = {}
+    para c en mm["campos"] { tipos[_md_externo(mm, c)] = c["molde"]["molde"] }
+    sea r = []
+    sea i = 1
+    mientras (i < longitud(filas)) {
+        sea d = {}
+        sea j = 0
+        mientras (j < longitud(cab)) {
+            sea x = filas[i][j] ?? ""
+            sea t = tipos[cab[j]] ?? "texto"
+            si ((t == "lista" o t == "mapa" o t == "registro" o t == "union") y x != "") {
+                intentar { x = json_parsear(x) } capturar (e) { _md_err("fila " + (i + 1) + "." + cab[j], "JSON inválido") }
+            }
+            si (x == "" y t != "texto") { x = nulo }
+            d[cab[j]] = x
+            j = j + 1
+        }
+        r.agregar(_md_desde(mm, d, "fila " + (i + 1), verdadero))
+        i = i + 1
+    }
+    retornar r
+}
+
+funcion _md_url_cod(s) {
+    sea r = ""
+    sea i = 0
+    mientras (i < longitud(s)) {
+        sea b = byte_en(s, i)
+        si ((b >= 48 y b <= 57) o (b >= 65 y b <= 90) o (b >= 97 y b <= 122) o b == 45 o b == 46 o b == 95 o b == 126) { r = r + caracter(b) } sino {
+            sea h = "0123456789ABCDEF"
+            r = r + "%" + subcadena(h, piso(b / 16), piso(b / 16) + 1) + subcadena(h, b % 16, b % 16 + 1)
+        }
+        i = i + 1
+    }
+    retornar r
+}
+
+funcion _md_url_dec(s) {
+    sea t = texto_reemplazar(s, "+", " ")
+    sea hex = ""
+    sea r = ""
+    sea i = 0
+    mientras (i < longitud(t)) {
+        sea b = byte_en(t, i)
+        si (b == 37 y i + 2 < longitud(t) + 1) {
+            hex = hex + subcadena(t, i + 1, i + 3)
+            i = i + 3
+        } sino {
+            si (hex != "") { r = r + bytes_de_hex(hex)  hex = "" }
+            r = r + subcadena(t, i, i + 1)
+            i = i + 1
+        }
+    }
+    si (hex != "") { r = r + bytes_de_hex(hex) }
+    retornar r
+}
+
+/// Registro plano → query string ("a=1&b=hola%20mundo"); las listas repiten la clave.
+funcion molde_a_query(m, v) {
+    sea d = molde_a_dato(m, v)
+    sea partes = []
+    para k en claves(d) {
+        sea x = d[k]
+        si (x != nulo) {
+            si (tipo(x) == "lista") { para e en x { partes.agregar(_md_url_cod(k) + "=" + _md_url_cod("" + e)) } } sino { partes.agregar(_md_url_cod(k) + "=" + _md_url_cod("" + x)) }
+        }
+    }
+    retornar unir(partes, "&")
+}
+
+funcion molde_desde_query(m, texto) {
+    sea mm = _md_norm(m)
+    sea t = "" + texto
+    si (texto_empieza_con(t, "?")) { t = subcadena(t, 1, longitud(t)) }
+    sea listas = {}
+    para c en mm["campos"] { si (c["molde"]["molde"] == "lista") { listas[_md_externo(mm, c)] = verdadero } }
+    sea d = {}
+    para par en texto_dividir(t, "&") {
+        si (par != "") {
+            sea i = texto_indice(par, "=")
+            sea k = par
+            sea v = ""
+            si (i >= 0) { k = subcadena(par, 0, i)  v = subcadena(par, i + 1, longitud(par)) }
+            k = _md_url_dec(k)
+            v = _md_url_dec(v)
+            si (tiene_clave(listas, k)) {
+                si (tiene_clave(d, k) == falso) { d[k] = [] }
+                d[k].agregar(v)
+            } sino { d[k] = v }
+        }
+    }
+    retornar _md_desde(mm, d, "", verdadero)
+}
+
+/// Binario compacto (formato de "paquete_bin", tipo MessagePack).
+funcion molde_a_binario(m, v) { retornar paquete_codificar(molde_a_dato(m, v)) }
+funcion molde_desde_binario(m, b) { retornar molde_desde_dato(m, paquete_decodificar(b)) }
+
+/// Versionado: lee datos de versiones viejas aplicando migraciones en orden.
+/// migraciones: lista de funciones (v1→v2, v2→v3, …); el dato trae "version".
+funcion molde_migrar(m, dato, migraciones, campo_version) {
+    sea cv = campo_version ?? "version"
+    sea d = dato
+    sea ver = d[cv] ?? 1
+    mientras (ver <= longitud(migraciones)) {
+        d = migraciones[ver - 1](d)
+        ver = ver + 1
+        d[cv] = ver
+    }
+    sea r = molde_desde_dato(m, d)
+    retornar r
+}

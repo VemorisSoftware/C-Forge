@@ -1,0 +1,407 @@
+// stdlib/planilla.cfv — análisis tabular avanzado sobre las tablas de
+// "tabla": tablas dinámicas (pivote), derretir (melt), tablas cruzadas,
+// ventanas móviles, acumulados, cambio porcentual, rangos, rellenar nulos,
+// quitar duplicados y agregaciones con mediana, desviación y cuantiles.
+// Inspirada en Pandas (BSD). En inglés: importar "pivot".
+//
+//   importar "tabla"
+//   importar "planilla"
+//   sea p = planilla_pivote(t, "region", "mes", "monto", "suma", 0)
+//   sea m = planilla_movil(t, "monto", 3, "media", "media_3")
+//   sea largo = planilla_derretir(p, ["region"], nulo, "mes", "monto")
+
+importar "tabla"
+
+funcion _pl_num(v) { retornar v != nulo y tipo(v) == "numero" }
+
+funcion _pl_cmp(a, b) {
+    si (a == nulo y b == nulo) { retornar 0 }
+    si (a == nulo) { retornar 1 }
+    si (b == nulo) { retornar -1 }
+    si (tipo(a) == "numero" y tipo(b) == "numero") {
+        si (a < b) { retornar -1 }
+        si (a > b) { retornar 1 }
+        retornar 0
+    }
+    sea x = "" + a
+    sea y_ = "" + b
+    si (x < y_) { retornar -1 }
+    si (x > y_) { retornar 1 }
+    retornar 0
+}
+
+funcion _pl_cuantil(nums, q) {
+    si (longitud(nums) == 0) { retornar nulo }
+    sea s = ordenar(nums, funcion(a, b) { retornar a - b })
+    sea h = (longitud(s) - 1) * q
+    sea i = piso(h)
+    si (i + 1 >= longitud(s)) { retornar s[longitud(s) - 1] }
+    retornar s[i] + (h - i) * (s[i + 1] - s[i])
+}
+
+/// Agrega una lista de valores. op: suma, media, cuenta, min, max, mediana,
+/// desv (muestral), var, primero, ultimo, unicos, producto, "q0.9" (cuantil).
+funcion planilla_agregar(valores, op) {
+    sea nums = []
+    para v en valores { si (v != nulo) { nums.agregar(v) } }
+    sea o = op
+    sea trad = {"sum": "suma", "mean": "media", "count": "cuenta", "median": "mediana", "std": "desv", "first": "primero", "last": "ultimo", "nunique": "unicos", "prod": "producto"}
+    si (tiene_clave(trad, o)) { o = trad[o] }
+    si (o == "cuenta") { retornar longitud(nums) }
+    si (o == "unicos") {
+        sea vistos = {}
+        para v en nums { vistos["" + v] = verdadero }
+        retornar longitud(claves(vistos))
+    }
+    si (longitud(nums) == 0) { retornar nulo }
+    si (o == "primero") { retornar nums[0] }
+    si (o == "ultimo") { retornar nums[longitud(nums) - 1] }
+    si (o == "min" o o == "max") {
+        sea m = nums[0]
+        para v en nums {
+            si (o == "min" y _pl_cmp(v, m) < 0) { m = v }
+            si (o == "max" y _pl_cmp(v, m) > 0) { m = v }
+        }
+        retornar m
+    }
+    sea s = 0
+    para v en nums { s = s + v }
+    si (o == "suma") { retornar s }
+    si (o == "media") { retornar s / longitud(nums) }
+    si (o == "producto") {
+        sea p = 1
+        para v en nums { p = p * v }
+        retornar p
+    }
+    si (o == "mediana") { retornar _pl_cuantil(nums, 0.5) }
+    si (texto_empieza_con(o, "q")) { retornar _pl_cuantil(nums, a_numero(subcadena(o, 1, longitud(o)))) }
+    si (o == "var" o o == "desv") {
+        si (longitud(nums) < 2) { retornar nulo }
+        sea m = s / longitud(nums)
+        sea q = 0
+        para v en nums { q = q + (v - m) * (v - m) }
+        sea var = q / (longitud(nums) - 1)
+        si (o == "var") { retornar var }
+        retornar raiz(var)
+    }
+    lanzar "planilla: agregación desconocida " + op
+}
+
+funcion _pl_unicos(t, c) {
+    sea r = []
+    sea vistos = {}
+    para f en t["filas"] {
+        sea k = "" + f[c]
+        si (tiene_clave(vistos, k) == falso) { vistos[k] = verdadero  r.agregar(f[c]) }
+    }
+    retornar ordenar(r, _pl_cmp)
+}
+
+/// Tabla dinámica: una fila por valor de `filas`, una columna por valor de
+/// `columnas`, celdas = agregación de `valor`. relleno para celdas vacías.
+funcion planilla_pivote(t, filas, columnas, valor, op, relleno) {
+    sea vf = _pl_unicos(t, filas)
+    sea vc = _pl_unicos(t, columnas)
+    sea celdas = {}
+    para f en t["filas"] {
+        sea k = "" + f[filas] + "\u0001" + f[columnas]
+        si (tiene_clave(celdas, k) == falso) { celdas[k] = [] }
+        celdas[k].agregar(f[valor])
+    }
+    sea cols = [filas]
+    para c en vc { cols.agregar("" + c) }
+    sea r = []
+    para a en vf {
+        sea fila = {}
+        fila[filas] = a
+        para c en vc {
+            sea k = "" + a + "\u0001" + c
+            si (tiene_clave(celdas, k)) { fila["" + c] = planilla_agregar(celdas[k], op ?? "suma") } sino { fila["" + c] = relleno }
+        }
+        r.agregar(fila)
+    }
+    retornar {"columnas": cols, "filas": r}
+}
+
+/// Formato ancho → largo. ids: columnas que se conservan; valores: columnas
+/// a derretir (nulo = todas las demás).
+funcion planilla_derretir(t, ids, valores, nombre_var, nombre_valor) {
+    sea nv = nombre_var ?? "variable"
+    sea nval = nombre_valor ?? "valor"
+    sea vs = valores
+    si (vs == nulo) {
+        vs = []
+        para c en t["columnas"] {
+            sea es_id = falso
+            para i en ids { si (i == c) { es_id = verdadero } }
+            si (es_id == falso) { vs.agregar(c) }
+        }
+    }
+    sea r = []
+    para f en t["filas"] {
+        para c en vs {
+            sea g = {}
+            para i en ids { g[i] = f[i] }
+            g[nv] = c
+            g[nval] = f[c] ?? nulo
+            r.agregar(g)
+        }
+    }
+    sea cols = []
+    para i en ids { cols.agregar(i) }
+    cols.agregar(nv)
+    cols.agregar(nval)
+    retornar {"columnas": cols, "filas": r}
+}
+
+/// Tabla cruzada de frecuencias (con totales si totales = verdadero).
+funcion planilla_cruzada(t, a, b, totales) {
+    sea p = planilla_pivote(t, a, b, a, "cuenta", 0)
+    si (totales != verdadero) { retornar p }
+    p["columnas"].agregar("total")
+    sea suma_col = {}
+    para f en p["filas"] {
+        sea s = 0
+        para c en p["columnas"] {
+            si (c != a y c != "total") {
+                s = s + f[c]
+                suma_col[c] = (suma_col[c] ?? 0) + f[c]
+            }
+        }
+        f["total"] = s
+    }
+    sea tot = {}
+    tot[a] = "total"
+    sea g = 0
+    para c en p["columnas"] { si (c != a y c != "total") { tot[c] = suma_col[c] ?? 0  g = g + tot[c] } }
+    tot["total"] = g
+    p["filas"].agregar(tot)
+    retornar p
+}
+
+funcion _pl_copiar(t) {
+    sea r = []
+    para f en t["filas"] {
+        sea g = {}
+        para k en claves(f) { g[k] = f[k] }
+        r.agregar(g)
+    }
+    sea cols = []
+    para c en t["columnas"] { cols.agregar(c) }
+    retornar {"columnas": cols, "filas": r}
+}
+
+funcion _pl_con_col(t, nombre) {
+    sea esta = falso
+    para c en t["columnas"] { si (c == nombre) { esta = verdadero } }
+    si (esta == falso) { t["columnas"].agregar(nombre) }
+}
+
+/// Ventana móvil de n filas (hacia atrás). Las primeras n-1 quedan en nulo
+/// salvo que min_filas (opcional) sea menor.
+funcion planilla_movil(t, columna, n, op, nueva, min_filas) {
+    sea r = _pl_copiar(t)
+    sea nombre = nueva ?? (columna + "_" + op + "_" + n)
+    sea minf = min_filas ?? n
+    _pl_con_col(r, nombre)
+    sea i = 0
+    mientras (i < longitud(r["filas"])) {
+        sea vals = []
+        sea j = maximo(0, i - n + 1)
+        mientras (j <= i) { vals.agregar(t["filas"][j][columna])  j = j + 1 }
+        si (longitud(vals) >= minf) { r["filas"][i][nombre] = planilla_agregar(vals, op) } sino { r["filas"][i][nombre] = nulo }
+        i = i + 1
+    }
+    retornar r
+}
+
+/// Acumulado: op "suma" | "producto" | "max" | "min" | "cuenta". Por grupo opcional.
+funcion planilla_acumulado(t, columna, op, nueva, grupo) {
+    sea r = _pl_copiar(t)
+    sea nombre = nueva ?? (columna + "_acum")
+    _pl_con_col(r, nombre)
+    sea estado = {}
+    para f en r["filas"] {
+        sea g = "_"
+        si (grupo != nulo) { g = "" + f[grupo] }
+        sea v = f[columna]
+        sea a = estado[g] ?? nulo
+        si (v != nulo) {
+            si (a == nulo) {
+                si (op == "cuenta" o op == "count") { a = 1 } sino { a = v }
+            } sino {
+                si (op == "suma" o op == "sum") { a = a + v }
+                si (op == "producto" o op == "prod") { a = a * v }
+                si (op == "max") { a = maximo(a, v) }
+                si (op == "min") { a = minimo(a, v) }
+                si (op == "cuenta" o op == "count") { a = a + 1 }
+            }
+        }
+        estado[g] = a
+        f[nombre] = a
+    }
+    retornar r
+}
+
+/// Cambio porcentual respecto de la fila `periodos` atrás (1 por defecto).
+funcion planilla_cambio(t, columna, nueva, periodos) {
+    sea r = _pl_copiar(t)
+    sea nombre = nueva ?? (columna + "_cambio")
+    sea p = periodos ?? 1
+    _pl_con_col(r, nombre)
+    sea i = 0
+    mientras (i < longitud(r["filas"])) {
+        sea v = nulo
+        si (i >= p) {
+            sea a = t["filas"][i - p][columna]
+            sea b = t["filas"][i][columna]
+            si (_pl_num(a) y _pl_num(b) y a != 0) { v = (b - a) / a }
+        }
+        r["filas"][i][nombre] = v
+        i = i + 1
+    }
+    retornar r
+}
+
+/// Desplaza una columna n filas (n > 0 hacia abajo, como shift de Pandas).
+funcion planilla_desplazar(t, columna, n, nueva) {
+    sea r = _pl_copiar(t)
+    sea nombre = nueva ?? (columna + "_desp")
+    _pl_con_col(r, nombre)
+    sea total = longitud(r["filas"])
+    sea i = 0
+    mientras (i < total) {
+        sea j = i - n
+        si (j >= 0 y j < total) { r["filas"][i][nombre] = t["filas"][j][columna] } sino { r["filas"][i][nombre] = nulo }
+        i = i + 1
+    }
+    retornar r
+}
+
+/// Rango (1 = menor). metodo: "promedio" (empates promediados), "min", "denso", "orden".
+funcion planilla_rango(t, columna, nueva, descendente, metodo) {
+    sea r = _pl_copiar(t)
+    sea nombre = nueva ?? (columna + "_rango")
+    sea m = metodo ?? "promedio"
+    _pl_con_col(r, nombre)
+    sea idx = []
+    sea i = 0
+    mientras (i < longitud(r["filas"])) { si (r["filas"][i][columna] != nulo) { idx.agregar(i) }  i = i + 1 }
+    idx = ordenar(idx, funcion(a, b) {
+        sea c = _pl_cmp(r["filas"][a][columna], r["filas"][b][columna])
+        si (descendente == verdadero) { retornar -c }
+        retornar c
+    })
+    para f en r["filas"] { f[nombre] = nulo }
+    sea k = 0
+    sea denso = 0
+    mientras (k < longitud(idx)) {
+        sea j = k
+        mientras (j + 1 < longitud(idx) y _pl_cmp(r["filas"][idx[j + 1]][columna], r["filas"][idx[k]][columna]) == 0) { j = j + 1 }
+        denso = denso + 1
+        sea q = k
+        mientras (q <= j) {
+            sea v = (k + j) / 2 + 1
+            si (m == "min") { v = k + 1 }
+            si (m == "denso" o m == "dense") { v = denso }
+            si (m == "orden" o m == "first") { v = q + 1 }
+            r["filas"][idx[q]][nombre] = v
+            q = q + 1
+        }
+        k = j + 1
+    }
+    retornar r
+}
+
+/// Rellena nulos: con un valor fijo, o "adelante" / "atras" (ffill/bfill), o "media".
+funcion planilla_rellenar(t, columnas, como) {
+    sea r = _pl_copiar(t)
+    para c en columnas {
+        si (como == "adelante" o como == "ffill" o como == "atras" o como == "bfill") {
+            sea n = longitud(r["filas"])
+            sea ultimo = nulo
+            sea i = 0
+            mientras (i < n) {
+                sea k = i
+                si (como == "atras" o como == "bfill") { k = n - 1 - i }
+                sea v = r["filas"][k][c] ?? nulo
+                si (v == nulo) { r["filas"][k][c] = ultimo } sino { ultimo = v }
+                i = i + 1
+            }
+        } sino {
+            sea valor = como
+            si (como == "media" o como == "mean") {
+                sea vals = []
+                para f en r["filas"] { vals.agregar(f[c] ?? nulo) }
+                valor = planilla_agregar(vals, "media")
+            }
+            para f en r["filas"] { si ((f[c] ?? nulo) == nulo) { f[c] = valor } }
+        }
+    }
+    retornar r
+}
+
+/// Quita filas duplicadas (según columnas; nulo = todas). Conserva la primera.
+funcion planilla_sin_duplicados(t, columnas) {
+    sea cols = columnas ?? t["columnas"]
+    sea vistos = {}
+    sea r = []
+    para f en t["filas"] {
+        sea partes = []
+        para c en cols { partes.agregar(json_texto(f[c] ?? nulo)) }
+        sea k = unir(partes, "\u0001")
+        si (tiene_clave(vistos, k) == falso) { vistos[k] = verdadero  r.agregar(f) }
+    }
+    retornar {"columnas": t["columnas"], "filas": r}
+}
+
+/// Agrupa y agrega con todas las operaciones de planilla_agregar:
+/// {"nueva": ["columna", "mediana"]}.
+funcion planilla_agrupar(t, por, agregaciones) {
+    sea grupos = {}
+    sea orden = []
+    para f en t["filas"] {
+        sea partes = []
+        para c en por { partes.agregar("" + f[c]) }
+        sea k = unir(partes, "\u0001")
+        si (tiene_clave(grupos, k) == falso) { grupos[k] = []  orden.agregar(k) }
+        grupos[k].agregar(f)
+    }
+    sea cols = []
+    para c en por { cols.agregar(c) }
+    para n en claves(agregaciones) { cols.agregar(n) }
+    sea r = []
+    para k en orden {
+        sea fs = grupos[k]
+        sea g = {}
+        para c en por { g[c] = fs[0][c] }
+        para n en claves(agregaciones) {
+            sea a = agregaciones[n]
+            sea vals = []
+            para f en fs { vals.agregar(f[a[0]] ?? nulo) }
+            g[n] = planilla_agregar(vals, a[1])
+        }
+        r.agregar(g)
+    }
+    retornar {"columnas": cols, "filas": r}
+}
+
+/// Agrega a cada fila el porcentaje que representa su valor dentro del total
+/// (o del total de su grupo).
+funcion planilla_porcentaje(t, columna, nueva, grupo) {
+    sea r = _pl_copiar(t)
+    sea nombre = nueva ?? (columna + "_pct")
+    _pl_con_col(r, nombre)
+    sea tot = {}
+    para f en r["filas"] {
+        sea g = "_"
+        si (grupo != nulo) { g = "" + f[grupo] }
+        si (_pl_num(f[columna])) { tot[g] = (tot[g] ?? 0) + f[columna] }
+    }
+    para f en r["filas"] {
+        sea g = "_"
+        si (grupo != nulo) { g = "" + f[grupo] }
+        si (_pl_num(f[columna]) y (tot[g] ?? 0) != 0) { f[nombre] = f[columna] / tot[g] } sino { f[nombre] = nulo }
+    }
+    retornar r
+}

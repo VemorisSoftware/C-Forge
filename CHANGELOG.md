@@ -33,6 +33,16 @@ Sitio oficial: [c-forge.org](https://c-forge.org)
   (bandadas y multitudes sin choques), `grafica`/`chart` (líneas, barras,
   torta y dispersión en SVG), `secretos`/`secrets` (valores cifrados en JSON
   y .env) y `alerta`/`errors` (reporte de errores compatible con Sentry).
+- **Lote 10 (bilingüe):** `estadistica`/`stats` (t de Student, Welch,
+  pareada, χ², ANOVA, Pearson, intervalos; contra SciPy), `gradiente`/
+  `autograd` (autodiferenciación en modo reverso, redes con Adam o SGD),
+  `vela`/`trees` (árboles, bosques aleatorios, Naive Bayes gaussiano y de
+  texto), `hibrida`/`hybrid` (BM25 + vectores con RRF, para RAG), `molde`/
+  `serde` (serialización con esquema a JSON, CSV, query string y binario,
+  con migraciones), `genoma`/`bio` (FASTA/FASTQ, traducción, ORFs,
+  Needleman–Wunsch y Smith–Waterman), `registro`/`logging` (fachada con
+  niveles por jerarquía, destinos, rotación y contexto) y `planilla`/`pivot`
+  (pivote, melt, ventanas móviles, rangos; contra Pandas).
 - `rastreo`/`glob`: recorrer carpetas y buscar con comodines (`**`, `{a,b}`,
   `[a-z]`). El lenguaje suma `listar_carpeta`, `es_carpeta` y `crear_carpeta`
   (como `mkdir -p`).

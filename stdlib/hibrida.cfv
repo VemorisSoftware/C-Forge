@@ -1,0 +1,131 @@
+// stdlib/hibrida.cfv — búsqueda híbrida: combina texto completo (BM25 de
+// "indice") con similitud de vectores (de "vecindad") usando Reciprocal
+// Rank Fusion o una mezcla ponderada, con filtros por metadatos. Ideal para
+// RAG: encuentra por palabras exactas Y por significado. Inspirada en
+// Weaviate / Vespa (BSD/Apache). En inglés: importar "hybrid".
+//
+//   importar "hibrida"
+//   sea h = hibrida_nueva(384, {"campos": {"titulo": 2, "texto": 1}})
+//   hibrida_agregar(h, "d1", {"titulo": "Pago con tarjeta", "texto": "…"}, embedding, {"idioma": "es"})
+//   hibrida_buscar(h, "pagar con visa", embedding_de_la_consulta, {"k": 5, "alfa": 0.5})
+//
+// alfa = 1 solo vectores, 0 solo texto, 0.5 mitad y mitad. modo "rrf"
+// (por defecto) es robusto aunque los puntajes tengan escalas distintas.
+
+importar "indice"
+importar "vecindad"
+
+funcion hibrida_nueva(dimension, opciones) {
+    retornar {"texto": indice_nuevo(opciones), "vectores": vecindad_nueva(dimension, "coseno"), "meta": {}, "docs": {}}
+}
+
+funcion hibrida_agregar(h, id, doc, vector, meta) {
+    sea k = "" + id
+    indice_agregar(h["texto"], k, doc)
+    h["meta"][k] = meta ?? {}
+    si (vector != nulo) { vecindad_agregar(h["vectores"], k, vector, h["meta"][k]) }
+    h["docs"][k] = doc
+    retornar h
+}
+
+funcion hibrida_quitar(h, id) {
+    sea k = "" + id
+    indice_quitar(h["texto"], k)
+    vecindad_quitar(h["vectores"], k)
+    sea m = {}
+    sea d = {}
+    para x en claves(h["meta"]) { si (x != k) { m[x] = h["meta"][x]  d[x] = h["docs"][x] } }
+    h["meta"] = m
+    h["docs"] = d
+    retornar h
+}
+
+funcion _hb_op(o, k, d) {
+    si (o != nulo) { si (tiene_clave(o, k)) { retornar o[k] } }
+    retornar d
+}
+
+/// Busca. opciones: k (10), alfa (0.5), modo ("rrf" | "ponderado"),
+/// filtro (función meta → verdadero/falso), rrf_k (60).
+funcion hibrida_buscar(h, consulta, vector, opciones) {
+    sea k = _hb_op(opciones, "k", 10)
+    sea alfa = _hb_op(opciones, "alfa", _hb_op(opciones, "alpha", 0.5))
+    sea modo = _hb_op(opciones, "modo", _hb_op(opciones, "mode", "rrf"))
+    sea filtro = _hb_op(opciones, "filtro", _hb_op(opciones, "filter", nulo))
+    sea rk = _hb_op(opciones, "rrf_k", 60)
+    sea profundidad = maximo(k * 4, 20)
+    sea pasa = funcion(id) {
+        si (filtro == nulo) { retornar verdadero }
+        retornar filtro(h["meta"][id]) == verdadero
+    }
+    sea texto = []
+    si (consulta != nulo y consulta != "" y alfa < 1) {
+        para r en indice_buscar(h["texto"], consulta, {"limite": profundidad * 4}) { si (pasa(r["id"])) { texto.agregar(r) } }
+    }
+    sea vec = []
+    si (vector != nulo y alfa > 0) { vec = vecindad_buscar(h["vectores"], vector, profundidad, funcion(m) { retornar filtro == nulo o filtro(m) == verdadero }) }
+    sea puntaje = {}
+    sea fuentes = {}
+    si (modo == "rrf") {
+        sea i = 0
+        mientras (i < longitud(texto)) {
+            sea id = texto[i]["id"]
+            puntaje[id] = (puntaje[id] ?? 0) + (1 - alfa) / (rk + i + 1)
+            fuentes[id] = "texto"
+            i = i + 1
+        }
+        i = 0
+        mientras (i < longitud(vec)) {
+            sea id = vec[i]["id"]
+            puntaje[id] = (puntaje[id] ?? 0) + alfa / (rk + i + 1)
+            si (tiene_clave(fuentes, id)) { fuentes[id] = "ambos" } sino { fuentes[id] = "vector" }
+            i = i + 1
+        }
+    } sino {
+        // Ponderado: normaliza cada lista a 0–1 por su máximo.
+        sea maxt = 0
+        para r en texto { maxt = maximo(maxt, r["puntaje"]) }
+        para r en texto {
+            puntaje[r["id"]] = (1 - alfa) * r["puntaje"] / maximo(maxt, 0.000000001)
+            fuentes[r["id"]] = "texto"
+        }
+        para r en vec {
+            puntaje[r["id"]] = (puntaje[r["id"]] ?? 0) + alfa * maximo(0, r["puntaje"])
+            si (tiene_clave(fuentes, r["id"])) { fuentes[r["id"]] = "ambos" } sino { fuentes[r["id"]] = "vector" }
+        }
+    }
+    sea l = []
+    para id en claves(puntaje) { l.agregar({"id": id, "puntaje": puntaje[id], "fuente": fuentes[id], "meta": h["meta"][id], "doc": h["docs"][id]}) }
+    l = ordenar(l, funcion(a, b) {
+        si (a["puntaje"] > b["puntaje"]) { retornar -1 }
+        si (a["puntaje"] < b["puntaje"]) { retornar 1 }
+        si (a["id"] < b["id"]) { retornar -1 }
+        retornar 1
+    })
+    si (longitud(l) > k) {
+        sea c = []
+        sea i = 0
+        mientras (i < k) { c.agregar(l[i])  i = i + 1 }
+        l = c
+    }
+    retornar l
+}
+
+/// Parte un texto largo en trozos con solapamiento (para indexar en RAG).
+funcion hibrida_trozos(texto, tamano, solape) {
+    sea palabras = []
+    para p en texto_dividir("" + texto, " ") { si (p != "") { palabras.agregar(p) } }
+    sea n = tamano ?? 200
+    sea s = solape ?? 40
+    si (s >= n) { lanzar "hibrida: el solape debe ser menor que el tamaño" }
+    sea r = []
+    sea i = 0
+    mientras (i < longitud(palabras)) {
+        sea t = []
+        sea j = i
+        mientras (j < minimo(longitud(palabras), i + n)) { t.agregar(palabras[j])  j = j + 1 }
+        r.agregar(unir(t, " "))
+        si (i + n >= longitud(palabras)) { i = longitud(palabras) } sino { i = i + n - s }
+    }
+    retornar r
+}
