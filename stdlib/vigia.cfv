@@ -1,0 +1,300 @@
+// stdlib/vigia.cfv — vigilar cambios en archivos y carpetas al estilo
+// Notify: eventos de creado, modificado, borrado y renombrado, en forma
+// recursiva, con patrones para ignorar (*.tmp, .git, node_modules) y
+// agrupación de ráfagas (debounce). En Linux usa inotify (sin sondeo);
+// en el resto, o si se pide, compara instantáneas con tamaño y fecha de
+// modificación. Inspirada en Notify (CC0/MIT/Apache). En inglés:
+// importar "notify".
+//
+//   importar "vigia"
+//   sea v = vigia_nuevo({"ignorar": ["*.tmp", ".git"]})
+//   vigia_agregar(v, "src")
+//   vigia_mirar(v, funcion(e) { mostrar(e["tipo"] + " " + e["ruta"]) })   // bloquea
+
+funcion __vigia_declaraciones() {
+    extern "libc" funcion inotify_init1(banderas: entero): entero
+    extern "libc" funcion inotify_add_watch(fd: entero, ruta: texto, mascara: entero): entero
+    extern "libc" funcion inotify_rm_watch(fd: entero, wd: entero): entero
+    extern "libc" funcion read(fd: entero, buf: puntero, n: entero): largo
+    extern "libc" funcion close(fd: entero): entero
+    extern "libc" funcion stat(ruta: texto, buf: puntero): entero
+}
+
+sea _VG_IN_MODIFY = 2
+sea _VG_IN_ATTRIB = 4
+sea _VG_IN_CLOSE_WRITE = 8
+sea _VG_IN_MOVED_FROM = 64
+sea _VG_IN_MOVED_TO = 128
+sea _VG_IN_CREATE = 256
+sea _VG_IN_DELETE = 512
+sea _VG_IN_DELETE_SELF = 1024
+sea _VG_IN_ISDIR = 1073741824
+
+funcion _vg_linux() { retornar existe_archivo("/proc/meminfo") }
+
+funcion _vg_unir(a, b) {
+    si (texto_termina_con(a, "/")) { retornar a + b }
+    retornar a + "/" + b
+}
+
+/// ¿El nombre coincide con un patrón glob simple (* ? y nombres exactos)?
+funcion vigia_coincide(patron, nombre) {
+    retornar _vg_glob(patron, 0, nombre, 0)
+}
+
+funcion _vg_glob(p, i, t, j) {
+    mientras (i < longitud(p)) {
+        sea c = subcadena(p, i, i + 1)
+        si (c == "*") {
+            si (i + 1 == longitud(p)) { retornar verdadero }
+            sea k = j
+            mientras (k <= longitud(t)) {
+                si (_vg_glob(p, i + 1, t, k)) { retornar verdadero }
+                k = k + 1
+            }
+            retornar falso
+        }
+        si (j >= longitud(t)) { retornar falso }
+        si (c != "?" y c != subcadena(t, j, j + 1)) { retornar falso }
+        i = i + 1
+        j = j + 1
+    }
+    retornar j == longitud(t)
+}
+
+funcion _vg_ignorado(v, ruta) {
+    para parte en texto_dividir(ruta, "/") {
+        para p en v["o"]["ignorar"] ?? [] { si (parte != "" y vigia_coincide(p, parte)) { retornar verdadero } }
+    }
+    retornar falso
+}
+
+/// Vigilante. opciones: recursivo (verdadero), ignorar ([patrones]),
+/// rebote_ms (50: junta eventos seguidos del mismo archivo), modo ("auto" |
+/// "inotify" | "sondeo"), intervalo_ms (250, para el sondeo).
+funcion vigia_nuevo(opciones) {
+    sea o = opciones ?? {}
+    sea modo = o["modo"] ?? "auto"
+    si (modo == "auto") {
+        modo = "sondeo"
+        si (_vg_linux()) { modo = "inotify" }
+    }
+    sea v = {"o": o, "modo": modo, "fd": -1, "wd": {}, "raices": [], "foto": {}, "buf": nulo, "pendientes": []}
+    si (modo == "inotify") {
+        // IN_NONBLOCK | IN_CLOEXEC
+        v["fd"] = inotify_init1(2048 + 524288)
+        si (v["fd"] < 0) { v["modo"] = "sondeo" } sino { v["buf"] = c_reservar(65536) }
+    }
+    retornar v
+}
+
+funcion _vg_vigilar_dir(v, dir) {
+    sea mascara = _VG_IN_MODIFY + _VG_IN_CLOSE_WRITE + _VG_IN_MOVED_FROM + _VG_IN_MOVED_TO + _VG_IN_CREATE + _VG_IN_DELETE + _VG_IN_DELETE_SELF + _VG_IN_ATTRIB
+    sea wd = inotify_add_watch(v["fd"], dir, mascara)
+    si (wd >= 0) { v["wd"]["" + wd] = dir }
+    si (v["o"]["recursivo"] ?? verdadero) {
+        para n en listar_carpeta(dir) {
+            sea r = _vg_unir(dir, n)
+            si (es_carpeta(r) y _vg_ignorado(v, r) == falso) { _vg_vigilar_dir(v, r) }
+        }
+    }
+}
+
+/// Empieza a vigilar un archivo o carpeta.
+funcion vigia_agregar(v, ruta) {
+    sea r = "" + ruta
+    mientras (longitud(r) > 1 y texto_termina_con(r, "/")) { r = subcadena(r, 0, longitud(r) - 1) }
+    v["raices"].agregar(r)
+    si (v["modo"] == "inotify") {
+        si (es_carpeta(r)) { _vg_vigilar_dir(v, r) } sino {
+            sea wd = inotify_add_watch(v["fd"], r, _VG_IN_MODIFY + _VG_IN_CLOSE_WRITE + _VG_IN_DELETE_SELF + _VG_IN_ATTRIB + _VG_IN_MOVED_FROM)
+            si (wd >= 0) { v["wd"]["" + wd] = "=" + r }
+        }
+    } sino { _vg_fotografiar(v, r, v["foto"]) }
+}
+
+// ── Sondeo ────────────────────────────────────────────────────────────────
+
+/// {"tamano", "modificado_ns", "carpeta"} de una ruta o nulo.
+funcion vigia_estado(ruta) {
+    sea buf = c_reservar(256)
+    sea rc = stat("" + ruta, buf)
+    si (rc != 0) {
+        c_liberar(buf)
+        retornar nulo
+    }
+    sea r = nulo
+    si (_vg_linux()) { r = {"tamano": c_leer64(buf, 48), "modificado_ns": c_leer64(buf, 88) * 1000000000 + c_leer64(buf, 96), "carpeta": bits_y(c_leer32(buf, 24), 61440) == 16384} } sino {
+        r = {"tamano": c_leer64(buf, 96), "modificado_ns": c_leer64(buf, 48) * 1000000000 + c_leer64(buf, 56), "carpeta": bits_y(c_leer32(buf, 4) % 65536, 61440) == 16384}
+    }
+    c_liberar(buf)
+    retornar r
+}
+
+funcion _vg_fotografiar(v, ruta, foto) {
+    si (_vg_ignorado(v, ruta)) { retornar nulo }
+    sea e = vigia_estado(ruta)
+    si (e == nulo) { retornar nulo }
+    foto[ruta] = e
+    si (e["carpeta"] y (v["o"]["recursivo"] ?? verdadero o _vg_es_raiz(v, ruta))) {
+        para n en listar_carpeta(ruta) { _vg_fotografiar(v, _vg_unir(ruta, n), foto) }
+    }
+}
+
+funcion _vg_es_raiz(v, ruta) {
+    para r en v["raices"] { si (r == ruta) { retornar verdadero } }
+    retornar falso
+}
+
+funcion _vg_sondear(v) {
+    sea nueva = {}
+    para r en v["raices"] { _vg_fotografiar(v, r, nueva) }
+    sea vieja = v["foto"]
+    sea ev = []
+    para k en claves(nueva) {
+        si (tiene_clave(vieja, k) == falso) { ev.agregar({"tipo": "creado", "ruta": k, "carpeta": nueva[k]["carpeta"]}) } sino {
+            si (nueva[k]["carpeta"] == falso y (nueva[k]["tamano"] != vieja[k]["tamano"] o nueva[k]["modificado_ns"] != vieja[k]["modificado_ns"])) { ev.agregar({"tipo": "modificado", "ruta": k, "carpeta": falso}) }
+        }
+    }
+    para k en claves(vieja) { si (tiene_clave(nueva, k) == falso) { ev.agregar({"tipo": "borrado", "ruta": k, "carpeta": vieja[k]["carpeta"]}) } }
+    v["foto"] = nueva
+    retornar ev
+}
+
+// ── inotify ───────────────────────────────────────────────────────────────
+
+funcion _vg_leer_inotify(v) {
+    sea ev = []
+    mientras (verdadero) {
+        sea n = read(v["fd"], v["buf"], 65536)
+        si (n <= 0) { retornar ev }
+        sea p = 0
+        mientras (p + 16 <= n) {
+            sea wd = c_leer32(v["buf"], p)
+            sea mascara = c_leer32(v["buf"], p + 4)
+            sea cookie = c_leer32(v["buf"], p + 8)
+            sea largo = c_leer32(v["buf"], p + 12)
+            sea nombre = ""
+            si (largo > 0) { nombre = c_texto(v["buf"] + p + 16) }
+            p = p + 16 + largo
+            sea base = v["wd"]["" + wd] ?? nulo
+            si (base != nulo) {
+                sea ruta = base
+                si (texto_empieza_con(base, "=")) { ruta = subcadena(base, 1, longitud(base)) } sino { si (nombre != "") { ruta = _vg_unir(base, nombre) } }
+                sea es_dir = bits_y(mascara, _VG_IN_ISDIR) != 0
+                si (_vg_ignorado(v, ruta) == falso) {
+                    si (bits_y(mascara, _VG_IN_CREATE) != 0) {
+                        ev.agregar({"tipo": "creado", "ruta": ruta, "carpeta": es_dir})
+                        // Carpeta nueva: también se vigila (y lo que ya tenga).
+                        si (es_dir y (v["o"]["recursivo"] ?? verdadero)) {
+                            _vg_vigilar_dir(v, ruta)
+                            para x en listar_carpeta(ruta) { ev.agregar({"tipo": "creado", "ruta": _vg_unir(ruta, x), "carpeta": es_carpeta(_vg_unir(ruta, x))}) }
+                        }
+                    }
+                    si (bits_y(mascara, _VG_IN_MODIFY) != 0 o bits_y(mascara, _VG_IN_CLOSE_WRITE) != 0) { ev.agregar({"tipo": "modificado", "ruta": ruta, "carpeta": es_dir}) }
+                    si (bits_y(mascara, _VG_IN_DELETE) != 0 o (bits_y(mascara, _VG_IN_DELETE_SELF) != 0 y texto_empieza_con(base, "="))) { ev.agregar({"tipo": "borrado", "ruta": ruta, "carpeta": es_dir}) }
+                    si (bits_y(mascara, _VG_IN_MOVED_FROM) != 0) { ev.agregar({"tipo": "movido_desde", "ruta": ruta, "carpeta": es_dir, "cookie": cookie}) }
+                    si (bits_y(mascara, _VG_IN_MOVED_TO) != 0) { ev.agregar({"tipo": "movido_hacia", "ruta": ruta, "carpeta": es_dir, "cookie": cookie}) }
+                    si (bits_y(mascara, _VG_IN_ATTRIB) != 0 y (v["o"]["atributos"] ?? falso)) { ev.agregar({"tipo": "atributos", "ruta": ruta, "carpeta": es_dir}) }
+                }
+            }
+        }
+    }
+}
+
+// Une movido_desde + movido_hacia (misma cookie) en renombrado, y junta
+// los eventos repetidos del mismo archivo.
+funcion _vg_ordenar(ev) {
+    sea r = []
+    sea usados = {}
+    sea i = 0
+    mientras (i < longitud(ev)) {
+        sea e = ev[i]
+        si (tiene_clave(usados, "" + i) == falso) {
+            si (e["tipo"] == "movido_desde") {
+                sea par = -1
+                sea j = i + 1
+                mientras (j < longitud(ev) y par < 0) {
+                    si (ev[j]["tipo"] == "movido_hacia" y ev[j]["cookie"] == e["cookie"]) { par = j }
+                    j = j + 1
+                }
+                si (par >= 0) {
+                    usados["" + par] = verdadero
+                    r.agregar({"tipo": "renombrado", "desde": e["ruta"], "ruta": ev[par]["ruta"], "carpeta": e["carpeta"]})
+                } sino { r.agregar({"tipo": "borrado", "ruta": e["ruta"], "carpeta": e["carpeta"]}) }
+            } sino {
+                si (e["tipo"] == "movido_hacia") { r.agregar({"tipo": "creado", "ruta": e["ruta"], "carpeta": e["carpeta"]}) } sino { r.agregar({"tipo": e["tipo"], "ruta": e["ruta"], "carpeta": e["carpeta"]}) }
+            }
+        }
+        i = i + 1
+    }
+    // Junta: creado + modificado → creado; modificado repetido → uno; creado
+    // + borrado → nada.
+    sea fin = []
+    sea por_ruta = {}
+    para e en r {
+        sea k = e["ruta"]
+        si (tiene_clave(por_ruta, k)) {
+            sea previo = por_ruta[k]
+            si (e["tipo"] == "modificado" y (previo["tipo"] == "modificado" o previo["tipo"] == "creado")) { } sino {
+                si (e["tipo"] == "borrado" y previo["tipo"] == "creado") {
+                    previo["tipo"] = "nada"
+                    quitar_clave(por_ruta, k)
+                } sino {
+                    fin.agregar(e)
+                    por_ruta[k] = e
+                }
+            }
+        } sino {
+            fin.agregar(e)
+            por_ruta[k] = e
+        }
+    }
+    sea limpio = []
+    para e en fin { si (e["tipo"] != "nada") { limpio.agregar(e) } }
+    retornar limpio
+}
+
+/// Espera hasta espera_ms (0: sólo lo ya ocurrido) y devuelve los eventos
+/// [{"tipo": "creado"|"modificado"|"borrado"|"renombrado", "ruta",
+/// "desde" (en renombrado), "carpeta"}].
+funcion vigia_eventos(v, espera_ms) {
+    sea fin = tiempo_ms() + (espera_ms ?? 0)
+    sea ev = []
+    sea paso = 10
+    si (v["modo"] == "sondeo") { paso = v["o"]["intervalo_ms"] ?? 250 }
+    mientras (verdadero) {
+        sea nuevos = []
+        si (v["modo"] == "inotify") { nuevos = _vg_leer_inotify(v) } sino { nuevos = _vg_sondear(v) }
+        para e en nuevos { ev.agregar(e) }
+        si (longitud(ev) > 0) {
+            // Rebote: espera un poco más por si vienen más del mismo cambio.
+            sea rebote = v["o"]["rebote_ms"] ?? 50
+            si (rebote > 0) {
+                dormir(rebote)
+                si (v["modo"] == "inotify") { para e en _vg_leer_inotify(v) { ev.agregar(e) } } sino { para e en _vg_sondear(v) { ev.agregar(e) } }
+            }
+            retornar _vg_ordenar(ev)
+        }
+        si (tiempo_ms() >= fin) { retornar [] }
+        dormir(minimo(paso, maximo(1, fin - tiempo_ms())))
+    }
+}
+
+/// Llama f(evento) por cada cambio, para siempre (o hasta que f devuelva
+/// falso).
+funcion vigia_mirar(v, f) {
+    mientras (verdadero) {
+        para e en vigia_eventos(v, 1000) {
+            si (f(e) == falso) { retornar nulo }
+        }
+    }
+}
+
+funcion vigia_cerrar(v) {
+    si (v["modo"] == "inotify" y v["fd"] >= 0) {
+        close(v["fd"])
+        c_liberar(v["buf"])
+        v["fd"] = -1
+    }
+}

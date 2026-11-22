@@ -1,0 +1,1021 @@
+// stdlib/formatos.cfv — trabajar con datos estructurados al estilo
+// Jackson: convertir entre JSON, YAML, TOML, XML y CSV con un solo modelo
+// de datos; JSON Pointer (RFC 6901), JSON Patch (RFC 6902) con aplicar y
+// calcular diferencias, JSON Merge Patch (RFC 7386), consultas JSONPath
+// (RFC 9535) y validación con JSON Schema 2020-12. Comparada con jsonpatch,
+// jsonpath y jsonschema de Python. Inspirada en Jackson (Apache).
+// En inglés: importar "dataformat".
+//
+//   importar "formatos"
+//   formatos_convertir("a: 1\nb: [x, y]", "yaml", "json")   // {"a":1,"b":["x","y"]}
+//   formatos_parche(doc, [{"op": "replace", "path": "/a", "value": 2}])
+//   formatos_jsonpath(doc, "$.tienda.libros[?@.precio < 10].titulo")
+//   formatos_validar(esquema, doc)       // {"valido": falso, "errores": [...]}
+
+importar "json"
+importar "ajustes"
+importar "xml"
+importar "csv"
+importar "regex"
+
+funcion _fm_copia(v) {
+    si (tipo(v) == "lista") {
+        sea r = []
+        para x en v { r.agregar(_fm_copia(x)) }
+        retornar r
+    }
+    si (tipo(v) == "mapa") {
+        sea r = {}
+        para k en claves(v) { r[k] = _fm_copia(v[k]) }
+        retornar r
+    }
+    retornar v
+}
+
+/// Igualdad profunda de valores JSON (1 y 1.0 son iguales).
+funcion formatos_iguales(a, b) {
+    si (tipo(a) != tipo(b)) { retornar falso }
+    si (tipo(a) == "lista") {
+        si (longitud(a) != longitud(b)) { retornar falso }
+        sea i = 0
+        mientras (i < longitud(a)) {
+            si (formatos_iguales(a[i], b[i]) == falso) { retornar falso }
+            i = i + 1
+        }
+        retornar verdadero
+    }
+    si (tipo(a) == "mapa") {
+        sea ka = claves(a)
+        si (longitud(ka) != longitud(claves(b))) { retornar falso }
+        para k en ka {
+            si (tiene_clave(b, k) == falso o formatos_iguales(a[k], b[k]) == falso) { retornar falso }
+        }
+        retornar verdadero
+    }
+    retornar a == b
+}
+
+// ══ Conversión entre formatos ══════════════════════════════════════════════
+
+// XML ↔ datos: atributos como "@nombre", texto como "#texto" (o el valor
+// directo si no hay otra cosa), elementos repetidos como lista.
+funcion _fm_xml_a_dato(n) {
+    sea hijos = n["hijos"] ?? []
+    sea attrs = n["atributos"] ?? {}
+    sea r = {}
+    para k en claves(attrs) { r["@" + k] = attrs[k] }
+    sea texto = ""
+    para h en hijos {
+        si (tipo(h) == "texto") { texto = texto + h } sino {
+            si ((h["tipo"] ?? "") == "texto" o tiene_clave(h, "nombre") == falso) { texto = texto + (h["texto"] ?? h["valor"] ?? "") } sino {
+                sea v = _fm_xml_a_dato(h)
+                sea nom = h["nombre"]
+                si (tiene_clave(r, nom)) {
+                    si (tipo(r[nom]) != "lista" o (r["$lista_" + nom] ?? falso) == falso) {
+                        r[nom] = [r[nom]]
+                        r["$lista_" + nom] = verdadero
+                    }
+                    r[nom].agregar(v)
+                } sino { r[nom] = v }
+            }
+        }
+    }
+    para k en claves(r) { si (texto_empieza_con(k, "$lista_")) { quitar_clave(r, k) } }
+    texto = texto_recortar(texto)
+    si (longitud(claves(r)) == 0) { retornar texto }
+    si (texto != "") { r["#texto"] = texto }
+    retornar r
+}
+
+funcion _fm_dato_a_xml(nombre, v) {
+    si (tipo(v) == "mapa") {
+        sea attrs = {}
+        sea hijos = []
+        para k en claves(v) {
+            si (texto_empieza_con(k, "@")) { attrs[subcadena(k, 1, longitud(k))] = "" + v[k] } sino {
+                si (k == "#texto") { hijos.agregar("" + v[k]) } sino {
+                    si (tipo(v[k]) == "lista") { para x en v[k] { hijos.agregar(_fm_dato_a_xml(k, x)) } } sino { hijos.agregar(_fm_dato_a_xml(k, v[k])) }
+                }
+            }
+        }
+        retornar xml_nodo(nombre, attrs, hijos)
+    }
+    si (tipo(v) == "lista") {
+        sea hijos = []
+        para x en v { hijos.agregar(_fm_dato_a_xml("elemento", x)) }
+        retornar xml_nodo(nombre, {}, hijos)
+    }
+    si (v == nulo) { retornar xml_nodo(nombre, {}, []) }
+    retornar xml_nodo(nombre, {}, ["" + v])
+}
+
+/// Lee un texto: formato "json" | "yaml" | "toml" | "xml" | "csv".
+/// XML devuelve {raíz: datos}; CSV una lista de registros (mapas).
+funcion formatos_leer(texto, formato) {
+    sea f = texto_minusculas(formato)
+    si (f == "json") { retornar json_parsear(texto) }
+    si (f == "yaml" o f == "yml") { retornar ajustes_yaml(texto) }
+    si (f == "toml") { retornar ajustes_toml(texto) }
+    si (f == "xml") {
+        sea n = xml_analizar(texto)
+        sea r = {}
+        r[n["nombre"]] = _fm_xml_a_dato(n)
+        retornar r
+    }
+    si (f == "csv") { retornar csv_registros(texto) }
+    lanzar "formatos: formato desconocido " + formato
+}
+
+/// Escribe un valor en el formato pedido. opciones: bonito (JSON con
+/// sangría), raiz (nombre del elemento raíz en XML).
+funcion formatos_escribir(v, formato, opciones) {
+    sea o = opciones ?? {}
+    sea f = texto_minusculas(formato)
+    si (f == "json") {
+        si (o["bonito"] ?? falso) { retornar json_bonito(v) }
+        retornar json_texto(v)
+    }
+    si (f == "yaml" o f == "yml") { retornar ajustes_a_yaml(v) }
+    si (f == "toml") { retornar ajustes_a_toml(v) }
+    si (f == "xml") {
+        sea raiz_ = o["raiz"] ?? nulo
+        sea dato = v
+        si (raiz_ == nulo y tipo(v) == "mapa" y longitud(claves(v)) == 1) {
+            raiz_ = claves(v)[0]
+            dato = v[raiz_]
+        }
+        retornar xml_texto(_fm_dato_a_xml(raiz_ ?? "raiz", dato), o["sangria"] ?? 2)
+    }
+    si (f == "csv") {
+        si (tipo(v) != "lista") { lanzar "formatos: CSV necesita una lista de registros" }
+        sea cols = o["columnas"] ?? nulo
+        si (cols == nulo) {
+            cols = []
+            sea vistas = {}
+            para r en v { para k en claves(r) { si (tiene_clave(vistas, k) == falso) { vistas[k] = verdadero  cols.agregar(k) } } }
+        }
+        retornar csv_desde_registros(v, cols)
+    }
+    lanzar "formatos: formato desconocido " + formato
+}
+
+funcion formatos_convertir(texto, de, a, opciones) { retornar formatos_escribir(formatos_leer(texto, de), a, opciones) }
+
+// ══ JSON Pointer ═══════════════════════════════════════════════════════════
+
+funcion _fm_tokens(puntero) {
+    si (puntero == "") { retornar [] }
+    si (texto_empieza_con(puntero, "/") == falso) { lanzar "formatos: puntero JSON inválido: " + puntero }
+    sea r = []
+    para t en texto_dividir(subcadena(puntero, 1, longitud(puntero)), "/") { r.agregar(texto_reemplazar(texto_reemplazar(t, "~1", "/"), "~0", "~")) }
+    retornar r
+}
+
+funcion _fm_indice(lista, t, para_agregar) {
+    si (t == "-" y para_agregar) { retornar longitud(lista) }
+    si (t == "" o (longitud(t) > 1 y texto_empieza_con(t, "0"))) { lanzar "formatos: índice inválido '" + t + "'" }
+    sea i = 0
+    mientras (i < longitud(t)) {
+        sea b = byte_en(t, i)
+        si (b < 48 o b > 57) { lanzar "formatos: índice inválido '" + t + "'" }
+        i = i + 1
+    }
+    sea n = a_numero(t)
+    sea max = longitud(lista) - 1
+    si (para_agregar) { max = longitud(lista) }
+    si (n > max) { lanzar "formatos: índice fuera de rango " + t }
+    retornar n
+}
+
+/// Valor en la ruta (o lanza si no existe).
+funcion formatos_puntero(doc, puntero) {
+    sea v = doc
+    para t en _fm_tokens(puntero) {
+        si (tipo(v) == "mapa") {
+            si (tiene_clave(v, t) == falso) { lanzar "formatos: no existe " + puntero }
+            v = v[t]
+        } sino {
+            si (tipo(v) == "lista") { v = v[_fm_indice(v, t, falso)] } sino { lanzar "formatos: no existe " + puntero }
+        }
+    }
+    retornar v
+}
+
+funcion formatos_puntero_existe(doc, puntero) {
+    sea ok = verdadero
+    intentar { formatos_puntero(doc, puntero) } capturar (e) { ok = falso }
+    retornar ok
+}
+
+funcion _fm_escapar_ptr(k) { retornar texto_reemplazar(texto_reemplazar("" + k, "~", "~0"), "/", "~1") }
+
+// ══ JSON Patch ═════════════════════════════════════════════════════════════
+
+funcion _fm_padre(doc, puntero) {
+    sea ts = _fm_tokens(puntero)
+    si (longitud(ts) == 0) { retornar [nulo, nulo] }
+    sea ult = ts[longitud(ts) - 1]
+    sea padre = ""
+    sea i = 0
+    mientras (i < longitud(ts) - 1) { padre = padre + "/" + _fm_escapar_ptr(ts[i])  i = i + 1 }
+    retornar [formatos_puntero(doc, padre), ult]
+}
+
+funcion _fm_agregar(doc, ruta, valor) {
+    si (ruta == "") { retornar valor }
+    sea pu = _fm_padre(doc, ruta)
+    sea p = pu[0]
+    sea k = pu[1]
+    si (tipo(p) == "mapa") { p[k] = valor } sino {
+        si (tipo(p) != "lista") { lanzar "formatos: no se puede agregar en " + ruta }
+        sea i = _fm_indice(p, k, verdadero)
+        sea nueva = []
+        sea j = 0
+        mientras (j < longitud(p)) {
+            si (j == i) { nueva.agregar(valor) }
+            nueva.agregar(p[j])
+            j = j + 1
+        }
+        si (i == longitud(p)) { nueva.agregar(valor) }
+        // Se modifica la lista en su lugar.
+        mientras (longitud(p) > 0) { quitar_ultimo(p) }
+        para x en nueva { p.agregar(x) }
+    }
+    retornar doc
+}
+
+funcion _fm_quitar(doc, ruta) {
+    si (ruta == "") { lanzar "formatos: no se puede quitar la raíz" }
+    sea pu = _fm_padre(doc, ruta)
+    sea p = pu[0]
+    sea k = pu[1]
+    si (tipo(p) == "mapa") {
+        si (tiene_clave(p, k) == falso) { lanzar "formatos: no existe " + ruta }
+        sea v = p[k]
+        quitar_clave(p, k)
+        retornar v
+    }
+    si (tipo(p) != "lista") { lanzar "formatos: no existe " + ruta }
+    sea i = _fm_indice(p, k, falso)
+    sea v = p[i]
+    sea nueva = []
+    sea j = 0
+    mientras (j < longitud(p)) { si (j != i) { nueva.agregar(p[j]) }  j = j + 1 }
+    mientras (longitud(p) > 0) { quitar_ultimo(p) }
+    para x en nueva { p.agregar(x) }
+    retornar v
+}
+
+/// Aplica un JSON Patch (lista de operaciones). No modifica el original;
+/// si una operación falla (incluida "test") lanza y no hay cambios.
+funcion formatos_parche(doc, parche) {
+    sea d = _fm_copia(doc)
+    sea n = 0
+    para op en parche {
+        sea o = op["op"] ?? nulo
+        sea ruta = op["path"] ?? nulo
+        si (ruta == nulo) { lanzar "formatos: la operación " + n + " no tiene path" }
+        si (o == "add") {
+            si (tiene_clave(op, "value") == falso) { lanzar "formatos: add sin value" }
+            d = _fm_agregar(d, ruta, _fm_copia(op["value"]))
+        } sino {
+            si (o == "remove") { _fm_quitar(d, ruta) } sino {
+                si (o == "replace") {
+                    formatos_puntero(d, ruta)
+                    si (ruta == "") { d = _fm_copia(op["value"]) } sino {
+                        _fm_quitar(d, ruta)
+                        d = _fm_agregar(d, ruta, _fm_copia(op["value"]))
+                    }
+                } sino {
+                    si (o == "move") {
+                        sea desde = op["from"]
+                        si (texto_empieza_con(ruta, desde + "/")) { lanzar "formatos: no se puede mover dentro de sí mismo" }
+                        si (desde != ruta) {
+                            sea v = _fm_quitar(d, desde)
+                            d = _fm_agregar(d, ruta, v)
+                        }
+                    } sino {
+                        si (o == "copy") { d = _fm_agregar(d, ruta, _fm_copia(formatos_puntero(d, op["from"]))) } sino {
+                            si (o == "test") {
+                                si (formatos_iguales(formatos_puntero(d, ruta), op["value"]) == falso) { lanzar "formatos: falló la prueba en " + ruta }
+                            } sino { lanzar "formatos: operación desconocida " + o }
+                        }
+                    }
+                }
+            }
+        }
+        n = n + 1
+    }
+    retornar d
+}
+
+/// Parche JSON que lleva de a hasta b (diferencias recursivas; las
+/// listas se comparan por posición y lo que sobra se agrega o quita).
+funcion formatos_diferencias(a, b) {
+    sea ops = []
+    _fm_dif(a, b, "", ops)
+    retornar ops
+}
+
+funcion _fm_dif(a, b, ruta, ops) {
+    si (formatos_iguales(a, b)) { retornar nulo }
+    si (tipo(a) == "mapa" y tipo(b) == "mapa") {
+        para k en claves(a) {
+            si (tiene_clave(b, k) == falso) { ops.agregar({"op": "remove", "path": ruta + "/" + _fm_escapar_ptr(k)}) }
+        }
+        para k en claves(b) {
+            si (tiene_clave(a, k) == falso) { ops.agregar({"op": "add", "path": ruta + "/" + _fm_escapar_ptr(k), "value": _fm_copia(b[k])}) } sino { _fm_dif(a[k], b[k], ruta + "/" + _fm_escapar_ptr(k), ops) }
+        }
+        retornar nulo
+    }
+    si (tipo(a) == "lista" y tipo(b) == "lista") {
+        sea comun = minimo(longitud(a), longitud(b))
+        sea i = 0
+        mientras (i < comun) { _fm_dif(a[i], b[i], ruta + "/" + i, ops)  i = i + 1 }
+        // Quitar desde el final para que los índices sigan valiendo.
+        sea j = longitud(a) - 1
+        mientras (j >= comun) { ops.agregar({"op": "remove", "path": ruta + "/" + j})  j = j - 1 }
+        i = comun
+        mientras (i < longitud(b)) { ops.agregar({"op": "add", "path": ruta + "/-", "value": _fm_copia(b[i])})  i = i + 1 }
+        retornar nulo
+    }
+    ops.agregar({"op": "replace", "path": ruta, "value": _fm_copia(b)})
+}
+
+// ══ JSON Merge Patch ═══════════════════════════════════════════════════════
+
+funcion formatos_mezcla(doc, parche) {
+    si (tipo(parche) != "mapa") { retornar _fm_copia(parche) }
+    sea r = {}
+    si (tipo(doc) == "mapa") { r = _fm_copia(doc) }
+    para k en claves(parche) {
+        si (parche[k] == nulo) { si (tiene_clave(r, k)) { quitar_clave(r, k) } } sino { r[k] = formatos_mezcla(r[k] ?? nulo, parche[k]) }
+    }
+    retornar r
+}
+
+/// Merge patch que lleva de a hasta b.
+funcion formatos_mezcla_diferencias(a, b) {
+    si (tipo(a) != "mapa" o tipo(b) != "mapa") { retornar _fm_copia(b) }
+    sea r = {}
+    para k en claves(a) { si (tiene_clave(b, k) == falso) { r[k] = nulo } }
+    para k en claves(b) {
+        si (tiene_clave(a, k) == falso) { r[k] = _fm_copia(b[k]) } sino {
+            si (formatos_iguales(a[k], b[k]) == falso) { r[k] = formatos_mezcla_diferencias(a[k], b[k]) }
+        }
+    }
+    retornar r
+}
+
+// ══ JSONPath (RFC 9535) ════════════════════════════════════════════════════
+
+funcion _jp_ws(p) { mientras (p["i"] < longitud(p["s"]) y (subcadena(p["s"], p["i"], p["i"] + 1) == " " o subcadena(p["s"], p["i"], p["i"] + 1) == "\t")) { p["i"] = p["i"] + 1 } }
+funcion _jp_c(p) { retornar subcadena(p["s"], p["i"], minimo(longitud(p["s"]), p["i"] + 1)) }
+
+funcion _jp_nombre(p) {
+    sea ini = p["i"]
+    mientras (p["i"] < longitud(p["s"])) {
+        sea b = byte_en(p["s"], p["i"])
+        si ((b >= 65 y b <= 90) o (b >= 97 y b <= 122) o (b >= 48 y b <= 57) o b == 95 o b >= 128 o (b == 45 y p["i"] > ini)) { p["i"] = p["i"] + 1 } sino { romper }
+    }
+    retornar subcadena(p["s"], ini, p["i"])
+}
+
+funcion _jp_texto(p) {
+    sea q = _jp_c(p)
+    p["i"] = p["i"] + 1
+    sea r = ""
+    mientras (_jp_c(p) != q) {
+        si (_jp_c(p) == "") { lanzar "formatos: texto sin cerrar en JSONPath" }
+        si (_jp_c(p) == "\\") {
+            p["i"] = p["i"] + 1
+            sea e = _jp_c(p)
+            si (e == "n") { r = r + "\n" } sino {
+                si (e == "t") { r = r + "\t" } sino { r = r + e }
+            }
+        } sino { r = r + _jp_c(p) }
+        p["i"] = p["i"] + 1
+    }
+    p["i"] = p["i"] + 1
+    retornar r
+}
+
+funcion _jp_entero(p) {
+    sea ini = p["i"]
+    si (_jp_c(p) == "-") { p["i"] = p["i"] + 1 }
+    mientras (texto_indice("0123456789", _jp_c(p)) >= 0 y _jp_c(p) != "") { p["i"] = p["i"] + 1 }
+    si (p["i"] == ini) { retornar nulo }
+    retornar a_numero(subcadena(p["s"], ini, p["i"]))
+}
+
+// Segmentos: [{"tipo": "hijo"|"desc", "sel": [selectores]}].
+funcion _jp_ruta(p, dentro) {
+    sea segs = []
+    mientras (verdadero) {
+        _jp_ws(p)
+        sea c = _jp_c(p)
+        si (c == ".") {
+            si (subcadena(p["s"], p["i"], p["i"] + 2) == "..") {
+                p["i"] = p["i"] + 2
+                si (_jp_c(p) == "[") { segs.agregar({"tipo": "desc", "sel": _jp_corchetes(p)}) } sino {
+                    si (_jp_c(p) == "*") { p["i"] = p["i"] + 1  segs.agregar({"tipo": "desc", "sel": [{"t": "todo"}]}) } sino { segs.agregar({"tipo": "desc", "sel": [{"t": "nombre", "v": _jp_nombre(p)}]}) }
+                }
+            } sino {
+                p["i"] = p["i"] + 1
+                si (_jp_c(p) == "*") { p["i"] = p["i"] + 1  segs.agregar({"tipo": "hijo", "sel": [{"t": "todo"}]}) } sino { segs.agregar({"tipo": "hijo", "sel": [{"t": "nombre", "v": _jp_nombre(p)}]}) }
+            }
+        } sino {
+            si (c == "[") { segs.agregar({"tipo": "hijo", "sel": _jp_corchetes(p)}) } sino { retornar segs }
+        }
+    }
+}
+
+funcion _jp_corchetes(p) {
+    p["i"] = p["i"] + 1
+    sea sels = []
+    mientras (verdadero) {
+        _jp_ws(p)
+        sea c = _jp_c(p)
+        si (c == "'" o c == "\"") { sels.agregar({"t": "nombre", "v": _jp_texto(p)}) } sino {
+            si (c == "*") { p["i"] = p["i"] + 1  sels.agregar({"t": "todo"}) } sino {
+                si (c == "?") {
+                    p["i"] = p["i"] + 1
+                    sels.agregar({"t": "filtro", "e": _jp_o(p)})
+                } sino {
+                    sea a = _jp_entero(p)
+                    _jp_ws(p)
+                    si (_jp_c(p) == ":") {
+                        p["i"] = p["i"] + 1
+                        _jp_ws(p)
+                        sea b = _jp_entero(p)
+                        sea paso = 1
+                        _jp_ws(p)
+                        si (_jp_c(p) == ":") {
+                            p["i"] = p["i"] + 1
+                            _jp_ws(p)
+                            paso = _jp_entero(p) ?? 1
+                        }
+                        sels.agregar({"t": "rebanada", "a": a, "b": b, "paso": paso})
+                    } sino {
+                        si (a == nulo) { lanzar "formatos: selector inválido en JSONPath en la posición " + p["i"] }
+                        sels.agregar({"t": "indice", "v": a})
+                    }
+                }
+            }
+        }
+        _jp_ws(p)
+        si (_jp_c(p) == ",") { p["i"] = p["i"] + 1 } sino {
+            si (_jp_c(p) != "]") { lanzar "formatos: falta ']' en JSONPath" }
+            p["i"] = p["i"] + 1
+            retornar sels
+        }
+    }
+}
+
+// Expresiones de filtro: ||, &&, !, comparaciones, @..., $..., literales,
+// funciones length() count() match() search() value().
+funcion _jp_o(p) {
+    sea a = _jp_y(p)
+    mientras (verdadero) {
+        _jp_ws(p)
+        si (subcadena(p["s"], p["i"], p["i"] + 2) == "||") {
+            p["i"] = p["i"] + 2
+            a = {"op": "o", "a": a, "b": _jp_y(p)}
+        } sino { retornar a }
+    }
+}
+
+funcion _jp_y(p) {
+    sea a = _jp_no(p)
+    mientras (verdadero) {
+        _jp_ws(p)
+        si (subcadena(p["s"], p["i"], p["i"] + 2) == "&&") {
+            p["i"] = p["i"] + 2
+            a = {"op": "y", "a": a, "b": _jp_no(p)}
+        } sino { retornar a }
+    }
+}
+
+funcion _jp_no(p) {
+    _jp_ws(p)
+    si (_jp_c(p) == "!" y subcadena(p["s"], p["i"], p["i"] + 2) != "!=") {
+        p["i"] = p["i"] + 1
+        retornar {"op": "no", "a": _jp_no(p)}
+    }
+    retornar _jp_cmp(p)
+}
+
+funcion _jp_cmp(p) {
+    sea a = _jp_atomo(p)
+    _jp_ws(p)
+    para op en ["==", "!=", "<=", ">=", "<", ">"] {
+        si (subcadena(p["s"], p["i"], p["i"] + longitud(op)) == op) {
+            p["i"] = p["i"] + longitud(op)
+            retornar {"op": op, "a": a, "b": _jp_atomo(p)}
+        }
+    }
+    retornar {"op": "existe", "a": a}
+}
+
+funcion _jp_atomo(p) {
+    _jp_ws(p)
+    sea c = _jp_c(p)
+    si (c == "(") {
+        p["i"] = p["i"] + 1
+        sea e = _jp_o(p)
+        _jp_ws(p)
+        p["i"] = p["i"] + 1
+        retornar {"op": "grupo", "a": e}
+    }
+    si (c == "@" o c == "$") {
+        p["i"] = p["i"] + 1
+        retornar {"op": "ruta", "raiz": c == "$", "segs": _jp_ruta(p, verdadero)}
+    }
+    si (c == "'" o c == "\"") { retornar {"op": "lit", "v": _jp_texto(p)} }
+    para w en [["true", verdadero], ["false", falso], ["null", nulo]] {
+        si (subcadena(p["s"], p["i"], p["i"] + longitud(w[0])) == w[0]) {
+            p["i"] = p["i"] + longitud(w[0])
+            retornar {"op": "lit", "v": w[1]}
+        }
+    }
+    si (c == "-" o texto_indice("0123456789", c) >= 0) {
+        sea ini = p["i"]
+        p["i"] = p["i"] + 1
+        mientras (texto_indice("0123456789.eE+-", _jp_c(p)) >= 0 y _jp_c(p) != "") { p["i"] = p["i"] + 1 }
+        retornar {"op": "lit", "v": a_numero(subcadena(p["s"], ini, p["i"]))}
+    }
+    sea nom = _jp_nombre(p)
+    si (nom != "" y _jp_c(p) == "(") {
+        p["i"] = p["i"] + 1
+        sea args = []
+        mientras (verdadero) {
+            _jp_ws(p)
+            si (_jp_c(p) == ")") { p["i"] = p["i"] + 1  retornar {"op": "funcion", "f": nom, "args": args} }
+            args.agregar(_jp_o(p))
+            _jp_ws(p)
+            si (_jp_c(p) == ",") { p["i"] = p["i"] + 1 }
+        }
+    }
+    lanzar "formatos: expresión inválida en JSONPath en la posición " + p["i"]
+}
+
+funcion _jp_aplicar(segs, nodos, raiz) {
+    sea actual = nodos
+    para s en segs {
+        sea sig = []
+        para n en actual {
+            si (s["tipo"] == "desc") {
+                para d en _jp_descendientes(n) { _jp_seleccionar(s["sel"], d, sig, raiz) }
+            } sino { _jp_seleccionar(s["sel"], n, sig, raiz) }
+        }
+        actual = sig
+    }
+    retornar actual
+}
+
+// Nodos: [valor, ruta normalizada].
+funcion _jp_descendientes(n) {
+    sea r = [n]
+    sea i = 0
+    mientras (i < longitud(r)) {
+        sea v = r[i][0]
+        si (tipo(v) == "lista") {
+            sea j = 0
+            mientras (j < longitud(v)) { r.agregar([v[j], r[i][1] + "[" + j + "]"])  j = j + 1 }
+        }
+        si (tipo(v) == "mapa") { para k en claves(v) { r.agregar([v[k], r[i][1] + "['" + texto_reemplazar(k, "'", "\\'") + "']"]) } }
+        i = i + 1
+    }
+    retornar r
+}
+
+funcion _jp_seleccionar(sels, n, sig, raiz) {
+    sea v = n[0]
+    para s en sels {
+        sea t = s["t"]
+        si (t == "nombre" y tipo(v) == "mapa" y tiene_clave(v, s["v"])) { sig.agregar([v[s["v"]], n[1] + "['" + texto_reemplazar(s["v"], "'", "\\'") + "']"]) }
+        si (t == "todo") {
+            si (tipo(v) == "lista") {
+                sea j = 0
+                mientras (j < longitud(v)) { sig.agregar([v[j], n[1] + "[" + j + "]"])  j = j + 1 }
+            }
+            si (tipo(v) == "mapa") { para k en claves(v) { sig.agregar([v[k], n[1] + "['" + texto_reemplazar(k, "'", "\\'") + "']"]) } }
+        }
+        si (t == "indice" y tipo(v) == "lista") {
+            sea i = s["v"]
+            si (i < 0) { i = i + longitud(v) }
+            si (i >= 0 y i < longitud(v)) { sig.agregar([v[i], n[1] + "[" + i + "]"]) }
+        }
+        si (t == "rebanada" y tipo(v) == "lista") {
+            sea len = longitud(v)
+            sea paso = s["paso"]
+            si (paso != 0) {
+                sea a = s["a"]
+                sea b = s["b"]
+                si (paso > 0) {
+                    si (a == nulo) { a = 0 }
+                    si (b == nulo) { b = len }
+                } sino {
+                    si (a == nulo) { a = len - 1 }
+                    si (b == nulo) { b = -len - 1 }
+                }
+                si (a < 0) { a = a + len }
+                si (b < 0) { b = b + len }
+                si (paso > 0) {
+                    sea i = maximo(0, minimo(a, len))
+                    sea fin = maximo(0, minimo(b, len))
+                    mientras (i < fin) { sig.agregar([v[i], n[1] + "[" + i + "]"])  i = i + paso }
+                } sino {
+                    sea i = minimo(len - 1, maximo(a, -1))
+                    sea fin = minimo(len - 1, maximo(b, -1))
+                    mientras (i > fin) { sig.agregar([v[i], n[1] + "[" + i + "]"])  i = i + paso }
+                }
+            }
+        }
+        si (t == "filtro") {
+            si (tipo(v) == "lista") {
+                sea j = 0
+                mientras (j < longitud(v)) {
+                    si (_jp_verdad(s["e"], v[j], raiz)) { sig.agregar([v[j], n[1] + "[" + j + "]"]) }
+                    j = j + 1
+                }
+            }
+            si (tipo(v) == "mapa") {
+                para k en claves(v) { si (_jp_verdad(s["e"], v[k], raiz)) { sig.agregar([v[k], n[1] + "['" + k + "']"]) } }
+            }
+        }
+    }
+}
+
+sea _JP_NADA = {"$nada": verdadero}
+
+funcion _jp_valor(e, actual, raiz) {
+    si (e["op"] == "lit") { retornar e["v"] }
+    // Un argumento sin comparación llega envuelto como "existe".
+    si (e["op"] == "existe" y (e["a"]["op"] == "ruta" o e["a"]["op"] == "lit" o e["a"]["op"] == "funcion")) { retornar _jp_valor(e["a"], actual, raiz) }
+    si (e["op"] == "ruta") {
+        sea base = actual
+        si (e["raiz"]) { base = raiz }
+        sea r = _jp_aplicar(e["segs"], [[base, "$"]], raiz)
+        si (longitud(r) == 1) { retornar r[0][0] }
+        retornar _JP_NADA
+    }
+    si (e["op"] == "funcion") {
+        sea f = e["f"]
+        si (f == "length") {
+            sea x = _jp_valor(e["args"][0], actual, raiz)
+            si (tipo(x) == "texto") { retornar longitud(_fm_puntos(x)) }
+            si (tipo(x) == "lista" o tipo(x) == "mapa") { retornar longitud(x) }
+            retornar _JP_NADA
+        }
+        si (f == "count") {
+            sea a = e["args"][0]
+            sea base = actual
+            si (a["raiz"]) { base = raiz }
+            retornar longitud(_jp_aplicar(a["segs"], [[base, "$"]], raiz))
+        }
+        si (f == "match" o f == "search") {
+            sea x = _jp_valor(e["args"][0], actual, raiz)
+            sea patron = _jp_valor(e["args"][1], actual, raiz)
+            si (tipo(x) != "texto" o tipo(patron) != "texto") { retornar falso }
+            si (f == "match") { retornar regex_coincidir(patron, x) }
+            retornar regex_buscar(patron, x) != nulo
+        }
+        si (f == "value") { retornar _jp_valor(e["args"][0], actual, raiz) }
+        lanzar "formatos: función JSONPath desconocida " + f
+    }
+    retornar _jp_verdad(e, actual, raiz)
+}
+
+funcion _fm_puntos(t) {
+    sea n = 0
+    sea i = 0
+    mientras (i < longitud(t)) {
+        sea b = byte_en(t, i)
+        si (b < 128 o b >= 192) { n = n + 1 }
+        i = i + 1
+    }
+    sea r = []
+    i = 0
+    mientras (i < n) { r.agregar(0)  i = i + 1 }
+    retornar r
+}
+
+funcion _jp_comparar(op, a, b) {
+    sea nada_a = tipo(a) == "mapa" y tiene_clave(a, "$nada")
+    sea nada_b = tipo(b) == "mapa" y tiene_clave(b, "$nada")
+    si (op == "==") {
+        si (nada_a o nada_b) { retornar nada_a y nada_b }
+        retornar formatos_iguales(a, b)
+    }
+    si (op == "!=") { retornar _jp_comparar("==", a, b) == falso }
+    si (nada_a o nada_b) { retornar falso }
+    si (op == "<=") { retornar _jp_comparar("<", a, b) o _jp_comparar("==", a, b) }
+    si (op == ">=") { retornar _jp_comparar("<", b, a) o _jp_comparar("==", a, b) }
+    si (op == ">") { retornar _jp_comparar("<", b, a) }
+    // "<": sólo números con números o textos con textos.
+    si (tipo(a) == "numero" y tipo(b) == "numero") { retornar a < b }
+    si (tipo(a) == "texto" y tipo(b) == "texto") { retornar a < b }
+    retornar falso
+}
+
+funcion _jp_verdad(e, actual, raiz) {
+    sea op = e["op"]
+    si (op == "o") { retornar _jp_verdad(e["a"], actual, raiz) o _jp_verdad(e["b"], actual, raiz) }
+    si (op == "y") { retornar _jp_verdad(e["a"], actual, raiz) y _jp_verdad(e["b"], actual, raiz) }
+    si (op == "no") { retornar _jp_verdad(e["a"], actual, raiz) == falso }
+    si (op == "grupo") { retornar _jp_verdad(e["a"], actual, raiz) }
+    si (op == "existe") {
+        sea a = e["a"]
+        si (a["op"] == "ruta") {
+            sea base = actual
+            si (a["raiz"]) { base = raiz }
+            retornar longitud(_jp_aplicar(a["segs"], [[base, "$"]], raiz)) > 0
+        }
+        sea v = _jp_valor(a, actual, raiz)
+        retornar v == verdadero
+    }
+    retornar _jp_comparar(op, _jp_valor(e["a"], actual, raiz), _jp_valor(e["b"], actual, raiz))
+}
+
+/// Consulta JSONPath: lista de valores encontrados.
+funcion formatos_jsonpath(doc, consulta) {
+    sea r = []
+    para n en formatos_jsonpath_rutas(doc, consulta) { r.agregar(n[0]) }
+    retornar r
+}
+
+/// Como formatos_jsonpath, pero con la ruta normalizada: [[valor, "$['a'][0]"]].
+funcion formatos_jsonpath_rutas(doc, consulta) {
+    sea p = {"s": "" + consulta, "i": 0}
+    _jp_ws(p)
+    si (_jp_c(p) != "$") { lanzar "formatos: JSONPath debe empezar con $" }
+    p["i"] = 1
+    sea segs = _jp_ruta(p, falso)
+    _jp_ws(p)
+    si (p["i"] < longitud(p["s"])) { lanzar "formatos: sobra texto en JSONPath en la posición " + p["i"] }
+    retornar _jp_aplicar(segs, [[doc, "$"]], doc)
+}
+
+// ══ JSON Schema 2020-12 ════════════════════════════════════════════════════
+
+funcion _js_tipo(v) {
+    sea t = tipo(v)
+    si (v == nulo) { retornar "null" }
+    si (t == "booleano") { retornar "boolean" }
+    si (t == "texto") { retornar "string" }
+    si (t == "lista") { retornar "array" }
+    si (t == "mapa") { retornar "object" }
+    si (v == piso(v)) { retornar "integer" }
+    retornar "number"
+}
+
+funcion _js_es_tipo(v, t) {
+    sea real = _js_tipo(v)
+    si (t == real) { retornar verdadero }
+    retornar t == "number" y real == "integer"
+}
+
+funcion _js_ref(raiz, ref) {
+    si (texto_empieza_con(ref, "#")) {
+        sea frag = subcadena(ref, 1, longitud(ref))
+        si (frag == "") { retornar raiz }
+        si (texto_empieza_con(frag, "/")) {
+            sea dec = frag
+            // Decodifica %XX.
+            sea r = ""
+            sea i = 0
+            mientras (i < longitud(dec)) {
+                si (subcadena(dec, i, i + 1) == "%" y i + 2 < longitud(dec) + 1) {
+                    r = r + bytes_de_hex(subcadena(dec, i + 1, i + 3))
+                    i = i + 3
+                } sino { r = r + subcadena(dec, i, i + 1)  i = i + 1 }
+            }
+            retornar formatos_puntero(raiz, r)
+        }
+        // Ancla ($anchor).
+        sea hallado = _js_ancla(raiz, frag)
+        si (hallado != nulo) { retornar hallado }
+    }
+    lanzar "formatos: $ref no soportado: " + ref
+}
+
+funcion _js_ancla(s, nombre) {
+    si (tipo(s) == "mapa") {
+        si ((s["$anchor"] ?? nulo) == nombre) { retornar s }
+        para k en claves(s) {
+            sea r = _js_ancla(s[k], nombre)
+            si (r != nulo) { retornar r }
+        }
+    }
+    si (tipo(s) == "lista") {
+        para x en s {
+            sea r = _js_ancla(x, nombre)
+            si (r != nulo) { retornar r }
+        }
+    }
+    retornar nulo
+}
+
+funcion _js_formato(f, v) {
+    si (tipo(v) != "texto") { retornar verdadero }
+    si (f == "email") { retornar regex_coincidir("^[^@\\s]+@[^@\\s]+\\.[^@\\s]+$", v) }
+    si (f == "date") { retornar regex_coincidir("^\\d{4}-\\d{2}-\\d{2}$", v) }
+    si (f == "date-time") { retornar regex_coincidir("^\\d{4}-\\d{2}-\\d{2}[Tt ]\\d{2}:\\d{2}:\\d{2}(\\.\\d+)?([Zz]|[+-]\\d{2}:\\d{2})$", v) }
+    si (f == "uuid") { retornar regex_coincidir("^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$", v) }
+    si (f == "ipv4") { retornar regex_coincidir("^((25[0-5]|2[0-4]\\d|1\\d\\d|[1-9]?\\d)\\.){3}(25[0-5]|2[0-4]\\d|1\\d\\d|[1-9]?\\d)$", v) }
+    si (f == "uri") { retornar regex_coincidir("^[a-zA-Z][a-zA-Z0-9+.-]*:.+$", v) }
+    retornar verdadero
+}
+
+funcion _js_largo(t) { retornar longitud(_fm_puntos(t)) }
+
+// Valida v contra el esquema s; agrega errores a errs. Devuelve las
+// propiedades e ítems evaluados (para unevaluated*).
+funcion _js_validar(s, v, ruta, raiz, errs, ctx) {
+    sea ev = {"props": {}, "items": -1, "todos_items": falso}
+    si (s == verdadero) { retornar ev }
+    si (s == falso) {
+        errs.agregar({"ruta": ruta, "mensaje": "no se permite ningún valor"})
+        retornar ev
+    }
+    si (tipo(s) != "mapa") { retornar ev }
+    sea n0 = longitud(errs)
+    si (tiene_clave(s, "$ref")) {
+        sea r = _js_validar(_js_ref(raiz, s["$ref"]), v, ruta, raiz, errs, ctx)
+        _js_unir_ev(ev, r)
+    }
+    si (tiene_clave(s, "type")) {
+        sea ts = s["type"]
+        si (tipo(ts) != "lista") { ts = [ts] }
+        sea ok = falso
+        para t en ts { si (_js_es_tipo(v, t)) { ok = verdadero } }
+        si (ok == falso) { errs.agregar({"ruta": ruta, "mensaje": "se esperaba " + unir(ts, " o ") + " y llegó " + _js_tipo(v)}) }
+    }
+    si (tiene_clave(s, "enum")) {
+        sea ok = falso
+        para x en s["enum"] { si (formatos_iguales(x, v)) { ok = verdadero } }
+        si (ok == falso) { errs.agregar({"ruta": ruta, "mensaje": "el valor no está entre los permitidos"}) }
+    }
+    si (tiene_clave(s, "const") y formatos_iguales(s["const"], v) == falso) { errs.agregar({"ruta": ruta, "mensaje": "el valor debe ser " + json_texto(s["const"])}) }
+    si (tipo(v) == "numero") {
+        si (tiene_clave(s, "minimum") y v < s["minimum"]) { errs.agregar({"ruta": ruta, "mensaje": "menor que el mínimo " + s["minimum"]}) }
+        si (tiene_clave(s, "maximum") y v > s["maximum"]) { errs.agregar({"ruta": ruta, "mensaje": "mayor que el máximo " + s["maximum"]}) }
+        si (tiene_clave(s, "exclusiveMinimum") y v <= s["exclusiveMinimum"]) { errs.agregar({"ruta": ruta, "mensaje": "debe ser mayor que " + s["exclusiveMinimum"]}) }
+        si (tiene_clave(s, "exclusiveMaximum") y v >= s["exclusiveMaximum"]) { errs.agregar({"ruta": ruta, "mensaje": "debe ser menor que " + s["exclusiveMaximum"]}) }
+        si (tiene_clave(s, "multipleOf")) {
+            sea q = v / s["multipleOf"]
+            si (absoluto(q - redondear(q)) > 1e-9) { errs.agregar({"ruta": ruta, "mensaje": "no es múltiplo de " + s["multipleOf"]}) }
+        }
+    }
+    si (tipo(v) == "texto") {
+        si (tiene_clave(s, "minLength") y _js_largo(v) < s["minLength"]) { errs.agregar({"ruta": ruta, "mensaje": "más corto que " + s["minLength"]}) }
+        si (tiene_clave(s, "maxLength") y _js_largo(v) > s["maxLength"]) { errs.agregar({"ruta": ruta, "mensaje": "más largo que " + s["maxLength"]}) }
+        si (tiene_clave(s, "pattern") y regex_buscar(s["pattern"], v) == nulo) { errs.agregar({"ruta": ruta, "mensaje": "no cumple el patrón " + s["pattern"]}) }
+        si (tiene_clave(s, "format") y (ctx["formatos"] ?? verdadero) y _js_formato(s["format"], v) == falso) { errs.agregar({"ruta": ruta, "mensaje": "no tiene el formato " + s["format"]}) }
+    }
+    si (tipo(v) == "lista") {
+        si (tiene_clave(s, "minItems") y longitud(v) < s["minItems"]) { errs.agregar({"ruta": ruta, "mensaje": "menos de " + s["minItems"] + " elementos"}) }
+        si (tiene_clave(s, "maxItems") y longitud(v) > s["maxItems"]) { errs.agregar({"ruta": ruta, "mensaje": "más de " + s["maxItems"] + " elementos"}) }
+        si (s["uniqueItems"] ?? falso) {
+            sea i = 0
+            mientras (i < longitud(v)) {
+                sea j = i + 1
+                mientras (j < longitud(v)) {
+                    si (formatos_iguales(v[i], v[j])) { errs.agregar({"ruta": ruta, "mensaje": "elementos repetidos (" + i + " y " + j + ")"})  i = longitud(v)  j = longitud(v) }
+                    j = j + 1
+                }
+                i = i + 1
+            }
+        }
+        sea pre = s["prefixItems"] ?? []
+        sea i = 0
+        mientras (i < minimo(longitud(pre), longitud(v))) {
+            _js_validar(pre[i], v[i], ruta + "/" + i, raiz, errs, ctx)
+            ev["items"] = maximo(ev["items"], i)
+            i = i + 1
+        }
+        si (tiene_clave(s, "items")) {
+            mientras (i < longitud(v)) {
+                _js_validar(s["items"], v[i], ruta + "/" + i, raiz, errs, ctx)
+                i = i + 1
+            }
+            ev["todos_items"] = verdadero
+        }
+        si (tiene_clave(s, "contains")) {
+            sea cuenta = 0
+            sea k = 0
+            mientras (k < longitud(v)) {
+                sea e2 = []
+                _js_validar(s["contains"], v[k], ruta + "/" + k, raiz, e2, ctx)
+                si (longitud(e2) == 0) { cuenta = cuenta + 1 }
+                k = k + 1
+            }
+            sea minc = s["minContains"] ?? 1
+            si (cuenta < minc) { errs.agregar({"ruta": ruta, "mensaje": "no contiene suficientes elementos válidos"}) }
+            si (tiene_clave(s, "maxContains") y cuenta > s["maxContains"]) { errs.agregar({"ruta": ruta, "mensaje": "contiene demasiados elementos válidos"}) }
+        }
+    }
+    si (tipo(v) == "mapa") {
+        sea ks = claves(v)
+        si (tiene_clave(s, "minProperties") y longitud(ks) < s["minProperties"]) { errs.agregar({"ruta": ruta, "mensaje": "menos de " + s["minProperties"] + " propiedades"}) }
+        si (tiene_clave(s, "maxProperties") y longitud(ks) > s["maxProperties"]) { errs.agregar({"ruta": ruta, "mensaje": "más de " + s["maxProperties"] + " propiedades"}) }
+        para req en s["required"] ?? [] { si (tiene_clave(v, req) == falso) { errs.agregar({"ruta": ruta, "mensaje": "falta la propiedad '" + req + "'"}) } }
+        para k en claves(s["dependentRequired"] ?? {}) {
+            si (tiene_clave(v, k)) { para req en s["dependentRequired"][k] { si (tiene_clave(v, req) == falso) { errs.agregar({"ruta": ruta, "mensaje": "'" + k + "' necesita '" + req + "'"}) } } }
+        }
+        para k en claves(s["dependentSchemas"] ?? {}) {
+            si (tiene_clave(v, k)) { _js_unir_ev(ev, _js_validar(s["dependentSchemas"][k], v, ruta, raiz, errs, ctx)) }
+        }
+        sea props = s["properties"] ?? {}
+        sea pats = s["patternProperties"] ?? {}
+        para k en ks {
+            sea cubierta = falso
+            si (tiene_clave(props, k)) {
+                _js_validar(props[k], v[k], ruta + "/" + _fm_escapar_ptr(k), raiz, errs, ctx)
+                cubierta = verdadero
+                ev["props"][k] = verdadero
+            }
+            para pt en claves(pats) {
+                si (regex_buscar(pt, k) != nulo) {
+                    _js_validar(pats[pt], v[k], ruta + "/" + _fm_escapar_ptr(k), raiz, errs, ctx)
+                    cubierta = verdadero
+                    ev["props"][k] = verdadero
+                }
+            }
+            si (cubierta == falso y tiene_clave(s, "additionalProperties")) {
+                _js_validar(s["additionalProperties"], v[k], ruta + "/" + _fm_escapar_ptr(k), raiz, errs, ctx)
+                ev["props"][k] = verdadero
+            }
+            si (tiene_clave(s, "propertyNames")) { _js_validar(s["propertyNames"], k, ruta, raiz, errs, ctx) }
+        }
+    }
+    para sub en s["allOf"] ?? [] { _js_unir_ev(ev, _js_validar(sub, v, ruta, raiz, errs, ctx)) }
+    si (tiene_clave(s, "anyOf")) {
+        sea ok = 0
+        para sub en s["anyOf"] {
+            sea e2 = []
+            sea r = _js_validar(sub, v, ruta, raiz, e2, ctx)
+            si (longitud(e2) == 0) { ok = ok + 1  _js_unir_ev(ev, r) }
+        }
+        si (ok == 0) { errs.agregar({"ruta": ruta, "mensaje": "no cumple ninguna opción de anyOf"}) }
+    }
+    si (tiene_clave(s, "oneOf")) {
+        sea ok = 0
+        para sub en s["oneOf"] {
+            sea e2 = []
+            sea r = _js_validar(sub, v, ruta, raiz, e2, ctx)
+            si (longitud(e2) == 0) { ok = ok + 1  _js_unir_ev(ev, r) }
+        }
+        si (ok != 1) { errs.agregar({"ruta": ruta, "mensaje": "debe cumplir exactamente una opción de oneOf (cumple " + ok + ")"}) }
+    }
+    si (tiene_clave(s, "not")) {
+        sea e2 = []
+        _js_validar(s["not"], v, ruta, raiz, e2, ctx)
+        si (longitud(e2) == 0) { errs.agregar({"ruta": ruta, "mensaje": "no debería cumplir el esquema de not"}) }
+    }
+    si (tiene_clave(s, "if")) {
+        sea e2 = []
+        sea r = _js_validar(s["if"], v, ruta, raiz, e2, ctx)
+        si (longitud(e2) == 0) {
+            _js_unir_ev(ev, r)
+            si (tiene_clave(s, "then")) { _js_unir_ev(ev, _js_validar(s["then"], v, ruta, raiz, errs, ctx)) }
+        } sino { si (tiene_clave(s, "else")) { _js_unir_ev(ev, _js_validar(s["else"], v, ruta, raiz, errs, ctx)) } }
+    }
+    si (tipo(v) == "mapa" y tiene_clave(s, "unevaluatedProperties")) {
+        para k en claves(v) {
+            si (tiene_clave(ev["props"], k) == falso) {
+                _js_validar(s["unevaluatedProperties"], v[k], ruta + "/" + _fm_escapar_ptr(k), raiz, errs, ctx)
+                ev["props"][k] = verdadero
+            }
+        }
+    }
+    si (tipo(v) == "lista" y tiene_clave(s, "unevaluatedItems") y ev["todos_items"] == falso) {
+        sea i = ev["items"] + 1
+        mientras (i < longitud(v)) {
+            _js_validar(s["unevaluatedItems"], v[i], ruta + "/" + i, raiz, errs, ctx)
+            i = i + 1
+        }
+        ev["todos_items"] = verdadero
+    }
+    retornar ev
+}
+
+funcion _js_unir_ev(a, b) {
+    para k en claves(b["props"]) { a["props"][k] = verdadero }
+    a["items"] = maximo(a["items"], b["items"])
+    si (b["todos_items"]) { a["todos_items"] = verdadero }
+}
+
+/// Valida doc contra un esquema JSON Schema (2020-12: tipos, enum, const,
+/// números, textos con pattern y format, arreglos con prefixItems, items,
+/// contains, objetos con properties, patternProperties,
+/// additionalProperties, required, dependent*, propertyNames, allOf, anyOf,
+/// oneOf, not, if/then/else, $ref local, $defs y unevaluated*).
+/// opciones: formatos (verdadero: valida "format"). Devuelve
+/// {"valido", "errores": [{"ruta", "mensaje"}]}.
+funcion formatos_validar(esquema, doc, opciones) {
+    sea errs = []
+    _js_validar(esquema, doc, "", esquema, errs, opciones ?? {})
+    retornar {"valido": longitud(errs) == 0, "errores": errs}
+}

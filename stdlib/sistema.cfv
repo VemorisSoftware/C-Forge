@@ -1,0 +1,503 @@
+// stdlib/sistema.cfv — información del sistema al estilo sysinfo/psutil:
+// sistema operativo y núcleo, CPU (modelo, núcleos, carga y uso en %),
+// memoria y swap, discos (espacio libre por partición), red (bytes y
+// paquetes por interfaz), procesos (pid, nombre, estado, memoria, comando,
+// usuario, hilos), temperaturas y batería. En Linux lee /proc y /sys
+// (igual que psutil); en macOS usa sysctl, vm_stat y df. Inspirada en
+// sysinfo (MIT) y psutil (BSD). En inglés: importar "sysinfo".
+//
+//   importar "sistema"
+//   sistema_memoria()["porcentaje"]          // 42.5
+//   sistema_uso_cpu(200)["total"]            // % de uso medido en 200 ms
+//   para p en sistema_procesos() { mostrar([p["pid"], p["nombre"], p["memoria"]]) }
+
+funcion __sistema_declaraciones() {
+    extern "libc" funcion statvfs(ruta: texto, buf: puntero): entero
+    extern "libc" funcion popen(cmd: texto, modo: texto): puntero
+    extern "libc" funcion pclose(f: puntero): entero
+    extern "libc" funcion fread(buf: puntero, tam: entero, n: entero, f: puntero): entero
+    extern "libc" funcion sysconf(nombre: entero): largo
+}
+
+funcion _si_linux() { retornar existe_archivo("/proc/meminfo") }
+
+funcion _si_leer(ruta) {
+    si (existe_archivo(ruta) == falso) { retornar nulo }
+    sea r = nulo
+    intentar { r = leer_archivo(ruta) } capturar (e) { r = nulo }
+    retornar r
+}
+
+funcion _si_recortar(t) {
+    si (t == nulo) { retornar nulo }
+    retornar texto_recortar(t)
+}
+
+/// Salida de un comando del sistema (o nulo si falla).
+funcion sistema_comando(cmd) {
+    sea f = popen(cmd + " 2>/dev/null", "r")
+    si (f == 0) { retornar nulo }
+    sea buf = c_reservar(4096)
+    sea r = ""
+    mientras (verdadero) {
+        sea n = fread(buf, 1, 4096, f)
+        si (n <= 0) { romper }
+        r = r + c_bytes(buf, n)
+    }
+    c_liberar(buf)
+    pclose(f)
+    retornar r
+}
+
+funcion _si_numeros(linea) {
+    sea r = []
+    para p en texto_dividir(texto_reemplazar(texto_reemplazar(linea, "\t", " "), "\n", " "), " ") { si (p != "" y texto_indice("0123456789", subcadena(p, 0, 1)) >= 0) { r.agregar(a_numero(p)) } }
+    retornar r
+}
+
+funcion _si_campos(linea) {
+    sea r = []
+    para p en texto_dividir(texto_reemplazar(linea, "\t", " "), " ") { si (p != "") { r.agregar(p) } }
+    retornar r
+}
+
+// ── Sistema ───────────────────────────────────────────────────────────────
+
+/// {"so", "nombre", "version", "nucleo", "arquitectura", "equipo",
+///  "arranque_ms", "activo_s"}
+funcion sistema_info() {
+    si (_si_linux()) {
+        sea r = {"so": "linux", "nombre": "Linux", "version": nulo, "nucleo": _si_recortar(_si_leer("/proc/sys/kernel/osrelease")), "equipo": _si_recortar(_si_leer("/proc/sys/kernel/hostname")), "arquitectura": nulo}
+        sea osr = _si_leer("/etc/os-release") ?? ""
+        para l en texto_dividir(osr, "\n") {
+            sea e = texto_indice(l, "=")
+            si (e > 0) {
+                sea k = subcadena(l, 0, e)
+                sea v = texto_reemplazar(subcadena(l, e + 1, longitud(l)), "\"", "")
+                si (k == "NAME") { r["nombre"] = v }
+                si (k == "VERSION_ID") { r["version"] = v }
+            }
+        }
+        sea up = _si_leer("/proc/uptime")
+        si (up != nulo) {
+            r["activo_s"] = a_numero(texto_dividir(texto_recortar(up), " ")[0])
+        }
+        sea st = _si_leer("/proc/stat") ?? ""
+        para l en texto_dividir(st, "\n") { si (texto_empieza_con(l, "btime ")) { r["arranque_ms"] = a_numero(subcadena(l, 6, longitud(l))) * 1000 } }
+        sea m = _si_recortar(sistema_comando("uname -m"))
+        r["arquitectura"] = m
+        retornar r
+    }
+    sea r = {"so": "macos", "nombre": "macOS", "version": _si_recortar(sistema_comando("sw_vers -productVersion")), "nucleo": _si_recortar(sistema_comando("uname -r")), "equipo": _si_recortar(sistema_comando("hostname")), "arquitectura": _si_recortar(sistema_comando("uname -m"))}
+    sea bt = sistema_comando("sysctl -n kern.boottime") ?? ""
+    sea i = texto_indice(bt, "sec = ")
+    si (i >= 0) {
+        sea s = a_numero(_si_numeros(subcadena(bt, i + 6, longitud(bt)))[0])
+        r["arranque_ms"] = s * 1000
+        r["activo_s"] = (tiempo_actual() * 1000 - s * 1000) / 1000
+    }
+    retornar r
+}
+
+// ── CPU ───────────────────────────────────────────────────────────────────
+
+/// {"modelo", "nucleos" (lógicos), "fisicos", "mhz", "carga": [1, 5, 15 min]}
+funcion sistema_cpu() {
+    si (_si_linux()) {
+        sea info = _si_leer("/proc/cpuinfo") ?? ""
+        sea modelo = nulo
+        sea logicos = 0
+        sea fisicos = {}
+        sea fisico_actual = "0"
+        sea mhz = nulo
+        para l en texto_dividir(info, "\n") {
+            sea e = texto_indice(l, ":")
+            si (e > 0) {
+                sea k = texto_recortar(subcadena(l, 0, e))
+                sea v = texto_recortar(subcadena(l, e + 1, longitud(l)))
+                si (k == "processor") { logicos = logicos + 1 }
+                si ((k == "model name" o k == "Hardware" o k == "cpu model") y modelo == nulo) { modelo = v }
+                si (k == "physical id") { fisico_actual = v }
+                si (k == "core id") { fisicos[fisico_actual + ":" + v] = verdadero }
+                si (k == "cpu MHz" y mhz == nulo) { mhz = a_numero(v) }
+            }
+        }
+        sea carga = [0, 0, 0]
+        sea la = _si_leer("/proc/loadavg")
+        si (la != nulo) {
+            sea p = texto_dividir(la, " ")
+            carga = [a_numero(p[0]), a_numero(p[1]), a_numero(p[2])]
+        }
+        sea nf = longitud(claves(fisicos))
+        si (nf == 0) { nf = nulo }
+        retornar {"modelo": modelo, "nucleos": logicos, "fisicos": nf, "mhz": mhz, "carga": carga}
+    }
+    sea la = _si_numeros(texto_reemplazar(texto_reemplazar(sistema_comando("sysctl -n vm.loadavg") ?? "", caracter(123), ""), caracter(125), ""))
+    retornar {"modelo": _si_recortar(sistema_comando("sysctl -n machdep.cpu.brand_string")), "nucleos": a_numero(_si_recortar(sistema_comando("sysctl -n hw.logicalcpu")) ?? "0"), "fisicos": a_numero(_si_recortar(sistema_comando("sysctl -n hw.physicalcpu")) ?? "0"), "mhz": nulo, "carga": la}
+}
+
+funcion _si_stat() {
+    sea r = {}
+    para l en texto_dividir(_si_leer("/proc/stat") ?? "", "\n") {
+        si (texto_empieza_con(l, "cpu")) {
+            sea c = _si_campos(l)
+            sea v = []
+            sea i = 1
+            mientras (i < longitud(c)) { v.agregar(a_numero(c[i]))  i = i + 1 }
+            r[c[0]] = v
+        }
+    }
+    retornar r
+}
+
+funcion _si_pct(a, b) {
+    // user nice system idle iowait irq softirq steal guest guest_nice
+    sea ta = 0
+    sea tb = 0
+    sea i = 0
+    mientras (i < minimo(8, longitud(a))) { ta = ta + a[i]  tb = tb + b[i]  i = i + 1 }
+    sea inactivo_a = a[3] + (a[4] ?? 0)
+    sea inactivo_b = b[3] + (b[4] ?? 0)
+    sea total = tb - ta
+    si (total <= 0) { retornar 0 }
+    retornar redondear(100 * (total - (inactivo_b - inactivo_a)) / total, 1)
+}
+
+/// Uso de CPU en % durante intervalo_ms (100 por defecto): {"total",
+/// "nucleos": [%…]}.
+funcion sistema_uso_cpu(intervalo_ms) {
+    si (_si_linux()) {
+        sea a = _si_stat()
+        dormir(intervalo_ms ?? 100)
+        sea b = _si_stat()
+        sea por = []
+        sea i = 0
+        mientras (tiene_clave(a, "cpu" + i)) {
+            por.agregar(_si_pct(a["cpu" + i], b["cpu" + i]))
+            i = i + 1
+        }
+        retornar {"total": _si_pct(a["cpu"], b["cpu"]), "nucleos": por}
+    }
+    sea t = sistema_comando("top -l 2 -n 0 -s " + maximo(1, redondear((intervalo_ms ?? 1000) / 1000)) + " | grep 'CPU usage' | tail -1") ?? ""
+    sea n = _si_numeros(texto_reemplazar(t, "%", " "))
+    si (longitud(n) >= 3) { retornar {"total": redondear(100 - n[2], 1), "nucleos": []} }
+    retornar {"total": nulo, "nucleos": []}
+}
+
+// ── Memoria ───────────────────────────────────────────────────────────────
+
+/// Bytes: {"total", "disponible", "usada", "libre", "porcentaje", "buffers",
+/// "cache", "swap_total", "swap_libre", "swap_usada"} (como psutil).
+funcion sistema_memoria() {
+    si (_si_linux()) {
+        sea m = {}
+        para l en texto_dividir(_si_leer("/proc/meminfo") ?? "", "\n") {
+            sea e = texto_indice(l, ":")
+            si (e > 0) {
+                sea ns = _si_numeros(subcadena(l, e + 1, longitud(l)))
+                si (longitud(ns) > 0) { m[subcadena(l, 0, e)] = ns[0] * 1024 }
+            }
+        }
+        sea total = m["MemTotal"] ?? 0
+        sea libre = m["MemFree"] ?? 0
+        sea disp = m["MemAvailable"] ?? (libre + (m["Buffers"] ?? 0) + (m["Cached"] ?? 0))
+        si (disp > total) { disp = libre }
+        sea st = m["SwapTotal"] ?? 0
+        sea sl = m["SwapFree"] ?? 0
+        sea pct = 0
+        si (total > 0) { pct = redondear(100 * (total - disp) / total, 1) }
+        retornar {"total": total, "disponible": disp, "usada": total - disp, "libre": libre, "porcentaje": pct, "buffers": m["Buffers"] ?? 0, "cache": (m["Cached"] ?? 0) + (m["SReclaimable"] ?? 0), "swap_total": st, "swap_libre": sl, "swap_usada": st - sl}
+    }
+    sea total = a_numero(_si_recortar(sistema_comando("sysctl -n hw.memsize")) ?? "0")
+    sea vm = sistema_comando("vm_stat") ?? ""
+    sea pagina = 4096
+    sea i = texto_indice(vm, "page size of ")
+    si (i >= 0) { pagina = _si_numeros(subcadena(vm, i + 13, longitud(vm)))[0] }
+    sea paginas = {}
+    para l en texto_dividir(vm, "\n") {
+        sea e = texto_indice(l, ":")
+        si (e > 0) {
+            sea ns = _si_numeros(texto_reemplazar(subcadena(l, e + 1, longitud(l)), ".", ""))
+            si (longitud(ns) > 0) { paginas[texto_recortar(subcadena(l, 0, e))] = ns[0] * pagina }
+        }
+    }
+    sea libre = paginas["Pages free"] ?? 0
+    sea disp = libre + (paginas["Pages inactive"] ?? 0) + (paginas["Pages purgeable"] ?? 0)
+    sea pct = 0
+    si (total > 0) { pct = redondear(100 * (total - disp) / total, 1) }
+    retornar {"total": total, "disponible": disp, "usada": total - disp, "libre": libre, "porcentaje": pct, "buffers": 0, "cache": 0, "swap_total": nulo, "swap_libre": nulo, "swap_usada": nulo}
+}
+
+// ── Discos ────────────────────────────────────────────────────────────────
+
+sea _SI_FS_VIRTUALES = {"proc": 1, "sysfs": 1, "devtmpfs": 1, "devpts": 1, "tmpfs": 1, "cgroup": 1, "cgroup2": 1, "pstore": 1, "securityfs": 1, "debugfs": 1, "tracefs": 1, "configfs": 1, "fusectl": 1, "mqueue": 1, "hugetlbfs": 1, "bpf": 1, "autofs": 1, "binfmt_misc": 1, "overlay": 0, "nsfs": 1, "ramfs": 1, "rpc_pipefs": 1, "squashfs": 1}
+
+/// Espacio de una ruta: {"total", "libre" (para el usuario), "usada",
+/// "porcentaje"} en bytes.
+funcion sistema_espacio(ruta) {
+    si (_si_linux()) {
+        sea buf = c_reservar(256)
+        sea rc = statvfs("" + ruta, buf)
+        si (rc != 0) {
+            c_liberar(buf)
+            retornar nulo
+        }
+        sea frsize = c_leer64(buf, 8)
+        si (frsize == 0) { frsize = c_leer64(buf, 0) }
+        sea total = c_leer64(buf, 16) * frsize
+        sea bfree = c_leer64(buf, 24) * frsize
+        sea bavail = c_leer64(buf, 32) * frsize
+        c_liberar(buf)
+        sea usada = total - bfree
+        sea pct = 0
+        si (usada + bavail > 0) { pct = redondear(100 * usada / (usada + bavail), 1) }
+        retornar {"total": total, "libre": bavail, "usada": usada, "porcentaje": pct}
+    }
+    sea d = sistema_comando("df -k '" + texto_reemplazar("" + ruta, "'", "") + "'") ?? ""
+    sea l = texto_dividir(texto_recortar(d), "\n")
+    si (longitud(l) < 2) { retornar nulo }
+    sea c = _si_campos(l[1])
+    sea total = a_numero(c[1]) * 1024
+    sea usada = a_numero(c[2]) * 1024
+    sea libre = a_numero(c[3]) * 1024
+    retornar {"total": total, "libre": libre, "usada": usada, "porcentaje": redondear(100 * usada / maximo(1, usada + libre), 1)}
+}
+
+/// Particiones montadas: [{"dispositivo", "montaje", "tipo", "total",
+/// "libre", "usada", "porcentaje"}]. todas: verdadero incluye las virtuales.
+funcion sistema_discos(todas) {
+    sea r = []
+    si (_si_linux()) {
+        sea vistos = {}
+        para l en texto_dividir(_si_leer("/proc/mounts") ?? "", "\n") {
+            sea c = _si_campos(l)
+            si (longitud(c) >= 3) {
+                sea virtual = (_SI_FS_VIRTUALES[c[2]] ?? 0) == 1
+                si ((todas == verdadero o virtual == falso) y tiene_clave(vistos, c[1]) == falso) {
+                    vistos[c[1]] = verdadero
+                    sea montaje = texto_reemplazar(c[1], "\\040", " ")
+                    sea e = sistema_espacio(montaje)
+                    sea d = {"dispositivo": c[0], "montaje": montaje, "tipo": c[2]}
+                    si (e != nulo) { para k en claves(e) { d[k] = e[k] } }
+                    r.agregar(d)
+                }
+            }
+        }
+        retornar r
+    }
+    sea lineas = texto_dividir(sistema_comando("df -k -T nodevfs,autofs 2>/dev/null || df -k") ?? "", "\n")
+    sea i = 1
+    mientras (i < longitud(lineas)) {
+        sea c = _si_campos(lineas[i])
+        si (longitud(c) >= 6) {
+            sea total = a_numero(c[1]) * 1024
+            sea usada = a_numero(c[2]) * 1024
+            sea libre = a_numero(c[3]) * 1024
+            r.agregar({"dispositivo": c[0], "montaje": c[longitud(c) - 1], "tipo": nulo, "total": total, "usada": usada, "libre": libre, "porcentaje": redondear(100 * usada / maximo(1, usada + libre), 1)})
+        }
+        i = i + 1
+    }
+    retornar r
+}
+
+// ── Red ───────────────────────────────────────────────────────────────────
+
+/// Contadores por interfaz: {"eth0": {"recibidos", "enviados",
+/// "paquetes_recibidos", "paquetes_enviados", "errores_entrada",
+/// "errores_salida", "descartados_entrada", "descartados_salida"}}.
+funcion sistema_red() {
+    sea r = {}
+    si (_si_linux()) {
+        para l en texto_dividir(_si_leer("/proc/net/dev") ?? "", "\n") {
+            sea e = texto_indice(l, ":")
+            si (e > 0) {
+                sea n = _si_numeros(subcadena(l, e + 1, longitud(l)))
+                si (longitud(n) >= 16) { r[texto_recortar(subcadena(l, 0, e))] = {"recibidos": n[0], "paquetes_recibidos": n[1], "errores_entrada": n[2], "descartados_entrada": n[3], "enviados": n[8], "paquetes_enviados": n[9], "errores_salida": n[10], "descartados_salida": n[11]} }
+            }
+        }
+        retornar r
+    }
+    para l en texto_dividir(sistema_comando("netstat -ibn") ?? "", "\n") {
+        sea c = _si_campos(l)
+        si (longitud(c) >= 10 y texto_indice(c[2], "Link") >= 0 y tiene_clave(r, c[0]) == falso) {
+            sea k = longitud(c)
+            r[c[0]] = {"recibidos": a_numero(c[k - 5]), "paquetes_recibidos": a_numero(c[k - 7]), "errores_entrada": a_numero(c[k - 6]), "descartados_entrada": 0, "enviados": a_numero(c[k - 2]), "paquetes_enviados": a_numero(c[k - 4]), "errores_salida": a_numero(c[k - 3]), "descartados_salida": 0}
+        }
+    }
+    retornar r
+}
+
+// ── Procesos ──────────────────────────────────────────────────────────────
+
+sea _SI_ESTADOS = {"R": "ejecutando", "S": "durmiendo", "D": "esperando_disco", "Z": "zombi", "T": "detenido", "t": "rastreado", "X": "muerto", "I": "inactivo", "W": "paginando", "P": "estacionado"}
+
+funcion _si_pagina() {
+    sea p = 4096
+    intentar { p = sysconf(30) } capturar (e) { p = 4096 }
+    si (p <= 0) { p = 4096 }
+    retornar p
+}
+
+funcion _si_ticks() {
+    sea t = 100
+    intentar { t = sysconf(2) } capturar (e) { t = 100 }
+    si (t <= 0) { t = 100 }
+    retornar t
+}
+
+/// Datos de un proceso (o nulo si no existe): {"pid", "ppid", "nombre",
+/// "estado", "memoria" (RSS en bytes), "virtual", "hilos", "usuario" (uid),
+/// "comando" ([args]), "cpu_s" (tiempo de CPU), "inicio_ms"}.
+funcion sistema_proceso(pid) {
+    si (_si_linux()) {
+        sea base = "/proc/" + pid
+        sea st = _si_leer(base + "/stat")
+        si (st == nulo) { retornar nulo }
+        // El nombre va entre paréntesis y puede tener espacios.
+        sea a = texto_indice(st, "(")
+        sea b = a
+        sea i = longitud(st) - 1
+        mientras (i > a) {
+            si (subcadena(st, i, i + 1) == ")") { b = i  i = a }
+            i = i - 1
+        }
+        sea nombre = subcadena(st, a + 1, b)
+        sea c = _si_campos(subcadena(st, b + 2, longitud(st)))
+        sea pagina = _si_pagina()
+        sea ticks = _si_ticks()
+        sea r = {"pid": pid, "nombre": nombre, "estado": _SI_ESTADOS[c[0]] ?? c[0], "ppid": a_numero(c[1]), "hilos": a_numero(c[17]), "cpu_s": (a_numero(c[11]) + a_numero(c[12])) / ticks, "virtual": a_numero(c[20]), "memoria": a_numero(c[21]) * pagina}
+        sea up_txt = _si_leer("/proc/stat") ?? ""
+        para l en texto_dividir(up_txt, "\n") { si (texto_empieza_con(l, "btime ")) { r["inicio_ms"] = (a_numero(subcadena(l, 6, longitud(l))) + a_numero(c[19]) / ticks) * 1000 } }
+        sea sta = _si_leer(base + "/status") ?? ""
+        para l en texto_dividir(sta, "\n") {
+            si (texto_empieza_con(l, "Uid:")) { r["usuario"] = _si_numeros(subcadena(l, 4, longitud(l)))[0] }
+            si (texto_empieza_con(l, "Name:")) { r["nombre_corto"] = texto_recortar(subcadena(l, 5, longitud(l))) }
+        }
+        sea cmd = _si_leer(base + "/cmdline") ?? ""
+        sea args = []
+        para x en texto_dividir(cmd, caracter(0)) { si (x != "") { args.agregar(x) } }
+        r["comando"] = args
+        retornar r
+    }
+    sea s = sistema_comando("ps -o pid=,ppid=,rss=,vsz=,uid=,state=,time=,comm= -p " + pid) ?? ""
+    sea c = _si_campos(texto_recortar(s))
+    si (longitud(c) < 8) { retornar nulo }
+    sea nombre = c[7]
+    sea k = 8
+    mientras (k < longitud(c)) { nombre = nombre + " " + c[k]  k = k + 1 }
+    sea partes = texto_dividir(nombre, "/")
+    retornar {"pid": a_numero(c[0]), "ppid": a_numero(c[1]), "memoria": a_numero(c[2]) * 1024, "virtual": a_numero(c[3]) * 1024, "usuario": a_numero(c[4]), "estado": _SI_ESTADOS[subcadena(c[5], 0, 1)] ?? c[5], "nombre": partes[longitud(partes) - 1], "comando": [nombre], "hilos": nulo, "cpu_s": nulo}
+}
+
+/// Todos los procesos visibles, ordenados por pid.
+funcion sistema_procesos() {
+    sea r = []
+    si (_si_linux()) {
+        sea pids = []
+        para n en listar_carpeta("/proc") {
+            si (n != "" y texto_indice("0123456789", subcadena(n, 0, 1)) >= 0) { pids.agregar(a_numero(n)) }
+        }
+        pids = ordenar(pids, funcion(a, b) { retornar a - b })
+        para p en pids {
+            sea x = sistema_proceso(p)
+            si (x != nulo) { r.agregar(x) }
+        }
+        retornar r
+    }
+    para l en texto_dividir(sistema_comando("ps -axo pid=") ?? "", "\n") {
+        sea n = texto_recortar(l)
+        si (n != "") {
+            sea x = sistema_proceso(a_numero(n))
+            si (x != nulo) { r.agregar(x) }
+        }
+    }
+    retornar r
+}
+
+/// Pid de este programa.
+funcion sistema_pid() {
+    si (_si_linux()) {
+        sea enlace = _si_leer("/proc/self/stat")
+        si (enlace != nulo) { retornar a_numero(texto_dividir(enlace, " ")[0]) }
+    }
+    retornar a_numero(_si_recortar(sistema_comando("echo $PPID")) ?? "0")
+}
+
+/// Procesos cuyo nombre contiene el texto (sin distinguir mayúsculas).
+funcion sistema_buscar_procesos(texto) {
+    sea r = []
+    sea t = texto_minusculas("" + texto)
+    para p en sistema_procesos() {
+        sea cmd = ""
+        si (longitud(p["comando"] ?? []) > 0) { cmd = p["comando"][0] }
+        si (texto_indice(texto_minusculas(p["nombre"]), t) >= 0 o texto_indice(texto_minusculas(cmd), t) >= 0) { r.agregar(p) }
+    }
+    retornar r
+}
+
+// ── Sensores ──────────────────────────────────────────────────────────────
+
+/// Temperaturas en °C: [{"sensor", "etiqueta", "actual", "maxima", "critica"}].
+funcion sistema_temperaturas() {
+    sea r = []
+    si (_si_linux() == falso) { retornar r }
+    si (es_carpeta("/sys/class/hwmon")) {
+        para h en listar_carpeta("/sys/class/hwmon") {
+            sea base = "/sys/class/hwmon/" + h
+            sea nombre = _si_recortar(_si_leer(base + "/name")) ?? h
+            para f en listar_carpeta(base) {
+                si (texto_empieza_con(f, "temp") y texto_termina_con(f, "_input")) {
+                    sea pre = subcadena(f, 0, longitud(f) - 6)
+                    sea v = _si_leer(base + "/" + f)
+                    si (v != nulo) {
+                        sea maxv = _si_leer(base + "/" + pre + "_max")
+                        sea crit = _si_leer(base + "/" + pre + "_crit")
+                        sea x = {"sensor": nombre, "etiqueta": _si_recortar(_si_leer(base + "/" + pre + "_label")) ?? pre, "actual": a_numero(texto_recortar(v)) / 1000, "maxima": nulo, "critica": nulo}
+                        si (maxv != nulo) { x["maxima"] = a_numero(texto_recortar(maxv)) / 1000 }
+                        si (crit != nulo) { x["critica"] = a_numero(texto_recortar(crit)) / 1000 }
+                        r.agregar(x)
+                    }
+                }
+            }
+        }
+    }
+    si (longitud(r) == 0 y es_carpeta("/sys/class/thermal")) {
+        para z en listar_carpeta("/sys/class/thermal") {
+            si (texto_empieza_con(z, "thermal_zone")) {
+                sea v = _si_leer("/sys/class/thermal/" + z + "/temp")
+                si (v != nulo) { r.agregar({"sensor": _si_recortar(_si_leer("/sys/class/thermal/" + z + "/type")) ?? z, "etiqueta": z, "actual": a_numero(texto_recortar(v)) / 1000, "maxima": nulo, "critica": nulo}) }
+            }
+        }
+    }
+    retornar r
+}
+
+/// Batería: {"porcentaje", "enchufado", "segundos_restantes"} o nulo.
+funcion sistema_bateria() {
+    si (_si_linux()) {
+        si (es_carpeta("/sys/class/power_supply") == falso) { retornar nulo }
+        para b en listar_carpeta("/sys/class/power_supply") {
+            sea base = "/sys/class/power_supply/" + b
+            si (_si_recortar(_si_leer(base + "/type")) == "Battery") {
+                sea cap = _si_leer(base + "/capacity")
+                sea est = _si_recortar(_si_leer(base + "/status")) ?? ""
+                retornar {"porcentaje": a_numero(texto_recortar(cap ?? "0")), "enchufado": est == "Charging" o est == "Full" o est == "Not charging", "segundos_restantes": nulo}
+            }
+        }
+        retornar nulo
+    }
+    sea t = sistema_comando("pmset -g batt") ?? ""
+    sea i = texto_indice(t, "%")
+    si (i < 0) { retornar nulo }
+    sea j = i - 1
+    mientras (j > 0 y texto_indice("0123456789", subcadena(t, j - 1, j)) >= 0) { j = j - 1 }
+    retornar {"porcentaje": a_numero(subcadena(t, j, i)), "enchufado": texto_indice(t, "AC Power") >= 0, "segundos_restantes": nulo}
+}
+
+/// Resumen legible (para registros o una línea de estado).
+funcion sistema_resumen() {
+    sea m = sistema_memoria()
+    sea c = sistema_cpu()
+    sea i = sistema_info()
+    retornar (i["nombre"] ?? "") + " " + (i["version"] ?? "") + " · " + c["nucleos"] + " núcleos · carga " + c["carga"][0] + " · memoria " + m["porcentaje"] + "% de " + redondear(m["total"] / 1073741824, 1) + " GiB"
+}
