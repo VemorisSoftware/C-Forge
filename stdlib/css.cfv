@@ -1,0 +1,258 @@
+// stdlib/css.cfv — CSS: minificador seguro (respeta textos, url() y calc())
+// y analizador a reglas. Inspirada en LightningCSS (MPL: solo la idea).
+// Nombres en español e inglés en el mismo módulo.
+//
+//   importar "css"
+//   css_minificar("a { color : #ffffff ; margin: 0px }")   // "a{color:#fff;margin:0}"
+//   sea reglas = css_analizar(texto)   // [{"selector": "a", "declaraciones": [["color", "red"]]}, …]
+//   css_texto(reglas)                   // de vuelta a CSS legible
+//
+// Las @reglas con bloque (@media, @supports…) llevan "reglas" dentro; las
+// de una línea (@import, @charset) llevan "valor".
+
+funcion _css_es_blanco(c) { retornar c == " " o c == "\n" o c == "\t" o c == "\r" o c == caracter(12) }
+
+// Divide en piezas: textos entre comillas, comentarios (se descartan),
+// espacios (colapsados a uno) y el resto carácter a carácter.
+funcion _css_piezas(t) {
+    sea p = []
+    sea i = 0
+    sea n = longitud(t)
+    mientras (i < n) {
+        sea c = subcadena(t, i, i + 1)
+        si (c == "/" y subcadena(t, i, i + 2) == "/*") {
+            sea fin = texto_indice(subcadena(t, i + 2, n), "*/")
+            si (fin < 0) { i = n } sino { i = i + 2 + fin + 2 }
+            p.agregar(" ")
+        } sino {
+            si (c == "\"" o c == "'") {
+                sea j = i + 1
+                mientras (j < n y subcadena(t, j, j + 1) != c) {
+                    si (subcadena(t, j, j + 1) == "\\") { j = j + 1 }
+                    j = j + 1
+                }
+                p.agregar(subcadena(t, i, minimo(j + 1, n)))
+                i = j + 1
+            } sino {
+                si (_css_es_blanco(c)) {
+                    mientras (i < n y _css_es_blanco(subcadena(t, i, i + 1))) { i = i + 1 }
+                    p.agregar(" ")
+                } sino {
+                    p.agregar(c)
+                    i = i + 1
+                }
+            }
+        }
+    }
+    retornar p
+}
+
+sea _CSS_SIN_ESPACIO = {"{": 1, "}": 1, ";": 1, ":": 1, ",": 1, ">": 1, "~": 1, "(": 1, ")": 1}
+
+funcion _css_hex(c) { retornar texto_indice("0123456789abcdefABCDEF", c) >= 0 }
+
+// #aabbcc → #abc ; 0px/0em/… → 0 ; 0.5 → .5
+funcion _css_corto(palabra) {
+    sea w = palabra
+    si (longitud(w) == 7 y subcadena(w, 0, 1) == "#") {
+        sea ok = verdadero
+        sea k = 1
+        mientras (k < 7) { si (_css_hex(subcadena(w, k, k + 1)) == falso) { ok = falso }  k = k + 1 }
+        si (ok) {
+            sea x = texto_minusculas(w)
+            si (subcadena(x, 1, 2) == subcadena(x, 2, 3) y subcadena(x, 3, 4) == subcadena(x, 4, 5) y subcadena(x, 5, 6) == subcadena(x, 6, 7)) {
+                retornar "#" + subcadena(x, 1, 2) + subcadena(x, 3, 4) + subcadena(x, 5, 6)
+            }
+            retornar x
+        }
+    }
+    para u en ["px", "em", "rem", "pt", "cm", "mm", "in", "pc", "ex", "ch", "vw", "vh", "vmin", "vmax"] {
+        si (w == "0" + u o w == "0.0" + u) { retornar "0" }
+    }
+    si (texto_empieza_con(w, "0.") y longitud(w) > 2) { retornar subcadena(w, 1, longitud(w)) }
+    si (texto_empieza_con(w, "-0.") y longitud(w) > 3) { retornar "-" + subcadena(w, 2, longitud(w)) }
+    retornar w
+}
+
+funcion _css_palabra(c) {
+    retornar longitud(c) == 1 y (texto_indice(" {};:,>~()\"'", c) < 0) y (c != "+")
+}
+
+/// CSS mínimo equivalente. En calc() se conservan los espacios de + y -.
+funcion css_minificar(texto) {
+    sea p = _css_piezas("" + texto)
+    // Agrupar en palabras para poder acortarlas.
+    sea fichas = []
+    sea actual = ""
+    para x en p {
+        si (_css_palabra(x)) { actual = actual + x } sino {
+            si (actual != "") { fichas.agregar(actual)  actual = "" }
+            fichas.agregar(x)
+        }
+    }
+    si (actual != "") { fichas.agregar(actual) }
+    sea r = []
+    sea parentesis = 0
+    sea k = 0
+    mientras (k < longitud(fichas)) {
+        sea f = fichas[k]
+        si (f == "(") { parentesis = parentesis + 1 }
+        si (f == ")") { parentesis = parentesis - 1 }
+        si (f == " ") {
+            sea antes = ""
+            si (longitud(r) > 0) { antes = r[longitud(r) - 1] }
+            sea despues = ""
+            si (k + 1 < longitud(fichas)) { despues = fichas[k + 1] }
+            sea quitar = antes == "" o despues == "" o tiene_clave(_CSS_SIN_ESPACIO, antes) o tiene_clave(_CSS_SIN_ESPACIO, despues)
+            // "a + b" en selectores se puede pegar; dentro de calc() no.
+            si ((antes == "+" o despues == "+") y parentesis == 0) { quitar = verdadero }
+            // "@media (…)" y "and (…)" conservan el espacio por compatibilidad.
+            si (despues == "(" y (texto_empieza_con(antes, "@") o antes == "and" o antes == "or" o antes == "not")) { quitar = falso }
+            // ":" de pseudo-clase tras un espacio es un descendiente: "a :hover".
+            si (despues == ":" y antes != "" y tiene_clave(_CSS_SIN_ESPACIO, antes) == falso) {
+                sea j = k + 1
+                sea en_bloque = falso
+                mientras (j < longitud(fichas) y en_bloque == falso y fichas[j] != ";" y fichas[j] != "}") {
+                    si (fichas[j] == "{") { en_bloque = verdadero }
+                    j = j + 1
+                }
+                si (en_bloque) { quitar = falso }
+            }
+            si (quitar == falso) { r.agregar(" ") }
+        } sino {
+            si (f == "}" y longitud(r) > 0 y r[longitud(r) - 1] == ";") { r[longitud(r) - 1] = "}" } sino {
+                si (f == ";" y longitud(r) > 0 y r[longitud(r) - 1] == ";") { } sino { r.agregar(_css_corto(f)) }
+            }
+        }
+        k = k + 1
+    }
+    // Quitar reglas vacías "x{}" (no dentro de @reglas con valor).
+    sea s = unir(r, "")
+    retornar _css_sin_vacias(s)
+}
+
+funcion _css_sin_vacias(s) {
+    sea cambio = verdadero
+    mientras (cambio) {
+        cambio = falso
+        sea p = texto_indice(s, "{}")
+        si (p > 0) {
+            sea ini = p - 1
+            mientras (ini >= 0 y subcadena(s, ini, ini + 1) != "}" y subcadena(s, ini, ini + 1) != "{" y subcadena(s, ini, ini + 1) != ";") { ini = ini - 1 }
+            s = subcadena(s, 0, ini + 1) + subcadena(s, p + 2, longitud(s))
+            cambio = verdadero
+        }
+    }
+    retornar s
+}
+
+// ── Analizador ────────────────────────────────────────────────────────────
+
+funcion _css_bloque(st) {
+    sea reglas = []
+    sea buf = ""
+    mientras (st["i"] < longitud(st["p"])) {
+        sea x = st["p"][st["i"]]
+        st["i"] = st["i"] + 1
+        si (x == "}") { retornar reglas }
+        si (x == ";") {
+            sea t = texto_recortar(buf)
+            si (texto_empieza_con(t, "@")) {
+                sea sp = texto_indice(t, " ")
+                si (sp < 0) { sp = longitud(t) }
+                reglas.agregar({"arroba": subcadena(t, 1, sp), "valor": texto_recortar(subcadena(t, sp, longitud(t)))})
+            }
+            buf = ""
+        } sino {
+            si (x == "{") {
+                sea sel = texto_recortar(buf)
+                buf = ""
+                si (texto_empieza_con(sel, "@")) {
+                    sea sp = texto_indice(sel, " ")
+                    si (sp < 0) { sp = longitud(sel) }
+                    sea nombre = subcadena(sel, 1, sp)
+                    sea dentro = {"arroba": nombre, "valor": texto_recortar(subcadena(sel, sp, longitud(sel)))}
+                    si (nombre == "font-face" o nombre == "page" o nombre == "property") { dentro["declaraciones"] = _css_declaraciones(st) } sino { dentro["reglas"] = _css_bloque(st) }
+                    reglas.agregar(dentro)
+                } sino {
+                    reglas.agregar({"selector": sel, "declaraciones": _css_declaraciones(st)})
+                }
+            } sino { buf = buf + x }
+        }
+    }
+    retornar reglas
+}
+
+funcion _css_declaraciones(st) {
+    sea d = []
+    sea buf = ""
+    sea prof = 0
+    sea seguir = verdadero
+    mientras (seguir y st["i"] < longitud(st["p"])) {
+        sea x = st["p"][st["i"]]
+        st["i"] = st["i"] + 1
+        si (x == "(") { prof = prof + 1 }
+        si (x == ")") { prof = prof - 1 }
+        si ((x == ";" y prof == 0) o x == "}") {
+            sea dos = texto_indice(buf, ":")
+            si (dos > 0) { d.agregar([texto_minusculas(texto_recortar(subcadena(buf, 0, dos))), texto_recortar(subcadena(buf, dos + 1, longitud(buf)))]) }
+            buf = ""
+            si (x == "}") { seguir = falso }
+        } sino { buf = buf + x }
+    }
+    retornar d
+}
+
+/// Texto CSS → lista de reglas.
+funcion css_analizar(texto) {
+    sea st = {"p": _css_piezas("" + texto), "i": 0}
+    retornar _css_bloque(st)
+}
+
+funcion _css_escribir(reglas, sangria, l) {
+    para r en reglas {
+        si (tiene_clave(r, "selector")) {
+            l.agregar(sangria + r["selector"] + " {")
+            para d en r["declaraciones"] { l.agregar(sangria + "  " + d[0] + ": " + d[1] + ";") }
+            l.agregar(sangria + "}")
+        } sino {
+            sea cab = sangria + "@" + r["arroba"]
+            si (r["valor"] != "") { cab = cab + " " + r["valor"] }
+            si (tiene_clave(r, "reglas")) {
+                l.agregar(cab + " {")
+                _css_escribir(r["reglas"], sangria + "  ", l)
+                l.agregar(sangria + "}")
+            } sino {
+                si (tiene_clave(r, "declaraciones")) {
+                    l.agregar(cab + " {")
+                    para d en r["declaraciones"] { l.agregar(sangria + "  " + d[0] + ": " + d[1] + ";") }
+                    l.agregar(sangria + "}")
+                } sino { l.agregar(cab + ";") }
+            }
+        }
+    }
+}
+
+/// Reglas → CSS legible.
+funcion css_texto(reglas) {
+    sea l = []
+    _css_escribir(reglas, "", l)
+    retornar unir(l, "\n")
+}
+
+/// Valor de una propiedad en la última regla cuyo selector sea exactamente sel.
+funcion css_valor(reglas, sel, propiedad) {
+    sea v = nulo
+    para r en reglas {
+        si (tiene_clave(r, "selector")) {
+            si (r["selector"] == sel) { para d en r["declaraciones"] { si (d[0] == propiedad) { v = d[1] } } }
+        }
+    }
+    retornar v
+}
+
+// English names.
+funcion css_minify(texto) { retornar css_minificar(texto) }
+funcion css_parse(texto) { retornar css_analizar(texto) }
+funcion css_stringify(reglas) { retornar css_texto(reglas) }
+funcion css_value(reglas, sel, propiedad) { retornar css_valor(reglas, sel, propiedad) }

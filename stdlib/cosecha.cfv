@@ -1,0 +1,498 @@
+// stdlib/cosecha.cfv — leer HTML real (aunque esté mal formado) y extraer
+// datos con selectores CSS. Inspirada en Cheerio (MIT). En inglés:
+// importar "scrape".
+//
+//   importar "cosecha"
+//   sea doc = cosecha_cargar(html)
+//   para a en cosecha_buscar(doc, "article.noticia > h2 a[href]") {
+//       mostrar(cosecha_texto(a) + " → " + cosecha_attr(a, "href"))
+//   }
+//
+// Selectores: etiqueta, *, .clase, #id, [attr], [attr=v], [attr^=v],
+// [attr$=v], [attr*=v], descendiente (espacio), hijo (>), hermano (+ ~),
+// grupos con coma, :first-child, :last-child, :nth-child(n), :not(sel simple).
+// Nodo: {"nombre", "atributos", "hijos"} o un texto; cosecha_padre(n) da el padre.
+
+sea _CO_VACIOS = {"area": 1, "base": 1, "br": 1, "col": 1, "embed": 1, "hr": 1, "img": 1, "input": 1, "link": 1, "meta": 1, "source": 1, "track": 1, "wbr": 1, "param": 1}
+sea _CO_CRUDOS = {"script": 1, "style": 1, "textarea": 1, "title": 1}
+// Al abrir la clave se cierran implícitamente estas etiquetas abiertas.
+sea _CO_CIERRA = {"p": ["p"], "li": ["li"], "dt": ["dt", "dd"], "dd": ["dt", "dd"], "tr": ["tr", "td", "th"], "td": ["td", "th"], "th": ["td", "th"], "option": ["option"], "thead": ["tbody", "tfoot"], "tbody": ["thead", "tbody"], "tfoot": ["thead", "tbody"]}
+sea _CO_BLOQUES = {"div": 1, "ul": 1, "ol": 1, "table": 1, "h1": 1, "h2": 1, "h3": 1, "h4": 1, "h5": 1, "h6": 1, "section": 1, "article": 1, "header": 1, "footer": 1, "nav": 1, "form": 1, "pre": 1, "blockquote": 1}
+sea _CO_ENT = {"amp": "&", "lt": "<", "gt": ">", "quot": "\"", "apos": "'", "nbsp": " ", "aacute": "á", "eacute": "é", "iacute": "í", "oacute": "ó", "uacute": "ú", "ntilde": "ñ", "Ntilde": "Ñ", "copy": "©", "reg": "®", "euro": "€", "hellip": "…", "mdash": "—", "ndash": "–", "laquo": "«", "raquo": "»", "iexcl": "¡", "iquest": "¿", "uuml": "ü"}
+
+funcion _co_entidades(t) {
+    si (texto_indice(t, "&") < 0) { retornar t }
+    sea r = []
+    sea i = 0
+    mientras (i < longitud(t)) {
+        sea c = subcadena(t, i, i + 1)
+        sea hecho = falso
+        si (c == "&") {
+            sea fin = texto_indice(subcadena(t, i, minimo(longitud(t), i + 12)), ";")
+            si (fin > 1) {
+                sea e = subcadena(t, i + 1, i + fin)
+                sea v = nulo
+                si (tiene_clave(_CO_ENT, e)) { v = _CO_ENT[e] }
+                si (v == nulo y texto_empieza_con(e, "#")) {
+                    sea n = 0
+                    sea ok = verdadero
+                    sea base = 10
+                    sea digitos = subcadena(e, 1, longitud(e))
+                    si (texto_empieza_con(digitos, "x") o texto_empieza_con(digitos, "X")) { base = 16  digitos = subcadena(digitos, 1, longitud(digitos)) }
+                    para k en texto_dividir(texto_minusculas(digitos), "") {
+                        sea d = texto_indice("0123456789abcdef", k)
+                        si (d < 0 o d >= base) { ok = falso } sino { n = n * base + d }
+                    }
+                    si (ok y n > 0 y n < 1114112 y longitud(digitos) > 0) { v = caracter(n) }
+                }
+                si (v != nulo) { r.agregar(v)  i = i + fin + 1  hecho = verdadero }
+            }
+        }
+        si (hecho == falso) { r.agregar(c)  i = i + 1 }
+    }
+    retornar unir(r, "")
+}
+
+funcion _co_nombre_b(b) { retornar (b >= 97 y b <= 122) o (b >= 65 y b <= 90) o (b >= 48 y b <= 57) o b == 45 o b == 95 o b == 58 }
+funcion _co_blanco(b) { retornar b == 32 o b == 9 o b == 10 o b == 13 o b == 12 }
+
+// "padre" se guarda como función: así mostrar(nodo) o json_texto no entran
+// en un ciclo. Usa cosecha_padre(n).
+funcion _co_nodo(nombre, padre) {
+    si (padre == nulo) { retornar {"nombre": nombre, "atributos": {}, "hijos": [], "padre": nulo} }
+    retornar {"nombre": nombre, "atributos": {}, "hijos": [], "padre": funcion() { retornar padre }}
+}
+
+funcion cosecha_padre(n) {
+    si (n["padre"] == nulo) { retornar nulo }
+    retornar n["padre"]()
+}
+
+/// HTML → documento (nodo raíz "#documento"). Nunca lanza.
+funcion cosecha_cargar(html) {
+    sea t = "" + html
+    sea n = longitud(t)
+    sea raiz = _co_nodo("#documento", nulo)
+    sea pila = [raiz]
+    sea i = 0
+    mientras (i < n) {
+        sea actual = pila[longitud(pila) - 1]
+        sea lt = texto_indice(subcadena(t, i, n), "<")
+        si (lt < 0) { lt = n - i }
+        si (lt > 0) {
+            actual["hijos"].agregar(_co_entidades(subcadena(t, i, i + lt)))
+            i = i + lt
+        } sino {
+            si (subcadena(t, i, i + 4) == "<!--") {
+                sea f = texto_indice(subcadena(t, i + 4, n), "-->")
+                si (f < 0) { i = n } sino { i = i + 4 + f + 3 }
+            } sino {
+                si (subcadena(t, i, i + 2) == "<!" o subcadena(t, i, i + 2) == "<?") {
+                    sea f = texto_indice(subcadena(t, i, n), ">")
+                    si (f < 0) { i = n } sino { i = i + f + 1 }
+                } sino {
+                    si (subcadena(t, i, i + 2) == "</") {
+                        sea j = i + 2
+                        mientras (j < n y _co_nombre_b(byte_en(t, j))) { j = j + 1 }
+                        sea nombre = texto_minusculas(subcadena(t, i + 2, j))
+                        sea f = texto_indice(subcadena(t, j, n), ">")
+                        si (f < 0) { i = n } sino { i = j + f + 1 }
+                        // Cierra hasta la etiqueta (si está abierta); si no, se ignora.
+                        sea k = longitud(pila) - 1
+                        mientras (k > 0 y pila[k]["nombre"] != nombre) { k = k - 1 }
+                        si (k > 0) {
+                            sea nueva = []
+                            sea q = 0
+                            mientras (q < k) { nueva.agregar(pila[q])  q = q + 1 }
+                            pila = nueva
+                        }
+                    } sino {
+                        sea j = i + 1
+                        mientras (j < n y _co_nombre_b(byte_en(t, j))) { j = j + 1 }
+                        si (j == i + 1) {
+                            actual["hijos"].agregar("<")
+                            i = i + 1
+                        } sino {
+                            sea nombre = texto_minusculas(subcadena(t, i + 1, j))
+                            si (tiene_clave(_CO_CIERRA, nombre)) {
+                                sea k = longitud(pila) - 1
+                                sea corte = 0 - 1
+                                sea frenar = falso
+                                mientras (k > 0 y frenar == falso) {
+                                    sea abierto = pila[k]["nombre"]
+                                    para x en _CO_CIERRA[nombre] { si (x == abierto) { corte = k } }
+                                    si (tiene_clave(_CO_BLOQUES, abierto) o abierto == "table" o abierto == "ul" o abierto == "ol") { frenar = verdadero }
+                                    k = k - 1
+                                }
+                                si (corte > 0) {
+                                    sea nueva = []
+                                    sea q = 0
+                                    mientras (q < corte) { nueva.agregar(pila[q])  q = q + 1 }
+                                    pila = nueva
+                                }
+                            }
+                            si (nombre != "li" y nombre != "td" y nombre != "th" y nombre != "tr" y tiene_clave(_CO_BLOQUES, nombre)) {
+                                // Un bloque cierra un <p> abierto.
+                                si (pila[longitud(pila) - 1]["nombre"] == "p") {
+                                    sea nueva = []
+                                    sea q = 0
+                                    mientras (q < longitud(pila) - 1) { nueva.agregar(pila[q])  q = q + 1 }
+                                    pila = nueva
+                                }
+                            }
+                            actual = pila[longitud(pila) - 1]
+                            sea nodo = _co_nodo(nombre, actual)
+                            actual["hijos"].agregar(nodo)
+                            // Atributos
+                            sea auto = falso
+                            sea seguir = verdadero
+                            mientras (seguir y j < n) {
+                                mientras (j < n y _co_blanco(byte_en(t, j))) { j = j + 1 }
+                                si (j >= n) { seguir = falso } sino {
+                                    sea c = subcadena(t, j, j + 1)
+                                    si (c == ">") { j = j + 1  seguir = falso } sino {
+                                        si (c == "/") { auto = verdadero  j = j + 1 } sino {
+                                            sea ki = j
+                                            mientras (j < n y byte_en(t, j) != 61 y byte_en(t, j) != 62 y _co_blanco(byte_en(t, j)) == falso y byte_en(t, j) != 47) { j = j + 1 }
+                                            sea k = texto_minusculas(subcadena(t, ki, j))
+                                            mientras (j < n y _co_blanco(byte_en(t, j))) { j = j + 1 }
+                                            sea v = ""
+                                            si (j < n y byte_en(t, j) == 61) {
+                                                j = j + 1
+                                                mientras (j < n y _co_blanco(byte_en(t, j))) { j = j + 1 }
+                                                sea q = subcadena(t, j, j + 1)
+                                                si (q == "\"" o q == "'") {
+                                                    sea f = texto_indice(subcadena(t, j + 1, n), q)
+                                                    si (f < 0) { f = n - j - 1 }
+                                                    v = subcadena(t, j + 1, j + 1 + f)
+                                                    j = j + f + 2
+                                                } sino {
+                                                    sea vi = j
+                                                    mientras (j < n y _co_blanco(byte_en(t, j)) == falso y byte_en(t, j) != 62) { j = j + 1 }
+                                                    v = subcadena(t, vi, j)
+                                                }
+                                            }
+                                            si (k != "" y tiene_clave(nodo["atributos"], k) == falso) { nodo["atributos"][k] = _co_entidades(v) }
+                                            si (k == "") { j = j + 1 }
+                                        }
+                                    }
+                                }
+                            }
+                            i = j
+                            si (tiene_clave(_CO_CRUDOS, nombre)) {
+                                sea resto = texto_minusculas(subcadena(t, i, n))
+                                sea f = texto_indice(resto, "</" + nombre)
+                                si (f < 0) { f = n - i }
+                                sea crudo = subcadena(t, i, i + f)
+                                si (nombre == "title" o nombre == "textarea") { crudo = _co_entidades(crudo) }
+                                si (crudo != "") { nodo["hijos"].agregar(crudo) }
+                                sea g = texto_indice(subcadena(t, i + f, n), ">")
+                                si (g < 0) { i = n } sino { i = i + f + g + 1 }
+                            } sino {
+                                si (auto == falso y tiene_clave(_CO_VACIOS, nombre) == falso) { pila.agregar(nodo) }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+    retornar raiz
+}
+
+// ── Selectores ────────────────────────────────────────────────────────────
+
+// Un compuesto ("a.b#c[x=y]:first-child") → {"nombre", "id", "clases", "attrs", "pseudo"}.
+funcion _co_compuesto(s) {
+    sea r = {"nombre": "*", "id": nulo, "clases": [], "attrs": [], "pseudo": []}
+    sea i = 0
+    sea n = longitud(s)
+    sea leer_id = funcion(desde) {
+        sea j = desde
+        mientras (j < n y _co_nombre_b(byte_en(s, j)) y byte_en(s, j) != 58) { j = j + 1 }
+        retornar j
+    }
+    si (i < n y subcadena(s, 0, 1) != "." y subcadena(s, 0, 1) != "#" y subcadena(s, 0, 1) != "[" y subcadena(s, 0, 1) != ":") {
+        sea j = leer_id(0)
+        si (subcadena(s, 0, 1) == "*") { j = 1 }
+        r["nombre"] = texto_minusculas(subcadena(s, 0, j))
+        i = j
+    }
+    mientras (i < n) {
+        sea c = subcadena(s, i, i + 1)
+        si (c == "." o c == "#") {
+            sea j = leer_id(i + 1)
+            si (j == i + 1) { lanzar "cosecha: selector inválido " + s }
+            si (c == ".") { r["clases"].agregar(subcadena(s, i + 1, j)) } sino { r["id"] = subcadena(s, i + 1, j) }
+            i = j
+        } sino {
+            si (c == "[") {
+                sea f = texto_indice(subcadena(s, i, n), "]")
+                si (f < 0) { lanzar "cosecha: falta ] en " + s }
+                sea dentro = subcadena(s, i + 1, i + f)
+                sea op = nulo
+                sea k = dentro
+                sea v = nulo
+                para o en ["^=", "$=", "*=", "~=", "="] {
+                    si (op == nulo) {
+                        sea p = texto_indice(dentro, o)
+                        si (p > 0) { op = o  k = subcadena(dentro, 0, p)  v = subcadena(dentro, p + longitud(o), longitud(dentro)) }
+                    }
+                }
+                si (v != nulo) {
+                    v = texto_recortar(v)
+                    si ((texto_empieza_con(v, "\"") y texto_termina_con(v, "\"")) o (texto_empieza_con(v, "'") y texto_termina_con(v, "'"))) { v = subcadena(v, 1, longitud(v) - 1) }
+                }
+                r["attrs"].agregar([texto_minusculas(texto_recortar(k)), op, v])
+                i = i + f + 1
+            } sino {
+                si (c == ":") {
+                    sea j = i + 1
+                    mientras (j < n y (_co_nombre_b(byte_en(s, j)) y byte_en(s, j) != 58)) { j = j + 1 }
+                    sea nombre = subcadena(s, i + 1, j)
+                    sea arg = nulo
+                    si (j < n y subcadena(s, j, j + 1) == "(") {
+                        sea prof = 1
+                        sea k = j + 1
+                        mientras (k < n y prof > 0) {
+                            si (subcadena(s, k, k + 1) == "(") { prof = prof + 1 }
+                            si (subcadena(s, k, k + 1) == ")") { prof = prof - 1 }
+                            k = k + 1
+                        }
+                        arg = subcadena(s, j + 1, k - 1)
+                        j = k
+                    }
+                    si (nombre != "first-child" y nombre != "last-child" y nombre != "nth-child" y nombre != "not" y nombre != "only-child" y nombre != "empty") { lanzar "cosecha: pseudo-clase no soportada :" + nombre }
+                    sea a = arg
+                    si (nombre == "not") { a = _co_compuesto(texto_recortar(arg)) }
+                    r["pseudo"].agregar([nombre, a])
+                    i = j
+                } sino { lanzar "cosecha: selector inválido " + s }
+            }
+        }
+    }
+    retornar r
+}
+
+// "div > p a, li + li" → [[ [comb, compuesto], … ], …]. Respeta [] y ()
+// (así "[class~=x]" o ":not(a, b)" no se cortan).
+funcion _co_selector(sel) {
+    sea t = "" + sel
+    sea grupos = []
+    sea pasos = []
+    sea comb = " "
+    sea actual = ""
+    sea prof = 0
+    sea comillas = ""
+    sea i = 0
+    sea cerrar = funcion() {
+        si (actual != "") {
+            pasos.agregar([comb, _co_compuesto(actual)])
+            comb = " "
+            actual = ""
+        }
+    }
+    mientras (i <= longitud(t)) {
+        sea c = ""
+        si (i < longitud(t)) { c = subcadena(t, i, i + 1) }
+        si (comillas != "") {
+            actual = actual + c
+            si (c == comillas) { comillas = "" }
+        } sino {
+            si (c == "\"" o c == "'") { comillas = c  actual = actual + c } sino {
+                si (c == "[" o c == "(") { prof = prof + 1  actual = actual + c } sino {
+                    si (c == "]" o c == ")") { prof = prof - 1  actual = actual + c } sino {
+                        si (prof > 0 y c != "") { actual = actual + c } sino {
+                            si (c == " " o c == "\t" o c == "\n") { cerrar() } sino {
+                                si (c == ">" o c == "+" o c == "~") {
+                                    cerrar()
+                                    si (longitud(pasos) == 0) { lanzar "cosecha: selector inválido " + t }
+                                    comb = c
+                                } sino {
+                                    si (c == "," o c == "") {
+                                        cerrar()
+                                        si (longitud(pasos) == 0 o comb != " ") { lanzar "cosecha: selector vacío o incompleto: " + t }
+                                        grupos.agregar(pasos)
+                                        pasos = []
+                                    } sino { actual = actual + c }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        i = i + 1
+    }
+    retornar grupos
+}
+
+funcion _co_elementos(lista) {
+    sea r = []
+    para h en lista { si (tipo(h) == "mapa") { r.agregar(h) } }
+    retornar r
+}
+
+funcion _co_hermanos(n) {
+    si (n["padre"] == nulo) { retornar [n] }
+    retornar _co_elementos(cosecha_padre(n)["hijos"])
+}
+
+funcion _co_posicion(n) {
+    sea hs = _co_hermanos(n)
+    sea i = 0
+    mientras (i < longitud(hs)) { si (hs[i] == n) { retornar i }  i = i + 1 }
+    retornar 0 - 1
+}
+
+funcion _co_cumple(n, c) {
+    si (tipo(n) != "mapa") { retornar falso }
+    si (texto_empieza_con(n["nombre"], "#")) { retornar falso }
+    si (c["nombre"] != "*" y c["nombre"] != n["nombre"]) { retornar falso }
+    sea a = n["atributos"]
+    si (c["id"] != nulo) {
+        si (tiene_clave(a, "id") == falso) { retornar falso }
+        si (a["id"] != c["id"]) { retornar falso }
+    }
+    si (longitud(c["clases"]) > 0) {
+        si (tiene_clave(a, "class") == falso) { retornar falso }
+        sea mias = {}
+        para x en texto_dividir(a["class"], " ") { si (x != "") { mias[x] = 1 } }
+        para x en c["clases"] { si (tiene_clave(mias, x) == falso) { retornar falso } }
+    }
+    para at en c["attrs"] {
+        si (tiene_clave(a, at[0]) == falso) { retornar falso }
+        sea v = a[at[0]]
+        sea op = at[1]
+        si (op == "=") { si (v != at[2]) { retornar falso } }
+        si (op == "^=") { si (texto_empieza_con(v, at[2]) == falso) { retornar falso } }
+        si (op == "$=") { si (texto_termina_con(v, at[2]) == falso) { retornar falso } }
+        si (op == "*=") { si (texto_indice(v, at[2]) < 0) { retornar falso } }
+        si (op == "~=") {
+            sea esta = falso
+            para x en texto_dividir(v, " ") { si (x == at[2]) { esta = verdadero } }
+            si (esta == falso) { retornar falso }
+        }
+    }
+    para p en c["pseudo"] {
+        sea nombre = p[0]
+        si (nombre == "first-child") { si (_co_posicion(n) != 0) { retornar falso } }
+        si (nombre == "last-child") { si (_co_posicion(n) != longitud(_co_hermanos(n)) - 1) { retornar falso } }
+        si (nombre == "only-child") { si (longitud(_co_hermanos(n)) != 1) { retornar falso } }
+        si (nombre == "empty") { si (longitud(n["hijos"]) != 0) { retornar falso } }
+        si (nombre == "nth-child") {
+            sea pos = _co_posicion(n) + 1
+            sea arg = texto_minusculas(texto_recortar(p[1]))
+            si (arg == "odd") { si (pos % 2 != 1) { retornar falso } } sino {
+                si (arg == "even") { si (pos % 2 != 0) { retornar falso } } sino {
+                    si (pos != a_numero(arg)) { retornar falso }
+                }
+            }
+        }
+        si (nombre == "not") { si (_co_cumple(n, p[1])) { retornar falso } }
+    }
+    retornar verdadero
+}
+
+// ¿n cumple los pasos[0..k] (de derecha a izquierda)?
+funcion _co_coincide(n, pasos, k) {
+    si (_co_cumple(n, pasos[k][1]) == falso) { retornar falso }
+    si (k == 0) { retornar verdadero }
+    sea comb = pasos[k][0]
+    si (comb == ">") {
+        si (n["padre"] == nulo) { retornar falso }
+        retornar _co_coincide(cosecha_padre(n), pasos, k - 1)
+    }
+    si (comb == " ") {
+        sea p = cosecha_padre(n)
+        mientras (p != nulo) {
+            si (_co_coincide(p, pasos, k - 1)) { retornar verdadero }
+            p = cosecha_padre(p)
+        }
+        retornar falso
+    }
+    sea hs = _co_hermanos(n)
+    sea pos = _co_posicion(n)
+    si (comb == "+") {
+        si (pos <= 0) { retornar falso }
+        retornar _co_coincide(hs[pos - 1], pasos, k - 1)
+    }
+    sea j = pos - 1
+    mientras (j >= 0) {
+        si (_co_coincide(hs[j], pasos, k - 1)) { retornar verdadero }
+        j = j - 1
+    }
+    retornar falso
+}
+
+funcion _co_recorrer(n, grupos, r) {
+    para h en n["hijos"] {
+        si (tipo(h) == "mapa") {
+            sea si_coincide = falso
+            para pasos en grupos { si (si_coincide == falso) { si (_co_coincide(h, pasos, longitud(pasos) - 1)) { si_coincide = verdadero } } }
+            si (si_coincide) { r.agregar(h) }
+            _co_recorrer(h, grupos, r)
+        }
+    }
+}
+
+/// Todos los elementos bajo nodo que cumplen el selector, en orden del documento.
+funcion cosecha_buscar(nodo, selector) {
+    sea r = []
+    _co_recorrer(nodo, _co_selector(selector), r)
+    retornar r
+}
+
+funcion cosecha_primero(nodo, selector) {
+    sea r = cosecha_buscar(nodo, selector)
+    si (longitud(r) == 0) { retornar nulo }
+    retornar r[0]
+}
+
+funcion _co_texto(n, partes) {
+    si (tipo(n) == "texto") { partes.agregar(n) } sino {
+        si (n["nombre"] != "script" y n["nombre"] != "style") { para h en n["hijos"] { _co_texto(h, partes) } }
+    }
+}
+
+/// Texto visible (sin scripts ni estilos), con espacios colapsados.
+funcion cosecha_texto(nodo) {
+    si (nodo == nulo) { retornar nulo }
+    sea partes = []
+    _co_texto(nodo, partes)
+    sea t = unir(partes, "")
+    t = texto_reemplazar(texto_reemplazar(texto_reemplazar(t, "\n", " "), "\t", " "), "\r", " ")
+    mientras (texto_indice(t, "  ") >= 0) { t = texto_reemplazar(t, "  ", " ") }
+    retornar texto_recortar(t)
+}
+
+funcion cosecha_attr(nodo, nombre) {
+    si (nodo == nulo) { retornar nulo }
+    si (tiene_clave(nodo["atributos"], nombre)) { retornar nodo["atributos"][nombre] }
+    retornar nulo
+}
+
+/// Lista de textos (o de un atributo si se da) para todos los que cumplen.
+funcion cosecha_extraer(nodo, selector, atributo) {
+    sea r = []
+    para n en cosecha_buscar(nodo, selector) {
+        si (atributo == nulo) { r.agregar(cosecha_texto(n)) } sino { r.agregar(cosecha_attr(n, atributo)) }
+    }
+    retornar r
+}
+
+funcion _co_esc(t) { retornar texto_reemplazar(texto_reemplazar(texto_reemplazar(texto_reemplazar("" + t, "&", "&amp;"), "<", "&lt;"), ">", "&gt;"), "\"", "&quot;") }
+
+/// HTML del nodo (re-serializado y escapado).
+funcion cosecha_html(n) {
+    si (tipo(n) == "texto") { retornar _co_esc(n) }
+    sea dentro = []
+    para h en n["hijos"] {
+        si (tipo(h) == "texto" y tiene_clave(_CO_CRUDOS, n["nombre"]) y n["nombre"] != "title" y n["nombre"] != "textarea") { dentro.agregar(h) } sino { dentro.agregar(cosecha_html(h)) }
+    }
+    si (n["nombre"] == "#documento") { retornar unir(dentro, "") }
+    sea r = "<" + n["nombre"]
+    para k en claves(n["atributos"]) { r = r + " " + k + "=\"" + _co_esc(n["atributos"][k]) + "\"" }
+    si (tiene_clave(_CO_VACIOS, n["nombre"])) { retornar r + ">" }
+    retornar r + ">" + unir(dentro, "") + "</" + n["nombre"] + ">"
+}

@@ -2273,20 +2273,184 @@ funcion valor_exponente(t) {
     retornar numero_literal(t)
 }
 
-// bits · 10^e en f64 (potencias exactas de 10 hasta 10^22 por tramo).
+// ── Literales decimales con redondeo correcto ─────────────────────────────
+// valor = M · 10^E con M entero (hasta 18 cifras). Si M < 2^53 y |E| <= 22
+// basta una operación exacta (caso común). Si no, se calcula en doble-doble
+// (~106 bits) con escalas de 2^400 para no desbordar, y se redondea una vez.
+
+funcion dd_nuevo(hi, lo, e2) {
+    sea p = mem_reservar(24)
+    __guardar64(p, hi)
+    __guardar64(p + 8, lo)
+    __guardar64(p + 16, e2)
+    retornar p
+}
+funcion dd_abs(x) { retornar __desplazar_der(__desplazar_izq(x, 1), 1) }
+funcion dd_hi(p) { retornar __cargar64(p) }
+funcion dd_lo(p) { retornar __cargar64(p + 8) }
+funcion dd_e2(p) { retornar __cargar64(p + 16) }
+
+funcion dd_rapida(a, b, e2) {
+    sea s = __f64_suma(a, b)
+    retornar dd_nuevo(s, __f64_resta(b, __f64_resta(s, a)), e2)
+}
+
+// 2^n exacto (|n| <= 1000) por multiplicaciones de 2.
+funcion dd_dos_a(n) {
+    sea r = __f64_desde_entero(1)
+    sea base = __f64_desde_entero(2)
+    si (n < 0) { base = __f64_div(__f64_desde_entero(1), base) }
+    sea k = n
+    si (k < 0) { k = 0 - k }
+    mientras (k > 0) {
+        r = __f64_mul(r, base)
+        k = k - 1
+    }
+    retornar r
+}
+
+// Producto exacto a·b = p + error (Dekker).
+funcion dd_partir_alto(a) {
+    sea t = __f64_mul(__f64_desde_entero(134217729), a)
+    retornar __f64_resta(t, __f64_resta(t, a))
+}
+funcion dd_producto(a, b, e2) {
+    sea p = __f64_mul(a, b)
+    sea ah = dd_partir_alto(a)
+    sea al = __f64_resta(a, ah)
+    sea bh = dd_partir_alto(b)
+    sea bl = __f64_resta(b, bh)
+    sea err = __f64_suma(__f64_suma(__f64_suma(__f64_resta(__f64_mul(ah, bh), p), __f64_mul(ah, bl)), __f64_mul(al, bh)), __f64_mul(al, bl))
+    retornar dd_nuevo(p, err, e2)
+}
+
+// Mantiene hi en [2^-400, 2^400] moviendo la escala a e2 (exacto).
+funcion dd_normalizar(x) {
+    sea alto = dd_dos_a(400)
+    sea bajo = dd_dos_a(0 - 400)
+    sea hi = dd_hi(x)
+    sea lo = dd_lo(x)
+    sea e2 = dd_e2(x)
+    mientras (__f64_menor(alto, dd_abs(hi))) {
+        hi = __f64_mul(hi, bajo)
+        lo = __f64_mul(lo, bajo)
+        e2 = e2 + 400
+    }
+    mientras (hi != 0 y __f64_menor(dd_abs(hi), bajo)) {
+        hi = __f64_mul(hi, alto)
+        lo = __f64_mul(lo, alto)
+        e2 = e2 - 400
+    }
+    retornar dd_nuevo(hi, lo, e2)
+}
+
+funcion dd_mul(x, y) {
+    sea p = dd_producto(dd_hi(x), dd_hi(y), dd_e2(x) + dd_e2(y))
+    sea lo = __f64_suma(dd_lo(p), __f64_suma(__f64_mul(dd_hi(x), dd_lo(y)), __f64_mul(dd_lo(x), dd_hi(y))))
+    retornar dd_normalizar(dd_rapida(dd_hi(p), lo, dd_e2(p)))
+}
+
+// x - q·y con x, y en la misma escala.
+funcion dd_menos_por(x, q, y) {
+    sea p = dd_producto(q, dd_hi(y), 0)
+    sea plo = __f64_suma(dd_lo(p), __f64_mul(q, dd_lo(y)))
+    sea s = __f64_resta(dd_hi(x), dd_hi(p))
+    sea bb = __f64_resta(s, dd_hi(x))
+    sea err = __f64_resta(__f64_resta(dd_hi(x), __f64_resta(s, bb)), __f64_suma(dd_hi(p), bb))
+    err = __f64_suma(err, __f64_resta(dd_lo(x), plo))
+    retornar dd_rapida(s, err, dd_e2(x))
+}
+
+funcion dd_div(x, y) {
+    sea q1 = __f64_div(dd_hi(x), dd_hi(y))
+    sea r = dd_menos_por(x, q1, y)
+    sea q2 = __f64_div(dd_hi(r), dd_hi(y))
+    r = dd_menos_por(r, q2, y)
+    sea q3 = __f64_div(dd_hi(r), dd_hi(y))
+    sea q = dd_rapida(q1, q2, 0)
+    sea s = __f64_suma(dd_hi(q), q3)
+    sea lo = __f64_suma(__f64_resta(q3, __f64_resta(s, dd_hi(q))), dd_lo(q))
+    retornar dd_normalizar(dd_rapida(s, lo, dd_e2(x) - dd_e2(y)))
+}
+
+// 10^n (n >= 0) en doble-doble por cuadrados sucesivos.
+funcion dd_potencia10(n) {
+    sea r = dd_nuevo(__f64_desde_entero(1), 0, 0)
+    sea b = dd_nuevo(__f64_desde_entero(10), 0, 0)
+    sea k = n
+    mientras (k > 0) {
+        si (k % 2 == 1) { r = dd_mul(r, b) }
+        k = k / 2
+        si (k > 0) { b = dd_mul(b, b) }
+    }
+    retornar r
+}
+
+funcion potencia10_exacta(n) {
+    sea p = __f64_desde_entero(1)
+    sea k = 0
+    mientras (k < n) {
+        p = __f64_mul(p, __f64_desde_entero(10))
+        k = k + 1
+    }
+    retornar p
+}
+
+// M · 10^E correctamente redondeado (salvo empates de 1 en 2^50).
+funcion decimal_a_f64(m, e) {
+    si (m == 0) { retornar __f64_desde_entero(0) }
+    si (m < 9007199254740992 y e >= 0 - 22 y e <= 22) {
+        si (e >= 0) { retornar __f64_mul(__f64_desde_entero(m), potencia10_exacta(e)) }
+        retornar __f64_div(__f64_desde_entero(m), potencia10_exacta(0 - e))
+    }
+    si (e > 330) { retornar __f64_div(__f64_desde_entero(1), __f64_desde_entero(0)) }
+    si (e < 0 - 360) { retornar __f64_desde_entero(0) }
+    sea hi = __f64_desde_entero(m)
+    sea mm = dd_nuevo(hi, __f64_desde_entero(m - __f64_a_entero(hi)), 0)
+    sea r = 0
+    si (e >= 0) { r = dd_mul(mm, dd_potencia10(e)) } sino { r = dd_div(mm, dd_potencia10(0 - e)) }
+    sea v = __f64_suma(dd_hi(r), dd_lo(r))
+    sea e2 = dd_e2(r)
+    mientras (e2 >= 400) { v = __f64_mul(v, dd_dos_a(400))  e2 = e2 - 400 }
+    mientras (e2 <= 0 - 400) { v = __f64_mul(v, dd_dos_a(0 - 400))  e2 = e2 + 400 }
+    retornar __f64_mul(v, dd_dos_a(e2))
+}
+
+// Cifras (parte entera + fracción) → M y E, con un máximo de 18 cifras.
+funcion literal_decimal(entera, fraccion, exponente) {
+    sea m = 0
+    sea e = exponente
+    sea cifras = 0
+    sea i = 0
+    mientras (i < str_largo(entera)) {
+        sea d = str_byte(entera, i) - 48
+        si (cifras < 18) {
+            m = m * 10 + d
+            si (m > 0) { cifras = cifras + 1 }
+        } sino { e = e + 1 }
+        i = i + 1
+    }
+    i = 0
+    mientras (i < str_largo(fraccion)) {
+        sea d = str_byte(fraccion, i) - 48
+        si (cifras < 18) {
+            m = m * 10 + d
+            e = e - 1
+            si (m > 0) { cifras = cifras + 1 }
+        }
+        i = i + 1
+    }
+    retornar decimal_a_f64(m, e)
+}
+
+// bits · 10^e en f64 (se mantiene para quien la use).
 funcion escalar_potencia10(bits, e) {
     mientras (e != 0) {
         sea paso = e
         si (paso > 22) { paso = 22 }
         si (paso < 0 - 22) { paso = 0 - 22 }
-        sea p = __f64_desde_entero(1)
-        sea k = 0
-        sea m = paso
-        si (m < 0) { m = 0 - m }
-        mientras (k < m) {
-            p = __f64_mul(p, __f64_desde_entero(10))
-            k = k + 1
-        }
+        sea p = potencia10_exacta(paso)
+        si (paso < 0) { p = potencia10_exacta(0 - paso) }
         si (paso > 0) { bits = __f64_mul(bits, p) } sino { bits = __f64_div(bits, p) }
         e = e - paso
     }
@@ -2314,16 +2478,7 @@ funcion numero_dinamico(c) {
             fraccion = str_rebanar(fraccion, 0, pf)
             con_exponente = 1
         }
-        // Más de 17 cifras no cambian un double y desbordarían el entero.
-        si (str_largo(fraccion) > 17) { fraccion = str_rebanar(fraccion, 0, 17) }
-        sea escala = 1
-        sea i = 0
-        mientras (i < str_largo(fraccion)) {
-            escala = escala * 10
-            i = i + 1
-        }
-        sea parte = __f64_div(__f64_desde_entero(numero_literal(fraccion)), __f64_desde_entero(escala))
-        bits = escalar_potencia10(__f64_suma(bits, parte), exponente)
+        bits = literal_decimal(lexema, fraccion, exponente)
         cargar_inmediato(c, bits)
         empujar(c)
         llamar_runtime(c, "dyn_flotante", 1)
@@ -2331,7 +2486,7 @@ funcion numero_dinamico(c) {
         retornar 0
     }
     si (con_exponente) {
-        cargar_inmediato(c, escalar_potencia10(bits, exponente))
+        cargar_inmediato(c, literal_decimal(lexema, "", exponente))
         empujar(c)
         llamar_runtime(c, "dyn_flotante", 1)
         fijar_tipo(c, 9)
@@ -2638,7 +2793,8 @@ funcion tok_tipo_en(c, salto) {
 
 // ¿Empieza una interpolación en la posición i del literal? "{" seguida de
 // una letra, "_" o "(", con su "}" antes del final. Así "{\"a\":1}" (JSON) o
-// "main() {" (GLSL) quedan como texto literal. Una llave doble "{{" nunca
+// "main() {" (GLSL) quedan como texto literal; también si dentro hay ":" o
+// ";" (CSS, objetos de JS). Una llave doble "{{" nunca
 // interpola: "{{nombre}}" llega tal cual (plantillas tipo Handlebars).
 funcion abre_interpolacion(lexema, i) {
     si (str_byte(lexema, i) != 123 o i + 1 >= str_largo(lexema) - 1) { retornar 0 }
@@ -2650,7 +2806,9 @@ funcion abre_interpolacion(lexema, i) {
     sea k = i + 1
     mientras (k < str_largo(lexema) - 1) {
         sea b = str_byte(lexema, k)
-        si (b == 34 o b == 92 o b == 10) { retornar 0 }
+        // ":" o ";" no aparecen en una expresión: es CSS ("a{color:red}") o
+        // un objeto de JS ("{a: 1}") y queda literal.
+        si (b == 34 o b == 92 o b == 10 o b == 58 o b == 59) { retornar 0 }
         si (b == 123) { nivel = nivel + 1 }
         si (b == 125) {
             nivel = nivel - 1
