@@ -3,7 +3,7 @@
 servidor HTTP (smuggling, cabeceras enormes, Slowloris) y WebSocket (tramas
 gigantes, fragmentos sin fin, violaciones de RFC 6455).
 Uso: python3 tests/seguridad/ataques.py ./cforge"""
-import base64, os, socket, struct, subprocess, sys, tempfile, time
+import threading, base64, os, socket, struct, subprocess, sys, tempfile, time
 
 CF = os.path.abspath(sys.argv[1] if len(sys.argv) > 1 else "./cforge")
 RAIZ = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
@@ -74,11 +74,24 @@ def ws(tramas):
     k = base64.b64encode(os.urandom(16))
     s.sendall(b"GET / HTTP/1.1\r\nHost: x\r\nUpgrade: websocket\r\nConnection: Upgrade\r\nSec-WebSocket-Key: " + k + b"\r\nSec-WebSocket-Version: 13\r\n\r\n")
     s.recv(1000)
+    # Se envía en otro hilo y se lee a la vez: si el servidor rechaza a mitad
+    # de camino (1009) y cierra, el cliente puede seguir enviando y ver un
+    # "broken pipe"; la respuesta ya llegó y se lee igual (sin carrera).
+    def enviar():
+        try:
+            for t in tramas: s.sendall(t)
+        except OSError: pass
+    hilo = threading.Thread(target=enviar, daemon=True); hilo.start()
+    r = b""
     try:
-        for t in tramas: s.sendall(t)
-        r = s.recv(100)
-    except Exception as e: r = type(e).__name__
-    s.close(); time.sleep(0.2)
+        while len(r) < 4:
+            parte = s.recv(100)
+            if not parte: break
+            r += parte
+            if r[:1] != b"\x88" and len(r) >= 2: break
+    except Exception as e:
+        if not r: r = type(e).__name__
+    hilo.join(10); s.close(); time.sleep(0.2)
     if isinstance(r, bytes) and r[:1] == b"\x88" and len(r) >= 4: return struct.unpack(">H", r[2:4])[0]
     return r
 
