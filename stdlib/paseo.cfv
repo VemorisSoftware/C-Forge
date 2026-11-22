@@ -1,0 +1,166 @@
+// stdlib/paseo.cfv — tokens PASETO v4.public (firmados con Ed25519): como
+// JWT pero sin algoritmos negociables ni "alg: none". Valida firma,
+// vencimiento (exp), "no antes de" (nbf), emisor y audiencia. Inspirada en
+// la especificación PASETO (MIT). En inglés: importar "paseto".
+//
+//   importar "paseo"
+//   sea par = paseo_claves()                                   // {"secreta", "publica"}
+//   sea t = paseo_firmar(par["secreta"], {"sub": "ana", "rol": "admin"}, {"expira_s": 3600})
+//   sea datos = paseo_verificar(par["publica"], t)              // o lanza
+//
+// Las claves van en bytes (32); paseo_clave_texto/paseo_clave_de_texto
+// las pasan a Base64URL para guardarlas en la configuración.
+
+importar "json"
+importar "base64"
+
+funcion _ps_b64(t) { retornar texto_reemplazar(texto_reemplazar(texto_reemplazar(base64_codificar(t), "+", "-"), "/", "_"), "=", "") }
+
+funcion _ps_de_b64(t) {
+    sea s = texto_reemplazar(texto_reemplazar("" + t, "-", "+"), "_", "/")
+    para c en texto_dividir(s, "") { si (texto_indice("ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/", c) < 0) { lanzar "paseo: token mal formado" } }
+    mientras (longitud(s) % 4 != 0) { s = s + "=" }
+    retornar base64_decodificar(s)
+}
+
+// PAE de PASETO: cuenta de piezas y largo de cada una en 64 bits little endian.
+sea _PS_EN = {"expires_in": "expira_s", "issuer": "emisor", "audience": "audiencia", "footer": "pie", "now_ms": "ahora_ms", "leeway_s": "tolerancia_s"}
+
+funcion _ps_opciones(o) {
+    sea r = {}
+    si (o == nulo) { retornar r }
+    para k en claves(o) {
+        si (tiene_clave(_PS_EN, k)) { r[_PS_EN[k]] = o[k] } sino { r[k] = o[k] }
+    }
+    retornar r
+}
+
+funcion _ps_le64(n) { retornar bytes_entero(n, 8, 1) }
+
+funcion _ps_pae(piezas) {
+    sea r = _ps_le64(longitud(piezas))
+    para p en piezas { r = r + _ps_le64(longitud(p)) + p }
+    retornar r
+}
+
+/// Par de claves nuevo: secreta (semilla de 32 bytes) y pública (32 bytes).
+funcion paseo_claves() {
+    sea s = bytes_aleatorios(32)
+    retornar {"secreta": s, "publica": ed25519_publica(s)}
+}
+
+funcion paseo_clave_texto(clave) { retornar _ps_b64(clave) }
+funcion paseo_clave_de_texto(t) { retornar _ps_de_b64(t) }
+
+funcion _ps_iso(ms) {
+    sea dias = cociente(ms, 86400000)
+    sea resto = cociente(ms - dias * 86400000, 1000)
+    // Fecha civil desde días (Hinnant).
+    sea z = dias + 719468
+    sea era = cociente(z, 146097)
+    sea doe = z - era * 146097
+    sea yoe = cociente(doe - cociente(doe, 1460) + cociente(doe, 36524) - cociente(doe, 146096), 365)
+    sea doy = doe - (365 * yoe + cociente(yoe, 4) - cociente(yoe, 100))
+    sea mp = cociente(5 * doy + 2, 153)
+    sea d = doy - cociente(153 * mp + 2, 5) + 1
+    sea m = mp + 3
+    si (m > 12) { m = m - 12 }
+    sea a = yoe + era * 400
+    si (m <= 2) { a = a + 1 }
+    sea dos = funcion(n) {
+        si (n < 10) { retornar "0" + n }
+        retornar "" + n
+    }
+    retornar a + "-" + dos(m) + "-" + dos(d) + "T" + dos(cociente(resto, 3600)) + ":" + dos(cociente(resto % 3600, 60)) + ":" + dos(resto % 60) + "Z"
+}
+
+funcion _ps_de_iso(t) {
+    sea s = "" + t
+    si (longitud(s) < 20) { lanzar "paseo: fecha inválida " + s }
+    sea a = a_numero(subcadena(s, 0, 4))
+    sea m = a_numero(subcadena(s, 5, 7))
+    sea d = a_numero(subcadena(s, 8, 10))
+    sea hh = a_numero(subcadena(s, 11, 13))
+    sea mi = a_numero(subcadena(s, 14, 16))
+    sea ss = a_numero(subcadena(s, 17, 19))
+    sea yy = a
+    si (m <= 2) { yy = yy - 1 }
+    sea era = cociente(yy, 400)
+    sea yoe = yy - era * 400
+    sea mm = m - 3
+    si (m <= 2) { mm = m + 9 }
+    sea doy = cociente(153 * mm + 2, 5) + d - 1
+    sea doe = yoe * 365 + cociente(yoe, 4) - cociente(yoe, 100) + doy
+    sea dias = era * 146097 + doe - 719468
+    // Desfase "+03:00" / "-03:00" al final.
+    sea desfase = 0
+    sea fin = subcadena(s, longitud(s) - 6, longitud(s))
+    si (texto_empieza_con(fin, "+") o texto_empieza_con(fin, "-")) {
+        desfase = (a_numero(subcadena(fin, 1, 3)) * 60 + a_numero(subcadena(fin, 4, 6))) * 60000
+        si (texto_empieza_con(fin, "+")) { desfase = 0 - desfase }
+    }
+    retornar dias * 86400000 + ((hh * 60 + mi) * 60 + ss) * 1000 + desfase
+}
+
+/// Firma. opciones: expira_s (3600), emisor (iss), audiencia (aud), pie
+/// (footer público), ahora_ms (para pruebas). En inglés: expires_in, issuer,
+// audience, footer, now_ms, leeway_s.
+funcion paseo_firmar(secreta, datos, opciones) {
+    sea o = _ps_opciones(opciones)
+    sea ahora = cfv_fecha_ahora_ms()
+    si (tiene_clave(o, "ahora_ms")) { ahora = o["ahora_ms"] }
+    sea d = {}
+    para k en claves(datos) { d[k] = datos[k] }
+    si (tiene_clave(d, "iat") == falso) { d["iat"] = _ps_iso(ahora) }
+    sea exp_s = 3600
+    si (tiene_clave(o, "expira_s")) { exp_s = o["expira_s"] }
+    si (exp_s != nulo y tiene_clave(d, "exp") == falso) { d["exp"] = _ps_iso(ahora + exp_s * 1000) }
+    si (tiene_clave(o, "emisor")) { d["iss"] = o["emisor"] }
+    si (tiene_clave(o, "audiencia")) { d["aud"] = o["audiencia"] }
+    sea pie = ""
+    si (tiene_clave(o, "pie")) { pie = "" + o["pie"] }
+    sea m = json_texto(d)
+    sea h = "v4.public."
+    sea firma = ed25519_firmar(secreta, _ps_pae([h, m, pie, ""]))
+    sea t = h + _ps_b64(m + firma)
+    si (pie != "") { t = t + "." + _ps_b64(pie) }
+    retornar t
+}
+
+/// Verifica y devuelve los datos. Lanza si la firma, las fechas, el emisor
+/// o la audiencia no calzan. opciones: emisor, audiencia, tolerancia_s (0), ahora_ms.
+funcion paseo_verificar(publica, token, opciones) {
+    sea o = _ps_opciones(opciones)
+    sea t = "" + token
+    sea h = "v4.public."
+    si (texto_empieza_con(t, h) == falso) { lanzar "paseo: solo se aceptan tokens v4.public" }
+    sea resto = subcadena(t, longitud(h), longitud(t))
+    sea partes = texto_dividir(resto, ".")
+    si (longitud(partes) > 2) { lanzar "paseo: token mal formado" }
+    sea cuerpo = _ps_de_b64(partes[0])
+    sea pie = ""
+    si (longitud(partes) == 2) { pie = _ps_de_b64(partes[1]) }
+    si (longitud(cuerpo) < 64) { lanzar "paseo: token mal formado" }
+    sea m = subcadena(cuerpo, 0, longitud(cuerpo) - 64)
+    sea firma = subcadena(cuerpo, longitud(cuerpo) - 64, longitud(cuerpo))
+    si (ed25519_verificar(publica, _ps_pae([h, m, pie, ""]), firma) == falso) { lanzar "paseo: firma inválida" }
+    sea d = nulo
+    intentar { d = json_parsear(m) } capturar (e) { lanzar "paseo: datos inválidos" }
+    si (tipo(d) != "mapa") { lanzar "paseo: datos inválidos" }
+    sea ahora = cfv_fecha_ahora_ms()
+    si (tiene_clave(o, "ahora_ms")) { ahora = o["ahora_ms"] }
+    sea tol = 0
+    si (tiene_clave(o, "tolerancia_s")) { tol = o["tolerancia_s"] * 1000 }
+    si (tiene_clave(d, "exp")) { si (ahora - tol >= _ps_de_iso(d["exp"])) { lanzar "paseo: el token venció" } }
+    si (tiene_clave(d, "nbf")) { si (ahora + tol < _ps_de_iso(d["nbf"])) { lanzar "paseo: el token aún no es válido" } }
+    si (tiene_clave(o, "emisor")) { si (tiene_clave(d, "iss") == falso o d["iss"] != o["emisor"]) { lanzar "paseo: emisor incorrecto" } }
+    si (tiene_clave(o, "audiencia")) { si (tiene_clave(d, "aud") == falso o d["aud"] != o["audiencia"]) { lanzar "paseo: audiencia incorrecta" } }
+    retornar d
+}
+
+/// Pie (footer) público sin verificar (p. ej. para elegir la clave por "kid").
+funcion paseo_pie(token) {
+    sea partes = texto_dividir("" + token, ".")
+    si (longitud(partes) < 4) { retornar nulo }
+    retornar _ps_de_b64(partes[3])
+}
