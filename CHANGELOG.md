@@ -12,6 +12,12 @@ Sitio oficial: [c-forge.org](https://c-forge.org)
 - **Bilingües:** `import "ink"`, `"ids"`, `"progress"`, `"money"` y los
   nombres en inglés de `csv` (`csv_read`, `csv_write`…); `money_round`
   acepta `"even"` y `"up"`. Pruebas escritas en inglés.
+- **Lote 2 (bilingüe):** `marcado`/`markdown` (Markdown a HTML sin HTML
+  crudo ni enlaces `javascript:`/`data:`), `orden`/`cli` (opciones, banderas,
+  posicionales y ayuda automática), `bitacora`/`logger` (niveles, texto o
+  JSON, sin inyección de líneas), `resiste`/`resilience` (reintentos con
+  espera exponencial y cortacircuitos) y `plantilla`/`template` (`{{ }}`
+  escapado, `#si`/`#if`, `#cada`/`#each`). Pruebas en español e inglés.
 - Nuevas funciones del lenguaje: `escribir(v)` (sin salto de línea) y
   `variable_entorno(nombre)`.
 

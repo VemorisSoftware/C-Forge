@@ -1,0 +1,142 @@
+// stdlib/plantilla.cfv — plantillas HTML con escape automático (seguras
+// contra XSS). Inspirada en Handlebars/Mustache (MIT). En inglés:
+// importar "template".
+//
+//   {{ nombre }}            valor escapado (también {{ usuario.nombre }})
+//   {{{ html }}}            valor sin escapar (solo contenido de confianza)
+//   {{#si activo}}…{{sino}}…{{/si}}     (también #if / else / /if)
+//   {{#cada items}}…{{/cada}}           (también #each / /each); dentro,
+//                                       {{.}} es el elemento y {{@indice}} su posición
+//
+//   Ojo: en un literal de C-Forge, "{x}" interpola; escribe {{ x }} con
+//   espacios (o \{) para que llegue tal cual a la plantilla.
+//
+//   importar "plantilla"
+//   mostrar(plantilla_render("<h1>{{ titulo }}</h1>", {"titulo": "Hola"}))
+
+funcion _pl_escapar(v) {
+    si (v == nulo) { retornar "" }
+    sea s = texto_reemplazar("" + v, "&", "&amp;")
+    s = texto_reemplazar(s, "<", "&lt;")
+    s = texto_reemplazar(s, ">", "&gt;")
+    s = texto_reemplazar(s, "\"", "&quot;")
+    retornar texto_reemplazar(s, "'", "&#39;")
+}
+
+funcion _pl_valor(ruta, pila) {
+    si (ruta == ".") { retornar pila[longitud(pila) - 1] }
+    sea partes = texto_dividir(ruta, ".")
+    sea k = longitud(pila) - 1
+    mientras (k >= 0) {
+        sea v = pila[k]
+        si (tipo(v) == "mapa" y tiene_clave(v, partes[0])) {
+            sea r = v[partes[0]]
+            sea i = 1
+            mientras (i < longitud(partes)) {
+                si (tipo(r) != "mapa") { retornar nulo }
+                r = r[partes[i]] ?? nulo
+                i = i + 1
+            }
+            retornar r
+        }
+        k = k - 1
+    }
+    retornar nulo
+}
+
+funcion _pl_verdad(v) {
+    si (v == nulo o v == falso o v == 0 o v == "") { retornar falso }
+    si (tipo(v) == "lista" y longitud(v) == 0) { retornar falso }
+    retornar verdadero
+}
+
+// Busca el {{/fin}} que cierra (con anidamiento) desde i; devuelve
+// [posición del {{sino}}/{{else}} de este nivel o -1, inicio del cierre, fin del cierre].
+funcion _pl_cierre(t, i, abre1, abre2, fin1, fin2) {
+    sea nivel = 0
+    sea medio = 0 - 1
+    sea k = i
+    mientras (k < longitud(t)) {
+        sea p = texto_indice(subcadena(t, k, longitud(t)), "{{")
+        si (p < 0) { lanzar "plantilla: falta {{/" + fin1 + "}}" }
+        p = p + k
+        sea q = texto_indice(subcadena(t, p, longitud(t)), "}}")
+        si (q < 0) { lanzar "plantilla: falta }}" }
+        q = q + p
+        sea etiqueta = texto_recortar(subcadena(t, p + 2, q))
+        si (texto_empieza_con(etiqueta, "#" + abre1 + " ") o texto_empieza_con(etiqueta, "#" + abre2 + " ")) { nivel = nivel + 1 }
+        si (etiqueta == "/" + fin1 o etiqueta == "/" + fin2) {
+            si (nivel == 0) { retornar [medio, p, q + 2] }
+            nivel = nivel - 1
+        }
+        si ((etiqueta == "sino" o etiqueta == "else") y nivel == 0 y medio < 0) { medio = p }
+        k = q + 2
+    }
+    lanzar "plantilla: falta {{/" + fin1 + "}}"
+}
+
+funcion _pl_render(t, pila) {
+    sea r = []
+    sea i = 0
+    mientras (i < longitud(t)) {
+        sea p = texto_indice(subcadena(t, i, longitud(t)), "{{")
+        si (p < 0) {
+            r.agregar(subcadena(t, i, longitud(t)))
+            i = longitud(t)
+        } sino {
+            p = p + i
+            r.agregar(subcadena(t, i, p))
+            si (subcadena(t, p, p + 3) == "{{{") {
+                sea q = texto_indice(subcadena(t, p, longitud(t)), "}}}")
+                si (q < 0) { lanzar "plantilla: falta }}}" }
+                sea v = _pl_valor(texto_recortar(subcadena(t, p + 3, p + q)), pila)
+                si (v != nulo) { r.agregar("" + v) }
+                i = p + q + 3
+            } sino {
+                sea q = texto_indice(subcadena(t, p, longitud(t)), "}}")
+                si (q < 0) { lanzar "plantilla: falta }}" }
+                q = q + p
+                sea etiqueta = texto_recortar(subcadena(t, p + 2, q))
+                si (texto_empieza_con(etiqueta, "#si ") o texto_empieza_con(etiqueta, "#if ")) {
+                    sea cond = _pl_valor(texto_recortar(subcadena(etiqueta, 3, longitud(etiqueta))), pila)
+                    sea c = _pl_cierre(t, q + 2, "si", "if", "si", "if")
+                    sea fin_si = c[1]
+                    si (c[0] >= 0) { fin_si = c[0] }
+                    si (_pl_verdad(cond)) { r.agregar(_pl_render(subcadena(t, q + 2, fin_si), pila)) } sino {
+                        si (c[0] >= 0) {
+                            sea tras = texto_indice(subcadena(t, c[0], longitud(t)), "}}") + c[0] + 2
+                            r.agregar(_pl_render(subcadena(t, tras, c[1]), pila))
+                        }
+                    }
+                    i = c[2]
+                } sino {
+                    si (texto_empieza_con(etiqueta, "#cada ") o texto_empieza_con(etiqueta, "#each ")) {
+                        sea lista_v = _pl_valor(texto_recortar(subcadena(etiqueta, 5, longitud(etiqueta))), pila)
+                        sea c = _pl_cierre(t, q + 2, "cada", "each", "cada", "each")
+                        sea cuerpo = subcadena(t, q + 2, c[1])
+                        si (lista_v != nulo) {
+                            sea k = 0
+                            mientras (k < longitud(lista_v)) {
+                                sea marco = lista_v[k]
+                                sea pila2 = []
+                                para x en pila { pila2.agregar(x) }
+                                pila2.agregar({"@indice": k, "@index": k})
+                                pila2.agregar(marco)
+                                r.agregar(_pl_render(cuerpo, pila2))
+                                k = k + 1
+                            }
+                        }
+                        i = c[2]
+                    } sino {
+                        r.agregar(_pl_escapar(_pl_valor(etiqueta, pila)))
+                        i = q + 2
+                    }
+                }
+            }
+        }
+    }
+    retornar unir(r, "")
+}
+
+/// Renderiza la plantilla con los datos (un mapa).
+funcion plantilla_render(texto, datos) { retornar _pl_render("" + texto, [datos ?? {}]) }

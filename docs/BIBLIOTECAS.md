@@ -30,7 +30,7 @@ Estado: ✅ ya existe en C-Forge · 🔗 se usa hoy vía `cforge bindgen`,
 | 11 | `marea` | Runtime asíncrono para servidores | Tokio | 🛠 |
 | 12 | `molde` | Serialización universal | Serde | 🛠 |
 | 13 | `enjambre` | Paralelismo de datos | Rayon | 🛠 |
-| 14 | `orden` | Argumentos de línea de comandos | Clap | 🛠 |
+| 14 | `orden` / `cli` | Argumentos de línea de comandos | Clap | ✅ `orden` |
 | 15 | `mensajero` | Cliente HTTP | Reqwest | ✅ `red` |
 | 16 | `portico` | Framework web | Axum, Actix | ✅ `web` (básico) |
 | 17 | `tabla` | DataFrames | Polars | 🛠 |
@@ -44,8 +44,8 @@ Estado: ✅ ya existe en C-Forge · 🔗 se usa hoy vía `cforge bindgen`,
 | 25 | `arbol_json` | JSON tipado y dinámico | System.Text.Json | ✅ `json` |
 | 26 | `regla` | Validación encadenada | FluentValidation | 🛠 |
 | 27 | `calco` | Mapeo entre estructuras | AutoMapper | 🛠 |
-| 28 | `resiste` | Reintentos y circuit breaker | Polly | 🛠 |
-| 29 | `bitacora` | Logs estructurados | Serilog | 🛠 |
+| 28 | `resiste` / `resilience` | Reintentos y circuit breaker | Polly | ✅ `resiste` |
+| 29 | `bitacora` / `logger` | Logs estructurados | Serilog | ✅ `bitacora` |
 | 30 | `torrente` | Red asíncrona de alto tráfico | Netty | 🛠 |
 | 31 | `caja` | Colecciones avanzadas y cachés | Guava | ✅ `colecciones` · 🛠 cachés |
 | 32 | `formatos` | JSON, XML, CSV y YAML | Jackson | ✅ JSON · 🛠 resto |
@@ -145,7 +145,7 @@ Estado: ✅ ya existe en C-Forge · 🔗 se usa hoy vía `cforge bindgen`,
 | 104 | `documento` | PDF: crear, leer y firmar | PDFium, lopdf | 🛠 |
 | 105 | `archivador` | ZIP/TAR seguros | libarchive | 🛠 |
 | 106 | `ajustes` | TOML y YAML estrictos | toml, yaml-rust | ✅ TOML (cforge.toml) · 🛠 |
-| 107 | `marcado` | Markdown a HTML | pulldown-cmark | 🛠 |
+| 107 | `marcado` / `markdown` | Markdown a HTML | pulldown-cmark | ✅ `marcado` |
 | 108 | `sintaxis` | Parser incremental | tree-sitter | 🔗 |
 | 109 | `xml` | XML rápido | quick-xml | 🛠 |
 | 110 | `csv` | CSV gigantes (RFC 4180) | csv-rs | ✅ `csv` |
@@ -156,7 +156,7 @@ Estado: ✅ ya existe en C-Forge · 🔗 se usa hoy vía `cforge bindgen`,
 | # | Nombre | Para qué | Inspiración | Estado |
 |---|---|---|---|---|
 | 112 | `grafo_api` | Servidor GraphQL | async-graphql | 🛠 |
-| 113 | `plantilla` | Plantillas HTML | Tera, Handlebars | 🛠 |
+| 113 | `plantilla` / `template` | Plantillas HTML | Tera, Handlebars | ✅ `plantilla` |
 | 114 | `piloto` | Navegadores automatizados | Playwright | 🛠 |
 | 115 | `atributo` | Interactividad por atributos HTML | htmx | 🛠 |
 | 116 | `css` | Parser y minificador CSS | LightningCSS | 🛠 |
