@@ -1,0 +1,761 @@
+// stdlib/textura.cfv — compresión de texturas para GPU al estilo Basis
+// Universal y los codificadores de bloques: BC1 (DXT1, con modo de 3
+// colores y transparencia), BC3 (DXT5), BC4 y BC5 (canales de 8 bits, uno
+// o dos), y ETC1 (móviles), en ambos sentidos; contenedores DDS (con
+// FourCC DXT1/DXT5/ATI1/ATI2 y mipmaps) y KTX 1.1; cadena de mipmaps con
+// filtro de caja y PSNR para medir la calidad. Las imágenes son las de
+// "imagen" ({"ancho", "alto", "pixeles" RGBA}). Idea de Basis Universal y
+// de los codificadores de bloques (Apache/MIT). En inglés:
+// importar "texcompress".
+//
+//   importar "textura"
+//   sea img = imagen_cargar("piedra.png")
+//   escribir_archivo("piedra.dds", textura_dds(img, "bc1", verdadero))
+
+importar "imagen"
+
+funcion _tx_b(n) { retornar bytes_entero(n, 1, 0) }
+
+// Lee el bloque 4×4 (con borde repetido) como lista de 16 [r, g, b, a].
+funcion _tx_bloque(img, bx, by) {
+    sea r = []
+    sea p = img["pixeles"]
+    sea w = img["ancho"]
+    sea yy = 0
+    mientras (yy < 4) {
+        sea py = minimo(by * 4 + yy, img["alto"] - 1)
+        sea xx = 0
+        mientras (xx < 4) {
+            sea px = minimo(bx * 4 + xx, w - 1)
+            sea i = (py * w + px) * 4
+            r.agregar([byte_en(p, i), byte_en(p, i + 1), byte_en(p, i + 2), byte_en(p, i + 3)])
+            xx = xx + 1
+        }
+        yy = yy + 1
+    }
+    retornar r
+}
+
+funcion _tx_565(c) { retornar piso(c[0] * 31 / 255 + 0.5) * 2048 + piso(c[1] * 63 / 255 + 0.5) * 32 + piso(c[2] * 31 / 255 + 0.5) }
+
+funcion _tx_de565(v) {
+    sea r = piso(v / 2048)
+    sea g = piso(v / 32) % 64
+    sea b = v % 32
+    retornar [piso(r * 255 / 31 + 0.5), piso(g * 255 / 63 + 0.5), piso(b * 255 / 31 + 0.5)]
+}
+
+// Expande 5/6 bits como los decodificadores de referencia (r << 3 | r >> 2).
+funcion _tx_de565_exacto(v) {
+    sea r = piso(v / 2048)
+    sea g = piso(v / 32) % 64
+    sea b = v % 32
+    retornar [r * 8 + piso(r / 4), g * 4 + piso(g / 16), b * 8 + piso(b / 4)]
+}
+
+funcion _tx_paleta(c0, c1, cuatro) {
+    sea a = _tx_de565_exacto(c0)
+    sea b = _tx_de565_exacto(c1)
+    si (cuatro) {
+        retornar [a, b, [piso((2 * a[0] + b[0]) / 3), piso((2 * a[1] + b[1]) / 3), piso((2 * a[2] + b[2]) / 3)], [piso((a[0] + 2 * b[0]) / 3), piso((a[1] + 2 * b[1]) / 3), piso((a[2] + 2 * b[2]) / 3)]]
+    }
+    retornar [a, b, [piso((a[0] + b[0]) / 2), piso((a[1] + b[1]) / 2), piso((a[2] + b[2]) / 2)], [0, 0, 0]]
+}
+
+funcion _tx_dist(a, b) {
+    sea dr = a[0] - b[0]
+    sea dg = a[1] - b[1]
+    sea db = a[2] - b[2]
+    retornar dr * dr * 2 + dg * dg * 4 + db * db
+}
+
+// Ejes principales por potencia: devuelve [media, eje].
+funcion _tx_pca(px) {
+    sea n = longitud(px)
+    sea m = [0, 0, 0]
+    para c en px {
+        m[0] = m[0] + c[0]
+        m[1] = m[1] + c[1]
+        m[2] = m[2] + c[2]
+    }
+    m = [m[0] / n, m[1] / n, m[2] / n]
+    sea cv = [0, 0, 0, 0, 0, 0]
+    para c en px {
+        sea d = [c[0] - m[0], c[1] - m[1], c[2] - m[2]]
+        cv[0] = cv[0] + d[0] * d[0]
+        cv[1] = cv[1] + d[0] * d[1]
+        cv[2] = cv[2] + d[0] * d[2]
+        cv[3] = cv[3] + d[1] * d[1]
+        cv[4] = cv[4] + d[1] * d[2]
+        cv[5] = cv[5] + d[2] * d[2]
+    }
+    sea v = [1, 1, 1]
+    sea k = 0
+    mientras (k < 8) {
+        sea nv = [cv[0] * v[0] + cv[1] * v[1] + cv[2] * v[2], cv[1] * v[0] + cv[3] * v[1] + cv[4] * v[2], cv[2] * v[0] + cv[4] * v[1] + cv[5] * v[2]]
+        sea l = maximo(absoluto(nv[0]), maximo(absoluto(nv[1]), absoluto(nv[2])))
+        si (l == 0) { k = 8 } sino {
+            v = [nv[0] / l, nv[1] / l, nv[2] / l]
+            k = k + 1
+        }
+    }
+    retornar [m, v]
+}
+
+// Codifica 16 colores en un bloque BC1 (8 bytes). con_alfa: usa el modo de
+// 3 colores para píxeles con alfa < 128.
+funcion _tx_bc1_bloque(px, con_alfa, forzar4) {
+    sea transparentes = falso
+    si (con_alfa) { para c en px { si (c[3] < 128) { transparentes = verdadero } } }
+    sea opacos = []
+    para c en px { si (transparentes == falso o c[3] >= 128) { opacos.agregar(c) } }
+    si (longitud(opacos) == 0) { retornar _tx_b(0) + _tx_b(0) + _tx_b(0) + _tx_b(0) + _tx_b(255) + _tx_b(255) + _tx_b(255) + _tx_b(255) }
+    sea pc = _tx_pca(opacos)
+    sea m = pc[0]
+    sea eje = pc[1]
+    sea mn = 1e9
+    sea mx = -1e9
+    para c en opacos {
+        sea t = (c[0] - m[0]) * eje[0] + (c[1] - m[1]) * eje[1] + (c[2] - m[2]) * eje[2]
+        si (t < mn) { mn = t }
+        si (t > mx) { mx = t }
+    }
+    sea l2 = eje[0] * eje[0] + eje[1] * eje[1] + eje[2] * eje[2]
+    si (l2 == 0) { l2 = 1 }
+    sea fin = funcion(t) { retornar [maximo(0, minimo(255, m[0] + eje[0] * t / l2)), maximo(0, minimo(255, m[1] + eje[1] * t / l2)), maximo(0, minimo(255, m[2] + eje[2] * t / l2))] }
+    sea mejor = nulo
+    sea mejor_err = 1e18
+    // Prueba los extremos y una versión encogida, en modo de 4 y de 3 colores.
+    para enc en [1, 0.9, 0.8] {
+        sea a = _tx_565(fin(mx * enc))
+        sea b = _tx_565(fin(mn * enc))
+        para modo en [4, 3] {
+            si (transparentes y modo == 4) { } sino si (forzar4 y modo == 3) { } sino {
+                sea c0 = a
+                sea c1 = b
+                si (modo == 4 y c0 < c1) {
+                    c0 = b
+                    c1 = a
+                }
+                si (modo == 3 y c0 > c1) {
+                    c0 = b
+                    c1 = a
+                }
+                si (modo == 4 y c0 == c1) {
+                    // Sin interpolación posible: índices 0.
+                    si (c0 > 0) { c1 = c0 - 1 } sino { c0 = 1 }
+                }
+                sea pal = _tx_paleta(c0, c1, c0 > c1)
+                sea idx = []
+                sea err = 0
+                para c en px {
+                    si (transparentes y c[3] < 128) { idx.agregar(3) } sino {
+                        sea bi = 0
+                        sea be = 1e18
+                        sea lim = 4
+                        si (c0 <= c1) { lim = 3 }
+                        sea k = 0
+                        mientras (k < lim) {
+                            sea d = _tx_dist(c, pal[k])
+                            si (d < be) {
+                                be = d
+                                bi = k
+                            }
+                            k = k + 1
+                        }
+                        idx.agregar(bi)
+                        err = err + be
+                    }
+                }
+                si (err < mejor_err) {
+                    mejor_err = err
+                    mejor = [c0, c1, idx]
+                }
+            }
+        }
+    }
+    sea bits = 0
+    sea k = 15
+    mientras (k >= 0) {
+        bits = bits * 4 + mejor[2][k]
+        k = k - 1
+    }
+    retornar bytes_entero(mejor[0], 2, 1) + bytes_entero(mejor[1], 2, 1) + bytes_entero(bits, 4, 1)
+}
+
+// BC4: 16 valores de 8 bits → 8 bytes.
+funcion _tx_bc4_bloque(vals) {
+    sea mn = 255
+    sea mx = 0
+    para v en vals {
+        si (v < mn) { mn = v }
+        si (v > mx) { mx = v }
+    }
+    sea mejor = nulo
+    sea mejor_err = 1e18
+    para modo en [8, 6] {
+        sea a = mx
+        sea b = mn
+        si (modo == 6) {
+            // Modo de 6 interpolados + 0 y 255: extremos sin contar 0/255.
+            a = 0
+            b = 255
+            para v en vals { si (v != 0 y v != 255) {
+                si (v > a) { a = v }
+                si (v < b) { b = v }
+            } }
+            si (a < b) {
+                a = mx
+                b = mn
+            }
+        }
+        sea e0 = a
+        sea e1 = b
+        si (modo == 8 y e0 == e1) {
+            si (e0 < 255) { e0 = e0 + 1 } sino { e1 = e1 - 1 }
+        }
+        si (modo == 6) {
+            e0 = b
+            e1 = a
+            si (e0 == e1) { si (e1 < 255) { e1 = e1 + 1 } sino { e0 = e0 - 1 } }
+        }
+        sea pal = _tx_paleta_bc4(e0, e1)
+        sea idx = []
+        sea err = 0
+        para v en vals {
+            sea bi = 0
+            sea be = 1e9
+            sea k = 0
+            mientras (k < 8) {
+                sea d = absoluto(v - pal[k])
+                si (d < be) {
+                    be = d
+                    bi = k
+                }
+                k = k + 1
+            }
+            idx.agregar(bi)
+            err = err + be * be
+        }
+        si (err < mejor_err) {
+            mejor_err = err
+            mejor = [e0, e1, idx]
+        }
+    }
+    sea r = [_tx_b(mejor[0]), _tx_b(mejor[1])]
+    // 48 bits de índices, 3 por valor, little endian.
+    sea bits = 0
+    sea k = 15
+    mientras (k >= 0) {
+        bits = bits * 8 + mejor[2][k]
+        k = k - 1
+    }
+    sea j = 0
+    mientras (j < 6) {
+        r.agregar(_tx_b(bits % 256))
+        bits = piso(bits / 256)
+        j = j + 1
+    }
+    retornar unir(r, "")
+}
+
+funcion _tx_paleta_bc4(e0, e1) {
+    si (e0 > e1) { retornar [e0, e1, piso((6 * e0 + e1) / 7), piso((5 * e0 + 2 * e1) / 7), piso((4 * e0 + 3 * e1) / 7), piso((3 * e0 + 4 * e1) / 7), piso((2 * e0 + 5 * e1) / 7), piso((e0 + 6 * e1) / 7)] }
+    retornar [e0, e1, piso((4 * e0 + e1) / 5), piso((3 * e0 + 2 * e1) / 5), piso((2 * e0 + 3 * e1) / 5), piso((e0 + 4 * e1) / 5), 0, 255]
+}
+
+funcion _tx_bc4_decod(b, p) {
+    sea e0 = byte_en(b, p)
+    sea e1 = byte_en(b, p + 1)
+    sea pal = _tx_paleta_bc4(e0, e1)
+    sea bits = 0
+    sea j = 5
+    mientras (j >= 0) {
+        bits = bits * 256 + byte_en(b, p + 2 + j)
+        j = j - 1
+    }
+    sea r = []
+    sea k = 0
+    mientras (k < 16) {
+        r.agregar(pal[bits % 8])
+        bits = piso(bits / 8)
+        k = k + 1
+    }
+    retornar r
+}
+
+funcion _tx_bc1_decod(b, p, bc3) {
+    sea c0 = byte_en(b, p) + byte_en(b, p + 1) * 256
+    sea c1 = byte_en(b, p + 2) + byte_en(b, p + 3) * 256
+    sea pal = _tx_paleta(c0, c1, c0 > c1 o bc3)
+    sea bits = byte_en(b, p + 4) + byte_en(b, p + 5) * 256 + byte_en(b, p + 6) * 65536 + byte_en(b, p + 7) * 16777216
+    sea r = []
+    sea k = 0
+    mientras (k < 16) {
+        sea i = bits % 4
+        sea a = 255
+        si (c0 <= c1 y i == 3 y bc3 == falso) { a = 0 }
+        r.agregar([pal[i][0], pal[i][1], pal[i][2], a])
+        bits = piso(bits / 4)
+        k = k + 1
+    }
+    retornar r
+}
+
+// ---------- ETC1 ----------
+
+sea _TX_ETC_TABLAS = [[2, 8], [5, 17], [9, 29], [13, 42], [18, 60], [24, 80], [33, 106], [47, 183]]
+// Índice de píxel (bit MSB/LSB) → modificador: 0 → +a, 1 → +b, 2 → −a, 3 → −b.
+
+funcion _tx_etc_mod(tabla, i) {
+    sea t = _TX_ETC_TABLAS[tabla]
+    si (i == 0) { retornar t[0] }
+    si (i == 1) { retornar t[1] }
+    si (i == 2) { retornar 0 - t[0] }
+    retornar 0 - t[1]
+}
+
+funcion _tx_lim(v) { retornar maximo(0, minimo(255, v)) }
+
+funcion _tx_etc1_decod(b, p) {
+    sea w0 = byte_en(b, p) * 16777216 + byte_en(b, p + 1) * 65536 + byte_en(b, p + 2) * 256 + byte_en(b, p + 3)
+    sea w1 = byte_en(b, p + 4) * 16777216 + byte_en(b, p + 5) * 65536 + byte_en(b, p + 6) * 256 + byte_en(b, p + 7)
+    sea dif = piso(w0 / 2) % 2 == 1
+    sea flip = w0 % 2 == 1
+    sea t1 = piso(w0 / 32) % 8
+    sea t2 = piso(w0 / 4) % 8
+    sea c1 = [0, 0, 0]
+    sea c2 = [0, 0, 0]
+    si (dif) {
+        sea r = piso(w0 / 134217728) % 32
+        sea g = piso(w0 / 524288) % 32
+        sea bb = piso(w0 / 2048) % 32
+        sea dr = piso(w0 / 16777216) % 8
+        sea dg = piso(w0 / 65536) % 8
+        sea db = piso(w0 / 256) % 8
+        si (dr >= 4) { dr = dr - 8 }
+        si (dg >= 4) { dg = dg - 8 }
+        si (db >= 4) { db = db - 8 }
+        // Como los decodificadores de referencia, el desborde da la vuelta.
+        sea r2 = (r + dr + 32) % 32
+        sea g2 = (g + dg + 32) % 32
+        sea b2 = (bb + db + 32) % 32
+        c1 = [r * 8 + piso(r / 4), g * 8 + piso(g / 4), bb * 8 + piso(bb / 4)]
+        c2 = [r2 * 8 + piso(r2 / 4), g2 * 8 + piso(g2 / 4), b2 * 8 + piso(b2 / 4)]
+    } sino {
+        sea r1 = piso(w0 / 268435456) % 16
+        sea r2 = piso(w0 / 16777216) % 16
+        sea g1 = piso(w0 / 1048576) % 16
+        sea g2 = piso(w0 / 65536) % 16
+        sea b1 = piso(w0 / 4096) % 16
+        sea b2 = piso(w0 / 256) % 16
+        c1 = [r1 * 17, g1 * 17, b1 * 17]
+        c2 = [r2 * 17, g2 * 17, b2 * 17]
+    }
+    sea r = []
+    sea k = 0
+    mientras (k < 16) {
+        r.agregar(nulo)
+        k = k + 1
+    }
+    // Los píxeles van por columnas: índice = x*4 + y.
+    sea x = 0
+    mientras (x < 4) {
+        sea yy = 0
+        mientras (yy < 4) {
+            sea pi = x * 4 + yy
+            sea msb = piso(w1 / potencia(2, pi + 16)) % 2
+            sea lsb = piso(w1 / potencia(2, pi)) % 2
+            sea idx = msb * 2 + lsb
+            sea segundo = falso
+            si (flip) { segundo = yy >= 2 } sino { segundo = x >= 2 }
+            sea c = c1
+            sea t = t1
+            si (segundo) {
+                c = c2
+                t = t2
+            }
+            sea md = _tx_etc_mod(t, idx)
+            r[yy * 4 + x] = [_tx_lim(c[0] + md), _tx_lim(c[1] + md), _tx_lim(c[2] + md), 255]
+            yy = yy + 1
+        }
+        x = x + 1
+    }
+    retornar r
+}
+
+// Mejor tabla e índices para una mitad con color base c.
+funcion _tx_etc_mitad(px, c) {
+    sea mejor = nulo
+    sea t = 0
+    mientras (t < 8) {
+        sea err = 0
+        sea idx = []
+        para q en px {
+            sea be = 1e18
+            sea bi = 0
+            sea i = 0
+            mientras (i < 4) {
+                sea md = _tx_etc_mod(t, i)
+                sea d = _tx_dist(q, [_tx_lim(c[0] + md), _tx_lim(c[1] + md), _tx_lim(c[2] + md)])
+                si (d < be) {
+                    be = d
+                    bi = i
+                }
+                i = i + 1
+            }
+            idx.agregar(bi)
+            err = err + be
+        }
+        si (mejor == nulo o err < mejor[0]) { mejor = [err, t, idx] }
+        t = t + 1
+    }
+    retornar mejor
+}
+
+funcion _tx_media(px) {
+    sea s = [0, 0, 0]
+    para c en px {
+        s[0] = s[0] + c[0]
+        s[1] = s[1] + c[1]
+        s[2] = s[2] + c[2]
+    }
+    retornar [s[0] / longitud(px), s[1] / longitud(px), s[2] / longitud(px)]
+}
+
+funcion _tx_etc1_bloque(px) {
+    sea mejor = nulo
+    para flip en [falso, verdadero] {
+        sea m1 = []
+        sea m2 = []
+        sea pos1 = []
+        sea pos2 = []
+        sea yy = 0
+        mientras (yy < 4) {
+            sea x = 0
+            mientras (x < 4) {
+                sea seg = x >= 2
+                si (flip) { seg = yy >= 2 }
+                si (seg) {
+                    m2.agregar(px[yy * 4 + x])
+                    pos2.agregar(x * 4 + yy)
+                } sino {
+                    m1.agregar(px[yy * 4 + x])
+                    pos1.agregar(x * 4 + yy)
+                }
+                x = x + 1
+            }
+            yy = yy + 1
+        }
+        sea a = _tx_media(m1)
+        sea b = _tx_media(m2)
+        // Diferencial (5 bits + delta de 3) si cabe; si no, individual (4 bits).
+        sea a5 = [piso(a[0] * 31 / 255 + 0.5), piso(a[1] * 31 / 255 + 0.5), piso(a[2] * 31 / 255 + 0.5)]
+        sea b5 = [piso(b[0] * 31 / 255 + 0.5), piso(b[1] * 31 / 255 + 0.5), piso(b[2] * 31 / 255 + 0.5)]
+        sea d = [b5[0] - a5[0], b5[1] - a5[1], b5[2] - a5[2]]
+        sea dif = d[0] >= -4 y d[0] <= 3 y d[1] >= -4 y d[1] <= 3 y d[2] >= -4 y d[2] <= 3
+        sea modos = [falso]
+        si (dif) { modos = [verdadero, falso] }
+        para usar_dif en modos {
+            sea c1 = nulo
+            sea c2 = nulo
+            si (usar_dif) {
+                c1 = [a5[0] * 8 + piso(a5[0] / 4), a5[1] * 8 + piso(a5[1] / 4), a5[2] * 8 + piso(a5[2] / 4)]
+                c2 = [b5[0] * 8 + piso(b5[0] / 4), b5[1] * 8 + piso(b5[1] / 4), b5[2] * 8 + piso(b5[2] / 4)]
+            } sino {
+                c1 = [piso(a[0] * 15 / 255 + 0.5) * 17, piso(a[1] * 15 / 255 + 0.5) * 17, piso(a[2] * 15 / 255 + 0.5) * 17]
+                c2 = [piso(b[0] * 15 / 255 + 0.5) * 17, piso(b[1] * 15 / 255 + 0.5) * 17, piso(b[2] * 15 / 255 + 0.5) * 17]
+            }
+            sea r1 = _tx_etc_mitad(m1, c1)
+            sea r2 = _tx_etc_mitad(m2, c2)
+            sea err = r1[0] + r2[0]
+            si (mejor == nulo o err < mejor["err"]) { mejor = {"err": err, "flip": flip, "dif": usar_dif, "a5": a5, "d": d, "c1": c1, "c2": c2, "r1": r1, "r2": r2, "pos1": pos1, "pos2": pos2} }
+        }
+    }
+    sea w0 = 0
+    si (mejor["dif"]) {
+        sea dd = mejor["d"]
+        w0 = mejor["a5"][0] * 134217728 + ((dd[0] + 8) % 8) * 16777216 + mejor["a5"][1] * 524288 + ((dd[1] + 8) % 8) * 65536 + mejor["a5"][2] * 2048 + ((dd[2] + 8) % 8) * 256 + 2
+    } sino {
+        sea c1 = mejor["c1"]
+        sea c2 = mejor["c2"]
+        w0 = (c1[0] / 17) * 268435456 + (c2[0] / 17) * 16777216 + (c1[1] / 17) * 1048576 + (c2[1] / 17) * 65536 + (c1[2] / 17) * 4096 + (c2[2] / 17) * 256
+    }
+    w0 = w0 + mejor["r1"][1] * 32 + mejor["r2"][1] * 4
+    si (mejor["flip"]) { w0 = w0 + 1 }
+    sea w1 = 0
+    sea k = 0
+    para par en [[mejor["pos1"], mejor["r1"][2]], [mejor["pos2"], mejor["r2"][2]]] {
+        sea j = 0
+        mientras (j < longitud(par[0])) {
+            sea pi = par[0][j]
+            sea idx = par[1][j]
+            w1 = w1 + piso(idx / 2) * potencia(2, pi + 16) + (idx % 2) * potencia(2, pi)
+            j = j + 1
+        }
+    }
+    retornar bytes_entero(w0, 4, 0) + bytes_entero(w1, 4, 0)
+}
+
+// ---------- api ----------
+
+sea _TX_TAM = {"bc1": 8, "bc1a": 8, "bc3": 16, "bc4": 8, "bc5": 16, "etc1": 8}
+
+/// Comprime una imagen. formato: "bc1", "bc1a" (BC1 con transparencia),
+/// "bc3", "bc4" (canal rojo), "bc5" (rojo y verde), "etc1".
+funcion textura_comprimir(img, formato) {
+    sea bw = piso((img["ancho"] + 3) / 4)
+    sea bh = piso((img["alto"] + 3) / 4)
+    sea r = []
+    sea by = 0
+    mientras (by < bh) {
+        sea bx = 0
+        mientras (bx < bw) {
+            sea px = _tx_bloque(img, bx, by)
+            si (formato == "bc1") { r.agregar(_tx_bc1_bloque(px, falso, falso)) }
+            sino si (formato == "bc1a") { r.agregar(_tx_bc1_bloque(px, verdadero, falso)) }
+            sino si (formato == "bc3") {
+                sea a = []
+                para c en px { a.agregar(c[3]) }
+                r.agregar(_tx_bc4_bloque(a) + _tx_bc1_bloque(px, falso, verdadero))
+            } sino si (formato == "bc4") {
+                sea a = []
+                para c en px { a.agregar(c[0]) }
+                r.agregar(_tx_bc4_bloque(a))
+            } sino si (formato == "bc5") {
+                sea a = []
+                sea g = []
+                para c en px {
+                    a.agregar(c[0])
+                    g.agregar(c[1])
+                }
+                r.agregar(_tx_bc4_bloque(a) + _tx_bc4_bloque(g))
+            } sino si (formato == "etc1") { r.agregar(_tx_etc1_bloque(px)) }
+            sino { lanzar "textura: formato desconocido " + formato }
+            bx = bx + 1
+        }
+        by = by + 1
+    }
+    retornar unir(r, "")
+}
+
+/// Descomprime a imagen RGBA.
+funcion textura_descomprimir(datos, formato, ancho, alto, desde) {
+    sea bw = piso((ancho + 3) / 4)
+    sea bh = piso((alto + 3) / 4)
+    sea tam = _TX_TAM[formato]
+    sea filas = []
+    sea k = 0
+    mientras (k < ancho * alto) {
+        filas.agregar(nulo)
+        k = k + 1
+    }
+    sea p = desde ?? 0
+    sea by = 0
+    mientras (by < bh) {
+        sea bx = 0
+        mientras (bx < bw) {
+            sea px = nulo
+            si (formato == "bc1" o formato == "bc1a") { px = _tx_bc1_decod(datos, p, falso) }
+            sino si (formato == "bc3") {
+                sea a = _tx_bc4_decod(datos, p)
+                px = _tx_bc1_decod(datos, p + 8, verdadero)
+                sea i = 0
+                mientras (i < 16) {
+                    px[i][3] = a[i]
+                    i = i + 1
+                }
+            } sino si (formato == "bc4") {
+                px = []
+                para v en _tx_bc4_decod(datos, p) { px.agregar([v, 0, 0, 255]) }
+            } sino si (formato == "bc5") {
+                sea rr = _tx_bc4_decod(datos, p)
+                sea gg = _tx_bc4_decod(datos, p + 8)
+                px = []
+                sea i = 0
+                mientras (i < 16) {
+                    px.agregar([rr[i], gg[i], 0, 255])
+                    i = i + 1
+                }
+            } sino si (formato == "etc1") { px = _tx_etc1_decod(datos, p) }
+            sino { lanzar "textura: formato desconocido " + formato }
+            sea i = 0
+            mientras (i < 16) {
+                sea x = bx * 4 + i % 4
+                sea yy = by * 4 + piso(i / 4)
+                si (x < ancho y yy < alto) { filas[yy * ancho + x] = px[i] }
+                i = i + 1
+            }
+            p = p + tam
+            bx = bx + 1
+        }
+        by = by + 1
+    }
+    sea partes = []
+    para c en filas { partes.agregar(_tx_b(c[0]) + _tx_b(c[1]) + _tx_b(c[2]) + _tx_b(c[3])) }
+    retornar {"ancho": ancho, "alto": alto, "pixeles": unir(partes, "")}
+}
+
+/// Mitad de tamaño (filtro de caja 2×2).
+funcion textura_reducir(img) {
+    sea w = maximo(1, piso(img["ancho"] / 2))
+    sea h = maximo(1, piso(img["alto"] / 2))
+    sea p = img["pixeles"]
+    sea partes = []
+    sea yy = 0
+    mientras (yy < h) {
+        sea x = 0
+        mientras (x < w) {
+            sea s = [0, 0, 0, 0]
+            para d en [[0, 0], [1, 0], [0, 1], [1, 1]] {
+                sea sx = minimo(x * 2 + d[0], img["ancho"] - 1)
+                sea sy = minimo(yy * 2 + d[1], img["alto"] - 1)
+                sea i = (sy * img["ancho"] + sx) * 4
+                s[0] = s[0] + byte_en(p, i)
+                s[1] = s[1] + byte_en(p, i + 1)
+                s[2] = s[2] + byte_en(p, i + 2)
+                s[3] = s[3] + byte_en(p, i + 3)
+            }
+            partes.agregar(_tx_b(piso((s[0] + 2) / 4)) + _tx_b(piso((s[1] + 2) / 4)) + _tx_b(piso((s[2] + 2) / 4)) + _tx_b(piso((s[3] + 2) / 4)))
+            x = x + 1
+        }
+        yy = yy + 1
+    }
+    retornar {"ancho": w, "alto": h, "pixeles": unir(partes, "")}
+}
+
+/// Cadena de mipmaps hasta 1×1.
+funcion textura_mipmaps(img) {
+    sea r = [img]
+    sea a = img
+    mientras (a["ancho"] > 1 o a["alto"] > 1) {
+        a = textura_reducir(a)
+        r.agregar(a)
+    }
+    retornar r
+}
+
+/// PSNR (dB) entre dos imágenes del mismo tamaño (canales RGB, o RGBA).
+funcion textura_psnr(a, b, con_alfa) {
+    sea n = a["ancho"] * a["alto"]
+    sea s = 0
+    sea canales = 3
+    si (con_alfa) { canales = 4 }
+    sea i = 0
+    mientras (i < n) {
+        sea j = 0
+        mientras (j < canales) {
+            sea d = byte_en(a["pixeles"], i * 4 + j) - byte_en(b["pixeles"], i * 4 + j)
+            s = s + d * d
+            j = j + 1
+        }
+        i = i + 1
+    }
+    si (s == 0) { retornar 99 }
+    sea mse = s / (n * canales)
+    retornar 10 * logaritmo(255 * 255 / mse) / logaritmo(10)
+}
+
+// ---------- DDS y KTX ----------
+
+sea _TX_FOURCC = {"bc1": "DXT1", "bc1a": "DXT1", "bc3": "DXT5", "bc4": "ATI1", "bc5": "ATI2"}
+
+/// Archivo DDS (con mipmaps si `mips`).
+funcion textura_dds(img, formato, mips) {
+    si (tiene_clave(_TX_FOURCC, formato) == falso) { lanzar "textura: DDS no soporta " + formato }
+    sea niveles = [img]
+    si (mips) { niveles = textura_mipmaps(img) }
+    sea datos = []
+    para n en niveles { datos.agregar(textura_comprimir(n, formato)) }
+    sea tam0 = longitud(datos[0])
+    sea u = funcion(v) { retornar bytes_entero(v, 4, 1) }
+    // DDSD_CAPS|HEIGHT|WIDTH|PIXELFORMAT|LINEARSIZE (+ MIPMAPCOUNT).
+    sea banderas = 1 + 2 + 4 + 4096 + 524288
+    si (mips) { banderas = banderas + 131072 }
+    sea caps = 4096
+    si (mips) { caps = caps + 8 + 4194304 }
+    sea cab = "DDS " + u(124) + u(banderas) + u(img["alto"]) + u(img["ancho"]) + u(tam0) + u(0) + u(longitud(niveles))
+    sea k = 0
+    mientras (k < 11) {
+        cab = cab + u(0)
+        k = k + 1
+    }
+    cab = cab + u(32) + u(4) + _TX_FOURCC[formato] + u(0) + u(0) + u(0) + u(0) + u(0) + u(caps) + u(0) + u(0) + u(0) + u(0)
+    retornar cab + unir(datos, "")
+}
+
+/// Lee un DDS: {"formato", "ancho", "alto", "niveles": [imagen]}.
+funcion textura_dds_leer(datos) {
+    si (subcadena(datos, 0, 4) != "DDS ") { lanzar "textura: no es DDS" }
+    sea alto = bytes_leer_entero(datos, 12, 4, 1)
+    sea ancho = bytes_leer_entero(datos, 16, 4, 1)
+    sea mips = maximo(1, bytes_leer_entero(datos, 28, 4, 1))
+    sea cc = subcadena(datos, 84, 88)
+    sea formato = nulo
+    para f en ["bc1", "bc3", "bc4", "bc5"] { si (_TX_FOURCC[f] == cc) { formato = f } }
+    si (cc == "BC4U") { formato = "bc4" }
+    si (cc == "BC5U") { formato = "bc5" }
+    si (formato == nulo) { lanzar "textura: FourCC no soportado " + cc }
+    sea p = 128
+    sea niveles = []
+    sea w = ancho
+    sea h = alto
+    sea k = 0
+    mientras (k < mips) {
+        niveles.agregar(textura_descomprimir(datos, formato, w, h, p))
+        p = p + piso((w + 3) / 4) * piso((h + 3) / 4) * _TX_TAM[formato]
+        w = maximo(1, piso(w / 2))
+        h = maximo(1, piso(h / 2))
+        k = k + 1
+    }
+    retornar {"formato": formato, "ancho": ancho, "alto": alto, "niveles": niveles}
+}
+
+sea _TX_GL = {"bc1": 33776, "bc1a": 33777, "bc3": 33779, "bc4": 36283, "bc5": 36285, "etc1": 36196}
+
+/// Archivo KTX 1.1 (con mipmaps si `mips`).
+funcion textura_ktx(img, formato, mips) {
+    sea niveles = [img]
+    si (mips) { niveles = textura_mipmaps(img) }
+    sea u = funcion(v) { retornar bytes_entero(v, 4, 1) }
+    sea ident = bytes_entero(171, 1, 0) + "KTX 11" + bytes_entero(187, 1, 0) + "\r\n" + bytes_entero(26, 1, 0) + "\n"
+    // glType 0, glTypeSize 1, glFormat 0 (comprimido), glInternalFormat, glBaseInternalFormat.
+    sea base = 6407
+    si (formato == "bc1a" o formato == "bc3") { base = 6408 }
+    si (formato == "bc4") { base = 6403 }
+    si (formato == "bc5") { base = 33319 }
+    sea cab = ident + u(67305985) + u(0) + u(1) + u(0) + u(_TX_GL[formato]) + u(base) + u(img["ancho"]) + u(img["alto"]) + u(0) + u(0) + u(1) + u(longitud(niveles)) + u(0)
+    sea partes = [cab]
+    para n en niveles {
+        sea d = textura_comprimir(n, formato)
+        partes.agregar(u(longitud(d)) + d)
+    }
+    retornar unir(partes, "")
+}
+
+/// Lee un KTX 1.1 de los formatos soportados.
+funcion textura_ktx_leer(datos) {
+    si (subcadena(datos, 1, 7) != "KTX 11") { lanzar "textura: no es KTX 1.1" }
+    sea gl = bytes_leer_entero(datos, 28, 4, 1)
+    sea formato = nulo
+    para f en ["bc1", "bc1a", "bc3", "bc4", "bc5", "etc1"] { si (_TX_GL[f] == gl) { formato = f } }
+    si (formato == nulo) { lanzar "textura: formato GL no soportado " + gl }
+    sea ancho = bytes_leer_entero(datos, 36, 4, 1)
+    sea alto = bytes_leer_entero(datos, 40, 4, 1)
+    sea mips = maximo(1, bytes_leer_entero(datos, 56, 4, 1))
+    sea p = 64 + bytes_leer_entero(datos, 60, 4, 1)
+    sea niveles = []
+    sea w = ancho
+    sea h = alto
+    sea k = 0
+    mientras (k < mips) {
+        sea tam = bytes_leer_entero(datos, p, 4, 1)
+        niveles.agregar(textura_descomprimir(datos, formato, w, h, p + 4))
+        p = p + 4 + tam
+        mientras (p % 4 != 0) { p = p + 1 }
+        w = maximo(1, piso(w / 2))
+        h = maximo(1, piso(h / 2))
+        k = k + 1
+    }
+    retornar {"formato": formato, "ancho": ancho, "alto": alto, "niveles": niveles}
+}

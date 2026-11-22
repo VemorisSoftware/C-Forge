@@ -1,0 +1,317 @@
+// stdlib/descubre.cfv — descubrimiento de servicios y configuración
+// distribuida con etcd v3 (por su pasarela JSON /v3/...) y Consul (API
+// HTTP /v1/...): clave-valor con prefijos, revisiones, arrendamientos con
+// TTL y renovación, transacciones de comparar y cambiar, bloqueos y
+// elección de líder sobre etcd; registro y baja de servicios con chequeos,
+// catálogo y servicios sanos, KV con índices y sesiones en Consul; y un
+// balanceador simple que elige instancias sanas. Idea de etcd y Consul
+// (Apache/MPL; solo la idea). En inglés: importar "discovery".
+//
+//   importar "descubre"
+//   sea e = descubre_etcd("http://127.0.0.1:2379", nulo)
+//   descubre_etcd_poner(e, "/config/modo", "prod", nulo)
+//   mostrar(descubre_etcd_obtener(e, "/config/modo"))
+
+importar "json"
+importar "base64"
+
+funcion _ds_http(cli, metodo, ruta, cuerpo) {
+    sea t = cli["transporte"]
+    si (t == nulo) { t = funcion(m, url, o) { retornar http_solicitud(m, url, {"cuerpo": o["cuerpo"], "tipo": "application/json", "cabeceras": o["cabeceras"]}) } }
+    sea cab = {}
+    si (cli["token"] != nulo) {
+        si (cli["tipo"] == "consul") { cab["X-Consul-Token"] = cli["token"] } sino { cab["Authorization"] = cli["token"] }
+    }
+    sea txt = nulo
+    si (cuerpo != nulo) {
+        si (tipo(cuerpo) == "texto") { txt = cuerpo } sino { txt = json_texto(cuerpo) }
+    }
+    sea r = t(metodo, cli["url"] + ruta, {"cabeceras": cab, "cuerpo": txt})
+    si (r["estado"] < 200 o r["estado"] >= 300) {
+        si (r["estado"] == 404 y cli["tipo"] == "consul") { retornar {"estado": 404, "cuerpo": "", "cabeceras": r["cabeceras"] ?? {}} }
+        lanzar "descubre: " + metodo + " " + ruta + " → " + r["estado"] + " " + r["cuerpo"]
+    }
+    retornar r
+}
+
+funcion _ds_json(r) {
+    si (texto_recortar("" + r["cuerpo"]) == "") { retornar nulo }
+    retornar json_parsear(r["cuerpo"])
+}
+
+// ---------- etcd ----------
+
+/// Cliente de etcd. opciones: "transporte", "usuario", "clave" (pide token).
+funcion descubre_etcd(url, opciones) {
+    sea op = opciones ?? {}
+    sea u = url
+    si (texto_termina_con(u, "/")) { u = subcadena(u, 0, longitud(u) - 1) }
+    sea cli = {"tipo": "etcd", "url": u, "transporte": op["transporte"] ?? nulo, "token": nulo}
+    si ((op["usuario"] ?? nulo) != nulo) { cli["token"] = _ds_json(_ds_http(cli, "POST", "/v3/auth/authenticate", {"name": op["usuario"], "password": op["clave"] ?? ""}))["token"] }
+    retornar cli
+}
+
+funcion _ds_b64(t) { retornar base64_codificar("" + t) }
+
+// Fin del rango de un prefijo: incrementa el último byte.
+funcion descubre_fin_prefijo(p) {
+    sea i = longitud(p) - 1
+    mientras (i >= 0) {
+        sea b = byte_en(p, i)
+        si (b < 255) { retornar subcadena(p, 0, i) + bytes_entero(b + 1, 1, 0) }
+        i = i - 1
+    }
+    retornar bytes_entero(0, 1, 0)
+}
+
+funcion _ds_kv(kv) {
+    retornar {"clave": base64_decodificar(kv["key"]), "valor": base64_decodificar(kv["value"] ?? ""), "version": a_numero("" + (kv["version"] ?? "0")), "creado": a_numero("" + (kv["create_revision"] ?? "0")),
+        "modificado": a_numero("" + (kv["mod_revision"] ?? "0")), "arriendo": kv["lease"] ?? nulo}
+}
+
+/// Guarda clave=valor. opciones: "arriendo" (id).
+funcion descubre_etcd_poner(cli, clave, valor, opciones) {
+    sea op = opciones ?? {}
+    sea c = {"key": _ds_b64(clave), "value": _ds_b64(valor)}
+    si ((op["arriendo"] ?? nulo) != nulo) { c["lease"] = "" + op["arriendo"] }
+    sea r = _ds_json(_ds_http(cli, "POST", "/v3/kv/put", c))
+    retornar a_numero("" + ((r["header"] ?? {})["revision"] ?? "0"))
+}
+
+/// Valor de una clave o nulo.
+funcion descubre_etcd_obtener(cli, clave) {
+    sea l = descubre_etcd_rango(cli, clave, nulo)
+    si (longitud(l) == 0) { retornar nulo }
+    retornar l[0]["valor"]
+}
+
+/// Pares de un rango. opciones: "prefijo" (verdadero: todas las claves
+/// que empiezan con `clave`), "limite", "revision", "solo_claves".
+funcion descubre_etcd_rango(cli, clave, opciones) {
+    sea op = opciones ?? {}
+    sea c = {"key": _ds_b64(clave)}
+    si (op["prefijo"] ?? falso) { c["range_end"] = _ds_b64(descubre_fin_prefijo(clave)) }
+    si ((op["limite"] ?? nulo) != nulo) { c["limit"] = "" + op["limite"] }
+    si ((op["revision"] ?? nulo) != nulo) { c["revision"] = "" + op["revision"] }
+    si (op["solo_claves"] ?? falso) { c["keys_only"] = verdadero }
+    sea r = _ds_json(_ds_http(cli, "POST", "/v3/kv/range", c))
+    sea l = []
+    para kv en r["kvs"] ?? [] { l.agregar(_ds_kv(kv)) }
+    retornar l
+}
+
+/// Borra una clave (o un prefijo). Devuelve cuántas borró.
+funcion descubre_etcd_borrar(cli, clave, prefijo) {
+    sea c = {"key": _ds_b64(clave)}
+    si (prefijo ?? falso) { c["range_end"] = _ds_b64(descubre_fin_prefijo(clave)) }
+    retornar a_numero("" + (_ds_json(_ds_http(cli, "POST", "/v3/kv/deleterange", c))["deleted"] ?? "0"))
+}
+
+/// Arrendamiento con TTL (segundos). Devuelve el id.
+funcion descubre_etcd_arriendo(cli, ttl) { retornar _ds_json(_ds_http(cli, "POST", "/v3/lease/grant", {"TTL": "" + ttl}))["ID"] }
+
+/// Renueva un arrendamiento (keepalive). Devuelve el TTL restante.
+funcion descubre_etcd_renovar(cli, id) {
+    sea r = _ds_json(_ds_http(cli, "POST", "/v3/lease/keepalive", {"ID": "" + id}))
+    sea x = r["result"] ?? r
+    retornar a_numero("" + (x["TTL"] ?? "0"))
+}
+
+funcion descubre_etcd_revocar(cli, id) { _ds_http(cli, "POST", "/v3/lease/revoke", {"ID": "" + id}) }
+
+/// Transacción: si todas las comparaciones se cumplen hace `exito`, si no
+/// `fallo`. Comparaciones: ["valor"|"version"|"creado"|"modificado", clave,
+/// "=="|"!="|"<"|">", valor]. Operaciones: ["poner", clave, valor] |
+/// ["borrar", clave] | ["obtener", clave]. Devuelve {"exito", "respuestas"}.
+funcion descubre_etcd_txn(cli, comparar, exito, fallo) {
+    sea res = {"==": "EQUAL", "!=": "NOT_EQUAL", "<": "LESS", ">": "GREATER"}
+    sea obj = {"valor": "VALUE", "version": "VERSION", "creado": "CREATE", "modificado": "MOD"}
+    sea campo = {"valor": "value", "version": "version", "creado": "create_revision", "modificado": "mod_revision"}
+    sea cmp = []
+    para c en comparar {
+        sea x = {"key": _ds_b64(c[1]), "result": res[c[2]], "target": obj[c[0]]}
+        si (c[0] == "valor") { x["value"] = _ds_b64(c[3]) } sino { x[campo[c[0]]] = "" + c[3] }
+        cmp.agregar(x)
+    }
+    sea ops = funcion(l) {
+        sea r = []
+        para o en l ?? [] {
+            si (o[0] == "poner") { r.agregar({"request_put": {"key": _ds_b64(o[1]), "value": _ds_b64(o[2])}}) }
+            si (o[0] == "borrar") { r.agregar({"request_delete_range": {"key": _ds_b64(o[1])}}) }
+            si (o[0] == "obtener") { r.agregar({"request_range": {"key": _ds_b64(o[1])}}) }
+        }
+        retornar r
+    }
+    sea r = _ds_json(_ds_http(cli, "POST", "/v3/kv/txn", {"compare": cmp, "success": ops(exito), "failure": ops(fallo)}))
+    sea resp = []
+    para x en r["responses"] ?? [] {
+        si ((x["response_range"] ?? nulo) != nulo) {
+            sea l = []
+            para kv en x["response_range"]["kvs"] ?? [] { l.agregar(_ds_kv(kv)) }
+            resp.agregar(l)
+        } sino { resp.agregar(x) }
+    }
+    retornar {"exito": r["succeeded"] ?? falso, "respuestas": resp}
+}
+
+/// Crea la clave solo si no existe (útil para bloqueos). Devuelve verdadero si la creó.
+funcion descubre_etcd_crear(cli, clave, valor, arriendo) {
+    sea r = descubre_etcd_txn(cli, [["creado", clave, "==", 0]], [["poner", clave, valor]], nulo)
+    si (r["exito"] y arriendo != nulo) { descubre_etcd_poner(cli, clave, valor, {"arriendo": arriendo}) }
+    retornar r["exito"]
+}
+
+/// Bloqueo simple: intenta tomar `nombre` con un arrendamiento de ttl.
+/// Devuelve {"tomado", "arriendo"}.
+funcion descubre_etcd_bloquear(cli, nombre, dueno, ttl) {
+    sea id = descubre_etcd_arriendo(cli, ttl ?? 15)
+    sea ok = descubre_etcd_crear(cli, "/bloqueos/" + nombre, dueno, id)
+    si (ok == falso) { descubre_etcd_revocar(cli, id) }
+    retornar {"tomado": ok, "arriendo": id}
+}
+
+funcion descubre_etcd_soltar(cli, nombre, b) {
+    descubre_etcd_borrar(cli, "/bloqueos/" + nombre, falso)
+    si (b != nulo) { descubre_etcd_revocar(cli, b["arriendo"]) }
+}
+
+/// Elección de líder: el primero en crear la clave gana. Devuelve el líder actual.
+funcion descubre_etcd_elegir(cli, eleccion, candidato, ttl) {
+    sea clave = "/elecciones/" + eleccion
+    sea id = descubre_etcd_arriendo(cli, ttl ?? 15)
+    si (descubre_etcd_crear(cli, clave, candidato, id) == falso) { descubre_etcd_revocar(cli, id) }
+    retornar descubre_etcd_obtener(cli, clave)
+}
+
+/// Eventos de un watch ya leído (texto con un JSON por línea).
+funcion descubre_etcd_eventos(texto) {
+    sea r = []
+    para l en texto_dividir(texto, "\n") {
+        si (texto_recortar(l) != "") {
+            sea x = json_parsear(l)
+            para e en (x["result"] ?? x)["events"] ?? [] {
+                sea kv = _ds_kv(e["kv"])
+                kv["tipo"] = e["type"] ?? "PUT"
+                r.agregar(kv)
+            }
+        }
+    }
+    retornar r
+}
+
+// ---------- Consul ----------
+
+/// Cliente de Consul. opciones: "transporte", "token", "dc".
+funcion descubre_consul(url, opciones) {
+    sea op = opciones ?? {}
+    sea u = url
+    si (texto_termina_con(u, "/")) { u = subcadena(u, 0, longitud(u) - 1) }
+    retornar {"tipo": "consul", "url": u, "transporte": op["transporte"] ?? nulo, "token": op["token"] ?? nulo, "dc": op["dc"] ?? nulo}
+}
+
+funcion _ds_dc(cli, sep) {
+    si (cli["dc"] == nulo) { retornar "" }
+    retornar sep + "dc=" + cli["dc"]
+}
+
+/// Registra un servicio en el agente. s: {"nombre", "id", "direccion",
+/// "puerto", "etiquetas", "meta", "chequeo": {"http"|"tcp", "intervalo",
+/// "ttl", "deregistrar_tras"}}.
+funcion descubre_consul_registrar(cli, s) {
+    sea c = {"Name": s["nombre"], "ID": s["id"] ?? s["nombre"], "Address": s["direccion"] ?? "", "Port": s["puerto"] ?? 0, "Tags": s["etiquetas"] ?? [], "Meta": s["meta"] ?? {}}
+    sea ch = s["chequeo"] ?? nulo
+    si (ch != nulo) {
+        sea x = {}
+        si ((ch["http"] ?? nulo) != nulo) { x["HTTP"] = ch["http"] }
+        si ((ch["tcp"] ?? nulo) != nulo) { x["TCP"] = ch["tcp"] }
+        si ((ch["ttl"] ?? nulo) != nulo) { x["TTL"] = ch["ttl"] }
+        si ((ch["intervalo"] ?? nulo) != nulo) { x["Interval"] = ch["intervalo"] }
+        si ((ch["deregistrar_tras"] ?? nulo) != nulo) { x["DeregisterCriticalServiceAfter"] = ch["deregistrar_tras"] }
+        c["Check"] = x
+    }
+    _ds_http(cli, "PUT", "/v1/agent/service/register", c)
+    retornar c["ID"]
+}
+
+funcion descubre_consul_baja(cli, id) { _ds_http(cli, "PUT", "/v1/agent/service/deregister/" + id, nulo) }
+
+/// Marca un chequeo TTL: estado "pass", "warn" o "fail".
+funcion descubre_consul_ttl(cli, id_chequeo, estado, nota) { _ds_http(cli, "PUT", "/v1/agent/check/" + (estado ?? "pass") + "/" + id_chequeo + "?note=" + (nota ?? ""), nulo) }
+
+/// Instancias de un servicio: [{"id", "direccion", "puerto", "etiquetas",
+/// "meta", "sano"}]. sanos: solo las que pasan todos los chequeos.
+funcion descubre_consul_servicio(cli, nombre, sanos, etiqueta) {
+    sea q = "?"
+    si (sanos ?? verdadero) { q = q + "passing=true&" }
+    si (etiqueta != nulo) { q = q + "tag=" + etiqueta + "&" }
+    sea r = _ds_json(_ds_http(cli, "GET", "/v1/health/service/" + nombre + q + _ds_dc(cli, ""), nulo)) ?? []
+    sea l = []
+    para x en r {
+        sea s = x["Service"]
+        sea sano = verdadero
+        para ch en x["Checks"] ?? [] { si (ch["Status"] != "passing") { sano = falso } }
+        sea dir = s["Address"]
+        si (dir == "" o dir == nulo) { dir = (x["Node"] ?? {})["Address"] ?? "" }
+        l.agregar({"id": s["ID"], "direccion": dir, "puerto": s["Port"], "etiquetas": s["Tags"] ?? [], "meta": s["Meta"] ?? {}, "sano": sano, "nodo": (x["Node"] ?? {})["Node"] ?? ""})
+    }
+    retornar l
+}
+
+/// Nombres de servicios del catálogo con sus etiquetas.
+funcion descubre_consul_servicios(cli) { retornar _ds_json(_ds_http(cli, "GET", "/v1/catalog/services" + _ds_dc(cli, "?"), nulo)) ?? {} }
+
+/// KV: valor o nulo.
+funcion descubre_consul_obtener(cli, clave) {
+    sea r = _ds_http(cli, "GET", "/v1/kv/" + clave + _ds_dc(cli, "?"), nulo)
+    si (r["estado"] == 404) { retornar nulo }
+    sea l = _ds_json(r)
+    si (l == nulo o longitud(l) == 0) { retornar nulo }
+    si (l[0]["Value"] == nulo) { retornar "" }
+    retornar base64_decodificar(l[0]["Value"])
+}
+
+/// KV con prefijo: [{"clave", "valor", "indice"}].
+funcion descubre_consul_prefijo(cli, prefijo) {
+    sea r = _ds_http(cli, "GET", "/v1/kv/" + prefijo + "?recurse=true" + _ds_dc(cli, "&"), nulo)
+    si (r["estado"] == 404) { retornar [] }
+    sea l = []
+    para x en _ds_json(r) ?? [] {
+        sea v = ""
+        si (x["Value"] != nulo) { v = base64_decodificar(x["Value"]) }
+        l.agregar({"clave": x["Key"], "valor": v, "indice": x["ModifyIndex"]})
+    }
+    retornar l
+}
+
+/// Guarda en el KV. cas: índice para comparar y cambiar. Devuelve verdadero si guardó.
+funcion descubre_consul_poner(cli, clave, valor, cas) {
+    sea q = ""
+    si (cas != nulo) { q = "?cas=" + cas }
+    sea r = _ds_http(cli, "PUT", "/v1/kv/" + clave + q, "" + valor)
+    retornar texto_recortar("" + r["cuerpo"]) == "true"
+}
+
+funcion descubre_consul_borrar(cli, clave, recursivo) {
+    sea q = ""
+    si (recursivo ?? falso) { q = "?recurse=true" }
+    _ds_http(cli, "DELETE", "/v1/kv/" + clave + q, nulo)
+}
+
+// ---------- balanceo ----------
+
+/// Elige una instancia sana: "round_robin" (con estado en `bal`), "azar" o "primera".
+funcion descubre_elegir(instancias, politica, bal) {
+    sea sanas = []
+    para i en instancias { si (i["sano"] ?? verdadero) { sanas.agregar(i) } }
+    si (longitud(sanas) == 0) { retornar nulo }
+    sea p = politica ?? "round_robin"
+    si (p == "primera") { retornar sanas[0] }
+    si (p == "azar") { retornar sanas[aleatorio_entero(0, longitud(sanas) - 1)] }
+    sea b = bal ?? {"turno": 0}
+    sea r = sanas[b["turno"] % longitud(sanas)]
+    b["turno"] = b["turno"] + 1
+    retornar r
+}
+
+/// URL "http://direccion:puerto" de una instancia.
+funcion descubre_url(inst, esquema) { retornar (esquema ?? "http") + "://" + inst["direccion"] + ":" + inst["puerto"] }

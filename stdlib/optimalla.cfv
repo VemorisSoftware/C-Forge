@@ -1,0 +1,654 @@
+// stdlib/optimalla.cfv — optimizar mallas y generar niveles de detalle
+// (LOD) al estilo meshoptimizer: quitar vértices repetidos (remapeo),
+// reordenar triángulos para la caché de vértices de la GPU (algoritmo de
+// Forsyth), reordenar vértices por primer uso (fetch), medir ACMR/ATVR y
+// la caché de vértices, simplificar con métricas cuádricas de error
+// (Garland-Heckbert) cuidando bordes, generar cadenas de LOD, cuantizar
+// atributos (flotante medio, snorm/unorm) y calcular esferas y cajas
+// envolventes. Trabaja con mallas de "modelo" ({"posiciones", "normales",
+// "uvs", "indices"}). Idea de meshoptimizer (MIT). En inglés:
+// importar "meshopt".
+//
+//   importar "optimalla"
+//   sea m = optimalla_optimizar(malla)            // remapeo + caché + fetch
+//   sea lod = optimalla_simplificar(m, 0.25, 0.01) // 25 % de los triángulos
+
+importar "modelo"
+
+// ---------- remapeo ----------
+
+/// Tabla de remapeo de vértices idénticos (todos los atributos):
+/// {"remapeo": [nuevo índice por vértice viejo], "vertices": cantidad única}.
+funcion optimalla_remapeo(m) {
+    sea n = longitud(m["posiciones"]) / 3
+    sea con_n = longitud(m["normales"] ?? []) == n * 3
+    sea con_uv = longitud(m["uvs"] ?? []) == n * 2
+    sea vistos = {}
+    sea remap = []
+    sea unicos = 0
+    // Orden de primer uso en el índice (como meshopt_generateVertexRemap).
+    sea k = 0
+    mientras (k < n) {
+        remap.agregar(-1)
+        k = k + 1
+    }
+    sea orden = []
+    si (longitud(m["indices"] ?? []) > 0) { orden = m["indices"] } sino {
+        k = 0
+        mientras (k < n) {
+            orden.agregar(k)
+            k = k + 1
+        }
+    }
+    para v en orden {
+        si (remap[v] < 0) {
+            sea p = m["posiciones"]
+            sea clave = "" + p[v * 3] + "," + p[v * 3 + 1] + "," + p[v * 3 + 2]
+            si (con_n) { clave = clave + "|" + m["normales"][v * 3] + "," + m["normales"][v * 3 + 1] + "," + m["normales"][v * 3 + 2] }
+            si (con_uv) { clave = clave + "|" + m["uvs"][v * 2] + "," + m["uvs"][v * 2 + 1] }
+            si (tiene_clave(vistos, clave)) { remap[v] = vistos[clave] } sino {
+                vistos[clave] = unicos
+                remap[v] = unicos
+                unicos = unicos + 1
+            }
+        }
+    }
+    retornar {"remapeo": remap, "vertices": unicos}
+}
+
+/// Aplica un remapeo: vértices únicos e índices nuevos.
+funcion optimalla_remapear(m, r) {
+    sea nv = r["vertices"]
+    sea out = malla_nueva()
+    sea n = longitud(m["posiciones"]) / 3
+    sea con_n = longitud(m["normales"] ?? []) == n * 3
+    sea con_uv = longitud(m["uvs"] ?? []) == n * 2
+    sea k = 0
+    mientras (k < nv * 3) {
+        out["posiciones"].agregar(0)
+        si (con_n) { out["normales"].agregar(0) }
+        k = k + 1
+    }
+    si (con_uv) {
+        k = 0
+        mientras (k < nv * 2) {
+            out["uvs"].agregar(0)
+            k = k + 1
+        }
+    }
+    sea v = 0
+    mientras (v < n) {
+        sea d = r["remapeo"][v]
+        si (d >= 0) {
+            sea j = 0
+            mientras (j < 3) {
+                out["posiciones"][d * 3 + j] = m["posiciones"][v * 3 + j]
+                si (con_n) { out["normales"][d * 3 + j] = m["normales"][v * 3 + j] }
+                j = j + 1
+            }
+            si (con_uv) {
+                out["uvs"][d * 2] = m["uvs"][v * 2]
+                out["uvs"][d * 2 + 1] = m["uvs"][v * 2 + 1]
+            }
+        }
+        v = v + 1
+    }
+    sea ind = m["indices"] ?? []
+    si (longitud(ind) == 0) {
+        k = 0
+        mientras (k < n) {
+            ind.agregar(k)
+            k = k + 1
+        }
+    }
+    para i en ind { out["indices"].agregar(r["remapeo"][i]) }
+    retornar out
+}
+
+// ---------- caché de vértices ----------
+
+/// Simula una caché FIFO de `tam` vértices: {"acmr" (fallos por
+/// triángulo), "atvr" (fallos por vértice), "fallos"}.
+funcion optimalla_cache_analizar(indices, n_vertices, tam) {
+    sea t = tam ?? 16
+    sea marca = []
+    sea k = 0
+    mientras (k < n_vertices) {
+        marca.agregar(-1000000)
+        k = k + 1
+    }
+    sea reloj = 0
+    sea fallos = 0
+    para i en indices {
+        si (reloj - marca[i] > t) {
+            marca[i] = reloj
+            reloj = reloj + 1
+            fallos = fallos + 1
+        }
+    }
+    sea tris = longitud(indices) / 3
+    sea usados = 0
+    para x en marca { si (x > -1000000) { usados = usados + 1 } }
+    si (tris == 0) { retornar {"acmr": 0, "atvr": 0, "fallos": 0} }
+    retornar {"acmr": fallos / tris, "atvr": fallos / maximo(1, usados), "fallos": fallos}
+}
+
+sea _OM_CACHE = 32
+
+funcion _om_puntaje(pos_cache, vivos) {
+    si (vivos == 0) { retornar -1 }
+    sea s = 0
+    si (pos_cache >= 0) {
+        si (pos_cache < 3) { s = 0.75 } sino { s = potencia(1 - (pos_cache - 3) / (_OM_CACHE - 3), 1.5) }
+    }
+    retornar s + 2 * potencia(vivos, -0.5)
+}
+
+/// Reordena triángulos para la caché de vértices (Forsyth, "Linear-Speed
+/// Vertex Cache Optimisation"). Devuelve índices nuevos.
+funcion optimalla_cache(indices, n_vertices) {
+    sea nt = longitud(indices) / 3
+    sea vivos = []
+    sea tris_de = []
+    sea k = 0
+    mientras (k < n_vertices) {
+        vivos.agregar(0)
+        tris_de.agregar([])
+        k = k + 1
+    }
+    sea t = 0
+    mientras (t < nt) {
+        sea j = 0
+        mientras (j < 3) {
+            sea v = indices[t * 3 + j]
+            vivos[v] = vivos[v] + 1
+            tris_de[v].agregar(t)
+            j = j + 1
+        }
+        t = t + 1
+    }
+    sea pos = []
+    sea puntaje = []
+    k = 0
+    mientras (k < n_vertices) {
+        pos.agregar(-1)
+        puntaje.agregar(_om_puntaje(-1, vivos[k]))
+        k = k + 1
+    }
+    sea hecho = []
+    sea pt = []
+    t = 0
+    mientras (t < nt) {
+        hecho.agregar(falso)
+        pt.agregar(puntaje[indices[t * 3]] + puntaje[indices[t * 3 + 1]] + puntaje[indices[t * 3 + 2]])
+        t = t + 1
+    }
+    sea cache = []
+    sea salida = []
+    sea emitidos = 0
+    sea cursor = 0
+    sea mejor = -1
+    // Primer triángulo: el de mayor puntaje.
+    sea mejor_p = -1
+    t = 0
+    mientras (t < nt) {
+        si (pt[t] > mejor_p) {
+            mejor_p = pt[t]
+            mejor = t
+        }
+        t = t + 1
+    }
+    mientras (emitidos < nt) {
+        si (mejor < 0) {
+            // Sin candidato en la caché: el siguiente libre en orden.
+            mientras (cursor < nt y hecho[cursor]) { cursor = cursor + 1 }
+            mejor = cursor
+        }
+        hecho[mejor] = verdadero
+        emitidos = emitidos + 1
+        sea tri = [indices[mejor * 3], indices[mejor * 3 + 1], indices[mejor * 3 + 2]]
+        para v en tri {
+            salida.agregar(v)
+            vivos[v] = vivos[v] - 1
+        }
+        // Actualiza la caché LRU: los tres al frente.
+        sea nueva = [tri[0], tri[1], tri[2]]
+        para v en cache { si (v != tri[0] y v != tri[1] y v != tri[2]) { nueva.agregar(v) } }
+        // Vértices que salen de la caché.
+        sea salen = []
+        si (longitud(nueva) > _OM_CACHE) {
+            k = _OM_CACHE
+            mientras (k < longitud(nueva)) {
+                salen.agregar(nueva[k])
+                k = k + 1
+            }
+            sea corta = []
+            k = 0
+            mientras (k < _OM_CACHE) {
+                corta.agregar(nueva[k])
+                k = k + 1
+            }
+            nueva = corta
+        }
+        cache = nueva
+        para v en salen { pos[v] = -1 }
+        k = 0
+        mientras (k < longitud(cache)) {
+            pos[cache[k]] = k
+            k = k + 1
+        }
+        // Recalcula puntajes de vértices tocados y de sus triángulos.
+        sea tocados = []
+        para v en cache { tocados.agregar(v) }
+        para v en salen { tocados.agregar(v) }
+        para v en tocados { puntaje[v] = _om_puntaje(pos[v], vivos[v]) }
+        mejor = -1
+        mejor_p = -1
+        para v en tocados {
+            para tt en tris_de[v] {
+                si (hecho[tt] == falso) {
+                    pt[tt] = puntaje[indices[tt * 3]] + puntaje[indices[tt * 3 + 1]] + puntaje[indices[tt * 3 + 2]]
+                    si (pt[tt] > mejor_p) {
+                        mejor_p = pt[tt]
+                        mejor = tt
+                    }
+                }
+            }
+        }
+    }
+    retornar salida
+}
+
+/// Reordena los vértices por orden de primer uso (mejora la lectura de
+/// memoria). Devuelve la malla nueva (igual que meshopt_optimizeVertexFetch).
+funcion optimalla_fetch(m) {
+    sea n = longitud(m["posiciones"]) / 3
+    sea remap = []
+    sea k = 0
+    mientras (k < n) {
+        remap.agregar(-1)
+        k = k + 1
+    }
+    sea sig = 0
+    para i en m["indices"] {
+        si (remap[i] < 0) {
+            remap[i] = sig
+            sig = sig + 1
+        }
+    }
+    retornar optimalla_remapear(m, {"remapeo": remap, "vertices": sig})
+}
+
+/// Remapeo + caché + fetch en un paso.
+funcion optimalla_optimizar(m) {
+    sea r = optimalla_remapear(m, optimalla_remapeo(m))
+    r["indices"] = optimalla_cache(r["indices"], longitud(r["posiciones"]) / 3)
+    retornar optimalla_fetch(r)
+}
+
+// ---------- simplificación ----------
+
+funcion _om_cuadrica_plano(a, b, c, d) { retornar [a * a, a * b, a * c, a * d, b * b, b * c, b * d, c * c, c * d, d * d] }
+
+funcion _om_sumar_q(q, r, peso) {
+    sea k = 0
+    mientras (k < 10) {
+        q[k] = q[k] + r[k] * peso
+        k = k + 1
+    }
+}
+
+funcion _om_error_q(q, x, yy, z) {
+    retornar q[0] * x * x + 2 * q[1] * x * yy + 2 * q[2] * x * z + 2 * q[3] * x + q[4] * yy * yy + 2 * q[5] * yy * z + 2 * q[6] * yy + q[7] * z * z + 2 * q[8] * z + q[9]
+}
+
+// Normal no normalizada de un triángulo.
+funcion _om_normal(p, a, b, c) {
+    sea ux = p[b * 3] - p[a * 3]
+    sea uy = p[b * 3 + 1] - p[a * 3 + 1]
+    sea uz = p[b * 3 + 2] - p[a * 3 + 2]
+    sea vx = p[c * 3] - p[a * 3]
+    sea vy = p[c * 3 + 1] - p[a * 3 + 1]
+    sea vz = p[c * 3 + 2] - p[a * 3 + 2]
+    retornar [uy * vz - uz * vy, uz * vx - ux * vz, ux * vy - uy * vx]
+}
+
+/// Simplifica a una fracción de los índices (o a "objetivo" absoluto si
+/// es mayor que 1) sin pasar el error relativo `error_max` (respecto del
+/// tamaño de la malla). opciones: "bloquear_bordes", "recortar" (quita
+/// vértices sin uso). Devuelve la malla con "error" (relativo).
+funcion optimalla_simplificar(m, fraccion, error_max, opciones) {
+    sea op = opciones ?? {}
+    sea p = m["posiciones"]
+    sea nv = longitud(p) / 3
+    sea ind = []
+    para i en m["indices"] { ind.agregar(i) }
+    sea nt = longitud(ind) / 3
+    sea objetivo = fraccion
+    si (fraccion <= 1) { objetivo = piso(nt * 3 * fraccion / 3) * 3 }
+    // Escala: diagonal de la caja.
+    sea lim = optimalla_caja(m)
+    sea dx = lim["max"][0] - lim["min"][0]
+    sea dy = lim["max"][1] - lim["min"][1]
+    sea dz = lim["max"][2] - lim["min"][2]
+    sea escala = maximo(dx, maximo(dy, dz))
+    si (escala == 0) { escala = 1 }
+    sea lim_err = (error_max ?? 0.01) * escala
+    lim_err = lim_err * lim_err
+    // Posiciones únicas: vértices con la misma posición se tratan juntos.
+    sea clave_pos = {}
+    sea rep = []
+    sea v = 0
+    mientras (v < nv) {
+        sea c = "" + p[v * 3] + "," + p[v * 3 + 1] + "," + p[v * 3 + 2]
+        si (tiene_clave(clave_pos, c)) { rep.agregar(clave_pos[c]) } sino {
+            clave_pos[c] = v
+            rep.agregar(v)
+        }
+        v = v + 1
+    }
+    // Cuádricas por vértice representante.
+    sea q = []
+    v = 0
+    mientras (v < nv) {
+        q.agregar([0, 0, 0, 0, 0, 0, 0, 0, 0, 0])
+        v = v + 1
+    }
+    // Aristas: conteo para detectar bordes (aristas con un solo triángulo).
+    sea aristas = {}
+    sea t = 0
+    mientras (t < nt) {
+        sea a = rep[ind[t * 3]]
+        sea b = rep[ind[t * 3 + 1]]
+        sea c = rep[ind[t * 3 + 2]]
+        sea n = _om_normal(p, a, b, c)
+        sea l = raiz(n[0] * n[0] + n[1] * n[1] + n[2] * n[2])
+        si (l > 0) {
+            sea nx = n[0] / l
+            sea ny = n[1] / l
+            sea nz = n[2] / l
+            sea d = 0 - (nx * p[a * 3] + ny * p[a * 3 + 1] + nz * p[a * 3 + 2])
+            sea pl = _om_cuadrica_plano(nx, ny, nz, d)
+            _om_sumar_q(q[a], pl, l / 2)
+            _om_sumar_q(q[b], pl, l / 2)
+            _om_sumar_q(q[c], pl, l / 2)
+        }
+        para par en [[a, b], [b, c], [c, a]] {
+            sea k1 = minimo(par[0], par[1])
+            sea k2 = maximo(par[0], par[1])
+            sea ka = "" + k1 + "_" + k2
+            aristas[ka] = (aristas[ka] ?? 0) + 1
+        }
+        t = t + 1
+    }
+    // Bordes: plano perpendicular con mucho peso (o bloqueo).
+    sea borde = {}
+    t = 0
+    mientras (t < nt) {
+        sea a = rep[ind[t * 3]]
+        sea b = rep[ind[t * 3 + 1]]
+        sea c = rep[ind[t * 3 + 2]]
+        sea n = _om_normal(p, a, b, c)
+        para par en [[a, b], [b, c], [c, a]] {
+            sea ka = "" + minimo(par[0], par[1]) + "_" + maximo(par[0], par[1])
+            si (aristas[ka] == 1) {
+                borde["" + par[0]] = verdadero
+                borde["" + par[1]] = verdadero
+                sea ex = p[par[1] * 3] - p[par[0] * 3]
+                sea ey = p[par[1] * 3 + 1] - p[par[0] * 3 + 1]
+                sea ez = p[par[1] * 3 + 2] - p[par[0] * 3 + 2]
+                // Plano que contiene la arista y es perpendicular a la cara.
+                sea bx = ey * n[2] - ez * n[1]
+                sea by = ez * n[0] - ex * n[2]
+                sea bz = ex * n[1] - ey * n[0]
+                sea bl = raiz(bx * bx + by * by + bz * bz)
+                si (bl > 0) {
+                    bx = bx / bl
+                    by = by / bl
+                    bz = bz / bl
+                    sea d = 0 - (bx * p[par[0] * 3] + by * p[par[0] * 3 + 1] + bz * p[par[0] * 3 + 2])
+                    sea pl = _om_cuadrica_plano(bx, by, bz, d)
+                    sea peso = 10 * (ex * ex + ey * ey + ez * ez)
+                    _om_sumar_q(q[par[0]], pl, peso)
+                    _om_sumar_q(q[par[1]], pl, peso)
+                }
+            }
+        }
+        t = t + 1
+    }
+    sea bloquear = op["bloquear_bordes"] ?? falso
+    // Colapsos por pasadas: en cada pasada se ordenan las aristas por costo
+    // y se colapsan las que no comparten vértices con otro colapso.
+    sea destino = []
+    v = 0
+    mientras (v < nv) {
+        destino.agregar(rep[v])
+        v = v + 1
+    }
+    sea raiz_de = funcion(x) {
+        sea r = x
+        mientras (destino[r] != r) { r = destino[r] }
+        retornar r
+    }
+    sea vivos_t = nt
+    sea error_final = 0
+    sea pasadas = 0
+    mientras (vivos_t * 3 > objetivo y pasadas < 100) {
+        pasadas = pasadas + 1
+        // Aristas actuales.
+        sea cand = []
+        sea vista = {}
+        t = 0
+        mientras (t < nt) {
+            sea a = raiz_de(ind[t * 3])
+            sea b = raiz_de(ind[t * 3 + 1])
+            sea c = raiz_de(ind[t * 3 + 2])
+            si (a != b y b != c y c != a) {
+                para par en [[a, b], [b, c], [c, a]] {
+                    sea k1 = minimo(par[0], par[1])
+                    sea k2 = maximo(par[0], par[1])
+                    sea ka = "" + k1 + "_" + k2
+                    si (tiene_clave(vista, ka) == falso) {
+                        vista[ka] = verdadero
+                        // Colapso hacia el extremo de menor error (sin mover vértices).
+                        sea qs = []
+                        sea k = 0
+                        mientras (k < 10) {
+                            qs.agregar(q[k1][k] + q[k2][k])
+                            k = k + 1
+                        }
+                        sea e1 = _om_error_q(qs, p[k1 * 3], p[k1 * 3 + 1], p[k1 * 3 + 2])
+                        sea e2 = _om_error_q(qs, p[k2 * 3], p[k2 * 3 + 1], p[k2 * 3 + 2])
+                        sea desde = k2
+                        sea hacia = k1
+                        sea e = e1
+                        si (e2 < e1) {
+                            desde = k1
+                            hacia = k2
+                            e = e2
+                        }
+                        // Un vértice de borde solo puede ir hacia otro de borde.
+                        sea ok = verdadero
+                        si (tiene_clave(borde, "" + desde) y tiene_clave(borde, "" + hacia) == falso) {
+                            sea tmp = desde
+                            desde = hacia
+                            hacia = tmp
+                            si (tiene_clave(borde, "" + desde)) { ok = falso }
+                            e = maximo(e1, e2)
+                        }
+                        si (bloquear y (tiene_clave(borde, "" + desde) o tiene_clave(borde, "" + hacia))) { ok = falso }
+                        si (ok) { cand.agregar([maximo(0, e), desde, hacia]) }
+                    }
+                }
+            }
+            t = t + 1
+        }
+        si (longitud(cand) == 0) { romper }
+        cand = ordenar(cand, funcion(x, z) {
+            si (x[0] < z[0]) { retornar -1 }
+            si (x[0] > z[0]) { retornar 1 }
+            retornar 0
+        })
+        sea bloqueado = {}
+        sea colapsos = 0
+        sea quitar = vivos_t - objetivo / 3
+        sea limite_pasada = maximo(1, piso(quitar / 2) + 1)
+        para c en cand {
+            si (c[0] > lim_err) { romper }
+            si (colapsos >= limite_pasada) { romper }
+            si (tiene_clave(bloqueado, "" + c[1]) == falso y tiene_clave(bloqueado, "" + c[2]) == falso) {
+                destino[c[1]] = c[2]
+                _om_sumar_q(q[c[2]], q[c[1]], 1)
+                bloqueado["" + c[1]] = verdadero
+                bloqueado["" + c[2]] = verdadero
+                colapsos = colapsos + 1
+                si (c[0] > error_final) { error_final = c[0] }
+            }
+        }
+        si (colapsos == 0) { romper }
+        // Cuenta triángulos vivos.
+        vivos_t = 0
+        t = 0
+        mientras (t < nt) {
+            sea a = raiz_de(ind[t * 3])
+            sea b = raiz_de(ind[t * 3 + 1])
+            sea c = raiz_de(ind[t * 3 + 2])
+            si (a != b y b != c y c != a) { vivos_t = vivos_t + 1 }
+            t = t + 1
+        }
+    }
+    // Arma índices finales: cada vértice va al vértice representante final,
+    // pero conserva sus atributos si el representante es él mismo.
+    sea final = []
+    t = 0
+    mientras (t < nt) {
+        sea ra = raiz_de(ind[t * 3])
+        sea rb = raiz_de(ind[t * 3 + 1])
+        sea rc = raiz_de(ind[t * 3 + 2])
+        si (ra != rb y rb != rc y rc != ra) {
+            para j en [0, 1, 2] {
+                sea orig = ind[t * 3 + j]
+                si (raiz_de(orig) == rep[orig]) { final.agregar(orig) } sino { final.agregar(raiz_de(orig)) }
+            }
+        }
+        t = t + 1
+    }
+    sea r = {"posiciones": m["posiciones"], "normales": m["normales"] ?? [], "uvs": m["uvs"] ?? [], "indices": final}
+    si (op["recortar"] ?? verdadero) { r = optimalla_fetch(r) }
+    r["error"] = raiz(error_final) / escala
+    retornar r
+}
+
+/// Cadena de LOD: lista de mallas con fracciones dadas ([1, 0.5, 0.25, ...]).
+funcion optimalla_lod(m, fracciones, error_max) {
+    sea r = []
+    para f en fracciones ?? [1, 0.5, 0.25, 0.125] {
+        si (f >= 1) { r.agregar(m) } sino { r.agregar(optimalla_simplificar(m, f, error_max ?? 0.05, nulo)) }
+    }
+    retornar r
+}
+
+// ---------- utilidades ----------
+
+/// Caja envolvente {"min", "max"}.
+funcion optimalla_caja(m) {
+    sea p = m["posiciones"]
+    sea mn = [1e308, 1e308, 1e308]
+    sea mx = [-1e308, -1e308, -1e308]
+    sea k = 0
+    mientras (k < longitud(p)) {
+        sea j = 0
+        mientras (j < 3) {
+            si (p[k + j] < mn[j]) { mn[j] = p[k + j] }
+            si (p[k + j] > mx[j]) { mx[j] = p[k + j] }
+            j = j + 1
+        }
+        k = k + 3
+    }
+    retornar {"min": mn, "max": mx}
+}
+
+/// Esfera envolvente aproximada (Ritter): {"centro", "radio"}.
+funcion optimalla_esfera(m) {
+    sea p = m["posiciones"]
+    sea n = longitud(p) / 3
+    si (n == 0) { retornar {"centro": [0, 0, 0], "radio": 0} }
+    sea dist2 = funcion(i, c) {
+        sea dx = p[i * 3] - c[0]
+        sea dy = p[i * 3 + 1] - c[1]
+        sea dz = p[i * 3 + 2] - c[2]
+        retornar dx * dx + dy * dy + dz * dz
+    }
+    sea lejano = funcion(c) {
+        sea mejor = 0
+        sea md = -1
+        sea i = 0
+        mientras (i < n) {
+            sea d = dist2(i, c)
+            si (d > md) {
+                md = d
+                mejor = i
+            }
+            i = i + 1
+        }
+        retornar mejor
+    }
+    sea a = lejano([p[0], p[1], p[2]])
+    sea b = lejano([p[a * 3], p[a * 3 + 1], p[a * 3 + 2]])
+    sea c = [(p[a * 3] + p[b * 3]) / 2, (p[a * 3 + 1] + p[b * 3 + 1]) / 2, (p[a * 3 + 2] + p[b * 3 + 2]) / 2]
+    sea r = raiz(dist2(a, c))
+    sea i = 0
+    mientras (i < n) {
+        sea d = raiz(dist2(i, c))
+        si (d > r) {
+            sea nr = (r + d) / 2
+            sea k = (nr - r) / d
+            c = [c[0] + (p[i * 3] - c[0]) * k, c[1] + (p[i * 3 + 1] - c[1]) * k, c[2] + (p[i * 3 + 2] - c[2]) * k]
+            r = nr
+        }
+        i = i + 1
+    }
+    retornar {"centro": c, "radio": r}
+}
+
+/// Flotante de 16 bits (IEEE 754 half) como entero sin signo.
+funcion optimalla_media(v) {
+    si (v != v) { retornar 32256 }
+    sea s = 0
+    sea x = v
+    si (x < 0 o (x == 0 y ("" + x) == "-0")) {
+        s = 32768
+        x = 0 - x
+    }
+    si (x >= 65520) { retornar s + 31744 }
+    si (x < 0.00006103515625) { retornar s + redondear(x / 0.000000059604644775390625) }
+    sea e = 0
+    mientras (x >= 2) {
+        x = x / 2
+        e = e + 1
+    }
+    mientras (x < 1) {
+        x = x * 2
+        e = e - 1
+    }
+    sea mant = redondear((x - 1) * 1024)
+    si (mant == 1024) {
+        mant = 0
+        e = e + 1
+    }
+    retornar s + (e + 15) * 1024 + mant
+}
+
+/// Entero normalizado: snorm (−1..1) o unorm (0..1) de `bits` bits.
+funcion optimalla_snorm(v, bits) {
+    sea esc = potencia(2, bits - 1) - 1
+    retornar redondear(maximo(0 - 1, minimo(1, v)) * esc)
+}
+
+funcion optimalla_unorm(v, bits) {
+    sea esc = potencia(2, bits) - 1
+    retornar redondear(maximo(0, minimo(1, v)) * esc)
+}
+
+/// Cantidad de triángulos.
+funcion optimalla_triangulos(m) { retornar longitud(m["indices"]) / 3 }
