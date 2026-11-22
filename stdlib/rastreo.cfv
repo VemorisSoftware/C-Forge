@@ -1,0 +1,214 @@
+// stdlib/rastreo.cfv — recorrer carpetas y buscar archivos con comodines:
+// patrones tipo glob (*, **, ?, [abc], [a-z], [!x], {uno,dos}; "[*]" es un
+// asterisco literal), ignorar carpetas (como .git o node_modules),
+// profundidad máxima y orden estable. También agrega al lenguaje
+// listar_carpeta, es_carpeta y crear_carpeta (como mkdir -p).
+// Inspirada en Walkdir y Glob (MIT/Apache). En inglés: importar "glob".
+//
+//   importar "rastreo"
+//   rastreo_buscar("proyecto", "**/*.cfv")                         // ["proyecto/a.cfv", "proyecto/src/b.cfv"]
+//   rastreo_recorrer("proyecto", {"ignorar": [".git", "node_modules"], "profundidad": 3})
+//   rastreo_coincide("src/**/prueba_*.{cfv,txt}", "src/a/prueba_x.cfv")   // verdadero
+
+funcion _ra_op(o, k, d) {
+    si (o != nulo) { si (tiene_clave(o, k)) { retornar o[k] } }
+    retornar d
+}
+
+funcion _ra_unir(a, b) {
+    si (a == "" o a == ".") { retornar b }
+    si (texto_termina_con(a, "/")) { retornar a + b }
+    retornar a + "/" + b
+}
+
+// Expande llaves {a,b} a varios patrones.
+funcion _ra_llaves(p) {
+    sea i = texto_indice(p, caracter(123))
+    si (i < 0) { retornar [p] }
+    sea prof = 0
+    sea j = i
+    sea fin = -1
+    mientras (j < longitud(p) y fin < 0) {
+        sea c = subcadena(p, j, j + 1)
+        si (c == caracter(123)) { prof = prof + 1 }
+        si (c == caracter(125)) {
+            prof = prof - 1
+            si (prof == 0) { fin = j }
+        }
+        j = j + 1
+    }
+    si (fin < 0) { retornar [p] }
+    sea dentro = subcadena(p, i + 1, fin)
+    // Separa por comas de primer nivel.
+    sea opciones = []
+    sea actual = ""
+    prof = 0
+    para c en texto_dividir(dentro, "") {
+        si (c == "," y prof == 0) { opciones.agregar(actual)  actual = "" } sino {
+            si (c == caracter(123)) { prof = prof + 1 }
+            si (c == caracter(125)) { prof = prof - 1 }
+            actual = actual + c
+        }
+    }
+    opciones.agregar(actual)
+    sea r = []
+    para o en opciones { para x en _ra_llaves(subcadena(p, 0, i) + o + subcadena(p, fin + 1, longitud(p))) { r.agregar(x) } }
+    retornar r
+}
+
+// Un segmento (sin "/") contra un nombre.
+funcion _ra_segmento(p, s, i, j) {
+    mientras (i < longitud(p)) {
+        sea c = subcadena(p, i, i + 1)
+        si (c == "*") {
+            // Prueba todas las longitudes.
+            sea k = j
+            mientras (k <= longitud(s)) {
+                si (_ra_segmento(p, s, i + 1, k)) { retornar verdadero }
+                k = k + 1
+            }
+            retornar falso
+        }
+        si (j >= longitud(s)) { retornar falso }
+        sea ch = subcadena(s, j, j + 1)
+        si (c == "?") { i = i + 1  j = j + 1 } sino {
+            si (c == "[") {
+                sea cierra = texto_indice(subcadena(p, i + 1, longitud(p)), "]")
+                si (cierra < 0) {
+                    si (ch != "[") { retornar falso }
+                    i = i + 1
+                    j = j + 1
+                } sino {
+                    sea clase = subcadena(p, i + 1, i + 1 + cierra)
+                    sea negar = falso
+                    si (texto_empieza_con(clase, "!") o texto_empieza_con(clase, "^")) { negar = verdadero  clase = subcadena(clase, 1, longitud(clase)) }
+                    sea dentro = falso
+                    sea k = 0
+                    mientras (k < longitud(clase)) {
+                        si (k + 2 < longitud(clase) y subcadena(clase, k + 1, k + 2) == "-") {
+                            si (ch >= subcadena(clase, k, k + 1) y ch <= subcadena(clase, k + 2, k + 3)) { dentro = verdadero }
+                            k = k + 3
+                        } sino {
+                            si (subcadena(clase, k, k + 1) == ch) { dentro = verdadero }
+                            k = k + 1
+                        }
+                    }
+                    si (dentro == negar) { retornar falso }
+                    i = i + cierra + 2
+                    j = j + 1
+                }
+            } sino {
+                si (c == "\\" y i + 1 < longitud(p)) { i = i + 1  c = subcadena(p, i, i + 1) }
+                si (c != ch) { retornar falso }
+                i = i + 1
+                j = j + 1
+            }
+        }
+    }
+    retornar j == longitud(s)
+}
+
+// Patrón por segmentos (con **) contra la ruta por segmentos.
+funcion _ra_ruta(ps, ss, i, j) {
+    si (i == longitud(ps)) { retornar j == longitud(ss) }
+    si (ps[i] == "**") {
+        sea k = j
+        mientras (k <= longitud(ss)) {
+            si (_ra_ruta(ps, ss, i + 1, k)) { retornar verdadero }
+            k = k + 1
+        }
+        retornar falso
+    }
+    si (j >= longitud(ss)) { retornar falso }
+    // "*" no calza nombres ocultos (que empiezan con ".") salvo que el patrón lo diga.
+    si (texto_empieza_con(ss[j], ".") y texto_empieza_con(ps[i], ".") == falso) { retornar falso }
+    si (_ra_segmento(ps[i], ss[j], 0, 0) == falso) { retornar falso }
+    retornar _ra_ruta(ps, ss, i + 1, j + 1)
+}
+
+funcion _ra_trozos(t) {
+    sea r = []
+    para x en texto_dividir(texto_reemplazar("" + t, "\\", "/"), "/") { si (x != "" y x != ".") { r.agregar(x) } }
+    retornar r
+}
+
+/// ¿La ruta calza con el patrón glob?
+funcion rastreo_coincide(patron, ruta) {
+    sea ss = _ra_trozos(ruta)
+    para p en _ra_llaves("" + patron) {
+        si (_ra_ruta(_ra_trozos(p), ss, 0, 0)) { retornar verdadero }
+    }
+    retornar falso
+}
+
+/// Filtra una lista de rutas con un patrón.
+funcion rastreo_filtrar(rutas, patron) {
+    sea r = []
+    para x en rutas { si (rastreo_coincide(patron, x)) { r.agregar(x) } }
+    retornar r
+}
+
+/// Recorre la carpeta: lista de {"ruta", "nombre", "carpeta", "profundidad"}.
+/// opciones: profundidad (nulo = sin límite, máximo 64), ignorar (nombres o
+/// patrones), ocultos (falso), carpetas (verdadero: también las incluye).
+funcion rastreo_recorrer(raiz, opciones) {
+    sea max = minimo(64, _ra_op(opciones, "profundidad", 64))
+    sea ignorar = _ra_op(opciones, "ignorar", [])
+    sea ocultos = _ra_op(opciones, "ocultos", falso)
+    sea con_carpetas = _ra_op(opciones, "carpetas", verdadero)
+    si (es_carpeta(raiz) == falso) { lanzar "rastreo: no es una carpeta: " + raiz }
+    sea r = []
+    sea pila = [[raiz, 0]]
+    mientras (longitud(pila) > 0) {
+        sea actual = pila[longitud(pila) - 1]
+        sea nueva = []
+        sea q = 0
+        mientras (q < longitud(pila) - 1) { nueva.agregar(pila[q])  q = q + 1 }
+        pila = nueva
+        sea nombres = listar_carpeta(actual[0])
+        si (nombres != nulo) {
+            nombres = ordenar(nombres, funcion(a, b) {
+                si (a < b) { retornar -1 }
+                retornar 1
+            })
+            sea hijos = []
+            para n en nombres {
+                sea saltar = falso
+                si (ocultos == falso y texto_empieza_con(n, ".")) { saltar = verdadero }
+                para ig en ignorar { si (n == ig o rastreo_coincide(ig, n)) { saltar = verdadero } }
+                si (saltar == falso) {
+                    sea ruta = _ra_unir(actual[0], n)
+                    sea carpeta = es_carpeta(ruta)
+                    si (carpeta == falso o con_carpetas) { r.agregar({"ruta": ruta, "nombre": n, "carpeta": carpeta, "profundidad": actual[1] + 1}) }
+                    si (carpeta y actual[1] + 1 < max) { hijos.agregar([ruta, actual[1] + 1]) }
+                }
+            }
+            // Orden en profundidad: empuja al revés para visitar en orden alfabético.
+            sea k = longitud(hijos) - 1
+            mientras (k >= 0) { pila.agregar(hijos[k])  k = k - 1 }
+        }
+    }
+    // Orden final estable por ruta.
+    retornar ordenar(r, funcion(a, b) {
+        si (a["ruta"] < b["ruta"]) { retornar -1 }
+        retornar 1
+    })
+}
+
+/// Archivos (no carpetas) bajo raiz cuya ruta relativa calza con el patrón.
+funcion rastreo_buscar(raiz, patron, opciones) {
+    sea o = {}
+    si (opciones != nulo) { para k en claves(opciones) { o[k] = opciones[k] } }
+    o["carpetas"] = falso
+    si (texto_indice(patron, ".") == 0 o texto_indice(patron, "/.") >= 0) { o["ocultos"] = verdadero }
+    sea r = []
+    sea base = _ra_trozos(raiz)
+    para e en rastreo_recorrer(raiz, o) {
+        sea partes = _ra_trozos(e["ruta"])
+        sea rel = []
+        sea i = longitud(base)
+        mientras (i < longitud(partes)) { rel.agregar(partes[i])  i = i + 1 }
+        si (rastreo_coincide(patron, unir(rel, "/"))) { r.agregar(e["ruta"]) }
+    }
+    retornar r
+}

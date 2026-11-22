@@ -1,0 +1,159 @@
+// stdlib/cobro.cfv — cobros seguros para tiendas y APIs: claves de
+// idempotencia (un reintento nunca cobra dos veces), firma y verificación de
+// webhooks (HMAC-SHA256 con marca de tiempo, al estilo Stripe), máquina de
+// estados de pagos y montos en enteros de la unidad mínima. Inspirada en la
+// API de Stripe. En inglés: importar "payments".
+//
+//   importar "cobro"
+//   sea c = cobro_nuevo()
+//   sea r = cobro_idempotente(c, cabeceras["Idempotency-Key"], cuerpo, funcion() { retornar crear_pago() })
+//   sea firma = cobro_firmar_webhook(secreto, cuerpo)            // "t=…,v1=…"
+//   cobro_verificar_webhook(secreto, cuerpo, firma, 300)          // o lanza
+//
+// Estados: pendiente → autorizado → capturado → reembolsado (parcial o
+// total); pendiente/autorizado → cancelado; pendiente → fallido.
+
+importar "crypto"
+importar "json"
+
+funcion cobro_nuevo(ttl_s) { retornar {"claves": {}, "ttl": (ttl_s ?? 86400) * 1000, "reloj": nulo} }
+
+funcion cobro_con_reloj(c, reloj) { c["reloj"] = reloj  retornar c }
+
+funcion _cb_ahora(c) {
+    si (c != nulo) { si (c["reloj"] != nulo) { retornar c["reloj"]() } }
+    retornar cfv_fecha_ahora_ms()
+}
+
+/// Ejecuta f() una sola vez por clave: los reintentos con la misma clave y
+/// el mismo cuerpo reciben el mismo resultado; con otro cuerpo, error.
+funcion cobro_idempotente(c, clave, cuerpo, f) {
+    si (clave == nulo o longitud("" + clave) < 8 o longitud("" + clave) > 255) { lanzar "cobro: falta una clave de idempotencia válida (8 a 255 caracteres)" }
+    sea ahora = _cb_ahora(c)
+    sea huella = sha256("" + cuerpo)
+    // Olvida claves vencidas.
+    sea vivas = {}
+    para k en claves(c["claves"]) { si (c["claves"][k]["vence"] > ahora) { vivas[k] = c["claves"][k] } }
+    c["claves"] = vivas
+    sea k = "" + clave
+    si (tiene_clave(c["claves"], k)) {
+        sea e = c["claves"][k]
+        si (e["huella"] != huella) { lanzar "cobro: la clave de idempotencia ya se usó con otro cuerpo" }
+        si (e["estado"] == "en_curso") { lanzar "cobro: hay una solicitud en curso con esta clave" }
+        si (e["estado"] == "error") { lanzar e["resultado"] }
+        retornar e["resultado"]
+    }
+    c["claves"][k] = {"huella": huella, "estado": "en_curso", "resultado": nulo, "vence": ahora + c["ttl"]}
+    sea r = nulo
+    intentar { r = f() } capturar (x) {
+        c["claves"][k]["estado"] = "error"
+        c["claves"][k]["resultado"] = x
+        lanzar x
+    }
+    c["claves"][k]["estado"] = "hecho"
+    c["claves"][k]["resultado"] = r
+    retornar r
+}
+
+/// Clave de idempotencia nueva (para el cliente).
+funcion cobro_clave() { retornar hex_de_bytes(bytes_aleatorios(16)) }
+
+/// Cabecera de firma "t=<segundos>,v1=<hmac>" para un webhook.
+funcion cobro_firmar_webhook(secreto, cuerpo, ms) {
+    sea t = cociente(ms ?? cfv_fecha_ahora_ms(), 1000)
+    retornar "t=" + t + ",v1=" + hmac_sha256(secreto, t + "." + cuerpo)
+}
+
+funcion _cb_igual(a, b) {
+    si (longitud(a) != longitud(b)) { retornar falso }
+    sea d = 0
+    sea i = 0
+    mientras (i < longitud(a)) {
+        si (byte_en(a, i) != byte_en(b, i)) { d = d + 1 }
+        i = i + 1
+    }
+    retornar d == 0
+}
+
+/// Verifica la firma (tiempo constante) y que no tenga más de tolerancia_s
+/// segundos (300). Devuelve el cuerpo como JSON si lo es.
+funcion cobro_verificar_webhook(secreto, cuerpo, cabecera, tolerancia_s, ms) {
+    sea t = nulo
+    sea firmas = []
+    para p en texto_dividir("" + cabecera, ",") {
+        sea kv = texto_dividir(texto_recortar(p), "=")
+        si (longitud(kv) == 2) {
+            si (kv[0] == "t") { t = kv[1] }
+            si (kv[0] == "v1") { firmas.agregar(kv[1]) }
+        }
+    }
+    si (t == nulo o longitud(firmas) == 0) { lanzar "cobro: cabecera de firma mal formada" }
+    sea ts = 0
+    intentar { ts = a_numero(t) } capturar (e) { lanzar "cobro: cabecera de firma mal formada" }
+    sea ahora = cociente(ms ?? cfv_fecha_ahora_ms(), 1000)
+    si (absoluto(ahora - ts) > (tolerancia_s ?? 300)) { lanzar "cobro: webhook fuera de tiempo (posible repetición)" }
+    sea esperado = hmac_sha256(secreto, t + "." + cuerpo)
+    sea ok = falso
+    para f en firmas { si (_cb_igual(f, esperado)) { ok = verdadero } }
+    si (ok == falso) { lanzar "cobro: firma de webhook inválida" }
+    sea d = cuerpo
+    intentar { d = json_parsear(cuerpo) } capturar (e) { d = cuerpo }
+    retornar d
+}
+
+sea _CB_TRANSICIONES = {
+    "pendiente": ["autorizado", "capturado", "cancelado", "fallido"],
+    "autorizado": ["capturado", "cancelado"],
+    "capturado": ["reembolsado"],
+    "reembolsado": [], "cancelado": [], "fallido": []
+}
+
+/// Pago nuevo. monto en la unidad mínima (pesos, centavos…), entero.
+funcion cobro_pago(monto, moneda, datos) {
+    si (tipo(monto) != "numero" o piso(monto) != monto o monto <= 0) { lanzar "cobro: el monto debe ser un entero positivo en la unidad mínima" }
+    retornar {"id": "pago_" + hex_de_bytes(bytes_aleatorios(8)), "monto": monto, "moneda": texto_mayusculas(moneda ?? "CLP"), "estado": "pendiente", "reembolsado": 0, "historial": [["pendiente", cfv_fecha_ahora_ms()]], "datos": datos ?? {}}
+}
+
+funcion cobro_cambiar(p, estado) {
+    sea ok = falso
+    para e en _CB_TRANSICIONES[p["estado"]] { si (e == estado) { ok = verdadero } }
+    si (ok == falso) { lanzar "cobro: no se puede pasar de " + p["estado"] + " a " + estado }
+    p["estado"] = estado
+    p["historial"].agregar([estado, cfv_fecha_ahora_ms()])
+    retornar p
+}
+
+/// Reembolso parcial o total (nulo = lo que queda).
+funcion cobro_reembolsar(p, monto) {
+    si (p["estado"] != "capturado" y p["estado"] != "reembolsado") { lanzar "cobro: solo se reembolsa un pago capturado" }
+    sea queda = p["monto"] - p["reembolsado"]
+    sea m = monto ?? queda
+    si (piso(m) != m o m <= 0 o m > queda) { lanzar "cobro: monto de reembolso inválido (quedan " + queda + ")" }
+    p["reembolsado"] = p["reembolsado"] + m
+    si (p["estado"] == "capturado") { p["estado"] = "reembolsado" }
+    p["historial"].agregar(["reembolso " + m, cfv_fecha_ahora_ms()])
+    retornar p
+}
+
+/// Monto legible: 1234500 CLP → "$1.234.500"; 1999 USD → "US$19,99".
+funcion cobro_formato(monto, moneda) {
+    sea m = texto_mayusculas(moneda ?? "CLP")
+    sea decimales = 2
+    si (m == "CLP" o m == "JPY" o m == "KRW" o m == "PYG") { decimales = 0 }
+    sea entero = "" + cociente(absoluto(monto), potencia(10, decimales))
+    sea frac = "" + (absoluto(monto) % potencia(10, decimales))
+    mientras (longitud(frac) < decimales) { frac = "0" + frac }
+    sea g = []
+    mientras (longitud(entero) > 3) {
+        g.insertar(0, subcadena(entero, longitud(entero) - 3, longitud(entero)))
+        entero = subcadena(entero, 0, longitud(entero) - 3)
+    }
+    g.insertar(0, entero)
+    sea simbolo = "$"
+    si (m == "USD") { simbolo = "US$" }
+    si (m == "EUR") { simbolo = "€" }
+    sea r = simbolo + unir(g, ".")
+    si (decimales > 0) { r = r + "," + frac }
+    si (monto < 0) { r = "-" + r }
+    retornar r
+}

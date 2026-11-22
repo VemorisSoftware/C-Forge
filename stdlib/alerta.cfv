@@ -1,0 +1,188 @@
+// stdlib/alerta.cfv — reporte de errores en producción: captura excepciones
+// con contexto (usuario, etiquetas, migas de pan de lo que pasó antes),
+// agrupa por huella, limita la tasa, filtra datos sensibles y los guarda o
+// los envía en formato compatible con Sentry (DSN y "envelope"). Inspirada
+// en Sentry (FSL/MIT: solo la idea). En inglés: importar "errors".
+//
+//   importar "alerta"
+//   sea a = alerta_nueva({"entorno": "produccion", "version": "1.4.0"})
+//   alerta_miga(a, "usuario abrió el carrito")
+//   alerta_capturar(a, funcion() { procesar_pago() })      // si lanza, se registra y se relanza
+//   alerta_eventos(a)                                       // para revisar o enviar
+//   alerta_sentry(a, evento, "https://clave@o1.ingest.sentry.io/123")   // {"url", "cuerpo", "cabeceras"}
+
+importar "json"
+importar "crypto"
+
+sea _AL_SENSIBLES = ["clave", "contrasena", "contraseña", "password", "passwd", "secret", "secreto", "token", "api_key", "apikey", "authorization", "cookie", "tarjeta", "card", "cvv", "rut"]
+
+funcion alerta_nueva(opciones) {
+    sea o = opciones ?? {}
+    retornar {"entorno": o["entorno"] ?? "desarrollo", "version": o["version"] ?? nulo, "migas": [], "max_migas": o["max_migas"] ?? 50, "eventos": [], "usuario": nulo, "etiquetas": {}, "conteo": {}, "max_por_minuto": o["max_por_minuto"] ?? 30, "ventana": [], "antes_de_enviar": o["antes_de_enviar"] ?? nulo}
+}
+
+funcion _al_op(o, k, d) {
+    si (o != nulo) { si (tiene_clave(o, k)) { retornar o[k] } }
+    retornar d
+}
+
+funcion alerta_usuario(a, usuario) { a["usuario"] = usuario  retornar a }
+funcion alerta_etiqueta(a, clave, valor) { a["etiquetas"][clave] = "" + valor  retornar a }
+
+/// Miga de pan: qué pasó antes del error (navegación, consultas, clics).
+funcion alerta_miga(a, mensaje, categoria, datos) {
+    a["migas"].agregar({"ms": cfv_fecha_ahora_ms(), "mensaje": mensaje, "categoria": categoria ?? "app", "datos": datos ?? {}})
+    si (longitud(a["migas"]) > a["max_migas"]) {
+        sea r = []
+        sea i = longitud(a["migas"]) - a["max_migas"]
+        mientras (i < longitud(a["migas"])) { r.agregar(a["migas"][i])  i = i + 1 }
+        a["migas"] = r
+    }
+    retornar a
+}
+
+funcion _al_sensible(k) {
+    sea x = texto_minusculas("" + k)
+    para s en _AL_SENSIBLES { si (texto_indice(x, s) >= 0) { retornar verdadero } }
+    retornar falso
+}
+
+/// Reemplaza valores de claves sensibles por "[filtrado]" (recursivo).
+funcion alerta_filtrar(v) {
+    si (tipo(v) == "mapa") {
+        sea r = {}
+        para k en claves(v) { si (_al_sensible(k)) { r[k] = "[filtrado]" } sino { r[k] = alerta_filtrar(v[k]) } }
+        retornar r
+    }
+    si (tipo(v) == "lista") {
+        sea r = []
+        para x en v { r.agregar(alerta_filtrar(x)) }
+        retornar r
+    }
+    si (tipo(v) == "texto") {
+        // Números de tarjeta sueltos dentro de un texto.
+        sea t = v
+        sea digitos = 0
+        sea i = 0
+        sea ini = 0
+        sea r = ""
+        mientras (i <= longitud(t)) {
+            sea c = subcadena(t, i, i + 1)
+            sea es_d = c != "" y texto_indice("0123456789", c) >= 0
+            si (es_d) {
+                si (digitos == 0) { ini = i }
+                digitos = digitos + 1
+            } sino {
+                si (digitos > 0) {
+                    si (digitos >= 13 y digitos <= 19) { r = r + "[tarjeta filtrada]" } sino { r = r + subcadena(t, ini, i) }
+                }
+                digitos = 0
+                r = r + c
+            }
+            i = i + 1
+        }
+        retornar r
+    }
+    retornar v
+}
+
+/// Huella para agrupar: el mensaje sin números ni ids.
+funcion alerta_huella(mensaje) {
+    sea t = ""
+    sea en_num = falso
+    para c en texto_dividir("" + mensaje, "") {
+        si (texto_indice("0123456789abcdef", texto_minusculas(c)) >= 0 y texto_indice("0123456789", c) >= 0) {
+            si (en_num == falso) { t = t + "#" }
+            en_num = verdadero
+        } sino { t = t + c  en_num = falso }
+    }
+    retornar subcadena(sha256(t), 0, 16)
+}
+
+/// Registra un error (texto o lo que se lanzó). nivel: "error", "aviso", "info", "fatal".
+funcion alerta_reportar(a, error, nivel, extra) {
+    sea ahora = cfv_fecha_ahora_ms()
+    // Límite por minuto (protege contra tormentas de errores).
+    sea vent = []
+    para t en a["ventana"] { si (ahora - t < 60000) { vent.agregar(t) } }
+    a["ventana"] = vent
+    si (longitud(vent) >= a["max_por_minuto"]) { retornar nulo }
+    a["ventana"].agregar(ahora)
+    sea mensaje = "" + error
+    sea huella = alerta_huella(alerta_filtrar(mensaje))
+    a["conteo"][huella] = (a["conteo"][huella] ?? 0) + 1
+    sea ev = {
+        "id": hex_de_bytes(bytes_aleatorios(16)), "ms": ahora, "nivel": nivel ?? "error", "mensaje": alerta_filtrar(mensaje),
+        "huella": huella, "veces": a["conteo"][huella], "entorno": a["entorno"], "version": a["version"],
+        "usuario": alerta_filtrar(a["usuario"]), "etiquetas": a["etiquetas"], "migas": alerta_filtrar(a["migas"]), "extra": alerta_filtrar(extra ?? {})
+    }
+    si (a["antes_de_enviar"] != nulo) {
+        ev = a["antes_de_enviar"](ev)
+        si (ev == nulo) { retornar nulo }
+    }
+    a["eventos"].agregar(ev)
+    retornar ev
+}
+
+/// Ejecuta f(); si lanza, reporta y relanza el mismo error.
+funcion alerta_capturar(a, f, extra) {
+    sea r = nulo
+    intentar { r = f() } capturar (e) {
+        alerta_reportar(a, e, "error", extra)
+        lanzar e
+    }
+    retornar r
+}
+
+funcion alerta_eventos(a) { retornar a["eventos"] }
+
+/// Resumen agrupado: [{"huella", "mensaje", "veces"}] de más a menos frecuente.
+funcion alerta_resumen(a) {
+    sea vistos = {}
+    sea r = []
+    para e en a["eventos"] {
+        si (tiene_clave(vistos, e["huella"]) == falso) {
+            vistos[e["huella"]] = verdadero
+            r.agregar({"huella": e["huella"], "mensaje": e["mensaje"], "veces": a["conteo"][e["huella"]]})
+        }
+    }
+    retornar ordenar(r, funcion(x, y) { retornar y["veces"] - x["veces"] })
+}
+
+/// Guarda los eventos como JSON por línea (para revisar o subir después).
+funcion alerta_guardar(a, ruta) {
+    sea l = []
+    para e en a["eventos"] { l.agregar(json_texto(e)) }
+    escribir_archivo(ruta, unir(l, "\n") + "\n")
+}
+
+/// Pedido HTTP listo para Sentry (envelope) desde un DSN
+/// "https://CLAVE@HOST/PROYECTO".
+funcion alerta_sentry(a, evento, dsn) {
+    sea d = "" + dsn
+    sea esquema = subcadena(d, 0, texto_indice(d, "://"))
+    sea resto = subcadena(d, texto_indice(d, "://") + 3, longitud(d))
+    sea arroba = texto_indice(resto, "@")
+    si (arroba < 0) { lanzar "alerta: DSN inválido" }
+    sea clave = subcadena(resto, 0, arroba)
+    sea host_ruta = subcadena(resto, arroba + 1, longitud(resto))
+    sea barra = 0 - 1
+    sea i = 0
+    mientras (i < longitud(host_ruta)) { si (subcadena(host_ruta, i, i + 1) == "/") { barra = i }  i = i + 1 }
+    si (barra < 0) { lanzar "alerta: DSN inválido" }
+    sea host = subcadena(host_ruta, 0, barra)
+    sea proyecto = subcadena(host_ruta, barra + 1, longitud(host_ruta))
+    sea niveles = {"error": "error", "aviso": "warning", "info": "info", "fatal": "fatal"}
+    sea migas = []
+    para m en evento["migas"] { migas.agregar({"timestamp": m["ms"] / 1000, "message": m["mensaje"], "category": m["categoria"], "data": m["datos"]}) }
+    sea cuerpo_ev = {"event_id": evento["id"], "timestamp": evento["ms"] / 1000, "platform": "other", "level": niveles[evento["nivel"]] ?? "error", "message": {"formatted": evento["mensaje"]}, "environment": evento["entorno"], "tags": evento["etiquetas"], "extra": evento["extra"], "fingerprint": [evento["huella"]], "breadcrumbs": {"values": migas}}
+    si (evento["version"] != nulo) { cuerpo_ev["release"] = evento["version"] }
+    si (evento["usuario"] != nulo) { cuerpo_ev["user"] = evento["usuario"] }
+    sea item = json_texto(cuerpo_ev)
+    sea envelope = json_texto({"event_id": evento["id"], "dsn": d}) + "\n" + json_texto({"type": "event", "length": longitud(item)}) + "\n" + item + "\n"
+    retornar {
+        "url": esquema + "://" + host + "/api/" + proyecto + "/envelope/",
+        "cuerpo": envelope,
+        "cabeceras": {"Content-Type": "application/x-sentry-envelope", "X-Sentry-Auth": "Sentry sentry_version=7, sentry_client=cforge-alerta/1.0, sentry_key=" + clave}
+    }
+}

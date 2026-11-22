@@ -87,7 +87,7 @@ Estado: ✅ ya existe en C-Forge · 🔗 se usa hoy vía `cforge bindgen`,
 | 61 | `oido` | Voz a texto | Whisper.cpp | 🔗 |
 | 62 | `prediccion` | Entrenar y predecir | ML.NET | 🔗 `dotnet` |
 | 63 | `numerica` / `numeric` | Estadística y FFT | Math.NET | ✅ `numerica` |
-| 64 | `simbolo` | Matemáticas simbólicas | SymPy | 🛠 |
+| 64 | `simbolo` / `symbolic` | Matemáticas simbólicas | SymPy | ✅ `simbolo` |
 | 65 | `estadistica` | Algoritmos estadísticos | linfa | 🛠 |
 | 66 | `hibrida` | Búsqueda vectorial + texto | Qdrant, Tantivy | 🛠 |
 
@@ -141,9 +141,9 @@ Estado: ✅ ya existe en C-Forge · 🔗 se usa hoy vía `cforge bindgen`,
 | 100 | `paquete_bin` / `msgpack` | Serialización binaria compacta | MessagePack | ✅ `paquete_bin` |
 | 101 | `sin_copia` | Serialización zero-copy | FlatBuffers | 🛠 |
 | 102 | `columnas` | Formato columnar | Arrow, Parquet | 🛠 |
-| 103 | `hoja` | Hojas de cálculo .xlsx | libxlsxwriter | 🛠 |
+| 103 | `hoja` / `xlsx` | Hojas de cálculo .xlsx | libxlsxwriter | ✅ `hoja` |
 | 104 | `documento` | PDF: crear, leer y firmar | PDFium, lopdf | 🛠 |
-| 105 | `archivador` | ZIP/TAR seguros | libarchive | 🛠 |
+| 105 | `archivador` / `archive` | ZIP/TAR seguros | libarchive | ✅ `archivador` |
 | 106 | `ajustes` | TOML y YAML estrictos | toml, yaml-rust | ✅ TOML (cforge.toml) · 🛠 |
 | 107 | `marcado` / `markdown` | Markdown a HTML | pulldown-cmark | ✅ `marcado` |
 | 108 | `sintaxis` | Parser incremental | tree-sitter | 🔗 |
@@ -194,7 +194,7 @@ Estado: ✅ ya existe en C-Forge · 🔗 se usa hoy vía `cforge bindgen`,
 | 138 | `progreso` / `progress` | Barras de progreso | Indicatif | ✅ `progreso` |
 | 139 | `pregunta` / `prompt` | Prompts interactivos | Dialoguer | ✅ `pregunta` |
 | 140 | `vigia` | Vigilar cambios en archivos | Notify | 🛠 |
-| 141 | `rastreo` | Búsqueda recursiva con comodines | Walkdir, Glob | 🛠 |
+| 141 | `rastreo` / `glob` | Búsqueda recursiva con comodines | Walkdir, Glob | ✅ `rastreo` |
 | 142 | `sistema` | CPU, RAM y procesos | sysinfo | 🛠 |
 | 143 | `historia` | Repositorios Git nativos | libgit2 | 🔗 |
 | 144 | `contenedor` | Controlar Docker | Bollard | 🛠 |
@@ -212,7 +212,7 @@ Estado: ✅ ya existe en C-Forge · 🔗 se usa hoy vía `cforge bindgen`,
 
 | # | Nombre | Para qué | Inspiración | Estado |
 |---|---|---|---|---|
-| 152 | `sobre` | Cifrado de archivos con claves | age | 🛠 |
+| 152 | `sobre` / `envelope` | Cifrado de archivos con claves | age | ✅ `sobre` |
 | 153 | `primitiva` | Cripto a prueba de errores | Tink | ✅ `crypto` (AEAD) |
 | 154 | `huella` | Patrones de malware | YARA | 🔗 |
 | 155 | `desarma` | Ensamblador y desensamblador | Capstone, Keystone | 🔗 |
@@ -225,7 +225,7 @@ Estado: ✅ ya existe en C-Forge · 🔗 se usa hoy vía `cforge bindgen`,
 | 162 | `segundo_factor` / `totp` | TOTP y Passkeys | TOTP, WebAuthn | ✅ `segundo_factor` |
 | 163 | `antivirus` | Escaneo por firmas | ClamAV | 🔗 |
 | 164 | `centinela` | Detección de intrusos | Suricata | 🛠 |
-| 165 | `secretos` | Secretos cifrados en repos | sops | 🛠 |
+| 165 | `secretos` / `secrets` | Secretos cifrados en repos | sops | ✅ `secretos` |
 | 166 | `apreton` | Protocolo Noise | snow | 🛠 |
 
 ### I. Ciencia, ingeniería y geoespacial
@@ -236,13 +236,13 @@ Estado: ✅ ya existe en C-Forge · 🔗 se usa hoy vía `cforge bindgen`,
 | 168 | `proyeccion` | Sistemas de coordenadas | PROJ | 🔗 |
 | 169 | `geometria` / `geo` | Operaciones espaciales | GEOS, Turf | ✅ `geometria` |
 | 170 | `panal` | Índice hexagonal del planeta | H3 | 🛠 |
-| 171 | `ciencia` | Optimización e interpolación | SciPy | 🛠 |
-| 172 | `fourier` | FFT rápida | FFTW | 🛠 |
+| 171 | `ciencia` / `science` | Optimización e interpolación | SciPy | ✅ `ciencia` |
+| 172 | `fourier` / `fft` | FFT rápida | FFTW | ✅ `fourier` |
 | 173 | `blas` | Matrices de alto rendimiento | OpenBLAS | 🔗 |
 | 174 | `malla_geo` | Geometría computacional | CGAL | 🛠 |
 | 175 | `robotica` | Física para robótica | MuJoCo | 🔗 |
 | 176 | `cuaternion` | Álgebra lineal y transformaciones | nalgebra | ✅ `matematica` (básica) · 🛠 |
-| 177 | `astro` | Órbitas y efemérides | NOVAS | 🛠 |
+| 177 | `astro` / `astronomy` | Órbitas y efemérides | NOVAS | ✅ `astro` |
 | 178 | `molecula` | Quimioinformática | RDKit | 🔗 |
 | 179 | `genoma` | Bioinformática | Rust-Bio | 🛠 |
 | 180 | `cientifica` | Funciones especiales y EDO | GSL | 🔗 |
@@ -262,10 +262,10 @@ Estado: ✅ ya existe en C-Forge · 🔗 se usa hoy vía `cforge bindgen`,
 | 189 | `sombreador` | Traducir shaders | naga | 🛠 |
 | 190 | `mosaico` / `tilemap` | Mapas de tiles | Tiled, LDtk | ✅ `mosaico` |
 | 191 | `esqueleto` | Animación por huesos 2D | Spine | 🛠 |
-| 192 | `multitud` | Simulación de multitudes | DetourCrowd | 🛠 |
+| 192 | `multitud` / `crowd` | Simulación de multitudes | DetourCrowd | ✅ `multitud` |
 | 193 | `ruido` / `noise` | Terrenos procedurales | FastNoiseLite | ✅ `ruido` |
 | 194 | `carga3d` | Cargar OBJ y glTF | tinyobjloader | ✅ `modelo` (OBJ) · 🛠 glTF |
-| 195 | `grafica` | Gráficas en tiempo real | ImPlot | 🛠 |
+| 195 | `grafica` / `chart` | Gráficas en tiempo real | ImPlot | ✅ `grafica` |
 | 196 | `dialogo` / `dialogue` | Narrativa interactiva | ink, YarnSpinner | ✅ `dialogo` |
 
 ### K. Multimedia, documentos y finanzas
@@ -278,12 +278,12 @@ Estado: ✅ ya existe en C-Forge · 🔗 se usa hoy vía `cforge bindgen`,
 | 200 | `codigo_qr` | QR y códigos de barras | ZXing | 🛠 |
 | 201 | `composicion` | Composición tipográfica de PDFs | Typst | 🛠 |
 | 202 | `conversor` | Conversión entre formatos de documento | Pandoc | 🛠 |
-| 203 | `lee_excel` | Leer .xlsx/.ods | Calamine | 🛠 |
+| 203 | `lee_excel` / `read_xlsx` | Leer .xlsx/.ods | Calamine | ✅ `lee_excel` |
 | 204 | `dinero` / `money` | Decimales exactos | rust_decimal | ✅ `dinero` |
 | 205 | `indicadores` / `ta` | Análisis técnico (RSI, MACD) | TA-Lib | ✅ `indicadores` |
 | 206 | `derivados` / `quant` | Valoración de opciones y bonos | QuantLib | ✅ `derivados` |
-| 207 | `mensaje_bancario` | ISO 8583 y FIX | ISO 8583, FIX | 🛠 |
-| 208 | `cobro` | Cobros idempotentes y webhooks | Stripe | 🛠 |
+| 207 | `mensaje_bancario` / `iso8583` | ISO 8583 y FIX | ISO 8583, FIX | ✅ `mensaje_bancario` |
+| 208 | `cobro` / `payments` | Cobros idempotentes y webhooks | Stripe | ✅ `cobro` |
 | 209 | `postura` | Rostro, manos y pose | MediaPipe | 🔗 |
 | 210 | `tuberia` | Pipelines multimedia | GStreamer | 🔗 |
 | 211 | `voz_activa` | Detección de voz | Silero VAD | 🛠 |
@@ -292,7 +292,7 @@ Estado: ✅ ya existe en C-Forge · 🔗 se usa hoy vía `cforge bindgen`,
 
 | # | Nombre | Para qué | Inspiración | Estado |
 |---|---|---|---|---|
-| 212 | `traza` | Trazas y métricas distribuidas | OpenTelemetry | 🛠 |
+| 212 | `traza` / `tracing` | Trazas y métricas distribuidas | OpenTelemetry | ✅ `traza` |
 | 213 | `metricas` / `metrics` | Métricas en tiempo real | Prometheus | ✅ `metricas` |
 | 214 | `flujo` | Streaming de eventos | Kafka | 🔗 |
 | 215 | `correo_rapido` | Mensajería entre microservicios | NATS | 🛠 |
@@ -300,7 +300,7 @@ Estado: ✅ ya existe en C-Forge · 🔗 se usa hoy vía `cforge bindgen`,
 | 217 | `descubre` | Descubrimiento de servicios | etcd, Consul | 🛠 |
 | 218 | `objetos` | Almacenamiento compatible con S3 | MinIO | 🛠 |
 | 219 | `orquesta` | Cliente de Kubernetes | kube-rs | 🛠 |
-| 220 | `infra` | Infraestructura como código | HCL | 🛠 |
+| 220 | `infra` / `hcl` | Infraestructura como código | HCL | ✅ `infra` |
 | 221 | `proxy` | Proxy inverso y balanceo | Caddy, Pingora | 🛠 |
 | 222 | `recolector` | Recolección de logs | Vector | 🛠 |
 | 223 | `proceso` | Flujos de trabajo de larga duración | Temporal | 🛠 |
@@ -336,4 +336,4 @@ Estado: ✅ ya existe en C-Forge · 🔗 se usa hoy vía `cforge bindgen`,
 | 248 | `vecinos` | Descubrimiento mDNS | Zeroconf | 🛠 |
 | 249 | `puertos` | Abrir puertos en el router | UPnP | 🛠 |
 | 250 | `usb` | USB de bajo nivel | libusb | 🔗 |
-| 251 | `alerta` | Reportes de errores en producción | Sentry | 🛠 |
+| 251 | `alerta` / `errors` | Reportes de errores en producción | Sentry | ✅ `alerta` |
