@@ -43,7 +43,7 @@ Estado: ✅ ya existe en C-Forge · 🔗 se usa hoy vía `cforge bindgen`,
 | 24 | `senal` | Tiempo real con reconexión | SignalR | 🛠 |
 | 25 | `arbol_json` | JSON tipado y dinámico | System.Text.Json | ✅ `json` |
 | 26 | `regla` | Validación encadenada | FluentValidation | 🛠 |
-| 27 | `calco` | Mapeo entre estructuras | AutoMapper | 🛠 |
+| 27 | `calco` / `mapper` | Mapeo entre estructuras | AutoMapper | ✅ `calco` |
 | 28 | `resiste` / `resilience` | Reintentos y circuit breaker | Polly | ✅ `resiste` |
 | 29 | `bitacora` / `logger` | Logs estructurados | Serilog | ✅ `bitacora` |
 | 30 | `torrente` | Red asíncrona de alto tráfico | Netty | 🛠 |
@@ -61,9 +61,9 @@ Estado: ✅ ya existe en C-Forge · 🔗 se usa hoy vía `cforge bindgen`,
 | 42 | `eco` | Eventos en tiempo real | Socket.io | ✅ WebSocket en `red` |
 | 43 | `modelo_db` | Esquemas y consultas limpias | Prisma, Drizzle | 🛠 |
 | 44 | `escena` | 3D sobre WebGL | Three.js | ✅ `gl` / `modelo` (básico) |
-| 45 | `cosecha` | HTML con selectores CSS | Cheerio | 🛠 |
+| 45 | `cosecha` / `scrape` | HTML con selectores CSS | Cheerio | ✅ `cosecha` |
 | 46 | `tinta` / `ink` | Colores en la terminal | Chalk | ✅ `tinta` |
-| 47 | `matriz` | Arreglos multidimensionales | NumPy | 🛠 |
+| 47 | `matriz` / `ndarray` | Arreglos multidimensionales | NumPy | ✅ `matriz` |
 | 48 | `planilla` | Análisis de datos tabulares | Pandas | 🛠 |
 | 49 | `api_rapida` | APIs con documentación automática | FastAPI | 🛠 |
 | 50 | `vitrina` / `rich` | Interfaces ricas en terminal | Rich | ✅ `vitrina` |
@@ -138,7 +138,7 @@ Estado: ✅ ya existe en C-Forge · 🔗 se usa hoy vía `cforge bindgen`,
 | 97 | `archivo_kv` | Clave-valor en disco | RocksDB | 🛠 |
 | 98 | `analitica` | SQL analítico embebido | DuckDB | 🔗 |
 | 99 | `cofre` | Base embebida ACID | sled, redb | 🛠 |
-| 100 | `paquete_bin` | Serialización binaria compacta | MessagePack | 🛠 |
+| 100 | `paquete_bin` / `msgpack` | Serialización binaria compacta | MessagePack | ✅ `paquete_bin` |
 | 101 | `sin_copia` | Serialización zero-copy | FlatBuffers | 🛠 |
 | 102 | `columnas` | Formato columnar | Arrow, Parquet | 🛠 |
 | 103 | `hoja` | Hojas de cálculo .xlsx | libxlsxwriter | 🛠 |
@@ -159,15 +159,15 @@ Estado: ✅ ya existe en C-Forge · 🔗 se usa hoy vía `cforge bindgen`,
 | 113 | `plantilla` / `template` | Plantillas HTML | Tera, Handlebars | ✅ `plantilla` |
 | 114 | `piloto` | Navegadores automatizados | Playwright | 🛠 |
 | 115 | `atributo` | Interactividad por atributos HTML | htmx | 🛠 |
-| 116 | `css` | Parser y minificador CSS | LightningCSS | 🛠 |
+| 116 | `css` | Parser y minificador CSS | LightningCSS | ✅ `css` |
 | 117 | `empaca` | Empaquetador web | esbuild | 🛠 |
 | 118 | `ensayo` | Mocks y snapshots | Vitest | ✅ `cforge test --coverage` · 🛠 mocks |
 | 119 | `ficticio` / `faker` | Datos falsos realistas | Faker | ✅ `ficticio` |
-| 120 | `contrato` | Documentación OpenAPI | Swagger | 🛠 |
-| 121 | `subida` | Subida de archivos multipart | busboy | 🛠 |
+| 120 | `contrato` / `openapi` | Documentación OpenAPI | Swagger | ✅ `contrato` |
+| 121 | `subida` / `multipart` | Subida de archivos multipart | busboy | ✅ `subida` |
 | 122 | `casco` / `helmet` | Cabeceras de seguridad HTTP | Helmet | ✅ `casco` |
 | 123 | `acceso` | Autenticación modular | Passport, Lucia | ✅ `auth` (básico) |
-| 124 | `cola` | Trabajos en segundo plano | BullMQ | 🛠 |
+| 124 | `cola` / `queue` | Trabajos en segundo plano | BullMQ | ✅ `cola` |
 | 125 | `idiomas` / `i18n` | Internacionalización | i18next | ✅ `idiomas` |
 | 126 | `extremo` | APIs con tipos compartidos | tRPC | 🛠 |
 

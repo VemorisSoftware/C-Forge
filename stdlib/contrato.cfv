@@ -1,0 +1,179 @@
+// stdlib/contrato.cfv — documentación OpenAPI 3.1 a partir de las rutas y
+// de los esquemas de "esquema" (una sola fuente de verdad para validar y
+// documentar). Inspirada en Swagger/OpenAPI (Apache). En inglés:
+// importar "openapi".
+//
+//   importar "contrato"
+//   importar "esquema"
+//   sea api = contrato_nuevo("Tienda", "1.0.0")
+//   contrato_ruta(api, "GET", "/productos/:id", {"resumen": "Un producto",
+//       "respuestas": {"200": producto, "404": "No existe"}})
+//   contrato_ruta(api, "POST", "/productos", {"cuerpo": producto, "etiquetas": ["productos"]})
+//   escribir_archivo("openapi.json", contrato_json(api))
+//
+// Los parámetros de ruta se escriben ":id" (en un texto de C-Forge "{id}"
+// interpolaría) y salen como {id} en el documento.
+
+importar "json"
+
+funcion contrato_nuevo(titulo, version, descripcion) {
+    sea info = {"title": titulo, "version": version ?? "1.0.0"}
+    si (descripcion != nulo) { info["description"] = descripcion }
+    retornar {"openapi": "3.1.0", "info": info, "paths": {}, "servidores": [], "componentes": {}, "idioma": "es"}
+}
+
+funcion contrato_servidor(c, url, descripcion) {
+    sea s = {"url": url}
+    si (descripcion != nulo) { s["description"] = descripcion }
+    c["servidores"].agregar(s)
+    retornar c
+}
+
+/// Esquema con nombre en components/schemas (se referencia con $ref).
+funcion contrato_componente(c, nombre, e) {
+    c["componentes"][nombre] = e
+    e["_contrato_nombre"] = nombre
+    retornar e
+}
+
+/// Esquema de "esquema" → JSON Schema.
+funcion contrato_json_schema(e) {
+    si (tiene_clave(e, "_contrato_nombre")) { retornar {"$ref": "#/components/schemas/" + e["_contrato_nombre"]} }
+    retornar _ct_schema(e)
+}
+
+funcion _ct_schema(e) {
+    sea t = e["tipo"]
+    sea r = {}
+    si (t == "texto") {
+        r["type"] = "string"
+        si (e["min"] != nulo) { r["minLength"] = e["min"] }
+        si (e["max"] != nulo) { r["maxLength"] = e["max"] }
+        si (e["patron"] != nulo) { r["pattern"] = "^(" + e["patron"] + ")$" }
+        si (e["correo"]) { r["format"] = "email" }
+    }
+    si (t == "numero" o t == "entero") {
+        r["type"] = "number"
+        si (t == "entero") { r["type"] = "integer" }
+        si (e["min"] != nulo) { r["minimum"] = e["min"] }
+        si (e["max"] != nulo) { r["maximum"] = e["max"] }
+    }
+    si (t == "booleano") { r["type"] = "boolean" }
+    si (t == "lista") {
+        r["type"] = "array"
+        r["items"] = contrato_json_schema(e["elemento"])
+        si (e["min"] != nulo) { r["minItems"] = e["min"] }
+        si (e["max"] != nulo) { r["maxItems"] = e["max"] }
+    }
+    si (t == "objeto") {
+        r["type"] = "object"
+        sea props = {}
+        sea requeridos = []
+        para k en claves(e["campos"]) {
+            props[k] = contrato_json_schema(e["campos"][k])
+            si (e["campos"][k]["opcional"] == falso y e["campos"][k]["tiene_defecto"] == falso) { requeridos.agregar(k) }
+        }
+        r["properties"] = props
+        si (longitud(requeridos) > 0) { r["required"] = requeridos }
+        si (e["estricto"]) { r["additionalProperties"] = falso }
+    }
+    si (e["opciones"] != nulo) { r["enum"] = e["opciones"] }
+    si (e["tiene_defecto"]) { r["default"] = e["defecto"] }
+    retornar r
+}
+
+sea _CT_EN = {"resumen": "summary", "descripcion": "description", "etiquetas": "tags", "consulta": "query", "cuerpo": "body", "respuestas": "responses", "seguridad": "security", "id": "operation_id"}
+
+funcion _ct_op(o, k, d) {
+    si (o != nulo) {
+        si (tiene_clave(o, k)) { retornar o[k] }
+        si (tiene_clave(_CT_EN, k)) { si (tiene_clave(o, _CT_EN[k])) { retornar o[_CT_EN[k]] } }
+    }
+    retornar d
+}
+
+sea _CT_MOTIVOS_EN = {"200": "OK", "201": "Created", "204": "No Content", "400": "Bad Request", "401": "Unauthorized", "403": "Forbidden", "404": "Not Found", "409": "Conflict", "422": "Unprocessable Content", "429": "Too Many Requests", "500": "Internal Server Error"}
+sea _CT_MOTIVOS = {"200": "OK", "201": "Creado", "204": "Sin contenido", "400": "Solicitud inválida", "401": "No autenticado", "403": "Prohibido", "404": "No existe", "409": "Conflicto", "422": "Datos inválidos", "429": "Demasiadas solicitudes", "500": "Error del servidor"}
+
+/// Registra una operación. opciones: resumen, descripcion, etiquetas,
+/// consulta (mapa nombre → esquema), cuerpo (esquema), respuestas
+/// (código → esquema o texto), seguridad (lista de nombres), id.
+funcion contrato_ruta(c, metodo, ruta, opciones) {
+    sea m = texto_minusculas(metodo)
+    si (texto_indice("get put post delete patch head options trace", m) < 0) { lanzar "contrato: método inválido " + metodo }
+    sea partes = []
+    sea parametros = []
+    para p en texto_dividir(ruta, "/") {
+        si (texto_empieza_con(p, ":")) {
+            sea nombre = subcadena(p, 1, longitud(p))
+            partes.agregar(caracter(123) + nombre + caracter(125))
+            parametros.agregar({"name": nombre, "in": "path", "required": verdadero, "schema": {"type": "string"}})
+        } sino { partes.agregar(p) }
+    }
+    sea camino = unir(partes, "/")
+    sea consulta = _ct_op(opciones, "consulta", {})
+    para k en claves(consulta) {
+        sea e = consulta[k]
+        parametros.agregar({"name": k, "in": "query", "required": e["opcional"] == falso y e["tiene_defecto"] == falso, "schema": contrato_json_schema(e)})
+    }
+    sea op = {}
+    si (_ct_op(opciones, "resumen", nulo) != nulo) { op["summary"] = _ct_op(opciones, "resumen", nulo) }
+    si (_ct_op(opciones, "descripcion", nulo) != nulo) { op["description"] = _ct_op(opciones, "descripcion", nulo) }
+    si (_ct_op(opciones, "etiquetas", nulo) != nulo) { op["tags"] = _ct_op(opciones, "etiquetas", nulo) }
+    si (_ct_op(opciones, "id", nulo) != nulo) { op["operationId"] = _ct_op(opciones, "id", nulo) }
+    si (longitud(parametros) > 0) { op["parameters"] = parametros }
+    sea cuerpo = _ct_op(opciones, "cuerpo", nulo)
+    si (cuerpo != nulo) { op["requestBody"] = {"required": verdadero, "content": {"application/json": {"schema": contrato_json_schema(cuerpo)}}} }
+    sea resp = {}
+    sea dadas = _ct_op(opciones, "respuestas", {"200": nulo})
+    para codigo en claves(dadas) {
+        sea v = dadas[codigo]
+        sea motivo = "Respuesta"
+        si (tiene_clave(_CT_MOTIVOS, "" + codigo)) {
+            motivo = _CT_MOTIVOS["" + codigo]
+            si (c["idioma"] == "en") { motivo = _CT_MOTIVOS_EN["" + codigo] }
+        }
+        si (tipo(v) == "texto") { resp["" + codigo] = {"description": v} } sino {
+            si (v == nulo) { resp["" + codigo] = {"description": motivo} } sino {
+                resp["" + codigo] = {"description": motivo, "content": {"application/json": {"schema": contrato_json_schema(v)}}}
+            }
+        }
+    }
+    op["responses"] = resp
+    sea seg = _ct_op(opciones, "seguridad", nulo)
+    si (seg != nulo) {
+        sea l = []
+        para s en seg { sea x = {}  x[s] = []  l.agregar(x) }
+        op["security"] = l
+    }
+    si (tiene_clave(c["paths"], camino) == falso) { c["paths"][camino] = {} }
+    si (tiene_clave(c["paths"][camino], m)) { lanzar "contrato: " + metodo + " " + ruta + " ya está definida" }
+    c["paths"][camino][m] = op
+    retornar c
+}
+
+/// Esquema de seguridad: "bearer" (JWT) o "clave" (X-API-Key en cabecera).
+funcion contrato_seguridad(c, nombre, tipo_s) {
+    si (tiene_clave(c, "seguridad") == falso) { c["seguridad"] = {} }
+    si (tipo_s == "bearer") { c["seguridad"][nombre] = {"type": "http", "scheme": "bearer", "bearerFormat": "JWT"} } sino {
+        c["seguridad"][nombre] = {"type": "apiKey", "in": "header", "name": "X-API-Key"}
+    }
+    retornar c
+}
+
+/// Documento OpenAPI como mapa.
+funcion contrato_documento(c) {
+    sea d = {"openapi": c["openapi"], "info": c["info"], "paths": c["paths"]}
+    si (longitud(c["servidores"]) > 0) { d["servers"] = c["servidores"] }
+    sea comp = {}
+    si (longitud(claves(c["componentes"])) > 0) {
+        sea s = {}
+        para k en claves(c["componentes"]) { s[k] = _ct_schema(c["componentes"][k]) }
+        comp["schemas"] = s
+    }
+    si (tiene_clave(c, "seguridad")) { comp["securitySchemes"] = c["seguridad"] }
+    si (longitud(claves(comp)) > 0) { d["components"] = comp }
+    retornar d
+}
+
+funcion contrato_json(c) { retornar json_texto(contrato_documento(c)) }
