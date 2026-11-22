@@ -1,0 +1,67 @@
+importar "archivo_kv"
+funcion cuatro(n) {
+    sea t = "" + n
+    mientras (longitud(t) < 4) { t = "0" + t }
+    retornar t
+}
+funcion igual(a, b, q) { afirmar(("" + a) == ("" + b), q + ": [" + a + "] != [" + b + "]") }
+sea dir = "/tmp/cforge_kv_prueba"
+kv_destruir(dir)
+sea db = kv_abrir(dir, {"memtable_bytes": 2000, "bloque_bytes": 256, "tablas_l0": 3})
+kv_poner(db, "b", "2")
+kv_poner(db, "a", "1")
+kv_poner(db, "c", "3")
+igual([kv_obtener(db, "a", nulo), kv_obtener(db, "z", nulo)], ["1", nulo], "poner y obtener")
+kv_borrar(db, "b")
+igual(kv_rango(db, nulo), [["a", "1"], ["c", "3"]], "borrar")
+// Muchas claves: fuerza vaciados y compactaciones.
+sea i = 0
+mientras (i < 600) {
+    kv_poner(db, "k" + cuatro(i), "valor-" + i)
+    i = i + 1
+}
+sea e = kv_estado(db)
+igual([e["estadisticas"]["vaciados"] > 3, e["estadisticas"]["compactaciones"] > 0], [verdadero, verdadero], "vaciados y compactaciones")
+igual([kv_obtener(db, "k0000", nulo), kv_obtener(db, "k0599", nulo), kv_obtener(db, "k0300", nulo)], ["valor-0", "valor-599", "valor-300"], "leer de tablas")
+// Sobrescribir y borrar entre niveles.
+kv_poner(db, "k0010", "nuevo")
+kv_borrar(db, "k0011")
+kv_vaciar(db)
+igual([kv_obtener(db, "k0010", nulo), kv_obtener(db, "k0011", nulo)], ["nuevo", nulo], "versiones")
+// Rango, prefijo, límite e inverso.
+igual(kv_rango(db, {"desde": "k0008", "hasta": "k0013"}), [["k0008", "valor-8"], ["k0009", "valor-9"], ["k0010", "nuevo"], ["k0012", "valor-12"]], "rango")
+igual(longitud(kv_rango(db, {"prefijo": "k05"})), 100, "prefijo")
+igual(kv_rango(db, {"prefijo": "k", "limite": 2, "inverso": verdadero}), [["k0599", "valor-599"], ["k0598", "valor-598"]], "inverso")
+// Instantánea: no ve escrituras posteriores ni tras compactar.
+sea s = kv_instantanea(db)
+kv_poner(db, "a", "cambiado")
+kv_borrar(db, "c")
+kv_compactar(db, nulo)
+igual([kv_obtener(db, "a", s), kv_obtener(db, "c", s), kv_obtener(db, "a", nulo), kv_obtener(db, "c", nulo)], ["1", "3", "cambiado", nulo], "instantánea")
+kv_soltar(db, s)
+// Lote atómico y combinador (contador).
+kv_cerrar(db)
+sea db2 = kv_abrir(dir, {"combinar": funcion(k, actual, op) { retornar a_numero(actual ?? "0") + op }})
+igual([kv_obtener(db2, "k0599", nulo), kv_obtener(db2, "a", nulo), kv_contar(db2, nulo)], ["valor-599", "cambiado", 600], "reabrir")
+kv_lote(db2, [["poner", "x", "1"], ["combinar", "visitas", 5], ["combinar", "visitas", 2], ["borrar", "a"]])
+igual([kv_obtener(db2, "visitas", nulo), kv_obtener(db2, "a", nulo)], ["7", nulo], "lote y combinar")
+// Caída sin vaciar: el WAL recupera lo escrito.
+kv_poner(db2, "despues", "de la caída")
+kv_soltar_sin_vaciar(db2)
+sea db3 = kv_abrir(dir, nulo)
+igual([kv_obtener(db3, "despues", nulo), kv_obtener(db3, "visitas", nulo), kv_obtener(db3, "x", nulo)], ["de la caída", "7", "1"], "recuperar WAL")
+// Un registro cortado al final del WAL se ignora.
+kv_poner(db3, "entero", "sí")
+kv_soltar_sin_vaciar(db3)
+sea wal = leer_archivo(dir + "/wal.log")
+escribir_archivo(dir + "/wal.log", wal + subcadena(wal, 0, 7))
+sea db4 = kv_abrir(dir, nulo)
+igual(kv_obtener(db4, "entero", nulo), "sí", "WAL cortado")
+// Valores binarios y claves vacías.
+kv_poner(db4, "bin", bytes_entero(0, 1, 0) + bytes_entero(255, 1, 0))
+kv_vaciar(db4)
+igual(longitud(kv_obtener(db4, "bin", nulo)), 2, "binario")
+kv_cerrar(db4)
+kv_destruir(dir)
+igual(existe_archivo(dir), falso, "destruir")
+mostrar("[OK] archivo_kv")
