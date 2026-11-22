@@ -18,6 +18,15 @@ Sitio oficial: [c-forge.org](https://c-forge.org)
   JSON, sin inyección de líneas), `resiste`/`resilience` (reintentos con
   espera exponencial y cortacircuitos) y `plantilla`/`template` (`{{ }}`
   escapado, `#si`/`#if`, `#cada`/`#each`). Pruebas en español e inglés.
+- **Lote 3 (bilingüe):** `esquema`/`schema` (validación con rutas de error y
+  mensajes en ambos idiomas), `freno`/`ratelimit` (cubeta de fichas por
+  clave, cabeceras RateLimit-*), `casco`/`helmet` (CSP, HSTS, nosniff,
+  anti-clickjacking, sin inyección de cabeceras), `idiomas`/`i18n` (claves
+  anidadas, plurales, respaldo, números por idioma), `ficticio`/`faker`
+  (datos reproducibles, RUT válido, dominios reservados), `xml` (sin
+  DOCTYPE/ENTITY: nada de XXE), `reloj`/`cron` (próxima ejecución sin
+  recorrer minuto a minuto, desfase horario) y `vitrina`/`rich` (tablas,
+  paneles y árboles con anchos Unicode correctos).
 - **Textos:** una llave doble `{{` ya no interpola, así las plantillas
   (`"{{nombre}}"`, `"{{#si x}}"`) se escriben sin espacios ni escapes.
 - Nuevas funciones del lenguaje: `escribir(v)` (sin salto de línea) y
