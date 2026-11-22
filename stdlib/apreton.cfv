@@ -1,0 +1,266 @@
+// stdlib/apreton.cfv — el Protocolo Noise (el apretón de manos de
+// WireGuard, WhatsApp y Lightning): patrones NN, NK, NX, XN, XK, XX, KN,
+// KK, KX, IN, IK e IX con X25519, ChaCha20-Poly1305 y SHA-256 (o
+// BLAKE2b), prólogo, hash del canal y transporte con contadores de nonce
+// y rekey. Interoperable con otras implementaciones del estándar
+// (Noise rev. 34). Inspirada en snow (Apache/MIT). En inglés:
+// importar "noise".
+//
+//   importar "apreton"
+//   sea yo = apreton_claves()
+//   sea a = apreton_nuevo("XX", verdadero, {"estatica": yo})
+//   sea m1 = apreton_escribir(a, "")          // → enviar al otro lado
+//   …
+//   si (apreton_listo(a)) { sea t = apreton_transporte(a)
+//       sea c = apreton_cifrar(t, "hola") }
+
+sea _AP_PATRONES = {
+    "NN": [[], [], [["e"], ["e", "ee"]]],
+    "NK": [[], ["s"], [["e", "es"], ["e", "ee"]]],
+    "NX": [[], [], [["e"], ["e", "ee", "s", "es"]]],
+    "XN": [[], [], [["e"], ["e", "ee"], ["s", "se"]]],
+    "XK": [[], ["s"], [["e", "es"], ["e", "ee"], ["s", "se"]]],
+    "XX": [[], [], [["e"], ["e", "ee", "s", "es"], ["s", "se"]]],
+    "KN": [["s"], [], [["e"], ["e", "ee", "se"]]],
+    "KK": [["s"], ["s"], [["e", "es", "ss"], ["e", "ee", "se"]]],
+    "KX": [["s"], [], [["e"], ["e", "ee", "se", "s", "es"]]],
+    "IN": [[], [], [["e", "s"], ["e", "ee", "se"]]],
+    "IK": [[], ["s"], [["e", "es", "s", "ss"], ["e", "ee", "se"]]],
+    "IX": [[], [], [["e", "s"], ["e", "ee", "se", "s", "es"]]]
+}
+
+/// Par de claves X25519: {"privada", "publica"} (32 bytes cada una).
+funcion apreton_claves(privada) {
+    sea p = privada ?? bytes_aleatorios(32)
+    si (longitud(p) != 32) { lanzar "apreton: la clave privada tiene 32 bytes" }
+    retornar {"privada": p, "publica": x25519_base(p)}
+}
+
+funcion _ap_hash(e, datos) {
+    si (e["hash"] == "BLAKE2b") { retornar blake2b(datos, 64) }
+    retornar sha256_bytes(datos)
+}
+
+funcion _ap_hmac(e, clave, datos) {
+    si (e["hash"] == "BLAKE2b") {
+        // HMAC con BLAKE2b (bloque de 128 bytes), como pide Noise.
+        sea k = clave
+        si (longitud(k) > 128) { k = blake2b(k, 64) }
+        mientras (longitud(k) < 128) { k = k + bytes_de_hex("00") }
+        sea ipad = ""
+        sea opad = ""
+        sea i = 0
+        mientras (i < 128) {
+            ipad = ipad + _ap_byte(bits_xo(byte_en(k, i), 54))
+            opad = opad + _ap_byte(bits_xo(byte_en(k, i), 92))
+            i = i + 1
+        }
+        retornar blake2b(opad + blake2b(ipad + datos, 64), 64)
+    }
+    retornar hmac_sha256_bytes(clave, datos)
+}
+
+funcion _ap_byte(v) { retornar bytes_de_hex(subcadena("0123456789abcdef", piso(v / 16), piso(v / 16) + 1) + subcadena("0123456789abcdef", v % 16, v % 16 + 1)) }
+
+funcion _ap_hkdf(e, ck, ikm, n) {
+    sea tk = _ap_hmac(e, ck, ikm)
+    sea o1 = _ap_hmac(e, tk, bytes_de_hex("01"))
+    sea o2 = _ap_hmac(e, tk, o1 + bytes_de_hex("02"))
+    si (n == 2) { retornar [o1, o2] }
+    retornar [o1, o2, _ap_hmac(e, tk, o2 + bytes_de_hex("03"))]
+}
+
+funcion _ap_nonce(n) {
+    sea r = bytes_de_hex("00000000")
+    sea v = n
+    sea i = 0
+    mientras (i < 8) {
+        r = r + _ap_byte(v % 256)
+        v = piso(v / 256)
+        i = i + 1
+    }
+    retornar r
+}
+
+funcion _ap_cifrar_cs(cs, ad, texto) {
+    si (cs["k"] == nulo) { retornar texto }
+    si (cs["n"] >= 9007199254740991) { lanzar "apreton: se agotaron los nonces; haz rekey" }
+    sea c = chacha20_poly1305_cifrar(cs["k"], _ap_nonce(cs["n"]), texto, ad)
+    cs["n"] = cs["n"] + 1
+    retornar c
+}
+
+funcion _ap_descifrar_cs(cs, ad, cifrado) {
+    si (cs["k"] == nulo) { retornar cifrado }
+    sea r = nulo
+    intentar { r = chacha20_poly1305_descifrar(cs["k"], _ap_nonce(cs["n"]), cifrado, ad) } capturar (err) { lanzar "apreton: mensaje alterado o fuera de orden" }
+    cs["n"] = cs["n"] + 1
+    retornar r
+}
+
+funcion _ap_mezclar_hash(e, datos) { e["h"] = _ap_hash(e, e["h"] + datos) }
+
+funcion _ap_mezclar_clave(e, ikm) {
+    sea o = _ap_hkdf(e, e["ck"], ikm, 2)
+    e["ck"] = o[0]
+    e["cs"] = {"k": subcadena(o[1], 0, 32), "n": 0}
+}
+
+funcion _ap_cifrar_y_hash(e, texto) {
+    sea c = _ap_cifrar_cs(e["cs"], e["h"], texto)
+    _ap_mezclar_hash(e, c)
+    retornar c
+}
+
+funcion _ap_descifrar_y_hash(e, c) {
+    sea t = _ap_descifrar_cs(e["cs"], e["h"], c)
+    _ap_mezclar_hash(e, c)
+    retornar t
+}
+
+/// Nuevo apretón. patron: "XX", "IK", … (o el nombre completo
+/// "Noise_XX_25519_ChaChaPoly_SHA256"). opciones: estatica (par de
+/// claves), remota (pública del otro, si el patrón la conoce de antes),
+/// prologo, efimera (solo para pruebas), hash ("SHA256" | "BLAKE2b").
+funcion apreton_nuevo(patron, iniciador, opciones) {
+    sea o = opciones ?? {}
+    sea p = "" + patron
+    sea hash_ = o["hash"] ?? "SHA256"
+    si (texto_empieza_con(p, "Noise_")) {
+        sea partes = texto_dividir(p, "_")
+        si (longitud(partes) != 5 o partes[2] != "25519" o partes[3] != "ChaChaPoly") { lanzar "apreton: solo se soporta 25519 + ChaChaPoly (" + p + ")" }
+        p = partes[1]
+        hash_ = partes[4]
+    }
+    si (tiene_clave(_AP_PATRONES, p) == falso) { lanzar "apreton: patrón desconocido " + p }
+    si (hash_ != "SHA256" y hash_ != "BLAKE2b") { lanzar "apreton: hash no soportado " + hash_ }
+    sea nombre = "Noise_" + p + "_25519_ChaChaPoly_" + hash_
+    sea largo_h = 32
+    si (hash_ == "BLAKE2b") { largo_h = 64 }
+    sea e = {"patron": p, "nombre": nombre, "hash": hash_, "iniciador": iniciador == verdadero, "s": o["estatica"] ?? nulo, "e": nulo, "rs": o["remota"] ?? nulo, "re": nulo, "efimera": o["efimera"] ?? nulo, "mensajes": _AP_PATRONES[p][2], "paso": 0, "cs": {"k": nulo, "n": 0}, "listo": falso}
+    si (longitud(nombre) <= largo_h) {
+        sea h = nombre
+        mientras (longitud(h) < largo_h) { h = h + bytes_de_hex("00") }
+        e["h"] = h
+    } sino { e["h"] = _ap_hash(e, nombre) }
+    e["ck"] = e["h"]
+    _ap_mezclar_hash(e, o["prologo"] ?? (o["prologue"] ?? ""))
+    // Pre-mensajes: claves que ya se conocen.
+    sea pre_i = _AP_PATRONES[p][0]
+    sea pre_r = _AP_PATRONES[p][1]
+    para t en pre_i {
+        sea k = nulo
+        si (e["iniciador"]) { k = e["s"] } sino { k = {"publica": e["rs"]} }
+        si (k == nulo o k["publica"] == nulo) { lanzar "apreton: el patrón " + p + " necesita la clave estática del iniciador" }
+        _ap_mezclar_hash(e, k["publica"])
+    }
+    para t en pre_r {
+        sea k = nulo
+        si (e["iniciador"]) { k = {"publica": e["rs"]} } sino { k = e["s"] }
+        si (k == nulo o k["publica"] == nulo) { lanzar "apreton: el patrón " + p + " necesita la clave estática del respondedor" }
+        _ap_mezclar_hash(e, k["publica"])
+    }
+    retornar e
+}
+
+funcion _ap_dh(a, pub) { retornar x25519(a["privada"], pub) }
+
+funcion _ap_mi_turno(e) { retornar (e["paso"] % 2 == 0) == e["iniciador"] }
+
+/// Escribe el siguiente mensaje del apretón con una carga (puede ser "").
+funcion apreton_escribir(e, carga) {
+    si (e["listo"]) { lanzar "apreton: el apretón ya terminó; usa apreton_transporte" }
+    si (_ap_mi_turno(e) == falso) { lanzar "apreton: no es tu turno de escribir" }
+    sea r = ""
+    para t en e["mensajes"][e["paso"]] {
+        si (t == "e") {
+            e["e"] = apreton_claves(e["efimera"])
+            r = r + e["e"]["publica"]
+            _ap_mezclar_hash(e, e["e"]["publica"])
+        }
+        si (t == "s") {
+            si (e["s"] == nulo) { lanzar "apreton: falta la clave estática" }
+            r = r + _ap_cifrar_y_hash(e, e["s"]["publica"])
+        }
+        si (t == "ee") { _ap_mezclar_clave(e, _ap_dh(e["e"], e["re"])) }
+        si (t == "es") {
+            si (e["iniciador"]) { _ap_mezclar_clave(e, _ap_dh(e["e"], e["rs"])) } sino { _ap_mezclar_clave(e, _ap_dh(e["s"], e["re"])) }
+        }
+        si (t == "se") {
+            si (e["iniciador"]) { _ap_mezclar_clave(e, _ap_dh(e["s"], e["re"])) } sino { _ap_mezclar_clave(e, _ap_dh(e["e"], e["rs"])) }
+        }
+        si (t == "ss") { _ap_mezclar_clave(e, _ap_dh(e["s"], e["rs"])) }
+    }
+    r = r + _ap_cifrar_y_hash(e, carga ?? "")
+    e["paso"] = e["paso"] + 1
+    si (e["paso"] >= longitud(e["mensajes"])) { e["listo"] = verdadero }
+    si (longitud(r) > 65535) { lanzar "apreton: mensaje de más de 65535 bytes" }
+    retornar r
+}
+
+/// Lee un mensaje del otro lado; devuelve su carga.
+funcion apreton_leer(e, mensaje) {
+    si (e["listo"]) { lanzar "apreton: el apretón ya terminó; usa apreton_transporte" }
+    si (_ap_mi_turno(e)) { lanzar "apreton: no es tu turno de leer" }
+    sea m = mensaje
+    sea i = 0
+    para t en e["mensajes"][e["paso"]] {
+        si (t == "e") {
+            si (i + 32 > longitud(m)) { lanzar "apreton: mensaje corto" }
+            e["re"] = subcadena(m, i, i + 32)
+            i = i + 32
+            _ap_mezclar_hash(e, e["re"])
+        }
+        si (t == "s") {
+            sea n = 32
+            si (e["cs"]["k"] != nulo) { n = 48 }
+            si (i + n > longitud(m)) { lanzar "apreton: mensaje corto" }
+            e["rs"] = _ap_descifrar_y_hash(e, subcadena(m, i, i + n))
+            i = i + n
+        }
+        si (t == "ee") { _ap_mezclar_clave(e, _ap_dh(e["e"], e["re"])) }
+        si (t == "es") {
+            si (e["iniciador"]) { _ap_mezclar_clave(e, _ap_dh(e["e"], e["rs"])) } sino { _ap_mezclar_clave(e, _ap_dh(e["s"], e["re"])) }
+        }
+        si (t == "se") {
+            si (e["iniciador"]) { _ap_mezclar_clave(e, _ap_dh(e["s"], e["re"])) } sino { _ap_mezclar_clave(e, _ap_dh(e["e"], e["rs"])) }
+        }
+        si (t == "ss") { _ap_mezclar_clave(e, _ap_dh(e["s"], e["rs"])) }
+    }
+    sea carga = _ap_descifrar_y_hash(e, subcadena(m, i, longitud(m)))
+    e["paso"] = e["paso"] + 1
+    si (e["paso"] >= longitud(e["mensajes"])) { e["listo"] = verdadero }
+    retornar carga
+}
+
+funcion apreton_listo(e) { retornar e["listo"] }
+
+/// Clave estática del otro lado (cuando el patrón la transmite).
+funcion apreton_remota(e) { retornar e["rs"] }
+
+/// Hash del apretón (para "channel binding").
+funcion apreton_hash(e) { retornar e["h"] }
+
+/// Estados de transporte: {"enviar", "recibir"} (después del último mensaje).
+funcion apreton_transporte(e) {
+    si (e["listo"] == falso) { lanzar "apreton: el apretón todavía no termina" }
+    sea o = _ap_hkdf(e, e["ck"], "", 2)
+    sea c1 = {"k": subcadena(o[0], 0, 32), "n": 0}
+    sea c2 = {"k": subcadena(o[1], 0, 32), "n": 0}
+    si (e["iniciador"]) { retornar {"enviar": c1, "recibir": c2, "hash_": e["hash"]} }
+    retornar {"enviar": c2, "recibir": c1, "hash_": e["hash"]}
+}
+
+funcion apreton_cifrar(t, datos) {
+    si (longitud(datos) > 65519) { lanzar "apreton: mensaje de transporte de más de 65519 bytes" }
+    retornar _ap_cifrar_cs(t["enviar"], "", datos)
+}
+
+funcion apreton_descifrar(t, datos) { retornar _ap_descifrar_cs(t["recibir"], "", datos) }
+
+/// Rekey (Noise §11.3) de la dirección "enviar" o "recibir".
+funcion apreton_rekey(t, direccion) {
+    sea cs = t[direccion]
+    sea k = chacha20_poly1305_cifrar(cs["k"], bytes_de_hex("00000000ffffffffffffffff"), bytes_de_hex("0000000000000000000000000000000000000000000000000000000000000000"), "")
+    cs["k"] = subcadena(k, 0, 32)
+}

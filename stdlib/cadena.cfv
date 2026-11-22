@@ -1,0 +1,670 @@
+// stdlib/cadena.cfv — Ethereum y redes EVM sin dependencias: Keccak-256,
+// direcciones con checksum EIP-55, unidades (wei, gwei, ether) con
+// enteros grandes en texto, RLP, ABI (codificar y decodificar llamadas,
+// eventos y tuplas), selectores, firmar y recuperar mensajes (EIP-191 y
+// EIP-712 a partir del hash) y transacciones firmadas legacy (EIP-155) y
+// tipo 2 (EIP-1559), listas para eth_sendRawTransaction. Usa "curva".
+// Inspirada en ethers / ethers-rs (MIT). En inglés: importar "evm".
+//
+//   importar "cadena"
+//   sea priv = bytes_de_hex("4646…")
+//   cadena_direccion(priv)                                   // "0x9d8A…"
+//   sea datos = cadena_abi_llamada("transfer(address,uint256)", ["0xabc…", "1000000"])
+//   sea tx = cadena_firmar_tx(priv, {"tipo": 2, "cadena": 1, "nonce": 0, "para": "0x…",
+//       "valor": cadena_wei("0.01", "ether"), "gas": 21000, "max_fee": cadena_wei("30", "gwei"),
+//       "max_prioridad": cadena_wei("1", "gwei")})        // "0x02f8…"
+//
+// Los enteros grandes (wei, uint256) se pasan como texto decimal o "0x…".
+
+importar "curva"
+
+funcion _cd_byte(v) { retornar bytes_de_hex(subcadena("0123456789abcdef", piso(v / 16), piso(v / 16) + 1) + subcadena("0123456789abcdef", v % 16, v % 16 + 1)) }
+
+// ── Keccak-256 (carriles de 64 bits como pares de 32) ────────────────────
+
+sea _CD_RC = [[0, 1], [0, 32898], [2147483648, 32906], [2147483648, 2147516416], [0, 32907], [0, 2147483649], [2147483648, 2147516545], [2147483648, 32777], [0, 138], [0, 136], [0, 2147516425], [0, 2147483658], [0, 2147516555], [2147483648, 139], [2147483648, 32905], [2147483648, 32771], [2147483648, 32770], [2147483648, 128], [0, 32778], [2147483648, 2147483658], [2147483648, 2147516545], [2147483648, 32896], [0, 2147483649], [2147483648, 2147516424]]
+sea _CD_ROT = [0, 1, 62, 28, 27, 36, 44, 6, 55, 20, 3, 10, 43, 25, 39, 41, 45, 15, 21, 8, 18, 2, 61, 56, 14]
+sea _CD_M32 = 4294967296
+
+funcion _cd_rotl(hi, lo, n) {
+    si (n == 0) { retornar [hi, lo] }
+    sea h = hi
+    sea l = lo
+    sea k = n
+    si (k >= 32) {
+        sea t = h  h = l  l = t
+        k = k - 32
+    }
+    si (k == 0) { retornar [h, l] }
+    sea p = potencia(2, k)
+    sea q = potencia(2, 32 - k)
+    retornar [(h * p) % _CD_M32 + piso(l / q), (l * p) % _CD_M32 + piso(h / q)]
+}
+
+funcion _cd_f(A) {
+    sea ronda = 0
+    mientras (ronda < 24) {
+        // θ
+        sea C = []
+        sea x = 0
+        mientras (x < 5) {
+            sea h = bits_xo(bits_xo(bits_xo(A[x][0], A[x + 5][0]), bits_xo(A[x + 10][0], A[x + 15][0])), A[x + 20][0])
+            sea l = bits_xo(bits_xo(bits_xo(A[x][1], A[x + 5][1]), bits_xo(A[x + 10][1], A[x + 15][1])), A[x + 20][1])
+            C.agregar([h, l])
+            x = x + 1
+        }
+        x = 0
+        mientras (x < 5) {
+            sea r = _cd_rotl(C[(x + 1) % 5][0], C[(x + 1) % 5][1], 1)
+            sea dh = bits_xo(C[(x + 4) % 5][0], r[0])
+            sea dl = bits_xo(C[(x + 4) % 5][1], r[1])
+            sea y_ = 0
+            mientras (y_ < 25) {
+                A[x + y_] = [bits_xo(A[x + y_][0], dh), bits_xo(A[x + y_][1], dl)]
+                y_ = y_ + 5
+            }
+            x = x + 1
+        }
+        // ρ y π
+        sea B = []
+        sea i = 0
+        mientras (i < 25) { B.agregar(nulo)  i = i + 1 }
+        x = 0
+        mientras (x < 5) {
+            sea y_ = 0
+            mientras (y_ < 5) {
+                sea idx = x + 5 * y_
+                B[y_ + 5 * ((2 * x + 3 * y_) % 5)] = _cd_rotl(A[idx][0], A[idx][1], _CD_ROT[idx])
+                y_ = y_ + 1
+            }
+            x = x + 1
+        }
+        // χ
+        sea y_ = 0
+        mientras (y_ < 25) {
+            x = 0
+            mientras (x < 5) {
+                sea a = B[y_ + x]
+                sea b = B[y_ + (x + 1) % 5]
+                sea c = B[y_ + (x + 2) % 5]
+                A[y_ + x] = [bits_xo(a[0], bits_y(4294967295 - b[0], c[0])), bits_xo(a[1], bits_y(4294967295 - b[1], c[1]))]
+                x = x + 1
+            }
+            y_ = y_ + 5
+        }
+        // ι
+        A[0] = [bits_xo(A[0][0], _CD_RC[ronda][0]), bits_xo(A[0][1], _CD_RC[ronda][1])]
+        ronda = ronda + 1
+    }
+}
+
+/// Keccak-256 (el de Ethereum, no SHA3-256): 32 bytes.
+funcion cadena_keccak(datos) {
+    sea tasa = 136
+    sea m = datos + bytes_de_hex("01")
+    mientras (longitud(m) % tasa != 0) { m = m + bytes_de_hex("00") }
+    // Último byte |= 0x80
+    sea ult = byte_en(m, longitud(m) - 1)
+    m = subcadena(m, 0, longitud(m) - 1) + _cd_byte(bits_o(ult, 128))
+    sea A = []
+    sea i = 0
+    mientras (i < 25) { A.agregar([0, 0])  i = i + 1 }
+    sea off = 0
+    mientras (off < longitud(m)) {
+        i = 0
+        mientras (i < tasa / 8) {
+            sea p = off + i * 8
+            sea lo = byte_en(m, p) + byte_en(m, p + 1) * 256 + byte_en(m, p + 2) * 65536 + byte_en(m, p + 3) * 16777216
+            sea hi = byte_en(m, p + 4) + byte_en(m, p + 5) * 256 + byte_en(m, p + 6) * 65536 + byte_en(m, p + 7) * 16777216
+            A[i] = [bits_xo(A[i][0], hi), bits_xo(A[i][1], lo)]
+            i = i + 1
+        }
+        _cd_f(A)
+        off = off + tasa
+    }
+    sea r = ""
+    i = 0
+    mientras (i < 4) {
+        sea lo = A[i][1]
+        sea hi = A[i][0]
+        para v en [lo, hi] {
+            r = r + _cd_byte(v % 256) + _cd_byte(piso(v / 256) % 256) + _cd_byte(piso(v / 65536) % 256) + _cd_byte(piso(v / 16777216) % 256)
+        }
+        i = i + 1
+    }
+    retornar r
+}
+
+// ── Enteros grandes como dígitos decimales ───────────────────────────────
+
+funcion _cd_hex_limpio(h) {
+    sea t = texto_minusculas("" + h)
+    si (texto_empieza_con(t, "0x")) { t = subcadena(t, 2, longitud(t)) }
+    retornar t
+}
+
+/// Entero (número, decimal en texto o "0x…") → bytes big-endian mínimos.
+funcion cadena_entero_bytes(v) {
+    si (v == nulo) { retornar "" }
+    si (tipo(v) == "numero") {
+        si (v < 0 o piso(v) != v) { lanzar "cadena: se esperaba un entero no negativo" }
+        si (v > 9007199254740991) { lanzar "cadena: número demasiado grande para ser exacto; pásalo como texto" }
+        v = "" + v
+    }
+    sea t = texto_recortar("" + v)
+    si (texto_empieza_con(texto_minusculas(t), "0x")) {
+        sea h = _cd_hex_limpio(t)
+        mientras (longitud(h) > 0 y texto_empieza_con(h, "0")) { h = subcadena(h, 1, longitud(h)) }
+        si (longitud(h) % 2 == 1) { h = "0" + h }
+        retornar bytes_de_hex(h)
+    }
+    // Decimal → base 256 con dígitos en lista.
+    sea bytes_ = []
+    sea i = 0
+    mientras (i < longitud(t)) {
+        sea d = byte_en(t, i) - 48
+        si (d < 0 o d > 9) { lanzar "cadena: entero inválido " + t }
+        sea carry = d
+        sea j = 0
+        mientras (j < longitud(bytes_)) {
+            sea x = bytes_[j] * 10 + carry
+            bytes_[j] = x % 256
+            carry = piso(x / 256)
+            j = j + 1
+        }
+        mientras (carry > 0) { bytes_.agregar(carry % 256)  carry = piso(carry / 256) }
+        i = i + 1
+    }
+    sea r = ""
+    i = longitud(bytes_) - 1
+    mientras (i >= 0) { r = r + _cd_byte(bytes_[i])  i = i - 1 }
+    retornar r
+}
+
+/// Bytes big-endian → decimal en texto.
+funcion cadena_bytes_entero(b) {
+    sea digitos = [0]
+    sea i = 0
+    mientras (i < longitud(b)) {
+        sea carry = byte_en(b, i)
+        sea j = 0
+        mientras (j < longitud(digitos)) {
+            sea x = digitos[j] * 256 + carry
+            digitos[j] = x % 10
+            carry = piso(x / 10)
+            j = j + 1
+        }
+        mientras (carry > 0) { digitos.agregar(carry % 10)  carry = piso(carry / 10) }
+        i = i + 1
+    }
+    sea r = ""
+    i = longitud(digitos) - 1
+    mientras (i > 0 y digitos[i] == 0) { i = i - 1 }
+    mientras (i >= 0) { r = r + digitos[i]  i = i - 1 }
+    retornar r
+}
+
+sea _CD_UNIDADES = {"wei": 0, "kwei": 3, "mwei": 6, "gwei": 9, "szabo": 12, "finney": 15, "ether": 18, "eth": 18}
+
+/// "1.5" ether → "1500000000000000000" (wei, en texto; exacto).
+funcion cadena_wei(cantidad, unidad) {
+    sea dec = _CD_UNIDADES[texto_minusculas(unidad ?? "ether")] ?? nulo
+    si (dec == nulo) { dec = a_numero(unidad) }
+    sea t = texto_recortar("" + cantidad)
+    sea p = texto_indice(t, ".")
+    sea ent = t
+    sea frac = ""
+    si (p >= 0) { ent = subcadena(t, 0, p)  frac = subcadena(t, p + 1, longitud(t)) }
+    si (longitud(frac) > dec) { lanzar "cadena: demasiados decimales para " + (unidad ?? "ether") }
+    mientras (longitud(frac) < dec) { frac = frac + "0" }
+    sea r = ent + frac
+    mientras (longitud(r) > 1 y texto_empieza_con(r, "0")) { r = subcadena(r, 1, longitud(r)) }
+    si (r == "") { r = "0" }
+    cadena_entero_bytes(r)
+    retornar r
+}
+
+/// wei (texto) → cantidad legible en la unidad ("ether" por defecto).
+funcion cadena_formatear(wei, unidad) {
+    sea dec = _CD_UNIDADES[texto_minusculas(unidad ?? "ether")] ?? a_numero(unidad)
+    sea t = cadena_bytes_entero(cadena_entero_bytes(wei))
+    mientras (longitud(t) <= dec) { t = "0" + t }
+    sea ent = subcadena(t, 0, longitud(t) - dec)
+    sea frac = subcadena(t, longitud(t) - dec, longitud(t))
+    mientras (longitud(frac) > 0 y texto_termina_con(frac, "0")) { frac = subcadena(frac, 0, longitud(frac) - 1) }
+    si (frac == "") { retornar ent }
+    retornar ent + "." + frac
+}
+
+// ── Direcciones ───────────────────────────────────────────────────────────
+
+/// Checksum EIP-55 de una dirección.
+funcion cadena_checksum(dir) {
+    sea h = _cd_hex_limpio(dir)
+    si (longitud(h) != 40) { lanzar "cadena: una dirección tiene 20 bytes" }
+    sea k = hex_de_bytes(cadena_keccak(h))
+    sea r = "0x"
+    sea i = 0
+    mientras (i < 40) {
+        sea c = subcadena(h, i, i + 1)
+        sea v = texto_indice("0123456789abcdef", subcadena(k, i, i + 1))
+        si (v >= 8) { r = r + texto_mayusculas(c) } sino { r = r + c }
+        i = i + 1
+    }
+    retornar r
+}
+
+/// ¿Es válida? (si trae mayúsculas, el checksum EIP-55 debe cuadrar).
+funcion cadena_direccion_valida(dir) {
+    sea t = "" + dir
+    si (texto_empieza_con(t, "0x") == falso o longitud(t) != 42) { retornar falso }
+    sea h = subcadena(t, 2, 42)
+    sea i = 0
+    mientras (i < 40) {
+        si (texto_indice("0123456789abcdefABCDEF", subcadena(h, i, i + 1)) < 0) { retornar falso }
+        i = i + 1
+    }
+    si (h == texto_minusculas(h) o h == texto_mayusculas(h)) { retornar verdadero }
+    retornar cadena_checksum(t) == t
+}
+
+/// Dirección desde una clave privada (32 bytes) o pública (33/65 bytes).
+funcion cadena_direccion(clave) {
+    sea pub = clave
+    si (longitud(clave) == 32) { pub = curva_publica(clave, falso) } sino { pub = curva_convertir(clave, falso) }
+    retornar cadena_checksum(hex_de_bytes(subcadena(cadena_keccak(subcadena(pub, 1, 65)), 12, 32)))
+}
+
+funcion _cd_dir_bytes(d) {
+    si (cadena_direccion_valida(d) == falso) { lanzar "cadena: dirección inválida " + d }
+    retornar bytes_de_hex(_cd_hex_limpio(d))
+}
+
+// ── RLP ───────────────────────────────────────────────────────────────────
+
+funcion _cd_largo(n, base) {
+    si (n < 56) { retornar _cd_byte(base + n) }
+    sea b = cadena_entero_bytes(n)
+    retornar _cd_byte(base + 55 + longitud(b)) + b
+}
+
+/// RLP de bytes o listas (anidadas) de bytes.
+funcion cadena_rlp(v) {
+    si (tipo(v) == "lista") {
+        sea cuerpo = ""
+        para x en v { cuerpo = cuerpo + cadena_rlp(x) }
+        retornar _cd_largo(longitud(cuerpo), 192) + cuerpo
+    }
+    sea b = "" + v
+    si (longitud(b) == 1 y byte_en(b, 0) < 128) { retornar b }
+    retornar _cd_largo(longitud(b), 128) + b
+}
+
+funcion _cd_rlp_leer(b, i) {
+    sea p = byte_en(b, i)
+    si (p < 128) { retornar [subcadena(b, i, i + 1), i + 1] }
+    sea lista = p >= 192
+    sea base = 128
+    si (lista) { base = 192 }
+    sea n = p - base
+    sea ini = i + 1
+    si (n > 55) {
+        sea ll = n - 55
+        n = 0
+        sea k = 0
+        mientras (k < ll) { n = n * 256 + byte_en(b, i + 1 + k)  k = k + 1 }
+        ini = i + 1 + ll
+    }
+    si (ini + n > longitud(b)) { lanzar "cadena: RLP truncado" }
+    si (lista == falso) { retornar [subcadena(b, ini, ini + n), ini + n] }
+    sea r = []
+    sea j = ini
+    mientras (j < ini + n) {
+        sea x = _cd_rlp_leer(b, j)
+        r.agregar(x[0])
+        j = x[1]
+    }
+    retornar [r, ini + n]
+}
+
+funcion cadena_de_rlp(b) {
+    sea x = _cd_rlp_leer(b, 0)
+    si (x[1] != longitud(b)) { lanzar "cadena: RLP con bytes de sobra" }
+    retornar x[0]
+}
+
+// ── ABI ───────────────────────────────────────────────────────────────────
+
+funcion _cd_relleno(b, izquierda) {
+    sea r = b
+    mientras (longitud(r) % 32 != 0 o longitud(r) == 0) {
+        si (izquierda) { r = bytes_de_hex("00") + r } sino { r = r + bytes_de_hex("00") }
+    }
+    retornar r
+}
+
+funcion _cd_tipos(lista) {
+    // Separa "uint256,(address,bool)[],bytes" respetando paréntesis.
+    sea r = []
+    sea nivel = 0
+    sea actual = ""
+    sea i = 0
+    mientras (i < longitud(lista)) {
+        sea c = subcadena(lista, i, i + 1)
+        si (c == "(") { nivel = nivel + 1 }
+        si (c == ")") { nivel = nivel - 1 }
+        si (c == "," y nivel == 0) { r.agregar(texto_recortar(actual))  actual = "" } sino { actual = actual + c }
+        i = i + 1
+    }
+    si (texto_recortar(actual) != "") { r.agregar(texto_recortar(actual)) }
+    retornar r
+}
+
+funcion _cd_es_dinamico(t) {
+    si (t == "bytes" o t == "string") { retornar verdadero }
+    si (texto_termina_con(t, "[]")) { retornar verdadero }
+    si (texto_termina_con(t, "]")) {
+        sea p = _cd_ultimo_corchete(t)
+        retornar _cd_es_dinamico(subcadena(t, 0, p))
+    }
+    si (texto_empieza_con(t, "(")) {
+        para x en _cd_tipos(subcadena(t, 1, longitud(t) - 1)) { si (_cd_es_dinamico(x)) { retornar verdadero } }
+    }
+    retornar falso
+}
+
+funcion _cd_ultimo_corchete(t) {
+    sea i = longitud(t) - 1
+    mientras (i >= 0 y subcadena(t, i, i + 1) != "[") { i = i - 1 }
+    retornar i
+}
+
+funcion _cd_complemento(b, negativo) {
+    // Complemento a dos de 32 bytes.
+    sea r = _cd_relleno(b, verdadero)
+    si (negativo == falso) { retornar r }
+    sea l = []
+    sea i = 0
+    mientras (i < 32) { l.agregar(255 - byte_en(r, i))  i = i + 1 }
+    i = 31
+    sea carry = 1
+    mientras (i >= 0 y carry > 0) {
+        sea v = l[i] + carry
+        l[i] = v % 256
+        carry = piso(v / 256)
+        i = i - 1
+    }
+    sea s = ""
+    para v en l { s = s + _cd_byte(v) }
+    retornar s
+}
+
+funcion _cd_cod(t, v) {
+    si (texto_termina_con(t, "]")) {
+        sea p = _cd_ultimo_corchete(t)
+        sea base = subcadena(t, 0, p)
+        sea tam = subcadena(t, p + 1, longitud(t) - 1)
+        sea tipos = []
+        para x en v { tipos.agregar(base) }
+        sea cuerpo = _cd_tupla(tipos, v)
+        si (tam == "") { retornar _cd_relleno(cadena_entero_bytes(longitud(v)), verdadero) + cuerpo }
+        si (longitud(v) != a_numero(tam)) { lanzar "cadena: " + t + " necesita " + tam + " elementos" }
+        retornar cuerpo
+    }
+    si (texto_empieza_con(t, "(")) { retornar _cd_tupla(_cd_tipos(subcadena(t, 1, longitud(t) - 1)), v) }
+    si (texto_empieza_con(t, "uint")) { retornar _cd_relleno(cadena_entero_bytes(v), verdadero) }
+    si (texto_empieza_con(t, "int")) {
+        sea s = "" + v
+        si (texto_empieza_con(s, "-")) { retornar _cd_complemento(cadena_entero_bytes(subcadena(s, 1, longitud(s))), verdadero) }
+        retornar _cd_relleno(cadena_entero_bytes(s), verdadero)
+    }
+    si (t == "address") { retornar _cd_relleno(_cd_dir_bytes(v), verdadero) }
+    si (t == "bool") {
+        si (v == verdadero) { retornar _cd_relleno(bytes_de_hex("01"), verdadero) }
+        retornar _cd_relleno(bytes_de_hex("00"), verdadero)
+    }
+    si (t == "string" o t == "bytes") {
+        sea b = "" + v
+        si (t == "bytes" y texto_empieza_con(b, "0x")) { b = bytes_de_hex(_cd_hex_limpio(b)) }
+        sea cuerpo = ""
+        si (longitud(b) > 0) { cuerpo = _cd_relleno(b, falso) }
+        retornar _cd_relleno(cadena_entero_bytes(longitud(b)), verdadero) + cuerpo
+    }
+    si (texto_empieza_con(t, "bytes")) {
+        sea b = "" + v
+        si (texto_empieza_con(b, "0x")) { b = bytes_de_hex(_cd_hex_limpio(b)) }
+        si (longitud(b) != a_numero(subcadena(t, 5, longitud(t)))) { lanzar "cadena: " + t + " necesita " + subcadena(t, 5, longitud(t)) + " bytes" }
+        retornar _cd_relleno(b, falso)
+    }
+    lanzar "cadena: tipo ABI desconocido " + t
+}
+
+funcion _cd_tupla(tipos, valores) {
+    si (longitud(tipos) != longitud(valores)) { lanzar "cadena: se esperaban " + longitud(tipos) + " valores y llegaron " + longitud(valores) }
+    sea cabeza = []
+    sea cola = []
+    sea largo_cabeza = 0
+    sea i = 0
+    mientras (i < longitud(tipos)) {
+        si (_cd_es_dinamico(tipos[i])) { largo_cabeza = largo_cabeza + 32 } sino { largo_cabeza = largo_cabeza + longitud(_cd_cod(tipos[i], valores[i])) }
+        i = i + 1
+    }
+    sea cola_txt = ""
+    i = 0
+    mientras (i < longitud(tipos)) {
+        si (_cd_es_dinamico(tipos[i])) {
+            cabeza.agregar(_cd_relleno(cadena_entero_bytes(largo_cabeza + longitud(cola_txt)), verdadero))
+            cola_txt = cola_txt + _cd_cod(tipos[i], valores[i])
+        } sino { cabeza.agregar(_cd_cod(tipos[i], valores[i])) }
+        i = i + 1
+    }
+    retornar unir(cabeza, "") + cola_txt
+}
+
+/// Codifica valores según tipos: ["address", "uint256"] → bytes.
+funcion cadena_abi(tipos, valores) { retornar _cd_tupla(tipos, valores) }
+
+/// Selector de 4 bytes de una firma "transfer(address,uint256)".
+funcion cadena_selector(firma) { retornar subcadena(cadena_keccak(texto_reemplazar(firma, " ", "")), 0, 4) }
+
+/// Datos de una llamada (hex con 0x): selector + argumentos.
+funcion cadena_abi_llamada(firma, valores) {
+    sea f = texto_reemplazar(firma, " ", "")
+    sea a = texto_indice(f, "(")
+    sea tipos = _cd_tipos(subcadena(f, a + 1, longitud(f) - 1))
+    retornar "0x" + hex_de_bytes(cadena_selector(f) + _cd_tupla(tipos, valores))
+}
+
+/// topic0 de un evento "Transfer(address,address,uint256)" (hex con 0x).
+funcion cadena_topico(firma) { retornar "0x" + hex_de_bytes(cadena_keccak(texto_reemplazar(firma, " ", ""))) }
+
+funcion _cd_palabra(b, i) {
+    si (i + 32 > longitud(b)) { lanzar "cadena: datos ABI truncados" }
+    retornar subcadena(b, i, i + 32)
+}
+
+funcion _cd_dec(t, b, i) {
+    si (texto_termina_con(t, "]")) {
+        sea p = _cd_ultimo_corchete(t)
+        sea base = subcadena(t, 0, p)
+        sea tam = subcadena(t, p + 1, longitud(t) - 1)
+        sea ini = i
+        sea n = 0
+        si (tam == "") {
+            ini = a_numero(cadena_bytes_entero(_cd_palabra(b, i)))
+            n = a_numero(cadena_bytes_entero(_cd_palabra(b, ini)))
+            ini = ini + 32
+        } sino {
+            n = a_numero(tam)
+            si (_cd_es_dinamico(t)) { ini = a_numero(cadena_bytes_entero(_cd_palabra(b, i))) }
+        }
+        sea tipos = []
+        sea k = 0
+        mientras (k < n) { tipos.agregar(base)  k = k + 1 }
+        retornar _cd_dec_tupla(tipos, subcadena(b, ini, longitud(b)))
+    }
+    si (texto_empieza_con(t, "(")) {
+        sea tipos = _cd_tipos(subcadena(t, 1, longitud(t) - 1))
+        si (_cd_es_dinamico(t)) {
+            sea off = a_numero(cadena_bytes_entero(_cd_palabra(b, i)))
+            retornar _cd_dec_tupla(tipos, subcadena(b, off, longitud(b)))
+        }
+        retornar _cd_dec_tupla(tipos, subcadena(b, i, longitud(b)))
+    }
+    si (texto_empieza_con(t, "uint")) { retornar cadena_bytes_entero(_cd_palabra(b, i)) }
+    si (texto_empieza_con(t, "int")) {
+        sea w = _cd_palabra(b, i)
+        si (byte_en(w, 0) >= 128) {
+            sea neg = _cd_complemento(w, verdadero)
+            retornar "-" + cadena_bytes_entero(neg)
+        }
+        retornar cadena_bytes_entero(w)
+    }
+    si (t == "address") { retornar cadena_checksum(hex_de_bytes(subcadena(_cd_palabra(b, i), 12, 32))) }
+    si (t == "bool") { retornar byte_en(_cd_palabra(b, i), 31) == 1 }
+    si (t == "string" o t == "bytes") {
+        sea off = a_numero(cadena_bytes_entero(_cd_palabra(b, i)))
+        sea n = a_numero(cadena_bytes_entero(_cd_palabra(b, off)))
+        si (off + 32 + n > longitud(b)) { lanzar "cadena: datos ABI truncados" }
+        sea v = subcadena(b, off + 32, off + 32 + n)
+        si (t == "bytes") { retornar "0x" + hex_de_bytes(v) }
+        retornar v
+    }
+    si (texto_empieza_con(t, "bytes")) { retornar "0x" + hex_de_bytes(subcadena(_cd_palabra(b, i), 0, a_numero(subcadena(t, 5, longitud(t))))) }
+    lanzar "cadena: tipo ABI desconocido " + t
+}
+
+funcion _cd_ancho(t) {
+    si (_cd_es_dinamico(t)) { retornar 32 }
+    si (texto_termina_con(t, "]")) {
+        sea p = _cd_ultimo_corchete(t)
+        retornar _cd_ancho(subcadena(t, 0, p)) * a_numero(subcadena(t, p + 1, longitud(t) - 1))
+    }
+    si (texto_empieza_con(t, "(")) {
+        sea s = 0
+        para x en _cd_tipos(subcadena(t, 1, longitud(t) - 1)) { s = s + _cd_ancho(x) }
+        retornar s
+    }
+    retornar 32
+}
+
+funcion _cd_dec_tupla(tipos, b) {
+    sea r = []
+    sea i = 0
+    para t en tipos {
+        si (_cd_es_dinamico(t) y (texto_termina_con(t, "]") o texto_empieza_con(t, "("))) { r.agregar(_cd_dec(t, b, i)) } sino { r.agregar(_cd_dec(t, b, i)) }
+        i = i + _cd_ancho(t)
+    }
+    retornar r
+}
+
+/// Decodifica bytes (o hex "0x…") según tipos. Enteros como texto decimal.
+funcion cadena_abi_decodificar(tipos, datos) {
+    sea b = datos
+    si (texto_empieza_con("" + datos, "0x")) { b = bytes_de_hex(_cd_hex_limpio(datos)) }
+    retornar _cd_dec_tupla(tipos, b)
+}
+
+// ── Firmas de mensajes ────────────────────────────────────────────────────
+
+/// Hash EIP-191 ("\x19Ethereum Signed Message:\n" + largo + mensaje).
+funcion cadena_hash_mensaje(mensaje) {
+    sea m = "" + mensaje
+    retornar cadena_keccak(bytes_de_hex("19") + "Ethereum Signed Message:\n" + longitud(m) + m)
+}
+
+funcion _cd_firma_hex(f) {
+    sea v = byte_en(f, 64) + 27
+    retornar "0x" + hex_de_bytes(subcadena(f, 0, 64) + _cd_byte(v))
+}
+
+/// personal_sign: firma de 65 bytes en hex (r ‖ s ‖ v con v = 27/28).
+funcion cadena_firmar_mensaje(priv, mensaje) { retornar _cd_firma_hex(curva_firmar_recuperable(priv, cadena_hash_mensaje(mensaje))) }
+
+/// Firma un hash de 32 bytes ya calculado (p. ej. el de EIP-712).
+funcion cadena_firmar_hash(priv, hash) { retornar _cd_firma_hex(curva_firmar_recuperable(priv, hash)) }
+
+/// Dirección que firmó un mensaje (o un hash con es_hash = verdadero).
+funcion cadena_recuperar(mensaje, firma_hex, es_hash) {
+    sea f = bytes_de_hex(_cd_hex_limpio(firma_hex))
+    si (longitud(f) != 65) { lanzar "cadena: la firma tiene 65 bytes" }
+    sea v = byte_en(f, 64)
+    si (v >= 27) { v = v - 27 }
+    sea h = mensaje
+    si (es_hash != verdadero) { h = cadena_hash_mensaje(mensaje) }
+    retornar cadena_direccion(curva_recuperar(h, subcadena(f, 0, 64) + _cd_byte(v)))
+}
+
+/// Hash EIP-712 desde el separador de dominio y el hash del struct (32 bytes cada uno).
+funcion cadena_hash_712(separador, hash_struct) { retornar cadena_keccak(bytes_de_hex("1901") + separador + hash_struct) }
+
+// ── Transacciones ─────────────────────────────────────────────────────────
+
+funcion _cd_op(t, k, k2) {
+    si (tiene_clave(t, k)) { retornar t[k] }
+    si (tiene_clave(t, k2)) { retornar t[k2] }
+    retornar nulo
+}
+
+funcion _cd_datos(t) {
+    sea d = _cd_op(t, "datos", "data") ?? ""
+    si (texto_empieza_con(d, "0x")) { retornar bytes_de_hex(_cd_hex_limpio(d)) }
+    retornar d
+}
+
+funcion _cd_para(t) {
+    sea p = _cd_op(t, "para", "to")
+    si (p == nulo) { retornar "" }
+    retornar _cd_dir_bytes(p)
+}
+
+/// Firma una transacción: legacy (EIP-155, "tipo": 0) o EIP-1559 ("tipo": 2).
+/// Campos: cadena (chain id), nonce, para, valor (wei), gas, datos y
+/// precio_gas (legacy) o max_fee + max_prioridad (tipo 2). Devuelve
+/// {"crudo": "0x…", "hash": "0x…", "de": dirección}.
+funcion cadena_firmar_tx(priv, t) {
+    sea tipo_ = _cd_op(t, "tipo", "type") ?? 2
+    sea cid = _cd_op(t, "cadena", "chain_id")
+    si (cid == nulo) { lanzar "cadena: falta el chain id (\"cadena\"): 1 = mainnet" }
+    sea nonce = cadena_entero_bytes(_cd_op(t, "nonce", "nonce") ?? 0)
+    sea gas = cadena_entero_bytes(_cd_op(t, "gas", "gas_limit"))
+    si (longitud(gas) == 0) { lanzar "cadena: falta el gas" }
+    sea valor = cadena_entero_bytes(_cd_op(t, "valor", "value") ?? 0)
+    sea para = _cd_para(t)
+    sea datos = _cd_datos(t)
+    sea crudo = ""
+    si (tipo_ == 0) {
+        sea precio = cadena_entero_bytes(_cd_op(t, "precio_gas", "gas_price"))
+        sea campos = [nonce, precio, gas, para, valor, datos]
+        sea h = cadena_keccak(cadena_rlp([nonce, precio, gas, para, valor, datos, cadena_entero_bytes(cid), "", ""]))
+        sea f = curva_firmar_recuperable(priv, h)
+        sea v = cadena_entero_bytes(byte_en(f, 64) + 35 + cid * 2)
+        campos.agregar(v)
+        campos.agregar(cadena_entero_bytes("0x" + hex_de_bytes(subcadena(f, 0, 32))))
+        campos.agregar(cadena_entero_bytes("0x" + hex_de_bytes(subcadena(f, 32, 64))))
+        crudo = cadena_rlp(campos)
+    } sino {
+        si (tipo_ != 2) { lanzar "cadena: tipo de transacción no soportado " + tipo_ }
+        sea maxp = cadena_entero_bytes(_cd_op(t, "max_prioridad", "max_priority_fee"))
+        sea maxf = cadena_entero_bytes(_cd_op(t, "max_fee", "max_fee"))
+        sea acceso = []
+        para a en (_cd_op(t, "acceso", "access_list") ?? []) {
+            sea ks = []
+            para k en (a["claves"] ?? (a["storage_keys"] ?? [])) { ks.agregar(bytes_de_hex(_cd_hex_limpio(k))) }
+            acceso.agregar([_cd_dir_bytes(a["direccion"] ?? a["address"]), ks])
+        }
+        sea campos = [cadena_entero_bytes(cid), nonce, maxp, maxf, gas, para, valor, datos, acceso]
+        sea h = cadena_keccak(bytes_de_hex("02") + cadena_rlp(campos))
+        sea f = curva_firmar_recuperable(priv, h)
+        campos.agregar(cadena_entero_bytes(byte_en(f, 64)))
+        campos.agregar(cadena_entero_bytes("0x" + hex_de_bytes(subcadena(f, 0, 32))))
+        campos.agregar(cadena_entero_bytes("0x" + hex_de_bytes(subcadena(f, 32, 64))))
+        crudo = bytes_de_hex("02") + cadena_rlp(campos)
+    }
+    retornar {"crudo": "0x" + hex_de_bytes(crudo), "hash": "0x" + hex_de_bytes(cadena_keccak(crudo)), "de": cadena_direccion(priv)}
+}
+
+/// Dirección de un contrato creado con CREATE (de + nonce).
+funcion cadena_direccion_contrato(de, nonce) {
+    retornar cadena_checksum(hex_de_bytes(subcadena(cadena_keccak(cadena_rlp([_cd_dir_bytes(de), cadena_entero_bytes(nonce)])), 12, 32)))
+}

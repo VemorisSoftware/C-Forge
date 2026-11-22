@@ -1,0 +1,533 @@
+// stdlib/sensor.cfv — MQTT 3.1.1 (y propiedades básicas de MQTT 5) para
+// IoT: arma y lee todos los paquetes (CONNECT, PUBLISH con QoS 0/1/2,
+// SUBSCRIBE, PING, DISCONNECT…), separa paquetes de un flujo TCP aunque
+// lleguen partidos, compara tópicos con comodines (+ y #, $SYS aparte), un
+// cliente con identificadores, reintentos y el baile completo de QoS 2, y
+// un mini broker en memoria (retenidos, última voluntad) para pruebas y
+// redes locales. El transporte (TCP, TLS, WebSocket) lo pones tú.
+// Inspirada en rumqtt / paho (Apache/EPL, solo la idea). En inglés:
+// importar "mqtt".
+//
+//   importar "sensor"
+//   sea c = sensor_cliente({"id": "termometro-1", "enviar": funcion(b) { tcp_enviar(sock, b) }})
+//   sensor_conectar(c)
+//   sensor_publicar(c, "casa/sala/temp", "21.5", {"qos": 1, "retener": verdadero})
+//   sensor_suscribir(c, "casa/+/temp", 1)
+//   sensor_recibir(c, bytes_que_llegaron)       // procesa y devuelve los mensajes
+
+funcion _sn_byte(v) { retornar bytes_de_hex(subcadena("0123456789abcdef", piso(v / 16), piso(v / 16) + 1) + subcadena("0123456789abcdef", v % 16, v % 16 + 1)) }
+
+funcion _sn_u16(n) { retornar _sn_byte(piso(n / 256) % 256) + _sn_byte(n % 256) }
+
+funcion _sn_cadena(t) {
+    sea s = "" + t
+    si (longitud(s) > 65535) { lanzar "sensor: texto de más de 65535 bytes" }
+    retornar _sn_u16(longitud(s)) + s
+}
+
+funcion _sn_largo(n) {
+    si (n > 268435455) { lanzar "sensor: paquete demasiado grande" }
+    sea r = ""
+    sea x = n
+    mientras (verdadero) {
+        sea b = x % 128
+        x = piso(x / 128)
+        si (x > 0) { r = r + _sn_byte(b + 128) } sino { retornar r + _sn_byte(b) }
+    }
+}
+
+funcion _sn_paquete(tipo_, banderas, cuerpo) { retornar _sn_byte(tipo_ * 16 + banderas) + _sn_largo(longitud(cuerpo)) + cuerpo }
+
+sea _SN_TIPOS = ["", "CONNECT", "CONNACK", "PUBLISH", "PUBACK", "PUBREC", "PUBREL", "PUBCOMP", "SUBSCRIBE", "SUBACK", "UNSUBSCRIBE", "UNSUBACK", "PINGREQ", "PINGRESP", "DISCONNECT", "AUTH"]
+
+// ── Armar paquetes ────────────────────────────────────────────────────────
+
+/// CONNECT. opciones: id, usuario, clave, mantener (keepalive s, 60),
+/// limpia (verdadero), voluntad {"topico", "mensaje", "qos", "retener"}, version (4 = 3.1.1, 5).
+funcion sensor_paquete_conectar(o) {
+    sea version = o["version"] ?? 4
+    sea flags = 0
+    si (o["limpia"] ?? verdadero) { flags = flags + 2 }
+    sea v = o["voluntad"] ?? nulo
+    si (v != nulo) {
+        flags = flags + 4 + (v["qos"] ?? 0) * 8
+        si (v["retener"] ?? falso) { flags = flags + 32 }
+    }
+    si ((o["clave"] ?? nulo) != nulo) { flags = flags + 64 }
+    si ((o["usuario"] ?? nulo) != nulo) { flags = flags + 128 }
+    sea cuerpo = _sn_cadena("MQTT") + _sn_byte(version) + _sn_byte(flags) + _sn_u16(o["mantener"] ?? 60)
+    si (version == 5) { cuerpo = cuerpo + _sn_largo(0) }
+    cuerpo = cuerpo + _sn_cadena(o["id"] ?? "")
+    si (v != nulo) {
+        si (version == 5) { cuerpo = cuerpo + _sn_largo(0) }
+        cuerpo = cuerpo + _sn_cadena(v["topico"]) + _sn_cadena(v["mensaje"] ?? "")
+    }
+    si ((o["usuario"] ?? nulo) != nulo) { cuerpo = cuerpo + _sn_cadena(o["usuario"]) }
+    si ((o["clave"] ?? nulo) != nulo) { cuerpo = cuerpo + _sn_cadena(o["clave"]) }
+    retornar _sn_paquete(1, 0, cuerpo)
+}
+
+funcion sensor_paquete_connack(presente, codigo, version) {
+    sea b = 0
+    si (presente == verdadero) { b = 1 }
+    sea cuerpo = _sn_byte(b) + _sn_byte(codigo ?? 0)
+    si (version == 5) { cuerpo = cuerpo + _sn_largo(0) }
+    retornar _sn_paquete(2, 0, cuerpo)
+}
+
+/// PUBLISH. opciones: qos (0), retener, dup, id (obligatorio si qos > 0).
+funcion sensor_paquete_publicar(topico, mensaje, o, version) {
+    sea op = o ?? {}
+    sea qos = op["qos"] ?? 0
+    si (qos < 0 o qos > 2) { lanzar "sensor: qos va de 0 a 2" }
+    sensor_validar_topico(topico)
+    sea flags = qos * 2
+    si (op["retener"] ?? falso) { flags = flags + 1 }
+    si (op["dup"] ?? falso) { flags = flags + 8 }
+    sea cuerpo = _sn_cadena(topico)
+    si (qos > 0) {
+        si ((op["id"] ?? nulo) == nulo) { lanzar "sensor: un PUBLISH con qos > 0 necesita id" }
+        cuerpo = cuerpo + _sn_u16(op["id"])
+    }
+    si (version == 5) { cuerpo = cuerpo + _sn_largo(0) }
+    retornar _sn_paquete(3, flags, cuerpo + mensaje)
+}
+
+funcion _sn_ack(tipo_, id, banderas) { retornar _sn_paquete(tipo_, banderas, _sn_u16(id)) }
+funcion sensor_paquete_puback(id) { retornar _sn_ack(4, id, 0) }
+funcion sensor_paquete_pubrec(id) { retornar _sn_ack(5, id, 0) }
+funcion sensor_paquete_pubrel(id) { retornar _sn_ack(6, id, 2) }
+funcion sensor_paquete_pubcomp(id) { retornar _sn_ack(7, id, 0) }
+
+/// SUBSCRIBE: filtros = [[filtro, qos], …].
+funcion sensor_paquete_suscribir(id, filtros, version) {
+    sea cuerpo = _sn_u16(id)
+    si (version == 5) { cuerpo = cuerpo + _sn_largo(0) }
+    para f en filtros {
+        sensor_validar_filtro(f[0])
+        cuerpo = cuerpo + _sn_cadena(f[0]) + _sn_byte(f[1] ?? 0)
+    }
+    retornar _sn_paquete(8, 2, cuerpo)
+}
+
+funcion sensor_paquete_suback(id, codigos) {
+    sea cuerpo = _sn_u16(id)
+    para c en codigos { cuerpo = cuerpo + _sn_byte(c) }
+    retornar _sn_paquete(9, 0, cuerpo)
+}
+
+funcion sensor_paquete_desuscribir(id, filtros) {
+    sea cuerpo = _sn_u16(id)
+    para f en filtros { cuerpo = cuerpo + _sn_cadena(f) }
+    retornar _sn_paquete(10, 2, cuerpo)
+}
+
+funcion sensor_paquete_unsuback(id) { retornar _sn_ack(11, id, 0) }
+funcion sensor_paquete_ping() { retornar _sn_paquete(12, 0, "") }
+funcion sensor_paquete_pong() { retornar _sn_paquete(13, 0, "") }
+funcion sensor_paquete_desconectar() { retornar _sn_paquete(14, 0, "") }
+
+// ── Leer paquetes ─────────────────────────────────────────────────────────
+
+funcion _sn_leer_u16(b, i) { retornar byte_en(b, i) * 256 + byte_en(b, i + 1) }
+
+funcion _sn_leer_cadena(b, i) {
+    si (i + 2 > longitud(b)) { lanzar "sensor: paquete truncado" }
+    sea n = _sn_leer_u16(b, i)
+    si (i + 2 + n > longitud(b)) { lanzar "sensor: paquete truncado" }
+    retornar [subcadena(b, i + 2, i + 2 + n), i + 2 + n]
+}
+
+funcion _sn_leer_largo(b, i) {
+    sea n = 0
+    sea mult = 1
+    sea j = i
+    mientras (verdadero) {
+        si (j >= longitud(b)) { retornar nulo }
+        sea x = byte_en(b, j)
+        n = n + (x % 128) * mult
+        j = j + 1
+        si (x < 128) { retornar [n, j] }
+        mult = mult * 128
+        si (mult > 2097152) { lanzar "sensor: largo restante inválido" }
+    }
+}
+
+/// Interpreta un paquete completo → mapa con "tipo" y sus campos.
+funcion sensor_leer_paquete(p, version) {
+    sea t = piso(byte_en(p, 0) / 16)
+    sea fl = byte_en(p, 0) % 16
+    sea l = _sn_leer_largo(p, 1)
+    si (l == nulo o l[1] + l[0] != longitud(p)) { lanzar "sensor: paquete incompleto" }
+    sea c = subcadena(p, l[1], longitud(p))
+    sea r = {"tipo": _SN_TIPOS[t]}
+    si (t == 1) {
+        sea x = _sn_leer_cadena(c, 0)
+        si (x[0] != "MQTT" y x[0] != "MQIsdp") { lanzar "sensor: protocolo desconocido " + x[0] }
+        sea i = x[1]
+        r["version"] = byte_en(c, i)
+        sea f = byte_en(c, i + 1)
+        r["mantener"] = _sn_leer_u16(c, i + 2)
+        i = i + 4
+        si (r["version"] == 5) {
+            sea pl = _sn_leer_largo(c, i)
+            i = pl[1] + pl[0]
+        }
+        r["limpia"] = piso(f / 2) % 2 == 1
+        sea id = _sn_leer_cadena(c, i)
+        r["id"] = id[0]
+        i = id[1]
+        si (piso(f / 4) % 2 == 1) {
+            si (r["version"] == 5) {
+                sea pl = _sn_leer_largo(c, i)
+                i = pl[1] + pl[0]
+            }
+            sea tp = _sn_leer_cadena(c, i)
+            sea ms = _sn_leer_cadena(c, tp[1])
+            r["voluntad"] = {"topico": tp[0], "mensaje": ms[0], "qos": piso(f / 8) % 4, "retener": piso(f / 32) % 2 == 1}
+            i = ms[1]
+        }
+        si (piso(f / 128) % 2 == 1) {
+            sea u = _sn_leer_cadena(c, i)
+            r["usuario"] = u[0]
+            i = u[1]
+        }
+        si (piso(f / 64) % 2 == 1) {
+            sea k = _sn_leer_cadena(c, i)
+            r["clave"] = k[0]
+        }
+        retornar r
+    }
+    si (t == 2) {
+        r["sesion_presente"] = byte_en(c, 0) % 2 == 1
+        r["codigo"] = byte_en(c, 1)
+        retornar r
+    }
+    si (t == 3) {
+        r["qos"] = piso(fl / 2) % 4
+        r["retener"] = fl % 2 == 1
+        r["dup"] = piso(fl / 8) == 1
+        sea x = _sn_leer_cadena(c, 0)
+        r["topico"] = x[0]
+        sea i = x[1]
+        si (r["qos"] > 0) {
+            r["id"] = _sn_leer_u16(c, i)
+            i = i + 2
+        }
+        si (version == 5) {
+            sea pl = _sn_leer_largo(c, i)
+            i = pl[1] + pl[0]
+        }
+        r["mensaje"] = subcadena(c, i, longitud(c))
+        retornar r
+    }
+    si (t == 4 o t == 5 o t == 6 o t == 7 o t == 11) {
+        r["id"] = _sn_leer_u16(c, 0)
+        retornar r
+    }
+    si (t == 8 o t == 10) {
+        r["id"] = _sn_leer_u16(c, 0)
+        sea i = 2
+        si (version == 5) {
+            sea pl = _sn_leer_largo(c, i)
+            i = pl[1] + pl[0]
+        }
+        sea fs = []
+        mientras (i < longitud(c)) {
+            sea x = _sn_leer_cadena(c, i)
+            i = x[1]
+            si (t == 8) {
+                fs.agregar([x[0], byte_en(c, i) % 4])
+                i = i + 1
+            } sino { fs.agregar(x[0]) }
+        }
+        r["filtros"] = fs
+        retornar r
+    }
+    si (t == 9) {
+        r["id"] = _sn_leer_u16(c, 0)
+        sea cods = []
+        sea i = 2
+        mientras (i < longitud(c)) { cods.agregar(byte_en(c, i))  i = i + 1 }
+        r["codigos"] = cods
+        retornar r
+    }
+    retornar r
+}
+
+/// Separa paquetes de un flujo de bytes: devuelve {"paquetes", "resto"}
+/// (lo que sobra se guarda para cuando llegue el resto).
+funcion sensor_separar(bufer) {
+    sea r = []
+    sea i = 0
+    mientras (i < longitud(bufer)) {
+        sea l = _sn_leer_largo(bufer, i + 1)
+        si (l == nulo o l[1] + l[0] > longitud(bufer)) { retornar {"paquetes": r, "resto": subcadena(bufer, i, longitud(bufer))} }
+        r.agregar(subcadena(bufer, i, l[1] + l[0]))
+        i = l[1] + l[0]
+    }
+    retornar {"paquetes": r, "resto": ""}
+}
+
+// ── Tópicos ───────────────────────────────────────────────────────────────
+
+funcion sensor_validar_topico(t) {
+    sea s = "" + t
+    si (s == "") { lanzar "sensor: tópico vacío" }
+    si (texto_indice(s, "+") >= 0 o texto_indice(s, "#") >= 0) { lanzar "sensor: un tópico de publicación no lleva comodines" }
+    si (texto_indice(s, bytes_de_hex("00")) >= 0) { lanzar "sensor: tópico con byte nulo" }
+}
+
+funcion sensor_validar_filtro(f) {
+    sea s = "" + f
+    si (s == "") { lanzar "sensor: filtro vacío" }
+    sea niveles = texto_dividir(s, "/")
+    sea i = 0
+    mientras (i < longitud(niveles)) {
+        sea n = niveles[i]
+        si (texto_indice(n, "#") >= 0 y (n != "#" o i != longitud(niveles) - 1)) { lanzar "sensor: # solo puede ir solo y al final (" + s + ")" }
+        si (texto_indice(n, "+") >= 0 y n != "+") { lanzar "sensor: + ocupa un nivel completo (" + s + ")" }
+        i = i + 1
+    }
+}
+
+/// ¿El tópico calza con el filtro? ("casa/+/temp", "casa/#").
+funcion sensor_coincide(filtro, topico) {
+    sea f = texto_dividir("" + filtro, "/")
+    sea t = texto_dividir("" + topico, "/")
+    // Los tópicos $… no calzan con comodines del primer nivel.
+    si (texto_empieza_con(topico, "$") y (f[0] == "+" o f[0] == "#")) { retornar falso }
+    sea i = 0
+    mientras (i < longitud(f)) {
+        si (f[i] == "#") { retornar verdadero }
+        si (i >= longitud(t)) { retornar falso }
+        si (f[i] != "+" y f[i] != t[i]) { retornar falso }
+        i = i + 1
+    }
+    retornar longitud(t) == longitud(f)
+}
+
+// ── Cliente ───────────────────────────────────────────────────────────────
+
+/// opciones: id, enviar (f(bytes)), usuario, clave, mantener, voluntad,
+/// version, reloj (f → ms), reintento_ms (5000).
+funcion sensor_cliente(o) {
+    si ((o["enviar"] ?? nulo) == nulo) { lanzar "sensor: falta la función enviar" }
+    retornar {"o": o, "enviar": o["enviar"], "sig_id": 1, "pendientes": {}, "qos2_entrantes": {}, "bufer": "", "conectado": falso, "version": o["version"] ?? 4, "subs": {}, "reloj": o["reloj"] ?? nulo, "ultimo_envio": 0}
+}
+
+funcion _sn_ahora(c) {
+    si (c["reloj"] != nulo) { retornar c["reloj"]() }
+    retornar tiempo_ms()
+}
+
+funcion _sn_mandar(c, b) {
+    c["ultimo_envio"] = _sn_ahora(c)
+    c["enviar"](b)
+}
+
+funcion _sn_nuevo_id(c) {
+    sea i = 0
+    mientras (i < 65535) {
+        sea id = c["sig_id"]
+        c["sig_id"] = id % 65535 + 1
+        si (tiene_clave(c["pendientes"], "" + id) == falso) { retornar id }
+        i = i + 1
+    }
+    lanzar "sensor: no quedan identificadores libres"
+}
+
+funcion sensor_conectar(c) { _sn_mandar(c, sensor_paquete_conectar(c["o"])) }
+
+/// Publica; con qos 1 o 2 queda pendiente hasta el acuse. Devuelve el id.
+funcion sensor_publicar(c, topico, mensaje, opciones) {
+    sea o = opciones ?? {}
+    sea qos = o["qos"] ?? 0
+    si (qos == 0) {
+        _sn_mandar(c, sensor_paquete_publicar(topico, "" + mensaje, o, c["version"]))
+        retornar nulo
+    }
+    sea id = _sn_nuevo_id(c)
+    sea op = {"qos": qos, "retener": o["retener"] ?? falso, "id": id}
+    c["pendientes"]["" + id] = {"tipo": "publicar", "topico": topico, "mensaje": "" + mensaje, "op": op, "fase": "enviado", "t": _sn_ahora(c)}
+    _sn_mandar(c, sensor_paquete_publicar(topico, "" + mensaje, op, c["version"]))
+    retornar id
+}
+
+funcion sensor_suscribir(c, filtro, qos) {
+    sea id = _sn_nuevo_id(c)
+    c["pendientes"]["" + id] = {"tipo": "suscribir", "filtro": filtro, "qos": qos ?? 0, "t": _sn_ahora(c)}
+    _sn_mandar(c, sensor_paquete_suscribir(id, [[filtro, qos ?? 0]], c["version"]))
+    retornar id
+}
+
+funcion sensor_desuscribir(c, filtro) {
+    sea id = _sn_nuevo_id(c)
+    c["pendientes"]["" + id] = {"tipo": "desuscribir", "filtro": filtro, "t": _sn_ahora(c)}
+    _sn_mandar(c, sensor_paquete_desuscribir(id, [filtro]))
+    retornar id
+}
+
+/// Procesa bytes recibidos; responde acuses y devuelve los eventos:
+/// [{"tipo": "mensaje", "topico", "mensaje", "qos", "retener"}, {"tipo": "conectado"}, …].
+funcion sensor_recibir(c, bytes_) {
+    sea sep = sensor_separar(c["bufer"] + bytes_)
+    c["bufer"] = sep["resto"]
+    sea eventos = []
+    para p en sep["paquetes"] {
+        sea x = sensor_leer_paquete(p, c["version"])
+        sea t = x["tipo"]
+        si (t == "CONNACK") {
+            c["conectado"] = x["codigo"] == 0
+            si (x["codigo"] == 0) { eventos.agregar({"tipo": "conectado", "sesion_presente": x["sesion_presente"]}) } sino { eventos.agregar({"tipo": "rechazado", "codigo": x["codigo"]}) }
+        }
+        si (t == "PUBLISH") {
+            si (x["qos"] == 0) { eventos.agregar({"tipo": "mensaje", "topico": x["topico"], "mensaje": x["mensaje"], "qos": 0, "retener": x["retener"]}) }
+            si (x["qos"] == 1) {
+                _sn_mandar(c, sensor_paquete_puback(x["id"]))
+                eventos.agregar({"tipo": "mensaje", "topico": x["topico"], "mensaje": x["mensaje"], "qos": 1, "retener": x["retener"]})
+            }
+            si (x["qos"] == 2) {
+                // Entrega exactamente una vez: se avisa al primer PUBLISH.
+                si (tiene_clave(c["qos2_entrantes"], "" + x["id"]) == falso) {
+                    c["qos2_entrantes"]["" + x["id"]] = verdadero
+                    eventos.agregar({"tipo": "mensaje", "topico": x["topico"], "mensaje": x["mensaje"], "qos": 2, "retener": x["retener"]})
+                }
+                _sn_mandar(c, sensor_paquete_pubrec(x["id"]))
+            }
+        }
+        si (t == "PUBREL") {
+            quitar_clave(c["qos2_entrantes"], "" + x["id"])
+            _sn_mandar(c, sensor_paquete_pubcomp(x["id"]))
+        }
+        si (t == "PUBACK" o t == "PUBCOMP" o t == "UNSUBACK") {
+            si (tiene_clave(c["pendientes"], "" + x["id"])) {
+                quitar_clave(c["pendientes"], "" + x["id"])
+                eventos.agregar({"tipo": "confirmado", "id": x["id"]})
+            }
+        }
+        si (t == "PUBREC") {
+            sea pd = c["pendientes"]["" + x["id"]] ?? nulo
+            si (pd != nulo) { pd["fase"] = "liberado"  pd["t"] = _sn_ahora(c) }
+            _sn_mandar(c, sensor_paquete_pubrel(x["id"]))
+        }
+        si (t == "SUBACK") {
+            sea pd = c["pendientes"]["" + x["id"]] ?? nulo
+            si (pd != nulo) {
+                quitar_clave(c["pendientes"], "" + x["id"])
+                si (x["codigos"][0] < 128) { c["subs"][pd["filtro"]] = x["codigos"][0] }
+                eventos.agregar({"tipo": "suscrito", "filtro": pd["filtro"], "qos": x["codigos"][0], "rechazado": x["codigos"][0] >= 128})
+            }
+        }
+        si (t == "PINGRESP") { eventos.agregar({"tipo": "pong"}) }
+    }
+    retornar eventos
+}
+
+/// Llamar seguido: manda PING si toca y reenvía lo que no tuvo acuse.
+funcion sensor_tic(c) {
+    sea ahora = _sn_ahora(c)
+    sea espera = c["o"]["reintento_ms"] ?? 5000
+    para k en claves(c["pendientes"]) {
+        sea pd = c["pendientes"][k]
+        si (ahora - pd["t"] >= espera) {
+            pd["t"] = ahora
+            si (pd["tipo"] == "publicar") {
+                si (pd["fase"] == "liberado") { _sn_mandar(c, sensor_paquete_pubrel(a_numero(k))) } sino {
+                    sea op = {"qos": pd["op"]["qos"], "retener": pd["op"]["retener"], "id": pd["op"]["id"], "dup": verdadero}
+                    _sn_mandar(c, sensor_paquete_publicar(pd["topico"], pd["mensaje"], op, c["version"]))
+                }
+            }
+        }
+    }
+    sea ka = (c["o"]["mantener"] ?? 60) * 1000
+    si (ka > 0 y ahora - c["ultimo_envio"] >= ka * 0.75) { _sn_mandar(c, sensor_paquete_ping()) }
+}
+
+funcion sensor_desconectar(c) {
+    _sn_mandar(c, sensor_paquete_desconectar())
+    c["conectado"] = falso
+}
+
+funcion sensor_pendientes(c) { retornar longitud(claves(c["pendientes"])) }
+
+// ── Mini broker en memoria ────────────────────────────────────────────────
+
+funcion sensor_broker() { retornar {"clientes": {}, "retenidos": {}} }
+
+/// Registra una conexión: enviar(bytes) le manda datos a ese cliente.
+/// Devuelve una función que se llama con los bytes que el cliente mandó.
+funcion sensor_broker_conexion(br, enviar) {
+    sea est = {"id": nulo, "subs": {}, "enviar": enviar, "bufer": "", "voluntad": nulo, "sig": 1}
+    retornar funcion(bytes_) {
+        sea sep = sensor_separar(est["bufer"] + bytes_)
+        est["bufer"] = sep["resto"]
+        para p en sep["paquetes"] {
+            sea x = sensor_leer_paquete(p, 4)
+            sea t = x["tipo"]
+            si (t == "CONNECT") {
+                est["id"] = x["id"]
+                est["voluntad"] = x["voluntad"] ?? nulo
+                br["clientes"][x["id"]] = est
+                enviar(sensor_paquete_connack(falso, 0))
+            }
+            si (t == "PUBLISH") {
+                si (x["qos"] == 1) { enviar(sensor_paquete_puback(x["id"])) }
+                si (x["qos"] == 2) { enviar(sensor_paquete_pubrec(x["id"])) }
+                _sn_broker_publicar(br, x["topico"], x["mensaje"], x["qos"], x["retener"])
+            }
+            si (t == "PUBREL") { enviar(sensor_paquete_pubcomp(x["id"])) }
+            si (t == "SUBSCRIBE") {
+                sea cods = []
+                para f en x["filtros"] {
+                    est["subs"][f[0]] = f[1]
+                    cods.agregar(minimo(f[1], 1))
+                }
+                enviar(sensor_paquete_suback(x["id"], cods))
+                // Entrega los retenidos que calzan.
+                para f en x["filtros"] {
+                    para tp en claves(br["retenidos"]) { si (sensor_coincide(f[0], tp)) { enviar(sensor_paquete_publicar(tp, br["retenidos"][tp], {"qos": 0, "retener": verdadero}, 4)) } }
+                }
+            }
+            si (t == "UNSUBSCRIBE") {
+                para f en x["filtros"] { quitar_clave(est["subs"], f) }
+                enviar(sensor_paquete_unsuback(x["id"]))
+            }
+            si (t == "PINGREQ") { enviar(sensor_paquete_pong()) }
+            si (t == "DISCONNECT") {
+                est["voluntad"] = nulo
+                quitar_clave(br["clientes"], est["id"])
+            }
+        }
+    }
+}
+
+funcion _sn_broker_publicar(br, topico, mensaje, qos, retener) {
+    si (retener) {
+        si (mensaje == "") { quitar_clave(br["retenidos"], topico) } sino { br["retenidos"][topico] = mensaje }
+    }
+    para id en claves(br["clientes"]) {
+        sea cl = br["clientes"][id]
+        sea mejor = -1
+        para f en claves(cl["subs"]) { si (sensor_coincide(f, topico)) { mejor = maximo(mejor, cl["subs"][f]) } }
+        si (mejor >= 0) {
+            // QoS 0 y 1 hacia el suscriptor (el broker mínimo no reintenta).
+            sea q = minimo(minimo(mejor, qos), 1)
+            sea op = {"qos": q}
+            si (q > 0) {
+                op["id"] = cl["sig"]
+                cl["sig"] = cl["sig"] % 65535 + 1
+            }
+            cl["enviar"](sensor_paquete_publicar(topico, mensaje, op, 4))
+        }
+    }
+}
+
+/// Simula que una conexión se cayó sin DISCONNECT (publica su voluntad).
+funcion sensor_broker_caida(br, id) {
+    sea cl = br["clientes"][id] ?? nulo
+    si (cl == nulo) { retornar nulo }
+    quitar_clave(br["clientes"], id)
+    sea v = cl["voluntad"]
+    si (v != nulo) { _sn_broker_publicar(br, v["topico"], v["mensaje"], v["qos"], v["retener"]) }
+}
