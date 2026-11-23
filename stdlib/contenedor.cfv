@@ -1,0 +1,677 @@
+// stdlib/contenedor.cfv — controlar Docker (y Podman con su API compatible)
+// por la API del motor: HTTP/1.1 sobre el socket unix o TCP, respuestas con
+// Content-Length o chunked, y el flujo multiplexado de stdout/stderr.
+// Imágenes (listar, inspeccionar, bajar, construir desde un mapa de
+// archivos, importar, etiquetar, borrar), contenedores (crear con opciones
+// simples, iniciar, parar, matar, esperar, borrar, logs, exec con código de
+// salida, top, stats, copiar archivos dentro y fuera), redes, volúmenes y
+// eventos. Probado contra dockerd 29. Idea de Bollard (Apache/MIT). En
+// inglés: importar "docker".
+//
+//   importar "contenedor"
+//   sea d = contenedor_cliente(nulo)
+//   sea id = contenedor_crear(d, {"imagen": "redis:7", "puertos": {"6379/tcp": 0}})
+//   contenedor_iniciar(d, id)
+//   mostrar(contenedor_puerto(d, id, "6379/tcp"))
+
+importar "json"
+importar "archivador"
+importar "base64"
+
+funcion __contenedor_declaraciones() {
+    extern "libc" funcion socket(dominio: entero, tipo_s: entero, proto: entero): entero
+    extern "libc" funcion connect(fd: entero, dir: puntero, largo: entero): entero
+    extern "libc" funcion read(fd: entero, buf: puntero, n: entero): largo
+    extern "libc" funcion write(fd: entero, datos: texto, n: entero): largo
+    extern "libc" funcion close(fd: entero): entero
+}
+
+// ---------- transporte ----------
+
+funcion _co_unix(ruta) {
+    __contenedor_declaraciones()
+    sea fd = socket(1, 1, 0)
+    si (fd < 0) { lanzar "contenedor: no se pudo crear el socket" }
+    sea dir = bytes_entero(1, 2, 1) + ruta + caracter(0)
+    sea largo = longitud(dir)
+    mientras (longitud(dir) % 4 != 0) { dir = dir + caracter(0) }
+    sea a = c_reservar(112)
+    sea i = 0
+    mientras (i < 112) {
+        sea w = 0
+        si (i < longitud(dir)) { w = bytes_leer_entero(dir, i, 4, 1) }
+        c_escribir32(a, i, w)
+        i = i + 4
+    }
+    si (connect(fd, a, largo) != 0) {
+        close(fd)
+        lanzar "contenedor: no se pudo conectar a " + ruta + " (¿está corriendo el motor?)"
+    }
+    sea buf = c_reservar(65536)
+    retornar {
+        "enviar": funcion(d) {
+            sea total = 0
+            mientras (total < longitud(d)) {
+                sea n = write(fd, subcadena(d, total, longitud(d)), longitud(d) - total)
+                si (n <= 0) { lanzar "contenedor: no se pudo escribir" }
+                total = total + n
+            }
+        },
+        // Lee hasta que el otro lado cierra.
+        "todo": funcion() {
+            sea p = []
+            mientras (verdadero) {
+                sea k = read(fd, buf, 65536)
+                si (k <= 0) { retornar unir(p, "") }
+                p.agregar(c_bytes(buf, k))
+            }
+        },
+        "cerrar": funcion() { close(fd) }
+    }
+}
+
+funcion _co_tcp(host, puerto) {
+    sea s = net_conectar(host, puerto)
+    retornar {
+        "enviar": funcion(d) { net_enviar(s, d) },
+        "todo": funcion() {
+            sea p = []
+            mientras (verdadero) {
+                sea b = nulo
+                intentar { b = net_recibir_exacto(s, 1) } capturar (e) { retornar unir(p, "") }
+                si (b == nulo o b == "") { retornar unir(p, "") }
+                p.agregar(b)
+            }
+        },
+        "cerrar": funcion() { net_cerrar(s) }
+    }
+}
+
+// ---------- HTTP ----------
+
+funcion _co_dechunk(b) {
+    sea p = []
+    sea i = 0
+    mientras (i < longitud(b)) {
+        sea f = texto_indice(subcadena(b, i, longitud(b)), "\r\n")
+        si (f < 0) { retornar unir(p, "") }
+        sea linea = texto_dividir(subcadena(b, i, i + f), ";")[0]
+        sea n = _co_hex(texto_recortar(linea))
+        si (n == 0) { retornar unir(p, "") }
+        p.agregar(subcadena(b, i + f + 2, i + f + 2 + n))
+        i = i + f + 2 + n + 2
+    }
+    retornar unir(p, "")
+}
+
+funcion _co_hex(t) {
+    sea d = "0123456789abcdef"
+    sea v = 0
+    para ch en texto_dividir(texto_minusculas(t), "") {
+        sea k = texto_indice(d, ch)
+        si (k < 0) { lanzar "contenedor: tamaño de bloque inválido '" + t + "'" }
+        v = v * 16 + k
+    }
+    retornar v
+}
+
+/// Decodifica una respuesta HTTP completa: {"estado", "cabeceras", "cuerpo"}.
+funcion contenedor_respuesta_http(crudo) {
+    sea f = texto_indice(crudo, "\r\n\r\n")
+    si (f < 0) { lanzar "contenedor: respuesta HTTP incompleta" }
+    sea ls = texto_dividir(subcadena(crudo, 0, f), "\r\n")
+    sea estado = a_numero(texto_dividir(ls[0], " ")[1])
+    sea cab = {}
+    sea i = 1
+    mientras (i < longitud(ls)) {
+        sea k = texto_indice(ls[i], ":")
+        si (k > 0) { cab[texto_minusculas(subcadena(ls[i], 0, k))] = texto_recortar(subcadena(ls[i], k + 1, longitud(ls[i]))) }
+        i = i + 1
+    }
+    sea cuerpo = subcadena(crudo, f + 4, longitud(crudo))
+    si (texto_minusculas(cab["transfer-encoding"] ?? "") == "chunked") { cuerpo = _co_dechunk(cuerpo) }
+    sino si (tiene_clave(cab, "content-length")) { cuerpo = subcadena(cuerpo, 0, a_numero(cab["content-length"])) }
+    retornar {"estado": estado, "cabeceras": cab, "cuerpo": cuerpo}
+}
+
+funcion _co_query(q) {
+    si (q == nulo) { retornar "" }
+    sea p = []
+    para k en claves(q) {
+        sea v = q[k]
+        si (v != nulo) {
+            si (tipo(v) == "mapa" o tipo(v) == "lista") { v = json_texto(v) }
+            si (v == verdadero) { v = "true" }
+            si (v == falso) { v = "false" }
+            p.agregar(k + "=" + _co_cod("" + v))
+        }
+    }
+    si (longitud(p) == 0) { retornar "" }
+    retornar "?" + unir(p, "&")
+}
+
+funcion _co_cod(s) {
+    sea seguros = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-_.~"
+    sea hexa = "0123456789ABCDEF"
+    sea r = []
+    sea i = 0
+    mientras (i < longitud(s)) {
+        sea b = byte_en(s, i)
+        sea ch = subcadena(s, i, i + 1)
+        si (b < 128 y contiene(seguros, ch)) { r.agregar(ch) } sino { r.agregar("%" + subcadena(hexa, piso(b / 16), piso(b / 16) + 1) + subcadena(hexa, b % 16, b % 16 + 1)) }
+        i = i + 1
+    }
+    retornar unir(r, "")
+}
+
+// ---------- cliente ----------
+
+/// Cliente del motor. direccion: nulo (DOCKER_HOST o /var/run/docker.sock),
+/// "unix:///ruta" o "tcp://host:puerto". opciones: "version" de la API
+/// (por ejemplo "1.43"; por defecto la del servidor), "transporte":
+/// función() → {"enviar", "todo", "cerrar"} (para pruebas).
+funcion contenedor_cliente(direccion, opciones) {
+    sea op = opciones ?? {}
+    sea d = direccion
+    si (d == nulo) { d = variable_entorno("DOCKER_HOST") }
+    si (d == nulo o d == "") { d = "unix:///var/run/docker.sock" }
+    sea fab = op["transporte"] ?? nulo
+    si (fab == nulo) {
+        si (texto_empieza_con(d, "unix://")) {
+            sea ruta = subcadena(d, 7, longitud(d))
+            fab = funcion() { retornar _co_unix(ruta) }
+        } sino si (texto_empieza_con(d, "tcp://") o texto_empieza_con(d, "http://")) {
+            sea r = texto_dividir(texto_dividir(d, "://")[1], "/")[0]
+            sea hp = texto_dividir(r, ":")
+            sea puerto = 2375
+            si (longitud(hp) > 1) { puerto = a_numero(hp[1]) }
+            fab = funcion() { retornar _co_tcp(hp[0], puerto) }
+        } sino { lanzar "contenedor: dirección no soportada '" + d + "'" }
+    }
+    sea c = {"fab": fab, "prefijo": "", "direccion": d}
+    si ((op["version"] ?? nulo) != nulo) { c["prefijo"] = "/v" + op["version"] }
+    retornar c
+}
+
+/// Petición cruda a la API: devuelve {"estado", "cabeceras", "cuerpo"}.
+/// cuerpo: mapa/lista (JSON) o texto (con tipo, por ejemplo un tar).
+funcion contenedor_api(c, metodo, ruta, consulta, cuerpo, tipo_cuerpo) {
+    sea t = c["fab"]()
+    sea datos = ""
+    sea ct = tipo_cuerpo
+    si (cuerpo != nulo) {
+        si (tipo(cuerpo) == "mapa" o tipo(cuerpo) == "lista") {
+            datos = json_texto(cuerpo)
+            si (ct == nulo) { ct = "application/json" }
+        } sino { datos = cuerpo }
+    }
+    sea req = metodo + " " + c["prefijo"] + ruta + _co_query(consulta) + " HTTP/1.1\r\nHost: docker\r\nUser-Agent: c-forge\r\nConnection: close\r\n"
+    si (ct != nulo) { req = req + "Content-Type: " + ct + "\r\n" }
+    si (cuerpo != nulo o metodo == "POST" o metodo == "PUT") { req = req + "Content-Length: " + longitud(datos) + "\r\n" }
+    t["enviar"](req + "\r\n" + datos)
+    sea crudo = t["todo"]()
+    t["cerrar"]()
+    retornar contenedor_respuesta_http(crudo)
+}
+
+// Petición que lanza si el estado no es 2xx y decodifica JSON.
+funcion _co_pedir(c, metodo, ruta, consulta, cuerpo, tipo_cuerpo) {
+    sea r = contenedor_api(c, metodo, ruta, consulta, cuerpo, tipo_cuerpo)
+    si (r["estado"] < 200 o r["estado"] >= 300) {
+        sea msg = r["cuerpo"]
+        intentar { msg = json_parsear(r["cuerpo"])["message"] } capturar (e) { nulo }
+        lanzar {"estado": r["estado"], "mensaje": "" + msg}
+    }
+    si (contiene(r["cabeceras"]["content-type"] ?? "", "json") y longitud(texto_recortar(r["cuerpo"])) > 0) {
+        sea out = nulo
+        intentar { out = json_parsear(r["cuerpo"]) } capturar (e) { out = _co_lineas_json(r["cuerpo"]) }
+        retornar out
+    }
+    retornar r["cuerpo"]
+}
+
+// Respuestas con un JSON por línea (pull, build, events).
+funcion _co_lineas_json(t) {
+    sea r = []
+    para l en texto_dividir(t, "\n") {
+        sea x = texto_recortar(l)
+        si (x != "") { r.agregar(json_parsear(x)) }
+    }
+    retornar r
+}
+
+/// Texto de un error de contenedor.
+funcion contenedor_error_texto(e) {
+    si (tipo(e) == "mapa" y tiene_clave(e, "estado")) { retornar "HTTP " + e["estado"] + ": " + e["mensaje"] }
+    retornar "" + e
+}
+
+/// Separa el flujo multiplexado (logs y attach sin TTY):
+/// {"stdout", "stderr", "tramas": [[flujo, datos]]}.
+funcion contenedor_demultiplexar(b) {
+    sea r = {"stdout": [], "stderr": [], "tramas": []}
+    sea i = 0
+    mientras (i + 8 <= longitud(b)) {
+        sea f = byte_en(b, i)
+        sea n = bytes_leer_entero(b, i + 4, 4, 0)
+        si (f > 2 o byte_en(b, i + 1) != 0) {
+            // No es multiplexado (contenedor con TTY): todo es stdout.
+            retornar {"stdout": b, "stderr": "", "tramas": [[1, b]]}
+        }
+        sea d = subcadena(b, i + 8, i + 8 + n)
+        r["tramas"].agregar([f, d])
+        si (f == 2) { r["stderr"].agregar(d) } sino { r["stdout"].agregar(d) }
+        i = i + 8 + n
+    }
+    retornar {"stdout": unir(r["stdout"], ""), "stderr": unir(r["stderr"], ""), "tramas": r["tramas"]}
+}
+
+/// Arma un flujo multiplexado (para pruebas).
+funcion contenedor_multiplexar(tramas) {
+    sea p = []
+    para t en tramas { p.agregar(bytes_entero(t[0], 1, 0) + caracter(0) + caracter(0) + caracter(0) + bytes_entero(longitud(t[1]), 4, 0) + t[1]) }
+    retornar unir(p, "")
+}
+
+// ---------- sistema ----------
+
+funcion contenedor_ping(c) { retornar contenedor_api(c, "GET", "/_ping", nulo, nulo, nulo)["cuerpo"] == "OK" }
+funcion contenedor_version(c) { retornar _co_pedir(c, "GET", "/version", nulo, nulo, nulo) }
+funcion contenedor_info(c) { retornar _co_pedir(c, "GET", "/info", nulo, nulo, nulo) }
+
+/// Eventos entre dos instantes (segundos Unix). filtros: {"type": ["container"]…}.
+funcion contenedor_eventos(c, desde, hasta, filtros) {
+    sea r = _co_pedir(c, "GET", "/events", {"since": desde, "until": hasta, "filters": filtros}, nulo, nulo)
+    si (tipo(r) == "mapa") { retornar [r] }
+    si (tipo(r) == "texto") { retornar _co_lineas_json(r) }
+    retornar r
+}
+
+// ---------- imágenes ----------
+
+funcion contenedor_imagenes(c, filtros) { retornar _co_pedir(c, "GET", "/images/json", {"filters": filtros}, nulo, nulo) }
+funcion contenedor_imagen(c, nombre) { retornar _co_pedir(c, "GET", "/images/" + nombre + "/json", nulo, nulo, nulo) }
+
+/// ¿Existe la imagen localmente?
+funcion contenedor_hay_imagen(c, nombre) {
+    retornar contenedor_api(c, "GET", "/images/" + nombre + "/json", nulo, nulo, nulo)["estado"] == 200
+}
+
+/// Baja una imagen ("nombre:etiqueta"). Devuelve los mensajes de progreso;
+/// lanza si alguno trae error.
+funcion contenedor_bajar(c, imagen) {
+    sea p = texto_dividir(imagen, ":")
+    sea etiqueta = "latest"
+    sea nombre = imagen
+    si (longitud(p) > 1 y contiene(p[longitud(p) - 1], "/") == falso) {
+        etiqueta = p[longitud(p) - 1]
+        nombre = subcadena(imagen, 0, longitud(imagen) - longitud(etiqueta) - 1)
+    }
+    sea r = _co_pedir(c, "POST", "/images/create", {"fromImage": nombre, "tag": etiqueta}, nulo, nulo)
+    si (tipo(r) == "mapa") { r = [r] }
+    si (tipo(r) == "texto") { r = _co_lineas_json(r) }
+    para m en r { si (tiene_clave(m, "error")) { lanzar {"estado": 500, "mensaje": m["error"]} } }
+    retornar r
+}
+
+/// Construye una imagen desde un mapa {ruta: contenido} (debe incluir
+/// "Dockerfile"). opciones: "etiqueta", "args" (build args), "sin_cache".
+/// Devuelve {"id", "salida"}.
+funcion contenedor_construir(c, archivos, opciones) {
+    sea op = opciones ?? {}
+    sea entradas = []
+    para k en claves(archivos) { entradas.agregar({"nombre": k, "datos": archivos[k]}) }
+    sea q = {"t": op["etiqueta"] ?? nulo, "buildargs": op["args"] ?? nulo, "rm": verdadero}
+    si ((op["sin_cache"] ?? falso) == verdadero) { q["nocache"] = verdadero }
+    sea r = _co_pedir(c, "POST", "/build", q, archivador_tar(entradas), "application/x-tar")
+    si (tipo(r) == "mapa") { r = [r] }
+    si (tipo(r) == "texto") { r = _co_lineas_json(r) }
+    sea salida = []
+    sea id = nulo
+    para m en r {
+        si (tiene_clave(m, "error")) { lanzar {"estado": 500, "mensaje": m["error"]} }
+        si (tiene_clave(m, "stream")) { salida.agregar(m["stream"]) }
+        si (tiene_clave(m, "aux")) { id = m["aux"]["ID"] ?? id }
+    }
+    retornar {"id": id, "salida": unir(salida, "")}
+}
+
+/// Importa una imagen desde un tar de sistema de archivos.
+funcion contenedor_importar(c, tar, repo, etiqueta) {
+    retornar _co_pedir(c, "POST", "/images/create", {"fromSrc": "-", "repo": repo, "tag": etiqueta ?? "latest"}, tar, "application/x-tar")
+}
+
+funcion contenedor_etiquetar(c, imagen, repo, etiqueta) { _co_pedir(c, "POST", "/images/" + imagen + "/tag", {"repo": repo, "tag": etiqueta ?? "latest"}, nulo, nulo) }
+funcion contenedor_borrar_imagen(c, imagen, forzar) { retornar _co_pedir(c, "DELETE", "/images/" + imagen, {"force": forzar ?? falso}, nulo, nulo) }
+
+// ---------- contenedores ----------
+
+/// Configuración de la API a partir de opciones simples: "imagen", "cmd"
+/// (lista o texto), "punto_entrada", "env" (mapa), "puertos" ({"80/tcp":
+/// puerto_host o 0 para uno libre}), "volumenes" ({ruta_host: ruta}),
+/// "etiquetas", "red", "alias", "nombre_host", "dir_trabajo", "usuario",
+/// "tty", "auto_borrar", "privilegiado", "memoria" (bytes), "cpus",
+/// "reinicio" ("no" | "always" | "on-failure" | "unless-stopped"),
+/// "salud" ({"cmd": [...], "intervalo_ms", "reintentos"}), "crudo" (mapa
+/// que se mezcla tal cual).
+funcion contenedor_config(oc) {
+    sea cfg = {"Image": oc["imagen"], "Labels": oc["etiquetas"] ?? {}, "Tty": oc["tty"] ?? falso, "HostConfig": {}}
+    sea cmd = oc["cmd"] ?? nulo
+    si (cmd != nulo) {
+        si (tipo(cmd) == "texto") { cmd = ["/bin/sh", "-c", cmd] }
+        cfg["Cmd"] = cmd
+    }
+    si ((oc["punto_entrada"] ?? nulo) != nulo) { cfg["Entrypoint"] = oc["punto_entrada"] }
+    si ((oc["env"] ?? nulo) != nulo) {
+        sea e = []
+        para k en claves(oc["env"]) { e.agregar(k + "=" + oc["env"][k]) }
+        cfg["Env"] = e
+    }
+    si ((oc["dir_trabajo"] ?? nulo) != nulo) { cfg["WorkingDir"] = oc["dir_trabajo"] }
+    si ((oc["usuario"] ?? nulo) != nulo) { cfg["User"] = oc["usuario"] }
+    si ((oc["nombre_host"] ?? nulo) != nulo) { cfg["Hostname"] = oc["nombre_host"] }
+    sea hc = cfg["HostConfig"]
+    si ((oc["puertos"] ?? nulo) != nulo) {
+        sea ex = {}
+        sea pb = {}
+        para p en claves(oc["puertos"]) {
+            sea k = p
+            si (contiene(k, "/") == falso) { k = k + "/tcp" }
+            ex[k] = {}
+            sea hp = oc["puertos"][p]
+            sea hps = ""
+            si (hp != nulo y hp != 0) { hps = "" + hp }
+            pb[k] = [{"HostIp": "", "HostPort": hps}]
+        }
+        cfg["ExposedPorts"] = ex
+        hc["PortBindings"] = pb
+    }
+    si ((oc["volumenes"] ?? nulo) != nulo) {
+        sea b = []
+        para k en claves(oc["volumenes"]) { b.agregar(k + ":" + oc["volumenes"][k]) }
+        hc["Binds"] = b
+    }
+    si ((oc["auto_borrar"] ?? falso) == verdadero) { hc["AutoRemove"] = verdadero }
+    si ((oc["privilegiado"] ?? falso) == verdadero) { hc["Privileged"] = verdadero }
+    si ((oc["memoria"] ?? nulo) != nulo) { hc["Memory"] = oc["memoria"] }
+    si ((oc["cpus"] ?? nulo) != nulo) { hc["NanoCpus"] = redondear(oc["cpus"] * 1000000000) }
+    si ((oc["reinicio"] ?? nulo) != nulo) { hc["RestartPolicy"] = {"Name": oc["reinicio"]} }
+    si ((oc["red"] ?? nulo) != nulo) {
+        hc["NetworkMode"] = oc["red"]
+        sea ep = {}
+        ep[oc["red"]] = {"Aliases": oc["alias"] ?? []}
+        cfg["NetworkingConfig"] = {"EndpointsConfig": ep}
+    }
+    si ((oc["salud"] ?? nulo) != nulo) {
+        sea s = oc["salud"]
+        sea t = s["cmd"]
+        si (tipo(t) == "texto") { t = ["CMD-SHELL", t] } sino { t = ["CMD"] + t }
+        cfg["Healthcheck"] = {"Test": t, "Interval": (s["intervalo_ms"] ?? 1000) * 1000000, "Retries": s["reintentos"] ?? 30, "Timeout": (s["espera_ms"] ?? 5000) * 1000000}
+    }
+    para k en claves(oc["crudo"] ?? {}) { cfg[k] = oc["crudo"][k] }
+    retornar cfg
+}
+
+/// Crea un contenedor (opciones como en contenedor_config, más "nombre").
+/// Devuelve el id.
+funcion contenedor_crear(c, opciones) {
+    sea q = nulo
+    si ((opciones["nombre"] ?? nulo) != nulo) { q = {"name": opciones["nombre"]} }
+    retornar _co_pedir(c, "POST", "/containers/create", q, contenedor_config(opciones), nulo)["Id"]
+}
+
+funcion contenedor_iniciar(c, id) { _co_pedir(c, "POST", "/containers/" + id + "/start", nulo, nulo, nulo) }
+funcion contenedor_parar(c, id, segundos) { _co_pedir(c, "POST", "/containers/" + id + "/stop", {"t": segundos ?? 10}, nulo, nulo) }
+funcion contenedor_reiniciar(c, id, segundos) { _co_pedir(c, "POST", "/containers/" + id + "/restart", {"t": segundos ?? 10}, nulo, nulo) }
+funcion contenedor_matar(c, id, senal) { _co_pedir(c, "POST", "/containers/" + id + "/kill", {"signal": senal ?? "SIGKILL"}, nulo, nulo) }
+funcion contenedor_pausar(c, id) { _co_pedir(c, "POST", "/containers/" + id + "/pause", nulo, nulo, nulo) }
+funcion contenedor_reanudar(c, id) { _co_pedir(c, "POST", "/containers/" + id + "/unpause", nulo, nulo, nulo) }
+funcion contenedor_renombrar(c, id, nombre) { _co_pedir(c, "POST", "/containers/" + id + "/rename", {"name": nombre}, nulo, nulo) }
+
+/// Borra un contenedor (forzar: aunque esté corriendo; volumenes: los anónimos).
+funcion contenedor_borrar(c, id, forzar, volumenes) { _co_pedir(c, "DELETE", "/containers/" + id, {"force": forzar ?? falso, "v": volumenes ?? falso}, nulo, nulo) }
+
+funcion contenedor_inspeccionar(c, id) { retornar _co_pedir(c, "GET", "/containers/" + id + "/json", nulo, nulo, nulo) }
+
+/// Lista contenedores. todos: también los detenidos. filtros: {"label": ["a=b"]}.
+funcion contenedor_listar(c, todos, filtros) { retornar _co_pedir(c, "GET", "/containers/json", {"all": todos ?? falso, "filters": filtros}, nulo, nulo) }
+
+/// Espera a que termine y devuelve el código de salida.
+funcion contenedor_esperar(c, id) { retornar _co_pedir(c, "POST", "/containers/" + id + "/wait", nulo, nulo, nulo)["StatusCode"] }
+
+/// Logs: {"stdout", "stderr"}. opciones: "cola" (últimas n líneas),
+/// "desde" (segundos Unix), "marcas" (marcas de tiempo).
+funcion contenedor_logs(c, id, opciones) {
+    sea op = opciones ?? {}
+    sea r = contenedor_api(c, "GET", "/containers/" + id + "/logs", {"stdout": verdadero, "stderr": verdadero, "tail": op["cola"] ?? "all", "since": op["desde"] ?? nulo, "timestamps": op["marcas"] ?? falso}, nulo, nulo)
+    si (r["estado"] != 200) { lanzar {"estado": r["estado"], "mensaje": r["cuerpo"]} }
+    sea d = contenedor_demultiplexar(r["cuerpo"])
+    retornar {"stdout": d["stdout"], "stderr": d["stderr"]}
+}
+
+/// Ejecuta un comando dentro de un contenedor corriendo:
+/// {"codigo", "stdout", "stderr"}. opciones: "env", "usuario", "dir_trabajo".
+funcion contenedor_ejecutar(c, id, cmd, opciones) {
+    sea op = opciones ?? {}
+    sea l = cmd
+    si (tipo(cmd) == "texto") { l = ["/bin/sh", "-c", cmd] }
+    sea cfg = {"Cmd": l, "AttachStdout": verdadero, "AttachStderr": verdadero}
+    si ((op["env"] ?? nulo) != nulo) {
+        sea e = []
+        para k en claves(op["env"]) { e.agregar(k + "=" + op["env"][k]) }
+        cfg["Env"] = e
+    }
+    si ((op["usuario"] ?? nulo) != nulo) { cfg["User"] = op["usuario"] }
+    si ((op["dir_trabajo"] ?? nulo) != nulo) { cfg["WorkingDir"] = op["dir_trabajo"] }
+    sea ex = _co_pedir(c, "POST", "/containers/" + id + "/exec", nulo, cfg, nulo)["Id"]
+    sea r = contenedor_api(c, "POST", "/exec/" + ex + "/start", nulo, {"Detach": falso, "Tty": falso}, nulo)
+    sea d = contenedor_demultiplexar(r["cuerpo"])
+    sea info = _co_pedir(c, "GET", "/exec/" + ex + "/json", nulo, nulo, nulo)
+    retornar {"codigo": info["ExitCode"], "stdout": d["stdout"], "stderr": d["stderr"]}
+}
+
+/// Procesos del contenedor: {"titulos", "procesos"}.
+funcion contenedor_procesos(c, id) {
+    sea r = _co_pedir(c, "GET", "/containers/" + id + "/top", nulo, nulo, nulo)
+    retornar {"titulos": r["Titles"], "procesos": r["Processes"]}
+}
+
+/// Una lectura de estadísticas (CPU, memoria, red).
+funcion contenedor_estadisticas(c, id) { retornar _co_pedir(c, "GET", "/containers/" + id + "/stats", {"stream": falso}, nulo, nulo) }
+
+/// Puerto del host publicado para un puerto del contenedor ("6379/tcp").
+funcion contenedor_puerto(c, id, puerto) {
+    sea k = puerto
+    si (contiene("" + k, "/") == falso) { k = k + "/tcp" }
+    sea info = contenedor_inspeccionar(c, id)
+    sea l = info["NetworkSettings"]["Ports"][k] ?? nulo
+    si (l == nulo o longitud(l) == 0) { lanzar "contenedor: el puerto " + k + " no está publicado" }
+    para b en l { si (contiene(b["HostIp"], ":") == falso) { retornar a_numero(b["HostPort"]) } }
+    retornar a_numero(l[0]["HostPort"])
+}
+
+/// Estado: "created", "running", "exited"… y salud si tiene.
+funcion contenedor_estado(c, id) {
+    sea s = contenedor_inspeccionar(c, id)["State"]
+    retornar {"estado": s["Status"], "corriendo": s["Running"], "codigo": s["ExitCode"], "salud": (s["Health"] ?? {})["Status"] ?? nulo}
+}
+
+/// Copia archivos dentro del contenedor: {ruta_relativa: contenido} en destino.
+funcion contenedor_copiar_dentro(c, id, destino, archivos) {
+    sea entradas = []
+    para k en claves(archivos) { entradas.agregar({"nombre": k, "datos": archivos[k]}) }
+    _co_pedir(c, "PUT", "/containers/" + id + "/archive", {"path": destino}, archivador_tar(entradas), "application/x-tar")
+}
+
+/// Copia una ruta del contenedor hacia afuera: {nombre: contenido}.
+funcion contenedor_copiar_fuera(c, id, ruta) {
+    sea r = contenedor_api(c, "GET", "/containers/" + id + "/archive", {"path": ruta}, nulo, nulo)
+    si (r["estado"] != 200) { lanzar {"estado": r["estado"], "mensaje": r["cuerpo"]} }
+    sea m = {}
+    para e en archivador_leer_tar(r["cuerpo"], nulo) { si ((e["es_carpeta"] ?? falso) == falso) { m[e["nombre"]] = e["datos"] } }
+    retornar m
+}
+
+// ---------- redes y volúmenes ----------
+
+funcion contenedor_crear_red(c, nombre, etiquetas) { retornar _co_pedir(c, "POST", "/networks/create", nulo, {"Name": nombre, "Labels": etiquetas ?? {}}, nulo)["Id"] }
+funcion contenedor_borrar_red(c, id) { _co_pedir(c, "DELETE", "/networks/" + id, nulo, nulo, nulo) }
+funcion contenedor_redes(c, filtros) { retornar _co_pedir(c, "GET", "/networks", {"filters": filtros}, nulo, nulo) }
+funcion contenedor_conectar_red(c, red, id, alias) { _co_pedir(c, "POST", "/networks/" + red + "/connect", nulo, {"Container": id, "EndpointConfig": {"Aliases": alias ?? []}}, nulo) }
+funcion contenedor_crear_volumen(c, nombre, etiquetas) { retornar _co_pedir(c, "POST", "/volumes/create", nulo, {"Name": nombre, "Labels": etiquetas ?? {}}, nulo)["Name"] }
+funcion contenedor_borrar_volumen(c, nombre) { _co_pedir(c, "DELETE", "/volumes/" + nombre, nulo, nulo, nulo) }
+funcion contenedor_volumenes(c, filtros) { retornar _co_pedir(c, "GET", "/volumes", {"filters": filtros}, nulo, nulo)["Volumes"] ?? [] }
+
+// ---------- motor simulado (para pruebas) ----------
+
+/// Motor falso en memoria que entiende las rutas principales. Devuelve
+/// {"estado": {...}, "transporte": función()} para contenedor_cliente.
+/// Los comandos "echo X" escriben X en stdout y "falla N" salen con N.
+funcion contenedor_simulado() {
+    sea est = {"contenedores": {}, "imagenes": {"cforge/mini:1": {"Id": "sha256:mini"}}, "redes": {}, "sig": 0, "peticiones": []}
+    sea fab = funcion() {
+        sea entrada = [""]
+        retornar {
+            "enviar": funcion(d) { entrada[0] = entrada[0] + d },
+            "todo": funcion() { retornar _co_sim_responder(est, entrada[0]) },
+            "cerrar": funcion() { nulo }
+        }
+    }
+    retornar {"estado": est, "transporte": fab}
+}
+
+funcion _co_sim_http(estado, cuerpo, tipo_c) {
+    sea tc = tipo_c ?? "application/json"
+    sea b = cuerpo
+    si (tipo(b) != "texto") { b = json_texto(b) }
+    // Respuesta con chunked para ejercitar el decodificador.
+    sea partes = []
+    sea i = 0
+    mientras (i < longitud(b)) {
+        sea n = 7
+        si (i + n > longitud(b)) { n = longitud(b) - i }
+        partes.agregar(hex_de_bytes(bytes_entero(n, 1, 0)) + "\r\n" + subcadena(b, i, i + n) + "\r\n")
+        i = i + n
+    }
+    retornar "HTTP/1.1 " + estado + " X\r\nContent-Type: " + tc + "\r\nTransfer-Encoding: chunked\r\n\r\n" + unir(partes, "") + "0\r\n\r\n"
+}
+
+funcion _co_sim_responder(est, req) {
+    sea f = texto_indice(req, "\r\n\r\n")
+    sea cab = texto_dividir(subcadena(req, 0, f), "\r\n")
+    sea cuerpo = subcadena(req, f + 4, longitud(req))
+    sea linea = texto_dividir(cab[0], " ")
+    sea metodo = linea[0]
+    sea url = linea[1]
+    sea ruta = texto_dividir(url, "?")[0]
+    est["peticiones"].agregar(metodo + " " + url)
+    si (texto_empieza_con(ruta, "/v") y contiene(subcadena(ruta, 1, longitud(ruta)), "/")) {
+        sea r2 = subcadena(ruta, 1, longitud(ruta))
+        ruta = subcadena(r2, texto_indice(r2, "/"), longitud(r2))
+    }
+    sea p = texto_dividir(ruta, "/")
+    sea ME = caracter(123) + caracter(34) + "message" + caracter(34) + ":" + caracter(34)
+    sea FIN = caracter(34) + caracter(125)
+    si (ruta == "/_ping") { retornar "HTTP/1.1 200 OK\r\nContent-Type: text/plain\r\nContent-Length: 2\r\n\r\nOK" }
+    si (ruta == "/version") { retornar _co_sim_http(200, {"Version": "simulado", "ApiVersion": "1.43"}, nulo) }
+    si (texto_empieza_con(ruta, "/images/") y texto_termina_con(ruta, "/json")) {
+        sea nombre = subcadena(ruta, 8, longitud(ruta) - 5)
+        si (tiene_clave(est["imagenes"], nombre)) { retornar _co_sim_http(200, est["imagenes"][nombre], nulo) }
+        retornar _co_sim_http(404, ME + "No such image: " + nombre + FIN, nulo)
+    }
+    si (ruta == "/containers/create") {
+        sea cfg = json_parsear(cuerpo)
+        si (tiene_clave(est["imagenes"], cfg["Image"]) == falso) { retornar _co_sim_http(404, ME + "No such image: " + cfg["Image"] + FIN, nulo) }
+        est["sig"] = est["sig"] + 1
+        sea id = "c" + est["sig"]
+        est["contenedores"][id] = {"cfg": cfg, "estado": "created", "codigo": 0, "logs": []}
+        retornar _co_sim_http(201, {"Id": id, "Warnings": []}, nulo)
+    }
+    si (ruta == "/containers/json") {
+        sea etiquetas = []
+        sea k = texto_indice(url, "filters=")
+        si (k >= 0) {
+            sea fl = json_parsear(url_decodificar(texto_dividir(subcadena(url, k + 8, longitud(url)), "&")[0]))
+            etiquetas = fl["label"] ?? []
+        }
+        sea l = []
+        para id en claves(est["contenedores"]) {
+            sea ct = est["contenedores"][id]
+            sea ok = ct["estado"] != "exec"
+            para et en etiquetas {
+                sea kv = texto_dividir(et, "=")
+                si ((ct["cfg"]["Labels"][kv[0]] ?? nulo) != kv[1]) { ok = falso }
+            }
+            si (ok) { l.agregar({"Id": id, "Image": ct["cfg"]["Image"], "State": ct["estado"], "Labels": ct["cfg"]["Labels"]}) }
+        }
+        retornar _co_sim_http(200, l, nulo)
+    }
+    si (longitud(p) >= 3 y p[1] == "containers") {
+        sea ct = est["contenedores"][p[2]] ?? nulo
+        si (ct == nulo) { retornar _co_sim_http(404, ME + "No such container: " + p[2] + FIN, nulo) }
+        sea acc = ""
+        si (longitud(p) > 3) { acc = p[3] }
+        si (acc == "start") {
+            ct["estado"] = "running"
+            sea cmd = ct["cfg"]["Cmd"] ?? []
+            sea t = unir(cmd, " ")
+            si (texto_empieza_con(t, "/bin/sh -c ")) { t = subcadena(t, 11, longitud(t)) }
+            si (texto_empieza_con(t, "echo ")) {
+                ct["logs"].agregar([1, subcadena(t, 5, longitud(t)) + "\n"])
+                ct["estado"] = "exited"
+            }
+            si (texto_empieza_con(t, "falla ")) {
+                ct["logs"].agregar([2, "error\n"])
+                ct["codigo"] = a_numero(subcadena(t, 6, longitud(t)))
+                ct["estado"] = "exited"
+            }
+            retornar "HTTP/1.1 204 No Content\r\n\r\n"
+        }
+        si (acc == "stop" o acc == "kill") {
+            ct["estado"] = "exited"
+            retornar "HTTP/1.1 204 No Content\r\n\r\n"
+        }
+        si (acc == "wait") { retornar _co_sim_http(200, {"StatusCode": ct["codigo"]}, nulo) }
+        si (acc == "logs") { retornar "HTTP/1.1 200 OK\r\nContent-Type: application/vnd.docker.multiplexed-stream\r\n\r\n" + contenedor_multiplexar(ct["logs"]) }
+        si (acc == "json") {
+            sea puertos = {}
+            sea n = 32768
+            para k en claves(ct["cfg"]["HostConfig"]["PortBindings"] ?? {}) {
+                sea hp = ct["cfg"]["HostConfig"]["PortBindings"][k][0]["HostPort"]
+                si (hp == "") {
+                    n = n + 1
+                    hp = "" + n
+                }
+                puertos[k] = [{"HostIp": "0.0.0.0", "HostPort": hp}, {"HostIp": "::", "HostPort": hp}]
+            }
+            retornar _co_sim_http(200, {"Id": p[2], "Config": ct["cfg"], "State": {"Status": ct["estado"], "Running": ct["estado"] == "running", "ExitCode": ct["codigo"]}, "NetworkSettings": {"Ports": puertos}}, nulo)
+        }
+        si (acc == "exec") {
+            sea cfg = json_parsear(cuerpo)
+            est["sig"] = est["sig"] + 1
+            sea eid = "e" + est["sig"]
+            est["contenedores"][eid] = {"exec": cfg, "estado": "exec", "cfg": {"Image": "", "Labels": {}}, "codigo": 0, "logs": []}
+            retornar _co_sim_http(201, {"Id": eid}, nulo)
+        }
+        si (acc == "" y metodo == "DELETE") {
+            si (ct["estado"] == "running" y contiene(url, "force=true") == falso) { retornar _co_sim_http(409, ME + "container is running" + FIN, nulo) }
+            quitar_clave(est["contenedores"], p[2])
+            retornar "HTTP/1.1 204 No Content\r\n\r\n"
+        }
+    }
+    si (longitud(p) >= 4 y p[1] == "exec") {
+        sea ex = est["contenedores"][p[2]]
+        si (p[3] == "start") {
+            sea t = unir(ex["exec"]["Cmd"], " ")
+            si (texto_empieza_con(t, "/bin/sh -c ")) { t = subcadena(t, 11, longitud(t)) }
+            sea tramas = [[1, "salida de " + t + "\n"]]
+            si (texto_empieza_con(t, "falla")) {
+                tramas = [[2, "mal\n"]]
+                ex["codigo"] = 3
+            }
+            retornar "HTTP/1.1 200 OK\r\nContent-Type: application/vnd.docker.raw-stream\r\n\r\n" + contenedor_multiplexar(tramas)
+        }
+        retornar _co_sim_http(200, {"ExitCode": ex["codigo"], "Running": falso}, nulo)
+    }
+    retornar _co_sim_http(404, ME + "page not found" + FIN, nulo)
+}

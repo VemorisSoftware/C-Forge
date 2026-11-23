@@ -1,0 +1,54 @@
+importar "memoria_rapida"
+funcion igual(a, b, q) { afirmar(("" + a) == ("" + b), q + ": [" + a + "] != [" + b + "]") }
+// Contra un clúster real de 3 maestros (redis-server 7) se probaron el mapa,
+// MGET/MSET/DEL entre ranuras, tuberías, MULTI/EXEC, EVALSHA→EVAL, RESP3 y
+// las redirecciones MOVED (mapa viejo) y ASK (ranura en migración).
+sea L = caracter(123)
+sea R = caracter(125)
+igual([memoria_crc16("123456789"), memoria_ranura("foo"), memoria_ranura("42"), memoria_ranura("usuario:" + L + "42" + R + ":a"), memoria_ranura(L + R + "x")], [12739, 12182, 8000, 8000, memoria_crc16(L + R + "x") % 16384], "ranuras")
+igual(memoria_resp(["SET", "k", 12]), "*3\r\n$3\r\nSET\r\n$1\r\nk\r\n$2\r\n12\r\n", "RESP")
+igual([memoria_clave_de(["GET", "a"]), memoria_clave_de(["PING"]), memoria_clave_de(["EVAL", "s", 1, "k"]), memoria_clave_de(["XREAD", "COUNT", 1, "STREAMS", "s1", "0"])], ["a", nulo, "k", "s1"], "clave del comando")
+// Lector RESP3 sobre un transporte de bytes fijos.
+funcion fijo(b) {
+    sea e = {"b": b}
+    retornar funcion(h, p) { retornar {"enviar": funcion(d) { nulo }, "recibir": funcion(n) {
+        sea r = subcadena(e["b"], 0, n)
+        e["b"] = subcadena(e["b"], n, longitud(e["b"]))
+        retornar r
+    }} }
+}
+sea c = memoria_conectar("x:1", {"transporte": fijo("%2\r\n+a\r\n:1\r\n+b\r\n~2\r\n,3.5\r\n#t\r\n>3\r\n+message\r\n+ch\r\n$2\r\nhi\r\n_\r\n=8\r\ntxt:hola\r\n-ERR malo\r\n")})
+igual(memoria_cmd(c, ["X"]), {"a": 1, "b": [3.5, verdadero]}, "mapa y conjunto")
+igual([memoria_cmd(c, ["X"]), longitud(c["push"]), memoria_cmd(c, ["X"])], [nulo, 1, "hola"], "push, nulo y verbatim")
+sea err = ""
+intentar { memoria_cmd(c, ["X"]) } capturar (e) { err = "" + e }
+igual(err, "redis: ERR malo", "error")
+igual(memoria_mensaje(c), {"canal": "ch", "datos": "hi", "patron": nulo}, "mensaje push")
+// Clúster simulado de 3 nodos.
+sea sim = memoria_simulado(["10.0.0.1:7001", "10.0.0.2:7002", "10.0.0.3:7003"])
+sea cl = memoria_cluster(["10.0.0.2:7002"], {"transporte": sim["transporte"]})
+igual(memoria_maestros(cl), ["10.0.0.1:7001", "10.0.0.2:7002", "10.0.0.3:7003"], "maestros")
+igual(cl["ranuras"][0], [0, 5460, "10.0.0.1:7001"], "mapa")
+para k en ["a", "b", "c", "d", "e"] { memoria_cmd(cl, ["SET", k, k + "!"]) }
+igual(memoria_nodo_de(cl, "foo"), "10.0.0.3:7003", "dueño")
+igual(sim["nodos"]["10.0.0.3:7003"]["datos"]["foo"] ?? nulo, nulo, "aún no")
+igual(memoria_mget(cl, ["a", "b", "zz", "e"]), ["a!", "b!", nulo, "e!"], "MGET entre ranuras")
+memoria_mset(cl, {"p": "1", "q": "2"})
+igual([memoria_cmd(cl, ["DBSIZE"]), memoria_escanear(cl, nulo)], [7, ["a", "b", "c", "d", "e", "p", "q"]], "DBSIZE y SCAN")
+igual(memoria_tuberia(cl, [["INCR", "n"], ["INCR", "n"], ["GET", "a"], ["NOEXISTE", "a"]]), [1, 2, "a!", {"__error__": "ERR unknown command 'NOEXISTE'"}], "tubería")
+igual(memoria_transaccion(cl, [["SET", L + "u" + R + "a", "1"], ["INCR", L + "u" + R + "b"]], nulo), ["OK", 1], "MULTI/EXEC")
+err = ""
+intentar { memoria_transaccion(cl, [["SET", "a", "1"], ["SET", "b", "2"]], nulo) } capturar (e) { err = "" + e }
+igual(texto_empieza_con(err, "redis: CROSSSLOT"), verdadero, "CROSSSLOT")
+memoria_cmd(cl, ["HSET", "h", "x", "1", "y", "2"])
+igual(memoria_mapa(memoria_cmd(cl, ["HGETALL", "h"])), {"x": "1", "y": "2"}, "HGETALL")
+// MOVED: la ranura de "a" pasa a otro nodo.
+sea s = memoria_ranura("a")
+sim["mover"](s, "10.0.0.1:7001")
+igual([memoria_cmd(cl, ["GET", "a"]), cl["redirecciones"], memoria_nodo_de(cl, "a")], ["a!", 1, "10.0.0.1:7001"], "MOVED")
+// ASK: ranura de "foo" en migración; una clave nueva va al destino.
+sim["migrando"](memoria_ranura("foo"), "10.0.0.2:7002")
+memoria_cmd(cl, ["SET", "foo", "nuevo"])
+igual([cl["redirecciones"], sim["nodos"]["10.0.0.2:7002"]["datos"]["foo"], memoria_nodo_de(cl, "foo")], [2, "nuevo", "10.0.0.3:7003"], "ASK")
+igual(memoria_borrar(cl, ["b", "c", "zz"]), 2, "DEL entre ranuras")
+mostrar("[OK] memoria_rapida")

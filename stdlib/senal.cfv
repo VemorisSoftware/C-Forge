@@ -1,0 +1,415 @@
+// stdlib/senal.cfv — cliente de SignalR (protocolo de hubs en JSON sobre
+// WebSocket): negociación, saludo, invocaciones con resultado, envíos sin
+// respuesta, métodos del cliente que el servidor llama, flujos del
+// servidor con cancelación, ping, cierre del servidor y reconexión
+// automática con esperas configurables. Incluye un hub en memoria para
+// pruebas. Probado contra ASP.NET Core 8. Idea de @microsoft/signalr
+// (MIT). En inglés: importar "signalr".
+//
+//   importar "senal"
+//   sea c = senal_conectar("http://127.0.0.1:5000/chat", nulo)
+//   senal_en(c, "Mensaje", funcion(args) { mostrar(args) })
+//   mostrar(senal_invocar(c, "Sumar", [1, 2]))
+
+importar "json"
+importar "red"
+
+sea _SE_RS = caracter(30)
+
+// ---------- protocolo ----------
+
+/// Codifica un mensaje del protocolo (mapa) con su separador.
+funcion senal_codificar(m) { retornar json_texto(m) + _SE_RS }
+
+/// Divide un bloque recibido en mensajes (mapas).
+funcion senal_decodificar(t) {
+    sea r = []
+    para p en texto_dividir(t, _SE_RS) { si (texto_recortar(p) != "") { r.agregar(json_parsear(p)) } }
+    retornar r
+}
+
+/// Saludo inicial del cliente.
+funcion senal_saludo() { retornar senal_codificar({"protocol": "json", "version": 1}) }
+
+// ---------- transporte ----------
+
+funcion _se_ws_url(url) {
+    si (texto_empieza_con(url, "https://")) { lanzar "senal: wss/https todavía no está soportado" }
+    si (texto_empieza_con(url, "http://")) { retornar "ws://" + subcadena(url, 7, longitud(url)) }
+    retornar url
+}
+
+funcion _se_con_query(url, k, v) {
+    si (contiene(url, "?")) { retornar url + "&" + k + "=" + v }
+    retornar url + "?" + k + "=" + v
+}
+
+// Negocia y abre el WebSocket. Devuelve {"enviar", "recibir", "cerrar", "id"}.
+funcion _se_transporte_red(url, op) {
+    sea destino = url
+    sea id = nulo
+    si ((op["sin_negociar"] ?? falso) == falso) {
+        sea base = texto_dividir(url, "?")
+        sea nu = base[0] + "/negotiate?negotiateVersion=1"
+        si (longitud(base) > 1) { nu = nu + "&" + base[1] }
+        sea cab = {}
+        si ((op["token"] ?? nulo) != nulo) { cab["Authorization"] = "Bearer " + op["token"] }
+        sea r = http_solicitud("POST", nu, {"cabeceras": cab, "cuerpo": "", "tipo": "text/plain"})
+        si (r["estado"] != 200) { lanzar "senal: la negociación falló con estado " + r["estado"] }
+        sea n = json_parsear(r["cuerpo"])
+        si (tiene_clave(n, "error")) { lanzar "senal: " + n["error"] }
+        si (tiene_clave(n, "url")) {
+            // Redirección (por ejemplo Azure SignalR).
+            destino = n["url"]
+            op["token"] = n["accessToken"] ?? op["token"] ?? nulo
+        } sino {
+            sea ws = falso
+            para t en n["availableTransports"] ?? [] { si (t["transport"] == "WebSockets") { ws = verdadero } }
+            si (ws == falso) { lanzar "senal: el servidor no ofrece WebSockets" }
+            id = n["connectionToken"] ?? n["connectionId"]
+            destino = _se_con_query(url, "id", id)
+        }
+    }
+    si ((op["token"] ?? nulo) != nulo) { destino = _se_con_query(destino, "access_token", op["token"]) }
+    sea conn = ws_conectar_url(_se_ws_url(destino))
+    retornar {"id": id, "enviar": funcion(t) { ws_enviar(conn, t) }, "recibir": funcion() { retornar ws_recibir(conn) }, "cerrar": funcion() { intentar { ws_cerrar(conn) } capturar (e) { nulo } }}
+}
+
+// ---------- conexión ----------
+
+/// Conecta a un hub. opciones: "token", "sin_negociar", "reconectar"
+/// (verdadero = esperas [0, 2000, 10000, 30000] ms, o una lista propia),
+/// "transporte" (función(url, opciones) → transporte, para pruebas),
+/// "dormir" (función(ms), para pruebas).
+funcion senal_conectar(url, opciones) {
+    sea op = {}
+    para k en claves(opciones ?? {}) { op[k] = opciones[k] }
+    sea c = {"url": url, "op": op, "t": nulo, "sig": 0, "manejadores": {}, "resultados": {}, "items": {}, "estado": "desconectado", "eventos": {}, "pendientes": [], "cierre": nulo}
+    _se_abrir(c)
+    retornar c
+}
+
+funcion _se_abrir(c) {
+    sea fab = c["op"]["transporte"] ?? nulo
+    sea t = nulo
+    si (fab != nulo) { t = fab(c["url"], c["op"]) } sino { t = _se_transporte_red(c["url"], c["op"]) }
+    c["t"] = t
+    c["pendientes"] = []
+    t["enviar"](senal_saludo())
+    // Respuesta al saludo: {} (y quizá más mensajes en el mismo bloque).
+    sea b = t["recibir"]()
+    si (b == nulo) { lanzar "senal: el servidor cerró durante el saludo" }
+    sea ms = senal_decodificar(b)
+    si (longitud(ms) == 0) { lanzar "senal: saludo vacío" }
+    si (tiene_clave(ms[0], "error")) { lanzar "senal: saludo rechazado: " + ms[0]["error"] }
+    sea i = 1
+    mientras (i < longitud(ms)) {
+        c["pendientes"].agregar(ms[i])
+        i = i + 1
+    }
+    c["estado"] = "conectado"
+    c["id"] = t["id"] ?? nulo
+}
+
+/// Registra un método del cliente (lo llama el servidor). fn(args); si
+/// devuelve un valor y el servidor espera resultado, se le responde.
+funcion senal_en(c, metodo, fn) {
+    sea k = texto_minusculas(metodo)
+    si (tiene_clave(c["manejadores"], k) == falso) { c["manejadores"][k] = [] }
+    c["manejadores"][k].agregar(fn)
+}
+
+funcion senal_quitar(c, metodo) { quitar_clave(c["manejadores"], texto_minusculas(metodo)) }
+
+/// Eventos de la conexión: "cerrada" (fn(error)), "reconectando"
+/// (fn(error)) y "reconectada" (fn(id)).
+funcion senal_al(c, evento, fn) { c["eventos"][evento] = fn }
+
+funcion _se_evento(c, ev, arg) {
+    sea f = c["eventos"][ev] ?? nulo
+    si (f != nulo) { f(arg) }
+}
+
+funcion _se_enviar(c, m) {
+    si (c["estado"] != "conectado") { lanzar "senal: la conexión no está activa (" + c["estado"] + ")" }
+    sea fallo = nulo
+    intentar { c["t"]["enviar"](senal_codificar(m)) } capturar (e) { fallo = "" + e }
+    si (fallo != nulo) {
+        // Se cayó al escribir: reconecta (si se pidió) y reintenta una vez.
+        _se_caida(c, fallo)
+        c["t"]["enviar"](senal_codificar(m))
+    }
+}
+
+funcion _se_dormir(c, ms) {
+    sea d = c["op"]["dormir"] ?? nulo
+    si (d != nulo) { d(ms) } sino { dormir(ms) }
+}
+
+// Siguiente mensaje (de lo pendiente o del transporte). Maneja la caída.
+funcion _se_mensaje(c) {
+    mientras (longitud(c["pendientes"]) == 0) {
+        sea b = nulo
+        sea fallo = nulo
+        intentar { b = c["t"]["recibir"]() } capturar (e) { fallo = "" + e }
+        si (b == nulo) {
+            _se_caida(c, fallo ?? "conexión cerrada")
+        } sino {
+            para m en senal_decodificar(b) { c["pendientes"].agregar(m) }
+        }
+    }
+    sea m = c["pendientes"][0]
+    sea r = []
+    sea i = 1
+    mientras (i < longitud(c["pendientes"])) {
+        r.agregar(c["pendientes"][i])
+        i = i + 1
+    }
+    c["pendientes"] = r
+    retornar m
+}
+
+// La conexión se cayó: falla lo que esperaba y reconecta si se pidió.
+funcion _se_caida(c, motivo) {
+    sea esperas = c["op"]["reconectar"] ?? nulo
+    si (esperas == verdadero) { esperas = [0, 2000, 10000, 30000] }
+    para k en claves(c["resultados"]) { si (c["resultados"][k] == nulo) { c["resultados"][k] = {"__error__": "conexión perdida: " + motivo} } }
+    intentar { c["t"]["cerrar"]() } capturar (e) { nulo }
+    si (esperas == nulo o esperas == falso o (c["cierre"] ?? nulo) == "sin_reconexion") {
+        c["estado"] = "desconectado"
+        _se_evento(c, "cerrada", motivo)
+        lanzar "senal: " + motivo
+    }
+    c["estado"] = "reconectando"
+    _se_evento(c, "reconectando", motivo)
+    para ms en esperas {
+        _se_dormir(c, ms)
+        sea ok = falso
+        intentar {
+            _se_abrir(c)
+            ok = verdadero
+        } capturar (e) { ok = falso }
+        si (ok) {
+            _se_evento(c, "reconectada", c["id"] ?? nulo)
+            retornar nulo
+        }
+    }
+    c["estado"] = "desconectado"
+    _se_evento(c, "cerrada", motivo)
+    lanzar "senal: no se pudo reconectar (" + motivo + ")"
+}
+
+// Procesa un mensaje: llama manejadores, guarda resultados e ítems.
+funcion _se_procesar(c, m) {
+    sea t = m["type"] ?? 0
+    si (t == 1) {
+        sea hs = c["manejadores"][texto_minusculas(m["target"])] ?? []
+        sea res = nulo
+        sea err = nulo
+        para h en hs {
+            intentar { res = h(m["arguments"] ?? []) } capturar (e) { err = "" + e }
+        }
+        sea iid = m["invocationId"] ?? nulo
+        si (iid != nulo) {
+            // El servidor espera un resultado (client results).
+            si (longitud(hs) == 0) { _se_enviar(c, {"type": 3, "invocationId": iid, "error": "Client didn't provide a result."}) }
+            sino si (err != nulo) { _se_enviar(c, {"type": 3, "invocationId": iid, "error": err}) }
+            sino { _se_enviar(c, {"type": 3, "invocationId": iid, "result": res}) }
+        }
+    } sino si (t == 2) {
+        sea k = "" + m["invocationId"]
+        sea cb = c["items"][k] ?? nulo
+        si (cb != nulo) { cb(m["item"]) }
+    } sino si (t == 3) {
+        sea k = "" + m["invocationId"]
+        si (tiene_clave(m, "error")) { c["resultados"][k] = {"__error__": m["error"]} } sino { c["resultados"][k] = {"valor": m["result"] ?? nulo} }
+    } sino si (t == 7) {
+        si ((m["allowReconnect"] ?? falso) == falso) { c["cierre"] = "sin_reconexion" }
+        _se_caida(c, "el servidor cerró la conexión" + _se_motivo(m))
+    }
+    // 6 (Ping) no necesita respuesta.
+    retornar m
+}
+
+funcion _se_motivo(m) {
+    si ((m["error"] ?? nulo) != nulo) { retornar ": " + m["error"] }
+    retornar ""
+}
+
+funcion _se_id(c) {
+    sea i = "" + c["sig"]
+    c["sig"] = c["sig"] + 1
+    retornar i
+}
+
+funcion _se_esperar(c, id) {
+    mientras ((c["resultados"][id] ?? nulo) == nulo) { _se_procesar(c, _se_mensaje(c)) }
+    sea r = c["resultados"][id]
+    quitar_clave(c["resultados"], id)
+    si (tiene_clave(r, "__error__")) { lanzar "senal: " + r["__error__"] }
+    retornar r["valor"]
+}
+
+/// Invoca un método del hub y espera su resultado.
+funcion senal_invocar(c, metodo, args) {
+    sea id = _se_id(c)
+    _se_enviar(c, {"type": 1, "invocationId": id, "target": metodo, "arguments": args ?? []})
+    c["resultados"][id] = nulo
+    retornar _se_esperar(c, id)
+}
+
+/// Llama a un método del hub sin esperar respuesta.
+funcion senal_enviar(c, metodo, args) { _se_enviar(c, {"type": 1, "target": metodo, "arguments": args ?? []}) }
+
+/// Flujo del servidor: llama fn(item) por cada elemento; si fn devuelve
+/// falso, cancela. Devuelve cuántos recibió.
+funcion senal_flujo_cada(c, metodo, args, fn) {
+    sea id = _se_id(c)
+    sea n = [0]
+    sea cancelado = [falso]
+    c["items"][id] = funcion(x) {
+        si (cancelado[0] == falso) {
+            n[0] = n[0] + 1
+            si (fn(x) == falso) {
+                cancelado[0] = verdadero
+                _se_enviar(c, {"type": 5, "invocationId": id})
+            }
+        }
+    }
+    _se_enviar(c, {"type": 4, "invocationId": id, "target": metodo, "arguments": args ?? []})
+    c["resultados"][id] = nulo
+    intentar { _se_esperar(c, id) } capturar (e) {
+        quitar_clave(c["items"], id)
+        si (cancelado[0] == falso) { lanzar e }
+    }
+    quitar_clave(c["items"], id)
+    retornar n[0]
+}
+
+/// Flujo del servidor completo, como lista.
+funcion senal_flujo(c, metodo, args) {
+    sea l = []
+    senal_flujo_cada(c, metodo, args, funcion(x) {
+        l.agregar(x)
+        retornar verdadero
+    })
+    retornar l
+}
+
+/// Procesa el siguiente mensaje entrante (bloquea) y lo devuelve.
+funcion senal_atender(c) { retornar _se_procesar(c, _se_mensaje(c)) }
+
+/// Espera a que el servidor llame a un método del cliente y devuelve sus
+/// argumentos (también corre los manejadores registrados).
+funcion senal_esperar(c, metodo) {
+    mientras (verdadero) {
+        sea m = senal_atender(c)
+        si ((m["type"] ?? 0) == 1 y texto_minusculas(m["target"]) == texto_minusculas(metodo)) { retornar m["arguments"] ?? [] }
+    }
+}
+
+/// Manda un ping (mantiene viva la conexión durante esperas largas).
+funcion senal_ping(c) { _se_enviar(c, {"type": 6}) }
+
+funcion senal_cerrar(c) {
+    si (c["estado"] == "conectado") {
+        c["cierre"] = "sin_reconexion"
+        c["estado"] = "desconectado"
+        intentar { c["t"]["cerrar"]() } capturar (e) { nulo }
+        _se_evento(c, "cerrada", nulo)
+    }
+}
+
+// ---------- hub en memoria (para pruebas) ----------
+
+/// Hub falso: metodos {nombre: función(args, ctx) → valor | lista para
+/// flujos}. ctx: {"id", "todos": fn(metodo, args), "otros", "llamador",
+/// "grupo": fn(g, metodo, args), "unir": fn(g), "cerrar": fn(error,
+/// permitir)}. Devuelve {"hub", "transporte": función(url, op)}.
+funcion senal_hub_memoria(metodos) {
+    sea hub = {"metodos": metodos, "conexiones": [], "grupos": {}, "sig": 0, "caer_en": nulo, "rechazar": nulo}
+    sea fab = funcion(url, op) {
+        hub["sig"] = hub["sig"] + 1
+        sea cn = {"id": "con" + hub["sig"], "salida": [], "saludo": falso, "vivo": verdadero, "flujos": {}}
+        hub["conexiones"].agregar(cn)
+        retornar {
+            "id": cn["id"],
+            "enviar": funcion(t) {
+                si (cn["vivo"] == falso) { lanzar "senal: conexión cerrada" }
+                _se_hub_entrada(hub, cn, t)
+            },
+            "recibir": funcion() {
+                si (longitud(cn["salida"]) == 0 o cn["vivo"] == falso) { retornar nulo }
+                sea t = unir(cn["salida"], "")
+                cn["salida"] = []
+                retornar t
+            },
+            "cerrar": funcion() { cn["vivo"] = falso }
+        }
+    }
+    retornar {"hub": hub, "transporte": fab}
+}
+
+funcion _se_hub_a(cn, m) { si (cn["vivo"]) { cn["salida"].agregar(senal_codificar(m)) } }
+
+funcion _se_hub_entrada(hub, cn, t) {
+    para m en senal_decodificar(t) {
+        si (cn["saludo"] == falso) {
+            si (hub["rechazar"] != nulo) { cn["salida"].agregar(senal_codificar({"error": hub["rechazar"]})) } sino si ((m["protocol"] ?? "") != "json") { cn["salida"].agregar(senal_codificar({"error": "protocolo no soportado"})) } sino { cn["salida"].agregar(senal_codificar({})) }
+            cn["saludo"] = verdadero
+        } sino {
+            _se_hub_mensaje(hub, cn, m)
+        }
+    }
+}
+
+funcion _se_hub_mensaje(hub, cn, m) {
+    sea t = m["type"] ?? 0
+    si (t == 6) { retornar nulo }
+    si (t == 5) {
+        cn["flujos"]["" + m["invocationId"]] = "cancelado"
+        retornar nulo
+    }
+    si (t != 1 y t != 4) { retornar nulo }
+    sea fn = hub["metodos"][m["target"]] ?? nulo
+    sea iid = m["invocationId"] ?? nulo
+    si (fn == nulo) {
+        si (iid != nulo) { _se_hub_a(cn, {"type": 3, "invocationId": iid, "error": "Failed to invoke '" + m["target"] + "' due to an error on the server. HubException: Method does not exist."}) }
+        retornar nulo
+    }
+    sea ctx = {"id": cn["id"]}
+    ctx["todos"] = funcion(met, args) { para x en hub["conexiones"] { _se_hub_a(x, {"type": 1, "target": met, "arguments": args}) } }
+    ctx["otros"] = funcion(met, args) { para x en hub["conexiones"] { si (x["id"] != cn["id"]) { _se_hub_a(x, {"type": 1, "target": met, "arguments": args}) } } }
+    ctx["llamador"] = funcion(met, args) { _se_hub_a(cn, {"type": 1, "target": met, "arguments": args}) }
+    ctx["unir"] = funcion(g) {
+        si (tiene_clave(hub["grupos"], g) == falso) { hub["grupos"][g] = [] }
+        hub["grupos"][g].agregar(cn)
+    }
+    ctx["grupo"] = funcion(g, met, args) { para x en hub["grupos"][g] ?? [] { _se_hub_a(x, {"type": 1, "target": met, "arguments": args}) } }
+    ctx["cerrar"] = funcion(error, permitir) {
+        _se_hub_a(cn, {"type": 7, "error": error, "allowReconnect": permitir ?? falso})
+        cn["cerrando"] = verdadero
+    }
+    sea r = nulo
+    sea err = nulo
+    intentar { r = fn(m["arguments"] ?? [], ctx) } capturar (e) { err = "" + e }
+    si ((cn["cerrando"] ?? falso) == verdadero) {
+        cn["vivo_hasta_leer"] = verdadero
+        retornar nulo
+    }
+    si (iid == nulo) { retornar nulo }
+    si (err != nulo) {
+        _se_hub_a(cn, {"type": 3, "invocationId": iid, "error": "An unexpected error occurred invoking '" + m["target"] + "' on the server. HubException: " + err})
+        retornar nulo
+    }
+    si (t == 4) {
+        // Los ítems se mandan de a uno; una cancelación llega entre medio
+        // solo en la vida real, aquí se respeta si ya estaba marcada.
+        para x en r {
+            si ((cn["flujos"]["" + iid] ?? "") != "cancelado") { _se_hub_a(cn, {"type": 2, "invocationId": iid, "item": x}) }
+        }
+        _se_hub_a(cn, {"type": 3, "invocationId": iid})
+        retornar nulo
+    }
+    si (r == nulo) { _se_hub_a(cn, {"type": 3, "invocationId": iid}) } sino { _se_hub_a(cn, {"type": 3, "invocationId": iid, "result": r}) }
+}
