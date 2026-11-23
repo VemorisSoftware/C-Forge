@@ -1,0 +1,404 @@
+// stdlib/cristal.cfv — Apps de escritorio con interfaz web al estilo de
+// Tauri: el frontend (HTML, CSS y JS) corre en una ventana del sistema y el
+// backend es C-Forge. Desde JavaScript se llaman comandos del backend con
+// invoke() y los dos lados se mandan eventos.
+//
+// Seguridad (como las capacidades de Tauri):
+//   · El servidor escucha solo en 127.0.0.1 y en una ruta con un token
+//     aleatorio de 128 bits.
+//   · Se revisan Host (contra DNS rebinding) y Origin; el IPC pide además
+//     la cabecera X-Cristal con el token.
+//   · Solo se pueden llamar los comandos registrados.
+//   · Los archivos se sirven solo desde la carpeta del frontend (sin "..")
+//     con Content-Security-Policy, nosniff y sin CORS.
+// La ventana se abre con el navegador del sistema en modo aplicación
+// (Chrome, Chromium o Edge con --app) o, si no hay, con el navegador por
+// defecto. El puente JS también expone window.__TAURI__.core.invoke y
+// window.__TAURI__.event.listen/emit para reusar frontends de Tauri.
+// Idea de Tauri (MIT/Apache), escrito desde cero. En inglés: importar "tauri".
+//
+//   importar "cristal"
+//   sea app = cristal_app({"titulo": "Notas", "frontend": "web/"})
+//   cristal_comando(app, "saludar", funcion(args, app) { retornar "Hola, " + args["nombre"] })
+//   cristal_ejecutar(app)
+//   // En web/index.html:  const r = await cristal.invoke("saludar", {nombre: "Ana"})
+
+importar "json"
+importar "sistema"
+
+funcion __cristal_declaraciones() {
+    extern "libc" funcion socket(dominio: entero, tipo_s: entero, protocolo: entero): entero
+    extern "libc" funcion setsockopt(fd: entero, nivel: entero, opcion: entero, valor: puntero, largo: entero): entero
+    extern "libc" funcion bind(fd: entero, dir: puntero, largo: entero): entero
+    extern "libc" funcion listen(fd: entero, cola: entero): entero
+    extern "libc" funcion accept(fd: entero, dir: puntero, largo: puntero): entero
+    extern "libc" funcion close(fd: entero): entero
+}
+
+sea _CX_TIPOS = {"html": "text/html; charset=utf-8", "htm": "text/html; charset=utf-8", "js": "text/javascript; charset=utf-8", "mjs": "text/javascript; charset=utf-8",
+    "css": "text/css; charset=utf-8", "json": "application/json", "svg": "image/svg+xml", "png": "image/png", "jpg": "image/jpeg", "jpeg": "image/jpeg",
+    "gif": "image/gif", "webp": "image/webp", "ico": "image/x-icon", "woff": "font/woff", "woff2": "font/woff2", "ttf": "font/ttf", "txt": "text/plain; charset=utf-8",
+    "wasm": "application/wasm", "map": "application/json"}
+
+/// Crea la app. opciones: "titulo", "ancho", "alto", "frontend" (carpeta o
+/// mapa ruta → contenido), "comandos" (mapa nombre → función(args, app)),
+/// "estado" (datos del backend), "csp" (Content-Security-Policy).
+funcion cristal_app(opciones) {
+    sea op = opciones ?? {}
+    retornar {"titulo": op["titulo"] ?? "C-Forge", "ancho": op["ancho"] ?? 900, "alto": op["alto"] ?? 640, "frontend": op["frontend"] ?? {},
+        "comandos": op["comandos"] ?? {}, "estado": op["estado"] ?? {}, "token": hex_de_bytes(bytes_aleatorios(16)), "eventos": [], "oyentes": {},
+        "csp": op["csp"] ?? "default-src 'self'; script-src 'self' 'unsafe-inline'; style-src 'self' 'unsafe-inline'; img-src 'self' data: blob:; connect-src 'self'",
+        "puerto": nulo, "escucha": nulo, "ultimo_latido": nulo, "cerrar": falso, "max_eventos": 1000, "primer_evento": 0}
+}
+
+/// Registra un comando que el frontend puede llamar con invoke().
+funcion cristal_comando(app, nombre, fn) { app["comandos"][nombre] = fn }
+
+/// Escucha eventos que manda el frontend con emit().
+funcion cristal_escuchar(app, evento, fn) {
+    si (tiene_clave(app["oyentes"], evento) == falso) { app["oyentes"][evento] = [] }
+    app["oyentes"][evento].agregar(fn)
+}
+
+/// Manda un evento al frontend (le llega a listen()).
+funcion cristal_emitir(app, evento, datos) {
+    app["eventos"].agregar({"evento": evento, "datos": datos})
+    // Se guardan los últimos max_eventos.
+    si (longitud(app["eventos"]) > app["max_eventos"]) {
+        eliminar(app["eventos"], 0)
+        app["primer_evento"] = app["primer_evento"] + 1
+    }
+}
+
+/// Dirección de la ventana (con el token).
+funcion cristal_url(app) { retornar "http://127.0.0.1:" + app["puerto"] + "/" + app["token"] + "/" }
+
+// ---------- puente JS ----------
+
+funcion _cx_puente(app) {
+    retornar "<script>(function()\{const T=\"" + app["token"] + "\";const B=\"/\"+T;" +
+        "async function invoke(cmd,args)\{const r=await fetch(B+\"/__ipc\",\{method:\"POST\",headers:\{\"content-type\":\"application/json\",\"x-cristal\":T},body:JSON.stringify(\{cmd:cmd,args:args||\{}})});" +
+        "const j=await r.json();if(!j.ok)throw new Error(j.error);return j.valor;}" +
+        "const oy=\{};let desde=0;" +
+        "async function sondear()\{try\{const ev=await invoke(\"__eventos\",\{desde:desde});desde=ev.siguiente;for(const e of ev.eventos)\{(oy[e.evento]||[]).slice().forEach(function(f)\{try\{f(\{event:e.evento,payload:e.datos})}catch(x)\{console.error(x)}})}}catch(x)\{}setTimeout(sondear,150)}" +
+        "function listen(ev,f)\{(oy[ev]=oy[ev]||[]).push(f);return Promise.resolve(function()\{oy[ev]=(oy[ev]||[]).filter(function(g)\{return g!==f})})}" +
+        "function emit(ev,d)\{return invoke(\"__emitir\",\{evento:ev,datos:d===undefined?null:d})}" +
+        "function close()\{return invoke(\"__cerrar\",\{})}" +
+        "setInterval(function()\{invoke(\"__latido\",\{}).catch(function()\{})},1000);" +
+        "window.cristal=\{invoke:invoke,listen:listen,emit:emit,close:close};" +
+        "window.__TAURI__=\{core:\{invoke:invoke},event:\{listen:listen,emit:emit},window:\{getCurrentWindow:function()\{return\{close:close}}}};" +
+        "sondear();})();</script>"
+}
+
+funcion _cx_inyectar(app, html) {
+    sea p = _cx_puente(app)
+    sea bajo = texto_minusculas(html)
+    sea i = texto_indice(bajo, "<head>")
+    si (i >= 0) { retornar subtexto(html, 0, i + 6) + p + subtexto(html, i + 6, longitud(html)) }
+    i = texto_indice(bajo, "<html")
+    si (i >= 0) {
+        sea j = i + texto_indice(subtexto(bajo, i, longitud(bajo)), ">")
+        retornar subtexto(html, 0, j + 1) + p + subtexto(html, j + 1, longitud(html))
+    }
+    retornar p + html
+}
+
+// ---------- manejo de solicitudes (sin E/S) ----------
+
+funcion _cx_resp(estado, tipo_c, cuerpo, extra) {
+    sea cab = {"content-type": tipo_c, "x-content-type-options": "nosniff", "cache-control": "no-store", "referrer-policy": "no-referrer"}
+    para k en claves(extra ?? {}) { cab[k] = extra[k] }
+    retornar {"estado": estado, "cabeceras": cab, "cuerpo": cuerpo}
+}
+
+funcion _cx_json(estado, v) { retornar _cx_resp(estado, "application/json", json_serializar(v), nulo) }
+
+funcion _cx_archivo(app, ruta) {
+    sea f = app["frontend"]
+    si (tipo(f) == "mapa") { retornar f[ruta] ?? nulo }
+    sea base = f
+    si (texto_termina_con(base, "/") == falso) { base = base + "/" }
+    sea completa = base + ruta
+    si (existe_archivo(completa) == falso) { retornar nulo }
+    intentar { retornar leer_archivo(completa) } capturar (e) { retornar nulo }
+}
+
+funcion _cx_ruta_segura(r) {
+    // Sin "..", sin barras invertidas ni rutas absolutas.
+    si (texto_indice(r, "\\") >= 0 o texto_indice(r, char_de(0)) >= 0 o texto_empieza_con(r, "/")) { retornar falso }
+    para parte en texto_dividir(r, "/") { si (parte == ".." o parte == ".") { retornar falso } }
+    retornar verdadero
+}
+
+funcion _cx_decodificar(r) {
+    sea s = ""
+    sea i = 0
+    sea n = longitud(r)
+    mientras (i < n) {
+        sea c = subtexto(r, i, i + 1)
+        si (c == "%" y i + 2 < n) {
+            intentar {
+                s = s + char_de(_cx_hex(subtexto(r, i + 1, i + 3)))
+                i = i + 3
+                continuar
+            } capturar (e) { }
+        }
+        s = s + c
+        i = i + 1
+    }
+    retornar s
+}
+
+funcion _cx_hex(h) {
+    sea r = 0
+    para c en texto_codigos(texto_minusculas(h)) {
+        sea d = c - 48
+        si (c >= 97) { d = c - 87 }
+        si (d < 0 o d > 15) { lanzar "hex" }
+        r = r * 16 + d
+    }
+    retornar r
+}
+
+/// Atiende una solicitud HTTP: {"metodo", "ruta", "cabeceras" (en
+/// minúsculas), "cuerpo"} → {"estado", "cabeceras", "cuerpo"}.
+funcion cristal_manejar(app, sol) {
+    sea cab = sol["cabeceras"] ?? {}
+    sea host = cab["host"] ?? ""
+    sea puerto = "" + (app["puerto"] ?? "")
+    si (host != "127.0.0.1:" + puerto y host != "localhost:" + puerto) { retornar _cx_resp(403, "text/plain", "host no permitido", nulo) }
+    sea ruta = sol["ruta"] ?? "/"
+    sea q = texto_indice(ruta, "?")
+    si (q >= 0) { ruta = subtexto(ruta, 0, q) }
+    sea prefijo = "/" + app["token"]
+    si (ruta == prefijo) { retornar _cx_resp(302, "text/plain", "", {"location": prefijo + "/"}) }
+    si (texto_empieza_con(ruta, prefijo + "/") == falso) { retornar _cx_resp(404, "text/plain", "no encontrado", nulo) }
+    sea resto = _cx_decodificar(subtexto(ruta, longitud(prefijo) + 1, longitud(ruta)))
+    si (resto == "__ipc") { retornar _cx_ipc(app, sol, cab) }
+    si (sol["metodo"] != "GET" y sol["metodo"] != "HEAD") { retornar _cx_resp(405, "text/plain", "método no permitido", nulo) }
+    si (resto == "" o texto_termina_con(resto, "/")) { resto = resto + "index.html" }
+    si (_cx_ruta_segura(resto) == falso) { retornar _cx_resp(400, "text/plain", "ruta inválida", nulo) }
+    sea datos = _cx_archivo(app, resto)
+    si (datos == nulo) { retornar _cx_resp(404, "text/plain", "no encontrado", nulo) }
+    sea ext = ""
+    sea punto = -1
+    sea i = 0
+    mientras (i < longitud(resto)) {
+        si (subtexto(resto, i, i + 1) == ".") { punto = i }
+        i = i + 1
+    }
+    si (punto >= 0) { ext = texto_minusculas(subtexto(resto, punto + 1, longitud(resto))) }
+    sea tipo_c = _CX_TIPOS[ext] ?? "application/octet-stream"
+    si (ext == "html" o ext == "htm") {
+        retornar _cx_resp(200, tipo_c, _cx_inyectar(app, datos), {"content-security-policy": app["csp"], "x-frame-options": "DENY"})
+    }
+    retornar _cx_resp(200, tipo_c, datos, nulo)
+}
+
+funcion _cx_ipc(app, sol, cab) {
+    si (sol["metodo"] != "POST") { retornar _cx_resp(405, "text/plain", "método no permitido", nulo) }
+    si ((cab["x-cristal"] ?? "") != app["token"]) { retornar _cx_json(403, {"ok": falso, "error": "token inválido"}) }
+    sea origen = cab["origin"] ?? nulo
+    si (origen != nulo y origen != "http://127.0.0.1:" + app["puerto"] y origen != "http://localhost:" + app["puerto"]) { retornar _cx_json(403, {"ok": falso, "error": "origen no permitido"}) }
+    sea pedido = nulo
+    intentar { pedido = json_parsear(sol["cuerpo"] ?? "") } capturar (e) { retornar _cx_json(400, {"ok": falso, "error": "JSON inválido"}) }
+    si (tipo(pedido) != "mapa") { retornar _cx_json(400, {"ok": falso, "error": "pedido inválido"}) }
+    sea cmd = "" + (pedido["cmd"] ?? "")
+    sea args = pedido["args"] ?? {}
+    si (cmd == "__latido") {
+        app["ultimo_latido"] = tiempo_ms()
+        retornar _cx_json(200, {"ok": verdadero, "valor": nulo})
+    }
+    si (cmd == "__cerrar") {
+        app["cerrar"] = verdadero
+        retornar _cx_json(200, {"ok": verdadero, "valor": nulo})
+    }
+    si (cmd == "__eventos") {
+        sea desde = args["desde"] ?? 0
+        sea primero = app["primer_evento"]
+        sea lista = []
+        sea k = maximo(0, desde - primero)
+        mientras (k < longitud(app["eventos"])) {
+            lista.agregar(app["eventos"][k])
+            k = k + 1
+        }
+        retornar _cx_json(200, {"ok": verdadero, "valor": {"eventos": lista, "siguiente": primero + longitud(app["eventos"])}})
+    }
+    si (cmd == "__emitir") {
+        sea ev = "" + (args["evento"] ?? "")
+        para f en app["oyentes"][ev] ?? [] {
+            intentar { f(args["datos"] ?? nulo, app) } capturar (e) { retornar _cx_json(200, {"ok": falso, "error": "" + e}) }
+        }
+        retornar _cx_json(200, {"ok": verdadero, "valor": nulo})
+    }
+    sea f = app["comandos"][cmd] ?? nulo
+    si (f == nulo) { retornar _cx_json(200, {"ok": falso, "error": "comando no permitido: " + cmd}) }
+    sea valor = nulo
+    intentar { valor = f(args, app) } capturar (e) { retornar _cx_json(200, {"ok": falso, "error": "" + e}) }
+    retornar _cx_json(200, {"ok": verdadero, "valor": valor})
+}
+
+// ---------- servidor en 127.0.0.1 ----------
+
+/// Empieza a escuchar en 127.0.0.1 (puerto 0: uno libre al azar).
+funcion cristal_servir(app, puerto) {
+    sea fd = socket(2, 1, 0)
+    si (fd < 0) { lanzar "cristal: no se pudo crear el socket" }
+    sea uno = c_reservar(4)
+    c_escribir32(uno, 0, 1)
+    sea linux = existe_archivo("/proc/meminfo")
+    si (linux) { setsockopt(fd, 1, 2, uno, 4) } sino { setsockopt(fd, 65535, 4, uno, 4) }
+    c_liberar(uno)
+    sea elegido = puerto
+    sea intentos = 0
+    mientras (verdadero) {
+        si (puerto == 0) { elegido = 20000 + bytes_leer_entero(bytes_aleatorios(2), 0, 2, 0) % 40000 }
+        sea dir = char_de(2) + char_de(0)
+        si (linux == falso) { dir = char_de(16) + char_de(2) }
+        dir = dir + char_de(piso(elegido / 256)) + char_de(elegido % 256) + char_de(127) + char_de(0) + char_de(0) + char_de(1)
+        mientras (longitud(dir) < 16) { dir = dir + char_de(0) }
+        sea pd = c_desde_bytes(dir)
+        sea r = bind(fd, pd, 16)
+        c_liberar(pd)
+        si (r == 0) { romper }
+        intentos = intentos + 1
+        si (puerto != 0 o intentos > 40) {
+            close(fd)
+            lanzar "cristal: no se pudo escuchar en 127.0.0.1:" + elegido
+        }
+    }
+    listen(fd, 32)
+    net_espera(fd, 20)
+    app["escucha"] = fd
+    app["puerto"] = elegido
+    retornar elegido
+}
+
+funcion _cx_leer_solicitud(fd) {
+    net_espera(fd, 3000)
+    sea datos = ""
+    sea fin_cab = -1
+    mientras (fin_cab < 0) {
+        sea parte = net_recibir(fd, 65536)
+        si (parte == "") { retornar nulo }
+        datos = datos + parte
+        fin_cab = texto_indice(datos, "\r\n\r\n")
+        si (longitud(datos) > 65536 y fin_cab < 0) { retornar nulo }
+    }
+    sea cabecera = subtexto(datos, 0, fin_cab)
+    sea lineas = texto_dividir(cabecera, "\r\n")
+    sea primera = texto_dividir(lineas[0], " ")
+    si (longitud(primera) < 3) { retornar nulo }
+    sea cab = {}
+    sea i = 1
+    mientras (i < longitud(lineas)) {
+        sea l = lineas[i]
+        sea d = texto_indice(l, ":")
+        si (d > 0) { cab[texto_minusculas(texto_recortar(subtexto(l, 0, d)))] = texto_recortar(subtexto(l, d + 1, longitud(l))) }
+        i = i + 1
+    }
+    sea cuerpo = subtexto(datos, fin_cab + 4, longitud(datos))
+    sea largo = 0
+    si (tiene_clave(cab, "content-length")) {
+        intentar { largo = a_numero(cab["content-length"]) } capturar (e) { retornar nulo }
+    }
+    si (largo > 16777216 o largo < 0) { retornar nulo }
+    mientras (longitud(cuerpo) < largo) {
+        sea parte = net_recibir(fd, 65536)
+        si (parte == "") { retornar nulo }
+        cuerpo = cuerpo + parte
+    }
+    retornar {"metodo": primera[0], "ruta": primera[1], "cabeceras": cab, "cuerpo": subtexto(cuerpo, 0, largo)}
+}
+
+funcion _cx_escribir(fd, r, cabeza) {
+    sea t = "HTTP/1.1 " + r["estado"] + " " + ({"200": "OK", "302": "Found", "400": "Bad Request", "403": "Forbidden", "404": "Not Found", "405": "Method Not Allowed"}["" + r["estado"]] ?? "OK") + "\r\n"
+    para k en claves(r["cabeceras"]) {
+        // Sin saltos de línea en las cabeceras.
+        sea v = texto_reemplazar(texto_reemplazar("" + r["cabeceras"][k], "\r", ""), "\n", "")
+        t = t + k + ": " + v + "\r\n"
+    }
+    t = t + "content-length: " + longitud(r["cuerpo"]) + "\r\nconnection: close\r\n\r\n"
+    si (cabeza == falso) { t = t + r["cuerpo"] }
+    intentar { net_enviar(fd, t) } capturar (e) { }
+}
+
+/// Atiende solicitudes durante ms milisegundos.
+funcion cristal_atender(app, ms) {
+    sea fin = tiempo_ms() + ms
+    mientras (verdadero) {
+        sea fd = accept(app["escucha"], c_reservar(16), c_reservar(4))
+        si (fd >= 0) {
+            sea sol = nulo
+            intentar { sol = _cx_leer_solicitud(fd) } capturar (e) { sol = nulo }
+            si (sol != nulo) {
+                sea r = cristal_manejar(app, sol)
+                _cx_escribir(fd, r, sol["metodo"] == "HEAD")
+            }
+            close(fd)
+        }
+        si (tiempo_ms() >= fin o app["cerrar"]) { romper }
+    }
+}
+
+/// Deja de escuchar.
+funcion cristal_cerrar(app) {
+    si (app["escucha"] != nulo) { close(app["escucha"]) }
+    app["escucha"] = nulo
+}
+
+// ---------- ventana ----------
+
+funcion _cx_tmp() {
+    sea t = variable_entorno("TMPDIR") ?? ""
+    si (t == "") { t = variable_entorno("TEMP") ?? "" }
+    si (t == "") { t = "/tmp" }
+    si (texto_termina_con(t, "/") == falso y texto_termina_con(t, "\\") == falso) { t = t + "/" }
+    retornar t
+}
+
+funcion _cx_comillas(t) { retornar "'" + texto_reemplazar(t, "'", "'\\''") + "'" }
+
+/// Abre la ventana: navegador del sistema en modo app (o el de siempre).
+/// Devuelve el comando usado.
+funcion cristal_abrir_ventana(app) {
+    sea url = cristal_url(app)
+    sea so = "linux"
+    si (existe_archivo("/System/Library/CoreServices")) { so = "macos" }
+    sino si ((variable_entorno("OS") ?? "") == "Windows_NT") { so = "windows" }
+    sea tam = "--window-size=" + app["ancho"] + "," + app["alto"]
+    sea perfil = "--user-data-dir=" + _cx_comillas(_cx_tmp() + "cristal-" + app["token"])
+    sea cmd = nulo
+    sea propio = variable_entorno("CRISTAL_NAVEGADOR")
+    si (propio != nulo y propio != "") { cmd = _cx_comillas(propio) + " --app=" + _cx_comillas(url) + " " + tam + " " + perfil }
+    sino si (so == "macos") {
+        para nombre en ["Google Chrome", "Chromium", "Microsoft Edge", "Brave Browser"] {
+            si (cmd == nulo y existe_archivo("/Applications/" + nombre + ".app")) { cmd = "open -n -a " + _cx_comillas(nombre) + " --args --app=" + _cx_comillas(url) + " " + tam + " " + perfil }
+        }
+        si (cmd == nulo) { cmd = "open " + _cx_comillas(url) }
+    } sino si (so == "windows") {
+        cmd = "start \"\" msedge --app=\"" + url + "\" " + tam
+    } sino {
+        para ruta en ["/usr/bin/google-chrome", "/usr/bin/chromium", "/usr/bin/chromium-browser", "/usr/bin/microsoft-edge", "/snap/bin/chromium"] {
+            si (cmd == nulo y existe_archivo(ruta)) { cmd = ruta + " --app=" + _cx_comillas(url) + " " + tam + " " + perfil }
+        }
+        si (cmd == nulo) { cmd = "xdg-open " + _cx_comillas(url) }
+    }
+    si (so == "windows") { sistema_comando(cmd) } sino { sistema_comando(cmd + " >/dev/null 2>&1 &") }
+    retornar cmd
+}
+
+/// Sirve, abre la ventana y atiende hasta que el frontend llame a close()
+/// o deje de dar señales de vida por 10 segundos.
+funcion cristal_ejecutar(app) {
+    si (app["escucha"] == nulo) { cristal_servir(app, 0) }
+    cristal_abrir_ventana(app)
+    sea inicio = tiempo_ms()
+    mientras (app["cerrar"] == falso) {
+        cristal_atender(app, 200)
+        sea ul = app["ultimo_latido"]
+        si (ul != nulo y tiempo_ms() - ul > 10000) { romper }
+        si (ul == nulo y tiempo_ms() - inicio > 120000) { romper }
+    }
+    cristal_cerrar(app)
+}
