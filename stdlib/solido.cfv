@@ -1,0 +1,1223 @@
+// stdlib/solido.cfv — física 3D de cuerpos rígidos al estilo de Jolt, en
+// C-Forge puro: cuerpos dinámicos, estáticos y cinemáticos con formas
+// (esfera, caja, cápsula y plano) y masa e inercia según la densidad; fase
+// amplia por barrido y poda, contactos con varios puntos (cajas con SAT y
+// recorte de caras, esferas, cápsulas y planos), solver de impulsos
+// secuenciales con arranque en caliente, fricción, restitución y corrección
+// de posición; restricciones de punto, distancia (barra o cuerda), bisagra
+// con límites y fija; islas de cuerpos conectados (independientes entre sí,
+// listas para repartirse en hilos con "enjambre"), sueño y despertar,
+// fuerzas e impulsos, rayos y consultas por esfera.
+// Idea de Jolt Physics (MIT), escrito desde cero. En inglés: importar "jolt".
+//
+//   importar "solido"
+//   sea m = solido_mundo(nulo)
+//   solido_cuerpo(m, {"forma": solido_plano([0, 1, 0], 0), "tipo": "estatico"})
+//   sea b = solido_cuerpo(m, {"forma": solido_caja([0.5, 0.5, 0.5]), "posicion": [0, 5, 0]})
+//   repetir 120 veces: solido_paso(m, 1 / 60)
+//   mostrar(solido_posicion(m, b))
+
+// ---------- vectores, cuaterniones y matrices ----------
+
+funcion _sd_suma(a, b) { retornar [a[0] + b[0], a[1] + b[1], a[2] + b[2]] }
+funcion _sd_resta(a, b) { retornar [a[0] - b[0], a[1] - b[1], a[2] - b[2]] }
+funcion _sd_esc(a, k) { retornar [a[0] * k, a[1] * k, a[2] * k] }
+funcion _sd_punto(a, b) { retornar a[0] * b[0] + a[1] * b[1] + a[2] * b[2] }
+funcion _sd_cruz(a, b) { retornar [a[1] * b[2] - a[2] * b[1], a[2] * b[0] - a[0] * b[2], a[0] * b[1] - a[1] * b[0]] }
+funcion _sd_largo(a) { retornar raiz(_sd_punto(a, a)) }
+funcion _sd_norm(a) {
+    sea l = _sd_largo(a)
+    si (l < 0.000000000001) { retornar [0, 0, 0] }
+    retornar _sd_esc(a, 1 / l)
+}
+funcion _sd_neg(a) { retornar [0 - a[0], 0 - a[1], 0 - a[2]] }
+
+funcion _sd_q_mul(a, b) {
+    retornar [a[0] * b[0] - a[1] * b[1] - a[2] * b[2] - a[3] * b[3],
+        a[0] * b[1] + a[1] * b[0] + a[2] * b[3] - a[3] * b[2],
+        a[0] * b[2] - a[1] * b[3] + a[2] * b[0] + a[3] * b[1],
+        a[0] * b[3] + a[1] * b[2] - a[2] * b[1] + a[3] * b[0]]
+}
+funcion _sd_q_norm(q) {
+    sea l = raiz(q[0] * q[0] + q[1] * q[1] + q[2] * q[2] + q[3] * q[3])
+    retornar [q[0] / l, q[1] / l, q[2] / l, q[3] / l]
+}
+funcion _sd_q_conj(q) { retornar [q[0], 0 - q[1], 0 - q[2], 0 - q[3]] }
+
+/// Cuaternión de un eje (unitario) y un ángulo en radianes.
+funcion solido_cuaternion(eje, angulo) {
+    sea n = _sd_norm(eje)
+    sea s = seno(angulo / 2)
+    retornar [coseno(angulo / 2), n[0] * s, n[1] * s, n[2] * s]
+}
+
+// Matriz de rotación (por filas) de un cuaternión.
+funcion _sd_q_mat(q) {
+    sea w = q[0]
+    sea x = q[1]
+    sea y_ = q[2]
+    sea z = q[3]
+    retornar [1 - 2 * (y_ * y_ + z * z), 2 * (x * y_ - w * z), 2 * (x * z + w * y_),
+        2 * (x * y_ + w * z), 1 - 2 * (x * x + z * z), 2 * (y_ * z - w * x),
+        2 * (x * z - w * y_), 2 * (y_ * z + w * x), 1 - 2 * (x * x + y_ * y_)]
+}
+
+funcion _sd_mv(m, v) { retornar [m[0] * v[0] + m[1] * v[1] + m[2] * v[2], m[3] * v[0] + m[4] * v[1] + m[5] * v[2], m[6] * v[0] + m[7] * v[1] + m[8] * v[2]] }
+funcion _sd_mtv(m, v) { retornar [m[0] * v[0] + m[3] * v[1] + m[6] * v[2], m[1] * v[0] + m[4] * v[1] + m[7] * v[2], m[2] * v[0] + m[5] * v[1] + m[8] * v[2]] }
+funcion _sd_col(m, i) { retornar [m[i], m[3 + i], m[6 + i]] }
+
+// R · diag(d) · Rᵀ
+funcion _sd_rdr(r, d) {
+    sea o = []
+    sea i = 0
+    mientras (i < 3) {
+        sea j = 0
+        mientras (j < 3) {
+            o.agregar(r[i * 3] * d[0] * r[j * 3] + r[i * 3 + 1] * d[1] * r[j * 3 + 1] + r[i * 3 + 2] * d[2] * r[j * 3 + 2])
+            j = j + 1
+        }
+        i = i + 1
+    }
+    retornar o
+}
+
+funcion _sd_inv3(m) {
+    sea a = m[0]
+    sea b = m[1]
+    sea c = m[2]
+    sea d = m[3]
+    sea e = m[4]
+    sea f = m[5]
+    sea g = m[6]
+    sea h = m[7]
+    sea i = m[8]
+    sea A = e * i - f * h
+    sea B = 0 - (d * i - f * g)
+    sea C = d * h - e * g
+    sea det = a * A + b * B + c * C
+    si (absoluto(det) < 0.000000000001) { retornar [0, 0, 0, 0, 0, 0, 0, 0, 0] }
+    sea k = 1 / det
+    retornar [A * k, 0 - (b * i - c * h) * k, (b * f - c * e) * k, B * k, (a * i - c * g) * k, 0 - (a * f - c * d) * k, C * k, 0 - (a * h - b * g) * k, (a * e - b * d) * k]
+}
+
+// Matriz del producto vectorial [r]×.
+funcion _sd_hat(r) { retornar [0, 0 - r[2], r[1], r[2], 0, 0 - r[0], 0 - r[1], r[0], 0] }
+funcion _sd_mm(a, b) {
+    sea o = []
+    sea i = 0
+    mientras (i < 3) {
+        sea j = 0
+        mientras (j < 3) {
+            o.agregar(a[i * 3] * b[j] + a[i * 3 + 1] * b[3 + j] + a[i * 3 + 2] * b[6 + j])
+            j = j + 1
+        }
+        i = i + 1
+    }
+    retornar o
+}
+funcion _sd_msuma(a, b) {
+    sea o = []
+    sea i = 0
+    mientras (i < 9) {
+        o.agregar(a[i] + b[i])
+        i = i + 1
+    }
+    retornar o
+}
+
+// ---------- formas ----------
+
+/// Esfera de radio r.
+funcion solido_esfera(r) { retornar {"tipo": "esfera", "radio": r} }
+/// Caja con medias dimensiones [hx, hy, hz].
+funcion solido_caja(medias) { retornar {"tipo": "caja", "medias": medias} }
+/// Cápsula a lo largo del eje Y local: radio y media altura del segmento.
+funcion solido_capsula(radio, media_altura) { retornar {"tipo": "capsula", "radio": radio, "media": media_altura} }
+/// Plano infinito (solo estático): normal y distancia al origen.
+funcion solido_plano(normal, distancia) { retornar {"tipo": "plano", "normal": _sd_norm(normal), "d": distancia} }
+
+// Masa e inercia (diagonal, local) según la densidad.
+funcion _sd_masa(forma, densidad) {
+    si (forma["tipo"] == "esfera") {
+        sea r = forma["radio"]
+        sea m = densidad * 4 / 3 * 3.141592653589793 * r * r * r
+        sea i = 0.4 * m * r * r
+        retornar [m, [i, i, i]]
+    }
+    si (forma["tipo"] == "caja") {
+        sea h = forma["medias"]
+        sea m = densidad * 8 * h[0] * h[1] * h[2]
+        sea x = 2 * h[0]
+        sea y_ = 2 * h[1]
+        sea z = 2 * h[2]
+        retornar [m, [m / 12 * (y_ * y_ + z * z), m / 12 * (x * x + z * z), m / 12 * (x * x + y_ * y_)]]
+    }
+    si (forma["tipo"] == "capsula") {
+        sea r = forma["radio"]
+        sea hl = forma["media"] * 2
+        sea mc = densidad * 3.141592653589793 * r * r * hl
+        sea ms = densidad * 4 / 3 * 3.141592653589793 * r * r * r
+        sea iy = mc * r * r / 2 + ms * 2 * r * r / 5
+        sea ix = mc * (hl * hl / 12 + r * r / 4) + ms * (2 * r * r / 5 + hl * hl / 4 + 3 * hl * r / 8)
+        retornar [mc + ms, [ix, iy, ix]]
+    }
+    retornar [0, [0, 0, 0]]
+}
+
+// ---------- mundo y cuerpos ----------
+
+/// Mundo. opciones: "gravedad" ([0, -9.81, 0]), "iteraciones" (10),
+/// "subpasos" (1), "dormir" (verdadero).
+funcion solido_mundo(opciones) {
+    sea op = opciones ?? {}
+    retornar {"cuerpos": [], "restricciones": [], "gravedad": op["gravedad"] ?? [0, -9.81, 0], "iteraciones": op["iteraciones"] ?? 10,
+        "subpasos": op["subpasos"] ?? 1, "dormir": op["dormir"] ?? verdadero, "contactos": [], "cache": {}, "tiempo": 0, "islas": []}
+}
+
+/// Agrega un cuerpo y devuelve su número. opciones: "forma", "tipo"
+/// ("dinamico", "estatico", "cinematico"), "posicion", "rotacion"
+/// (cuaternión [w, x, y, z]), "velocidad", "velocidad_angular",
+/// "densidad" (1000) o "masa", "friccion" (0.5), "restitucion" (0),
+/// "amortiguacion" (0.05), "amortiguacion_angular" (0.05), "datos".
+funcion solido_cuerpo(m, opciones) {
+    sea op = opciones ?? {}
+    sea forma = op["forma"] ?? solido_esfera(0.5)
+    sea tipo_c = op["tipo"] ?? "dinamico"
+    tipo_c = {"dynamic": "dinamico", "static": "estatico", "kinematic": "cinematico"}[tipo_c] ?? tipo_c
+    si (forma["tipo"] == "plano") { tipo_c = "estatico" }
+    sea mi = _sd_masa(forma, op["densidad"] ?? 1000)
+    si (tiene_clave(op, "masa") y mi[0] > 0) {
+        sea k = op["masa"] / mi[0]
+        mi = [op["masa"], _sd_esc(mi[1], k)]
+    }
+    sea inv_m = 0
+    sea inv_i = [0, 0, 0]
+    si (tipo_c == "dinamico" y mi[0] > 0) {
+        inv_m = 1 / mi[0]
+        inv_i = [1 / mi[1][0], 1 / mi[1][1], 1 / mi[1][2]]
+    }
+    sea b = {"id": longitud(m["cuerpos"]), "forma": forma, "tipo": tipo_c, "x": op["posicion"] ?? [0, 0, 0], "q": _sd_q_norm(op["rotacion"] ?? [1, 0, 0, 0]),
+        "v": op["velocidad"] ?? [0, 0, 0], "w": op["velocidad_angular"] ?? [0, 0, 0], "inv_m": inv_m, "inv_i_local": inv_i, "masa": mi[0],
+        "friccion": op["friccion"] ?? 0.5, "restitucion": op["restitucion"] ?? 0, "amort": op["amortiguacion"] ?? 0.05, "amort_ang": op["amortiguacion_angular"] ?? 0.05,
+        "fuerza": [0, 0, 0], "torque": [0, 0, 0], "dormido": falso, "quieto": 0, "datos": op["datos"] ?? nulo, "isla": -1}
+    _sd_actualizar(b)
+    m["cuerpos"].agregar(b)
+    retornar b["id"]
+}
+
+funcion _sd_actualizar(b) {
+    b["R"] = _sd_q_mat(b["q"])
+    b["inv_i"] = _sd_rdr(b["R"], b["inv_i_local"])
+    b["aabb"] = _sd_aabb(b)
+}
+
+funcion _sd_aabb(b) {
+    sea f = b["forma"]
+    sea x = b["x"]
+    si (f["tipo"] == "esfera") {
+        sea r = f["radio"]
+        retornar [[x[0] - r, x[1] - r, x[2] - r], [x[0] + r, x[1] + r, x[2] + r]]
+    }
+    si (f["tipo"] == "caja") {
+        sea R = b["R"]
+        sea h = f["medias"]
+        sea e = [absoluto(R[0]) * h[0] + absoluto(R[1]) * h[1] + absoluto(R[2]) * h[2], absoluto(R[3]) * h[0] + absoluto(R[4]) * h[1] + absoluto(R[5]) * h[2], absoluto(R[6]) * h[0] + absoluto(R[7]) * h[1] + absoluto(R[8]) * h[2]]
+        retornar [_sd_resta(x, e), _sd_suma(x, e)]
+    }
+    si (f["tipo"] == "capsula") {
+        sea eje = _sd_esc(_sd_col(b["R"], 1), f["media"])
+        sea r = f["radio"]
+        sea e = [absoluto(eje[0]) + r, absoluto(eje[1]) + r, absoluto(eje[2]) + r]
+        retornar [_sd_resta(x, e), _sd_suma(x, e)]
+    }
+    retornar [[-1000000000, -1000000000, -1000000000], [1000000000, 1000000000, 1000000000]]
+}
+
+/// Posición, rotación y velocidades de un cuerpo.
+funcion solido_posicion(m, id) { retornar m["cuerpos"][id]["x"] }
+funcion solido_rotacion(m, id) { retornar m["cuerpos"][id]["q"] }
+funcion solido_velocidad(m, id) { retornar m["cuerpos"][id]["v"] }
+funcion solido_velocidad_angular(m, id) { retornar m["cuerpos"][id]["w"] }
+funcion solido_dormido(m, id) { retornar m["cuerpos"][id]["dormido"] }
+
+/// Mueve un cuerpo (lo despierta).
+funcion solido_poner(m, id, posicion, rotacion) {
+    sea b = m["cuerpos"][id]
+    b["x"] = posicion
+    si (rotacion != nulo) { b["q"] = _sd_q_norm(rotacion) }
+    _sd_actualizar(b)
+    _sd_despertar(b)
+}
+
+/// Cambia la velocidad lineal (y angular, si no es nulo).
+funcion solido_poner_velocidad(m, id, v, w) {
+    sea b = m["cuerpos"][id]
+    b["v"] = v
+    si (w != nulo) { b["w"] = w }
+    _sd_despertar(b)
+}
+
+/// Aplica una fuerza (en el centro o en un punto del mundo) durante el próximo paso.
+funcion solido_fuerza(m, id, f, punto) {
+    sea b = m["cuerpos"][id]
+    b["fuerza"] = _sd_suma(b["fuerza"], f)
+    si (punto != nulo) { b["torque"] = _sd_suma(b["torque"], _sd_cruz(_sd_resta(punto, b["x"]), f)) }
+    _sd_despertar(b)
+}
+
+/// Aplica un impulso (cambio instantáneo de cantidad de movimiento).
+funcion solido_impulso(m, id, j, punto) {
+    sea b = m["cuerpos"][id]
+    b["v"] = _sd_suma(b["v"], _sd_esc(j, b["inv_m"]))
+    si (punto != nulo) { b["w"] = _sd_suma(b["w"], _sd_mv(b["inv_i"], _sd_cruz(_sd_resta(punto, b["x"]), j))) }
+    _sd_despertar(b)
+}
+
+funcion _sd_despertar(b) {
+    b["dormido"] = falso
+    b["quieto"] = 0
+}
+
+// ---------- colisiones ----------
+
+funcion _sd_contacto(a, b, n) { retornar {"a": a["id"], "b": b["id"], "n": n, "puntos": []} }
+funcion _sd_pt(c, p, pen) { c["puntos"].agregar({"p": p, "pen": pen}) }
+
+funcion _sd_segmento(b) {
+    sea eje = _sd_esc(_sd_col(b["R"], 1), b["forma"]["media"])
+    retornar [_sd_resta(b["x"], eje), _sd_suma(b["x"], eje)]
+}
+
+funcion _sd_cercano_segmento(p, a, b) {
+    sea ab = _sd_resta(b, a)
+    sea t = 0
+    sea l2 = _sd_punto(ab, ab)
+    si (l2 > 0) { t = _sd_punto(_sd_resta(p, a), ab) / l2 }
+    si (t < 0) { t = 0 }
+    si (t > 1) { t = 1 }
+    retornar _sd_suma(a, _sd_esc(ab, t))
+}
+
+// Puntos más cercanos entre dos segmentos.
+funcion _sd_cercanos_segmentos(p1, q1, p2, q2) {
+    sea d1 = _sd_resta(q1, p1)
+    sea d2 = _sd_resta(q2, p2)
+    sea r = _sd_resta(p1, p2)
+    sea a = _sd_punto(d1, d1)
+    sea e = _sd_punto(d2, d2)
+    sea f = _sd_punto(d2, r)
+    sea s = 0
+    sea t = 0
+    si (a <= 0.000000001 y e <= 0.000000001) { retornar [p1, p2] }
+    si (a <= 0.000000001) { t = _sd_limitar(f / e, 0, 1) } sino {
+        sea c = _sd_punto(d1, r)
+        si (e <= 0.000000001) { s = _sd_limitar(0 - c / a, 0, 1) } sino {
+            sea b = _sd_punto(d1, d2)
+            sea den = a * e - b * b
+            si (den != 0) { s = _sd_limitar((b * f - c * e) / den, 0, 1) }
+            t = (b * s + f) / e
+            si (t < 0) {
+                t = 0
+                s = _sd_limitar(0 - c / a, 0, 1)
+            } sino si (t > 1) {
+                t = 1
+                s = _sd_limitar((b - c) / a, 0, 1)
+            }
+        }
+    }
+    retornar [_sd_suma(p1, _sd_esc(d1, s)), _sd_suma(p2, _sd_esc(d2, t))]
+}
+
+funcion _sd_limitar(v, a, b) {
+    si (v < a) { retornar a }
+    si (v > b) { retornar b }
+    retornar v
+}
+
+// Dos esferas (centro y radio): contacto o nulo.
+funcion _sd_esferas(a, b, ca, ra, cb, rb) {
+    sea d = _sd_resta(cb, ca)
+    sea dist = _sd_largo(d)
+    si (dist >= ra + rb) { retornar nulo }
+    sea n = [0, 1, 0]
+    si (dist > 0.000001) { n = _sd_esc(d, 1 / dist) }
+    sea c = _sd_contacto(a, b, n)
+    sea pen = ra + rb - dist
+    _sd_pt(c, _sd_suma(ca, _sd_esc(n, ra - pen / 2)), pen)
+    retornar c
+}
+
+funcion _sd_esfera_plano(pl, b, centro, r) {
+    sea n = pl["forma"]["normal"]
+    sea dist = _sd_punto(n, centro) - pl["forma"]["d"]
+    si (dist >= r) { retornar nulo }
+    sea c = _sd_contacto(pl, b, n)
+    sea pen = r - dist
+    _sd_pt(c, _sd_resta(centro, _sd_esc(n, dist + pen / 2)), pen)
+    retornar c
+}
+
+funcion _sd_vertices(b) {
+    sea h = b["forma"]["medias"]
+    sea r = []
+    para sx en [-1, 1] {
+        para sy en [-1, 1] {
+            para sz en [-1, 1] { r.agregar(_sd_suma(b["x"], _sd_mv(b["R"], [sx * h[0], sy * h[1], sz * h[2]]))) }
+        }
+    }
+    retornar r
+}
+
+funcion _sd_caja_plano(pl, b) {
+    sea n = pl["forma"]["normal"]
+    sea c = _sd_contacto(pl, b, n)
+    para v en _sd_vertices(b) {
+        sea dist = _sd_punto(n, v) - pl["forma"]["d"]
+        si (dist < 0.002) { _sd_pt(c, _sd_resta(v, _sd_esc(n, dist / 2)), 0 - dist) }
+    }
+    si (longitud(c["puntos"]) == 0) { retornar nulo }
+    retornar c
+}
+
+// Esfera contra caja (a = caja, b = esfera): normal de la caja a la esfera.
+funcion _sd_caja_esfera(cj, es, centro, r) {
+    sea h = cj["forma"]["medias"]
+    sea local = _sd_mtv(cj["R"], _sd_resta(centro, cj["x"]))
+    sea cl = [_sd_limitar(local[0], 0 - h[0], h[0]), _sd_limitar(local[1], 0 - h[1], h[1]), _sd_limitar(local[2], 0 - h[2], h[2])]
+    sea dentro = cl[0] == local[0] y cl[1] == local[1] y cl[2] == local[2]
+    sea n_local = nulo
+    sea pen = 0
+    sea punto_local = cl
+    si (dentro) {
+        // El centro está dentro: se sale por la cara más cercana.
+        sea mejor = 1000000000
+        sea eje = 0
+        sea signo = 1
+        sea k = 0
+        mientras (k < 3) {
+            sea dpos = h[k] - local[k]
+            sea dneg = local[k] + h[k]
+            si (dpos < mejor) {
+                mejor = dpos
+                eje = k
+                signo = 1
+            }
+            si (dneg < mejor) {
+                mejor = dneg
+                eje = k
+                signo = -1
+            }
+            k = k + 1
+        }
+        n_local = [0, 0, 0]
+        n_local[eje] = signo
+        pen = r + mejor
+        punto_local = [local[0], local[1], local[2]]
+        punto_local[eje] = signo * h[eje]
+    } sino {
+        sea d = _sd_resta(local, cl)
+        sea dist = _sd_largo(d)
+        si (dist >= r) { retornar nulo }
+        n_local = _sd_esc(d, 1 / dist)
+        pen = r - dist
+    }
+    sea n = _sd_mv(cj["R"], n_local)
+    sea c = _sd_contacto(cj, es, n)
+    _sd_pt(c, _sd_suma(cj["x"], _sd_mv(cj["R"], punto_local)), pen)
+    retornar c
+}
+
+// Caja contra caja: SAT con 15 ejes y recorte de la cara incidente.
+funcion _sd_cajas(A, B) {
+    sea RA = A["R"]
+    sea RB = B["R"]
+    sea hA = A["forma"]["medias"]
+    sea hB = B["forma"]["medias"]
+    sea ejesA = [_sd_col(RA, 0), _sd_col(RA, 1), _sd_col(RA, 2)]
+    sea ejesB = [_sd_col(RB, 0), _sd_col(RB, 1), _sd_col(RB, 2)]
+    sea d = _sd_resta(B["x"], A["x"])
+    sea mejor = 1000000000
+    sea eje_mejor = nulo
+    sea tipo_mejor = -1
+    sea idx = [0, 0]
+    sea candidatos = []
+    para i en [0, 1, 2] { candidatos.agregar([ejesA[i], 0, i, 0]) }
+    para j en [0, 1, 2] { candidatos.agregar([ejesB[j], 1, j, 0]) }
+    para i en [0, 1, 2] { para j en [0, 1, 2] { candidatos.agregar([_sd_cruz(ejesA[i], ejesB[j]), 2, i, j]) } }
+    para cand en candidatos {
+        sea L = cand[0]
+        sea largo = _sd_largo(L)
+        si (largo > 0.0001) {
+            L = _sd_esc(L, 1 / largo)
+            sea ra = hA[0] * absoluto(_sd_punto(L, ejesA[0])) + hA[1] * absoluto(_sd_punto(L, ejesA[1])) + hA[2] * absoluto(_sd_punto(L, ejesA[2]))
+            sea rb = hB[0] * absoluto(_sd_punto(L, ejesB[0])) + hB[1] * absoluto(_sd_punto(L, ejesB[1])) + hB[2] * absoluto(_sd_punto(L, ejesB[2]))
+            sea dist = absoluto(_sd_punto(d, L))
+            sea solape = ra + rb - dist
+            si (solape < 0) { retornar nulo }
+            // Preferimos caras sobre aristas (más estable).
+            sea comparar = solape
+            si (cand[1] == 2) { comparar = solape * 1.05 + 0.001 }
+            si (comparar < mejor) {
+                mejor = comparar
+                eje_mejor = L
+                tipo_mejor = cand[1]
+                idx = [cand[2], cand[3]]
+            }
+        }
+    }
+    sea n = eje_mejor
+    si (_sd_punto(n, d) < 0) { n = _sd_neg(n) }
+    sea c = _sd_contacto(A, B, n)
+    si (tipo_mejor == 2) {
+        // Arista contra arista.
+        sea pa = A["x"]
+        para k en [0, 1, 2] {
+            si (k != idx[0]) {
+                sea s = 1
+                si (_sd_punto(n, ejesA[k]) < 0) { s = -1 }
+                pa = _sd_suma(pa, _sd_esc(ejesA[k], s * hA[k]))
+            }
+        }
+        sea pb = B["x"]
+        para k en [0, 1, 2] {
+            si (k != idx[1]) {
+                sea s = 1
+                si (_sd_punto(n, ejesB[k]) > 0) { s = -1 }
+                pb = _sd_suma(pb, _sd_esc(ejesB[k], s * hB[k]))
+            }
+        }
+        sea ea = _sd_esc(ejesA[idx[0]], hA[idx[0]])
+        sea eb = _sd_esc(ejesB[idx[1]], hB[idx[1]])
+        sea cc = _sd_cercanos_segmentos(_sd_resta(pa, ea), _sd_suma(pa, ea), _sd_resta(pb, eb), _sd_suma(pb, eb))
+        sea pen = _sd_punto(_sd_resta(cc[0], cc[1]), n)
+        _sd_pt(c, _sd_esc(_sd_suma(cc[0], cc[1]), 0.5), maximo(pen, 0))
+        retornar c
+    }
+    // Cara de referencia e incidente.
+    sea ref = A
+    sea inc = B
+    sea ejes_ref = ejesA
+    sea ejes_inc = ejesB
+    sea h_ref = hA
+    sea h_inc = hB
+    sea n_ref = n
+    si (tipo_mejor == 1) {
+        ref = B
+        inc = A
+        ejes_ref = ejesB
+        ejes_inc = ejesA
+        h_ref = hB
+        h_inc = hA
+        n_ref = _sd_neg(n)
+    }
+    sea k_ref = idx[0]
+    sea centro_ref = _sd_suma(ref["x"], _sd_esc(n_ref, h_ref[k_ref]))
+    // Cara incidente: la más opuesta a n_ref.
+    sea j = 0
+    sea mejor_dot = -1
+    para k en [0, 1, 2] {
+        sea dd = absoluto(_sd_punto(n_ref, ejes_inc[k]))
+        si (dd > mejor_dot) {
+            mejor_dot = dd
+            j = k
+        }
+    }
+    sea s = -1
+    si (_sd_punto(n_ref, ejes_inc[j]) < 0) { s = 1 }
+    sea centro_inc = _sd_suma(inc["x"], _sd_esc(ejes_inc[j], s * h_inc[j]))
+    sea otros = []
+    para k en [0, 1, 2] { si (k != j) { otros.agregar(k) } }
+    sea u = _sd_esc(ejes_inc[otros[0]], h_inc[otros[0]])
+    sea v = _sd_esc(ejes_inc[otros[1]], h_inc[otros[1]])
+    sea poli = [_sd_suma(_sd_suma(centro_inc, u), v), _sd_resta(_sd_suma(centro_inc, u), v), _sd_resta(_sd_resta(centro_inc, u), v), _sd_suma(_sd_resta(centro_inc, u), v)]
+    // Recorte contra los cuatro lados de la cara de referencia.
+    para k en [0, 1, 2] {
+        si (k != k_ref) {
+            sea ax = ejes_ref[k]
+            sea lim = _sd_punto(ax, ref["x"]) + h_ref[k]
+            poli = _sd_recortar(poli, ax, lim)
+            poli = _sd_recortar(poli, _sd_neg(ax), 0 - _sd_punto(ax, ref["x"]) + h_ref[k])
+        }
+    }
+    sea puntos = []
+    para p en poli {
+        sea sep = _sd_punto(n_ref, _sd_resta(p, centro_ref))
+        si (sep <= 0.005) { puntos.agregar([_sd_resta(p, _sd_esc(n_ref, sep / 2)), 0 - sep]) }
+    }
+    // Como mucho 4 puntos: el más profundo y los más separados.
+    si (longitud(puntos) > 4) { puntos = _sd_reducir(puntos) }
+    para pp en puntos { _sd_pt(c, pp[0], maximo(pp[1], 0)) }
+    si (longitud(c["puntos"]) == 0) { retornar nulo }
+    retornar c
+}
+
+funcion _sd_recortar(poli, n, lim) {
+    sea r = []
+    sea k = longitud(poli)
+    si (k == 0) { retornar r }
+    sea i = 0
+    mientras (i < k) {
+        sea a = poli[i]
+        sea b = poli[(i + 1) % k]
+        sea da = _sd_punto(n, a) - lim
+        sea db = _sd_punto(n, b) - lim
+        si (da <= 0) { r.agregar(a) }
+        si ((da < 0 y db > 0) o (da > 0 y db < 0)) {
+            sea t = da / (da - db)
+            r.agregar(_sd_suma(a, _sd_esc(_sd_resta(b, a), t)))
+        }
+        i = i + 1
+    }
+    retornar r
+}
+
+funcion _sd_reducir(puntos) {
+    sea elegidos = []
+    // El más profundo.
+    sea mejor = 0
+    sea i = 1
+    mientras (i < longitud(puntos)) {
+        si (puntos[i][1] > puntos[mejor][1]) { mejor = i }
+        i = i + 1
+    }
+    elegidos.agregar(puntos[mejor])
+    mientras (longitud(elegidos) < 4) {
+        sea lejano = nulo
+        sea dist_max = -1
+        para p en puntos {
+            sea dmin = 1000000000
+            para e en elegidos {
+                sea dd = _sd_largo(_sd_resta(p[0], e[0]))
+                si (dd < dmin) { dmin = dd }
+            }
+            si (dmin > dist_max) {
+                dist_max = dmin
+                lejano = p
+            }
+        }
+        elegidos.agregar(lejano)
+    }
+    retornar elegidos
+}
+
+// Contactos entre dos cuerpos (normal de a hacia b).
+funcion _sd_colision(a, b) {
+    sea ta = a["forma"]["tipo"]
+    sea tb = b["forma"]["tipo"]
+    si (tb == "plano" o (ta == "caja" y tb != "caja" y tb != "plano") o (ta == "capsula" y tb == "esfera")) {
+        sea c = _sd_colision(b, a)
+        si (c == nulo) { retornar nulo }
+        retornar {"a": a["id"], "b": b["id"], "n": _sd_neg(c["n"]), "puntos": c["puntos"]}
+    }
+    si (ta == "plano") {
+        si (tb == "esfera") { retornar _sd_esfera_plano(a, b, b["x"], b["forma"]["radio"]) }
+        si (tb == "caja") { retornar _sd_caja_plano(a, b) }
+        si (tb == "capsula") {
+            sea seg = _sd_segmento(b)
+            sea c = _sd_contacto(a, b, a["forma"]["normal"])
+            para p en seg {
+                sea x = _sd_esfera_plano(a, b, p, b["forma"]["radio"])
+                si (x != nulo) { para q en x["puntos"] { c["puntos"].agregar(q) } }
+            }
+            si (longitud(c["puntos"]) == 0) { retornar nulo }
+            retornar c
+        }
+        retornar nulo
+    }
+    si (ta == "esfera" y tb == "esfera") { retornar _sd_esferas(a, b, a["x"], a["forma"]["radio"], b["x"], b["forma"]["radio"]) }
+    si (ta == "esfera" y tb == "caja") {
+        sea c = _sd_caja_esfera(b, a, a["x"], a["forma"]["radio"])
+        si (c == nulo) { retornar nulo }
+        retornar {"a": a["id"], "b": b["id"], "n": _sd_neg(c["n"]), "puntos": c["puntos"]}
+    }
+    si (ta == "esfera" y tb == "capsula") {
+        sea seg = _sd_segmento(b)
+        retornar _sd_esferas(a, b, a["x"], a["forma"]["radio"], _sd_cercano_segmento(a["x"], seg[0], seg[1]), b["forma"]["radio"])
+    }
+    si (ta == "capsula" y tb == "capsula") {
+        sea s1 = _sd_segmento(a)
+        sea s2 = _sd_segmento(b)
+        sea cc = _sd_cercanos_segmentos(s1[0], s1[1], s2[0], s2[1])
+        retornar _sd_esferas(a, b, cc[0], a["forma"]["radio"], cc[1], b["forma"]["radio"])
+    }
+    si (ta == "capsula" y tb == "caja") {
+        // La cápsula como tres esferas sobre el segmento.
+        sea seg = _sd_segmento(a)
+        sea c = nulo
+        para t en [0, 0.5, 1] {
+            sea centro = _sd_suma(seg[0], _sd_esc(_sd_resta(seg[1], seg[0]), t))
+            sea x = _sd_caja_esfera(b, a, centro, a["forma"]["radio"])
+            si (x != nulo) {
+                si (c == nulo) { c = {"a": a["id"], "b": b["id"], "n": _sd_neg(x["n"]), "puntos": []} }
+                para q en x["puntos"] { c["puntos"].agregar(q) }
+            }
+        }
+        retornar c
+    }
+    si (ta == "caja" y tb == "caja") { retornar _sd_cajas(a, b) }
+    retornar nulo
+}
+
+// ---------- restricciones ----------
+
+/// Punto (rótula) entre dos cuerpos en un punto del mundo.
+funcion solido_punto(m, a, b, punto) {
+    sea A = m["cuerpos"][a]
+    sea B = m["cuerpos"][b]
+    m["restricciones"].agregar({"tipo": "punto", "a": a, "b": b, "la": _sd_mtv(A["R"], _sd_resta(punto, A["x"])), "lb": _sd_mtv(B["R"], _sd_resta(punto, B["x"])), "acum": [0, 0, 0]})
+    retornar longitud(m["restricciones"]) - 1
+}
+
+/// Distancia fija (barra) o máxima (cuerda: opciones "cuerda") entre dos
+/// puntos del mundo, uno en cada cuerpo.
+funcion solido_distancia(m, a, b, punto_a, punto_b, opciones) {
+    sea op = opciones ?? {}
+    sea A = m["cuerpos"][a]
+    sea B = m["cuerpos"][b]
+    m["restricciones"].agregar({"tipo": "distancia", "a": a, "b": b, "la": _sd_mtv(A["R"], _sd_resta(punto_a, A["x"])), "lb": _sd_mtv(B["R"], _sd_resta(punto_b, B["x"])),
+        "largo": op["largo"] ?? _sd_largo(_sd_resta(punto_b, punto_a)), "cuerda": op["cuerda"] ?? falso, "acum": 0})
+    retornar longitud(m["restricciones"]) - 1
+}
+
+/// Bisagra en un punto y un eje del mundo. opciones: "min" y "max" (radianes).
+funcion solido_bisagra(m, a, b, punto, eje, opciones) {
+    sea op = opciones ?? {}
+    sea A = m["cuerpos"][a]
+    sea B = m["cuerpos"][b]
+    sea e = _sd_norm(eje)
+    sea perp = _sd_cruz(e, [1, 0, 0])
+    si (_sd_largo(perp) < 0.1) { perp = _sd_cruz(e, [0, 1, 0]) }
+    perp = _sd_norm(perp)
+    m["restricciones"].agregar({"tipo": "bisagra", "a": a, "b": b, "la": _sd_mtv(A["R"], _sd_resta(punto, A["x"])), "lb": _sd_mtv(B["R"], _sd_resta(punto, B["x"])),
+        "eje_a": _sd_mtv(A["R"], e), "eje_b": _sd_mtv(B["R"], e), "ref_a": _sd_mtv(A["R"], perp), "ref_b": _sd_mtv(B["R"], perp),
+        "min": op["min"] ?? nulo, "max": op["max"] ?? nulo, "acum": [0, 0, 0], "acum_ang": [0, 0], "acum_lim": 0})
+    retornar longitud(m["restricciones"]) - 1
+}
+
+/// Unión fija (sin movimiento relativo).
+funcion solido_fija(m, a, b) {
+    sea A = m["cuerpos"][a]
+    sea B = m["cuerpos"][b]
+    sea punto = _sd_esc(_sd_suma(A["x"], B["x"]), 0.5)
+    m["restricciones"].agregar({"tipo": "fija", "a": a, "b": b, "la": _sd_mtv(A["R"], _sd_resta(punto, A["x"])), "lb": _sd_mtv(B["R"], _sd_resta(punto, B["x"])),
+        "q0": _sd_q_mul(B["q"], _sd_q_conj(A["q"])), "acum": [0, 0, 0], "acum_ang": [0, 0, 0]})
+    retornar longitud(m["restricciones"]) - 1
+}
+
+/// Ángulo de una bisagra (radianes).
+funcion solido_angulo(m, r) {
+    sea c = m["restricciones"][r]
+    sea A = m["cuerpos"][c["a"]]
+    sea B = m["cuerpos"][c["b"]]
+    sea ra = _sd_mv(A["R"], c["ref_a"])
+    sea rb = _sd_mv(B["R"], c["ref_b"])
+    sea e = _sd_mv(A["R"], c["eje_a"])
+    retornar _sd_atan2(_sd_punto(_sd_cruz(ra, rb), e), _sd_punto(ra, rb))
+}
+
+funcion _sd_atan2(y_, x) {
+    si (x > 0) { retornar arcotangente(y_ / x) }
+    si (x < 0 y y_ >= 0) { retornar arcotangente(y_ / x) + 3.141592653589793 }
+    si (x < 0 y y_ < 0) { retornar arcotangente(y_ / x) - 3.141592653589793 }
+    si (y_ > 0) { retornar 1.5707963267948966 }
+    si (y_ < 0) { retornar -1.5707963267948966 }
+    retornar 0
+}
+
+// ---------- solver ----------
+
+funcion _sd_vel_punto(b, r) { retornar _sd_suma(b["v"], _sd_cruz(b["w"], r)) }
+
+funcion _sd_aplicar(b, imp, r) {
+    si (b["inv_m"] == 0) { retornar nulo }
+    b["v"] = _sd_suma(b["v"], _sd_esc(imp, b["inv_m"]))
+    b["w"] = _sd_suma(b["w"], _sd_mv(b["inv_i"], _sd_cruz(r, imp)))
+}
+
+funcion _sd_aplicar_ang(b, imp) {
+    si (b["inv_m"] == 0) { retornar nulo }
+    b["w"] = _sd_suma(b["w"], _sd_mv(b["inv_i"], imp))
+}
+
+funcion _sd_masa_efectiva(A, B, ra, rb, n) {
+    sea ka = _sd_cruz(ra, n)
+    sea kb = _sd_cruz(rb, n)
+    sea k = A["inv_m"] + B["inv_m"] + _sd_punto(ka, _sd_mv(A["inv_i"], ka)) + _sd_punto(kb, _sd_mv(B["inv_i"], kb))
+    si (k <= 0) { retornar 0 }
+    retornar 1 / k
+}
+
+funcion _sd_tangentes(n) {
+    sea t1 = [0, 0, 0]
+    si (absoluto(n[0]) >= 0.57735) { t1 = _sd_norm([n[1], 0 - n[0], 0]) } sino { t1 = _sd_norm([0, n[2], 0 - n[1]]) }
+    retornar [t1, _sd_cruz(n, t1)]
+}
+
+funcion _sd_preparar_contactos(m, dt) {
+    sea nuevos = {}
+    para c en m["contactos"] {
+        sea A = m["cuerpos"][c["a"]]
+        sea B = m["cuerpos"][c["b"]]
+        sea t = _sd_tangentes(c["n"])
+        c["t"] = t
+        c["mu"] = raiz(A["friccion"] * B["friccion"])
+        sea e = maximo(A["restitucion"], B["restitucion"])
+        sea clave = "" + c["a"] + "-" + c["b"]
+        sea viejos = m["cache"][clave] ?? []
+        para pt en c["puntos"] {
+            pt["ra"] = _sd_resta(pt["p"], A["x"])
+            pt["rb"] = _sd_resta(pt["p"], B["x"])
+            pt["mn"] = _sd_masa_efectiva(A, B, pt["ra"], pt["rb"], c["n"])
+            pt["mt"] = [_sd_masa_efectiva(A, B, pt["ra"], pt["rb"], t[0]), _sd_masa_efectiva(A, B, pt["ra"], pt["rb"], t[1])]
+            sea vrel = _sd_resta(_sd_vel_punto(B, pt["rb"]), _sd_vel_punto(A, pt["ra"]))
+            sea vn = _sd_punto(vrel, c["n"])
+            pt["sesgo"] = 0.2 / dt * maximo(pt["pen"] - 0.005, 0)
+            si (vn < -1) { pt["sesgo"] = maximo(pt["sesgo"], 0 - e * vn) }
+            // Arranque en caliente con el punto más cercano del paso anterior.
+            pt["jn"] = 0
+            pt["jt"] = [0, 0]
+            pt["local"] = _sd_mtv(A["R"], pt["ra"])
+            para v en viejos {
+                si (_sd_largo(_sd_resta(v["local"], pt["local"])) < 0.05) {
+                    pt["jn"] = v["jn"]
+                    pt["jt"] = v["jt"]
+                }
+            }
+            sea imp = _sd_suma(_sd_esc(c["n"], pt["jn"]), _sd_suma(_sd_esc(t[0], pt["jt"][0]), _sd_esc(t[1], pt["jt"][1])))
+            _sd_aplicar(A, _sd_neg(imp), pt["ra"])
+            _sd_aplicar(B, imp, pt["rb"])
+        }
+    }
+}
+
+funcion _sd_resolver_contactos(m) {
+    para c en m["contactos"] {
+        sea A = m["cuerpos"][c["a"]]
+        sea B = m["cuerpos"][c["b"]]
+        sea n = c["n"]
+        para pt en c["puntos"] {
+            // Fricción.
+            sea k = 0
+            mientras (k < 2) {
+                sea t = c["t"][k]
+                sea vt = _sd_punto(_sd_resta(_sd_vel_punto(B, pt["rb"]), _sd_vel_punto(A, pt["ra"])), t)
+                sea dj = 0 - vt * pt["mt"][k]
+                sea lim = c["mu"] * pt["jn"]
+                sea nuevo = _sd_limitar(pt["jt"][k] + dj, 0 - lim, lim)
+                dj = nuevo - pt["jt"][k]
+                pt["jt"][k] = nuevo
+                sea imp = _sd_esc(t, dj)
+                _sd_aplicar(A, _sd_neg(imp), pt["ra"])
+                _sd_aplicar(B, imp, pt["rb"])
+                k = k + 1
+            }
+            // Normal.
+            sea vn = _sd_punto(_sd_resta(_sd_vel_punto(B, pt["rb"]), _sd_vel_punto(A, pt["ra"])), n)
+            sea dj = (pt["sesgo"] - vn) * pt["mn"]
+            sea nuevo = maximo(pt["jn"] + dj, 0)
+            dj = nuevo - pt["jn"]
+            pt["jn"] = nuevo
+            sea imp = _sd_esc(n, dj)
+            _sd_aplicar(A, _sd_neg(imp), pt["ra"])
+            _sd_aplicar(B, imp, pt["rb"])
+        }
+    }
+}
+
+// Restricción de punto (3 grados) compartida por punto, bisagra y fija.
+funcion _sd_resolver_punto(A, B, c, dt) {
+    sea ra = _sd_mv(A["R"], c["la"])
+    sea rb = _sd_mv(B["R"], c["lb"])
+    sea K = [A["inv_m"] + B["inv_m"], 0, 0, 0, A["inv_m"] + B["inv_m"], 0, 0, 0, A["inv_m"] + B["inv_m"]]
+    sea ha = _sd_hat(ra)
+    sea hb = _sd_hat(rb)
+    sea ta = _sd_mm(_sd_mm(ha, A["inv_i"]), ha)
+    sea tb = _sd_mm(_sd_mm(hb, B["inv_i"]), hb)
+    sea i = 0
+    mientras (i < 9) {
+        K[i] = K[i] - ta[i] - tb[i]
+        i = i + 1
+    }
+    sea error = _sd_resta(_sd_suma(B["x"], rb), _sd_suma(A["x"], ra))
+    sea cdot = _sd_resta(_sd_vel_punto(B, rb), _sd_vel_punto(A, ra))
+    sea lam = _sd_neg(_sd_mv(_sd_inv3(K), _sd_suma(cdot, _sd_esc(error, 0.2 / dt))))
+    _sd_aplicar(A, _sd_neg(lam), ra)
+    _sd_aplicar(B, lam, rb)
+}
+
+funcion _sd_resolver_angular(A, B, j, valor, dt) {
+    sea k = _sd_punto(j, _sd_mv(A["inv_i"], j)) + _sd_punto(j, _sd_mv(B["inv_i"], j))
+    si (k <= 0) { retornar 0 }
+    sea cdot = _sd_punto(_sd_resta(B["w"], A["w"]), j)
+    sea lam = 0 - (cdot + 0.2 / dt * valor) / k
+    _sd_aplicar_ang(A, _sd_esc(j, 0 - lam))
+    _sd_aplicar_ang(B, _sd_esc(j, lam))
+    retornar lam
+}
+
+funcion _sd_resolver_restricciones(m, dt) {
+    para c en m["restricciones"] {
+        sea A = m["cuerpos"][c["a"]]
+        sea B = m["cuerpos"][c["b"]]
+        si (A["dormido"] y B["dormido"]) { continuar }
+        si (c["tipo"] == "punto") { _sd_resolver_punto(A, B, c, dt) }
+        sino si (c["tipo"] == "distancia") {
+            sea ra = _sd_mv(A["R"], c["la"])
+            sea rb = _sd_mv(B["R"], c["lb"])
+            sea d = _sd_resta(_sd_suma(B["x"], rb), _sd_suma(A["x"], ra))
+            sea largo = _sd_largo(d)
+            si (largo > 0.000001 y (c["cuerda"] == falso o largo > c["largo"])) {
+                sea n = _sd_esc(d, 1 / largo)
+                sea mm = _sd_masa_efectiva(A, B, ra, rb, n)
+                sea vn = _sd_punto(_sd_resta(_sd_vel_punto(B, rb), _sd_vel_punto(A, ra)), n)
+                sea lam = 0 - (vn + 0.2 / dt * (largo - c["largo"])) * mm
+                si (c["cuerda"]) { lam = minimo(lam, 0) }
+                sea imp = _sd_esc(n, lam)
+                _sd_aplicar(A, _sd_neg(imp), ra)
+                _sd_aplicar(B, imp, rb)
+            }
+        } sino si (c["tipo"] == "bisagra") {
+            _sd_resolver_punto(A, B, c, dt)
+            sea ea = _sd_mv(A["R"], c["eje_a"])
+            sea eb = _sd_mv(B["R"], c["eje_b"])
+            sea tt = _sd_tangentes(ea)
+            para b1 en tt { _sd_resolver_angular(A, B, _sd_cruz(eb, b1), _sd_punto(b1, eb), dt) }
+            // Límites del ángulo.
+            si (c["min"] != nulo o c["max"] != nulo) {
+                sea ang = solido_angulo(m, _sd_indice(m, c))
+                sea fuera = 0
+                si (c["min"] != nulo y ang < c["min"]) { fuera = ang - c["min"] }
+                si (c["max"] != nulo y ang > c["max"]) { fuera = ang - c["max"] }
+                si (fuera != 0) {
+                    sea k = _sd_punto(ea, _sd_mv(A["inv_i"], ea)) + _sd_punto(ea, _sd_mv(B["inv_i"], ea))
+                    sea cdot = _sd_punto(_sd_resta(B["w"], A["w"]), ea)
+                    // Solo empuja hacia adentro del rango.
+                    si ((fuera > 0 y cdot > 0) o (fuera < 0 y cdot < 0) o absoluto(fuera) > 0.01) {
+                        sea lam = 0 - (cdot + 0.2 / 0.016666 * fuera * 0.5) / k
+                        _sd_aplicar_ang(A, _sd_esc(ea, 0 - lam))
+                        _sd_aplicar_ang(B, _sd_esc(ea, lam))
+                    }
+                }
+            }
+        } sino si (c["tipo"] == "fija") {
+            _sd_resolver_punto(A, B, c, dt)
+            sea qe = _sd_q_mul(_sd_q_mul(B["q"], _sd_q_conj(A["q"])), _sd_q_conj(c["q0"]))
+            sea s = 1
+            si (qe[0] < 0) { s = -1 }
+            sea err = [2 * s * qe[1], 2 * s * qe[2], 2 * s * qe[3]]
+            sea K = _sd_msuma(A["inv_i"], B["inv_i"])
+            sea cdot = _sd_resta(B["w"], A["w"])
+            sea lam = _sd_neg(_sd_mv(_sd_inv3(K), _sd_suma(cdot, _sd_esc(err, 0.2 / dt))))
+            _sd_aplicar_ang(A, _sd_neg(lam))
+            _sd_aplicar_ang(B, lam)
+        }
+    }
+}
+
+funcion _sd_indice(m, c) {
+    sea i = 0
+    para x en m["restricciones"] {
+        si (x == c) { retornar i }
+        i = i + 1
+    }
+    retornar -1
+}
+
+// ---------- islas ----------
+
+funcion _sd_raiz(p, i) {
+    sea x = i
+    mientras (p[x] != x) {
+        p[x] = p[p[x]]
+        x = p[x]
+    }
+    retornar x
+}
+
+funcion _sd_unir(m, p, a, b) {
+    si (m["cuerpos"][a]["tipo"] != "dinamico" o m["cuerpos"][b]["tipo"] != "dinamico") { retornar nulo }
+    sea ra = _sd_raiz(p, a)
+    sea rb = _sd_raiz(p, b)
+    si (ra != rb) { p[ra] = rb }
+}
+
+funcion _sd_islas(m) {
+    sea p = []
+    sea i = 0
+    mientras (i < longitud(m["cuerpos"])) {
+        p.agregar(i)
+        i = i + 1
+    }
+    para c en m["contactos"] { _sd_unir(m, p, c["a"], c["b"]) }
+    para c en m["restricciones"] { _sd_unir(m, p, c["a"], c["b"]) }
+    sea grupos = {}
+    para b en m["cuerpos"] {
+        si (b["tipo"] == "dinamico") {
+            sea r = "" + _sd_raiz(p, b["id"])
+            si (tiene_clave(grupos, r) == falso) { grupos[r] = [] }
+            grupos[r].agregar(b["id"])
+        }
+    }
+    sea islas = []
+    para k en claves(grupos) {
+        sea n = longitud(islas)
+        para id en grupos[k] { m["cuerpos"][id]["isla"] = n }
+        islas.agregar(grupos[k])
+    }
+    m["islas"] = islas
+}
+
+/// Islas: listas de cuerpos dinámicos que se tocan o están unidos.
+funcion solido_islas(m) { retornar m["islas"] }
+
+// ---------- paso ----------
+
+funcion _sd_solapan(a, b) {
+    retornar a[0][0] <= b[1][0] y a[1][0] >= b[0][0] y a[0][1] <= b[1][1] y a[1][1] >= b[0][1] y a[0][2] <= b[1][2] y a[1][2] >= b[0][2]
+}
+
+funcion _sd_pares(m) {
+    // Barrido y poda en X (los planos van aparte porque son infinitos).
+    sea lista = []
+    sea planos = []
+    para b en m["cuerpos"] {
+        si (b["forma"]["tipo"] == "plano") { planos.agregar(b) } sino { lista.agregar(b) }
+    }
+    sea orden = lista
+    sea i0 = 1
+    mientras (i0 < longitud(orden)) {
+        sea v = orden[i0]
+        sea j0 = i0 - 1
+        mientras (j0 >= 0 y orden[j0]["aabb"][0][0] > v["aabb"][0][0]) {
+            orden[j0 + 1] = orden[j0]
+            j0 = j0 - 1
+        }
+        orden[j0 + 1] = v
+        i0 = i0 + 1
+    }
+    sea pares = []
+    sea i = 0
+    mientras (i < longitud(orden)) {
+        sea a = orden[i]
+        sea j = i + 1
+        mientras (j < longitud(orden) y orden[j]["aabb"][0][0] <= a["aabb"][1][0] + 0.01) {
+            sea b = orden[j]
+            sea activo = (a["tipo"] == "dinamico" y a["dormido"] == falso) o (b["tipo"] == "dinamico" y b["dormido"] == falso)
+            si (activo y (a["tipo"] == "dinamico" o b["tipo"] == "dinamico") y _sd_solapan(a["aabb"], b["aabb"])) { pares.agregar([a, b]) }
+            j = j + 1
+        }
+        para pl en planos {
+            si (a["tipo"] == "dinamico" y a["dormido"] == falso) { pares.agregar([pl, a]) }
+        }
+        i = i + 1
+    }
+    retornar pares
+}
+
+/// Avanza la simulación dt segundos.
+funcion solido_paso(m, dt) {
+    sea sub = m["subpasos"]
+    sea h = dt / sub
+    sea k = 0
+    mientras (k < sub) {
+        _sd_subpaso(m, h)
+        k = k + 1
+    }
+    para b en m["cuerpos"] {
+        b["fuerza"] = [0, 0, 0]
+        b["torque"] = [0, 0, 0]
+    }
+    m["tiempo"] = m["tiempo"] + dt
+}
+
+funcion _sd_subpaso(m, dt) {
+    sea g = m["gravedad"]
+    // Velocidades.
+    para b en m["cuerpos"] {
+        si (b["tipo"] == "dinamico" y b["dormido"] == falso) {
+            b["v"] = _sd_suma(b["v"], _sd_esc(_sd_suma(g, _sd_esc(b["fuerza"], b["inv_m"])), dt))
+            b["w"] = _sd_suma(b["w"], _sd_esc(_sd_mv(b["inv_i"], b["torque"]), dt))
+            b["v"] = _sd_esc(b["v"], 1 / (1 + dt * b["amort"]))
+            b["w"] = _sd_esc(b["w"], 1 / (1 + dt * b["amort_ang"]))
+        }
+    }
+    // Contactos.
+    sea contactos = []
+    para par en _sd_pares(m) {
+        sea c = _sd_colision(par[0], par[1])
+        si (c != nulo y longitud(c["puntos"]) > 0) {
+            contactos.agregar(c)
+            // Despierta al dormido que toca uno despierto.
+            sea A = m["cuerpos"][c["a"]]
+            sea B = m["cuerpos"][c["b"]]
+            si (A["dormido"] y B["dormido"] == falso y B["tipo"] == "dinamico") { _sd_despertar(A) }
+            si (B["dormido"] y A["dormido"] == falso y A["tipo"] == "dinamico") { _sd_despertar(B) }
+        }
+    }
+    m["contactos"] = contactos
+    _sd_islas(m)
+    _sd_preparar_contactos(m, dt)
+    sea it = 0
+    mientras (it < m["iteraciones"]) {
+        _sd_resolver_restricciones(m, dt)
+        _sd_resolver_contactos(m)
+        it = it + 1
+    }
+    // Guarda los impulsos para el arranque en caliente.
+    sea cache = {}
+    para c en m["contactos"] {
+        sea l = []
+        para pt en c["puntos"] { l.agregar({"local": pt["local"], "jn": pt["jn"], "jt": pt["jt"]}) }
+        cache["" + c["a"] + "-" + c["b"]] = l
+    }
+    m["cache"] = cache
+    // Posiciones.
+    para b en m["cuerpos"] {
+        si ((b["tipo"] == "dinamico" y b["dormido"] == falso) o b["tipo"] == "cinematico") {
+            b["x"] = _sd_suma(b["x"], _sd_esc(b["v"], dt))
+            sea w = b["w"]
+            sea dq = _sd_q_mul([0, w[0], w[1], w[2]], b["q"])
+            b["q"] = _sd_q_norm([b["q"][0] + 0.5 * dt * dq[0], b["q"][1] + 0.5 * dt * dq[1], b["q"][2] + 0.5 * dt * dq[2], b["q"][3] + 0.5 * dt * dq[3]])
+            _sd_actualizar(b)
+        }
+    }
+    // Sueño por islas.
+    si (m["dormir"]) {
+        para b en m["cuerpos"] {
+            si (b["tipo"] == "dinamico" y b["dormido"] == falso) {
+                si (_sd_punto(b["v"], b["v"]) < 0.0025 y _sd_punto(b["w"], b["w"]) < 0.0025) { b["quieto"] = b["quieto"] + dt } sino { b["quieto"] = 0 }
+            }
+        }
+        para isla en m["islas"] {
+            sea todos = verdadero
+            para id en isla { si (m["cuerpos"][id]["quieto"] < 0.5) { todos = falso } }
+            si (todos) {
+                para id en isla {
+                    sea b = m["cuerpos"][id]
+                    b["dormido"] = verdadero
+                    b["v"] = [0, 0, 0]
+                    b["w"] = [0, 0, 0]
+                }
+            }
+        }
+    }
+}
+
+// ---------- consultas ----------
+
+/// Rayo: el primer cuerpo que toca, {"cuerpo", "punto", "normal",
+/// "distancia"} o nulo. ignorar: lista de cuerpos que no cuentan.
+funcion solido_rayo(m, origen, direccion, distancia_max, ignorar) {
+    sea d = _sd_norm(direccion)
+    sea mejor = nulo
+    para b en m["cuerpos"] {
+        si (contiene(ignorar ?? [], b["id"]) == falso) {
+            sea r = _sd_rayo_cuerpo(b, origen, d)
+            si (r != nulo y r[0] >= 0 y r[0] <= distancia_max y (mejor == nulo o r[0] < mejor["distancia"])) {
+                mejor = {"cuerpo": b["id"], "distancia": r[0], "punto": _sd_suma(origen, _sd_esc(d, r[0])), "normal": r[1]}
+            }
+        }
+    }
+    retornar mejor
+}
+
+funcion _sd_rayo_esfera(c, r, o, d) {
+    sea oc = _sd_resta(o, c)
+    sea b = _sd_punto(oc, d)
+    sea cc = _sd_punto(oc, oc) - r * r
+    sea disc = b * b - cc
+    si (disc < 0) { retornar nulo }
+    sea t = 0 - b - raiz(disc)
+    si (t < 0) { t = 0 - b + raiz(disc) }
+    si (t < 0) { retornar nulo }
+    retornar [t, _sd_norm(_sd_resta(_sd_suma(o, _sd_esc(d, t)), c))]
+}
+
+funcion _sd_rayo_cuerpo(b, o, d) {
+    sea f = b["forma"]
+    si (f["tipo"] == "esfera") { retornar _sd_rayo_esfera(b["x"], f["radio"], o, d) }
+    si (f["tipo"] == "plano") {
+        sea den = _sd_punto(f["normal"], d)
+        si (absoluto(den) < 0.0000001) { retornar nulo }
+        sea t = (f["d"] - _sd_punto(f["normal"], o)) / den
+        si (t < 0) { retornar nulo }
+        retornar [t, f["normal"]]
+    }
+    si (f["tipo"] == "caja") {
+        sea lo = _sd_mtv(b["R"], _sd_resta(o, b["x"]))
+        sea ld = _sd_mtv(b["R"], d)
+        sea h = f["medias"]
+        sea tmin = -1000000000
+        sea tmax = 1000000000
+        sea eje = 0
+        sea signo = 1
+        sea k = 0
+        mientras (k < 3) {
+            si (absoluto(ld[k]) < 0.0000001) {
+                si (lo[k] < 0 - h[k] o lo[k] > h[k]) { retornar nulo }
+            } sino {
+                sea t1 = (0 - h[k] - lo[k]) / ld[k]
+                sea t2 = (h[k] - lo[k]) / ld[k]
+                sea s = -1
+                si (t1 > t2) {
+                    sea tmp = t1
+                    t1 = t2
+                    t2 = tmp
+                    s = 1
+                }
+                si (t1 > tmin) {
+                    tmin = t1
+                    eje = k
+                    signo = s
+                }
+                si (t2 < tmax) { tmax = t2 }
+                si (tmin > tmax) { retornar nulo }
+            }
+            k = k + 1
+        }
+        si (tmax < 0) { retornar nulo }
+        sea n = [0, 0, 0]
+        n[eje] = signo
+        retornar [maximo(tmin, 0), _sd_mv(b["R"], n)]
+    }
+    si (f["tipo"] == "capsula") {
+        // Aproximación: esferas a lo largo del segmento.
+        sea seg = _sd_segmento(b)
+        sea mejor = nulo
+        sea i = 0
+        mientras (i <= 8) {
+            sea c = _sd_suma(seg[0], _sd_esc(_sd_resta(seg[1], seg[0]), i / 8))
+            sea r = _sd_rayo_esfera(c, f["radio"], o, d)
+            si (r != nulo y (mejor == nulo o r[0] < mejor[0])) { mejor = r }
+            i = i + 1
+        }
+        retornar mejor
+    }
+    retornar nulo
+}
+
+/// Cuerpos que tocan una esfera (centro, radio).
+funcion solido_superpuestos(m, centro, radio) {
+    sea sonda = {"id": -1, "forma": solido_esfera(radio), "tipo": "estatico", "x": centro, "q": [1, 0, 0, 0], "R": [1, 0, 0, 0, 1, 0, 0, 0, 1]}
+    sea r = []
+    para b en m["cuerpos"] {
+        sea c = nulo
+        si (b["forma"]["tipo"] == "plano") { c = _sd_colision(b, sonda) } sino { c = _sd_colision(sonda, b) }
+        si (c != nulo) { r.agregar(b["id"]) }
+    }
+    retornar r
+}
+
+/// Energía cinética total (para pruebas y depuración).
+funcion solido_energia(m) {
+    sea e = 0
+    para b en m["cuerpos"] {
+        si (b["tipo"] == "dinamico") {
+            e = e + 0.5 * b["masa"] * _sd_punto(b["v"], b["v"])
+            sea inv = b["inv_i"]
+            sea I = _sd_inv3(inv)
+            e = e + 0.5 * _sd_punto(b["w"], _sd_mv(I, b["w"]))
+        }
+    }
+    retornar e
+}
