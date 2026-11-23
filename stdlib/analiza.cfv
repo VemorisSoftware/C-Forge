@@ -1,0 +1,1206 @@
+// stdlib/analiza.cfv — el compilador como servicio para código C-Forge, al
+// estilo de Roslyn: tokens con línea y columna, árbol de sintaxis con
+// recuperación de errores, diagnósticos (sintaxis, variables no
+// declaradas, funciones desconocidas, argumentos de más o de menos,
+// variables sin usar, código inalcanzable, romper fuera de un bucle,
+// módulos inexistentes), símbolos del documento, ir a la definición,
+// referencias, completado según el ámbito, información al pasar el ratón
+// (firma y comentarios ///), renombrar y rangos para plegar. Entiende las
+// palabras clave en español y en inglés. Sirve para editores, linters y
+// herramientas de refactorización. Idea de Roslyn (MIT), escrito desde cero.
+// En inglés: importar "code_analysis".
+//
+//   importar "analiza"
+//   para d en analiza_diagnosticos(leer_archivo("app.cfv"), nulo) {
+//       mostrar("" + d["linea"] + ":" + d["col"] + " " + d["mensaje"])
+//   }
+
+sea _AN_CLAVE = {"sea": "sea", "let": "sea", "var": "sea", "funcion": "funcion", "function": "funcion", "retornar": "retornar", "return": "retornar",
+    "si": "si", "if": "si", "sino": "sino", "else": "sino", "mientras": "mientras", "while": "mientras", "para": "para", "for": "para", "en": "en", "in": "en",
+    "intentar": "intentar", "try": "intentar", "capturar": "capturar", "catch": "capturar", "lanzar": "lanzar", "throw": "lanzar", "clase": "clase", "class": "clase",
+    "esto": "esto", "this": "esto", "self": "esto", "importar": "importar", "import": "importar", "romper": "romper", "break": "romper", "continuar": "continuar",
+    "continue": "continuar", "verdadero": "verdadero", "true": "verdadero", "falso": "falso", "false": "falso", "nulo": "nulo", "null": "nulo",
+    "y": "y", "and": "y", "o": "o", "or": "o", "no": "no", "not": "no", "extern": "extern", "como": "como", "extiende": "extiende", "extends": "extiende"}
+
+// Palabras clave que también pueden ser nombres según el lugar.
+sea _AN_CONTEXTUALES = ["y", "o", "and", "or", "clase", "class", "como", "en", "in", "extiende", "extends", "self", "no", "not"]
+
+sea _AN_BUILTINS = ["mostrar", "afirmar", "longitud", "agregar", "quitar_ultimo", "claves", "valores", "tiene_clave", "quitar_clave", "contiene", "unir", "separar",
+    "texto_dividir", "texto_indice", "texto_reemplazar", "texto_recortar", "texto_minusculas", "texto_mayusculas", "texto_empieza_con", "texto_termina_con",
+    "texto_codigos", "subtexto", "subcadena", "caracter", "char_de", "byte_en", "bytes_de_hex", "hex_de_bytes", "bytes_entero", "bytes_leer_entero",
+    "a_numero", "a_texto", "tipo", "piso", "techo", "redondear", "absoluto", "abs", "raiz", "potencia", "exponencial", "logaritmo", "seno", "coseno", "tangente",
+    "minimo", "maximo", "aleatorio", "bytes_aleatorios", "ordenar", "invertir", "rango", "leer_archivo", "escribir_archivo", "existe_archivo", "listar_carpeta",
+    "crear_carpeta", "borrar_archivo", "argumentos", "variable_entorno", "tiempo_ms", "dormir", "lanzar", "sha256", "sha256_bytes", "sha512", "sha384", "sha1_bytes",
+    "hmac_sha256", "hmac_sha256_bytes", "base64_codificar", "base64_decodificar", "json_codificar", "json_decodificar", "bits_y", "bits_o", "bits_xo",
+    "net_conectar", "net_enviar", "net_recibir", "net_cerrar", "udp_crear", "udp_enviar", "udp_recibir", "udp_cerrar", "c_reservar", "c_liberar", "c_bytes",
+    "c_desde_bytes", "c_escribir32", "c_leer32", "c_escribir64", "c_leer64", "c_llamar", "pi", "ejecutar", "salir", "entrada", "leer_linea",
+    "print", "assert", "len", "length", "append", "keys", "range", "sort", "split", "join", "upper", "lower", "trim", "str", "int", "min", "max", "round",
+    "floor", "ceil", "sqrt", "pow", "contains", "replace"]
+
+// ---------- tokens ----------
+
+funcion _an_letra(c) { retornar (c >= 97 y c <= 122) o (c >= 65 y c <= 90) o c == 95 o c >= 128 }
+funcion _an_digito(c) { retornar c >= 48 y c <= 57 }
+
+/// Tokens: [{"tipo" (ident, clave, numero, texto, simbolo, comentario,
+/// doc, fin), "texto", "valor", "linea", "col", "pos", "fin"}].
+funcion analiza_tokens(fuente) {
+    sea r = []
+    sea n = longitud(fuente)
+    sea p = 0
+    sea linea = 1
+    sea inicio_linea = 0
+    mientras (p < n) {
+        sea c = byte_en(fuente, p)
+        sea col = p - inicio_linea + 1
+        si (c == 10) {
+            linea = linea + 1
+            p = p + 1
+            inicio_linea = p
+        } sino si (c == 32 o c == 9 o c == 13) {
+            p = p + 1
+        } sino si (c == 47 y p + 1 < n y byte_en(fuente, p + 1) == 47) {
+            sea q = p
+            mientras (q < n y byte_en(fuente, q) != 10) { q = q + 1 }
+            sea t = subtexto(fuente, p, q)
+            sea tipo_t = "comentario"
+            si (texto_empieza_con(t, "///")) { tipo_t = "doc" }
+            r.agregar({"tipo": tipo_t, "texto": t, "linea": linea, "col": col, "pos": p, "fin": q})
+            p = q
+        } sino si (_an_letra(c)) {
+            sea q = p
+            mientras (q < n y (_an_letra(byte_en(fuente, q)) o _an_digito(byte_en(fuente, q)))) { q = q + 1 }
+            sea t = subtexto(fuente, p, q)
+            sea tipo_t = "ident"
+            si (tiene_clave(_AN_CLAVE, t)) { tipo_t = "clave" }
+            r.agregar({"tipo": tipo_t, "texto": t, "valor": _AN_CLAVE[t] ?? t, "linea": linea, "col": col, "pos": p, "fin": q})
+            p = q
+        } sino si (_an_digito(c)) {
+            sea q = p
+            mientras (q < n y _an_digito(byte_en(fuente, q))) { q = q + 1 }
+            si (q + 1 < n y byte_en(fuente, q) == 46 y _an_digito(byte_en(fuente, q + 1))) {
+                q = q + 1
+                mientras (q < n y _an_digito(byte_en(fuente, q))) { q = q + 1 }
+            }
+            si (q < n y (byte_en(fuente, q) == 101 o byte_en(fuente, q) == 69)) {
+                sea k = q + 1
+                si (k < n y (byte_en(fuente, k) == 43 o byte_en(fuente, k) == 45)) { k = k + 1 }
+                si (k < n y _an_digito(byte_en(fuente, k))) {
+                    q = k
+                    mientras (q < n y _an_digito(byte_en(fuente, q))) { q = q + 1 }
+                }
+            }
+            r.agregar({"tipo": "numero", "texto": subtexto(fuente, p, q), "linea": linea, "col": col, "pos": p, "fin": q})
+            p = q
+        } sino si (c == 34) {
+            sea q = p + 1
+            sea linea_extra = 0
+            sea ultimo_salto = -1
+            sea valor = ""
+            sea cerrado = falso
+            mientras (q < n y cerrado == falso) {
+                sea d = byte_en(fuente, q)
+                si (d == 92 y q + 1 < n) {
+                    sea e = byte_en(fuente, q + 1)
+                    si (e == 110) { valor = valor + "\n" } sino si (e == 116) { valor = valor + "\t" } sino si (e == 114) { valor = valor + "\r" } sino { valor = valor + char_de(e) }
+                    q = q + 2
+                } sino si (d == 34) {
+                    cerrado = verdadero
+                    q = q + 1
+                } sino si (d == 10) {
+                    // Los textos pueden ocupar varias líneas.
+                    valor = valor + "\n"
+                    q = q + 1
+                    linea_extra = linea_extra + 1
+                    ultimo_salto = q
+                } sino {
+                    valor = valor + char_de(d)
+                    q = q + 1
+                }
+            }
+            r.agregar({"tipo": "texto", "texto": subtexto(fuente, p, q), "valor": valor, "linea": linea, "col": col, "pos": p, "fin": q, "sin_cerrar": cerrado == falso})
+            linea = linea + linea_extra
+            si (ultimo_salto >= 0) { inicio_linea = ultimo_salto }
+            p = q
+        } sino {
+            sea dos = ""
+            si (p + 1 < n) { dos = subtexto(fuente, p, p + 2) }
+            si (dos == "==" o dos == "!=" o dos == "<=" o dos == ">=" o dos == "??" o dos == "->" o dos == "+=" o dos == "-=" o dos == "*=" o dos == "/=" o dos == "%=") {
+                r.agregar({"tipo": "simbolo", "texto": dos, "linea": linea, "col": col, "pos": p, "fin": p + 2})
+                p = p + 2
+            } sino {
+                r.agregar({"tipo": "simbolo", "texto": char_de(c), "linea": linea, "col": col, "pos": p, "fin": p + 1})
+                p = p + 1
+            }
+        }
+    }
+    r.agregar({"tipo": "fin", "texto": "", "linea": linea, "col": n - inicio_linea + 1, "pos": n, "fin": n})
+    retornar r
+}
+
+// ---------- parser ----------
+
+funcion _an_p(fuente) {
+    sea todos = analiza_tokens(fuente)
+    sea ts = []
+    sea docs = {}
+    sea doc_acum = []
+    para t en todos {
+        si (t["tipo"] == "doc") { doc_acum.agregar(texto_recortar(subtexto(t["texto"], 3, longitud(t["texto"])))) }
+        sino si (t["tipo"] == "comentario") { doc_acum = [] }
+        sino {
+            si (longitud(doc_acum) > 0) {
+                docs["" + longitud(ts)] = unir(doc_acum, "\n")
+                doc_acum = []
+            }
+            ts.agregar(t)
+        }
+    }
+    retornar {"t": ts, "i": 0, "errores": [], "docs": docs, "fuente": fuente}
+}
+
+funcion _an_ver(p) { retornar p["t"][p["i"]] }
+funcion _an_ver2(p) { retornar p["t"][minimo(p["i"] + 1, longitud(p["t"]) - 1)] }
+funcion _an_avanzar(p) {
+    sea t = p["t"][p["i"]]
+    si (p["i"] < longitud(p["t"]) - 1) { p["i"] = p["i"] + 1 }
+    retornar t
+}
+
+funcion _an_es(p, texto) {
+    sea t = _an_ver(p)
+    si (t["tipo"] == "simbolo") { retornar t["texto"] == texto }
+    si (t["tipo"] == "clave") { retornar t["valor"] == texto }
+    retornar falso
+}
+
+funcion _an_error(p, t, msj) {
+    // Un error por posición.
+    para e en p["errores"] { si (e["linea"] == t["linea"] y e["col"] == t["col"]) { retornar nulo } }
+    p["errores"].agregar({"linea": t["linea"], "col": t["col"], "severidad": "error", "codigo": "CF001", "mensaje": msj})
+}
+
+funcion _an_esperar(p, texto) {
+    si (_an_es(p, texto)) { retornar _an_avanzar(p) }
+    sea t = _an_ver(p)
+    sea visto = t["texto"]
+    si (t["tipo"] == "fin") { visto = "el final del archivo" }
+    _an_error(p, t, "se esperaba '" + texto + "' y llegó '" + visto + "'")
+    retornar nulo
+}
+
+funcion _an_ident(p) {
+    sea t = _an_ver(p)
+    si (t["tipo"] == "ident") { retornar _an_avanzar(p) }
+    si (t["tipo"] == "clave" y t["valor"] != "verdadero" y t["valor"] != "falso" y t["valor"] != "nulo") { retornar _an_avanzar(p) }
+    si (t["tipo"] == "clave" y (t["valor"] == "y" o t["valor"] == "o")) { _an_error(p, t, "'" + t["texto"] + "' es una palabra clave (y/o): no se puede usar como nombre") }
+    sino { _an_error(p, t, "se esperaba un nombre y llegó '" + t["texto"] + "'") }
+    retornar nulo
+}
+
+funcion _an_nodo(tipo_n, t) { retornar {"t": tipo_n, "linea": t["linea"], "col": t["col"]} }
+
+/// Árbol de sintaxis: {"raiz": {"t": "programa", "cuerpo": [...]}, "errores"}.
+funcion analiza_arbol(fuente) {
+    sea p = _an_p(fuente)
+    sea cuerpo = []
+    mientras (_an_ver(p)["tipo"] != "fin") {
+        sea antes = p["i"]
+        sea s = _an_sentencia(p)
+        si (s != nulo) { cuerpo.agregar(s) }
+        si (p["i"] == antes) { _an_avanzar(p) }
+    }
+    retornar {"raiz": {"t": "programa", "cuerpo": cuerpo, "linea": 1, "col": 1}, "errores": p["errores"]}
+}
+
+funcion _an_bloque(p) {
+    sea r = []
+    si (_an_esperar(p, "{") == nulo) { retornar r }
+    mientras (_an_es(p, "}") == falso y _an_ver(p)["tipo"] != "fin") {
+        sea antes = p["i"]
+        sea s = _an_sentencia(p)
+        si (s != nulo) { r.agregar(s) }
+        si (p["i"] == antes) { _an_avanzar(p) }
+    }
+    _an_esperar(p, "}")
+    retornar r
+}
+
+funcion _an_tipo_anotado(p) {
+    si (_an_es(p, ":")) {
+        _an_avanzar(p)
+        sea t = _an_avanzar(p)
+        retornar t["texto"]
+    }
+    retornar nulo
+}
+
+funcion _an_parametros(p) {
+    sea r = []
+    _an_esperar(p, "(")
+    mientras (_an_es(p, ")") == falso y _an_ver(p)["tipo"] != "fin") {
+        sea variadico = falso
+        mientras (_an_es(p, ".")) {
+            _an_avanzar(p)
+            variadico = verdadero
+        }
+        sea t = _an_ident(p)
+        si (t == nulo) {
+            _an_avanzar(p)
+        } sino {
+            sea prm = {"nombre": t["texto"], "linea": t["linea"], "col": t["col"], "tipo_dato": _an_tipo_anotado(p), "defecto": nulo, "variadico": variadico}
+            si (_an_es(p, "=")) {
+                _an_avanzar(p)
+                prm["defecto"] = _an_expresion(p)
+            }
+            r.agregar(prm)
+        }
+        si (_an_es(p, ",")) { _an_avanzar(p) } sino si (_an_es(p, ")") == falso) {
+            _an_error(p, _an_ver(p), "se esperaba ',' o ')' en los parámetros")
+            romper
+        }
+    }
+    _an_esperar(p, ")")
+    retornar r
+}
+
+funcion _an_sentencia(p) {
+    sea t = _an_ver(p)
+    si (_an_es(p, ";")) {
+        _an_avanzar(p)
+        retornar nulo
+    }
+    si (_an_es(p, "sea")) {
+        _an_avanzar(p)
+        sea nombre = _an_ident(p)
+        sea n = _an_nodo("sea", t)
+        si (nombre == nulo) { retornar nulo }
+        n["nombre"] = nombre["texto"]
+        n["nlinea"] = nombre["linea"]
+        n["ncol"] = nombre["col"]
+        n["tipo_dato"] = _an_tipo_anotado(p)
+        si (_an_esperar(p, "=") != nulo) { n["valor"] = _an_expresion(p) }
+        retornar n
+    }
+    si (_an_es(p, "funcion") y _an_ver2(p)["tipo"] == "ident") {
+        sea doc = p["docs"]["" + p["i"]] ?? nulo
+        _an_avanzar(p)
+        sea nombre = _an_avanzar(p)
+        sea n = _an_nodo("funcion", t)
+        n["nombre"] = nombre["texto"]
+        n["nlinea"] = nombre["linea"]
+        n["ncol"] = nombre["col"]
+        n["doc"] = doc
+        n["params"] = _an_parametros(p)
+        n["retorno"] = _an_tipo_anotado(p)
+        n["cuerpo"] = _an_bloque(p)
+        n["fin_linea"] = p["t"][maximo(0, p["i"] - 1)]["linea"]
+        retornar n
+    }
+    si (_an_es(p, "clase") y _an_ver2(p)["tipo"] == "ident") {
+        sea doc = p["docs"]["" + p["i"]] ?? nulo
+        _an_avanzar(p)
+        sea nombre = _an_ident(p)
+        sea n = _an_nodo("clase", t)
+        si (nombre == nulo) { retornar nulo }
+        n["nombre"] = nombre["texto"]
+        n["nlinea"] = nombre["linea"]
+        n["ncol"] = nombre["col"]
+        n["doc"] = doc
+        n["padre"] = nulo
+        si (_an_es(p, "extiende")) {
+            _an_avanzar(p)
+            n["padre"] = _an_avanzar(p)["texto"]
+        }
+        n["metodos"] = []
+        _an_esperar(p, "{")
+        mientras (_an_es(p, "}") == falso y _an_ver(p)["tipo"] != "fin") {
+            si (_an_es(p, "funcion")) { _an_avanzar(p) }
+            sea mt = _an_avanzar(p)
+            si (mt["tipo"] != "ident") {
+                _an_error(p, mt, "se esperaba un método en la clase")
+            } sino {
+                sea m = {"t": "metodo", "nombre": mt["texto"], "linea": mt["linea"], "col": mt["col"], "nlinea": mt["linea"], "ncol": mt["col"]}
+                m["params"] = _an_parametros(p)
+                m["retorno"] = _an_tipo_anotado(p)
+                m["cuerpo"] = _an_bloque(p)
+                n["metodos"].agregar(m)
+            }
+        }
+        _an_esperar(p, "}")
+        n["fin_linea"] = p["t"][maximo(0, p["i"] - 1)]["linea"]
+        retornar n
+    }
+    si (_an_es(p, "si")) { retornar _an_si(p) }
+    si (_an_es(p, "mientras")) {
+        _an_avanzar(p)
+        sea n = _an_nodo("mientras", t)
+        _an_esperar(p, "(")
+        n["cond"] = _an_expresion(p)
+        _an_esperar(p, ")")
+        n["cuerpo"] = _an_bloque(p)
+        retornar n
+    }
+    si (_an_es(p, "para")) {
+        _an_avanzar(p)
+        sea n = _an_nodo("para", t)
+        sea par = _an_es(p, "(")
+        si (par) { _an_avanzar(p) }
+        sea v = nulo
+        si (_an_es(p, "en") y _an_ver2(p)["tipo"] == "clave" y _an_ver2(p)["valor"] == "en") { v = _an_avanzar(p) } sino { v = _an_ident(p) }
+        n["vars"] = []
+        si (v != nulo) { n["vars"].agregar({"nombre": v["texto"], "linea": v["linea"], "col": v["col"]}) }
+        si (_an_es(p, ",")) {
+            _an_avanzar(p)
+            sea v2 = _an_ident(p)
+            si (v2 != nulo) { n["vars"].agregar({"nombre": v2["texto"], "linea": v2["linea"], "col": v2["col"]}) }
+        }
+        _an_esperar(p, "en")
+        n["coleccion"] = _an_expresion(p)
+        si (par) { _an_esperar(p, ")") }
+        n["cuerpo"] = _an_bloque(p)
+        retornar n
+    }
+    si (_an_es(p, "retornar")) {
+        _an_avanzar(p)
+        sea n = _an_nodo("retornar", t)
+        sea sig = _an_ver(p)
+        si (sig["linea"] == t["linea"] y _an_es(p, "}") == falso y sig["tipo"] != "fin" y _an_es(p, ";") == falso) { n["valor"] = _an_expresion(p) }
+        retornar n
+    }
+    si (_an_es(p, "romper") o _an_es(p, "continuar")) {
+        _an_avanzar(p)
+        retornar _an_nodo(t["valor"], t)
+    }
+    si (_an_es(p, "lanzar")) {
+        _an_avanzar(p)
+        sea n = _an_nodo("lanzar", t)
+        n["valor"] = _an_expresion(p)
+        retornar n
+    }
+    si (_an_es(p, "intentar")) {
+        _an_avanzar(p)
+        sea n = _an_nodo("intentar", t)
+        n["cuerpo"] = _an_bloque(p)
+        n["var"] = nulo
+        n["captura"] = []
+        si (_an_es(p, "capturar")) {
+            _an_avanzar(p)
+            si (_an_es(p, "(")) {
+                _an_avanzar(p)
+                sea v = _an_ident(p)
+                si (v != nulo) { n["var"] = {"nombre": v["texto"], "linea": v["linea"], "col": v["col"]} }
+                _an_esperar(p, ")")
+            }
+            n["captura"] = _an_bloque(p)
+        } sino { _an_error(p, _an_ver(p), "falta 'capturar' después de 'intentar'") }
+        retornar n
+    }
+    si (_an_es(p, "importar")) {
+        _an_avanzar(p)
+        sea n = _an_nodo("importar", t)
+        sea m = _an_avanzar(p)
+        si (m["tipo"] != "texto") { _an_error(p, m, "importar necesita el nombre del módulo entre comillas") }
+        n["modulo"] = m["valor"] ?? m["texto"]
+        retornar n
+    }
+    si (_an_es(p, "extern")) {
+        _an_avanzar(p)
+        sea n = _an_nodo("extern", t)
+        n["biblioteca"] = _an_avanzar(p)["valor"] ?? ""
+        _an_esperar(p, "funcion")
+        sea nombre = _an_ident(p)
+        si (nombre == nulo) { retornar nulo }
+        n["nombre"] = nombre["texto"]
+        n["nlinea"] = nombre["linea"]
+        n["ncol"] = nombre["col"]
+        n["params"] = _an_parametros(p)
+        n["retorno"] = _an_tipo_anotado(p)
+        si (_an_es(p, "como")) {
+            _an_avanzar(p)
+            _an_avanzar(p)
+        }
+        retornar n
+    }
+    // Expresión o asignación.
+    sea e = _an_expresion(p)
+    si (e == nulo) { retornar nulo }
+    sea tc = _an_ver(p)
+    si (tc["tipo"] == "simbolo" y (tc["texto"] == "+=" o tc["texto"] == "-=" o tc["texto"] == "*=" o tc["texto"] == "/=" o tc["texto"] == "%=")) {
+        _an_avanzar(p)
+        sea n = _an_nodo("asignar", t)
+        n["destino"] = e
+        n["compuesta"] = subtexto(tc["texto"], 0, 1)
+        n["valor"] = _an_expresion(p)
+        retornar n
+    }
+    si (_an_es(p, "=")) {
+        sea igual = _an_avanzar(p)
+        sea n = _an_nodo("asignar", t)
+        n["destino"] = e
+        n["valor"] = _an_expresion(p)
+        si (e["t"] != "nombre" y e["t"] != "indice" y e["t"] != "miembro") { _an_error(p, igual, "no se puede asignar a esta expresión") }
+        retornar n
+    }
+    sea n = _an_nodo("expresion", t)
+    n["valor"] = e
+    retornar n
+}
+
+funcion _an_si(p) {
+    sea t = _an_avanzar(p)
+    sea n = _an_nodo("si", t)
+    _an_esperar(p, "(")
+    n["cond"] = _an_expresion(p)
+    _an_esperar(p, ")")
+    n["cuerpo"] = _an_bloque(p)
+    n["sino"] = nulo
+    si (_an_es(p, "sino")) {
+        _an_avanzar(p)
+        si (_an_es(p, "si")) { n["sino"] = [_an_si(p)] } sino { n["sino"] = _an_bloque(p) }
+    }
+    retornar n
+}
+
+// ---------- expresiones ----------
+
+funcion _an_expresion(p) {
+    sea c = _an_binaria(p, 0)
+    si (c != nulo y _an_es(p, "?")) {
+        sea t = _an_avanzar(p)
+        sea n = _an_nodo("ternaria", t)
+        n["linea"] = c["linea"]
+        n["col"] = c["col"]
+        n["cond"] = c
+        n["si"] = _an_expresion(p)
+        _an_esperar(p, ":")
+        n["no"] = _an_expresion(p)
+        retornar n
+    }
+    retornar c
+}
+
+sea _AN_NIVELES = [["??"], ["o"], ["y"], ["==", "!=", "<", "<=", ">", ">="], ["+", "-"], ["*", "/", "%"]]
+
+funcion _an_op_actual(p, nivel) {
+    sea t = _an_ver(p)
+    sea x = t["texto"]
+    si (t["tipo"] == "clave") {
+        x = t["valor"]
+        // "y"/"o" son operadores solo si siguen en la misma línea.
+        si (p["i"] > 0 y p["t"][p["i"] - 1]["linea"] != t["linea"]) { retornar nulo }
+    }
+    si (t["tipo"] != "simbolo" y t["tipo"] != "clave") { retornar nulo }
+    si (contiene(_AN_NIVELES[nivel], x)) { retornar x }
+    retornar nulo
+}
+
+funcion _an_binaria(p, nivel) {
+    si (nivel >= longitud(_AN_NIVELES)) { retornar _an_unaria(p) }
+    sea izq = _an_binaria(p, nivel + 1)
+    mientras (izq != nulo y _an_op_actual(p, nivel) != nulo) {
+        sea t = _an_avanzar(p)
+        sea op = _an_op_actual_de(t)
+        sea der = _an_binaria(p, nivel + 1)
+        sea n = _an_nodo("binaria", t)
+        n["op"] = op
+        n["izq"] = izq
+        n["der"] = der
+        izq = n
+    }
+    retornar izq
+}
+
+funcion _an_op_actual_de(t) {
+    si (t["tipo"] == "clave") { retornar t["valor"] }
+    retornar t["texto"]
+}
+
+funcion _an_unaria(p) {
+    sea t = _an_ver(p)
+    si (_an_es(p, "-") o _an_es(p, "no")) {
+        _an_avanzar(p)
+        sea n = _an_nodo("unaria", t)
+        n["op"] = _an_op_actual_de(t)
+        n["valor"] = _an_unaria(p)
+        retornar n
+    }
+    retornar _an_postfija(p)
+}
+
+funcion _an_argumentos(p) {
+    sea r = []
+    _an_esperar(p, "(")
+    mientras (_an_es(p, ")") == falso y _an_ver(p)["tipo"] != "fin") {
+        sea e = _an_expresion(p)
+        si (e == nulo) { romper }
+        r.agregar(e)
+        si (_an_es(p, ",")) { _an_avanzar(p) } sino { romper }
+    }
+    _an_esperar(p, ")")
+    retornar r
+}
+
+funcion _an_postfija(p) {
+    sea e = _an_primaria(p)
+    mientras (e != nulo) {
+        sea t = _an_ver(p)
+        // Una llamada o índice en la línea siguiente no continúa la expresión.
+        si (_an_es(p, "(") y t["linea"] == (e["ultima_linea"] ?? e["linea"])) {
+            sea n = _an_nodo("llamada", t)
+            n["linea"] = e["linea"]
+            n["col"] = e["col"]
+            n["funcion"] = e
+            n["args"] = _an_argumentos(p)
+            n["ultima_linea"] = p["t"][maximo(0, p["i"] - 1)]["linea"]
+            e = n
+        } sino si (_an_es(p, "[") y t["linea"] == (e["ultima_linea"] ?? e["linea"])) {
+            _an_avanzar(p)
+            sea n = _an_nodo("indice", t)
+            n["linea"] = e["linea"]
+            n["col"] = e["col"]
+            n["objeto"] = e
+            n["indice"] = _an_expresion(p)
+            _an_esperar(p, "]")
+            n["ultima_linea"] = p["t"][maximo(0, p["i"] - 1)]["linea"]
+            e = n
+        } sino si (_an_es(p, ".")) {
+            _an_avanzar(p)
+            sea m = _an_avanzar(p)
+            sea n = _an_nodo("miembro", m)
+            n["objeto"] = e
+            n["nombre"] = m["texto"]
+            n["ultima_linea"] = m["linea"]
+            e = n
+        } sino { romper }
+    }
+    retornar e
+}
+
+funcion _an_primaria(p) {
+    sea t = _an_ver(p)
+    si (t["tipo"] == "numero") {
+        _an_avanzar(p)
+        sea n = _an_nodo("numero", t)
+        n["valor"] = t["texto"]
+        retornar n
+    }
+    si (t["tipo"] == "texto") {
+        _an_avanzar(p)
+        si (t["sin_cerrar"] ?? falso) { _an_error(p, t, "texto sin cerrar (falta la comilla)") }
+        sea n = _an_nodo("texto", t)
+        n["valor"] = t["valor"]
+        retornar n
+    }
+    si (t["tipo"] == "clave" y (t["valor"] == "verdadero" o t["valor"] == "falso" o t["valor"] == "nulo")) {
+        _an_avanzar(p)
+        sea n = _an_nodo("literal", t)
+        n["valor"] = t["valor"]
+        retornar n
+    }
+    si (t["tipo"] == "clave" y t["valor"] != "no" y t["valor"] != "funcion" y t["valor"] != "esto" y t["valor"] != "verdadero" y t["valor"] != "falso" y t["valor"] != "nulo") {
+        _an_avanzar(p)
+        sea n = _an_nodo("nombre", t)
+        n["nombre"] = t["texto"]
+        retornar n
+    }
+    si (t["tipo"] == "clave" y t["valor"] == "esto") {
+        _an_avanzar(p)
+        retornar _an_nodo("esto", t)
+    }
+    si (t["tipo"] == "ident") {
+        _an_avanzar(p)
+        si (t["texto"] == "nuevo" y _an_ver(p)["tipo"] == "ident" y _an_ver2(p)["texto"] == "(") {
+            sea clase_t = _an_avanzar(p)
+            sea n = _an_nodo("nuevo", t)
+            n["clase"] = clase_t["texto"]
+            n["clinea"] = clase_t["linea"]
+            n["ccol"] = clase_t["col"]
+            n["args"] = _an_argumentos(p)
+            retornar n
+        }
+        sea n = _an_nodo("nombre", t)
+        n["nombre"] = t["texto"]
+        retornar n
+    }
+    si (_an_es(p, "(")) {
+        _an_avanzar(p)
+        sea e = _an_expresion(p)
+        _an_esperar(p, ")")
+        si (e != nulo) { e["ultima_linea"] = p["t"][maximo(0, p["i"] - 1)]["linea"] }
+        retornar e
+    }
+    si (_an_es(p, "[")) {
+        _an_avanzar(p)
+        sea n = _an_nodo("lista", t)
+        n["elementos"] = []
+        mientras (_an_es(p, "]") == falso y _an_ver(p)["tipo"] != "fin") {
+            sea e = _an_expresion(p)
+            si (e == nulo) { romper }
+            n["elementos"].agregar(e)
+            si (_an_es(p, ",")) { _an_avanzar(p) } sino { romper }
+        }
+        _an_esperar(p, "]")
+        n["ultima_linea"] = p["t"][maximo(0, p["i"] - 1)]["linea"]
+        retornar n
+    }
+    si (_an_es(p, "{")) {
+        _an_avanzar(p)
+        sea n = _an_nodo("mapa", t)
+        n["pares"] = []
+        mientras (_an_es(p, "}") == falso y _an_ver(p)["tipo"] != "fin") {
+            sea k = _an_expresion(p)
+            _an_esperar(p, ":")
+            sea v = _an_expresion(p)
+            si (k == nulo o v == nulo) { romper }
+            n["pares"].agregar([k, v])
+            si (_an_es(p, ",")) { _an_avanzar(p) } sino { romper }
+        }
+        _an_esperar(p, "}")
+        n["ultima_linea"] = p["t"][maximo(0, p["i"] - 1)]["linea"]
+        retornar n
+    }
+    si (_an_es(p, "funcion")) {
+        _an_avanzar(p)
+        sea n = _an_nodo("lambda", t)
+        n["params"] = _an_parametros(p)
+        n["retorno"] = _an_tipo_anotado(p)
+        n["cuerpo"] = _an_bloque(p)
+        n["ultima_linea"] = p["t"][maximo(0, p["i"] - 1)]["linea"]
+        retornar n
+    }
+    sea visto = t["texto"]
+    si (t["tipo"] == "fin") { visto = "el final del archivo" }
+    _an_error(p, t, "se esperaba una expresión y llegó '" + visto + "'")
+    retornar nulo
+}
+
+// ---------- módulos ----------
+
+sea _AN_MODS = {}
+
+funcion _an_ruta_stdlib(op) {
+    si ((op["stdlib"] ?? nulo) != nulo) { retornar op["stdlib"] }
+    sea e = nulo
+    intentar { e = variable_entorno("CFORGE_STDLIB") } capturar (x) { e = nulo }
+    si (e != nulo y e != "" y existe_archivo(e)) { retornar e }
+    si (existe_archivo("stdlib")) { retornar "stdlib" }
+    retornar nulo
+}
+
+// Nombres que exporta un módulo (funciones, globales y clases), con sus
+// importaciones. nulo si no se encuentra.
+funcion _an_modulo(ruta, nombre, profundidad) {
+    sea clave = ruta + "/" + nombre
+    si (tiene_clave(_AN_MODS, clave)) { retornar _AN_MODS[clave] }
+    sea archivo = ruta + "/" + nombre + ".cfv"
+    si (existe_archivo(archivo) == falso) { retornar nulo }
+    sea r = {"nombres": {}, "docs": {}, "firmas": {}}
+    _AN_MODS[clave] = r
+    sea doc = []
+    para l0 en texto_dividir(leer_archivo(archivo), "\n") {
+        sea l = texto_recortar(l0)
+        si (texto_empieza_con(l, "///")) { doc.agregar(texto_recortar(subtexto(l, 3, longitud(l)))) }
+        sino {
+            si (texto_empieza_con(l0, "funcion ") o texto_empieza_con(l0, "sea ") o texto_empieza_con(l0, "clase ")) {
+                sea resto = subtexto(l0, texto_indice(l0, " ") + 1, longitud(l0))
+                sea k = 0
+                mientras (k < longitud(resto) y (_an_letra(byte_en(resto, k)) o _an_digito(byte_en(resto, k)))) { k = k + 1 }
+                sea n = subtexto(resto, 0, k)
+                si (n != "") {
+                    r["nombres"][n] = nombre
+                    si (texto_empieza_con(l0, "funcion ")) {
+                        sea fin = texto_indice(resto, ")")
+                        si (fin > 0) { r["firmas"][n] = "funcion " + subtexto(resto, 0, fin + 1) }
+                        si (longitud(doc) > 0) { r["docs"][n] = unir(doc, "\n") }
+                    }
+                }
+            }
+            si (texto_empieza_con(l0, "importar ") y profundidad < 3) {
+                sea m = texto_reemplazar(texto_recortar(subtexto(l0, 9, longitud(l0))), "\"", "")
+                sea sub = _an_modulo(ruta, m, profundidad + 1)
+                si (sub != nulo) {
+                    para k2 en claves(sub["nombres"]) { si (tiene_clave(r["nombres"], k2) == falso) { r["nombres"][k2] = sub["nombres"][k2] } }
+                    para k2 en claves(sub["firmas"]) { si (tiene_clave(r["firmas"], k2) == falso) { r["firmas"][k2] = sub["firmas"][k2] } }
+                    para k2 en claves(sub["docs"]) { si (tiene_clave(r["docs"], k2) == falso) { r["docs"][k2] = sub["docs"][k2] } }
+                }
+            }
+            doc = []
+        }
+    }
+    retornar r
+}
+
+// ---------- enlazado (ámbitos, definiciones y referencias) ----------
+
+/// Análisis completo: {"arbol", "defs", "refs", "diagnosticos", "importados"}.
+/// opciones: "stdlib" (carpeta de módulos), "globales" (nombres extra).
+funcion analiza_documento(fuente, opciones) {
+    sea op = opciones ?? {}
+    sea arbol = analiza_arbol(fuente)
+    sea a = {"defs": [], "refs": [], "diag": [], "ambitos": [{}], "bucle": 0, "funcion": 0, "importados": {}, "importados_firmas": {}, "importados_docs": {},
+        "modulos_sin_ver": falso, "globales": {}, "op": op, "rangos": []}
+    para d en arbol["errores"] { a["diag"].agregar(d) }
+    para g en op["globales"] ?? [] { a["globales"][g] = verdadero }
+    para b en _AN_BUILTINS { a["globales"][b] = verdadero }
+    sea ruta = _an_ruta_stdlib(op)
+    // Primera pasada: importaciones, funciones, clases y globales del módulo.
+    sea raiz = arbol["raiz"]
+    para s en raiz["cuerpo"] {
+        si (s["t"] == "importar") {
+            sea m = nulo
+            si (ruta != nulo) { m = _an_modulo(ruta, s["modulo"], 0) }
+            si (m == nulo) {
+                a["modulos_sin_ver"] = verdadero
+                si (ruta != nulo) { _an_diag(a, s, "aviso", "CF013", "no se encontró el módulo '" + s["modulo"] + "'") }
+            } sino {
+                para k en claves(m["nombres"]) { a["importados"][k] = m["nombres"][k] }
+                para k en claves(m["firmas"]) { a["importados_firmas"][k] = m["firmas"][k] }
+                para k en claves(m["docs"]) { a["importados_docs"][k] = m["docs"][k] }
+            }
+        }
+        si (s["t"] == "funcion" o s["t"] == "extern" o s["t"] == "clase") {
+            si (tiene_clave(a["ambitos"][0], s["nombre"])) {
+                sea previa = a["defs"][a["ambitos"][0][s["nombre"]]]
+                si (previa["tipo"] == "funcion" o previa["tipo"] == "clase") { _an_diag_en(a, s["nlinea"], s["ncol"], "error", "CF006", "'" + s["nombre"] + "' ya está definida en la línea " + previa["linea"]) }
+            }
+            sea tipo_d = s["t"]
+            si (tipo_d == "extern") { tipo_d = "funcion" }
+            si (tiene_clave(a["ambitos"][0], s["nombre"]) == falso) { _an_definir(a, s["nombre"], tipo_d, s["nlinea"], s["ncol"], s) }
+        }
+    }
+    para s en raiz["cuerpo"] { si (s["t"] == "sea") { _an_definir(a, s["nombre"], "variable", s["nlinea"], s["ncol"], s) } }
+    _an_bloque_sem(a, raiz["cuerpo"], verdadero)
+    // Variables sin usar (en funciones; las del módulo pueden usarse desde afuera).
+    para d en a["defs"] {
+        si (d["tipo"] == "variable" y d["local"] y d["usos"] == 0 y texto_empieza_con(d["nombre"], "_") == falso) { _an_diag_en(a, d["linea"], d["col"], "aviso", "CF004", "la variable '" + d["nombre"] + "' no se usa") }
+    }
+    a["diag"] = _an_ordenar_diag(a["diag"])
+    retornar {"arbol": arbol, "defs": a["defs"], "refs": a["refs"], "diagnosticos": a["diag"], "importados": a["importados"], "importados_firmas": a["importados_firmas"],
+        "importados_docs": a["importados_docs"], "rangos": a["rangos"], "globales": a["globales"]}
+}
+
+funcion _an_ordenar_diag(l) {
+    sea r = []
+    para d en l { r.agregar(d) }
+    sea i = 1
+    mientras (i < longitud(r)) {
+        sea v = r[i]
+        sea j = i - 1
+        mientras (j >= 0 y (r[j]["linea"] > v["linea"] o (r[j]["linea"] == v["linea"] y r[j]["col"] > v["col"]))) {
+            r[j + 1] = r[j]
+            j = j - 1
+        }
+        r[j + 1] = v
+        i = i + 1
+    }
+    retornar r
+}
+
+funcion _an_diag(a, nodo, sev, codigo, msj) { _an_diag_en(a, nodo["linea"], nodo["col"], sev, codigo, msj) }
+funcion _an_diag_en(a, linea, col, sev, codigo, msj) {
+    para d en a["diag"] { si (d["linea"] == linea y d["col"] == col y d["codigo"] == codigo) { retornar nulo } }
+    a["diag"].agregar({"linea": linea, "col": col, "severidad": sev, "codigo": codigo, "mensaje": msj})
+}
+
+funcion _an_definir(a, nombre, tipo_d, linea, col, nodo) {
+    sea amb = a["ambitos"][longitud(a["ambitos"]) - 1]
+    sea d = {"nombre": nombre, "tipo": tipo_d, "linea": linea, "col": col, "usos": 0, "local": longitud(a["ambitos"]) > 1, "nodo": nodo, "id": longitud(a["defs"])}
+    a["defs"].agregar(d)
+    amb[nombre] = d["id"]
+    retornar d
+}
+
+funcion _an_buscar(a, nombre) {
+    sea i = longitud(a["ambitos"]) - 1
+    mientras (i >= 0) {
+        si (tiene_clave(a["ambitos"][i], nombre)) { retornar a["defs"][a["ambitos"][i][nombre]] }
+        i = i - 1
+    }
+    retornar nulo
+}
+
+funcion _an_entrar(a) { a["ambitos"].agregar({}) }
+funcion _an_salir(a) {
+    sea n = []
+    sea i = 0
+    mientras (i < longitud(a["ambitos"]) - 1) {
+        n.agregar(a["ambitos"][i])
+        i = i + 1
+    }
+    a["ambitos"] = n
+}
+
+funcion _an_referir(a, nombre, linea, col, es_llamada) {
+    sea d = _an_buscar(a, nombre)
+    sea id = nulo
+    si (d != nulo) {
+        d["usos"] = d["usos"] + 1
+        id = d["id"]
+    }
+    a["refs"].agregar({"nombre": nombre, "linea": linea, "col": col, "def": id, "llamada": es_llamada})
+    si (d == nulo y tiene_clave(a["globales"], nombre) == falso y tiene_clave(a["importados"], nombre) == falso) {
+        si (es_llamada) { _an_diag_en(a, linea, col, "aviso", "CF003", "función desconocida '" + nombre + "'") }
+        sino si (a["modulos_sin_ver"]) { _an_diag_en(a, linea, col, "aviso", "CF002", "'" + nombre + "' no está declarada aquí (¿viene de un módulo importado?)") }
+        sino { _an_diag_en(a, linea, col, "error", "CF002", "'" + nombre + "' no está declarada") }
+    }
+    retornar d
+}
+
+funcion _an_bloque_sem(a, sentencias, nivel_modulo) {
+    sea terminado = falso
+    sea avisado = falso
+    para s en sentencias {
+        si (terminado y avisado == falso) {
+            _an_diag(a, s, "aviso", "CF005", "código inalcanzable")
+            avisado = verdadero
+        }
+        _an_sentencia_sem(a, s, nivel_modulo)
+        si (s["t"] == "retornar" o s["t"] == "lanzar" o s["t"] == "romper" o s["t"] == "continuar") { terminado = verdadero }
+    }
+}
+
+funcion _an_funcion_sem(a, nodo, nombre_metodo_clase) {
+    a["rangos"].agregar({"desde": nodo["linea"], "hasta": nodo["fin_linea"] ?? (nodo["ultima_linea"] ?? nodo["linea"]), "tipo": "funcion"})
+    _an_entrar(a)
+    sea fun_previa = a["funcion"]
+    sea bucle_previo = a["bucle"]
+    a["funcion"] = 1
+    a["bucle"] = 0
+    para prm en nodo["params"] {
+        si (prm["defecto"] != nulo) { _an_expr(a, prm["defecto"]) }
+        sea d = _an_definir(a, prm["nombre"], "parametro", prm["linea"], prm["col"], prm)
+    }
+    _an_bloque_sem(a, nodo["cuerpo"], falso)
+    a["funcion"] = fun_previa
+    a["bucle"] = bucle_previo
+    _an_salir(a)
+}
+
+funcion _an_sentencia_sem(a, s, nivel_modulo) {
+    sea t = s["t"]
+    si (t == "sea") {
+        si ((s["valor"] ?? nulo) != nulo) { _an_expr(a, s["valor"]) }
+        si (nivel_modulo == falso) {
+            sea previa = nulo
+            sea amb = a["ambitos"][longitud(a["ambitos"]) - 1]
+            _an_definir(a, s["nombre"], "variable", s["nlinea"], s["ncol"], s)
+        }
+    } sino si (t == "funcion") {
+        si (nivel_modulo == falso) { _an_definir(a, s["nombre"], "funcion", s["nlinea"], s["ncol"], s) }
+        _an_funcion_sem(a, s, nulo)
+    } sino si (t == "clase") {
+        a["rangos"].agregar({"desde": s["linea"], "hasta": s["fin_linea"], "tipo": "clase"})
+        para m en s["metodos"] {
+            _an_entrar(a)
+            _an_definir(a, "esto", "esto", m["linea"], m["col"], s)
+            _an_funcion_sem(a, m, s["nombre"])
+            _an_salir(a)
+        }
+    } sino si (t == "si") {
+        _an_expr(a, s["cond"])
+        _an_entrar(a)
+        _an_bloque_sem(a, s["cuerpo"], falso)
+        _an_salir(a)
+        si (s["sino"] != nulo) {
+            _an_entrar(a)
+            _an_bloque_sem(a, s["sino"], falso)
+            _an_salir(a)
+        }
+    } sino si (t == "mientras") {
+        _an_expr(a, s["cond"])
+        a["bucle"] = a["bucle"] + 1
+        _an_entrar(a)
+        _an_bloque_sem(a, s["cuerpo"], falso)
+        _an_salir(a)
+        a["bucle"] = a["bucle"] - 1
+    } sino si (t == "para") {
+        _an_expr(a, s["coleccion"])
+        a["bucle"] = a["bucle"] + 1
+        _an_entrar(a)
+        para v en s["vars"] {
+            sea d = _an_definir(a, v["nombre"], "variable", v["linea"], v["col"], s)
+            d["usos"] = 1
+        }
+        _an_bloque_sem(a, s["cuerpo"], falso)
+        _an_salir(a)
+        a["bucle"] = a["bucle"] - 1
+    } sino si (t == "retornar") {
+        si (a["funcion"] == 0) { _an_diag(a, s, "error", "CF011", "retornar fuera de una función") }
+        si ((s["valor"] ?? nulo) != nulo) { _an_expr(a, s["valor"]) }
+    } sino si (t == "romper" o t == "continuar") {
+        si (a["bucle"] == 0) { _an_diag(a, s, "error", "CF010", "'" + t + "' fuera de un bucle") }
+    } sino si (t == "lanzar" o t == "expresion") {
+        si ((s["valor"] ?? nulo) != nulo) { _an_expr(a, s["valor"]) }
+    } sino si (t == "intentar") {
+        _an_entrar(a)
+        _an_bloque_sem(a, s["cuerpo"], falso)
+        _an_salir(a)
+        _an_entrar(a)
+        si (s["var"] != nulo) {
+            sea d = _an_definir(a, s["var"]["nombre"], "variable", s["var"]["linea"], s["var"]["col"], s)
+            d["usos"] = 1
+        }
+        _an_bloque_sem(a, s["captura"], falso)
+        _an_salir(a)
+    } sino si (t == "asignar") {
+        _an_expr(a, s["valor"])
+        sea dest = s["destino"]
+        si (dest["t"] == "nombre") {
+            sea d = _an_buscar(a, dest["nombre"])
+            si (d == nulo y tiene_clave(a["importados"], dest["nombre"]) == falso) { _an_diag(a, dest, "error", "CF012", "asignación a '" + dest["nombre"] + "', que no está declarada (falta 'sea')") }
+            sino si (d != nulo) { a["refs"].agregar({"nombre": dest["nombre"], "linea": dest["linea"], "col": dest["col"], "def": d["id"], "llamada": falso, "escritura": verdadero}) }
+        } sino { _an_expr(a, dest) }
+    }
+}
+
+funcion _an_expr(a, e) {
+    si (e == nulo) { retornar nulo }
+    sea t = e["t"]
+    si (t == "nombre") { _an_referir(a, e["nombre"], e["linea"], e["col"], falso) }
+    sino si (t == "binaria") {
+        _an_expr(a, e["izq"])
+        _an_expr(a, e["der"])
+    } sino si (t == "unaria") { _an_expr(a, e["valor"]) }
+    sino si (t == "llamada") {
+        sea f = e["funcion"]
+        si (f["t"] == "nombre") {
+            sea d = _an_referir(a, f["nombre"], f["linea"], f["col"], verdadero)
+            si (d != nulo y d["tipo"] == "funcion" y tiene_clave(d["nodo"], "params")) {
+                sea total = longitud(d["nodo"]["params"])
+                sea requeridos = 0
+                sea variadica = falso
+                para prm en d["nodo"]["params"] {
+                    si (prm["variadico"] ?? falso) { variadica = verdadero } sino si (prm["defecto"] == nulo) { requeridos = requeridos + 1 }
+                }
+                si (variadica) { total = 1000000 }
+                sea n = longitud(e["args"])
+                si (n > total) {
+                    sea esperado = "" + total
+                    si (requeridos != total) { esperado = "" + requeridos + " a " + total }
+                    _an_diag(a, f, "error", "CF007", "'" + f["nombre"] + "' recibe " + esperado + " argumentos y se le pasan " + n)
+                } sino si (n < requeridos) { _an_diag(a, f, "aviso", "CF015", "a '" + f["nombre"] + "' le faltan argumentos (" + n + " de " + requeridos + "): los que faltan valen nulo") }
+            }
+        } sino { _an_expr(a, f) }
+        para x en e["args"] { _an_expr(a, x) }
+    } sino si (t == "indice") {
+        _an_expr(a, e["objeto"])
+        _an_expr(a, e["indice"])
+    } sino si (t == "miembro") { _an_expr(a, e["objeto"]) }
+    sino si (t == "lista") { para x en e["elementos"] { _an_expr(a, x) } }
+    sino si (t == "mapa") {
+        para par en e["pares"] {
+            _an_expr(a, par[0])
+            _an_expr(a, par[1])
+        }
+    } sino si (t == "lambda") { _an_funcion_sem(a, e, nulo) }
+    sino si (t == "nuevo") {
+        _an_referir(a, e["clase"], e["clinea"], e["ccol"], verdadero)
+        para x en e["args"] { _an_expr(a, x) }
+    } sino si (t == "esto") {
+        si (_an_buscar(a, "esto") == nulo) { _an_diag(a, e, "error", "CF014", "'esto' fuera de un método") }
+    }
+}
+
+// ---------- consultas ----------
+
+/// Diagnósticos: [{"linea", "col", "severidad" (error/aviso), "codigo", "mensaje"}].
+funcion analiza_diagnosticos(fuente, opciones) { retornar analiza_documento(fuente, opciones)["diagnosticos"] }
+
+// Referencia o definición en una posición.
+funcion _an_en(doc, linea, col) {
+    para r en doc["refs"] { si (r["linea"] == linea y col >= r["col"] y col < r["col"] + longitud(r["nombre"])) { retornar {"ref": r, "def": r["def"]} } }
+    para d en doc["defs"] { si (d["linea"] == linea y col >= d["col"] y col < d["col"] + longitud(d["nombre"]) y d["tipo"] != "esto") { retornar {"ref": nulo, "def": d["id"], "nombre": d["nombre"]} } }
+    retornar nulo
+}
+
+/// Definición del nombre en (linea, col): {"linea", "col", "nombre", "tipo"},
+/// {"modulo"} si viene de un módulo importado, o nulo.
+funcion analiza_definicion(fuente, linea, col, opciones) {
+    sea doc = analiza_documento(fuente, opciones)
+    sea x = _an_en(doc, linea, col)
+    si (x == nulo) { retornar nulo }
+    si (x["def"] != nulo) {
+        sea d = doc["defs"][x["def"]]
+        retornar {"linea": d["linea"], "col": d["col"], "nombre": d["nombre"], "tipo": d["tipo"]}
+    }
+    sea n = x["ref"]["nombre"]
+    si (tiene_clave(doc["importados"], n)) { retornar {"modulo": doc["importados"][n], "nombre": n, "tipo": "importado"} }
+    retornar nulo
+}
+
+/// Todas las apariciones (definición y usos) del nombre en (linea, col).
+funcion analiza_referencias(fuente, linea, col, opciones) {
+    sea doc = analiza_documento(fuente, opciones)
+    sea x = _an_en(doc, linea, col)
+    si (x == nulo) { retornar [] }
+    sea r = []
+    si (x["def"] != nulo) {
+        sea d = doc["defs"][x["def"]]
+        r.agregar({"linea": d["linea"], "col": d["col"], "definicion": verdadero})
+        para ref en doc["refs"] { si (ref["def"] == x["def"]) { r.agregar({"linea": ref["linea"], "col": ref["col"], "definicion": falso}) } }
+    } sino {
+        para ref en doc["refs"] { si (ref["def"] == nulo y ref["nombre"] == x["ref"]["nombre"]) { r.agregar({"linea": ref["linea"], "col": ref["col"], "definicion": falso}) } }
+    }
+    retornar r
+}
+
+/// Renombra el símbolo en (linea, col) y devuelve el texto nuevo.
+funcion analiza_renombrar(fuente, linea, col, nuevo, opciones) {
+    sea refs = analiza_referencias(fuente, linea, col, opciones)
+    si (longitud(refs) == 0) { lanzar "analiza: no hay un símbolo en " + linea + ":" + col }
+    sea toks = analiza_tokens(nuevo)
+    si (longitud(toks) != 2 o toks[0]["tipo"] != "ident") { lanzar "analiza: '" + nuevo + "' no es un nombre válido" }
+    sea doc = analiza_documento(fuente, opciones)
+    sea viejo = _an_en(doc, linea, col)
+    sea nombre = ""
+    si (viejo["ref"] != nulo) { nombre = viejo["ref"]["nombre"] } sino { nombre = doc["defs"][viejo["def"]]["nombre"] }
+    // Posiciones absolutas, de atrás para adelante.
+    sea inicios = [0]
+    sea i = 0
+    mientras (i < longitud(fuente)) {
+        si (byte_en(fuente, i) == 10) { inicios.agregar(i + 1) }
+        i = i + 1
+    }
+    sea pos = []
+    para r en refs { pos.agregar(inicios[r["linea"] - 1] + r["col"] - 1) }
+    pos = ordenar(pos)
+    sea texto = fuente
+    sea k = longitud(pos) - 1
+    mientras (k >= 0) {
+        texto = subtexto(texto, 0, pos[k]) + nuevo + subtexto(texto, pos[k] + longitud(nombre), longitud(texto))
+        k = k - 1
+    }
+    retornar texto
+}
+
+funcion _an_firma(nodo) {
+    sea ps = []
+    para prm en nodo["params"] ?? [] {
+        sea x = prm["nombre"]
+        si (prm["tipo_dato"] != nulo) { x = x + ": " + prm["tipo_dato"] }
+        si (prm["defecto"] != nulo) { x = x + " = …" }
+        ps.agregar(x)
+    }
+    sea r = "funcion " + (nodo["nombre"] ?? "") + "(" + unir(ps, ", ") + ")"
+    si ((nodo["retorno"] ?? nulo) != nulo) { r = r + ": " + nodo["retorno"] }
+    retornar r
+}
+
+/// Información del símbolo en (linea, col): {"nombre", "tipo", "firma", "doc", "modulo"}.
+funcion analiza_info(fuente, linea, col, opciones) {
+    sea doc = analiza_documento(fuente, opciones)
+    sea x = _an_en(doc, linea, col)
+    si (x == nulo) { retornar nulo }
+    si (x["def"] != nulo) {
+        sea d = doc["defs"][x["def"]]
+        sea firma = nulo
+        si (d["tipo"] == "funcion") { firma = _an_firma(d["nodo"]) }
+        sino si (d["tipo"] == "clase") { firma = "clase " + d["nombre"] }
+        sino si (d["tipo"] == "parametro") { firma = "parámetro " + d["nombre"] }
+        sino {
+            firma = "sea " + d["nombre"]
+            si ((d["nodo"]["tipo_dato"] ?? nulo) != nulo) { firma = firma + ": " + d["nodo"]["tipo_dato"] }
+        }
+        retornar {"nombre": d["nombre"], "tipo": d["tipo"], "firma": firma, "doc": d["nodo"]["doc"] ?? nulo, "modulo": nulo}
+    }
+    sea n = x["ref"]["nombre"]
+    si (tiene_clave(doc["importados"], n)) { retornar {"nombre": n, "tipo": "importado", "firma": doc["importados_firmas"][n] ?? n, "doc": doc["importados_docs"][n] ?? nulo, "modulo": doc["importados"][n]} }
+    si (tiene_clave(doc["globales"], n)) { retornar {"nombre": n, "tipo": "incorporada", "firma": n + "(…)", "doc": "Función del lenguaje.", "modulo": nulo} }
+    retornar nulo
+}
+
+/// Candidatos para completar en (linea, col): [{"nombre", "tipo", "detalle"}],
+/// filtrados por lo que ya se escribió antes del cursor.
+funcion analiza_completar(fuente, linea, col, opciones) {
+    sea lineas = texto_dividir(fuente, "\n")
+    sea actual = ""
+    si (linea - 1 < longitud(lineas)) { actual = lineas[linea - 1] }
+    sea k = minimo(col - 1, longitud(actual))
+    sea ini = k
+    mientras (ini > 0 y (_an_letra(byte_en(actual, ini - 1)) o _an_digito(byte_en(actual, ini - 1)))) { ini = ini - 1 }
+    sea prefijo = subtexto(actual, ini, k)
+    // Se analiza sin la palabra a medio escribir.
+    sea limpio = fuente
+    si (longitud(prefijo) > 0) {
+        lineas[linea - 1] = subtexto(actual, 0, ini) + subtexto(actual, k, longitud(actual))
+        limpio = unir(lineas, "\n")
+    }
+    sea doc = analiza_documento(limpio, opciones)
+    sea vistos = {}
+    sea r = []
+    // Definiciones visibles: las del módulo y las locales de la función que contiene la línea.
+    sea dentro = nulo
+    para rg en doc["rangos"] { si (rg["tipo"] == "funcion" y linea >= rg["desde"] y linea <= rg["hasta"]) { si (dentro == nulo o rg["desde"] >= dentro["desde"]) { dentro = rg } } }
+    para d en doc["defs"] {
+        sea visible = d["local"] == falso
+        si (d["local"] y dentro != nulo y d["linea"] >= dentro["desde"] y d["linea"] <= linea) { visible = verdadero }
+        si (visible y d["tipo"] != "esto" y texto_empieza_con(d["nombre"], prefijo) y tiene_clave(vistos, d["nombre"]) == falso) {
+            vistos[d["nombre"]] = verdadero
+            sea det = d["tipo"]
+            si (d["tipo"] == "funcion") { det = _an_firma(d["nodo"]) }
+            r.agregar({"nombre": d["nombre"], "tipo": d["tipo"], "detalle": det})
+        }
+    }
+    para n en claves(doc["importados"]) {
+        si (texto_empieza_con(n, prefijo) y texto_empieza_con(n, "_") == falso y tiene_clave(vistos, n) == falso) {
+            vistos[n] = verdadero
+            r.agregar({"nombre": n, "tipo": "importado", "detalle": doc["importados_firmas"][n] ?? ("módulo " + doc["importados"][n])})
+        }
+    }
+    para n en _AN_BUILTINS {
+        si (texto_empieza_con(n, prefijo) y tiene_clave(vistos, n) == falso) {
+            vistos[n] = verdadero
+            r.agregar({"nombre": n, "tipo": "incorporada", "detalle": "función del lenguaje"})
+        }
+    }
+    para n en ["sea", "funcion", "si", "sino", "mientras", "para", "retornar", "romper", "continuar", "intentar", "capturar", "lanzar", "importar", "clase", "verdadero", "falso", "nulo"] {
+        si (texto_empieza_con(n, prefijo) y longitud(prefijo) > 0 y tiene_clave(vistos, n) == falso) {
+            vistos[n] = verdadero
+            r.agregar({"nombre": n, "tipo": "palabra_clave", "detalle": "palabra clave"})
+        }
+    }
+    retornar r
+}
+
+/// Símbolos del documento (esquema): importaciones, funciones, clases con
+/// métodos y globales, con línea y documentación.
+funcion analiza_simbolos(fuente) {
+    sea arbol = analiza_arbol(fuente)
+    sea r = []
+    para s en arbol["raiz"]["cuerpo"] {
+        si (s["t"] == "funcion") { r.agregar({"nombre": s["nombre"], "tipo": "funcion", "linea": s["nlinea"], "hasta": s["fin_linea"], "firma": _an_firma(s), "doc": s["doc"]}) }
+        si (s["t"] == "extern") { r.agregar({"nombre": s["nombre"], "tipo": "extern", "linea": s["nlinea"], "hasta": s["nlinea"], "firma": _an_firma(s), "doc": nulo}) }
+        si (s["t"] == "sea") { r.agregar({"nombre": s["nombre"], "tipo": "variable", "linea": s["nlinea"], "hasta": s["nlinea"], "firma": "sea " + s["nombre"], "doc": nulo}) }
+        si (s["t"] == "importar") { r.agregar({"nombre": s["modulo"], "tipo": "importacion", "linea": s["linea"], "hasta": s["linea"], "firma": "importar \"" + s["modulo"] + "\"", "doc": nulo}) }
+        si (s["t"] == "clase") {
+            sea metodos = []
+            para m en s["metodos"] { metodos.agregar({"nombre": m["nombre"], "tipo": "metodo", "linea": m["nlinea"], "firma": _an_firma(m)}) }
+            r.agregar({"nombre": s["nombre"], "tipo": "clase", "linea": s["nlinea"], "hasta": s["fin_linea"], "firma": "clase " + s["nombre"], "doc": s["doc"], "metodos": metodos})
+        }
+    }
+    retornar r
+}
+
+/// Rangos para plegar: [{"desde", "hasta", "tipo"}] (funciones, clases y
+/// bloques de más de una línea).
+funcion analiza_plegado(fuente) {
+    sea toks = analiza_tokens(fuente)
+    sea pila = []
+    sea r = []
+    para t en toks {
+        si (t["tipo"] == "simbolo" y t["texto"] == "{") { pila.agregar(t["linea"]) }
+        si (t["tipo"] == "simbolo" y t["texto"] == "}" y longitud(pila) > 0) {
+            sea desde = pila[longitud(pila) - 1]
+            sea n = []
+            sea i = 0
+            mientras (i < longitud(pila) - 1) {
+                n.agregar(pila[i])
+                i = i + 1
+            }
+            pila = n
+            si (t["linea"] > desde) { r.agregar({"desde": desde, "hasta": t["linea"], "tipo": "bloque"}) }
+        }
+    }
+    retornar r
+}

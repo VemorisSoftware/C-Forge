@@ -1,0 +1,68 @@
+// Pruebas de analiza (el compilador como servicio).
+importar "analiza"
+funcion eq(a, b, q) { afirmar(("" + a) == ("" + b), q + ": [" + a + "] != [" + b + "]") }
+funcion codigos(l) {
+    sea r = []
+    para d en l { r.agregar("" + d["linea"] + ":" + d["codigo"]) }
+    retornar r
+}
+
+// Tokens con posición.
+sea t = analiza_tokens("sea x = 1.5e3 // nota\n/// doc\nsi (x >= 2 ?? 3) { mostrar(\"a\\\"b\") }")
+eq([t[0]["tipo"], t[0]["texto"], t[1]["tipo"], t[3]["tipo"], t[3]["texto"], t[4]["tipo"]], ["clave", "sea", "ident", "numero", "1.5e3", "comentario"], "tokens")
+eq([t[5]["tipo"], t[6]["linea"], t[6]["col"], t[9]["texto"], t[11]["texto"]], ["doc", 3, 1, ">=", "??"], "posiciones y símbolos")
+sea txt = nulo
+para k en t { si (k["tipo"] == "texto") { txt = k["valor"] } }
+eq(txt, "a\"b", "escapes")
+
+// Diagnósticos.
+sea fuente = "importar \"json\"\n/// Suma dos números.\nfuncion sumar(a, b = 1) {\n    sea sin_uso = 3\n    retornar a + b\n    mostrar(\"nunca\")\n}\nsea total = sumar(1, 2, 3)\nmostrar(totl)\nromper\nfuncion sumar(x) { retornar x }\nx = 5\nsi (total != nulo) { mostrar(desconocida(total)) }\n"
+sea diags = analiza_diagnosticos(fuente, {"stdlib": "stdlib"})
+eq(codigos(diags), ["4:CF004", "6:CF005", "8:CF007", "9:CF002", "10:CF010", "11:CF005", "11:CF006", "12:CF012", "13:CF003"], "diagnósticos")
+eq(diags[2]["mensaje"], "'sumar' recibe 1 a 2 argumentos y se le pasan 3", "mensaje de argumentos")
+eq(codigos(analiza_diagnosticos("funcion f(a, b) { retornar a }\nmostrar(f(1))\n", nulo)), ["2:CF015"], "argumentos de menos (valen nulo)")
+// Sintaxis menos común: ternario, textos de varias líneas, +=, variádicos y palabras clave como nombres.
+eq(analiza_diagnosticos("funcion g(o, y, ...resto) { retornar o ? y : resto }\nsea para = \"a\nb\"\nsea n = 1\nn += 2\nmostrar(g(1, 2, 3, 4) y para)\n", nulo), [], "sintaxis variada")
+// Un programa correcto no tiene diagnósticos (y entiende palabras clave en inglés).
+sea bueno = "import \"json\"\nfunction doble(n: numero): numero { return n * 2 }\nlet lista_ = [1, 2, 3]\nlet suma = 0\nfor x in lista_ {\n    if (x > 1 and not (x == 3)) { suma = suma + doble(x) } else { continue }\n}\ntry { throw \"e\" } catch (err) { mostrar(err) }\nsea f = funcion(v) { retornar v + suma }\nmostrar(f(1))\nmostrar(json_decodificar(\"[]\"))\nclase Punto {\n    constructor(x) { esto.x = x }\n    norma() { retornar esto.x }\n}\nsea p = nuevo Punto(3)\nmostrar(p.norma())\nsea m = {\"a\": [1, {\"b\": nulo}], \"c\": -suma ?? 0}\nmostrar(m[\"a\"][1][\"b\"])\n"
+eq(analiza_diagnosticos(bueno, {"stdlib": "stdlib"}), [], "programa correcto")
+// Errores de sintaxis con recuperación.
+sea malo = "sea a = (1 + 2\nsea b = 3\nfuncion f( { }\nsea y = 4\nmostrar(b)\n"
+sea dm = analiza_diagnosticos(malo, nulo)
+afirmar(longitud(dm) >= 2, "varios errores de sintaxis")
+eq(dm[0]["codigo"], "CF001", "sintaxis")
+afirmar(contiene(analiza_arbol("mostrar(\"sin cerrar)")["errores"][0]["mensaje"], "sin cerrar"), "texto sin cerrar")
+// Módulo inexistente.
+eq(codigos(analiza_diagnosticos("importar \"no_existe_x\"\n", {"stdlib": "stdlib"})), ["1:CF013"], "módulo inexistente")
+
+// Definición, referencias, información y renombrar.
+eq(analiza_definicion(fuente, 8, 13, nulo), {"col": 9, "linea": 3, "nombre": "sumar", "tipo": "funcion"}, "ir a la definición")
+eq(longitud(analiza_referencias(fuente, 3, 9, nulo)), 2, "referencias")
+sea inf = analiza_info(fuente, 8, 13, nulo)
+eq([inf["firma"], inf["doc"]], ["funcion sumar(a, b = …)", "Suma dos números."], "información")
+sea mod = analiza_info("importar \"json\"\nmostrar(json_leer_archivo(\"x\"))\n", 2, 9, {"stdlib": "stdlib"})
+afirmar(mod == nulo o mod["tipo"] == "importado" o mod["tipo"] == "incorporada", "función de un módulo")
+sea ren = analiza_renombrar("sea cuenta = 1\nfuncion f(cuenta) { retornar cuenta }\nmostrar(cuenta + f(cuenta))\n", 1, 5, "total", nulo)
+eq(ren, "sea total = 1\nfuncion f(cuenta) { retornar cuenta }\nmostrar(total + f(total))\n", "renombrar respeta el ámbito")
+sea fallo = ""
+intentar { analiza_renombrar("sea a = 1\n", 1, 5, "1x", nulo) } capturar (e) { fallo = e }
+afirmar(contiene(fallo, "no es un nombre"), "nombre inválido")
+
+// Completado según el ámbito.
+sea comp = []
+para c en analiza_completar("sea total = 1\nfuncion f(valor) {\n    sea temporal = 2\n    te\n}\nfuncion g() { sea tesoro = 1 }\n", 4, 7, nulo) { comp.agregar(c["nombre"]) }
+afirmar(contiene(comp, "temporal") y contiene(comp, "texto_dividir"), "completa locales y del lenguaje")
+afirmar(contiene(comp, "tesoro") == falso, "no ve locales de otra función")
+sea comp2 = []
+para c en analiza_completar("importar \"json\"\njson_\n", 2, 6, {"stdlib": "stdlib"}) { comp2.agregar(c["nombre"]) }
+afirmar(longitud(comp2) > 0, "completa funciones del módulo importado")
+
+// Símbolos y plegado.
+sea sim = analiza_simbolos(bueno)
+sea nombres = []
+para s en sim { nombres.agregar(s["tipo"] + ":" + s["nombre"]) }
+eq(nombres, ["importacion:json", "funcion:doble", "variable:lista_", "variable:suma", "variable:f", "clase:Punto", "variable:p", "variable:m"], "símbolos")
+eq(sim[5]["metodos"][1]["nombre"], "norma", "métodos")
+sea pl = analiza_plegado("funcion f() {\n    si (x) {\n        y_ = 1\n    }\n}\n")
+eq(longitud(pl), 2, "plegado")
+mostrar("[OK] analiza")
