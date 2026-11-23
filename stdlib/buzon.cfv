@@ -1,0 +1,459 @@
+// stdlib/buzon.cfv — mensajería entre procesos compatible con ZeroMQ
+// (ZMTP 3.0/3.1 con el mecanismo NULL): saludo de 64 bytes, comandos
+// READY y SUBSCRIBE, tramas cortas y largas con partes (MORE), y los
+// patrones REQ/REP, PUB/SUB (con filtro por prefijo), PUSH/PULL y
+// DEALER/ROUTER (con identidades). Conecta por TCP como cliente (tcp://)
+// o escucha como servidor con sockets de libc, y también funciona sobre un
+// transporte en memoria para pruebas. Se entiende con libzmq/pyzmq. Idea
+// y protocolo de ZeroMQ (MPL; solo la idea, ZMTP es una especificación
+// abierta). En inglés: importar "zeromq".
+//
+//   importar "buzon"
+//   sea s = buzon_conectar("REQ", "tcp://127.0.0.1:5555", nulo)
+//   buzon_enviar(s, ["hola"])
+//   mostrar(buzon_recibir(s))      // ["mundo"]
+
+funcion __buzon_declaraciones() {
+    extern "libc" funcion socket(dominio: entero, tipo_s: entero, proto: entero): entero
+    extern "libc" funcion setsockopt(fd: entero, nivel: entero, opcion: entero, valor: puntero, largo: entero): entero
+    extern "libc" funcion bind(fd: entero, dir: puntero, largo: entero): entero
+    extern "libc" funcion listen(fd: entero, cola: entero): entero
+    extern "libc" funcion accept(fd: entero, dir: puntero, largo: puntero): entero
+    extern "libc" funcion read(fd: entero, buf: puntero, n: entero): largo
+    extern "libc" funcion write(fd: entero, datos: texto, n: entero): largo
+    extern "libc" funcion close(fd: entero): entero
+    extern "libc" funcion poll(fds: puntero, n: entero, espera: entero): entero
+}
+
+funcion _bz_b(n) { retornar bytes_entero(n, 1, 0) }
+
+sea _BZ_COMPATIBLES = {"REQ": ["REP", "ROUTER"], "REP": ["REQ", "DEALER"], "PUB": ["SUB", "XSUB"], "SUB": ["PUB", "XPUB"], "PUSH": ["PULL"], "PULL": ["PUSH"], "DEALER": ["REP", "DEALER", "ROUTER"], "ROUTER": ["REQ", "DEALER", "ROUTER"], "PAIR": ["PAIR"], "XPUB": ["SUB", "XSUB"], "XSUB": ["PUB", "XPUB"]}
+
+// ---------- codificación ----------
+
+/// Saludo ZMTP de 64 bytes.
+funcion buzon_saludo(servidor) {
+    sea s = _bz_b(255) + bytes_entero(0, 8, 0) + _bz_b(127) + _bz_b(3) + _bz_b(0) + "NULL" + bytes_entero(0, 16, 0)
+    si (servidor) { s = s + _bz_b(1) } sino { s = s + _bz_b(0) }
+    retornar s + bytes_entero(0, 31, 0)
+}
+
+funcion _bz_trama(flags, cuerpo) {
+    sea n = longitud(cuerpo)
+    si (n <= 255) { retornar _bz_b(flags) + _bz_b(n) + cuerpo }
+    retornar _bz_b(flags + 2) + bytes_entero(n, 8, 0) + cuerpo
+}
+
+/// Comando con propiedades {nombre: valor}.
+funcion buzon_comando(nombre, props) {
+    sea partes = [_bz_b(longitud(nombre)) + nombre]
+    para k en ordenar(claves(props ?? {})) { partes.agregar(_bz_b(longitud(k)) + k + bytes_entero(longitud(props[k]), 4, 0) + props[k]) }
+    retornar _bz_trama(4, unir(partes, ""))
+}
+
+/// Mensaje de varias partes (lista de textos).
+funcion buzon_mensaje(partes) {
+    sea r = []
+    sea i = 0
+    mientras (i < longitud(partes)) {
+        sea f = 0
+        si (i + 1 < longitud(partes)) { f = 1 }
+        r.agregar(_bz_trama(f, "" + partes[i]))
+        i = i + 1
+    }
+    retornar unir(r, "")
+}
+
+funcion _bz_leer_props(t) {
+    sea r = {}
+    sea p = 0
+    mientras (p < longitud(t)) {
+        sea nl = byte_en(t, p)
+        sea k = subcadena(t, p + 1, p + 1 + nl)
+        sea vl = bytes_leer_entero(t, p + 1 + nl, 4, 0)
+        r[k] = subcadena(t, p + 5 + nl, p + 5 + nl + vl)
+        p = p + 5 + nl + vl
+    }
+    retornar r
+}
+
+// ---------- transporte ----------
+
+funcion _bz_linux() { retornar existe_archivo("/proc/meminfo") }
+
+funcion _bz_sockaddr(host, puerto) {
+    sea a = c_reservar(16)
+    sea ip = [0, 0, 0, 0]
+    si (host != "*" y host != "0.0.0.0") {
+        sea p = texto_dividir(host, ".")
+        si (longitud(p) == 4) { ip = [a_numero(p[0]), a_numero(p[1]), a_numero(p[2]), a_numero(p[3])] }
+    }
+    sea w0 = 0
+    si (_bz_linux()) { w0 = 2 + piso(puerto / 256) * 65536 + (puerto % 256) * 16777216 } sino { w0 = 16 + 2 * 256 + piso(puerto / 256) * 65536 + (puerto % 256) * 16777216 }
+    sea w1 = ip[0] + ip[1] * 256 + ip[2] * 65536 + ip[3] * 16777216
+    si (w0 >= 2147483648) { w0 = w0 - 4294967296 }
+    si (w1 >= 2147483648) { w1 = w1 - 4294967296 }
+    c_escribir32(a, 0, w0)
+    c_escribir32(a, 4, w1)
+    c_escribir32(a, 8, 0)
+    c_escribir32(a, 12, 0)
+    retornar a
+}
+
+funcion _bz_fd_transporte(fd) {
+    sea buf = c_reservar(65536)
+    sea pendiente = [""]
+    retornar {
+        "enviar": funcion(d) {
+            sea total = 0
+            mientras (total < longitud(d)) {
+                sea n = write(fd, subcadena(d, total, longitud(d)), longitud(d) - total)
+                si (n <= 0) { lanzar "buzon: no se pudo escribir" }
+                total = total + n
+            }
+        },
+        "recibir": funcion(n) {
+            mientras (longitud(pendiente[0]) < n) {
+                sea k = read(fd, buf, 65536)
+                si (k <= 0) { lanzar "buzon: conexión cerrada" }
+                pendiente[0] = pendiente[0] + c_bytes(buf, k)
+            }
+            sea r = subcadena(pendiente[0], 0, n)
+            pendiente[0] = subcadena(pendiente[0], n, longitud(pendiente[0]))
+            retornar r
+        },
+        "hay": funcion() {
+            si (longitud(pendiente[0]) > 0) { retornar verdadero }
+            sea pf = c_reservar(8)
+            c_escribir32(pf, 0, fd)
+            c_escribir32(pf, 4, 1)
+            sea n = poll(pf, 1, 0)
+            sea rev = 0
+            si (n > 0) { rev = piso(c_leer32(pf, 4) / 65536) % 65536 }
+            c_liberar(pf)
+            retornar rev % 2 == 1
+        },
+        "cerrar": funcion() { close(fd) }
+    }
+}
+
+funcion _bz_tcp_cliente(host, puerto) {
+    sea s = net_conectar(host, puerto)
+    retornar {"enviar": funcion(d) { net_enviar(s, d) }, "recibir": funcion(n) { retornar net_recibir_exacto(s, n) }, "cerrar": funcion() { net_cerrar(s) }}
+}
+
+funcion _bz_url(url) {
+    si (texto_empieza_con(url, "tcp://") == falso) { lanzar "buzon: solo se soporta tcp:// (" + url + ")" }
+    sea r = subcadena(url, 6, longitud(url))
+    sea k = 0
+    sea i = longitud(r) - 1
+    mientras (i >= 0 y subcadena(r, i, i + 1) != ":") { i = i - 1 }
+    retornar [subcadena(r, 0, i), a_numero(subcadena(r, i + 1, longitud(r)))]
+}
+
+/// Par de transportes en memoria conectados entre sí (para pruebas).
+funcion buzon_tubo() {
+    sea a_b = [""]
+    sea b_a = [""]
+    sea lado = funcion(salida, entrada) {
+        retornar {"enviar": funcion(d) { salida[0] = salida[0] + d }, "recibir": funcion(n) {
+            si (longitud(entrada[0]) < n) { lanzar "buzon: el otro lado no envió nada (tubo vacío)" }
+            sea r = subcadena(entrada[0], 0, n)
+            entrada[0] = subcadena(entrada[0], n, longitud(entrada[0]))
+            retornar r
+        }, "hay": funcion() { retornar longitud(entrada[0]) > 0 }, "cerrar": funcion() { }}
+    }
+    retornar [lado(a_b, b_a), lado(b_a, a_b)]
+}
+
+// ---------- sockets ----------
+
+funcion _bz_peer(sock, t) {
+    sea props = {"Socket-Type": sock["tipo"]}
+    si (sock["identidad"] != nulo) { props["Identity"] = sock["identidad"] }
+    t["enviar"](buzon_saludo(sock["servidor"]) + buzon_comando("READY", props))
+    sea pr = {"t": t, "listo": falso, "tipo": nulo, "identidad": nulo, "subs": [], "vivo": verdadero}
+    sock["peers"].agregar(pr)
+    retornar pr
+}
+
+// Termina el apretón de manos con el peer (lee su saludo y READY).
+funcion _bz_listo(sock, pr) {
+    si (pr["listo"]) { retornar pr }
+    sea g = pr["t"]["recibir"](64)
+    si (byte_en(g, 0) != 255 o byte_en(g, 9) != 127) { lanzar "buzon: saludo ZMTP inválido" }
+    si (byte_en(g, 10) < 3) { lanzar "buzon: se necesita ZMTP 3 o más" }
+    sea mec = subcadena(g, 12, 32)
+    si (texto_empieza_con(mec, "NULL") == falso) { lanzar "buzon: mecanismo no soportado" }
+    sea c = _bz_leer_trama(pr)
+    si (c["comando"] == falso o c["nombre"] != "READY") { lanzar "buzon: se esperaba READY" }
+    pr["tipo"] = c["props"]["Socket-Type"] ?? ""
+    pr["identidad"] = c["props"]["Identity"] ?? nulo
+    si (pr["identidad"] == "" ) { pr["identidad"] = nulo }
+    si (lista_contiene(_BZ_COMPATIBLES[sock["tipo"]] ?? [], pr["tipo"]) == falso) { lanzar "buzon: " + sock["tipo"] + " no se conecta con " + pr["tipo"] }
+    si (pr["identidad"] == nulo) {
+        sock["sig_id"] = sock["sig_id"] + 1
+        pr["identidad"] = _bz_b(0) + bytes_entero(sock["sig_id"], 4, 0)
+    }
+    pr["listo"] = verdadero
+    // libzmq no acepta mensajes antes de terminar el apretón de manos, así
+    // que las suscripciones se mandan recién ahora.
+    si (sock["tipo"] == "SUB") { para x en sock["subs"] { pr["t"]["enviar"](_bz_trama(0, _bz_b(1) + x)) } }
+    retornar pr
+}
+
+funcion _bz_leer_trama(pr) {
+    sea t = pr["t"]
+    sea fl = byte_en(t["recibir"](1), 0)
+    sea n = 0
+    si (piso(fl / 2) % 2 == 1) { n = bytes_leer_entero(t["recibir"](8), 0, 8, 0) } sino { n = byte_en(t["recibir"](1), 0) }
+    sea cuerpo = ""
+    si (n > 0) { cuerpo = t["recibir"](n) }
+    sea r = {"mas": fl % 2 == 1, "comando": piso(fl / 4) % 2 == 1, "cuerpo": cuerpo}
+    si (r["comando"]) {
+        sea nl = byte_en(cuerpo, 0)
+        r["nombre"] = subcadena(cuerpo, 1, 1 + nl)
+        r["datos"] = subcadena(cuerpo, 1 + nl, longitud(cuerpo))
+        si (r["nombre"] == "READY") { r["props"] = _bz_leer_props(r["datos"]) }
+    }
+    retornar r
+}
+
+// Lee un mensaje completo del peer (atiende comandos de suscripción).
+funcion _bz_leer_mensaje(sock, pr) {
+    _bz_listo(sock, pr)
+    sea partes = []
+    mientras (verdadero) {
+        sea f = _bz_leer_trama(pr)
+        si (f["comando"]) {
+            si (f["nombre"] == "SUBSCRIBE") { pr["subs"].agregar(f["datos"]) }
+            si (f["nombre"] == "CANCEL") { pr["subs"] = _bz_sin(pr["subs"], f["datos"]) }
+            si (f["nombre"] == "PING") {
+                // PONG con el mismo contexto.
+                sea ctx = subcadena(f["datos"], 2, longitud(f["datos"]))
+                pr["t"]["enviar"](_bz_trama(4, _bz_b(4) + "PONG" + ctx))
+            }
+        } sino {
+            // Los PUB reciben suscripciones como mensajes 0x01/0x00 + tema (ZMTP 3.0).
+            si ((sock["tipo"] == "PUB" o sock["tipo"] == "XPUB") y longitud(partes) == 0 y f["mas"] == falso y longitud(f["cuerpo"]) >= 1 y (byte_en(f["cuerpo"], 0) == 1 o byte_en(f["cuerpo"], 0) == 0)) {
+                sea tema = subcadena(f["cuerpo"], 1, longitud(f["cuerpo"]))
+                si (byte_en(f["cuerpo"], 0) == 1) { pr["subs"].agregar(tema) } sino { pr["subs"] = _bz_sin(pr["subs"], tema) }
+                si (sock["tipo"] == "PUB") { retornar nulo }
+            }
+            partes.agregar(f["cuerpo"])
+            si (f["mas"] == falso) { retornar partes }
+        }
+    }
+}
+
+funcion _bz_sin(l, x) {
+    sea r = []
+    sea quitado = falso
+    para y en l {
+        si (y == x y quitado == falso) { quitado = verdadero } sino { r.agregar(y) }
+    }
+    retornar r
+}
+
+funcion _bz_nuevo(tipo_s, opciones) {
+    sea op = opciones ?? {}
+    si (tiene_clave(_BZ_COMPATIBLES, tipo_s) == falso) { lanzar "buzon: tipo de socket desconocido " + tipo_s }
+    retornar {"tipo": tipo_s, "peers": [], "identidad": op["identidad"] ?? nulo, "servidor": falso, "subs": [], "turno": 0, "sobre": nulo, "pendiente_rep": nulo, "esperando": falso, "sig_id": 0, "escucha": nulo, "buzon": []}
+}
+
+/// Conecta un socket a un punto ("tcp://host:puerto"). opciones:
+/// "identidad", "transporte" (para usar uno propio).
+funcion buzon_conectar(tipo_s, url, opciones) {
+    sea op = opciones ?? {}
+    sea s = _bz_nuevo(tipo_s, op)
+    sea t = op["transporte"] ?? nulo
+    si (t == nulo) {
+        sea hp = _bz_url(url)
+        t = _bz_tcp_cliente(hp[0], hp[1])
+    }
+    _bz_peer(s, t)
+    retornar s
+}
+
+/// Socket sobre un transporte ya abierto (por ejemplo, de buzon_tubo).
+funcion buzon_socket(tipo_s, transporte, opciones) {
+    sea s = _bz_nuevo(tipo_s, opciones)
+    s["servidor"] = (opciones ?? {})["servidor"] ?? falso
+    _bz_peer(s, transporte)
+    retornar s
+}
+
+/// Escucha en "tcp://*:puerto" (o una IP). Los peers se aceptan con buzon_aceptar.
+funcion buzon_escuchar(tipo_s, url, opciones) {
+    sea s = _bz_nuevo(tipo_s, opciones)
+    s["servidor"] = verdadero
+    sea hp = _bz_url(url)
+    sea fd = socket(2, 1, 0)
+    si (fd < 0) { lanzar "buzon: no se pudo crear el socket" }
+    sea uno = c_reservar(4)
+    c_escribir32(uno, 0, 1)
+    // SO_REUSEADDR: SOL_SOCKET=1/opción 2 en Linux; 0xffff/4 en macOS.
+    si (_bz_linux()) { setsockopt(fd, 1, 2, uno, 4) } sino { setsockopt(fd, 65535, 4, uno, 4) }
+    sea dir = _bz_sockaddr(hp[0], hp[1])
+    si (bind(fd, dir, 16) != 0) {
+        close(fd)
+        lanzar "buzon: no se pudo escuchar en " + url
+    }
+    listen(fd, 16)
+    s["escucha"] = fd
+    retornar s
+}
+
+/// Acepta un peer en un socket que escucha (bloquea hasta que llegue).
+funcion buzon_aceptar(s) {
+    sea fd = accept(s["escucha"], c_reservar(16), c_reservar(4))
+    si (fd < 0) { lanzar "buzon: accept falló" }
+    _bz_peer(s, _bz_fd_transporte(fd))
+}
+
+/// Suscribe un SUB a un prefijo ("" = todo).
+funcion buzon_suscribir(s, prefijo) {
+    s["subs"].agregar("" + prefijo)
+    para pr en s["peers"] { si (pr["listo"]) { pr["t"]["enviar"](_bz_trama(0, _bz_b(1) + prefijo)) } }
+}
+
+funcion buzon_desuscribir(s, prefijo) {
+    s["subs"] = _bz_sin(s["subs"], prefijo)
+    para pr en s["peers"] { si (pr["listo"]) { pr["t"]["enviar"](_bz_trama(0, _bz_b(0) + prefijo)) } }
+}
+
+funcion _bz_partes(m) {
+    si (tipo(m) == "lista") { retornar m }
+    retornar ["" + m]
+}
+
+/// Envía un mensaje (texto o lista de partes) según el patrón del socket.
+funcion buzon_enviar(s, mensaje) {
+    sea partes = _bz_partes(mensaje)
+    sea t = s["tipo"]
+    si (longitud(s["peers"]) == 0) { lanzar "buzon: no hay peers conectados" }
+    si (t == "REQ") {
+        si (s["esperando"]) { lanzar "buzon: REQ debe recibir la respuesta antes de enviar otra vez" }
+        sea pr = s["peers"][s["turno"] % longitud(s["peers"])]
+        s["turno"] = s["turno"] + 1
+        s["actual"] = pr
+        _bz_listo(s, pr)
+        sea env = [""]
+        para p en partes { env.agregar(p) }
+        pr["t"]["enviar"](buzon_mensaje(env))
+        s["esperando"] = verdadero
+    } sino si (t == "REP") {
+        si (s["pendiente_rep"] == nulo) { lanzar "buzon: REP debe recibir antes de responder" }
+        sea env = []
+        para p en s["sobre"] { env.agregar(p) }
+        para p en partes { env.agregar(p) }
+        s["pendiente_rep"]["t"]["enviar"](buzon_mensaje(env))
+        s["pendiente_rep"] = nulo
+    } sino si (t == "PUB" o t == "XPUB") {
+        para pr en s["peers"] {
+            _bz_listo(s, pr)
+            _bz_procesar_subs(s, pr)
+            sea va = falso
+            para sub en pr["subs"] { si (texto_empieza_con(partes[0], sub)) { va = verdadero } }
+            si (va) { pr["t"]["enviar"](buzon_mensaje(partes)) }
+        }
+    } sino si (t == "ROUTER") {
+        // La primera parte es la identidad del destino.
+        sea dest = partes[0]
+        sea resto = []
+        sea i = 1
+        mientras (i < longitud(partes)) {
+            resto.agregar(partes[i])
+            i = i + 1
+        }
+        para pr en s["peers"] {
+            _bz_listo(s, pr)
+            si (pr["identidad"] == dest) {
+                pr["t"]["enviar"](buzon_mensaje(resto))
+                retornar nulo
+            }
+        }
+        lanzar "buzon: no hay peer con esa identidad"
+    } sino {
+        // PUSH, DEALER, PAIR: turno rotativo.
+        sea pr = s["peers"][s["turno"] % longitud(s["peers"])]
+        s["turno"] = s["turno"] + 1
+        _bz_listo(s, pr)
+        pr["t"]["enviar"](buzon_mensaje(partes))
+    }
+}
+
+// En transportes en memoria, lee las suscripciones pendientes del peer.
+funcion _bz_procesar_subs(s, pr) {
+    sea hay = pr["t"]["hay"] ?? nulo
+    si (hay == nulo) { retornar nulo }
+    mientras (hay()) { _bz_leer_mensaje(s, pr) }
+}
+
+/// Recibe un mensaje (lista de partes). Para ROUTER, la primera parte es
+/// la identidad del remitente.
+funcion buzon_recibir(s) {
+    sea t = s["tipo"]
+    si (t == "REQ") {
+        si (s["esperando"] == falso) { lanzar "buzon: REQ debe enviar antes de recibir" }
+        sea m = _bz_leer_mensaje(s, s["actual"])
+        s["esperando"] = falso
+        // Quita el delimitador vacío.
+        sea r = []
+        sea i = 0
+        mientras (i < longitud(m) y m[i] != "") { i = i + 1 }
+        i = i + 1
+        mientras (i < longitud(m)) {
+            r.agregar(m[i])
+            i = i + 1
+        }
+        retornar r
+    }
+    // Elige el peer con datos (turno justo; en TCP se bloquea en el siguiente).
+    sea pr = s["peers"][s["turno"] % longitud(s["peers"])]
+    para x en s["peers"] {
+        sea hay = x["t"]["hay"] ?? nulo
+        si (hay != nulo y hay()) { pr = x }
+    }
+    s["turno"] = s["turno"] + 1
+    sea m = _bz_leer_mensaje(s, pr)
+    mientras (m == nulo) { m = _bz_leer_mensaje(s, pr) }
+    si (t == "REP") {
+        // Sobre: todo hasta el delimitador vacío.
+        sea sobre = []
+        sea i = 0
+        mientras (i < longitud(m) y m[i] != "") {
+            sobre.agregar(m[i])
+            i = i + 1
+        }
+        sobre.agregar("")
+        s["sobre"] = sobre
+        s["pendiente_rep"] = pr
+        sea r = []
+        i = i + 1
+        mientras (i < longitud(m)) {
+            r.agregar(m[i])
+            i = i + 1
+        }
+        retornar r
+    }
+    si (t == "ROUTER") {
+        sea r = [pr["identidad"]]
+        para p en m { r.agregar(p) }
+        retornar r
+    }
+    si (t == "SUB") {
+        // Filtro local también (por si el PUB no filtra).
+        sea va = falso
+        para sub en s["subs"] { si (texto_empieza_con(m[0], sub)) { va = verdadero } }
+        si (va == falso) { retornar buzon_recibir(s) }
+    }
+    retornar m
+}
+
+/// Cierra el socket y sus conexiones.
+funcion buzon_cerrar(s) {
+    para pr en s["peers"] { pr["t"]["cerrar"]() }
+    si (s["escucha"] != nulo) { close(s["escucha"]) }
+    s["peers"] = []
+}

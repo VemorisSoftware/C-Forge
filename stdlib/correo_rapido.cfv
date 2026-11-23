@@ -1,0 +1,417 @@
+// stdlib/correo_rapido.cfv — cliente de NATS para mensajería entre
+// microservicios: protocolo de texto completo (INFO, CONNECT, PUB, HPUB,
+// SUB con grupos de cola, UNSUB con máximo, MSG, HMSG, PING/PONG, +OK,
+// -ERR), comodines * y >, cabeceras NATS/1.0, petición/respuesta con
+// buzones _INBOX, autenticación con usuario/clave o token, y un modo en
+// memoria que imita al servidor para pruebas. Probado contra nats-server
+// 2.10. Idea de nats.go (Apache). En inglés: importar "nats".
+//
+//   importar "correo_rapido"
+//   sea nc = correo_conectar("nats://127.0.0.1:4222", nulo)
+//   correo_suscribir(nc, "pedidos.*", nulo)
+//   correo_publicar(nc, "pedidos.nuevo", "{\"id\": 1}", nulo)
+//   mostrar(correo_siguiente(nc)["datos"])
+
+importar "json"
+
+// ---------- comodines ----------
+
+/// ¿El asunto coincide con el patrón (con * y >)?
+funcion correo_coincide(patron, asunto) {
+    sea p = texto_dividir(patron, ".")
+    sea a = texto_dividir(asunto, ".")
+    sea i = 0
+    mientras (i < longitud(p)) {
+        si (p[i] == ">") { retornar i < longitud(a) }
+        si (i >= longitud(a)) { retornar falso }
+        si (p[i] != "*" y p[i] != a[i]) { retornar falso }
+        i = i + 1
+    }
+    retornar longitud(a) == longitud(p)
+}
+
+// ---------- cabeceras ----------
+
+/// Bloque de cabeceras NATS/1.0 ({nombre: valor | [valores]}).
+funcion correo_cabeceras(m, estado) {
+    sea l = ["NATS/1.0"]
+    si (estado != nulo) { l = ["NATS/1.0 " + estado] }
+    para k en ordenar(claves(m ?? {})) {
+        sea v = m[k]
+        si (tipo(v) == "lista") { para x en v { l.agregar(k + ": " + x) } } sino { l.agregar(k + ": " + v) }
+    }
+    retornar unir(l, "\r\n") + "\r\n\r\n"
+}
+
+funcion correo_leer_cabeceras(t) {
+    sea ls = texto_dividir(t, "\r\n")
+    sea r = {"estado": nulo, "cabeceras": {}}
+    sea p = texto_dividir(ls[0], " ")
+    si (longitud(p) > 1) { r["estado"] = a_numero(p[1]) }
+    sea i = 1
+    mientras (i < longitud(ls)) {
+        sea k = texto_indice(ls[i], ":")
+        si (k > 0) {
+            sea nombre = subcadena(ls[i], 0, k)
+            sea v = texto_recortar(subcadena(ls[i], k + 1, longitud(ls[i])))
+            sea prev = r["cabeceras"][nombre] ?? nulo
+            si (prev == nulo) { r["cabeceras"][nombre] = v } sino si (tipo(prev) == "lista") { prev.agregar(v) } sino { r["cabeceras"][nombre] = [prev, v] }
+        }
+        i = i + 1
+    }
+    retornar r
+}
+
+// ---------- protocolo ----------
+
+/// Comando PUB (o HPUB si hay cabeceras).
+funcion correo_pub(asunto, datos, responder, cabeceras) {
+    sea d = "" + datos
+    sea rr = ""
+    si (responder != nulo) { rr = " " + responder }
+    si (cabeceras != nulo) {
+        sea h = correo_cabeceras(cabeceras, nulo)
+        retornar "HPUB " + asunto + rr + " " + longitud(h) + " " + (longitud(h) + longitud(d)) + "\r\n" + h + d + "\r\n"
+    }
+    retornar "PUB " + asunto + rr + " " + longitud(d) + "\r\n" + d + "\r\n"
+}
+
+// Lector de líneas y bloques sobre un transporte {"recibir": fn(n)}.
+funcion _nt_linea(nc) {
+    sea partes = []
+    mientras (verdadero) {
+        sea c = nc["t"]["recibir"](1)
+        si (c == "\n") {
+            sea l = unir(partes, "")
+            si (texto_termina_con(l, "\r")) { l = subcadena(l, 0, longitud(l) - 1) }
+            retornar l
+        }
+        partes.agregar(c)
+    }
+}
+
+// Lee la siguiente operación del servidor: {"op", ...}.
+funcion _nt_operacion(nc) {
+    sea l = _nt_linea(nc)
+    sea esp = texto_indice(l, " ")
+    sea op = texto_mayusculas(l)
+    sea resto = ""
+    si (esp > 0) {
+        op = texto_mayusculas(subcadena(l, 0, esp))
+        resto = subcadena(l, esp + 1, longitud(l))
+    }
+    si (op == "INFO") { retornar {"op": "INFO", "info": json_parsear(resto)} }
+    si (op == "PING" o op == "PONG" o op == "+OK") { retornar {"op": op} }
+    si (op == "-ERR") { retornar {"op": "-ERR", "error": texto_reemplazar(resto, "'", "")} }
+    si (op == "MSG" o op == "HMSG") {
+        sea p = []
+        para x en texto_dividir(resto, " ") { si (x != "") { p.agregar(x) } }
+        sea m = {"op": op, "asunto": p[0], "sid": p[1], "responder": nulo, "cabeceras": nulo, "estado": nulo}
+        sea total = 0
+        sea hlen = 0
+        si (op == "MSG") {
+            si (longitud(p) == 4) { m["responder"] = p[2] }
+            total = a_numero(p[longitud(p) - 1])
+        } sino {
+            si (longitud(p) == 5) { m["responder"] = p[2] }
+            hlen = a_numero(p[longitud(p) - 2])
+            total = a_numero(p[longitud(p) - 1])
+        }
+        sea cuerpo = ""
+        si (total > 0) { cuerpo = nc["t"]["recibir"](total) }
+        nc["t"]["recibir"](2)
+        si (hlen > 0) {
+            sea h = correo_leer_cabeceras(subcadena(cuerpo, 0, hlen))
+            m["cabeceras"] = h["cabeceras"]
+            m["estado"] = h["estado"]
+        }
+        m["datos"] = subcadena(cuerpo, hlen, longitud(cuerpo))
+        retornar m
+    }
+    lanzar "nats: operación desconocida '" + l + "'"
+}
+
+// ---------- cliente ----------
+
+funcion _nt_transporte(host, puerto) {
+    sea s = net_conectar(host, puerto)
+    retornar {"enviar": funcion(d) { net_enviar(s, d) }, "recibir": funcion(n) { retornar net_recibir_exacto(s, n) }, "cerrar": funcion() { net_cerrar(s) }}
+}
+
+funcion _nt_url(url) {
+    sea u = {"host": "127.0.0.1", "puerto": 4222, "usuario": nulo, "clave": nulo, "token": nulo}
+    sea r = url ?? "nats://127.0.0.1:4222"
+    si (texto_empieza_con(r, "nats://")) { r = subcadena(r, 7, longitud(r)) }
+    sea arroba = texto_indice(r, "@")
+    si (arroba >= 0) {
+        sea cred = subcadena(r, 0, arroba)
+        r = subcadena(r, arroba + 1, longitud(r))
+        sea dos = texto_indice(cred, ":")
+        si (dos >= 0) {
+            u["usuario"] = subcadena(cred, 0, dos)
+            u["clave"] = subcadena(cred, dos + 1, longitud(cred))
+        } sino { u["token"] = cred }
+    }
+    sea p = texto_dividir(r, ":")
+    si (p[0] != "") { u["host"] = p[0] }
+    si (longitud(p) > 1) { u["puerto"] = a_numero(texto_dividir(p[1], "/")[0]) }
+    retornar u
+}
+
+/// Conecta. opciones: "nombre", "usuario", "clave", "token", "eco"
+/// (recibir lo propio, verdadero), "transporte".
+funcion correo_conectar(url, opciones) {
+    sea op = opciones ?? {}
+    sea u = _nt_url(url)
+    sea t = op["transporte"] ?? nulo
+    si (t == nulo) { t = _nt_transporte(u["host"], u["puerto"]) }
+    sea nc = {"t": t, "sid": 0, "subs": {}, "pendientes": [], "info": {}, "abierta": verdadero, "inbox": "_INBOX." + _nt_azar(), "req_sid": nulo, "respuestas": {}, "sig_req": 0}
+    sea inf = _nt_operacion(nc)
+    si (inf["op"] != "INFO") { lanzar "nats: se esperaba INFO" }
+    nc["info"] = inf["info"]
+    sea c = {"verbose": falso, "pedantic": falso, "lang": "c-forge", "version": "1.0", "protocol": 1, "headers": verdadero, "no_responders": verdadero, "echo": op["eco"] ?? verdadero, "name": op["nombre"] ?? "c-forge"}
+    sea usuario = op["usuario"] ?? u["usuario"]
+    si (usuario != nulo) {
+        c["user"] = usuario
+        c["pass"] = op["clave"] ?? u["clave"] ?? ""
+    }
+    sea token = op["token"] ?? u["token"]
+    si (token != nulo) { c["auth_token"] = token }
+    t["enviar"]("CONNECT " + json_texto(c) + "\r\nPING\r\n")
+    // Espera el PONG (o el error de autenticación).
+    mientras (verdadero) {
+        sea r = _nt_operacion(nc)
+        si (r["op"] == "PONG") { retornar nc }
+        si (r["op"] == "-ERR") { lanzar "nats: " + r["error"] }
+        si (r["op"] == "PING") { t["enviar"]("PONG\r\n") }
+    }
+}
+
+funcion _nt_azar() {
+    sea a = "ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789"
+    sea r = []
+    sea b = bytes_aleatorios(16)
+    sea i = 0
+    mientras (i < 16) {
+        r.agregar(subcadena(a, byte_en(b, i) % 36, byte_en(b, i) % 36 + 1))
+        i = i + 1
+    }
+    retornar unir(r, "")
+}
+
+/// Publica. cabeceras: mapa opcional; responder: asunto de respuesta.
+funcion correo_publicar(nc, asunto, datos, cabeceras, responder) { nc["t"]["enviar"](correo_pub(asunto, datos, responder, cabeceras)) }
+
+/// Se suscribe. opciones: "cola" (grupo), "maximo" (se da de baja sola).
+/// Devuelve el sid.
+funcion correo_suscribir(nc, asunto, opciones) {
+    sea op = opciones ?? {}
+    nc["sid"] = nc["sid"] + 1
+    sea sid = "" + nc["sid"]
+    sea cola = ""
+    si ((op["cola"] ?? nulo) != nulo) { cola = " " + op["cola"] }
+    nc["t"]["enviar"]("SUB " + asunto + cola + " " + sid + "\r\n")
+    si ((op["maximo"] ?? nulo) != nulo) { nc["t"]["enviar"]("UNSUB " + sid + " " + op["maximo"] + "\r\n") }
+    nc["subs"][sid] = {"asunto": asunto, "cola": op["cola"] ?? nulo, "recibidos": 0, "maximo": op["maximo"] ?? nulo}
+    retornar sid
+}
+
+funcion correo_desuscribir(nc, sid) {
+    nc["t"]["enviar"]("UNSUB " + sid + "\r\n")
+    quitar_clave(nc["subs"], "" + sid)
+}
+
+// Procesa operaciones hasta tener un mensaje; contesta PING.
+funcion _nt_bombear(nc) {
+    mientras (verdadero) {
+        sea r = _nt_operacion(nc)
+        si (r["op"] == "PING") { nc["t"]["enviar"]("PONG\r\n") }
+        sino si (r["op"] == "-ERR") { lanzar "nats: " + r["error"] }
+        sino si (r["op"] == "MSG" o r["op"] == "HMSG") {
+            sea s = nc["subs"][r["sid"]] ?? nulo
+            si (s != nulo) {
+                s["recibidos"] = s["recibidos"] + 1
+                si (s["maximo"] != nulo y s["recibidos"] >= s["maximo"]) { quitar_clave(nc["subs"], r["sid"]) }
+            }
+            retornar r
+        }
+    }
+}
+
+/// Siguiente mensaje de cualquier suscripción (bloquea): {"asunto", "sid",
+/// "datos", "responder", "cabeceras", "estado"}.
+funcion correo_siguiente(nc) {
+    si (longitud(nc["pendientes"]) > 0) {
+        sea m = nc["pendientes"][0]
+        sea r = []
+        sea i = 1
+        mientras (i < longitud(nc["pendientes"])) {
+            r.agregar(nc["pendientes"][i])
+            i = i + 1
+        }
+        nc["pendientes"] = r
+        retornar m
+    }
+    retornar _nt_bombear(nc)
+}
+
+/// Responde a un mensaje recibido (usa su asunto de respuesta).
+funcion correo_responder(nc, mensaje, datos, cabeceras) {
+    si (mensaje["responder"] == nulo) { lanzar "nats: el mensaje no espera respuesta" }
+    correo_publicar(nc, mensaje["responder"], datos, cabeceras, nulo)
+}
+
+/// Petición/respuesta: publica y espera la primera respuesta. Lanza si no
+/// hay quien responda (estado 503).
+funcion correo_pedir(nc, asunto, datos, cabeceras) {
+    si (nc["req_sid"] == nulo) { nc["req_sid"] = correo_suscribir(nc, nc["inbox"] + ".*", nulo) }
+    nc["sig_req"] = nc["sig_req"] + 1
+    sea buzon = nc["inbox"] + "." + nc["sig_req"]
+    correo_publicar(nc, asunto, datos, cabeceras, buzon)
+    mientras (verdadero) {
+        sea m = _nt_bombear(nc)
+        si (m["asunto"] == buzon) {
+            si (m["estado"] == 503) { lanzar "nats: nadie responde en " + asunto }
+            retornar m
+        }
+        // Otros mensajes quedan para correo_siguiente.
+        nc["pendientes"].agregar(m)
+    }
+}
+
+/// Ida y vuelta con el servidor (PING/PONG): asegura que todo lo enviado llegó.
+funcion correo_vaciar(nc) {
+    nc["t"]["enviar"]("PING\r\n")
+    mientras (verdadero) {
+        sea r = _nt_operacion(nc)
+        si (r["op"] == "PONG") { retornar verdadero }
+        si (r["op"] == "PING") { nc["t"]["enviar"]("PONG\r\n") }
+        si (r["op"] == "MSG" o r["op"] == "HMSG") { nc["pendientes"].agregar(r) }
+        si (r["op"] == "-ERR") { lanzar "nats: " + r["error"] }
+    }
+}
+
+funcion correo_cerrar(nc) {
+    si (nc["abierta"]) {
+        nc["abierta"] = falso
+        sea c = nc["t"]["cerrar"] ?? nulo
+        si (c != nulo) { c() }
+    }
+}
+
+// ---------- servidor en memoria (para pruebas) ----------
+
+/// Servidor NATS mínimo en memoria. Devuelve {"servidor", "transporte":
+/// función() → transporte para un cliente nuevo}.
+funcion correo_memoria(opciones) {
+    sea op = opciones ?? {}
+    sea srv = {"clientes": [], "info": {"server_id": "MEMORIA", "version": "2.10.0", "proto": 1, "headers": verdadero, "max_payload": 1048576, "auth_required": (op["usuario"] ?? nulo) != nulo}, "op": op, "turno_cola": {}}
+    sea nuevo = funcion() {
+        sea cl = {"entrada": "", "salida": "", "subs": {}, "eco": verdadero, "ok": falso}
+        srv["clientes"].agregar(cl)
+        cl["salida"] = "INFO " + json_texto(srv["info"]) + "\r\n"
+        retornar {
+            "enviar": funcion(d) {
+                cl["entrada"] = cl["entrada"] + d
+                _nt_srv_procesar(srv, cl)
+            },
+            "recibir": funcion(n) {
+                si (longitud(cl["salida"]) < n) { lanzar "nats: el servidor en memoria no tiene datos" }
+                sea r = subcadena(cl["salida"], 0, n)
+                cl["salida"] = subcadena(cl["salida"], n, longitud(cl["salida"]))
+                retornar r
+            },
+            "cerrar": funcion() { cl["cerrado"] = verdadero }
+        }
+    }
+    retornar {"servidor": srv, "transporte": nuevo}
+}
+
+funcion _nt_srv_entregar(srv, origen, asunto, responder, cab, datos) {
+    sea entregado = falso
+    sea colas = {}
+    para cl en srv["clientes"] {
+        si ((cl["cerrado"] ?? falso) == falso y (cl != origen o cl["eco"])) {
+            para sid en claves(cl["subs"]) {
+                sea s = cl["subs"][sid]
+                si (correo_coincide(s["asunto"], asunto)) {
+                    si (s["cola"] != nulo) {
+                        si (tiene_clave(colas, s["cola"]) == falso) { colas[s["cola"]] = [] }
+                        colas[s["cola"]].agregar([cl, sid])
+                    } sino {
+                        _nt_srv_msg(cl, sid, asunto, responder, cab, datos)
+                        entregado = verdadero
+                    }
+                }
+            }
+        }
+    }
+    para q en claves(colas) {
+        sea t = srv["turno_cola"][q] ?? 0
+        srv["turno_cola"][q] = t + 1
+        sea elegido = colas[q][t % longitud(colas[q])]
+        _nt_srv_msg(elegido[0], elegido[1], asunto, responder, cab, datos)
+        entregado = verdadero
+    }
+    retornar entregado
+}
+
+funcion _nt_srv_msg(cl, sid, asunto, responder, cab, datos) {
+    sea rr = ""
+    si (responder != nulo) { rr = " " + responder }
+    si (cab != nulo) { cl["salida"] = cl["salida"] + "HMSG " + asunto + " " + sid + rr + " " + longitud(cab) + " " + (longitud(cab) + longitud(datos)) + "\r\n" + cab + datos + "\r\n" } sino { cl["salida"] = cl["salida"] + "MSG " + asunto + " " + sid + rr + " " + longitud(datos) + "\r\n" + datos + "\r\n" }
+    sea s = cl["subs"][sid]
+    s["n"] = (s["n"] ?? 0) + 1
+    si (s["max"] != nulo y s["n"] >= s["max"]) { quitar_clave(cl["subs"], sid) }
+}
+
+funcion _nt_srv_procesar(srv, cl) {
+    mientras (verdadero) {
+        sea fin = texto_indice(cl["entrada"], "\r\n")
+        si (fin < 0) { retornar nulo }
+        sea l = subcadena(cl["entrada"], 0, fin)
+        sea p = []
+        para x en texto_dividir(l, " ") { si (x != "") { p.agregar(x) } }
+        sea op = texto_mayusculas(p[0])
+        si (op == "PUB" o op == "HPUB") {
+            sea total = a_numero(p[longitud(p) - 1])
+            si (longitud(cl["entrada"]) < fin + 2 + total + 2) { retornar nulo }
+            sea cuerpo = subcadena(cl["entrada"], fin + 2, fin + 2 + total)
+            cl["entrada"] = subcadena(cl["entrada"], fin + 4 + total, longitud(cl["entrada"]))
+            sea responder = nulo
+            sea cab = nulo
+            sea datos = cuerpo
+            si (op == "PUB" y longitud(p) == 4) { responder = p[2] }
+            si (op == "HPUB") {
+                si (longitud(p) == 5) { responder = p[2] }
+                sea hl = a_numero(p[longitud(p) - 2])
+                cab = subcadena(cuerpo, 0, hl)
+                datos = subcadena(cuerpo, hl, longitud(cuerpo))
+            }
+            si (_nt_srv_entregar(srv, cl, p[1], responder, cab, datos) == falso y responder != nulo) {
+                // Nadie escucha: respuesta 503 al buzón.
+                _nt_srv_entregar(srv, nulo, responder, nulo, "NATS/1.0 503\r\n\r\n", "")
+            }
+        } sino {
+            cl["entrada"] = subcadena(cl["entrada"], fin + 2, longitud(cl["entrada"]))
+            si (op == "CONNECT") {
+                sea c = json_parsear(subcadena(l, 8, longitud(l)))
+                cl["eco"] = c["echo"] ?? verdadero
+                sea u = srv["op"]["usuario"] ?? nulo
+                si (u != nulo y ((c["user"] ?? "") != u o (c["pass"] ?? "") != srv["op"]["clave"])) {
+                    cl["salida"] = cl["salida"] + "-ERR 'Authorization Violation'\r\n"
+                    retornar nulo
+                }
+            } sino si (op == "PING") { cl["salida"] = cl["salida"] + "PONG\r\n" }
+            sino si (op == "SUB") {
+                sea cola = nulo
+                si (longitud(p) == 4) { cola = p[2] }
+                cl["subs"][p[longitud(p) - 1]] = {"asunto": p[1], "cola": cola, "max": nulo}
+            } sino si (op == "UNSUB") {
+                si (longitud(p) == 3) {
+                    si (tiene_clave(cl["subs"], p[1])) { cl["subs"][p[1]]["max"] = a_numero(p[2]) }
+                } sino { quitar_clave(cl["subs"], p[1]) }
+            }
+        }
+    }
+}

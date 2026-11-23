@@ -65,6 +65,12 @@ Sitio oficial: [c-forge.org](https://c-forge.org)
   `llamada`/`protobuf` (.proto, binario como protoc, marcos gRPC),
   `recolecta`/`crawler` (cookies RFC 6265, formularios, robots.txt,
   rastreo) y `sensor`/`mqtt` (paquetes MQTT, QoS 2, mini broker).
+- Lote 19 de bibliotecas (con alias en inglés y pruebas en ambos idiomas):
+  `cofre`/`embeddb` (base B+tree ACID con copia en escritura y recuperación
+  ante caídas), `huesped`/`wasm` (intérprete de WebAssembly, igual que
+  Wasmtime), `centinela`/`suricata` (pcap/pcapng y reglas tipo Suricata),
+  `buzon`/`zeromq` (ZMTP 3.0, interopera con libzmq) y
+  `correo_rapido`/`nats` (cliente NATS probado contra nats-server).
 - Lote 18 de bibliotecas (con alias en inglés y pruebas en ambos idiomas):
   `columnas`/`columnar` (Parquet con páginas v1 y v2, diccionario y
   compresión snappy/gzip/zstd/lz4, y Arrow IPC en flujo y archivo; se

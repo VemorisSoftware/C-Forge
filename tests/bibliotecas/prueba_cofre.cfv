@@ -1,0 +1,97 @@
+importar "cofre"
+funcion igual(a, b, q) { afirmar(("" + a) == ("" + b), q + ": [" + a + "] != [" + b + "]") }
+funcion cuatro(n) {
+    sea t = "" + n
+    mientras (longitud(t) < 4) { t = "0" + t }
+    retornar t
+}
+sea ruta = "/tmp/cforge_cofre_prueba.db"
+// Un archivo vacío se inicializa como base nueva.
+si (existe_archivo(ruta)) { escribir_archivo(ruta, "") }
+sea db = cofre_abrir(ruta, nulo)
+cofre_escribir(db, funcion(tx) {
+    cofre_poner(tx, "usuarios", "1", "Ana")
+    cofre_poner(tx, "usuarios", "2", "Luis")
+    cofre_poner(tx, "config", "modo", "prod")
+})
+igual(cofre_leer(db, funcion(tx) { retornar [cofre_obtener(tx, "usuarios", "1"), cofre_obtener(tx, "config", "modo"), cofre_obtener(tx, "usuarios", "9"), cofre_obtener(tx, "nada", "x")] }), ["Ana", "prod", nulo, nulo], "poner y obtener")
+// Muchas claves: divisiones de nodos y varias capas.
+cofre_escribir(db, funcion(tx) {
+    sea i = 0
+    mientras (i < 2000) {
+        cofre_poner(tx, "num", "k" + cuatro(i), "valor número " + i)
+        i = i + 1
+    }
+})
+igual(cofre_leer(db, funcion(tx) { retornar [cofre_contar(tx, "num"), cofre_obtener(tx, "num", "k1234"), cofre_obtener(tx, "num", "k0000")] }), [2000, "valor número 1234", "valor número 0"], "árbol grande")
+igual(cofre_leer(db, funcion(tx) { retornar cofre_rango(tx, "num", {"desde": "k0998", "hasta": "k1001"}) }), [["k0998", "valor número 998"], ["k0999", "valor número 999"], ["k1000", "valor número 1000"]], "rango")
+igual(cofre_leer(db, funcion(tx) { retornar longitud(cofre_rango(tx, "num", {"prefijo": "k19"})) }), 100, "prefijo")
+igual(cofre_leer(db, funcion(tx) { retornar cofre_rango(tx, "num", {"inverso": verdadero, "limite": 2}) }), [["k1999", "valor número 1999"], ["k1998", "valor número 1998"]], "inverso")
+// Valor grande en páginas de desborde.
+sea grande = ""
+sea i = 0
+mientras (i < 3000) {
+    grande = grande + "bloque" + i + "|"
+    i = i + 1
+}
+cofre_escribir(db, funcion(tx) { cofre_poner(tx, "blobs", "uno", grande) })
+igual(cofre_leer(db, funcion(tx) { retornar cofre_obtener(tx, "blobs", "uno") == grande }), verdadero, "desborde")
+// Rollback: un error deshace todo.
+sea err = ""
+intentar {
+    cofre_escribir(db, funcion(tx) {
+        cofre_poner(tx, "usuarios", "1", "CAMBIADO")
+        cofre_borrar(tx, "usuarios", "2")
+        lanzar "falla a propósito"
+    })
+} capturar (e) { err = "" + e }
+igual([err, cofre_leer(db, funcion(tx) { retornar [cofre_obtener(tx, "usuarios", "1"), cofre_obtener(tx, "usuarios", "2")] })], ["falla a propósito", ["Ana", "Luis"]], "rollback")
+// Borrar muchas y reutilizar páginas libres.
+cofre_escribir(db, funcion(tx) {
+    sea j = 0
+    mientras (j < 2000) {
+        si (j % 3 != 0) { cofre_borrar(tx, "num", "k" + cuatro(j)) }
+        j = j + 1
+    }
+})
+igual(cofre_leer(db, funcion(tx) { retornar [cofre_contar(tx, "num"), cofre_obtener(tx, "num", "k0003"), cofre_obtener(tx, "num", "k0004")] }), [667, "valor número 3", nulo], "borrar")
+sea antes = cofre_estado(db)["paginas"]
+cofre_escribir(db, funcion(tx) {
+    sea j = 0
+    mientras (j < 300) {
+        cofre_poner(tx, "otra", "x" + j, "y" + j)
+        j = j + 1
+    }
+})
+igual(cofre_estado(db)["paginas"] - antes < 5, verdadero, "reutiliza páginas libres")
+cofre_escribir(db, funcion(tx) { cofre_borrar_tabla(tx, "blobs") })
+igual(cofre_leer(db, funcion(tx) { retornar cofre_tablas(tx) }), ["config", "num", "otra", "usuarios"], "tablas")
+// Reabrir: todo persiste.
+sea r2 = db["ruta"]
+cofre_cerrar(db)
+sea db2 = cofre_abrir(r2, nulo)
+igual(cofre_leer(db2, funcion(tx) { retornar [cofre_contar(tx, "num"), cofre_obtener(tx, "usuarios", "2"), cofre_obtener(tx, "otra", "x299"), cofre_obtener(tx, "blobs", "uno")] }), [667, "Luis", "y299", nulo], "persistencia")
+// Caída a mitad de un commit: se ven los datos anteriores al reabrir.
+db2["op"]["fallar_antes_de_meta"] = verdadero
+err = ""
+intentar { cofre_escribir(db2, funcion(tx) { cofre_poner(tx, "usuarios", "1", "NO DEBE QUEDAR") }) } capturar (e) { err = "" + e }
+cofre_cerrar(db2)
+sea db3 = cofre_abrir(r2, nulo)
+igual([texto_indice(err, "caída simulada") >= 0, cofre_leer(db3, funcion(tx) { retornar cofre_obtener(tx, "usuarios", "1") })], [verdadero, "Ana"], "caída")
+// Meta dañada: se usa la otra.
+sea txid = cofre_estado(db3)["txid"]
+cofre_escribir(db3, funcion(tx) { cofre_poner(tx, "usuarios", "3", "Eva") })
+cofre_cerrar(db3)
+sea todo = leer_archivo(r2)
+sea pag = (txid + 1) % 2
+escribir_archivo(r2, subcadena(todo, 0, pag * 4096 + 20) + "XXXX" + subcadena(todo, pag * 4096 + 24, longitud(todo)))
+sea db4 = cofre_abrir(r2, nulo)
+igual([cofre_estado(db4)["txid"], cofre_leer(db4, funcion(tx) { retornar [cofre_obtener(tx, "usuarios", "1"), cofre_obtener(tx, "usuarios", "3")] })], [txid, ["Ana", nulo]], "meta dañada")
+igual(texto_indice("" + (cofre_leer(db4, funcion(tx) {
+    sea e2 = ""
+    intentar { cofre_poner(tx, "x", "y", "z") } capturar (e) { e2 = "" + e }
+    retornar e2
+})), "solo lectura") >= 0, verdadero, "solo lectura")
+cofre_cerrar(db4)
+escribir_archivo(ruta, "")
+mostrar("[OK] cofre")
