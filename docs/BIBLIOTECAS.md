@@ -123,11 +123,11 @@ Estado: ✅ ya existe en C-Forge · 🔗 se usa hoy vía `cforge bindgen`,
 | 87 | `certifica` / `acme` | Certificados HTTPS automáticos | ACME | ✅ `certifica` |
 | 88 | `ficha` | Tokens JWT/JWE | jose | ✅ `auth` (JWT) |
 | 89 | `clave` / `password` | Hash de contraseñas | Argon2, bcrypt | ✅ `clave` |
-| 90 | `sonda` | Captura de paquetes | libpcap | 🔗 |
+| 90 | `sonda` | Captura de paquetes | libpcap | ✅ `sonda` / `libpcap` |
 | 91 | `consenso` / `raft` | Consenso distribuido | Raft | ✅ `consenso` |
 | 92 | `sensor` / `mqtt` | Mensajería IoT | MQTT | ✅ `sensor` |
 | 93 | `directo` | Audio/video P2P | WebRTC | ✅ `directo` / `webrtc` |
-| 94 | `transporte` | Transferencia multiprotocolo | libcurl | ✅ HTTP en `red` · 🔗 |
+| 94 | `transporte` | Transferencia multiprotocolo | libcurl | ✅ `transporte` / `libcurl` (HTTP, FTP, TFTP, file, data) |
 | 95 | `freno` / `ratelimit` | Límite de peticiones | Governor | ✅ `freno` |
 | 96 | `consola_remota` | SSH y SFTP | libssh2 | 🔗 |
 
@@ -214,7 +214,7 @@ Estado: ✅ ya existe en C-Forge · 🔗 se usa hoy vía `cforge bindgen`,
 |---|---|---|---|---|
 | 152 | `sobre` / `envelope` | Cifrado de archivos con claves | age | ✅ `sobre` |
 | 153 | `primitiva` | Cripto a prueba de errores | Tink | ✅ `crypto` (AEAD) |
-| 154 | `huella` | Patrones de malware | YARA | 🔗 |
+| 154 | `huella` | Patrones de malware | YARA | ✅ `huella` / `yara` |
 | 155 | `desarma` | Ensamblador y desensamblador | Capstone, Keystone | 🔗 |
 | 156 | `emulador` | Emulación de CPU | Unicorn | 🔗 |
 | 157 | `curva` / `secp256k1` | Curva secp256k1 | libsecp256k1 | ✅ `curva` |

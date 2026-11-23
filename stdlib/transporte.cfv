@@ -1,0 +1,577 @@
+// stdlib/transporte.cfv — Transferencias por URL al estilo de libcurl,
+// escrito desde cero (idea de libcurl, licencia curl/MIT): una sola API
+// para varios protocolos.
+//
+//   · http:// y https:// (sobre el cliente HTTP de C-Forge), con método,
+//     cabeceras, cuerpo, rango y redirecciones.
+//   · ftp://: modo pasivo (EPSV y PASV), binario, usuario y clave en la URL
+//     o en opciones, descargar con reanudación (REST), subir (STOR/APPE),
+//     listar (NLST y LIST), tamaño y fecha (SIZE/MDTM), borrar, crear
+//     carpetas y comandos sueltos.
+//   · tftp:// (RFC 1350, UDP): leer y escribir con bloques de 512 bytes.
+//   · file:// (leer, escribir, anexar, listar, borrar) y data: (RFC 2397,
+//     base64 o con %XX).
+//   · Análisis de URL con percent-decoding y armado de URL.
+//
+// En inglés: importar "libcurl".
+//
+//   importar "transporte"
+//   sea r = transporte_obtener("ftp://usuario:clave@servidor/archivo.zip", {"desde": 1000})
+//   escribir_archivo("archivo.zip", r["cuerpo"])
+
+importar "red"
+importar "sistema"
+importar "base64"
+
+// ---------- URL ----------
+
+funcion _tp_hexval(c) { retornar texto_indice("0123456789abcdef", texto_minusculas(c)) }
+
+/// Decodifica %XX (y "+" no se toca).
+funcion transporte_decodificar(t) {
+    sea r = []
+    sea i = 0
+    mientras (i < longitud(t)) {
+        sea c = subtexto(t, i, i + 1)
+        si (c == "%" y i + 2 < longitud(t) + 0 y _tp_hexval(subtexto(t, i + 1, i + 2)) >= 0 y _tp_hexval(subtexto(t, i + 2, i + 3)) >= 0) {
+            r.agregar(char_de(_tp_hexval(subtexto(t, i + 1, i + 2)) * 16 + _tp_hexval(subtexto(t, i + 2, i + 3))))
+            i = i + 3
+        } sino {
+            r.agregar(c)
+            i = i + 1
+        }
+    }
+    retornar unir(r, "")
+}
+
+/// Codifica para una URL (deja letras, dígitos, "-._~" y, si se pide, "/").
+funcion transporte_codificar(t, dejar_barras) {
+    sea h = "0123456789ABCDEF"
+    sea r = []
+    sea i = 0
+    mientras (i < longitud(t)) {
+        sea b = byte_en(t, i)
+        si ((b >= 48 y b <= 57) o (b >= 65 y b <= 90) o (b >= 97 y b <= 122) o b == 45 o b == 46 o b == 95 o b == 126 o (b == 47 y (dejar_barras ?? falso))) {
+            r.agregar(char_de(b))
+        } sino { r.agregar("%" + subtexto(h, piso(b / 16), piso(b / 16) + 1) + subtexto(h, b % 16, b % 16 + 1)) }
+        i = i + 1
+    }
+    retornar unir(r, "")
+}
+
+/// Partes de una URL: {"esquema", "usuario", "clave", "host", "puerto", "ruta",
+/// "consulta", "fragmento"} (usuario, clave y ruta ya decodificados).
+funcion transporte_url(url) {
+    sea p = texto_indice(url, ":")
+    si (p <= 0) { lanzar "transporte: URL sin esquema: " + url }
+    sea esq = texto_minusculas(subtexto(url, 0, p))
+    sea resto = subtexto(url, p + 1, longitud(url))
+    sea r = {"esquema": esq, "usuario": nulo, "clave": nulo, "host": "", "puerto": nulo, "ruta": "", "consulta": nulo, "fragmento": nulo}
+    si (esq == "data") {
+        r["ruta"] = resto
+        retornar r
+    }
+    sea f = texto_indice(resto, "#")
+    si (f >= 0) {
+        r["fragmento"] = subtexto(resto, f + 1, longitud(resto))
+        resto = subtexto(resto, 0, f)
+    }
+    si (texto_empieza_con(resto, "//")) {
+        resto = subtexto(resto, 2, longitud(resto))
+        sea fin_auth = longitud(resto)
+        para sep en ["/", "?"] {
+            sea k = texto_indice(resto, sep)
+            si (k >= 0 y k < fin_auth) { fin_auth = k }
+        }
+        sea auth = subtexto(resto, 0, fin_auth)
+        resto = subtexto(resto, fin_auth, longitud(resto))
+        sea arroba = -1
+        sea k = 0
+        mientras (k < longitud(auth)) {
+            si (subtexto(auth, k, k + 1) == "@") { arroba = k }
+            k = k + 1
+        }
+        si (arroba >= 0) {
+            sea cred = subtexto(auth, 0, arroba)
+            auth = subtexto(auth, arroba + 1, longitud(auth))
+            sea dp = texto_indice(cred, ":")
+            si (dp >= 0) {
+                r["usuario"] = transporte_decodificar(subtexto(cred, 0, dp))
+                r["clave"] = transporte_decodificar(subtexto(cred, dp + 1, longitud(cred)))
+            } sino { r["usuario"] = transporte_decodificar(cred) }
+        }
+        si (texto_empieza_con(auth, "[")) {
+            sea cierre = texto_indice(auth, "]")
+            r["host"] = subtexto(auth, 1, cierre)
+            sea cola = subtexto(auth, cierre + 1, longitud(auth))
+            si (texto_empieza_con(cola, ":")) { r["puerto"] = a_numero(subtexto(cola, 1, longitud(cola))) }
+        } sino {
+            sea dp = texto_indice(auth, ":")
+            si (dp >= 0) {
+                r["host"] = subtexto(auth, 0, dp)
+                r["puerto"] = a_numero(subtexto(auth, dp + 1, longitud(auth)))
+            } sino { r["host"] = auth }
+        }
+    }
+    sea q = texto_indice(resto, "?")
+    si (q >= 0) {
+        r["consulta"] = subtexto(resto, q + 1, longitud(resto))
+        resto = subtexto(resto, 0, q)
+    }
+    r["ruta"] = transporte_decodificar(resto)
+    si (r["puerto"] == nulo) { r["puerto"] = {"http": 80, "https": 443, "ftp": 21, "tftp": 69}[esq] ?? nulo }
+    retornar r
+}
+
+// ---------- puerta de entrada ----------
+
+/// Descarga una URL. opciones: "usuario", "clave", "desde" (byte inicial),
+/// "hasta" (byte final incluido, HTTP), "cabeceras", "metodo", "cuerpo",
+/// "espera_ms", "progreso": funcion(hecho, total). Devuelve {"estado",
+/// "protocolo", "cuerpo", "cabeceras", "url"}.
+funcion transporte_obtener(url, opciones) {
+    sea op = opciones ?? {}
+    sea u = transporte_url(url)
+    sea e = u["esquema"]
+    si (e == "http" o e == "https") { retornar _tp_http(url, u, op) }
+    si (e == "ftp") { retornar _tp_ftp_obtener(u, op) }
+    si (e == "file") { retornar _tp_respuesta("file", 0, _tp_rango(leer_archivo(_tp_ruta_local(u)), op), url) }
+    si (e == "data") { retornar _tp_data(u, url) }
+    si (e == "tftp") { retornar _tp_tftp_leer(u, op, url) }
+    lanzar "transporte: protocolo no soportado: " + e
+}
+
+/// Sube datos a una URL (ftp STOR o APPE con "anexar", tftp WRQ, file, http
+/// PUT o el "metodo" indicado).
+funcion transporte_enviar(url, datos, opciones) {
+    sea op = opciones ?? {}
+    sea u = transporte_url(url)
+    sea e = u["esquema"]
+    si (e == "http" o e == "https") {
+        op["metodo"] = op["metodo"] ?? "PUT"
+        op["cuerpo"] = datos
+        retornar _tp_http(url, u, op)
+    }
+    si (e == "ftp") { retornar _tp_ftp_enviar(u, datos, op) }
+    si (e == "file") {
+        sea ruta = _tp_ruta_local(u)
+        si ((op["anexar"] ?? falso) == verdadero) { escribir_archivo(ruta, _tp_si_existe(ruta) + datos) } sino { escribir_archivo(ruta, datos) }
+        retornar _tp_respuesta("file", 0, "", url)
+    }
+    si (e == "tftp") { retornar _tp_tftp_escribir(u, datos, op, url) }
+    lanzar "transporte: no se puede subir con " + e
+}
+
+/// Nombres de una carpeta remota (ftp NLST, o LIST con {"detalle": verdadero})
+/// o local (file://).
+funcion transporte_listar(url, opciones) {
+    sea op = opciones ?? {}
+    sea u = transporte_url(url)
+    si (u["esquema"] == "file") {
+        sea r = listar_carpeta(_tp_ruta_local(u))
+        ordenar(r)
+        retornar r
+    }
+    si (u["esquema"] != "ftp") { lanzar "transporte: listar solo con ftp:// o file://" }
+    sea c = _tp_ftp_abrir(u, op)
+    sea cmd = "NLST"
+    si ((op["detalle"] ?? falso) == verdadero) { cmd = "LIST" }
+    sea ruta = _tp_ftp_ruta(u)
+    si (ruta != "") { cmd = cmd + " " + ruta }
+    sea datos = _tp_ftp_transferir(c, cmd, nulo, op)
+    _tp_ftp_cerrar(c)
+    sea r = []
+    para l en texto_dividir(texto_reemplazar(datos, "\r\n", "\n"), "\n") {
+        si (l != "") {
+            si ((op["detalle"] ?? falso) == verdadero) { r.agregar(l) } sino {
+                // Algunos servidores devuelven la ruta completa.
+                sea partes = texto_dividir(l, "/")
+                r.agregar(partes[longitud(partes) - 1])
+            }
+        }
+    }
+    retornar r
+}
+
+/// Tamaño y fecha: {"tamano", "modificado"} (ftp SIZE/MDTM, http HEAD, file).
+funcion transporte_info(url, opciones) {
+    sea op = opciones ?? {}
+    sea u = transporte_url(url)
+    si (u["esquema"] == "ftp") {
+        sea c = _tp_ftp_abrir(u, op)
+        sea ruta = _tp_ftp_ruta(u)
+        sea t = _tp_ftp_cmd(c, "SIZE " + ruta)
+        sea m = _tp_ftp_cmd(c, "MDTM " + ruta)
+        _tp_ftp_cerrar(c)
+        si (t[0] != 213) { lanzar "transporte: SIZE falló: " + t[1] }
+        sea fecha = nulo
+        si (m[0] == 213) {
+            sea s = texto_recortar(m[1])
+            fecha = subtexto(s, 0, 4) + "-" + subtexto(s, 4, 6) + "-" + subtexto(s, 6, 8) + "T" + subtexto(s, 8, 10) + ":" + subtexto(s, 10, 12) + ":" + subtexto(s, 12, 14) + "Z"
+        }
+        retornar {"tamano": a_numero(texto_recortar(t[1])), "modificado": fecha}
+    }
+    si (u["esquema"] == "file") { retornar {"tamano": longitud(leer_archivo(_tp_ruta_local(u))), "modificado": nulo} }
+    si (u["esquema"] == "http" o u["esquema"] == "https") {
+        op["metodo"] = "HEAD"
+        sea r = _tp_http(url, u, op)
+        sea largo = nulo
+        para k en claves(r["cabeceras"]) { si (texto_minusculas(k) == "content-length") { largo = a_numero(r["cabeceras"][k]) } }
+        retornar {"tamano": largo, "modificado": nulo}
+    }
+    lanzar "transporte: info no disponible para " + u["esquema"]
+}
+
+/// Borra un archivo remoto (ftp DELE) o local (file://).
+funcion transporte_borrar(url, opciones) {
+    sea u = transporte_url(url)
+    si (u["esquema"] == "file") {
+        eliminar_archivo(_tp_ruta_local(u))
+        retornar verdadero
+    }
+    si (u["esquema"] != "ftp") { lanzar "transporte: borrar solo con ftp:// o file://" }
+    sea c = _tp_ftp_abrir(u, opciones ?? {})
+    sea r = _tp_ftp_cmd(c, "DELE " + _tp_ftp_ruta(u))
+    _tp_ftp_cerrar(c)
+    si (r[0] != 250) { lanzar "transporte: DELE falló: " + r[0] + " " + r[1] }
+    retornar verdadero
+}
+
+/// Ejecuta comandos FTP sueltos tras iniciar sesión (MKD, RMD, RNFR/RNTO…):
+/// devuelve [[código, texto], …].
+funcion transporte_ftp_comandos(url, comandos, opciones) {
+    sea u = transporte_url(url)
+    sea c = _tp_ftp_abrir(u, opciones ?? {})
+    sea r = []
+    para cmd en comandos { r.agregar(_tp_ftp_cmd(c, cmd)) }
+    _tp_ftp_cerrar(c)
+    retornar r
+}
+
+funcion _tp_respuesta(protocolo, estado, cuerpo, url) { retornar {"estado": estado, "protocolo": protocolo, "cuerpo": cuerpo, "cabeceras": {}, "url": url} }
+
+funcion _tp_si_existe(ruta) {
+    intentar { retornar leer_archivo(ruta) } capturar (e) { retornar "" }
+}
+
+funcion _tp_rango(datos, op) {
+    sea desde = op["desde"] ?? 0
+    sea hasta = op["hasta"] ?? (longitud(datos) - 1)
+    si (desde == 0 y hasta == longitud(datos) - 1) { retornar datos }
+    retornar subtexto(datos, desde, minimo(longitud(datos), hasta + 1))
+}
+
+funcion _tp_ruta_local(u) {
+    si (u["host"] != "" y u["host"] != "localhost") { lanzar "transporte: file:// solo para este equipo" }
+    sea r = u["ruta"]
+    // file:///C:/carpeta → C:/carpeta
+    si (longitud(r) >= 3 y subtexto(r, 0, 1) == "/" y subtexto(r, 2, 3) == ":") { r = subtexto(r, 1, longitud(r)) }
+    retornar r
+}
+
+// ---------- data: ----------
+
+funcion _tp_data(u, url) {
+    sea t = u["ruta"]
+    sea coma = texto_indice(t, ",")
+    si (coma < 0) { lanzar "transporte: data: sin coma" }
+    sea meta = subtexto(t, 0, coma)
+    sea datos = subtexto(t, coma + 1, longitud(t))
+    sea tipo_m = "text/plain;charset=US-ASCII"
+    sea es64 = texto_termina_con(meta, ";base64")
+    si (es64) { meta = subtexto(meta, 0, longitud(meta) - 7) }
+    si (meta != "") { tipo_m = meta }
+    sea cuerpo = ""
+    si (es64) { cuerpo = base64_decodificar(transporte_decodificar(datos)) } sino { cuerpo = transporte_decodificar(datos) }
+    sea r = _tp_respuesta("data", 0, cuerpo, url)
+    r["cabeceras"] = {"Content-Type": tipo_m}
+    retornar r
+}
+
+// ---------- HTTP ----------
+
+funcion _tp_http(url, u, op) {
+    sea cab = {}
+    para k en claves(op["cabeceras"] ?? {}) { cab[k] = op["cabeceras"][k] }
+    si ((op["desde"] ?? nulo) != nulo o (op["hasta"] ?? nulo) != nulo) {
+        sea h = ""
+        si ((op["hasta"] ?? nulo) != nulo) { h = "" + op["hasta"] }
+        cab["Range"] = "bytes=" + (op["desde"] ?? 0) + "-" + h
+    }
+    si (u["usuario"] != nulo) { cab["Authorization"] = "Basic " + base64_codificar(u["usuario"] + ":" + (u["clave"] ?? "")) }
+    sea hop = {"cabeceras": cab}
+    si ((op["cuerpo"] ?? nulo) != nulo) { hop["cuerpo"] = op["cuerpo"] }
+    si ((op["tipo"] ?? nulo) != nulo) { hop["tipo"] = op["tipo"] }
+    si ((op["redirecciones"] ?? nulo) != nulo) { hop["redirecciones"] = op["redirecciones"] }
+    // La URL sin credenciales.
+    sea limpia = url
+    si (u["usuario"] != nulo) {
+        sea arroba = texto_indice(url, "@")
+        limpia = u["esquema"] + "://" + subtexto(url, arroba + 1, longitud(url))
+    }
+    sea r = http_solicitud(op["metodo"] ?? "GET", limpia, hop)
+    retornar {"estado": r["estado"], "protocolo": u["esquema"], "cuerpo": r["cuerpo"], "cabeceras": r["cabeceras"] ?? {}, "url": url}
+}
+
+// ---------- FTP ----------
+
+funcion _tp_ftp_linea(c) {
+    mientras (verdadero) {
+        sea k = texto_indice(c["buf"], "\n")
+        si (k >= 0) {
+            sea l = subtexto(c["buf"], 0, k)
+            c["buf"] = subtexto(c["buf"], k + 1, longitud(c["buf"]))
+            si (texto_termina_con(l, "\r")) { l = subtexto(l, 0, longitud(l) - 1) }
+            retornar l
+        }
+        sea m = net_recibir(c["s"], 4096)
+        si (m == "" o m == nulo) { lanzar "transporte: el servidor FTP cerró la conexión" }
+        c["buf"] = c["buf"] + m
+    }
+}
+
+// Respuesta FTP: [código, texto] (también multilínea "123-…" hasta "123 …").
+funcion _tp_ftp_respuesta(c) {
+    sea l = _tp_ftp_linea(c)
+    si (longitud(l) < 3) { lanzar "transporte: respuesta FTP inválida: " + l }
+    sea cod = a_numero(subtexto(l, 0, 3))
+    sea texto = subtexto(l, 4, longitud(l))
+    si (subtexto(l, 3, 4) == "-") {
+        sea fin = subtexto(l, 0, 3) + " "
+        mientras (verdadero) {
+            sea s = _tp_ftp_linea(c)
+            si (texto_empieza_con(s, fin)) {
+                texto = texto + "\n" + subtexto(s, 4, longitud(s))
+                romper
+            }
+            texto = texto + "\n" + s
+        }
+    }
+    retornar [cod, texto]
+}
+
+funcion _tp_ftp_cmd(c, cmd) {
+    si (texto_contiene(cmd, "\r") o texto_contiene(cmd, "\n")) { lanzar "transporte: comando FTP con saltos de línea" }
+    net_enviar(c["s"], cmd + "\r\n")
+    retornar _tp_ftp_respuesta(c)
+}
+
+funcion _tp_ftp_abrir(u, op) {
+    sea s = net_conectar(u["host"], u["puerto"] ?? 21)
+    net_espera(s, op["espera_ms"] ?? 15000)
+    sea c = {"s": s, "buf": "", "host": u["host"]}
+    sea bienvenida = _tp_ftp_respuesta(c)
+    si (bienvenida[0] != 220) { lanzar "transporte: el servidor FTP no saluda: " + bienvenida[0] + " " + bienvenida[1] }
+    sea usuario = u["usuario"] ?? (op["usuario"] ?? "anonymous")
+    sea clave = u["clave"] ?? (op["clave"] ?? "cforge@")
+    sea r = _tp_ftp_cmd(c, "USER " + usuario)
+    si (r[0] == 331) { r = _tp_ftp_cmd(c, "PASS " + clave) }
+    si (r[0] != 230 y r[0] != 202) { lanzar "transporte: inicio de sesión FTP rechazado: " + r[0] + " " + r[1] }
+    sea t = _tp_ftp_cmd(c, "TYPE I")
+    si (t[0] != 200) { lanzar "transporte: TYPE I falló: " + t[1] }
+    retornar c
+}
+
+funcion _tp_ftp_cerrar(c) {
+    intentar { _tp_ftp_cmd(c, "QUIT") } capturar (e) { }
+    net_cerrar(c["s"])
+}
+
+funcion _tp_ftp_ruta(u) {
+    sea r = u["ruta"]
+    // Como curl: la ruta es relativa a la carpeta de inicio ("/%2F…" para absoluta).
+    si (texto_empieza_con(r, "/")) { r = subtexto(r, 1, longitud(r)) }
+    retornar r
+}
+
+funcion _tp_ftp_pasivo(c) {
+    sea r = _tp_ftp_cmd(c, "EPSV")
+    si (r[0] == 229) {
+        sea a = texto_indice(r[1], "(|||")
+        sea b = texto_indice(r[1], "|)")
+        retornar net_conectar(c["host"], a_numero(subtexto(r[1], a + 4, b)))
+    }
+    r = _tp_ftp_cmd(c, "PASV")
+    si (r[0] != 227) { lanzar "transporte: el servidor no acepta modo pasivo: " + r[1] }
+    sea a = texto_indice(r[1], "(")
+    sea b = texto_indice(r[1], ")")
+    sea n = texto_dividir(subtexto(r[1], a + 1, b), ",")
+    // Como curl, se usa el host de la conexión de control (no la IP anunciada).
+    retornar net_conectar(c["host"], a_numero(n[4]) * 256 + a_numero(n[5]))
+}
+
+// Transferencia con canal de datos: si datos es nulo, descarga; si no, sube.
+funcion _tp_ftp_transferir(c, cmd, datos, op) {
+    sea d = _tp_ftp_pasivo(c)
+    sea r = _tp_ftp_cmd(c, cmd)
+    si (r[0] != 150 y r[0] != 125) {
+        net_cerrar(d)
+        lanzar "transporte: " + cmd + " falló: " + r[0] + " " + r[1]
+    }
+    sea recibido = ""
+    si (datos == nulo) {
+        net_espera(d, op["espera_ms"] ?? 15000)
+        sea partes = []
+        sea hecho = 0
+        mientras (verdadero) {
+            sea m = net_recibir(d, 65536)
+            si (m == "" o m == nulo) { romper }
+            partes.agregar(m)
+            hecho = hecho + longitud(m)
+            si ((op["progreso"] ?? nulo) != nulo) { op["progreso"](hecho, op["_total"] ?? nulo) }
+        }
+        recibido = unir(partes, "")
+    } sino {
+        sea k = 0
+        mientras (k < longitud(datos)) {
+            net_enviar(d, subtexto(datos, k, minimo(longitud(datos), k + 65536)))
+            k = k + 65536
+            si ((op["progreso"] ?? nulo) != nulo) { op["progreso"](minimo(k, longitud(datos)), longitud(datos)) }
+        }
+    }
+    net_cerrar(d)
+    sea fin = _tp_ftp_respuesta(c)
+    si (fin[0] != 226 y fin[0] != 250) { lanzar "transporte: la transferencia FTP terminó con " + fin[0] + " " + fin[1] }
+    retornar recibido
+}
+
+funcion _tp_ftp_obtener(u, op) {
+    sea c = _tp_ftp_abrir(u, op)
+    sea ruta = _tp_ftp_ruta(u)
+    si (ruta == "" o texto_termina_con(ruta, "/")) {
+        // Una carpeta: como curl, su listado.
+        sea cmd = "LIST"
+        si (ruta != "") { cmd = cmd + " " + ruta }
+        sea l = _tp_ftp_transferir(c, cmd, nulo, op)
+        _tp_ftp_cerrar(c)
+        retornar _tp_respuesta("ftp", 226, l, "ftp://" + u["host"] + "/" + ruta)
+    }
+    sea t = _tp_ftp_cmd(c, "SIZE " + ruta)
+    si (t[0] == 213) { op["_total"] = a_numero(texto_recortar(t[1])) }
+    si ((op["desde"] ?? 0) > 0) {
+        sea r = _tp_ftp_cmd(c, "REST " + op["desde"])
+        si (r[0] != 350) { lanzar "transporte: el servidor no permite reanudar: " + r[1] }
+    }
+    sea datos = _tp_ftp_transferir(c, "RETR " + ruta, nulo, op)
+    _tp_ftp_cerrar(c)
+    si ((op["hasta"] ?? nulo) != nulo) { datos = subtexto(datos, 0, minimo(longitud(datos), op["hasta"] - (op["desde"] ?? 0) + 1)) }
+    retornar _tp_respuesta("ftp", 226, datos, "ftp://" + u["host"] + "/" + ruta)
+}
+
+funcion _tp_ftp_enviar(u, datos, op) {
+    sea c = _tp_ftp_abrir(u, op)
+    sea ruta = _tp_ftp_ruta(u)
+    si ((op["crear_carpetas"] ?? falso) == verdadero) {
+        sea partes = texto_dividir(ruta, "/")
+        sea acc = ""
+        sea i = 0
+        mientras (i < longitud(partes) - 1) {
+            si (acc == "") { acc = partes[i] } sino { acc = acc + "/" + partes[i] }
+            _tp_ftp_cmd(c, "MKD " + acc)
+            i = i + 1
+        }
+    }
+    sea cmd = "STOR "
+    si ((op["anexar"] ?? falso) == verdadero) { cmd = "APPE " }
+    _tp_ftp_transferir(c, cmd + ruta, datos, op)
+    _tp_ftp_cerrar(c)
+    retornar _tp_respuesta("ftp", 226, "", "ftp://" + u["host"] + "/" + ruta)
+}
+
+// ---------- TFTP (RFC 1350) ----------
+
+// Los sockets UDP no bloquean: se espera la respuesta consultando cada pocos ms.
+funcion _tp_udp_esperar(s, ms) {
+    sea limite = tiempo_ms() + ms
+    mientras (verdadero) {
+        sea m = udp_recibir(s)
+        si (m != nulo y m != 0) { retornar m }
+        si (tiempo_ms() >= limite) { retornar nulo }
+        dormir(2)
+    }
+}
+
+funcion _tp_tftp_error(m) {
+    sea cod = bytes_leer_entero(m, 2, 2, 0)
+    lanzar "transporte: TFTP error " + cod + ": " + subtexto(m, 4, longitud(m) - 1)
+}
+
+funcion _tp_tftp_leer(u, op, url) {
+    sea s = udp_crear(0)
+    sea ruta = _tp_ftp_ruta(u)
+    sea pedido = bytes_entero(1, 2, 0) + ruta + char_de(0) + "octet" + char_de(0)
+    udp_enviar(s, u["host"], u["puerto"] ?? 69, pedido)
+    sea partes = []
+    sea esperado = 1
+    sea puerto_srv = nulo
+    sea intentos = 0
+    mientras (verdadero) {
+        sea m = _tp_udp_esperar(s, op["espera_ms"] ?? 2000)
+        si (m == nulo o m == 0) {
+            intentos = intentos + 1
+            si (intentos > 5) {
+                udp_cerrar(s)
+                lanzar "transporte: el servidor TFTP no responde"
+            }
+            // Reenvía el último paquete (pedido o acuse).
+            si (puerto_srv == nulo) { udp_enviar(s, u["host"], u["puerto"] ?? 69, pedido) } sino { udp_enviar(s, u["host"], puerto_srv, bytes_entero(4, 2, 0) + bytes_entero(esperado - 1, 2, 0)) }
+            continuar
+        }
+        intentos = 0
+        sea d = m["datos"]
+        sea op = bytes_leer_entero(d, 0, 2, 0)
+        si (op == 5) {
+            udp_cerrar(s)
+            _tp_tftp_error(d)
+        }
+        si (op != 3) { continuar }
+        si (puerto_srv == nulo) { puerto_srv = m["puerto"] }
+        sea bloque = bytes_leer_entero(d, 2, 2, 0)
+        si (bloque == esperado % 65536) {
+            partes.agregar(subtexto(d, 4, longitud(d)))
+            udp_enviar(s, u["host"], puerto_srv, bytes_entero(4, 2, 0) + bytes_entero(bloque, 2, 0))
+            esperado = esperado + 1
+            si (longitud(d) - 4 < 512) { romper }
+        } sino { udp_enviar(s, u["host"], puerto_srv, bytes_entero(4, 2, 0) + bytes_entero(bloque, 2, 0)) }
+    }
+    udp_cerrar(s)
+    retornar _tp_respuesta("tftp", 0, _tp_rango(unir(partes, ""), op), url)
+}
+
+funcion _tp_tftp_escribir(u, datos, op, url) {
+    sea s = udp_crear(0)
+    sea ruta = _tp_ftp_ruta(u)
+    sea paquete = bytes_entero(2, 2, 0) + ruta + char_de(0) + "octet" + char_de(0)
+    sea destino_puerto = u["puerto"] ?? 69
+    sea bloque = 0
+    sea total_bloques = piso(longitud(datos) / 512) + 1
+    sea intentos = 0
+    mientras (verdadero) {
+        udp_enviar(s, u["host"], destino_puerto, paquete)
+        sea m = _tp_udp_esperar(s, op["espera_ms"] ?? 2000)
+        si (m == nulo o m == 0) {
+            intentos = intentos + 1
+            si (intentos > 5) {
+                udp_cerrar(s)
+                lanzar "transporte: el servidor TFTP no responde"
+            }
+            continuar
+        }
+        intentos = 0
+        sea d = m["datos"]
+        sea op = bytes_leer_entero(d, 0, 2, 0)
+        si (op == 5) {
+            udp_cerrar(s)
+            _tp_tftp_error(d)
+        }
+        si (op == 4 y bytes_leer_entero(d, 2, 2, 0) == bloque % 65536) {
+            destino_puerto = m["puerto"]
+            si (bloque == total_bloques) { romper }
+            bloque = bloque + 1
+            sea ini = (bloque - 1) * 512
+            paquete = bytes_entero(3, 2, 0) + bytes_entero(bloque % 65536, 2, 0) + subtexto(datos, ini, minimo(longitud(datos), ini + 512))
+        }
+    }
+    udp_cerrar(s)
+    retornar _tp_respuesta("tftp", 0, "", url)
+}

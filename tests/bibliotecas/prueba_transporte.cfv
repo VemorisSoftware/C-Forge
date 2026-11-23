@@ -1,0 +1,96 @@
+// Pruebas de transporte. FTP y TFTP se prueban contra pyftpdlib y tftpy
+// (datos/transporte/servidor_*.py) si están instalados; si no, se omiten.
+importar "transporte"
+importar "sistema"
+importar "base64"
+funcion eq(a, b, q) { afirmar(("" + a) == ("" + b), q + ": [" + a + "] != [" + b + "]") }
+
+// URL.
+eq(transporte_url("https://us%40r:p%3Ass@[::1]:8443/a%20b/c?x=1#frag"),
+    {"clave": "p:ss", "consulta": "x=1", "esquema": "https", "fragmento": "frag", "host": "::1", "puerto": 8443, "ruta": "/a b/c", "usuario": "us@r"}, "URL completa")
+eq([transporte_url("ftp://servidor/x")["puerto"], transporte_url("tftp://h/y")["puerto"], transporte_url("http://h")["ruta"]], [21, 69, ""], "puertos por defecto")
+eq([transporte_codificar("a b/ñ", falso), transporte_codificar("a b/c", verdadero), transporte_decodificar("%C3%B1%2")], ["a%20b%2F%C3%B1", "a%20b/c", "ñ%2"], "codificar")
+
+// data: y file://
+eq(transporte_obtener("data:text/plain;base64,SG9sYSDDsQ==", nulo)["cuerpo"], "Hola ñ", "data: base64")
+eq([transporte_obtener("data:,a%20b", nulo)["cuerpo"], transporte_obtener("data:,a%20b", nulo)["cabeceras"]["Content-Type"]], ["a b", "text/plain;charset=US-ASCII"], "data: simple")
+sea tmp = (variable_entorno("TMPDIR") ?? "/tmp")
+si (tmp == "") { tmp = "/tmp" }
+sea carpeta = tmp + "/transporte-" + hex_de_bytes(bytes_aleatorios(4))
+crear_carpeta(carpeta)
+sea f = "file://" + carpeta + "/uno.txt"
+transporte_enviar(f, "0123456789", nulo)
+transporte_enviar(f, "AB", {"anexar": verdadero})
+eq([transporte_obtener(f, nulo)["cuerpo"], transporte_obtener(f, {"desde": 2, "hasta": 4})["cuerpo"], transporte_info(f, nulo)["tamano"]], ["0123456789AB", "234", 12], "file://")
+eq(transporte_listar("file://" + carpeta, nulo), ["uno.txt"], "listar file://")
+transporte_borrar(f, nulo)
+eq(transporte_listar("file://" + carpeta, nulo), [], "borrar file://")
+
+// HTTP contra un servidor de C-Forge: rango, PUT y credenciales.
+sea puerto = aleatorio_entero(38000, 39999)
+sea srv = servidor_http_escuchar(puerto)
+sea vistos = []
+sea t = tarea(funcion() {
+    sea k = 0
+    mientras (k < 3) {
+        sea q = servidor_http_solicitud(srv)
+        vistos.agregar([q["metodo"], q["cabeceras"]["range"] ?? "", q["cabeceras"]["authorization"] ?? "", q["cuerpo"]])
+        servidor_http_responder(srv, 200, "respuesta " + k, nulo)
+        k = k + 1
+    }
+    retornar k
+})
+dormir(100)
+sea base = "http://127.0.0.1:" + puerto
+eq(transporte_obtener(base + "/a", {"desde": 10, "hasta": 19})["cuerpo"], "respuesta 0", "GET con rango")
+eq(transporte_enviar("http://ana:clave@127.0.0.1:" + puerto + "/b", "datos", nulo)["estado"], 200, "PUT con credenciales")
+eq(transporte_obtener(base + "/c", {"metodo": "DELETE"})["protocolo"], "http", "otro método")
+esperar(t, 5000)
+servidor_http_cerrar(srv)
+eq(vistos, [["GET", "bytes=10-19", "", ""], ["PUT", "", "Basic " + base64_codificar("ana:clave"), "datos"], ["DELETE", "", "", ""]], "lo que recibió el servidor")
+
+// FTP y TFTP (si hay pyftpdlib y tftpy).
+sea hay_python = texto_recortar(sistema_comando("python3 -c 'import pyftpdlib, tftpy; print(1)'") ?? "") == "1"
+si (hay_python) {
+    sea raiz = carpeta + "/ftp"
+    crear_carpeta(raiz)
+    crear_carpeta(raiz + "/docs")
+    escribir_archivo(raiz + "/hola.txt", "hola desde ftp\n")
+    escribir_archivo(raiz + "/docs/a.txt", "a")
+    escribir_archivo(raiz + "/docs/b.txt", "b")
+    sea grande = bytes_aleatorios(50000) + bytes_aleatorios(50000) + bytes_aleatorios(50000)
+    escribir_archivo(raiz + "/grande.bin", grande)
+    sea pf = aleatorio_entero(40000, 44999)
+    sea pt = aleatorio_entero(45000, 49999)
+    sea datos = "tests/bibliotecas/datos/transporte/"
+    sea pid_ftp = texto_recortar(sistema_comando("python3 " + datos + "servidor_ftp.py " + raiz + " " + pf + " >/dev/null 2>&1 & echo $!"))
+    sea pid_tftp = texto_recortar(sistema_comando("python3 " + datos + "servidor_tftp.py " + raiz + " " + pt + " >/dev/null 2>&1 & echo $!"))
+    dormir(1500)
+    intentar {
+        sea ftp = "ftp://ana:s3cr3t@127.0.0.1:" + pf
+        eq(transporte_obtener(ftp + "/hola.txt", nulo)["cuerpo"], "hola desde ftp\n", "FTP RETR")
+        eq(transporte_obtener("ftp://127.0.0.1:" + pf + "/hola.txt", {"desde": 5})["cuerpo"], "desde ftp\n", "FTP anónimo con REST")
+        eq(transporte_obtener(ftp + "/grande.bin", nulo)["cuerpo"] == grande, verdadero, "FTP binario de 150 KB")
+        eq(transporte_listar(ftp + "/docs/", nulo), ["a.txt", "b.txt"], "FTP NLST")
+        eq(longitud(transporte_listar(ftp + "/docs/", {"detalle": verdadero})), 2, "FTP LIST")
+        eq(transporte_info(ftp + "/grande.bin", nulo)["tamano"], 150000, "FTP SIZE")
+        transporte_enviar(ftp + "/sub/nuevo.txt", "subido", {"crear_carpetas": verdadero})
+        transporte_enviar(ftp + "/sub/nuevo.txt", "+más", {"anexar": verdadero})
+        eq(leer_archivo(raiz + "/sub/nuevo.txt"), "subido+más", "FTP STOR, MKD y APPE")
+        transporte_borrar(ftp + "/sub/nuevo.txt", nulo)
+        eq(transporte_ftp_comandos(ftp + "/", ["RMD sub"], nulo)[0][0], 250, "FTP DELE y RMD")
+        sea fallo = ""
+        intentar { transporte_obtener("ftp://ana:mal@127.0.0.1:" + pf + "/hola.txt", nulo) } capturar (e) { fallo = e }
+        afirmar(texto_contiene(fallo, "rechazado"), "FTP con clave mala")
+        sea tftp = "tftp://127.0.0.1:" + pt
+        eq(transporte_obtener(tftp + "/grande.bin", nulo)["cuerpo"] == grande, verdadero, "TFTP RRQ de 150 KB")
+        transporte_enviar(tftp + "/escrito.bin", texto_repetir("z", 1024), nulo)
+        eq(leer_archivo(raiz + "/escrito.bin"), texto_repetir("z", 1024), "TFTP WRQ con bloque final vacío")
+        mostrar("(FTP y TFTP probados con pyftpdlib y tftpy)")
+    } capturar (e) {
+        sistema_comando("kill " + pid_ftp + " " + pid_tftp)
+        lanzar e
+    }
+    sistema_comando("kill " + pid_ftp + " " + pid_tftp)
+}
+mostrar("[OK] transporte")

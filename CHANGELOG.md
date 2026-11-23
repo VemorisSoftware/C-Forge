@@ -2,6 +2,17 @@
 
 Sitio oficial: [c-forge.org](https://c-forge.org)
 
+## Sin publicar
+
+- Lote 33 de bibliotecas (tres que antes se usaban por enlaces, ahora
+  nativas): `sonda`/`libpcap` (archivos pcap y pcapng, decodificación de
+  Ethernet, VLAN, ARP, IPv4, IPv6, TCP, UDP, ICMP y DNS, filtros con la
+  sintaxis de tcpdump, construcción de paquetes y captura en vivo en Linux;
+  probado contra Scapy y dpkt), `huella`/`yara` (reglas YARA con cadenas de
+  texto, hexadecimales y expresiones regulares, condiciones completas;
+  mismos resultados que yara-python) y `transporte`/`libcurl` (HTTP, FTP,
+  TFTP, file y data con una sola API; probado contra pyftpdlib y tftpy).
+
 ## 5.0.0 — 2026-11-23
 
 - **Licencia aclarada en c-forge.org:** el sitio decía "código abierto,
