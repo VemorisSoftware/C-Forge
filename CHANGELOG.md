@@ -4,6 +4,39 @@ Sitio oficial: [c-forge.org](https://c-forge.org)
 
 ## Sin publicar
 
+- **Cambio de comportamiento — `==` compara listas y mapas por contenido:**
+  `[1, [2]] == [1, [2]]`, `[] == []` y `{"a": 1} == {"a": 1}` ahora son
+  `verdadero` (antes comparaban la referencia). Los objetos de clase siguen
+  comparándose por identidad; `es_mismo(a, b)` / `is_same` dice si son el
+  mismo objeto. Vale también para `lista_contiene` y `coincidir`.
+- **Cambio de comportamiento — servidor HTTP seguro por defecto:**
+  `servidor_http_escuchar(puerto)` escucha solo en `127.0.0.1` (antes en
+  todas las interfaces) y ya no agrega `Access-Control-Allow-Origin: *`.
+  Para atender a la red: `servidor_http_escuchar_en("0.0.0.0", puerto)`,
+  `CFORGE_HTTP_HOST=0.0.0.0` o la opción `host` de `api_rapida`, `extremo`
+  y `proxy`; `extremo_servir` acepta `cors`. Nuevo
+  `servidor_http_responder_con(id, estado, cuerpo, tipo, cabeceras)`:
+  `api_rapida`, `extremo` y `proxy` ya envían sus cabeceras (antes se
+  perdían: CORS, `Location`, `Set-Cookie`…). Servidor y cliente
+  (`http_solicitud`) rechazan saltos de línea en métodos, rutas y cabeceras
+  (inyección de cabeceras).
+- **Corregido:** `sys_info()["sistema"]` decía `"linux"` en todos los
+  sistemas; ahora da `linux`, `macos` o `windows`, `cpu` da `x86_64` o
+  `arm64` y hay `plataforma`. `cristal`, `jit`, `teclado` y `ventanas_api`
+  lo usan en vez de mirar archivos del sistema.
+- **JSON nativo:** `json_parsear` unas 7 veces más rápido y
+  `json_serializar`/`json_bonito` unas 3 veces (3,6 MB en medio segundo),
+  pares sustitutos `\uD83D\uDE00`, rechazo de escapes y números inválidos
+  y límite de anidamiento. Los decimales se escriben exactos con el texto
+  más corto que vuelve al mismo número (`0.1`, `100.28571428571429`); antes
+  15 cifras con redondeo podían cambiar el valor.
+- **`extern` sin límite de 6 argumentos:** en System V (Linux, macOS Intel)
+  y AAPCS64 los argumentos que no caben en registros van por la pila.
+- **Interpolación sin sorpresas:** `"{Binding Nombre}"`, `"{B29F-CA47}"` o
+  `"<b>{nombre}</b>"` sin una variable `nombre` quedan literales en vez de
+  fallar al compilar: solo se interpola si cada nombre es una variable o
+  función conocida.
+
 - **Corregido:** `esperar(t)` podía quedarse colgada para siempre si la
   tarea terminaba justo entre la comprobación y la espera del futex (volvía
   a leer el tid y esperaba con 0). Ahora espera con el mismo valor que

@@ -1,5 +1,5 @@
 // Generado por cforge build --target wasm. No editar.
-const FUNCIONES = {"forja_entrada": 1560, "forja_listas": 1563, "tsen": 1600, "tcos": 1609, "azar": 1621, "gauss": 1635, "forja_paso": 2061};
+const FUNCIONES = {"forja_entrada": 1681, "forja_listas": 1684, "tsen": 1721, "tcos": 1730, "azar": 1742, "gauss": 1756, "forja_paso": 2182};
 const EXTERNAS = [["js", "forja_entrada", [5], 5], ["js", "forja_listas", [0, 0, 0, 0, 5], 4]];
 const WASM = "./forja.wasm";
 // ── Cargador de C-Forge para WebAssembly (navegador y Node.js) ──────────────
