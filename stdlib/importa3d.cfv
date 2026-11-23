@@ -1,0 +1,719 @@
+// stdlib/importa3d.cfv — importar y exportar modelos 3D al estilo Assimp con
+// una sola malla de salida (la de "modelo"): STL (ASCII y binario), PLY
+// (ASCII y binario en ambos órdenes de bytes, con normales, UV y colores),
+// OFF, OBJ (con materiales MTL), glTF/GLB (vía "carga3d") y 3MF. Detecta el
+// formato por extensión o por contenido. Procesos posteriores: triangular,
+// unir vértices iguales, quitar triángulos degenerados, generar normales
+// planas o suaves, invertir caras, centrar y escalar, y medir (caja,
+// superficie, volumen, si es cerrada). Exporta a STL, PLY, OBJ y OFF.
+// Cruzado con trimesh en ambos sentidos. Idea de Assimp (BSD). En inglés:
+// importar "meshio".
+//
+//   importar "importa3d"
+//   sea m = importa3d_cargar("pieza.stl", {"unir": verdadero, "normales": "suaves"})
+//   mostrar(importa3d_medidas(m))
+//   escribir_archivo("pieza.ply", importa3d_exportar(m, "ply", nulo))
+
+importar "modelo"
+importar "carga3d"
+importar "archivador"
+
+// ---------- utilidades binarias ----------
+
+funcion _i3_f32(d, p, le) {
+    sea b = [byte_en(d, p), byte_en(d, p + 1), byte_en(d, p + 2), byte_en(d, p + 3)]
+    si (le == falso) { b = [b[3], b[2], b[1], b[0]] }
+    sea s = 1
+    si (b[3] >= 128) { s = -1 }
+    sea ex = (b[3] % 128) * 2 + piso(b[2] / 128)
+    sea man = (b[2] % 128) * 65536 + b[1] * 256 + b[0]
+    si (ex == 0) { retornar s * man * potencia(2, -149) }
+    si (ex == 255) { retornar 0 }
+    retornar s * (1 + man / 8388608) * potencia(2, ex - 127)
+}
+
+funcion _i3_f32_bytes(v) {
+    si (v == 0) { retornar caracter(0) + caracter(0) + caracter(0) + caracter(0) }
+    sea s = 0
+    sea m = v
+    si (v < 0) {
+        s = 1
+        m = 0 - v
+    }
+    sea ex = 0
+    mientras (m >= 2) {
+        m = m / 2
+        ex = ex + 1
+    }
+    mientras (m < 1) {
+        m = m * 2
+        ex = ex - 1
+    }
+    sea man = redondear((m - 1) * 8388608)
+    si (man >= 8388608) {
+        man = 0
+        ex = ex + 1
+    }
+    sea e = ex + 127
+    si (e <= 0) { retornar caracter(0) + caracter(0) + caracter(0) + caracter(0) }
+    sea total = s * 2147483648 + e * 8388608 + man
+    retornar bytes_entero(total, 4, 1)
+}
+
+funcion _i3_num(d, p, t, le) {
+    sea o = 1
+    si (le) { o = 1 } sino { o = 0 }
+    si (t == "float" o t == "float32") { retornar _i3_f32(d, p, le) }
+    si (t == "double" o t == "float64") {
+        // Doble: se arma desde los dos enteros de 32 bits.
+        sea lo = bytes_leer_entero(d, p, 4, o)
+        sea hi = bytes_leer_entero(d, p + 4, 4, o)
+        si (le == falso) {
+            hi = bytes_leer_entero(d, p, 4, o)
+            lo = bytes_leer_entero(d, p + 4, 4, o)
+        }
+        sea s = 1
+        si (hi >= 2147483648) {
+            s = -1
+            hi = hi - 2147483648
+        }
+        sea ex = piso(hi / 1048576)
+        sea man = (hi % 1048576) * 4294967296 + lo
+        si (ex == 0) { retornar s * man * potencia(2, -1074) }
+        retornar s * (1 + man / 4503599627370496) * potencia(2, ex - 1023)
+    }
+    sea tam = _I3_TAM[t]
+    sea v = bytes_leer_entero(d, p, tam, o)
+    si (t == "char" o t == "int8") { si (v >= 128) { v = v - 256 } }
+    si (t == "short" o t == "int16") { si (v >= 32768) { v = v - 65536 } }
+    si (t == "int" o t == "int32") { si (v >= 2147483648) { v = v - 4294967296 } }
+    retornar v
+}
+
+sea _I3_TAM = {"char": 1, "uchar": 1, "int8": 1, "uint8": 1, "short": 2, "ushort": 2, "int16": 2, "uint16": 2, "int": 4, "uint": 4, "int32": 4, "uint32": 4, "float": 4, "float32": 4, "double": 8, "float64": 8}
+
+funcion _i3_palabras(t) {
+    sea r = []
+    para x en texto_dividir(texto_reemplazar(texto_reemplazar(t, "\t", " "), "\r", " "), " ") { si (x != "") { r.agregar(x) } }
+    retornar r
+}
+
+funcion _i3_mas(l, xs) { para x en xs { l.agregar(x) } }
+
+funcion _i3_malla() {
+    sea m = malla_nueva()
+    m["colores"] = []
+    retornar m
+}
+
+// Agrega un polígono como abanico de triángulos.
+funcion _i3_poligono(m, idx) {
+    sea k = 1
+    mientras (k + 1 < longitud(idx)) {
+        m["indices"].agregar(idx[0])
+        m["indices"].agregar(idx[k])
+        m["indices"].agregar(idx[k + 1])
+        k = k + 1
+    }
+}
+
+// ---------- STL ----------
+
+funcion _i3_stl(d) {
+    sea m = _i3_malla()
+    si (longitud(d) >= 84) {
+        sea n = bytes_leer_entero(d, 80, 4, 1)
+        si (84 + 50 * n == longitud(d)) {
+            sea i = 0
+            mientras (i < n) {
+                sea p = 84 + 50 * i
+                sea k = 0
+                mientras (k < 3) {
+                    sea q = p + 12 + 12 * k
+                    _i3_mas(m["posiciones"], [_i3_f32(d, q, verdadero), _i3_f32(d, q + 4, verdadero), _i3_f32(d, q + 8, verdadero)])
+                    m["indices"].agregar(3 * i + k)
+                    k = k + 1
+                }
+                i = i + 1
+            }
+            retornar m
+        }
+    }
+    // ASCII.
+    sea v = 0
+    para l en texto_dividir(d, "\n") {
+        sea w = _i3_palabras(l)
+        si (longitud(w) == 4 y w[0] == "vertex") {
+            _i3_mas(m["posiciones"], [a_numero(w[1]), a_numero(w[2]), a_numero(w[3])])
+            m["indices"].agregar(v)
+            v = v + 1
+        }
+    }
+    retornar m
+}
+
+// ---------- PLY ----------
+
+funcion _i3_ply(d) {
+    sea fin = texto_indice(d, "end_header")
+    si (fin < 0) { lanzar "importa3d: PLY sin end_header" }
+    sea nl = texto_indice(subcadena(d, fin, longitud(d)), "\n")
+    sea cuerpo_ini = fin + nl + 1
+    sea formato = "ascii"
+    sea elementos = []
+    para l en texto_dividir(subcadena(d, 0, fin), "\n") {
+        sea w = _i3_palabras(l)
+        si (longitud(w) > 0) {
+            si (w[0] == "format") { formato = w[1] }
+            si (w[0] == "element") { elementos.agregar({"nombre": w[1], "n": a_numero(w[2]), "props": []}) }
+            si (w[0] == "property") {
+                sea e = elementos[longitud(elementos) - 1]
+                si (w[1] == "list") { e["props"].agregar({"nombre": w[4], "lista": verdadero, "tn": w[2], "t": w[3]}) } sino { e["props"].agregar({"nombre": w[2], "lista": falso, "t": w[1]}) }
+            }
+        }
+    }
+    sea m = _i3_malla()
+    sea leer_elemento = nulo
+    sea pos = cuerpo_ini
+    sea toks = nulo
+    sea ti = 0
+    si (formato == "ascii") { toks = _i3_palabras(texto_reemplazar(subcadena(d, cuerpo_ini, longitud(d)), "\n", " ")) }
+    sea le = formato == "binary_little_endian"
+    sea tiene_normales = falso
+    sea tiene_uv = falso
+    sea tiene_color = falso
+    para e en elementos {
+        sea i = 0
+        mientras (i < e["n"]) {
+            sea vals = {}
+            para pr en e["props"] {
+                si (pr["lista"]) {
+                    sea cnt = 0
+                    si (formato == "ascii") {
+                        cnt = a_numero(toks[ti])
+                        ti = ti + 1
+                    } sino {
+                        cnt = _i3_num(d, pos, pr["tn"], le)
+                        pos = pos + _I3_TAM[pr["tn"]]
+                    }
+                    sea l = []
+                    sea k = 0
+                    mientras (k < cnt) {
+                        si (formato == "ascii") {
+                            l.agregar(a_numero(toks[ti]))
+                            ti = ti + 1
+                        } sino {
+                            l.agregar(_i3_num(d, pos, pr["t"], le))
+                            pos = pos + _I3_TAM[pr["t"]]
+                        }
+                        k = k + 1
+                    }
+                    vals[pr["nombre"]] = l
+                } sino {
+                    si (formato == "ascii") {
+                        vals[pr["nombre"]] = a_numero(toks[ti])
+                        ti = ti + 1
+                    } sino {
+                        vals[pr["nombre"]] = _i3_num(d, pos, pr["t"], le)
+                        pos = pos + _I3_TAM[pr["t"]]
+                    }
+                }
+            }
+            si (e["nombre"] == "vertex") {
+                _i3_mas(m["posiciones"], [vals["x"], vals["y"], vals["z"]])
+                si (tiene_clave(vals, "nx")) {
+                    _i3_mas(m["normales"], [vals["nx"], vals["ny"], vals["nz"]])
+                    tiene_normales = verdadero
+                }
+                sea u = vals["u"] ?? (vals["s"] ?? (vals["texture_u"] ?? nulo))
+                si (u != nulo) {
+                    _i3_mas(m["uvs"], [u, vals["v"] ?? (vals["t"] ?? (vals["texture_v"] ?? 0))])
+                    tiene_uv = verdadero
+                }
+                si (tiene_clave(vals, "red")) {
+                    sea esc = 1
+                    para pr en e["props"] { si (pr["nombre"] == "red" y (pr["t"] == "uchar" o pr["t"] == "uint8")) { esc = 255 } }
+                    _i3_mas(m["colores"], [vals["red"] / esc, vals["green"] / esc, vals["blue"] / esc, (vals["alpha"] ?? esc) / esc])
+                    tiene_color = verdadero
+                }
+            }
+            si (e["nombre"] == "face") { _i3_poligono(m, vals["vertex_indices"] ?? (vals["vertex_index"] ?? [])) }
+            i = i + 1
+        }
+    }
+    retornar m
+}
+
+// ---------- OFF ----------
+
+funcion _i3_off(d) {
+    sea lineas = []
+    para l en texto_dividir(d, "\n") {
+        sea t = texto_recortar(texto_dividir(l, "#")[0])
+        si (t != "") { lineas.agregar(t) }
+    }
+    sea i = 0
+    sea cab = _i3_palabras(lineas[0])
+    sea cuentas = nulo
+    si (texto_termina_con(cab[0], "OFF")) {
+        si (longitud(cab) > 1) { cuentas = [a_numero(cab[1]), a_numero(cab[2])] }
+        i = 1
+    }
+    si (cuentas == nulo) {
+        sea w = _i3_palabras(lineas[i])
+        cuentas = [a_numero(w[0]), a_numero(w[1])]
+        i = i + 1
+    }
+    sea m = _i3_malla()
+    sea k = 0
+    mientras (k < cuentas[0]) {
+        sea w = _i3_palabras(lineas[i + k])
+        _i3_mas(m["posiciones"], [a_numero(w[0]), a_numero(w[1]), a_numero(w[2])])
+        k = k + 1
+    }
+    i = i + cuentas[0]
+    k = 0
+    mientras (k < cuentas[1]) {
+        sea w = _i3_palabras(lineas[i + k])
+        sea n = a_numero(w[0])
+        sea idx = []
+        sea j = 1
+        mientras (j <= n) {
+            idx.agregar(a_numero(w[j]))
+            j = j + 1
+        }
+        _i3_poligono(m, idx)
+        k = k + 1
+    }
+    retornar m
+}
+
+// ---------- 3MF ----------
+
+funcion _i3_atributo(t, nombre) {
+    sea k = texto_indice(t, " " + nombre + "=" + caracter(34))
+    si (k < 0) { retornar nulo }
+    sea resto = subcadena(t, k + longitud(nombre) + 3, longitud(t))
+    retornar subcadena(resto, 0, texto_indice(resto, caracter(34)))
+}
+
+funcion _i3_3mf(d) {
+    sea xml = nulo
+    para e en archivador_leer_zip(d, nulo) { si (texto_termina_con(texto_minusculas(e["nombre"]), ".model")) { xml = e["datos"] } }
+    si (xml == nulo) { lanzar "importa3d: el 3MF no tiene 3D/3dmodel.model" }
+    sea m = _i3_malla()
+    sea base = 0
+    // Cada <mesh>: vértices y triángulos.
+    para trozo en texto_dividir(xml, "<mesh") {
+        si (contiene(trozo, "<vertices")) {
+            sea n = 0
+            para v en texto_dividir(trozo, "<vertex ") {
+                si (contiene(v, "x=")) {
+                    _i3_mas(m["posiciones"], [a_numero(_i3_atributo(" " + v, "x")), a_numero(_i3_atributo(" " + v, "y")), a_numero(_i3_atributo(" " + v, "z"))])
+                    n = n + 1
+                }
+            }
+            para t en texto_dividir(trozo, "<triangle ") {
+                si (contiene(t, "v1=")) { _i3_mas(m["indices"], [base + a_numero(_i3_atributo(" " + t, "v1")), base + a_numero(_i3_atributo(" " + t, "v2")), base + a_numero(_i3_atributo(" " + t, "v3"))]) }
+            }
+            base = base + n
+        }
+    }
+    retornar m
+}
+
+// ---------- detección y carga ----------
+
+/// Formato de unos datos ("stl", "ply", "off", "obj", "gltf", "glb", "3mf")
+/// por la extensión del nombre o por el contenido.
+funcion importa3d_formato(datos, nombre) {
+    si (nombre != nulo) {
+        sea p = texto_dividir(texto_minusculas(nombre), ".")
+        sea e = p[longitud(p) - 1]
+        si (contiene(" stl ply off obj gltf glb 3mf ", " " + e + " ")) { retornar e }
+    }
+    si (texto_empieza_con(datos, "ply")) { retornar "ply" }
+    si (texto_empieza_con(datos, "glTF")) { retornar "glb" }
+    si (texto_empieza_con(datos, "PK")) { retornar "3mf" }
+    si (texto_empieza_con(texto_recortar(subcadena(datos, 0, 64)), "OFF") o texto_empieza_con(texto_recortar(subcadena(datos, 0, 64)), "COFF") o texto_empieza_con(texto_recortar(subcadena(datos, 0, 64)), "NOFF")) { retornar "off" }
+    si (texto_empieza_con(texto_recortar(subcadena(datos, 0, 64)), "{")) { retornar "gltf" }
+    si (texto_empieza_con(datos, "solid") y contiene(subcadena(datos, 0, 2000), "facet")) { retornar "stl" }
+    si (longitud(datos) >= 84 y 84 + 50 * bytes_leer_entero(datos, 80, 4, 1) == longitud(datos)) { retornar "stl" }
+    retornar "obj"
+}
+
+/// Carga desde bytes. opciones: "formato", "nombre" (para detectar),
+/// "triangular" (siempre), "unir" (vértices iguales), "normales" ("planas"
+/// o "suaves"), "invertir", "centrar", "escala", "limpiar" (degenerados).
+funcion importa3d_desde(datos, opciones) {
+    sea op = opciones ?? {}
+    sea f = op["formato"] ?? importa3d_formato(datos, op["nombre"] ?? nulo)
+    sea m = nulo
+    si (f == "stl") { m = _i3_stl(datos) }
+    sino si (f == "ply") { m = _i3_ply(datos) }
+    sino si (f == "off") { m = _i3_off(datos) }
+    sino si (f == "3mf") { m = _i3_3mf(datos) }
+    sino si (f == "obj") {
+        m = obj_parsear(datos)
+        si (tiene_clave(m, "colores") == falso) { m["colores"] = [] }
+    }
+    sino si (f == "gltf" o f == "glb") {
+        m = carga3d_aplanar(carga3d_gltf(datos, op["gltf"] ?? nulo), nulo)
+        si (tiene_clave(m, "colores") == falso) { m["colores"] = [] }
+    }
+    sino { lanzar "importa3d: formato desconocido " + f }
+    m["formato"] = f
+    retornar importa3d_procesar(m, op)
+}
+
+/// Carga un archivo (detecta el formato por la extensión).
+funcion importa3d_cargar(ruta, opciones) {
+    sea op = {}
+    para k en claves(opciones ?? {}) { op[k] = opciones[k] }
+    op["nombre"] = op["nombre"] ?? ruta
+    retornar importa3d_desde(leer_archivo(ruta), op)
+}
+
+// ---------- procesos ----------
+
+funcion _i3_v(m, i) { retornar [m["posiciones"][3 * i], m["posiciones"][3 * i + 1], m["posiciones"][3 * i + 2]] }
+funcion _i3_resta(a, b) { retornar [a[0] - b[0], a[1] - b[1], a[2] - b[2]] }
+funcion _i3_cruz(a, b) { retornar [a[1] * b[2] - a[2] * b[1], a[2] * b[0] - a[0] * b[2], a[0] * b[1] - a[1] * b[0]] }
+funcion _i3_largo(a) { retornar raiz(a[0] * a[0] + a[1] * a[1] + a[2] * a[2]) }
+
+/// Aplica procesos posteriores (las mismas opciones que importa3d_desde).
+funcion importa3d_procesar(m, opciones) {
+    sea op = opciones ?? {}
+    si ((op["unir"] ?? falso) == verdadero) { m = importa3d_unir(m, op["tolerancia"] ?? 0) }
+    si ((op["limpiar"] ?? falso) == verdadero) { m = importa3d_limpiar(m) }
+    si ((op["invertir"] ?? falso) == verdadero) { importa3d_invertir(m) }
+    si ((op["centrar"] ?? falso) == verdadero o (op["escala"] ?? nulo) != nulo) { importa3d_normalizar(m, op["centrar"] ?? falso, op["escala"] ?? nulo) }
+    si ((op["normales"] ?? nulo) == "planas") { m = importa3d_normales_planas(m) }
+    si ((op["normales"] ?? nulo) == "suaves") { importa3d_normales_suaves(m) }
+    retornar m
+}
+
+/// Une vértices con la misma posición (y normal/UV si las hay) a menos de
+/// tolerancia. Devuelve una malla nueva.
+funcion importa3d_unir(m, tolerancia) {
+    sea r = _i3_malla()
+    sea mapa = {}
+    sea nuevo_de = []
+    sea n = longitud(m["posiciones"]) / 3
+    sea q = tolerancia
+    si (q <= 0) { q = 0.000001 }
+    sea i = 0
+    mientras (i < n) {
+        sea p = _i3_v(m, i)
+        sea k = "" + redondear(p[0] / q) + "," + redondear(p[1] / q) + "," + redondear(p[2] / q)
+        si (longitud(m["uvs"]) > 0) { k = k + "|" + redondear(m["uvs"][2 * i] / 0.0001) + "," + redondear(m["uvs"][2 * i + 1] / 0.0001) }
+        sea j = mapa[k] ?? nulo
+        si (j == nulo) {
+            j = longitud(r["posiciones"]) / 3
+            mapa[k] = j
+            _i3_mas(r["posiciones"], p)
+            si (longitud(m["normales"]) > 0) { _i3_mas(r["normales"], [m["normales"][3 * i], m["normales"][3 * i + 1], m["normales"][3 * i + 2]]) }
+            si (longitud(m["uvs"]) > 0) { _i3_mas(r["uvs"], [m["uvs"][2 * i], m["uvs"][2 * i + 1]]) }
+            si (longitud(m["colores"] ?? []) > 0) { _i3_mas(r["colores"], [m["colores"][4 * i], m["colores"][4 * i + 1], m["colores"][4 * i + 2], m["colores"][4 * i + 3]]) }
+        }
+        nuevo_de.agregar(j)
+        i = i + 1
+    }
+    para x en m["indices"] { r["indices"].agregar(nuevo_de[x]) }
+    r["formato"] = m["formato"] ?? nulo
+    retornar r
+}
+
+/// Quita triángulos degenerados (índices repetidos o área nula).
+funcion importa3d_limpiar(m) {
+    sea idx = []
+    sea t = 0
+    mientras (t < longitud(m["indices"])) {
+        sea a = m["indices"][t]
+        sea b = m["indices"][t + 1]
+        sea c = m["indices"][t + 2]
+        si (a != b y b != c y a != c) {
+            sea area = _i3_largo(_i3_cruz(_i3_resta(_i3_v(m, b), _i3_v(m, a)), _i3_resta(_i3_v(m, c), _i3_v(m, a))))
+            si (area > 0.0000000001) { idx = idx + [a, b, c] }
+        }
+        t = t + 3
+    }
+    m["indices"] = idx
+    retornar m
+}
+
+/// Invierte el sentido de los triángulos (y las normales).
+funcion importa3d_invertir(m) {
+    sea t = 0
+    mientras (t < longitud(m["indices"])) {
+        sea x = m["indices"][t + 1]
+        m["indices"][t + 1] = m["indices"][t + 2]
+        m["indices"][t + 2] = x
+        t = t + 3
+    }
+    sea i = 0
+    mientras (i < longitud(m["normales"])) {
+        m["normales"][i] = 0 - m["normales"][i]
+        i = i + 1
+    }
+}
+
+/// Centra en el origen y escala para que la dimensión mayor mida "escala".
+funcion importa3d_normalizar(m, centrar, escala) {
+    sea med = importa3d_medidas(m)
+    sea c = [0, 0, 0]
+    si (centrar) { c = med["centro"] }
+    sea k = 1
+    si (escala != nulo) {
+        sea t = med["tamano"]
+        sea mayor = maximo(t[0], maximo(t[1], t[2]))
+        si (mayor > 0) { k = escala / mayor }
+    }
+    sea i = 0
+    mientras (i < longitud(m["posiciones"])) {
+        m["posiciones"][i] = (m["posiciones"][i] - c[i % 3]) * k
+        i = i + 1
+    }
+}
+
+/// Normales planas: cada triángulo con sus propios vértices.
+funcion importa3d_normales_planas(m) {
+    sea r = _i3_malla()
+    sea t = 0
+    mientras (t < longitud(m["indices"])) {
+        sea a = _i3_v(m, m["indices"][t])
+        sea b = _i3_v(m, m["indices"][t + 1])
+        sea c = _i3_v(m, m["indices"][t + 2])
+        sea n = _i3_cruz(_i3_resta(b, a), _i3_resta(c, a))
+        sea l = _i3_largo(n)
+        si (l > 0) { n = [n[0] / l, n[1] / l, n[2] / l] }
+        sea k = 0
+        mientras (k < 3) {
+            sea vi = m["indices"][t + k]
+            _i3_mas(r["posiciones"], _i3_v(m, vi))
+            _i3_mas(r["normales"], n)
+            si (longitud(m["uvs"]) > 0) { _i3_mas(r["uvs"], [m["uvs"][2 * vi], m["uvs"][2 * vi + 1]]) }
+            r["indices"].agregar(t + k)
+            k = k + 1
+        }
+        t = t + 3
+    }
+    r["formato"] = m["formato"] ?? nulo
+    retornar r
+}
+
+/// Normales suaves: promedio de las caras ponderado por área.
+funcion importa3d_normales_suaves(m) {
+    sea n = longitud(m["posiciones"]) / 3
+    sea acc = []
+    sea i = 0
+    mientras (i < 3 * n) {
+        acc.agregar(0)
+        i = i + 1
+    }
+    sea t = 0
+    mientras (t < longitud(m["indices"])) {
+        sea ia = m["indices"][t]
+        sea ib = m["indices"][t + 1]
+        sea ic = m["indices"][t + 2]
+        sea c = _i3_cruz(_i3_resta(_i3_v(m, ib), _i3_v(m, ia)), _i3_resta(_i3_v(m, ic), _i3_v(m, ia)))
+        para vi en [ia, ib, ic] {
+            acc[3 * vi] = acc[3 * vi] + c[0]
+            acc[3 * vi + 1] = acc[3 * vi + 1] + c[1]
+            acc[3 * vi + 2] = acc[3 * vi + 2] + c[2]
+        }
+        t = t + 3
+    }
+    i = 0
+    mientras (i < n) {
+        sea v = [acc[3 * i], acc[3 * i + 1], acc[3 * i + 2]]
+        sea l = _i3_largo(v)
+        si (l > 0) {
+            acc[3 * i] = v[0] / l
+            acc[3 * i + 1] = v[1] / l
+            acc[3 * i + 2] = v[2] / l
+        }
+        i = i + 1
+    }
+    m["normales"] = acc
+}
+
+/// Medidas: {"vertices", "triangulos", "min", "max", "centro", "tamano",
+/// "area", "volumen", "cerrada"} (cerrada: cada arista en dos triángulos).
+funcion importa3d_medidas(m) {
+    sea n = longitud(m["posiciones"]) / 3
+    sea mn = [0, 0, 0]
+    sea mx = [0, 0, 0]
+    si (n > 0) {
+        mn = _i3_v(m, 0)
+        mx = _i3_v(m, 0)
+    }
+    sea i = 0
+    mientras (i < n) {
+        sea p = _i3_v(m, i)
+        sea k = 0
+        mientras (k < 3) {
+            si (p[k] < mn[k]) { mn[k] = p[k] }
+            si (p[k] > mx[k]) { mx[k] = p[k] }
+            k = k + 1
+        }
+        i = i + 1
+    }
+    sea area = 0
+    sea vol = 0
+    sea aristas = {}
+    sea t = 0
+    mientras (t < longitud(m["indices"])) {
+        sea ia = m["indices"][t]
+        sea ib = m["indices"][t + 1]
+        sea ic = m["indices"][t + 2]
+        sea a = _i3_v(m, ia)
+        sea b = _i3_v(m, ib)
+        sea c = _i3_v(m, ic)
+        area = area + _i3_largo(_i3_cruz(_i3_resta(b, a), _i3_resta(c, a))) / 2
+        sea bc = _i3_cruz(b, c)
+        vol = vol + (a[0] * bc[0] + a[1] * bc[1] + a[2] * bc[2]) / 6
+        para par en [[ia, ib], [ib, ic], [ic, ia]] {
+            sea k = "" + minimo(par[0], par[1]) + "," + maximo(par[0], par[1])
+            aristas[k] = (aristas[k] ?? 0) + 1
+        }
+        t = t + 3
+    }
+    sea cerrada = longitud(m["indices"]) > 0
+    para k en claves(aristas) { si (aristas[k] != 2) { cerrada = falso } }
+    retornar {"vertices": n, "triangulos": longitud(m["indices"]) / 3, "min": mn, "max": mx, "centro": [(mn[0] + mx[0]) / 2, (mn[1] + mx[1]) / 2, (mn[2] + mx[2]) / 2], "tamano": [mx[0] - mn[0], mx[1] - mn[1], mx[2] - mn[2]], "area": area, "volumen": vol, "cerrada": cerrada}
+}
+
+// ---------- exportar ----------
+
+funcion _i3_n(v) {
+    sea r = redondear(v * 1000000) / 1000000
+    si (r == piso(r)) { retornar "" + piso(r) }
+    retornar "" + r
+}
+
+/// Exporta a "stl" (binario; "stl_ascii" para texto), "ply" (binario;
+/// "ply_ascii" para texto), "obj" u "off". opciones: "nombre".
+funcion importa3d_exportar(m, formato, opciones) {
+    sea op = opciones ?? {}
+    sea n = longitud(m["posiciones"]) / 3
+    sea nt = longitud(m["indices"]) / 3
+    si (formato == "stl" o formato == "stl_ascii") {
+        sea partes = []
+        si (formato == "stl") {
+            sea cab = "C-Forge importa3d"
+            mientras (longitud(cab) < 80) { cab = cab + " " }
+            partes.agregar(cab + bytes_entero(nt, 4, 1))
+        } sino { partes.agregar("solid " + (op["nombre"] ?? "cforge") + "\n") }
+        sea t = 0
+        mientras (t < nt) {
+            sea a = _i3_v(m, m["indices"][3 * t])
+            sea b = _i3_v(m, m["indices"][3 * t + 1])
+            sea c = _i3_v(m, m["indices"][3 * t + 2])
+            sea nn = _i3_cruz(_i3_resta(b, a), _i3_resta(c, a))
+            sea l = _i3_largo(nn)
+            si (l > 0) { nn = [nn[0] / l, nn[1] / l, nn[2] / l] }
+            si (formato == "stl") {
+                sea q = []
+                para v en [nn, a, b, c] { para x en v { q.agregar(_i3_f32_bytes(x)) } }
+                partes.agregar(unir(q, "") + caracter(0) + caracter(0))
+            } sino {
+                partes.agregar("  facet normal " + _i3_n(nn[0]) + " " + _i3_n(nn[1]) + " " + _i3_n(nn[2]) + "\n    outer loop\n")
+                para v en [a, b, c] { partes.agregar("      vertex " + _i3_n(v[0]) + " " + _i3_n(v[1]) + " " + _i3_n(v[2]) + "\n") }
+                partes.agregar("    endloop\n  endfacet\n")
+            }
+            t = t + 1
+        }
+        si (formato == "stl_ascii") { partes.agregar("endsolid " + (op["nombre"] ?? "cforge") + "\n") }
+        retornar unir(partes, "")
+    }
+    si (formato == "ply" o formato == "ply_ascii") {
+        sea con_n = longitud(m["normales"]) == 3 * n y n > 0
+        sea con_uv = longitud(m["uvs"]) == 2 * n y n > 0
+        sea fmt = "binary_little_endian"
+        si (formato == "ply_ascii") { fmt = "ascii" }
+        sea cab = ["ply", "format " + fmt + " 1.0", "comment C-Forge importa3d", "element vertex " + n, "property float x", "property float y", "property float z"]
+        si (con_n) { cab = cab + ["property float nx", "property float ny", "property float nz"] }
+        si (con_uv) { cab = cab + ["property float s", "property float t"] }
+        cab = cab + ["element face " + nt, "property list uchar int vertex_indices", "end_header"]
+        sea partes = [unir(cab, "\n") + "\n"]
+        sea i = 0
+        mientras (i < n) {
+            sea vs = _i3_v(m, i)
+            si (con_n) { vs = vs + [m["normales"][3 * i], m["normales"][3 * i + 1], m["normales"][3 * i + 2]] }
+            si (con_uv) { vs = vs + [m["uvs"][2 * i], m["uvs"][2 * i + 1]] }
+            si (formato == "ply") {
+                sea q = []
+                para x en vs { q.agregar(_i3_f32_bytes(x)) }
+                partes.agregar(unir(q, ""))
+            } sino {
+                sea q = []
+                para x en vs { q.agregar(_i3_n(x)) }
+                partes.agregar(unir(q, " ") + "\n")
+            }
+            i = i + 1
+        }
+        sea t = 0
+        mientras (t < nt) {
+            sea tri = [m["indices"][3 * t], m["indices"][3 * t + 1], m["indices"][3 * t + 2]]
+            si (formato == "ply") { partes.agregar(caracter(3) + bytes_entero(tri[0], 4, 1) + bytes_entero(tri[1], 4, 1) + bytes_entero(tri[2], 4, 1)) } sino { partes.agregar("3 " + tri[0] + " " + tri[1] + " " + tri[2] + "\n") }
+            t = t + 1
+        }
+        retornar unir(partes, "")
+    }
+    si (formato == "off") {
+        sea p = ["OFF\n" + n + " " + nt + " 0\n"]
+        sea i = 0
+        mientras (i < n) {
+            sea v = _i3_v(m, i)
+            p.agregar(_i3_n(v[0]) + " " + _i3_n(v[1]) + " " + _i3_n(v[2]) + "\n")
+            i = i + 1
+        }
+        sea t = 0
+        mientras (t < nt) {
+            p.agregar("3 " + m["indices"][3 * t] + " " + m["indices"][3 * t + 1] + " " + m["indices"][3 * t + 2] + "\n")
+            t = t + 1
+        }
+        retornar unir(p, "")
+    }
+    si (formato == "obj") {
+        sea p = ["# C-Forge importa3d\n"]
+        sea i = 0
+        mientras (i < n) {
+            sea v = _i3_v(m, i)
+            p.agregar("v " + _i3_n(v[0]) + " " + _i3_n(v[1]) + " " + _i3_n(v[2]) + "\n")
+            i = i + 1
+        }
+        sea con_n = longitud(m["normales"]) == 3 * n y n > 0
+        sea con_uv = longitud(m["uvs"]) == 2 * n y n > 0
+        si (con_uv) {
+            i = 0
+            mientras (i < n) {
+                p.agregar("vt " + _i3_n(m["uvs"][2 * i]) + " " + _i3_n(m["uvs"][2 * i + 1]) + "\n")
+                i = i + 1
+            }
+        }
+        si (con_n) {
+            i = 0
+            mientras (i < n) {
+                p.agregar("vn " + _i3_n(m["normales"][3 * i]) + " " + _i3_n(m["normales"][3 * i + 1]) + " " + _i3_n(m["normales"][3 * i + 2]) + "\n")
+                i = i + 1
+            }
+        }
+        sea t = 0
+        mientras (t < nt) {
+            sea f = []
+            para k en [0, 1, 2] {
+                sea x = m["indices"][3 * t + k] + 1
+                si (con_n y con_uv) { f.agregar(x + "/" + x + "/" + x) }
+                sino si (con_n) { f.agregar(x + "//" + x) }
+                sino si (con_uv) { f.agregar(x + "/" + x) }
+                sino { f.agregar("" + x) }
+            }
+            p.agregar("f " + unir(f, " ") + "\n")
+            t = t + 1
+        }
+        retornar unir(p, "")
+    }
+    lanzar "importa3d: no sé exportar a " + formato
+}

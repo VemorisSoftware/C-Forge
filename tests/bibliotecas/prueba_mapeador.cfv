@@ -1,0 +1,77 @@
+importar "mapeador"
+funcion igual(a, b, q) { afirmar(("" + a) == ("" + b), q + ": [" + a + "] != [" + b + "]") }
+sea ruta = "/tmp/cforge_mapeador_prueba.db"
+si (existe_archivo(ruta)) { eliminar_archivo(ruta) }
+sea orm = mapeador_abrir(ruta)
+sea sqls = []
+mapeador_registro(orm, funcion(s, p) { sqls.agregar(s) })
+mapeador_modelo(orm, "Usuario", {"campos": {
+    "id": {"tipo": "entero", "clave": verdadero},
+    "nombre": {"tipo": "texto", "requerido": verdadero, "largo": 20},
+    "email": {"tipo": "texto", "unico": verdadero, "formato": "email"},
+    "edad": {"tipo": "entero", "min": 0},
+    "activo": {"tipo": "booleano", "defecto": verdadero},
+    "prefs": {"tipo": "json"}
+}, "relaciones": {"posts": {"tiene_muchos": "Post", "clave": "autor_id"}}, "indices": [["nombre"]]})
+mapeador_modelo(orm, "Post", {"campos": {
+    "titulo": {"tipo": "texto", "requerido": verdadero},
+    "autor_id": {"tipo": "entero", "referencia": "Usuario", "al_borrar": "cascada"},
+    "votos": {"tipo": "entero", "defecto": 0}
+}, "relaciones": {"autor": {"pertenece_a": "Usuario", "clave": "autor_id"}}})
+igual(mapeador_migrar(orm), ["crear tabla usuarios", "crear índice ix_usuarios_nombre", "crear tabla posts"], "migración inicial")
+igual(mapeador_migrar(orm), [], "nada que migrar")
+sea ana = mapeador_crear(orm, "Usuario", {"nombre": "Ana", "email": "ana@x.cl", "edad": 30, "prefs": {"tema": "oscuro"}})
+sea luis = mapeador_crear(orm, "Usuario", {"nombre": "Luis", "email": "luis@x.cl", "edad": 17, "activo": falso})
+igual([ana["id"], luis["id"], ana["activo"], mapeador_buscar(orm, "Usuario", 1)["prefs"]["tema"]], [1, 2, verdadero, "oscuro"], "crear y buscar")
+// Validación y restricciones.
+sea err = nulo
+intentar { mapeador_crear(orm, "Usuario", {"email": "malo", "edad": -1, "nombre": "Un nombre demasiado largo para el campo"}) } capturar (e) { err = e["errores"] }
+igual(err, {"edad": "debe ser al menos 0", "email": "no es un correo válido", "nombre": "supera 20 caracteres"}, "validación")
+err = nulo
+intentar { mapeador_crear(orm, "Usuario", {"nombre": "Otra", "email": "ana@x.cl"}) } capturar (e) { err = e["errores"] }
+igual(err, {"email": "ya existe"}, "único")
+err = nulo
+intentar { mapeador_crear(orm, "Post", {"titulo": "x", "autor_id": 99}) } capturar (e) { err = e["mensaje"] }
+igual(err, "mapeador: Post: referencia inexistente", "clave foránea")
+// Seguimiento de cambios: solo se actualiza lo modificado.
+ana["edad"] = 31
+igual(mapeador_cambios(orm, ana), {"edad": [30, 31]}, "cambios")
+mapeador_guardar(orm, ana)
+igual([sqls[longitud(sqls) - 1], mapeador_cambios(orm, ana)], ["UPDATE " + caracter(34) + "usuarios" + caracter(34) + " SET " + caracter(34) + "edad" + caracter(34) + " = ?1 WHERE " + caracter(34) + "id" + caracter(34) + " = ?2", {}], "guardar cambios")
+para t en ["Hola", "Segundo", "Tercero"] { mapeador_crear(orm, "Post", {"titulo": t, "autor_id": ana["id"], "votos": longitud(t)}) }
+mapeador_crear(orm, "Post", {"titulo": "De Luis", "autor_id": luis["id"]})
+// Consultas.
+sea q = mapeador_ordenar(mapeador_donde(mapeador_consulta(orm, "Post"), "votos", ">", 3), "votos", "desc")
+igual(mapeador_sql(q), ["SELECT * FROM " + caracter(34) + "posts" + caracter(34) + " WHERE " + caracter(34) + "votos" + caracter(34) + " > ?1 ORDER BY " + caracter(34) + "votos" + caracter(34) + " DESC", [3]], "sql")
+sea titulos = []
+para p en mapeador_lista(q) { titulos.agregar(p["titulo"]) }
+igual(titulos, ["Segundo", "Tercero", "Hola"], "filtrar y ordenar")
+igual(mapeador_contar(mapeador_o(mapeador_consulta(orm, "Usuario"), [["edad", "<", 18], ["nombre", "like", "A%"]])), 2, "o")
+igual(mapeador_contar(mapeador_donde(mapeador_consulta(orm, "Post"), "titulo", "in", ["Hola", "De Luis", "nada"])), 2, "in")
+igual([mapeador_agregado(mapeador_consulta(orm, "Post"), "suma", "votos"), mapeador_agregado(mapeador_consulta(orm, "Usuario"), "maximo", "edad")], [18, 31], "agregados")
+igual(mapeador_agrupar(mapeador_consulta(orm, "Usuario"), "activo"), [{"cantidad": 1, "valor": falso}, {"cantidad": 1, "valor": verdadero}], "agrupar")
+// Relaciones (carga anticipada y perezosa).
+sea us = mapeador_lista(mapeador_incluir(mapeador_ordenar(mapeador_consulta(orm, "Usuario"), "id", nulo), "posts"))
+igual([longitud(us[0]["posts"]), longitud(us[1]["posts"])], [3, 1], "tiene muchos")
+sea p1 = mapeador_primero(mapeador_incluir(mapeador_donde(mapeador_consulta(orm, "Post"), "titulo", "=", "De Luis"), "autor"))
+igual(p1["autor"]["nombre"], "Luis", "pertenece a")
+igual(longitud(mapeador_cargar(orm, ana, "posts")), 3, "carga perezosa")
+// Bloque, transacción y cascada.
+igual(mapeador_actualizar_donde(mapeador_donde(mapeador_consulta(orm, "Post"), "autor_id", "=", 1), {"votos": 0}), 3, "actualizar en bloque")
+err = nulo
+intentar { mapeador_transaccion(orm, funcion() {
+    mapeador_crear(orm, "Post", {"titulo": "temporal", "autor_id": 1})
+    lanzar "falla adrede"
+}) } capturar (e) { err = e }
+igual([err, mapeador_contar(mapeador_consulta(orm, "Post"))], ["falla adrede", 4], "transacción revertida")
+mapeador_borrar(orm, luis)
+igual(mapeador_contar(mapeador_consulta(orm, "Post")), 3, "borrar en cascada")
+// Cambio de modelo: columna nueva (simple) y luego una quitada (reconstruye).
+mapeador_modelo(orm, "Post", {"campos": {"titulo": {"tipo": "texto", "requerido": verdadero}, "autor_id": {"tipo": "entero", "referencia": "Usuario", "al_borrar": "cascada"}, "votos": {"tipo": "entero", "defecto": 0}, "resumen": {"tipo": "texto"}}})
+igual(mapeador_migrar(orm), ["agregar columna posts.resumen"], "agregar columna")
+mapeador_modelo(orm, "Post", {"campos": {"titulo": {"tipo": "texto", "requerido": verdadero}, "autor_id": {"tipo": "entero", "referencia": "Usuario", "al_borrar": "cascada"}, "resumen": {"tipo": "texto"}}})
+igual([mapeador_migrar(orm), mapeador_contar(mapeador_consulta(orm, "Post"))], [["reconstruir tabla posts"], 3], "quitar columna")
+igual(longitud(mapeador_historial(orm)), 5, "historial")
+mapeador_cerrar(orm)
+eliminar_archivo(ruta)
+mostrar("[OK] mapeador")

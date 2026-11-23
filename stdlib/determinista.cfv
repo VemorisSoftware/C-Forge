@@ -1,0 +1,658 @@
+// stdlib/determinista.cfv — física 2D reproducible bit a bit en punto fijo
+// (Q16.16, solo enteros): el mismo mundo con las mismas entradas da
+// exactamente el mismo resultado en cualquier máquina, ideal para juegos en
+// red con rollback y repeticiones. Cuerpos dinámicos, estáticos y
+// cinemáticos; círculos y cajas orientadas; gravedad, amortiguación,
+// fricción y restitución; detección amplia por rejilla y estrecha por SAT
+// (caja-caja con recorte de aristas, círculo-caja, círculo-círculo);
+// solucionador por impulsos secuenciales con corrección de posición;
+// sensores; capturas y restauración del estado y una suma de verificación
+// para comparar mundos. Seno, coseno y raíz cuadrada también en enteros.
+// Idea de Rapier (Apache) y Box2D Lite (zlib). En inglés:
+// importar "fixedphysics".
+//
+//   importar "determinista"
+//   sea m = det_mundo({"gravedad": [0, -10]})
+//   det_caja(m, {"x": 0, "y": -1, "ancho": 20, "alto": 2, "tipo": "estatico"})
+//   sea b = det_circulo(m, {"x": 0, "y": 5, "radio": 0.5})
+//   det_pasos(m, 120)
+//   mostrar(det_posicion(m, b))
+
+// ---------- punto fijo Q16.16 ----------
+
+sea _DT_UNO = 65536
+
+/// Número real → punto fijo.
+funcion det_fijo(v) { retornar redondear(v * _DT_UNO) }
+
+/// Punto fijo → número real.
+funcion det_real(f) { retornar f / _DT_UNO }
+
+// Multiplicación y división con redondeo hacia cero (como C).
+funcion _dt_trunc(x) {
+    si (x >= 0) { retornar piso(x) }
+    retornar 0 - piso(0 - x)
+}
+funcion _dt_mul(a, b) { retornar _dt_trunc(a * b / _DT_UNO) }
+funcion _dt_div(a, b) {
+    si (b == 0) { retornar 0 }
+    retornar _dt_trunc(a * _DT_UNO / b)
+}
+
+// Raíz cuadrada entera de x (piso), por Newton.
+funcion _dt_isqrt(x) {
+    si (x <= 0) { retornar 0 }
+    sea r = x
+    sea z = piso((r + 1) / 2)
+    mientras (z < r) {
+        r = z
+        z = piso((r + piso(x / r)) / 2)
+    }
+    retornar r
+}
+
+/// Raíz cuadrada en punto fijo.
+funcion det_raiz(f) { retornar _dt_isqrt(f * _DT_UNO) }
+
+// Seno y coseno con una tabla de 1024 pasos por vuelta e interpolación.
+sea _DT_TABLA = nulo
+sea _DT_DOS_PI = 411775
+
+funcion _dt_tabla() {
+    si (_DT_TABLA != nulo) { retornar _DT_TABLA }
+    // Se arma con una recurrencia entera (rotación por un ángulo fijo con
+    // renormalización) para no depender del seno de la plataforma.
+    sea t = []
+    sea c = 1073741824
+    sea s = 0
+    // cos y sin de 2π/1024 en Q30.
+    sea ca = 1073721611
+    sea sa = 6588356
+    sea i = 0
+    mientras (i <= 1024) {
+        t.agregar(_dt_trunc(s / 16384))
+        sea c2 = _dt_trunc((c * ca - s * sa) / 1073741824)
+        sea s2 = _dt_trunc((s * ca + c * sa) / 1073741824)
+        c = c2
+        s = s2
+        // Renormaliza cada 64 pasos con la raíz entera.
+        si (i % 64 == 63) {
+            sea n = _dt_isqrt(c * c + s * s)
+            c = _dt_trunc(c * 1073741824 / n)
+            s = _dt_trunc(s * 1073741824 / n)
+        }
+        i = i + 1
+    }
+    _DT_TABLA = t
+    retornar t
+}
+
+/// Seno de un ángulo en punto fijo (radianes Q16.16).
+funcion det_seno(a) {
+    sea t = _dt_tabla()
+    sea x = a % _DT_DOS_PI
+    si (x < 0) { x = x + _DT_DOS_PI }
+    sea pos = x * 1024
+    sea i = piso(pos / _DT_DOS_PI)
+    sea frac = pos - i * _DT_DOS_PI
+    retornar t[i] + _dt_trunc((t[i + 1] - t[i]) * frac / _DT_DOS_PI)
+}
+
+funcion det_coseno(a) { retornar det_seno(a + 102944) }
+
+// ---------- vectores ----------
+
+funcion _dt_v(x, y) { retornar [x, y] }
+funcion _dt_suma(a, b) { retornar [a[0] + b[0], a[1] + b[1]] }
+funcion _dt_resta(a, b) { retornar [a[0] - b[0], a[1] - b[1]] }
+funcion _dt_esc(a, k) { retornar [_dt_mul(a[0], k), _dt_mul(a[1], k)] }
+funcion _dt_punto(a, b) { retornar _dt_mul(a[0], b[0]) + _dt_mul(a[1], b[1]) }
+funcion _dt_cruz(a, b) { retornar _dt_mul(a[0], b[1]) - _dt_mul(a[1], b[0]) }
+// Cruz de escalar por vector: s × v = (-s*vy, s*vx).
+funcion _dt_cruz_sv(s, v) { retornar [0 - _dt_mul(s, v[1]), _dt_mul(s, v[0])] }
+funcion _dt_largo(a) { retornar det_raiz(_dt_punto(a, a)) }
+funcion _dt_rot(c, s, v) { retornar [_dt_mul(c, v[0]) - _dt_mul(s, v[1]), _dt_mul(s, v[0]) + _dt_mul(c, v[1])] }
+funcion _dt_rot_inv(c, s, v) { retornar [_dt_mul(c, v[0]) + _dt_mul(s, v[1]), 0 - _dt_mul(s, v[0]) + _dt_mul(c, v[1])] }
+funcion _dt_abs(x) {
+    si (x < 0) { retornar 0 - x }
+    retornar x
+}
+
+// ---------- mundo ----------
+
+/// Nuevo mundo. opciones: "gravedad" [x, y] (reales), "paso" (s, 1/60),
+/// "iteraciones" (10), "celda" (tamaño de la rejilla, 4).
+funcion det_mundo(opciones) {
+    sea op = opciones ?? {}
+    sea g = op["gravedad"] ?? [0, -10]
+    retornar {"g": [det_fijo(g[0]), det_fijo(g[1])], "dt": det_fijo(op["paso"] ?? (1 / 60)), "iter": op["iteraciones"] ?? 10, "celda": det_fijo(op["celda"] ?? 4), "cuerpos": [], "contactos": [], "sensores": [], "tick": 0, "sig": 0}
+}
+
+funcion _dt_cuerpo(m, o, forma) {
+    m["sig"] = m["sig"] + 1
+    sea t = o["tipo"] ?? "dinamico"
+    sea b = {"id": m["sig"], "tipo": t, "forma": forma, "p": [det_fijo(o["x"] ?? 0), det_fijo(o["y"] ?? 0)], "a": det_fijo(o["angulo"] ?? 0), "v": [det_fijo((o["vel"] ?? [0, 0])[0]), det_fijo((o["vel"] ?? [0, 0])[1])], "w": det_fijo(o["vel_angular"] ?? 0),
+        "f": [0, 0], "tq": 0, "friccion": det_fijo(o["friccion"] ?? 0.5), "rest": det_fijo(o["restitucion"] ?? 0), "amort": det_fijo(o["amortiguacion"] ?? 0), "sensor": o["sensor"] ?? falso, "datos": o["datos"] ?? nulo, "inv_m": 0, "inv_i": 0, "dormido": falso}
+    sea densidad = o["densidad"] ?? 1
+    si (t == "dinamico") {
+        sea masa = 0
+        sea inercia = 0
+        si (forma["tipo"] == "circulo") {
+            sea r = forma["r"]
+            masa = _dt_mul(det_fijo(densidad * 3.141592653589793), _dt_mul(r, r))
+            inercia = _dt_mul(masa, _dt_mul(r, r)) / 2
+        } sino {
+            sea w = forma["he"][0] * 2
+            sea h = forma["he"][1] * 2
+            masa = _dt_mul(det_fijo(densidad), _dt_mul(w, h))
+            inercia = _dt_div(_dt_mul(masa, _dt_mul(w, w) + _dt_mul(h, h)), det_fijo(12))
+        }
+        si ((o["masa"] ?? nulo) != nulo) {
+            sea nueva = det_fijo(o["masa"])
+            inercia = _dt_div(_dt_mul(inercia, nueva), masa)
+            masa = nueva
+        }
+        b["inv_m"] = _dt_div(_DT_UNO, masa)
+        si ((o["sin_rotacion"] ?? falso) == falso y inercia > 0) { b["inv_i"] = _dt_div(_DT_UNO, inercia) }
+    }
+    m["cuerpos"].agregar(b)
+    retornar b["id"]
+}
+
+/// Círculo. o: "x", "y", "radio", "tipo" ("dinamico", "estatico",
+/// "cinematico"), "densidad", "masa", "friccion", "restitucion",
+/// "amortiguacion", "vel" [vx, vy], "vel_angular", "sensor", "datos".
+funcion det_circulo(m, o) { retornar _dt_cuerpo(m, o, {"tipo": "circulo", "r": det_fijo(o["radio"] ?? 0.5)}) }
+
+/// Caja orientada. o: como det_circulo con "ancho", "alto", "angulo".
+funcion det_caja(m, o) { retornar _dt_cuerpo(m, o, {"tipo": "caja", "he": [det_fijo((o["ancho"] ?? 1) / 2), det_fijo((o["alto"] ?? 1) / 2)]}) }
+
+funcion _dt_b(m, id) {
+    para b en m["cuerpos"] { si (b["id"] == id) { retornar b } }
+    lanzar "determinista: no existe el cuerpo " + id
+}
+
+funcion det_quitar(m, id) {
+    sea r = []
+    para b en m["cuerpos"] { si (b["id"] != id) { r.agregar(b) } }
+    m["cuerpos"] = r
+}
+
+/// Posición [x, y] (reales) de un cuerpo.
+funcion det_posicion(m, id) {
+    sea b = _dt_b(m, id)
+    retornar [det_real(b["p"][0]), det_real(b["p"][1])]
+}
+
+funcion det_angulo(m, id) { retornar det_real(_dt_b(m, id)["a"]) }
+funcion det_velocidad(m, id) {
+    sea b = _dt_b(m, id)
+    retornar [det_real(b["v"][0]), det_real(b["v"][1])]
+}
+
+/// Cambia la velocidad (reales).
+funcion det_fijar_velocidad(m, id, vx, vy) {
+    sea b = _dt_b(m, id)
+    b["v"] = [det_fijo(vx), det_fijo(vy)]
+}
+
+/// Aplica un impulso (reales) en el centro.
+funcion det_impulso(m, id, ix, iy) {
+    sea b = _dt_b(m, id)
+    b["v"] = _dt_suma(b["v"], _dt_esc([det_fijo(ix), det_fijo(iy)], b["inv_m"]))
+}
+
+/// Fuerza (reales) que actúa durante el próximo paso.
+funcion det_fuerza(m, id, fx, fy) {
+    sea b = _dt_b(m, id)
+    b["f"] = _dt_suma(b["f"], [det_fijo(fx), det_fijo(fy)])
+}
+
+/// Mueve un cuerpo cinemático o estático (reales).
+funcion det_mover(m, id, x, y) {
+    sea b = _dt_b(m, id)
+    b["p"] = [det_fijo(x), det_fijo(y)]
+}
+
+// ---------- colisiones ----------
+
+funcion _dt_aabb(b) {
+    si (b["forma"]["tipo"] == "circulo") {
+        sea r = b["forma"]["r"]
+        retornar [b["p"][0] - r, b["p"][1] - r, b["p"][0] + r, b["p"][1] + r]
+    }
+    sea c = _dt_abs(det_coseno(b["a"]))
+    sea s = _dt_abs(det_seno(b["a"]))
+    sea he = b["forma"]["he"]
+    sea ex = _dt_mul(c, he[0]) + _dt_mul(s, he[1])
+    sea ey = _dt_mul(s, he[0]) + _dt_mul(c, he[1])
+    retornar [b["p"][0] - ex, b["p"][1] - ey, b["p"][0] + ex, b["p"][1] + ey]
+}
+
+// Pares candidatos por rejilla uniforme (en orden estable de ids).
+funcion _dt_pares(m) {
+    sea celdas = {}
+    sea cajas = {}
+    para b en m["cuerpos"] {
+        sea a = _dt_aabb(b)
+        cajas["" + b["id"]] = a
+        sea x0 = piso(a[0] / m["celda"])
+        sea x1 = piso(a[2] / m["celda"])
+        sea y0 = piso(a[1] / m["celda"])
+        sea y1 = piso(a[3] / m["celda"])
+        // Cuerpos enormes (suelos): a una lista aparte.
+        si ((x1 - x0 + 1) * (y1 - y0 + 1) > 64) {
+            si (tiene_clave(celdas, "grande") == falso) { celdas["grande"] = [] }
+            celdas["grande"].agregar(b)
+        } sino {
+            sea x = x0
+            mientras (x <= x1) {
+                sea yy = y0
+                mientras (yy <= y1) {
+                    sea k = x + "," + yy
+                    si (tiene_clave(celdas, k) == falso) { celdas[k] = [] }
+                    celdas[k].agregar(b)
+                    yy = yy + 1
+                }
+                x = x + 1
+            }
+        }
+    }
+    sea vistos = {}
+    sea pares = []
+    sea grandes = celdas["grande"] ?? []
+    para k en claves(celdas) {
+        sea l = celdas[k]
+        si (k != "grande") { l = l + grandes }
+        sea i = 0
+        mientras (i < longitud(l)) {
+            sea j = i + 1
+            mientras (j < longitud(l)) {
+                sea a = l[i]
+                sea b = l[j]
+                si (a["id"] > b["id"]) {
+                    sea t = a
+                    a = b
+                    b = t
+                }
+                sea clave = a["id"] + "-" + b["id"]
+                si (a["id"] != b["id"] y tiene_clave(vistos, clave) == falso y (a["inv_m"] != 0 o b["inv_m"] != 0)) {
+                    vistos[clave] = verdadero
+                    sea ca = cajas["" + a["id"]]
+                    sea cb = cajas["" + b["id"]]
+                    si (ca[0] <= cb[2] y cb[0] <= ca[2] y ca[1] <= cb[3] y cb[1] <= ca[3]) { pares.agregar([a, b]) }
+                }
+                j = j + 1
+            }
+            i = i + 1
+        }
+    }
+    retornar ordenar(pares, funcion(x, z) {
+        si (x[0]["id"] != z[0]["id"]) { retornar x[0]["id"] - z[0]["id"] }
+        retornar x[1]["id"] - z[1]["id"]
+    })
+}
+
+// Contactos de a contra b: [{"p": punto, "n": normal de a hacia b, "prof"}].
+funcion _dt_colision(a, b) {
+    sea fa = a["forma"]["tipo"]
+    sea fb = b["forma"]["tipo"]
+    si (fa == "circulo" y fb == "circulo") { retornar _dt_cc(a, b) }
+    si (fa == "caja" y fb == "circulo") { retornar _dt_bc(a, b) }
+    si (fa == "circulo" y fb == "caja") {
+        sea r = _dt_bc(b, a)
+        para c en r { c["n"] = [0 - c["n"][0], 0 - c["n"][1]] }
+        retornar r
+    }
+    retornar _dt_bb(a, b)
+}
+
+funcion _dt_cc(a, b) {
+    sea d = _dt_resta(b["p"], a["p"])
+    sea r = a["forma"]["r"] + b["forma"]["r"]
+    sea d2 = _dt_punto(d, d)
+    si (d2 >= _dt_mul(r, r)) { retornar [] }
+    sea dist = det_raiz(d2)
+    sea n = [_DT_UNO, 0]
+    si (dist > 0) { n = [_dt_div(d[0], dist), _dt_div(d[1], dist)] }
+    retornar [{"p": _dt_suma(a["p"], _dt_esc(n, a["forma"]["r"])), "n": n, "prof": r - dist}]
+}
+
+// Caja contra círculo (normal de la caja hacia el círculo).
+funcion _dt_bc(a, c) {
+    sea co = det_coseno(a["a"])
+    sea si_ = det_seno(a["a"])
+    sea he = a["forma"]["he"]
+    sea local = _dt_rot_inv(co, si_, _dt_resta(c["p"], a["p"]))
+    sea q = [local[0], local[1]]
+    si (q[0] > he[0]) { q[0] = he[0] }
+    si (q[0] < 0 - he[0]) { q[0] = 0 - he[0] }
+    si (q[1] > he[1]) { q[1] = he[1] }
+    si (q[1] < 0 - he[1]) { q[1] = 0 - he[1] }
+    sea r = c["forma"]["r"]
+    sea dentro = q[0] == local[0] y q[1] == local[1]
+    sea n = [0, 0]
+    sea prof = 0
+    si (dentro) {
+        // Centro dentro de la caja: sale por la cara más cercana.
+        sea dx = he[0] - _dt_abs(local[0])
+        sea dy = he[1] - _dt_abs(local[1])
+        si (dx < dy) {
+            n = [_DT_UNO, 0]
+            si (local[0] < 0) { n = [0 - _DT_UNO, 0] }
+            prof = dx + r
+            q = [_dt_mul(n[0], he[0]), local[1]]
+        } sino {
+            n = [0, _DT_UNO]
+            si (local[1] < 0) { n = [0, 0 - _DT_UNO] }
+            prof = dy + r
+            q = [local[0], _dt_mul(n[1], he[1])]
+        }
+    } sino {
+        sea d = _dt_resta(local, q)
+        sea d2 = _dt_punto(d, d)
+        si (d2 >= _dt_mul(r, r)) { retornar [] }
+        sea dist = det_raiz(d2)
+        si (dist == 0) { retornar [] }
+        n = [_dt_div(d[0], dist), _dt_div(d[1], dist)]
+        prof = r - dist
+    }
+    retornar [{"p": _dt_suma(a["p"], _dt_rot(co, si_, q)), "n": _dt_rot(co, si_, n), "prof": prof}]
+}
+
+// Caja contra caja: SAT y recorte de la arista incidente (Box2D Lite).
+funcion _dt_bb(a, b) {
+    sea ca = det_coseno(a["a"])
+    sea sa = det_seno(a["a"])
+    sea cb = det_coseno(b["a"])
+    sea sb = det_seno(b["a"])
+    sea ha = a["forma"]["he"]
+    sea hb = b["forma"]["he"]
+    sea ejes_a = [[ca, sa], [0 - sa, ca]]
+    sea ejes_b = [[cb, sb], [0 - sb, cb]]
+    sea d = _dt_resta(b["p"], a["p"])
+    sea mejor = nulo
+    // Ejes de a y de b.
+    sea k = 0
+    mientras (k < 4) {
+        sea eje = nulo
+        si (k < 2) { eje = ejes_a[k] } sino { eje = ejes_b[k - 2] }
+        sea ra = _dt_abs(_dt_mul(ha[0], _dt_punto(ejes_a[0], eje))) + _dt_abs(_dt_mul(ha[1], _dt_punto(ejes_a[1], eje)))
+        sea rb = _dt_abs(_dt_mul(hb[0], _dt_punto(ejes_b[0], eje))) + _dt_abs(_dt_mul(hb[1], _dt_punto(ejes_b[1], eje)))
+        sea dist = _dt_punto(d, eje)
+        sea sep = _dt_abs(dist) - (ra + rb)
+        si (sep > 0) { retornar [] }
+        sea n = eje
+        si (dist < 0) { n = [0 - eje[0], 0 - eje[1]] }
+        // Preferencia estable por los ejes de a (sesgo pequeño).
+        si (mejor == nulo o sep > mejor[0] + 6) { mejor = [sep, n, k] }
+        k = k + 1
+    }
+    sea n = mejor[1]
+    // Caja de referencia y caja incidente.
+    sea ref = a
+    sea inc = b
+    sea nr = n
+    si (mejor[2] >= 2) {
+        ref = b
+        inc = a
+        nr = [0 - n[0], 0 - n[1]]
+    }
+    sea ri = _dt_caja_vertices(inc)
+    // Arista incidente: la más opuesta a la normal.
+    sea min = nulo
+    sea idx = 0
+    sea i = 0
+    mientras (i < 4) {
+        sea e = _dt_resta(ri[(i + 1) % 4], ri[i])
+        sea normal = [e[1], 0 - e[0]]
+        sea pd = _dt_punto(normal, nr)
+        si (min == nulo o pd < min) {
+            min = pd
+            idx = i
+        }
+        i = i + 1
+    }
+    sea v1 = ri[idx]
+    sea v2 = ri[(idx + 1) % 4]
+    // Planos laterales de la cara de referencia.
+    sea cr = det_coseno(ref["a"])
+    sea sr = det_seno(ref["a"])
+    sea hr = ref["forma"]["he"]
+    sea ex = [cr, sr]
+    sea ey = [0 - sr, cr]
+    sea tang = ey
+    sea he_t = hr[1]
+    sea he_n = hr[0]
+    si (_dt_abs(_dt_punto(nr, ey)) > _dt_abs(_dt_punto(nr, ex))) {
+        tang = ex
+        he_t = hr[0]
+        he_n = hr[1]
+    }
+    sea pts = [v1, v2]
+    sea c_ref = _dt_punto(tang, ref["p"])
+    pts = _dt_recortar(pts, [0 - tang[0], 0 - tang[1]], he_t - c_ref)
+    si (pts == nulo) { retornar [] }
+    pts = _dt_recortar(pts, tang, he_t + c_ref)
+    si (pts == nulo) { retornar [] }
+    sea plano = _dt_punto(nr, ref["p"]) + he_n
+    sea r = []
+    para p en pts {
+        sea prof = plano - _dt_punto(nr, p)
+        si (prof >= 0) { r.agregar({"p": p, "n": n, "prof": prof}) }
+    }
+    retornar r
+}
+
+funcion _dt_caja_vertices(b) {
+    sea c = det_coseno(b["a"])
+    sea s = det_seno(b["a"])
+    sea he = b["forma"]["he"]
+    sea r = []
+    para l en [[0 - he[0], 0 - he[1]], [he[0], 0 - he[1]], [he[0], he[1]], [0 - he[0], he[1]]] { r.agregar(_dt_suma(b["p"], _dt_rot(c, s, l))) }
+    retornar r
+}
+
+// Recorta un segmento contra el semiplano punto·n <= o.
+funcion _dt_recortar(pts, n, o) {
+    sea d0 = _dt_punto(n, pts[0]) - o
+    sea d1 = _dt_punto(n, pts[1]) - o
+    sea r = []
+    si (d0 <= 0) { r.agregar(pts[0]) }
+    si (d1 <= 0) { r.agregar(pts[1]) }
+    si ((d0 < 0 y d1 > 0) o (d0 > 0 y d1 < 0)) {
+        sea t = _dt_div(d0, d0 - d1)
+        r.agregar(_dt_suma(pts[0], _dt_esc(_dt_resta(pts[1], pts[0]), t)))
+    }
+    si (longitud(r) < 2) { retornar nulo }
+    retornar [r[0], r[1]]
+}
+
+// ---------- paso ----------
+
+/// Avanza un paso fijo. Devuelve los contactos nuevos de sensores.
+funcion det_paso(m) {
+    sea dt = m["dt"]
+    // Fuerzas y gravedad.
+    para b en m["cuerpos"] {
+        si (b["tipo"] == "dinamico") {
+            b["v"] = _dt_suma(b["v"], _dt_esc(_dt_suma(m["g"], _dt_esc(b["f"], b["inv_m"])), dt))
+            b["w"] = b["w"] + _dt_mul(_dt_mul(b["tq"], b["inv_i"]), dt)
+            si (b["amort"] > 0) {
+                sea k = _DT_UNO - _dt_mul(b["amort"], dt)
+                si (k < 0) { k = 0 }
+                b["v"] = _dt_esc(b["v"], k)
+                b["w"] = _dt_mul(b["w"], k)
+            }
+        }
+        b["f"] = [0, 0]
+        b["tq"] = 0
+    }
+    // Contactos.
+    sea contactos = []
+    sea sensores = []
+    para par en _dt_pares(m) {
+        sea a = par[0]
+        sea b = par[1]
+        sea cs = _dt_colision(a, b)
+        si (longitud(cs) > 0) {
+            si (a["sensor"] o b["sensor"]) { sensores.agregar([a["id"], b["id"]]) } sino {
+                para c en cs {
+                    c["a"] = a
+                    c["b"] = b
+                    c["ra"] = _dt_resta(c["p"], a["p"])
+                    c["rb"] = _dt_resta(c["p"], b["p"])
+                    sea ran = _dt_cruz(c["ra"], c["n"])
+                    sea rbn = _dt_cruz(c["rb"], c["n"])
+                    sea kn = a["inv_m"] + b["inv_m"] + _dt_mul(_dt_mul(ran, ran), a["inv_i"]) + _dt_mul(_dt_mul(rbn, rbn), b["inv_i"])
+                    c["mn"] = 0
+                    si (kn > 0) { c["mn"] = _dt_div(_DT_UNO, kn) }
+                    sea t = [c["n"][1], 0 - c["n"][0]]
+                    c["t"] = t
+                    sea rat = _dt_cruz(c["ra"], t)
+                    sea rbt = _dt_cruz(c["rb"], t)
+                    sea kt = a["inv_m"] + b["inv_m"] + _dt_mul(_dt_mul(rat, rat), a["inv_i"]) + _dt_mul(_dt_mul(rbt, rbt), b["inv_i"])
+                    c["mt"] = 0
+                    si (kt > 0) { c["mt"] = _dt_div(_DT_UNO, kt) }
+                    // Rebote: velocidad relativa normal inicial.
+                    sea dv = _dt_resta(_dt_suma(b["v"], _dt_cruz_sv(b["w"], c["rb"])), _dt_suma(a["v"], _dt_cruz_sv(a["w"], c["ra"])))
+                    sea vn = _dt_punto(dv, c["n"])
+                    sea e = a["rest"]
+                    si (b["rest"] > e) { e = b["rest"] }
+                    c["sesgo_rebote"] = 0
+                    si (vn < 0 - det_fijo(1)) { c["sesgo_rebote"] = 0 - _dt_mul(e, vn) }
+                    c["pn"] = 0
+                    c["pt"] = 0
+                    c["mu"] = det_raiz(_dt_mul(a["friccion"], b["friccion"]))
+                    contactos.agregar(c)
+                }
+            }
+        }
+    }
+    // Impulsos secuenciales.
+    sea it = 0
+    mientras (it < m["iter"]) {
+        para c en contactos {
+            sea a = c["a"]
+            sea b = c["b"]
+            sea dv = _dt_resta(_dt_suma(b["v"], _dt_cruz_sv(b["w"], c["rb"])), _dt_suma(a["v"], _dt_cruz_sv(a["w"], c["ra"])))
+            sea vn = _dt_punto(dv, c["n"])
+            sea dpn = _dt_mul(c["mn"], c["sesgo_rebote"] - vn)
+            sea pn0 = c["pn"]
+            c["pn"] = pn0 + dpn
+            si (c["pn"] < 0) { c["pn"] = 0 }
+            dpn = c["pn"] - pn0
+            _dt_aplicar(a, b, c, _dt_esc(c["n"], dpn))
+            // Fricción.
+            dv = _dt_resta(_dt_suma(b["v"], _dt_cruz_sv(b["w"], c["rb"])), _dt_suma(a["v"], _dt_cruz_sv(a["w"], c["ra"])))
+            sea vt = _dt_punto(dv, c["t"])
+            sea dpt = _dt_mul(c["mt"], 0 - vt)
+            sea maxf = _dt_mul(c["mu"], c["pn"])
+            sea pt0 = c["pt"]
+            c["pt"] = pt0 + dpt
+            si (c["pt"] > maxf) { c["pt"] = maxf }
+            si (c["pt"] < 0 - maxf) { c["pt"] = 0 - maxf }
+            dpt = c["pt"] - pt0
+            _dt_aplicar(a, b, c, _dt_esc(c["t"], dpt))
+        }
+        it = it + 1
+    }
+    // Integración de posiciones.
+    para b en m["cuerpos"] {
+        si (b["tipo"] != "estatico") {
+            b["p"] = _dt_suma(b["p"], _dt_esc(b["v"], dt))
+            b["a"] = b["a"] + _dt_mul(b["w"], dt)
+        }
+    }
+    // Corrección de posición (penetración menos un margen).
+    sea margen = det_fijo(0.01)
+    para c en contactos {
+        sea a = c["a"]
+        sea b = c["b"]
+        sea tot = a["inv_m"] + b["inv_m"]
+        si (tot > 0 y c["prof"] > margen) {
+            sea corr = _dt_div(_dt_mul(c["prof"] - margen, det_fijo(0.4)), tot)
+            sea pc = _dt_esc(c["n"], corr)
+            a["p"] = _dt_resta(a["p"], _dt_esc(pc, a["inv_m"]))
+            b["p"] = _dt_suma(b["p"], _dt_esc(pc, b["inv_m"]))
+        }
+    }
+    m["contactos"] = contactos
+    m["sensores"] = sensores
+    m["tick"] = m["tick"] + 1
+    retornar sensores
+}
+
+funcion _dt_aplicar(a, b, c, p) {
+    a["v"] = _dt_resta(a["v"], _dt_esc(p, a["inv_m"]))
+    a["w"] = a["w"] - _dt_mul(a["inv_i"], _dt_cruz(c["ra"], p))
+    b["v"] = _dt_suma(b["v"], _dt_esc(p, b["inv_m"]))
+    b["w"] = b["w"] + _dt_mul(b["inv_i"], _dt_cruz(c["rb"], p))
+}
+
+/// Varios pasos seguidos.
+funcion det_pasos(m, n) {
+    sea i = 0
+    mientras (i < n) {
+        det_paso(m)
+        i = i + 1
+    }
+}
+
+/// Pares [id_a, id_b] en contacto en el último paso (sin sensores).
+funcion det_contactos(m) {
+    sea vistos = {}
+    sea r = []
+    para c en m["contactos"] {
+        sea k = c["a"]["id"] + "-" + c["b"]["id"]
+        si (tiene_clave(vistos, k) == falso) {
+            vistos[k] = verdadero
+            r.agregar([c["a"]["id"], c["b"]["id"]])
+        }
+    }
+    retornar r
+}
+
+// ---------- estado ----------
+
+/// Captura del estado (para rollback): lista de cuerpos con sus enteros.
+funcion det_captura(m) {
+    sea r = []
+    para b en m["cuerpos"] { r.agregar([b["id"], b["p"][0], b["p"][1], b["a"], b["v"][0], b["v"][1], b["w"]]) }
+    retornar {"tick": m["tick"], "cuerpos": r}
+}
+
+/// Vuelve al estado de una captura.
+funcion det_restaurar(m, cap) {
+    m["tick"] = cap["tick"]
+    para x en cap["cuerpos"] {
+        para b en m["cuerpos"] {
+            si (b["id"] == x[0]) {
+                b["p"] = [x[1], x[2]]
+                b["a"] = x[3]
+                b["v"] = [x[4], x[5]]
+                b["w"] = x[6]
+            }
+        }
+    }
+}
+
+/// Suma de verificación del estado (FNV-1a de 32 bits sobre los enteros).
+funcion det_suma(m) {
+    sea h = 2166136261
+    para b en m["cuerpos"] {
+        para v en [b["id"], b["p"][0], b["p"][1], b["a"], b["v"][0], b["v"][1], b["w"]] {
+            sea x = v
+            si (x < 0) { x = x + 4294967296 }
+            x = x % 4294967296
+            sea k = 0
+            mientras (k < 4) {
+                h = bits_xo(h, x % 256)
+                h = (h * 16777619) % 4294967296
+                x = piso(x / 256)
+                k = k + 1
+            }
+        }
+    }
+    retornar h
+}

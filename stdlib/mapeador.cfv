@@ -1,0 +1,616 @@
+// stdlib/mapeador.cfv — ORM sobre SQLite al estilo Entity Framework y
+// Prisma: modelos con tipos, claves, valores por defecto, únicos, índices y
+// relaciones (tiene uno, tiene muchos, pertenece a); migraciones generadas
+// comparando el modelo con la base (crear tablas, agregar columnas e
+// índices, y reconstruir la tabla cuando cambia o desaparece una columna),
+// con historial; validación; consultas encadenables (filtros con
+// operadores, o, orden, límite, agregados, carga anticipada de
+// relaciones); seguimiento de cambios para guardar solo lo modificado;
+// ganchos antes y después de guardar; y transacciones. Todos los valores
+// van como parámetros. Sobre "sqlite". Idea de EF Core (MIT) y Prisma
+// (Apache). En inglés: importar "orm".
+//
+//   importar "mapeador"
+//   sea orm = mapeador_abrir("app.db")
+//   mapeador_modelo(orm, "Usuario", {"campos": {"id": {"tipo": "entero", "clave": verdadero},
+//       "nombre": {"tipo": "texto", "requerido": verdadero}, "email": {"tipo": "texto", "unico": verdadero}}})
+//   mapeador_migrar(orm)
+//   sea ana = mapeador_crear(orm, "Usuario", {"nombre": "Ana", "email": "ana@x.cl"})
+//   mostrar(mapeador_lista(mapeador_donde(mapeador_consulta(orm, "Usuario"), "nombre", "like", "A%")))
+
+importar "sqlite"
+importar "json"
+
+// ---------- utilidades ----------
+
+funcion _ma_ident(n) {
+    sea ok = longitud(n) > 0
+    para ch en texto_dividir(n, "") {
+        si (contiene("abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789_", ch) == falso) { ok = falso }
+    }
+    si (ok == falso o contiene("0123456789", subcadena(n, 0, 1))) { lanzar "mapeador: nombre inválido '" + n + "'" }
+    retornar caracter(34) + n + caracter(34)
+}
+
+sea _MA_TIPOS_SQL = {"entero": "INTEGER", "real": "REAL", "texto": "TEXT", "booleano": "INTEGER", "fecha": "TEXT", "json": "TEXT", "bytes": "BLOB"}
+
+funcion _ma_snake(n) {
+    sea r = []
+    sea i = 0
+    para ch en texto_dividir(n, "") {
+        si (ch != texto_minusculas(ch) y i > 0) { r.agregar("_") }
+        r.agregar(texto_minusculas(ch))
+        i = i + 1
+    }
+    retornar unir(r, "")
+}
+
+// ---------- apertura y modelos ----------
+
+/// Abre (o crea) la base. ":memory:" para una en memoria.
+funcion mapeador_abrir(ruta) { retornar {"db": db_abrir(ruta), "modelos": {}, "orden": [], "registro": nulo} }
+
+funcion mapeador_cerrar(orm) { db_cerrar(orm["db"]) }
+
+/// Guarda cada sentencia SQL ejecutada en fn(sql, parametros) (nulo: nada).
+funcion mapeador_registro(orm, fn) { orm["registro"] = fn }
+
+funcion _ma_sql(orm, sql, params) {
+    si (orm["registro"] != nulo) { orm["registro"](sql, params) }
+    retornar db_consulta_p(orm["db"], sql, params ?? [])
+}
+
+/// Define un modelo. def: "tabla" (por defecto el nombre en snake_case +
+/// "s"), "campos" {nombre: {"tipo", "clave", "auto", "requerido", "unico",
+/// "defecto" (valor o "ahora"), "largo", "min", "max", "referencia":
+/// "Modelo"}}, "relaciones" {nombre: {"tiene_muchos" | "tiene_uno" |
+/// "pertenece_a": "Modelo", "clave": campo}}, "indices" [[campos…]],
+/// "antes_guardar" / "despues_guardar" (función(entidad)).
+funcion mapeador_modelo(orm, nombre, def) {
+    sea m = {"nombre": nombre, "tabla": def["tabla"] ?? (_ma_snake(nombre) + "s"), "campos": def["campos"] ?? {}, "relaciones": def["relaciones"] ?? {}, "indices": def["indices"] ?? [], "antes": def["antes_guardar"] ?? nulo, "despues": def["despues_guardar"] ?? nulo, "clave": nulo}
+    para c en claves(m["campos"]) {
+        sea f = m["campos"][c]
+        si (tiene_clave(_MA_TIPOS_SQL, f["tipo"] ?? "texto") == falso) { lanzar "mapeador: tipo desconocido " + f["tipo"] + " en " + nombre + "." + c }
+        si ((f["clave"] ?? falso) == verdadero) { m["clave"] = c }
+    }
+    si (m["clave"] == nulo) {
+        m["campos"]["id"] = {"tipo": "entero", "clave": verdadero}
+        m["clave"] = "id"
+    }
+    si (tiene_clave(orm["modelos"], nombre) == falso) { orm["orden"].agregar(nombre) }
+    orm["modelos"][nombre] = m
+    retornar m
+}
+
+funcion _ma_modelo(orm, nombre) {
+    sea m = orm["modelos"][nombre] ?? nulo
+    si (m == nulo) { lanzar "mapeador: no hay modelo " + nombre }
+    retornar m
+}
+
+// Columnas en orden estable: clave primero.
+funcion _ma_columnas(m) {
+    sea r = [m["clave"]]
+    para c en ordenar(claves(m["campos"])) { si (c != m["clave"]) { r.agregar(c) } }
+    retornar r
+}
+
+funcion _ma_def_columna(orm, m, c) {
+    sea f = m["campos"][c]
+    sea t = _MA_TIPOS_SQL[f["tipo"] ?? "texto"]
+    sea d = _ma_ident(c) + " " + t
+    si (c == m["clave"]) {
+        d = d + " PRIMARY KEY"
+        si ((f["tipo"] ?? "entero") == "entero" y (f["auto"] ?? verdadero) == verdadero) { d = d + " AUTOINCREMENT" }
+    } sino {
+        si ((f["requerido"] ?? falso) == verdadero) { d = d + " NOT NULL" }
+        si ((f["unico"] ?? falso) == verdadero) { d = d + " UNIQUE" }
+        si ((f["referencia"] ?? nulo) != nulo) {
+            sea r = _ma_modelo(orm, f["referencia"])
+            d = d + " REFERENCES " + _ma_ident(r["tabla"]) + "(" + _ma_ident(r["clave"]) + ")"
+            si ((f["al_borrar"] ?? nulo) == "cascada") { d = d + " ON DELETE CASCADE" }
+            si ((f["al_borrar"] ?? nulo) == "nulo") { d = d + " ON DELETE SET NULL" }
+        }
+    }
+    retornar d
+}
+
+// ---------- migraciones ----------
+
+funcion _ma_esquema_db(orm, tabla) {
+    sea cols = _ma_sql(orm, "SELECT name, type, \"notnull\" AS nn, pk FROM pragma_table_info(?1)", [tabla])
+    si (longitud(cols) == 0) { retornar nulo }
+    sea r = {}
+    para c en cols { r[c["name"]] = {"tipo": c["type"], "nn": c["nn"], "pk": c["pk"]} }
+    retornar r
+}
+
+funcion _ma_indices_db(orm, tabla) {
+    sea r = {}
+    para i en _ma_sql(orm, "SELECT name FROM pragma_index_list(?1) WHERE origin = 'c'", [tabla]) { r[i["name"]] = verdadero }
+    retornar r
+}
+
+funcion _ma_nombre_indice(m, campos) { retornar "ix_" + m["tabla"] + "_" + unir(campos, "_") }
+
+/// Pasos SQL para llevar la base al modelo: [{"descripcion", "sql": [...]}].
+funcion mapeador_plan(orm) {
+    sea pasos = []
+    para nombre en orm["orden"] {
+        sea m = orm["modelos"][nombre]
+        sea tabla = m["tabla"]
+        sea actual = _ma_esquema_db(orm, tabla)
+        sea cols = _ma_columnas(m)
+        sea defs = []
+        para c en cols { defs.agregar(_ma_def_columna(orm, m, c)) }
+        si (actual == nulo) {
+            pasos.agregar({"descripcion": "crear tabla " + tabla, "sql": ["CREATE TABLE " + _ma_ident(tabla) + " (" + unir(defs, ", ") + ")"]})
+        } sino {
+            // ¿Hay que reconstruir? (columna quitada o con otro tipo, o una
+            // nueva que es única o requerida sin defecto).
+            sea reconstruir = falso
+            sea nuevas = []
+            para c en claves(actual) { si (tiene_clave(m["campos"], c) == falso) { reconstruir = verdadero } }
+            para c en cols {
+                si (tiene_clave(actual, c) == falso) {
+                    sea f = m["campos"][c]
+                    si ((f["unico"] ?? falso) == verdadero o (f["requerido"] ?? falso) == verdadero o (f["referencia"] ?? nulo) != nulo) { reconstruir = verdadero } sino { nuevas.agregar(c) }
+                } sino si (texto_mayusculas(actual[c]["tipo"]) != _MA_TIPOS_SQL[m["campos"][c]["tipo"] ?? "texto"]) { reconstruir = verdadero }
+            }
+            si (reconstruir) {
+                sea comunes = []
+                para c en cols { si (tiene_clave(actual, c)) { comunes.agregar(_ma_ident(c)) } }
+                sea tmp = "_nuevo_" + tabla
+                pasos.agregar({"descripcion": "reconstruir tabla " + tabla, "sql": [
+                    "CREATE TABLE " + _ma_ident(tmp) + " (" + unir(defs, ", ") + ")",
+                    "INSERT INTO " + _ma_ident(tmp) + " (" + unir(comunes, ", ") + ") SELECT " + unir(comunes, ", ") + " FROM " + _ma_ident(tabla),
+                    "DROP TABLE " + _ma_ident(tabla),
+                    "ALTER TABLE " + _ma_ident(tmp) + " RENAME TO " + _ma_ident(tabla)
+                ]})
+            } sino {
+                para c en nuevas { pasos.agregar({"descripcion": "agregar columna " + tabla + "." + c, "sql": ["ALTER TABLE " + _ma_ident(tabla) + " ADD COLUMN " + _ma_def_columna(orm, m, c)]}) }
+            }
+        }
+        sea existentes = {}
+        si (actual != nulo) { existentes = _ma_indices_db(orm, tabla) }
+        para ix en m["indices"] {
+            sea n = _ma_nombre_indice(m, ix)
+            si (tiene_clave(existentes, n) == falso) {
+                sea cs = []
+                para c en ix { cs.agregar(_ma_ident(c)) }
+                pasos.agregar({"descripcion": "crear índice " + n, "sql": ["CREATE INDEX IF NOT EXISTS " + _ma_ident(n) + " ON " + _ma_ident(tabla) + " (" + unir(cs, ", ") + ")"]})
+            }
+        }
+    }
+    retornar pasos
+}
+
+/// Aplica el plan en una transacción y lo anota en el historial
+/// (tabla "_mapeador_migraciones"). Devuelve las descripciones aplicadas.
+funcion mapeador_migrar(orm) {
+    _ma_sql(orm, "CREATE TABLE IF NOT EXISTS \"_mapeador_migraciones\" (id INTEGER PRIMARY KEY AUTOINCREMENT, descripcion TEXT, sql TEXT, fecha TEXT DEFAULT (datetime('now')))", nulo)
+    sea pasos = mapeador_plan(orm)
+    si (longitud(pasos) == 0) { retornar [] }
+    sea hechos = []
+    _ma_sql(orm, "PRAGMA foreign_keys = OFF", nulo)
+    db_transaccion_con(orm["db"], funcion() {
+        para p en pasos {
+            para s en p["sql"] { _ma_sql(orm, s, nulo) }
+            _ma_sql(orm, "INSERT INTO \"_mapeador_migraciones\" (descripcion, sql) VALUES (?1, ?2)", [p["descripcion"], unir(p["sql"], ";\n")])
+            hechos.agregar(p["descripcion"])
+        }
+    })
+    _ma_sql(orm, "PRAGMA foreign_keys = ON", nulo)
+    retornar hechos
+}
+
+/// Historial de migraciones aplicadas: [{"id", "descripcion", "fecha"}].
+funcion mapeador_historial(orm) { retornar _ma_sql(orm, "SELECT id, descripcion, fecha FROM \"_mapeador_migraciones\" ORDER BY id", nulo) }
+
+// ---------- conversión de valores ----------
+
+funcion _ma_a_db(f, v) {
+    si (v == nulo) { retornar nulo }
+    sea t = f["tipo"] ?? "texto"
+    si (t == "booleano") {
+        si (v == verdadero) { retornar 1 }
+        retornar 0
+    }
+    si (t == "json") { retornar json_texto(v) }
+    si (t == "bytes") { retornar db_blob(v) }
+    retornar v
+}
+
+funcion _ma_de_db(f, v) {
+    si (v == nulo) { retornar nulo }
+    sea t = f["tipo"] ?? "texto"
+    si (t == "booleano") { retornar v == 1 }
+    si (t == "json") { retornar json_parsear(v) }
+    retornar v
+}
+
+funcion _ma_fila(orm, m, fila) {
+    sea e = {"__modelo": m["nombre"]}
+    para c en claves(m["campos"]) { e[c] = _ma_de_db(m["campos"][c], fila[c] ?? nulo) }
+    sea orig = {}
+    para c en claves(m["campos"]) { orig[c] = e[c] }
+    e["__original"] = orig
+    retornar e
+}
+
+// ---------- validación ----------
+
+/// Valida datos contra el modelo: {} si están bien o {campo: mensaje}.
+funcion mapeador_validar(orm, nombre, datos) {
+    sea m = _ma_modelo(orm, nombre)
+    sea errores = {}
+    para c en claves(m["campos"]) {
+        sea f = m["campos"][c]
+        sea v = datos[c] ?? nulo
+        si (v == nulo) {
+            si ((f["requerido"] ?? falso) == verdadero y (f["defecto"] ?? nulo) == nulo) { errores[c] = "es obligatorio" }
+        } sino {
+            sea t = f["tipo"] ?? "texto"
+            si ((t == "entero" o t == "real") y tipo(v) != "numero") { errores[c] = "debe ser un número" }
+            sino si (t == "entero" y piso(v) != v) { errores[c] = "debe ser entero" }
+            sino si ((t == "texto" o t == "fecha") y tipo(v) != "texto") { errores[c] = "debe ser texto" }
+            sino si (t == "booleano" y v != verdadero y v != falso) { errores[c] = "debe ser verdadero o falso" }
+            sino {
+                si ((f["largo"] ?? nulo) != nulo y tipo(v) == "texto" y longitud(texto_codigos(v)) > f["largo"]) { errores[c] = "supera " + f["largo"] + " caracteres" }
+                si ((f["min"] ?? nulo) != nulo y tipo(v) == "numero" y v < f["min"]) { errores[c] = "debe ser al menos " + f["min"] }
+                si ((f["max"] ?? nulo) != nulo y tipo(v) == "numero" y v > f["max"]) { errores[c] = "debe ser como mucho " + f["max"] }
+                si ((f["formato"] ?? nulo) == "email" y (contiene(v, "@") == falso o contiene(v, ".") == falso)) { errores[c] = "no es un correo válido" }
+            }
+        }
+    }
+    para c en claves(datos) {
+        si (texto_empieza_con(c, "__") == falso y tiene_clave(m["campos"], c) == falso y tiene_clave(m["relaciones"], c) == falso) { errores[c] = "no existe en " + nombre }
+    }
+    retornar errores
+}
+
+// ---------- escritura ----------
+
+funcion _ma_lanzar_validacion(nombre, errores) {
+    sea partes = []
+    para k en ordenar(claves(errores)) { partes.agregar(k + " " + errores[k]) }
+    lanzar {"modelo": nombre, "errores": errores, "mensaje": "mapeador: " + nombre + " inválido: " + unir(partes, ", ")}
+}
+
+/// Crea y guarda una entidad. Devuelve la entidad con su clave.
+funcion mapeador_crear(orm, nombre, datos) {
+    sea m = _ma_modelo(orm, nombre)
+    sea e = {"__modelo": nombre, "__original": nulo}
+    para c en claves(datos) { e[c] = datos[c] }
+    retornar mapeador_guardar(orm, e)
+}
+
+/// Inserta o actualiza (solo los campos que cambiaron) y corre los ganchos.
+funcion mapeador_guardar(orm, e) {
+    sea m = _ma_modelo(orm, e["__modelo"])
+    si (m["antes"] != nulo) { m["antes"](e) }
+    // Valores por defecto al crear.
+    si (e["__original"] == nulo) {
+        para c en claves(m["campos"]) {
+            sea f = m["campos"][c]
+            si ((e[c] ?? nulo) == nulo y (f["defecto"] ?? nulo) != nulo) {
+                si (f["defecto"] == "ahora") { e[c] = db_valor(orm["db"], "SELECT strftime('%Y-%m-%dT%H:%M:%SZ', 'now')", nulo) } sino { e[c] = f["defecto"] }
+            }
+        }
+    }
+    sea datos = {}
+    para c en claves(m["campos"]) { si (tiene_clave(e, c)) { datos[c] = e[c] } }
+    sea errores = mapeador_validar(orm, e["__modelo"], datos)
+    si (longitud(claves(errores)) > 0) { _ma_lanzar_validacion(e["__modelo"], errores) }
+    sea k = m["clave"]
+    si (e["__original"] == nulo) {
+        sea cols = []
+        sea marcas = []
+        sea vals = []
+        para c en _ma_columnas(m) {
+            si (tiene_clave(datos, c) y (datos[c] != nulo o c != k)) {
+                cols.agregar(_ma_ident(c))
+                vals.agregar(_ma_a_db(m["campos"][c], datos[c]))
+                marcas.agregar("?" + longitud(vals))
+            }
+        }
+        sea sql = "INSERT INTO " + _ma_ident(m["tabla"]) + " DEFAULT VALUES"
+        si (longitud(cols) > 0) { sql = "INSERT INTO " + _ma_ident(m["tabla"]) + " (" + unir(cols, ", ") + ") VALUES (" + unir(marcas, ", ") + ")" }
+        _ma_sql_escritura(orm, m, sql, vals)
+        si ((e[k] ?? nulo) == nulo) { e[k] = db_ultimo_id(orm["db"]) }
+    } sino {
+        sea sets = []
+        sea vals = []
+        para c en _ma_columnas(m) {
+            si (c != k y tiene_clave(datos, c) y json_texto([datos[c]]) != json_texto([e["__original"][c] ?? nulo])) {
+                vals.agregar(_ma_a_db(m["campos"][c], datos[c]))
+                sets.agregar(_ma_ident(c) + " = ?" + longitud(vals))
+            }
+        }
+        si (longitud(sets) > 0) {
+            vals.agregar(e["__original"][k])
+            _ma_sql_escritura(orm, m, "UPDATE " + _ma_ident(m["tabla"]) + " SET " + unir(sets, ", ") + " WHERE " + _ma_ident(k) + " = ?" + longitud(vals), vals)
+        }
+    }
+    sea orig = {}
+    para c en claves(m["campos"]) { orig[c] = e[c] ?? nulo }
+    e["__original"] = orig
+    si (m["despues"] != nulo) { m["despues"](e) }
+    retornar e
+}
+
+// Traduce errores de restricción de SQLite a errores de validación.
+funcion _ma_sql_escritura(orm, m, sql, vals) {
+    intentar { _ma_sql(orm, sql, vals) } capturar (x) {
+        sea t = "" + x
+        si (contiene(t, "UNIQUE constraint failed")) {
+            sea campo = texto_dividir(t, ".")
+            sea c = texto_recortar(campo[longitud(campo) - 1])
+            sea errores = {}
+            errores[c] = "ya existe"
+            _ma_lanzar_validacion(m["nombre"], errores)
+        }
+        si (contiene(t, "FOREIGN KEY constraint failed")) { lanzar {"modelo": m["nombre"], "errores": {"__relacion": "referencia inexistente"}, "mensaje": "mapeador: " + m["nombre"] + ": referencia inexistente"} }
+        lanzar x
+    }
+}
+
+/// ¿Qué campos cambiaron desde que se cargó o guardó? {campo: [antes, ahora]}.
+funcion mapeador_cambios(orm, e) {
+    sea m = _ma_modelo(orm, e["__modelo"])
+    sea r = {}
+    si (e["__original"] == nulo) { retornar r }
+    para c en claves(m["campos"]) {
+        si (json_texto([e[c] ?? nulo]) != json_texto([e["__original"][c] ?? nulo])) { r[c] = [e["__original"][c] ?? nulo, e[c] ?? nulo] }
+    }
+    retornar r
+}
+
+funcion mapeador_borrar(orm, e) {
+    sea m = _ma_modelo(orm, e["__modelo"])
+    _ma_sql_escritura(orm, m, "DELETE FROM " + _ma_ident(m["tabla"]) + " WHERE " + _ma_ident(m["clave"]) + " = ?1", [e[m["clave"]]])
+}
+
+/// Busca por clave (o nulo).
+funcion mapeador_buscar(orm, nombre, clave) {
+    sea m = _ma_modelo(orm, nombre)
+    retornar mapeador_primero(mapeador_donde(mapeador_consulta(orm, nombre), m["clave"], "=", clave))
+}
+
+/// Corre fn() en una transacción (anidable); si lanza, revierte todo.
+funcion mapeador_transaccion(orm, fn) { retornar db_transaccion_con(orm["db"], fn) }
+
+// ---------- consultas ----------
+
+/// Consulta sobre un modelo.
+funcion mapeador_consulta(orm, nombre) {
+    retornar {"orm": orm, "m": _ma_modelo(orm, nombre), "filtros": [], "orden": [], "limite": nulo, "desde": nulo, "incluir": []}
+}
+
+sea _MA_OPS = {"=": "=", "!=": "<>", "<": "<", "<=": "<=", ">": ">", ">=": ">=", "like": "LIKE", "in": "IN", "no_in": "NOT IN", "es_nulo": "IS NULL", "no_es_nulo": "IS NOT NULL", "entre": "BETWEEN"}
+
+funcion _ma_filtro(q, campo, op, valor) {
+    si (tiene_clave(q["m"]["campos"], campo) == falso) { lanzar "mapeador: " + q["m"]["nombre"] + " no tiene el campo " + campo }
+    si (tiene_clave(_MA_OPS, op) == falso) { lanzar "mapeador: operador desconocido " + op }
+    retornar {"campo": campo, "op": op, "valor": _ma_valor_filtro(q["m"]["campos"][campo], op, valor)}
+}
+
+funcion _ma_valor_filtro(f, op, v) {
+    si (op == "in" o op == "no_in" o op == "entre") {
+        sea r = []
+        para x en v { r.agregar(_ma_a_db(f, x)) }
+        retornar r
+    }
+    retornar _ma_a_db(f, v)
+}
+
+/// Filtro campo op valor (op: =, !=, <, <=, >, >=, like, in, no_in,
+/// es_nulo, no_es_nulo, entre). Los filtros se unen con Y.
+funcion mapeador_donde(q, campo, op, valor) {
+    q["filtros"].agregar(_ma_filtro(q, campo, op, valor))
+    retornar q
+}
+
+/// Igualdades desde un mapa {campo: valor}.
+funcion mapeador_donde_mapa(q, m) {
+    para k en claves(m) { mapeador_donde(q, k, "=", m[k]) }
+    retornar q
+}
+
+/// Grupo O: alternativas = [[campo, op, valor]…].
+funcion mapeador_o(q, alternativas) {
+    sea r = []
+    para a en alternativas { r.agregar(_ma_filtro(q, a[0], a[1], a[2])) }
+    q["filtros"].agregar({"o": r})
+    retornar q
+}
+
+funcion mapeador_ordenar(q, campo, sentido) {
+    si (tiene_clave(q["m"]["campos"], campo) == falso) { lanzar "mapeador: " + q["m"]["nombre"] + " no tiene el campo " + campo }
+    sea s = "ASC"
+    si (sentido == "desc") { s = "DESC" }
+    q["orden"].agregar(_ma_ident(campo) + " " + s)
+    retornar q
+}
+
+funcion mapeador_limite(q, n, desde) {
+    q["limite"] = n
+    q["desde"] = desde
+    retornar q
+}
+
+/// Carga anticipada de una relación del modelo.
+funcion mapeador_incluir(q, relacion) {
+    si (tiene_clave(q["m"]["relaciones"], relacion) == falso) { lanzar "mapeador: " + q["m"]["nombre"] + " no tiene la relación " + relacion }
+    q["incluir"].agregar(relacion)
+    retornar q
+}
+
+funcion _ma_cond(f, vals) {
+    si (tiene_clave(f, "o")) {
+        sea p = []
+        para g en f["o"] { p.agregar(_ma_cond(g, vals)) }
+        retornar "(" + unir(p, " OR ") + ")"
+    }
+    sea c = _ma_ident(f["campo"])
+    sea op = _MA_OPS[f["op"]]
+    si (f["op"] == "es_nulo" o f["op"] == "no_es_nulo") { retornar c + " " + op }
+    si (f["op"] == "in" o f["op"] == "no_in") {
+        si (longitud(f["valor"]) == 0) {
+            si (f["op"] == "in") { retornar "0" }
+            retornar "1"
+        }
+        sea ms = []
+        para v en f["valor"] {
+            vals.agregar(v)
+            ms.agregar("?" + longitud(vals))
+        }
+        retornar c + " " + op + " (" + unir(ms, ", ") + ")"
+    }
+    si (f["op"] == "entre") {
+        vals.agregar(f["valor"][0])
+        sea a = "?" + longitud(vals)
+        vals.agregar(f["valor"][1])
+        retornar c + " BETWEEN " + a + " AND ?" + longitud(vals)
+    }
+    vals.agregar(f["valor"])
+    retornar c + " " + op + " ?" + longitud(vals)
+}
+
+funcion _ma_where(q, vals) {
+    si (longitud(q["filtros"]) == 0) { retornar "" }
+    sea p = []
+    para f en q["filtros"] { p.agregar(_ma_cond(f, vals)) }
+    retornar " WHERE " + unir(p, " AND ")
+}
+
+/// SQL y parámetros que generaría la consulta (para depurar).
+funcion mapeador_sql(q) {
+    sea vals = []
+    sea sql = "SELECT * FROM " + _ma_ident(q["m"]["tabla"]) + _ma_where(q, vals)
+    si (longitud(q["orden"]) > 0) { sql = sql + " ORDER BY " + unir(q["orden"], ", ") }
+    si (q["limite"] != nulo) {
+        vals.agregar(q["limite"])
+        sql = sql + " LIMIT ?" + longitud(vals)
+        si (q["desde"] != nulo) {
+            vals.agregar(q["desde"])
+            sql = sql + " OFFSET ?" + longitud(vals)
+        }
+    }
+    retornar [sql, vals]
+}
+
+/// Ejecuta la consulta: lista de entidades (con relaciones incluidas).
+funcion mapeador_lista(q) {
+    sea s = mapeador_sql(q)
+    sea r = []
+    para fila en _ma_sql(q["orm"], s[0], s[1]) { r.agregar(_ma_fila(q["orm"], q["m"], fila)) }
+    para rel en q["incluir"] { _ma_cargar_relacion(q["orm"], q["m"], r, rel) }
+    retornar r
+}
+
+funcion mapeador_primero(q) {
+    mapeador_limite(q, 1, nulo)
+    sea l = mapeador_lista(q)
+    si (longitud(l) == 0) { retornar nulo }
+    retornar l[0]
+}
+
+funcion mapeador_contar(q) {
+    sea vals = []
+    retornar db_valor(q["orm"]["db"], "SELECT COUNT(*) FROM " + _ma_ident(q["m"]["tabla"]) + _ma_where(q, vals), vals)
+}
+
+funcion mapeador_existe(q) { retornar mapeador_contar(q) > 0 }
+
+/// Agregado: "suma", "promedio", "minimo" o "maximo" de un campo.
+funcion mapeador_agregado(q, funcion_ag, campo) {
+    sea fs = {"suma": "SUM", "promedio": "AVG", "minimo": "MIN", "maximo": "MAX"}
+    si (tiene_clave(fs, funcion_ag) == falso) { lanzar "mapeador: agregado desconocido " + funcion_ag }
+    si (tiene_clave(q["m"]["campos"], campo) == falso) { lanzar "mapeador: " + q["m"]["nombre"] + " no tiene el campo " + campo }
+    sea vals = []
+    retornar db_valor(q["orm"]["db"], "SELECT " + fs[funcion_ag] + "(" + _ma_ident(campo) + ") FROM " + _ma_ident(q["m"]["tabla"]) + _ma_where(q, vals), vals)
+}
+
+/// Conteo por valores de un campo: [{"valor", "cantidad"}].
+funcion mapeador_agrupar(q, campo) {
+    si (tiene_clave(q["m"]["campos"], campo) == falso) { lanzar "mapeador: " + q["m"]["nombre"] + " no tiene el campo " + campo }
+    sea vals = []
+    sea c = _ma_ident(campo)
+    sea r = []
+    para f en _ma_sql(q["orm"], "SELECT " + c + " AS valor, COUNT(*) AS cantidad FROM " + _ma_ident(q["m"]["tabla"]) + _ma_where(q, vals) + " GROUP BY " + c + " ORDER BY " + c, vals) {
+        r.agregar({"valor": _ma_de_db(q["m"]["campos"][campo], f["valor"]), "cantidad": f["cantidad"]})
+    }
+    retornar r
+}
+
+/// Actualiza en bloque lo que cumple la consulta; devuelve cuántas filas.
+funcion mapeador_actualizar_donde(q, datos) {
+    sea vals = []
+    sea sets = []
+    para c en ordenar(claves(datos)) {
+        si (tiene_clave(q["m"]["campos"], c) == falso) { lanzar "mapeador: " + q["m"]["nombre"] + " no tiene el campo " + c }
+        vals.agregar(_ma_a_db(q["m"]["campos"][c], datos[c]))
+        sets.agregar(_ma_ident(c) + " = ?" + longitud(vals))
+    }
+    _ma_sql_escritura(q["orm"], q["m"], "UPDATE " + _ma_ident(q["m"]["tabla"]) + " SET " + unir(sets, ", ") + _ma_where(q, vals), vals)
+    retornar db_cambios(q["orm"]["db"])
+}
+
+/// Borra lo que cumple la consulta; devuelve cuántas filas.
+funcion mapeador_borrar_donde(q) {
+    sea vals = []
+    _ma_sql_escritura(q["orm"], q["m"], "DELETE FROM " + _ma_ident(q["m"]["tabla"]) + _ma_where(q, vals), vals)
+    retornar db_cambios(q["orm"]["db"])
+}
+
+// ---------- relaciones ----------
+
+funcion _ma_cargar_relacion(orm, m, entidades, rel) {
+    sea r = m["relaciones"][rel]
+    si (longitud(entidades) == 0) { retornar nulo }
+    si (tiene_clave(r, "tiene_muchos") o tiene_clave(r, "tiene_uno")) {
+        sea otro = r["tiene_muchos"] ?? r["tiene_uno"]
+        sea ks = []
+        para e en entidades { ks.agregar(e[m["clave"]]) }
+        sea hijos = mapeador_lista(mapeador_donde(mapeador_consulta(orm, otro), r["clave"], "in", ks))
+        sea por = {}
+        para h en hijos {
+            sea k = "" + h[r["clave"]]
+            si (tiene_clave(por, k) == falso) { por[k] = [] }
+            por[k].agregar(h)
+        }
+        para e en entidades {
+            sea l = por["" + e[m["clave"]]] ?? []
+            si (tiene_clave(r, "tiene_uno")) {
+                si (longitud(l) > 0) { e[rel] = l[0] } sino { e[rel] = nulo }
+            } sino { e[rel] = l }
+        }
+        retornar nulo
+    }
+    si (tiene_clave(r, "pertenece_a")) {
+        sea om = _ma_modelo(orm, r["pertenece_a"])
+        sea ks = []
+        para e en entidades { si ((e[r["clave"]] ?? nulo) != nulo) { ks.agregar(e[r["clave"]]) } }
+        sea por = {}
+        para p en mapeador_lista(mapeador_donde(mapeador_consulta(orm, r["pertenece_a"]), om["clave"], "in", ks)) { por["" + p[om["clave"]]] = p }
+        para e en entidades { e[rel] = por["" + (e[r["clave"]] ?? "")] ?? nulo }
+        retornar nulo
+    }
+    lanzar "mapeador: relación " + rel + " sin tipo"
+}
+
+/// Carga una relación de una entidad ya leída (perezosa) y la devuelve.
+funcion mapeador_cargar(orm, e, rel) {
+    sea m = _ma_modelo(orm, e["__modelo"])
+    _ma_cargar_relacion(orm, m, [e], rel)
+    retornar e[rel]
+}
+
+/// Entidad como mapa simple (sin campos internos ni relaciones).
+funcion mapeador_datos(orm, e) {
+    sea m = _ma_modelo(orm, e["__modelo"])
+    sea r = {}
+    para c en claves(m["campos"]) { r[c] = e[c] ?? nulo }
+    retornar r
+}
