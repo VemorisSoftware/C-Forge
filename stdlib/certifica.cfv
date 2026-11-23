@@ -1,0 +1,551 @@
+// stdlib/certifica.cfv — certificados HTTPS automáticos con ACME (RFC 8555,
+// Let's Encrypt y compatibles): cuenta, pedidos, desafíos http-01, dns-01 y
+// tls-alpn-01 (valores listos para publicar), finalizar con CSR, esperar y
+// bajar la cadena PEM, revocar. Incluye ECDSA P-256 (ES256) propio para la
+// cuenta y la clave del certificado, JWS/JWK, huella RFC 7638, CSR PKCS#10
+// con SAN y claves en PEM (SEC1 y PKCS#8). El transporte HTTP se puede
+// cambiar (opción "transporte"). Probado de punta a punta contra Pebble.
+// Protocolo público, escrito desde cero. En inglés: importar "acme".
+//
+//   importar "certifica"
+//   sea c = certifica_cliente(CERTIFICA_LETS_ENCRYPT_PRUEBAS, {"clave": leer_archivo("cuenta.pem")})
+//   certifica_cuenta(c, {"contacto": ["mailto:yo@ejemplo.com"]})
+//   sea r = certifica_emitir(c, ["ejemplo.com"], funcion(d) { publicar(d["ruta"], d["clave_autorizacion"]) }, nulo)
+//   escribir_archivo("cadena.pem", r["certificado"])
+//   escribir_archivo("privada.pem", r["clave_pem"])
+
+importar "curva"
+importar "base64"
+importar "json"
+
+sea CERTIFICA_LETS_ENCRYPT = "https://acme-v02.api.letsencrypt.org/directory"
+sea CERTIFICA_LETS_ENCRYPT_PRUEBAS = "https://acme-staging-v02.api.letsencrypt.org/directory"
+
+// ---------- P-256 ----------
+
+sea _CE = [nulo]
+
+funcion _ce() {
+    si (_CE[0] != nulo) { retornar _CE[0] }
+    sea p = _cv_modulo("ffffffff00000001000000000000000000000000ffffffffffffffffffffffff")
+    sea n = _cv_modulo("ffffffff00000000ffffffffffffffffbce6faada7179e84f3b9cac2fc632551")
+    sea gx = _cv_hex("6b17d1f2e12c4247f8bce6e563a440f277037d812deb33a0f4a13945d898c296")
+    sea gy = _cv_hex("4fe342e2fe1a7f9b8ee7eb4a7c0f9e162bce33576b315ececbb6406837bf51f5")
+    sea b = _cv_hex("5ac635d8aa3a93e7b3ebbd55769886bc651d06b0cc53b0f63bce3c3e27d2604b")
+    _CE[0] = {"p": p, "n": n, "g": [_cv_a_m(p, gx), _cv_a_m(p, gy), p["uno_m"]], "b": _cv_a_m(p, b)}
+    retornar _CE[0]
+}
+
+// Doblar con a = -3 (dbl-2001-b).
+funcion _ce_doblar(P) {
+    si (P == nulo) { retornar nulo }
+    sea f = _ce()["p"]
+    si (_cv_cero(P[1])) { retornar nulo }
+    sea delta = _cv_mont(f, P[2], P[2])
+    sea gamma = _cv_mont(f, P[1], P[1])
+    sea beta = _cv_mont(f, P[0], gamma)
+    sea t = _cv_mont(f, _cv_mod_restar(f, P[0], delta), _cv_mod_sumar(f, P[0], delta))
+    sea alfa = _cv_mod_sumar(f, _cv_mod_sumar(f, t, t), t)
+    sea b4 = _cv_mod_sumar(f, beta, beta)
+    b4 = _cv_mod_sumar(f, b4, b4)
+    sea X3 = _cv_mod_restar(f, _cv_mont(f, alfa, alfa), _cv_mod_sumar(f, b4, b4))
+    sea yz = _cv_mod_sumar(f, P[1], P[2])
+    sea Z3 = _cv_mod_restar(f, _cv_mod_restar(f, _cv_mont(f, yz, yz), gamma), delta)
+    sea g2 = _cv_mont(f, gamma, gamma)
+    sea g8 = _cv_mod_sumar(f, g2, g2)
+    g8 = _cv_mod_sumar(f, g8, g8)
+    g8 = _cv_mod_sumar(f, g8, g8)
+    sea Y3 = _cv_mod_restar(f, _cv_mont(f, alfa, _cv_mod_restar(f, b4, X3)), g8)
+    retornar [X3, Y3, Z3]
+}
+
+funcion _ce_sumar(P, Q) {
+    si (P == nulo) { retornar Q }
+    si (Q == nulo) { retornar P }
+    sea f = _ce()["p"]
+    sea Z1Z1 = _cv_mont(f, P[2], P[2])
+    sea Z2Z2 = _cv_mont(f, Q[2], Q[2])
+    sea U1 = _cv_mont(f, P[0], Z2Z2)
+    sea U2 = _cv_mont(f, Q[0], Z1Z1)
+    sea S1 = _cv_mont(f, P[1], _cv_mont(f, Q[2], Z2Z2))
+    sea S2 = _cv_mont(f, Q[1], _cv_mont(f, P[2], Z1Z1))
+    si (_cv_cmp(U1, U2) == 0) {
+        si (_cv_cmp(S1, S2) != 0) { retornar nulo }
+        retornar _ce_doblar(P)
+    }
+    sea H = _cv_mod_restar(f, U2, U1)
+    sea R = _cv_mod_restar(f, S2, S1)
+    sea HH = _cv_mont(f, H, H)
+    sea HHH = _cv_mont(f, H, HH)
+    sea V = _cv_mont(f, U1, HH)
+    sea X3 = _cv_mod_restar(f, _cv_mod_restar(f, _cv_mont(f, R, R), HHH), _cv_mod_sumar(f, V, V))
+    sea Y3 = _cv_mod_restar(f, _cv_mont(f, R, _cv_mod_restar(f, V, X3)), _cv_mont(f, S1, HHH))
+    retornar [X3, Y3, _cv_mont(f, H, _cv_mont(f, P[2], Q[2]))]
+}
+
+funcion _ce_por(k, P) {
+    sea R = nulo
+    sea i = _CV_K - 1
+    mientras (i >= 0) {
+        sea bit = 23
+        mientras (bit >= 0) {
+            R = _ce_doblar(R)
+            si (piso(k[i] / potencia(2, bit)) % 2 == 1) { R = _ce_sumar(R, P) }
+            bit = bit - 1
+        }
+        i = i - 1
+    }
+    retornar R
+}
+
+funcion _ce_afin(P) {
+    si (P == nulo) { retornar nulo }
+    sea f = _ce()["p"]
+    sea zi = _cv_inv(f, P[2])
+    sea zi2 = _cv_mont(f, zi, zi)
+    retornar [_cv_de_m(f, _cv_mont(f, P[0], zi2)), _cv_de_m(f, _cv_mont(f, P[1], _cv_mont(f, zi2, zi)))]
+}
+
+funcion _ce_reducir(a, m) {
+    sea r = a
+    mientras (_cv_cmp(r, m["n"]) >= 0) { r = _cv_restar(r, m["n"]) }
+    retornar r
+}
+
+/// Par de claves P-256: {"privada" (32 bytes), "x", "y" (32 bytes cada uno)}.
+funcion certifica_claves(privada) {
+    sea c = _ce()
+    sea d = privada
+    si (d == nulo) {
+        d = bytes_aleatorios(32)
+        mientras (_cv_cero(_cv_de_bytes(d)) o _cv_cmp(_cv_de_bytes(d), c["n"]["n"]) >= 0) { d = bytes_aleatorios(32) }
+    }
+    sea Q = _ce_afin(_ce_por(_cv_de_bytes(d), c["g"]))
+    retornar {"privada": d, "x": _cv_a_bytes(Q[0], 32), "y": _cv_a_bytes(Q[1], 32)}
+}
+
+/// Firma ECDSA P-256 con SHA-256: r‖s (64 bytes).
+funcion certifica_firmar(clave, mensaje) {
+    sea c = _ce()
+    sea N = c["n"]
+    sea z = _ce_reducir(_cv_de_bytes(sha256_bytes(mensaje)), N)
+    sea d = _cv_de_bytes(clave["privada"])
+    mientras (verdadero) {
+        sea kb = bytes_aleatorios(32)
+        sea k = _cv_de_bytes(kb)
+        si (_cv_cero(k) == falso y _cv_cmp(k, N["n"]) < 0) {
+            sea R = _ce_afin(_ce_por(k, c["g"]))
+            sea r = _ce_reducir(R[0], N)
+            si (_cv_cero(r) == falso) {
+                sea km = _cv_a_m(N, k)
+                sea s_m = _cv_mont(N, _cv_inv(N, km), _cv_mod_sumar(N, _cv_a_m(N, z), _cv_mont(N, _cv_a_m(N, r), _cv_a_m(N, d))))
+                sea s = _cv_de_m(N, s_m)
+                si (_cv_cero(s) == falso) { retornar _cv_a_bytes(r, 32) + _cv_a_bytes(s, 32) }
+            }
+        }
+    }
+}
+
+/// Verifica una firma r‖s con la clave pública {"x", "y"}.
+funcion certifica_verificar(publica, mensaje, firma) {
+    si (longitud(firma) != 64) { retornar falso }
+    sea c = _ce()
+    sea N = c["n"]
+    sea r = _cv_de_bytes(subtexto(firma, 0, 32))
+    sea s = _cv_de_bytes(subtexto(firma, 32, 64))
+    si (_cv_cero(r) o _cv_cero(s) o _cv_cmp(r, N["n"]) >= 0 o _cv_cmp(s, N["n"]) >= 0) { retornar falso }
+    sea z = _ce_reducir(_cv_de_bytes(sha256_bytes(mensaje)), N)
+    sea w = _cv_inv(N, _cv_a_m(N, s))
+    sea u1 = _cv_de_m(N, _cv_mont(N, _cv_a_m(N, z), w))
+    sea u2 = _cv_de_m(N, _cv_mont(N, _cv_a_m(N, r), w))
+    sea f = c["p"]
+    sea Q = [_cv_a_m(f, _cv_de_bytes(publica["x"])), _cv_a_m(f, _cv_de_bytes(publica["y"])), f["uno_m"]]
+    sea X = _ce_afin(_ce_sumar(_ce_por(u1, c["g"]), _ce_por(u2, Q)))
+    si (X == nulo) { retornar falso }
+    retornar _cv_cmp(_ce_reducir(X[0], N), r) == 0
+}
+
+// ---------- DER y PEM ----------
+
+funcion _ce_largo(n) {
+    si (n < 128) { retornar char_de(n) }
+    si (n < 256) { retornar char_de(129) + char_de(n) }
+    si (n < 65536) { retornar char_de(130) + bytes_entero(n, 2, 0) }
+    retornar char_de(131) + bytes_entero(n, 3, 0)
+}
+funcion _ce_tlv(etiqueta, contenido) { retornar char_de(etiqueta) + _ce_largo(longitud(contenido)) + contenido }
+funcion _ce_seq(partes) { retornar _ce_tlv(48, unir(partes, "")) }
+funcion _ce_set(partes) { retornar _ce_tlv(49, unir(partes, "")) }
+
+funcion _ce_entero(b) {
+    sea x = b
+    mientras (longitud(x) > 1 y byte_en(x, 0) == 0 y byte_en(x, 1) < 128) { x = subtexto(x, 1, longitud(x)) }
+    si (byte_en(x, 0) >= 128) { x = char_de(0) + x }
+    retornar _ce_tlv(2, x)
+}
+
+funcion _ce_oid(texto) {
+    sea p = texto_dividir(texto, ".")
+    sea r = char_de(a_numero(p[0]) * 40 + a_numero(p[1]))
+    sea i = 2
+    mientras (i < longitud(p)) {
+        sea v = a_numero(p[i])
+        sea partes = [char_de(v % 128)]
+        v = piso(v / 128)
+        mientras (v > 0) {
+            partes.agregar(char_de(128 + v % 128))
+            v = piso(v / 128)
+        }
+        sea j = longitud(partes) - 1
+        mientras (j >= 0) {
+            r = r + partes[j]
+            j = j - 1
+        }
+        i = i + 1
+    }
+    retornar _ce_tlv(6, r)
+}
+
+sea _CE_OID_EC = "1.2.840.10045.2.1"
+sea _CE_OID_P256 = "1.2.840.10045.3.1.7"
+
+// Lee un TLV en pos: [etiqueta, inicio del contenido, largo].
+funcion _ce_leer(d, pos) {
+    sea et = byte_en(d, pos)
+    sea l = byte_en(d, pos + 1)
+    sea ini = pos + 2
+    si (l >= 128) {
+        sea k = l - 128
+        l = 0
+        sea i = 0
+        mientras (i < k) {
+            l = l * 256 + byte_en(d, pos + 2 + i)
+            i = i + 1
+        }
+        ini = pos + 2 + k
+    }
+    retornar [et, ini, l]
+}
+
+// Hijos directos de un TLV construido.
+funcion _ce_hijos(d, tlv) {
+    sea r = []
+    sea pos = tlv[1]
+    mientras (pos < tlv[1] + tlv[2]) {
+        sea h = _ce_leer(d, pos)
+        r.agregar(h)
+        pos = h[1] + h[2]
+    }
+    retornar r
+}
+
+funcion _ce_contenido(d, tlv) { retornar subtexto(d, tlv[1], tlv[1] + tlv[2]) }
+
+funcion _ce_pem(tipo_p, der) {
+    sea b = base64_codificar(der)
+    sea l = []
+    sea i = 0
+    mientras (i < longitud(b)) {
+        l.agregar(subtexto(b, i, minimo(i + 64, longitud(b))))
+        i = i + 64
+    }
+    retornar "-----BEGIN " + tipo_p + "-----\n" + unir(l, "\n") + "\n-----END " + tipo_p + "-----\n"
+}
+
+funcion _ce_de_pem(pem) {
+    sea r = []
+    sea dentro = falso
+    para linea en texto_dividir(texto_reemplazar(pem, "\r", ""), "\n") {
+        // Solo el primer bloque (en una cadena, el certificado final).
+        si (texto_empieza_con(linea, "-----BEGIN") y longitud(r) == 0) { dentro = verdadero }
+        sino si (texto_empieza_con(linea, "-----END")) { dentro = falso }
+        sino si (dentro) { r.agregar(texto_recortar(linea)) }
+    }
+    retornar base64_decodificar(unir(r, ""))
+}
+
+/// Clave en PEM "EC PRIVATE KEY" (SEC1, como openssl ecparam).
+funcion certifica_clave_pem(clave) {
+    sea pub = _ce_tlv(3, char_de(0) + char_de(4) + clave["x"] + clave["y"])
+    sea der = _ce_seq([_ce_tlv(2, char_de(1)), _ce_tlv(4, clave["privada"]), _ce_tlv(160, _ce_oid(_CE_OID_P256)), _ce_tlv(161, pub)])
+    retornar _ce_pem("EC PRIVATE KEY", der)
+}
+
+/// Lee una clave P-256 en PEM (SEC1 "EC PRIVATE KEY" o PKCS#8 "PRIVATE KEY").
+funcion certifica_leer_clave(pem) {
+    sea d = _ce_de_pem(pem)
+    sea raiz = _ce_leer(d, 0)
+    sea h = _ce_hijos(d, raiz)
+    si (contiene(pem, "BEGIN PRIVATE KEY")) {
+        // PKCS#8: version, algoritmo, OCTET STRING con la SEC1.
+        sea alg = _ce_contenido(d, h[1])
+        si (contiene(alg, _ce_contenido(_ce_oid(_CE_OID_P256), _ce_leer(_ce_oid(_CE_OID_P256), 0))) == falso) { lanzar "certifica: solo claves P-256" }
+        retornar certifica_leer_clave(_ce_pem("EC PRIVATE KEY", _ce_contenido(d, h[2])))
+    }
+    sea priv = _ce_contenido(d, h[1])
+    mientras (longitud(priv) < 32) { priv = char_de(0) + priv }
+    retornar certifica_claves(priv)
+}
+
+/// Clave pública en PEM (SubjectPublicKeyInfo).
+funcion certifica_publica_pem(clave) { retornar _ce_pem("PUBLIC KEY", _ce_spki(clave)) }
+
+funcion _ce_spki(clave) {
+    retornar _ce_seq([_ce_seq([_ce_oid(_CE_OID_EC), _ce_oid(_CE_OID_P256)]), _ce_tlv(3, char_de(0) + char_de(4) + clave["x"] + clave["y"])])
+}
+
+funcion _ce_firma_der(rs) { retornar _ce_seq([_ce_entero(subtexto(rs, 0, 32)), _ce_entero(subtexto(rs, 32, 64))]) }
+
+/// CSR PKCS#10 (DER) para los dominios, firmada con la clave del certificado.
+funcion certifica_csr(clave, dominios) {
+    sea nombre = _ce_seq([_ce_set([_ce_seq([_ce_oid("2.5.4.3"), _ce_tlv(12, dominios[0])])])])
+    sea sans = []
+    para dn en dominios { sans.agregar(_ce_tlv(130, dn)) }
+    sea ext = _ce_seq([_ce_seq([_ce_oid("2.5.29.17"), _ce_tlv(4, _ce_seq(sans))])])
+    sea atributos = _ce_tlv(160, _ce_seq([_ce_oid("1.2.840.113549.1.9.14"), _ce_set([ext])]))
+    sea info = _ce_seq([_ce_tlv(2, char_de(0)), nombre, _ce_spki(clave), atributos])
+    sea firma = _ce_firma_der(certifica_firmar(clave, info))
+    retornar _ce_seq([info, _ce_seq([_ce_oid("1.2.840.10045.4.3.2")]), _ce_tlv(3, char_de(0) + firma)])
+}
+
+funcion certifica_csr_pem(clave, dominios) { retornar _ce_pem("CERTIFICATE REQUEST", certifica_csr(clave, dominios)) }
+
+// ---------- JWS ----------
+
+funcion _ce_b64u(d) {
+    sea b = base64_codificar(d)
+    b = texto_reemplazar(texto_reemplazar(b, "+", "-"), "/", "_")
+    retornar texto_reemplazar(b, "=", "")
+}
+
+funcion _ce_comillas(t) { retornar caracter(34) + t + caracter(34) }
+
+/// JWK pública (texto JSON con los campos en el orden de RFC 7638).
+funcion certifica_jwk(clave) {
+    retornar "{" + _ce_comillas("crv") + ":" + _ce_comillas("P-256") + "," + _ce_comillas("kty") + ":" + _ce_comillas("EC") + "," + _ce_comillas("x") + ":" + _ce_comillas(_ce_b64u(clave["x"])) + "," + _ce_comillas("y") + ":" + _ce_comillas(_ce_b64u(clave["y"])) + "}"
+}
+
+/// Huella de la JWK (RFC 7638) en base64url.
+funcion certifica_huella(clave) { retornar _ce_b64u(sha256_bytes(certifica_jwk(clave))) }
+
+// JWS plano: cabecera con "jwk" (sin kid) o "kid".
+funcion _ce_jws(clave, protegido, carga) {
+    sea p = _ce_b64u(protegido)
+    sea c = ""
+    si (carga != nulo) { c = _ce_b64u(carga) }
+    sea f = _ce_b64u(certifica_firmar(clave, p + "." + c))
+    retornar "{" + _ce_comillas("protected") + ":" + _ce_comillas(p) + "," + _ce_comillas("payload") + ":" + _ce_comillas(c) + "," + _ce_comillas("signature") + ":" + _ce_comillas(f) + "}"
+}
+
+// ---------- ACME ----------
+
+funcion _ce_transporte(metodo, url, cabeceras, cuerpo) {
+    sea op = {"cabeceras": cabeceras, "redirecciones": 0}
+    si (cuerpo != nulo) {
+        op["cuerpo"] = cuerpo
+        op["tipo"] = "application/jose+json"
+    }
+    retornar http_solicitud(metodo, url, op)
+}
+
+funcion _ce_cab(r, n) {
+    sea c = r["cabeceras"] ?? {}
+    sea k = texto_minusculas(n)
+    para x en claves(c) { si (texto_minusculas(x) == k) { retornar c[x] } }
+    retornar nulo
+}
+
+/// Cliente ACME. opciones: "clave" (PEM o mapa de certifica_claves; si no
+/// se da, se crea una), "transporte" (función(metodo, url, cabeceras,
+/// cuerpo) → {"estado", "cabeceras", "cuerpo"}), "espera_ms" (sondeos).
+funcion certifica_cliente(directorio, opciones) {
+    sea op = opciones ?? {}
+    sea k = op["clave"] ?? nulo
+    si (k == nulo) { k = certifica_claves(nulo) }
+    si (tipo(k) == "texto") { k = certifica_leer_clave(k) }
+    sea c = {"directorio_url": directorio, "clave": k, "transporte": op["transporte"] ?? _ce_transporte, "nonce": nulo, "kid": nulo, "dir": nulo,
+        "espera_ms": op["espera_ms"] ?? 1000}
+    sea r = c["transporte"]("GET", directorio, {}, nulo)
+    si (r["estado"] != 200) { lanzar "certifica: no se pudo leer el directorio (" + r["estado"] + ")" }
+    c["dir"] = json_parsear(r["cuerpo"])
+    retornar c
+}
+
+funcion _ce_nonce(c) {
+    si (c["nonce"] != nulo) {
+        sea n = c["nonce"]
+        c["nonce"] = nulo
+        retornar n
+    }
+    sea r = c["transporte"]("HEAD", c["dir"]["newNonce"], {}, nulo)
+    sea n = _ce_cab(r, "Replay-Nonce")
+    si (n == nulo) { lanzar "certifica: el servidor no dio un nonce" }
+    retornar n
+}
+
+// POST firmado; carga nulo = POST-as-GET. Reintenta una vez con badNonce.
+funcion _ce_post(c, url, carga, con_jwk) {
+    sea intento = 0
+    mientras (verdadero) {
+        sea prot = "{" + _ce_comillas("alg") + ":" + _ce_comillas("ES256") + "," + _ce_comillas("nonce") + ":" + _ce_comillas(_ce_nonce(c)) + "," + _ce_comillas("url") + ":" + _ce_comillas(url) + ","
+        si (con_jwk o c["kid"] == nulo) { prot = prot + _ce_comillas("jwk") + ":" + certifica_jwk(c["clave"]) + "}" }
+        sino { prot = prot + _ce_comillas("kid") + ":" + _ce_comillas(c["kid"]) + "}" }
+        sea texto_carga = nulo
+        si (carga != nulo) {
+            si (tipo(carga) == "texto") { texto_carga = carga } sino { texto_carga = json_texto(carga) }
+        }
+        sea r = c["transporte"]("POST", url, {}, _ce_jws(c["clave"], prot, texto_carga))
+        sea n = _ce_cab(r, "Replay-Nonce")
+        si (n != nulo) { c["nonce"] = n }
+        si (r["estado"] < 400) {
+            sea cuerpo = nulo
+            sea tc = _ce_cab(r, "Content-Type") ?? ""
+            si (contiene(tc, "json") y longitud(r["cuerpo"]) > 0) { cuerpo = json_parsear(r["cuerpo"]) }
+            retornar {"estado": r["estado"], "cuerpo": cuerpo, "texto": r["cuerpo"], "ubicacion": _ce_cab(r, "Location"), "cabeceras": r["cabeceras"]}
+        }
+        sea err = {}
+        intentar { err = json_parsear(r["cuerpo"]) } capturar (e) { err = {"detail": r["cuerpo"]} }
+        si ((err["type"] ?? "") == "urn:ietf:params:acme:error:badNonce" y intento == 0) {
+            intento = 1
+        } sino {
+            lanzar "certifica: " + (err["type"] ?? ("error " + r["estado"])) + ": " + (err["detail"] ?? "")
+        }
+    }
+}
+
+/// Crea (o recupera) la cuenta. opciones: "contacto" (lista de mailto:),
+/// "aceptar_terminos" (verdadero por defecto), "solo_existente".
+funcion certifica_cuenta(c, opciones) {
+    sea op = opciones ?? {}
+    sea carga = {"termsOfServiceAgreed": op["aceptar_terminos"] ?? verdadero}
+    si ((op["contacto"] ?? nulo) != nulo) { carga["contact"] = op["contacto"] }
+    si ((op["solo_existente"] ?? falso) == verdadero) { carga["onlyReturnExisting"] = verdadero }
+    sea r = _ce_post(c, c["dir"]["newAccount"], carga, verdadero)
+    c["kid"] = r["ubicacion"]
+    retornar {"url": r["ubicacion"], "estado": r["cuerpo"]["status"] ?? nulo, "nueva": r["estado"] == 201}
+}
+
+/// Pide un certificado para los dominios. Devuelve el pedido.
+funcion certifica_pedido(c, dominios) {
+    sea ids = []
+    para d en dominios { ids.agregar({"type": "dns", "value": d}) }
+    sea r = _ce_post(c, c["dir"]["newOrder"], {"identifiers": ids}, falso)
+    sea ped = r["cuerpo"]
+    ped["url"] = r["ubicacion"]
+    retornar ped
+}
+
+/// Desafíos por resolver del pedido: [{"dominio", "tipo", "url", "token",
+/// "clave_autorizacion", "ruta" (http-01), "valor_dns" (dns-01),
+/// "nombre_dns", "autorizacion"}].
+funcion certifica_desafios(c, pedido) {
+    sea r = []
+    para az en pedido["authorizations"] {
+        sea a = _ce_post(c, az, nulo, falso)["cuerpo"]
+        si (a["status"] == "pending") {
+            sea dom = a["identifier"]["value"]
+            para d en a["challenges"] {
+              si ((d["token"] ?? nulo) != nulo) {
+                sea ka = d["token"] + "." + certifica_huella(c["clave"])
+                sea base = dom
+                si (texto_empieza_con(base, "*.")) { base = subtexto(base, 2, longitud(base)) }
+                r.agregar({"dominio": dom, "tipo": d["type"], "url": d["url"], "token": d["token"], "clave_autorizacion": ka,
+                    "ruta": "/.well-known/acme-challenge/" + d["token"], "valor_dns": _ce_b64u(sha256_bytes(ka)), "nombre_dns": "_acme-challenge." + base,
+                    "alpn_sha256": sha256_bytes(ka), "autorizacion": az, "estado": d["status"] ?? nulo})
+              }
+            }
+        }
+    }
+    retornar r
+}
+
+/// Avisa al servidor que el desafío está listo.
+funcion certifica_responder(c, desafio) { retornar _ce_post(c, desafio["url"], {}, falso)["cuerpo"] }
+
+/// Consulta un recurso (pedido, autorización…) hasta que su estado esté en
+/// "listos" o falle. Devuelve el recurso.
+funcion certifica_esperar(c, url, listos, intentos) {
+    sea n = intentos ?? 30
+    sea i = 0
+    mientras (i < n) {
+        sea r = _ce_post(c, url, nulo, falso)["cuerpo"]
+        si (contiene(listos, r["status"])) { retornar r }
+        si (r["status"] == "invalid") {
+            sea detalle = ""
+            para ch en r["challenges"] ?? [] { si ((ch["error"] ?? nulo) != nulo) { detalle = detalle + " " + (ch["error"]["detail"] ?? "") } }
+            si ((r["error"] ?? nulo) != nulo) { detalle = detalle + " " + (r["error"]["detail"] ?? "") }
+            lanzar "certifica: falló la validación:" + detalle
+        }
+        hilo_dormir(c["espera_ms"])
+        i = i + 1
+    }
+    lanzar "certifica: se agotó la espera de " + url
+}
+
+/// Envía la CSR. Devuelve el pedido actualizado.
+funcion certifica_finalizar(c, pedido, clave_cert, dominios) {
+    sea csr = _ce_b64u(certifica_csr(clave_cert, dominios))
+    sea r = _ce_post(c, pedido["finalize"], {"csr": csr}, falso)["cuerpo"]
+    r["url"] = pedido["url"]
+    retornar r
+}
+
+/// Baja la cadena de certificados (PEM).
+funcion certifica_bajar(c, pedido) {
+    si ((pedido["certificate"] ?? nulo) == nulo) { lanzar "certifica: el pedido todavía no tiene certificado" }
+    retornar _ce_post(c, pedido["certificate"], nulo, falso)["texto"]
+}
+
+/// Todo junto: pedido, desafíos (publicar(desafio) los deja disponibles; se
+/// usa el tipo de "opciones.tipo", http-01 por defecto), finalizar y bajar.
+/// Devuelve {"certificado" (PEM), "clave" , "clave_pem", "pedido"}.
+funcion certifica_emitir(c, dominios, publicar, opciones) {
+    sea op = opciones ?? {}
+    sea tipo_d = op["tipo"] ?? "http-01"
+    si (c["kid"] == nulo) { certifica_cuenta(c, {"contacto": op["contacto"] ?? nulo}) }
+    sea pedido = certifica_pedido(c, dominios)
+    para d en certifica_desafios(c, pedido) {
+        si (d["tipo"] == tipo_d) {
+            publicar(d)
+            certifica_responder(c, d)
+            certifica_esperar(c, d["autorizacion"], ["valid"], op["intentos"] ?? 30)
+        }
+    }
+    sea url = pedido["url"]
+    pedido = certifica_esperar(c, url, ["ready", "valid"], op["intentos"] ?? 30)
+    sea kc = op["clave_certificado"] ?? certifica_claves(nulo)
+    si (tipo(kc) == "texto") { kc = certifica_leer_clave(kc) }
+    si (pedido["status"] == "ready") {
+        pedido["url"] = url
+        certifica_finalizar(c, pedido, kc, dominios)
+    }
+    pedido = certifica_esperar(c, url, ["valid"], op["intentos"] ?? 30)
+    pedido["url"] = url
+    retornar {"certificado": certifica_bajar(c, pedido), "clave": kc, "clave_pem": certifica_clave_pem(kc), "pedido": pedido}
+}
+
+/// Revoca un certificado (PEM). motivo: código RFC 5280 (0 por defecto).
+funcion certifica_revocar(c, cert_pem, motivo) {
+    sea der = _ce_de_pem(cert_pem)
+    _ce_post(c, c["dir"]["revokeCert"], {"certificate": _ce_b64u(der), "reason": motivo ?? 0}, falso)
+    retornar verdadero
+}
+
+/// Fecha de vencimiento (texto "AAAAMMDDhhmmssZ") del primer certificado
+/// de una cadena PEM.
+funcion certifica_vence(cert_pem) {
+    sea d = _ce_de_pem(cert_pem)
+    sea cert = _ce_leer(d, 0)
+    sea tbs = _ce_hijos(d, cert)[0]
+    sea h = _ce_hijos(d, tbs)
+    sea i = 0
+    si (h[0][0] == 160) { i = 1 }
+    sea validez = _ce_hijos(d, h[i + 3])
+    sea t = _ce_contenido(d, validez[1])
+    si (validez[1][0] == 23) {
+        // UTCTime (AAMMDD…): años 50-99 son 19xx.
+        sea a = a_numero(subtexto(t, 0, 2))
+        si (a >= 50) { t = "19" + t } sino { t = "20" + t }
+    }
+    retornar t
+}

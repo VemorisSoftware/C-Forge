@@ -78,7 +78,9 @@ Sitio oficial: [c-forge.org](https://c-forge.org)
   jsdom, y ayudas de servidor), `teclado`/`input_sim` (simular teclado y
   ratón: X11 con XTest, macOS y Windows) y `tunel`/`wireguard` (protocolo
   de WireGuard con BLAKE2s propio, cookies y ventana anti-repetición;
-  interopera con boringtun como iniciador y como respondedor).
+  interopera con boringtun como iniciador y como respondedor) y
+  `certifica`/`acme` (ACME RFC 8555 con ECDSA P-256 propio, CSR y PEM;
+  emite y revoca certificados de punta a punta contra Pebble).
 - Lote 23 de bibliotecas (con alias en inglés y pruebas en ambos idiomas):
   `enjambre`/`parallel` (paralelismo de datos al estilo Rayon: mapear,
   filtrar, reducir y ordenar en hilos), `marea`/`asyncrt` (tareas, canales,
