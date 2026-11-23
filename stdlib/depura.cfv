@@ -1,0 +1,395 @@
+// stdlib/depura.cfv — cliente del Debug Adapter Protocol (DAP): habla con
+// cualquier adaptador de depuración (debugpy, js-debug, codelldb, delve…)
+// por TCP o por un transporte propio. Mensajes con Content-Length,
+// peticiones con número de secuencia, respuestas fuera de orden, eventos en
+// cola y peticiones inversas del adaptador (runInTerminal, startDebugging).
+// Atajos para el flujo completo: inicializar, lanzar o adjuntar, puntos de
+// interrupción (con condición, conteo y mensajes), configuración lista,
+// hilos, pila, ámbitos, variables, evaluar, continuar, paso a paso y
+// desconectar. Trae un adaptador simulado para pruebas. Probado contra
+// debugpy. Idea del protocolo de Microsoft (MIT). En inglés:
+// importar "dap".
+//
+//   importar "depura"
+//   sea c = depura_conectar("127.0.0.1", 5678, nulo)
+//   depura_inicializar(c, nulo)
+//   sea l = depura_enviar(c, "launch", {"program": "/ruta/app.py"})
+//   depura_esperar_evento(c, "initialized")
+//   depura_puntos(c, "/ruta/app.py", [10])
+//   depura_configuracion_lista(c)
+//   depura_respuesta(c, l)
+//   sea parada = depura_esperar_evento(c, "stopped")
+
+importar "json"
+
+// ---------- mensajes ----------
+
+/// Codifica un mensaje DAP (mapa) con su cabecera.
+funcion depura_codificar(m) {
+    sea j = json_texto(m)
+    retornar "Content-Length: " + longitud(j) + "\r\n\r\n" + j
+}
+
+funcion _dp_leer(c) {
+    sea t = c["t"]
+    sea cab = []
+    sea fin = ""
+    mientras (fin != "\r\n\r\n") {
+        sea b = t["recibir"](1)
+        si (b == nulo o b == "") { lanzar "depura: el adaptador cerró la conexión" }
+        cab.agregar(b)
+        fin = fin + b
+        si (longitud(fin) > 4) { fin = subcadena(fin, 1, 5) }
+    }
+    sea n = -1
+    para l en texto_dividir(unir(cab, ""), "\r\n") {
+        si (texto_empieza_con(texto_minusculas(l), "content-length:")) { n = a_numero(texto_recortar(subcadena(l, 15, longitud(l)))) }
+    }
+    si (n < 0) { lanzar "depura: falta Content-Length" }
+    retornar json_parsear(t["recibir"](n))
+}
+
+// ---------- conexión ----------
+
+funcion _dp_tcp(host, puerto) {
+    sea s = net_conectar(host, puerto)
+    retornar {"enviar": funcion(d) { net_enviar(s, d) }, "recibir": funcion(n) { retornar net_recibir_exacto(s, n) }, "cerrar": funcion() { net_cerrar(s) }}
+}
+
+/// Conecta con un adaptador que escucha por TCP. opciones: "transporte"
+/// (ya abierto, con "enviar", "recibir"(n) y "cerrar"), "inversas"
+/// ({comando: función(argumentos) → cuerpo de la respuesta}).
+funcion depura_conectar(host, puerto, opciones) {
+    sea op = opciones ?? {}
+    sea t = op["transporte"] ?? nulo
+    si (t == nulo) { t = _dp_tcp(host, puerto) }
+    retornar {"t": t, "seq": 0, "respuestas": {}, "eventos": [], "inversas": op["inversas"] ?? {}, "capacidades": {}, "salida": [], "abierta": verdadero}
+}
+
+funcion _dp_mandar(c, m) {
+    c["seq"] = c["seq"] + 1
+    m["seq"] = c["seq"]
+    c["t"]["enviar"](depura_codificar(m))
+    retornar c["seq"]
+}
+
+// Lee un mensaje y lo reparte: respuestas, eventos o peticiones inversas.
+funcion _dp_procesar(c) {
+    sea m = _dp_leer(c)
+    sea t = m["type"] ?? ""
+    si (t == "response") { c["respuestas"]["" + m["request_seq"]] = m }
+    sino si (t == "event") {
+        si (m["event"] == "output") { c["salida"].agregar(m["body"]) }
+        c["eventos"].agregar(m)
+    } sino si (t == "request") {
+        sea h = c["inversas"][m["command"]] ?? nulo
+        si (h == nulo) {
+            _dp_mandar(c, {"type": "response", "request_seq": m["seq"], "command": m["command"], "success": falso, "message": "no soportado"})
+        } sino {
+            sea cuerpo = nulo
+            sea err = nulo
+            intentar { cuerpo = h(m["arguments"] ?? {}) } capturar (e) { err = "" + e }
+            si (err != nulo) { _dp_mandar(c, {"type": "response", "request_seq": m["seq"], "command": m["command"], "success": falso, "message": err}) } sino { _dp_mandar(c, {"type": "response", "request_seq": m["seq"], "command": m["command"], "success": verdadero, "body": cuerpo ?? {}}) }
+        }
+    }
+    retornar m
+}
+
+/// Envía una petición sin esperar; devuelve su número de secuencia.
+funcion depura_enviar(c, comando, argumentos) {
+    sea m = {"type": "request", "command": comando}
+    si (argumentos != nulo) { m["arguments"] = argumentos }
+    retornar _dp_mandar(c, m)
+}
+
+/// Espera la respuesta de una petición; devuelve su cuerpo o lanza
+/// {"comando", "mensaje", "cuerpo"} si falló.
+funcion depura_respuesta(c, seq) {
+    mientras (tiene_clave(c["respuestas"], "" + seq) == falso) { _dp_procesar(c) }
+    sea r = c["respuestas"]["" + seq]
+    quitar_clave(c["respuestas"], "" + seq)
+    si ((r["success"] ?? falso) == falso) { lanzar {"comando": r["command"], "mensaje": r["message"] ?? "falló", "cuerpo": r["body"] ?? nulo} }
+    retornar r["body"] ?? {}
+}
+
+/// Petición y respuesta.
+funcion depura_pedir(c, comando, argumentos) { retornar depura_respuesta(c, depura_enviar(c, comando, argumentos)) }
+
+/// Texto de un error de depura.
+funcion depura_error_texto(e) {
+    si (tipo(e) == "mapa" y tiene_clave(e, "comando")) {
+        sea t = e["comando"] + ": " + e["mensaje"]
+        sea cu = e["cuerpo"] ?? nulo
+        si (cu != nulo y tipo(cu) == "mapa" y tiene_clave(cu, "error")) { t = t + " (" + (cu["error"]["format"] ?? "") + ")" }
+        retornar t
+    }
+    retornar "" + e
+}
+
+/// Espera un evento por nombre (y que cumpla filtro(cuerpo), opcional).
+/// Los demás eventos quedan en la cola.
+funcion depura_esperar_evento(c, nombre, filtro) {
+    mientras (verdadero) {
+        sea i = 0
+        mientras (i < longitud(c["eventos"])) {
+            sea e = c["eventos"][i]
+            si (e["event"] == nombre y (filtro == nulo o filtro(e["body"] ?? {}))) {
+                sea r = []
+                sea k = 0
+                mientras (k < longitud(c["eventos"])) {
+                    si (k != i) { r.agregar(c["eventos"][k]) }
+                    k = k + 1
+                }
+                c["eventos"] = r
+                retornar e["body"] ?? {}
+            }
+            i = i + 1
+        }
+        _dp_procesar(c)
+    }
+}
+
+/// Texto que el programa escribió (eventos "output"), por categoría o todo.
+funcion depura_salida(c, categoria) {
+    sea p = []
+    para o en c["salida"] { si (categoria == nulo o (o["category"] ?? "console") == categoria) { p.agregar(o["output"] ?? "") } }
+    retornar unir(p, "")
+}
+
+// ---------- atajos ----------
+
+/// initialize. opciones se mezclan con los argumentos por defecto.
+/// Devuelve las capacidades del adaptador.
+funcion depura_inicializar(c, opciones) {
+    sea a = {"clientID": "c-forge", "clientName": "C-Forge", "adapterID": "c-forge", "locale": "es", "linesStartAt1": verdadero, "columnsStartAt1": verdadero, "pathFormat": "path", "supportsVariableType": verdadero, "supportsRunInTerminalRequest": tiene_clave(c["inversas"], "runInTerminal")}
+    para k en claves(opciones ?? {}) { a[k] = opciones[k] }
+    c["capacidades"] = depura_pedir(c, "initialize", a)
+    retornar c["capacidades"]
+}
+
+/// Puntos de interrupción de un archivo. lineas: [n] o [{"line", "condition",
+/// "hitCondition", "logMessage"}]. Devuelve los puntos verificados.
+funcion depura_puntos(c, ruta, lineas) {
+    sea bp = []
+    para l en lineas {
+        si (tipo(l) == "mapa") { bp.agregar(l) } sino { bp.agregar({"line": l}) }
+    }
+    retornar depura_pedir(c, "setBreakpoints", {"source": {"path": ruta}, "breakpoints": bp})["breakpoints"] ?? []
+}
+
+/// Puntos de interrupción por nombre de función.
+funcion depura_puntos_funcion(c, nombres) {
+    sea bp = []
+    para n en nombres { bp.agregar({"name": n}) }
+    retornar depura_pedir(c, "setFunctionBreakpoints", {"breakpoints": bp})["breakpoints"] ?? []
+}
+
+/// Interrumpir en excepciones: filtros como ["raised"] o ["uncaught"].
+funcion depura_excepciones(c, filtros) { retornar depura_pedir(c, "setExceptionBreakpoints", {"filters": filtros}) }
+
+funcion depura_configuracion_lista(c) { retornar depura_pedir(c, "configurationDone", nulo) }
+
+funcion depura_hilos(c) { retornar depura_pedir(c, "threads", nulo)["threads"] ?? [] }
+
+/// Marcos de la pila de un hilo: [{"id", "name", "line", "column", "source"}].
+funcion depura_pila(c, hilo) { retornar depura_pedir(c, "stackTrace", {"threadId": hilo, "startFrame": 0, "levels": 50})["stackFrames"] ?? [] }
+
+funcion depura_ambitos(c, marco) { retornar depura_pedir(c, "scopes", {"frameId": marco})["scopes"] ?? [] }
+
+funcion depura_variables(c, referencia) { retornar depura_pedir(c, "variables", {"variablesReference": referencia})["variables"] ?? [] }
+
+/// Variables locales del marco como mapa {nombre: valor (texto)}.
+funcion depura_locales(c, marco) {
+    sea r = {}
+    para a en depura_ambitos(c, marco) {
+        sea n = texto_minusculas(a["name"])
+        si (n == "locals" o n == "local" o n == "locales") {
+            para v en depura_variables(c, a["variablesReference"]) {
+                si (texto_empieza_con(v["name"], "(") == falso y texto_empieza_con(v["name"], "special") == falso y v["name"] != "function variables" y v["name"] != "class variables") { r[v["name"]] = v["value"] }
+            }
+        }
+    }
+    retornar r
+}
+
+/// Evalúa una expresión en un marco: {"result", "type", "variablesReference"}.
+funcion depura_evaluar(c, expresion, marco, contexto) {
+    sea a = {"expression": expresion, "context": contexto ?? "repl"}
+    si (marco != nulo) { a["frameId"] = marco }
+    retornar depura_pedir(c, "evaluate", a)
+}
+
+funcion depura_continuar(c, hilo) { retornar depura_pedir(c, "continue", {"threadId": hilo}) }
+funcion depura_siguiente(c, hilo) { retornar depura_pedir(c, "next", {"threadId": hilo}) }
+funcion depura_entrar(c, hilo) { retornar depura_pedir(c, "stepIn", {"threadId": hilo}) }
+funcion depura_salir(c, hilo) { retornar depura_pedir(c, "stepOut", {"threadId": hilo}) }
+funcion depura_pausar(c, hilo) { retornar depura_pedir(c, "pause", {"threadId": hilo}) }
+
+/// Hace un paso y espera la siguiente parada; devuelve el marco superior.
+funcion depura_paso(c, hilo, tipo_paso) {
+    sea nombres = {"siguiente": "next", "entrar": "stepIn", "salir": "stepOut", "continuar": "continue"}
+    sea cmd = nombres[tipo_paso ?? "siguiente"] ?? tipo_paso
+    depura_pedir(c, cmd, {"threadId": hilo})
+    sea p = depura_esperar_evento(c, "stopped", nulo)
+    retornar depura_pila(c, p["threadId"] ?? hilo)[0]
+}
+
+/// Desconecta (terminar: también termina el programa depurado).
+funcion depura_desconectar(c, terminar) {
+    si (c["abierta"] == falso) { retornar nulo }
+    intentar { depura_pedir(c, "disconnect", {"terminateDebuggee": terminar ?? verdadero}) } capturar (e) { nulo }
+    c["abierta"] = falso
+    intentar { c["t"]["cerrar"]() } capturar (e) { nulo }
+}
+
+// ---------- adaptador simulado (para pruebas) ----------
+
+/// Adaptador falso que "ejecuta" un programa de líneas: programa es una
+/// lista de [linea, {variables}] en orden de ejecución. Soporta initialize,
+/// launch, setBreakpoints (con condición sobre las variables simples
+/// "x == n"), configurationDone, threads, stackTrace, scopes, variables,
+/// evaluate (nombre de variable), continue, next y disconnect.
+funcion depura_simulado(ruta, programa) {
+    sea est = {"pc": -1, "puntos": [], "salida": "", "entrada": "", "terminado": falso, "lanzado": falso}
+    sea a_cliente = funcion(m) {
+        sea j = json_texto(m)
+        est["salida"] = est["salida"] + "Content-Length: " + longitud(j) + "\r\n\r\n" + j
+    }
+    sea seq = [100]
+    sea evento = funcion(nombre, cuerpo) {
+        seq[0] = seq[0] + 1
+        a_cliente({"seq": seq[0], "type": "event", "event": nombre, "body": cuerpo})
+    }
+    sea responder = funcion(req, cuerpo, ok, msg) {
+        seq[0] = seq[0] + 1
+        sea r = {"seq": seq[0], "type": "response", "request_seq": req["seq"], "command": req["command"], "success": ok}
+        si (cuerpo != nulo) { r["body"] = cuerpo }
+        si (msg != nulo) { r["message"] = msg }
+        a_cliente(r)
+    }
+    sea cumple = funcion(p, vars) {
+        si ((p["condition"] ?? nulo) == nulo) { retornar verdadero }
+        sea partes = texto_dividir(p["condition"], "==")
+        retornar ("" + (vars[texto_recortar(partes[0])] ?? "")) == texto_recortar(partes[1])
+    }
+    // Avanza hasta un punto (o una línea si paso) o el final.
+    sea correr = funcion(paso) {
+        mientras (verdadero) {
+            est["pc"] = est["pc"] + 1
+            si (est["pc"] >= longitud(programa)) {
+                est["terminado"] = verdadero
+                evento("output", {"category": "stdout", "output": "fin\n"})
+                evento("exited", {"exitCode": 0})
+                evento("terminated", {})
+                retornar nulo
+            }
+            sea l = programa[est["pc"]]
+            si (paso) {
+                evento("stopped", {"reason": "step", "threadId": 1})
+                retornar nulo
+            }
+            para p en est["puntos"] {
+                si (p["line"] == l[0] y cumple(p, l[1])) {
+                    evento("stopped", {"reason": "breakpoint", "threadId": 1, "hitBreakpointIds": [p["id"]]})
+                    retornar nulo
+                }
+            }
+        }
+    }
+    sea atender = funcion(req) {
+        sea cmd = req["command"]
+        sea a = req["arguments"] ?? {}
+        si (cmd == "initialize") {
+            responder(req, {"supportsConfigurationDoneRequest": verdadero, "supportsConditionalBreakpoints": verdadero}, verdadero, nulo)
+            retornar nulo
+        }
+        si (cmd == "launch") {
+            si ((a["program"] ?? "") != ruta) {
+                responder(req, nulo, falso, "no existe " + (a["program"] ?? ""))
+                retornar nulo
+            }
+            est["lanzado"] = req
+            evento("initialized", {})
+            retornar nulo
+        }
+        si (cmd == "setBreakpoints") {
+            est["puntos"] = []
+            sea r = []
+            sea id = 1
+            para b en a["breakpoints"] ?? [] {
+                sea ok = falso
+                para l en programa { si (l[0] == b["line"]) { ok = verdadero } }
+                sea p = {"id": id, "line": b["line"], "condition": b["condition"] ?? nulo}
+                si (ok) { est["puntos"].agregar(p) }
+                r.agregar({"id": id, "verified": ok, "line": b["line"]})
+                id = id + 1
+            }
+            responder(req, {"breakpoints": r}, verdadero, nulo)
+            retornar nulo
+        }
+        si (cmd == "configurationDone") {
+            responder(req, nulo, verdadero, nulo)
+            si (est["lanzado"] != falso) { responder(est["lanzado"], nulo, verdadero, nulo) }
+            evento("process", {"name": ruta})
+            correr(falso)
+            retornar nulo
+        }
+        si (cmd == "threads") {
+            responder(req, {"threads": [{"id": 1, "name": "principal"}]}, verdadero, nulo)
+            retornar nulo
+        }
+        si (cmd == "stackTrace") {
+            sea l = programa[est["pc"]]
+            responder(req, {"stackFrames": [{"id": 1000, "name": "principal", "line": l[0], "column": 1, "source": {"path": ruta}}], "totalFrames": 1}, verdadero, nulo)
+            retornar nulo
+        }
+        si (cmd == "scopes") {
+            responder(req, {"scopes": [{"name": "Locals", "variablesReference": 7, "expensive": falso}]}, verdadero, nulo)
+            retornar nulo
+        }
+        si (cmd == "variables") {
+            sea vs = []
+            sea vars = programa[est["pc"]][1]
+            para k en claves(vars) { vs.agregar({"name": k, "value": "" + vars[k], "variablesReference": 0}) }
+            responder(req, {"variables": vs}, verdadero, nulo)
+            retornar nulo
+        }
+        si (cmd == "evaluate") {
+            sea vars = programa[est["pc"]][1]
+            si (tiene_clave(vars, a["expression"])) { responder(req, {"result": "" + vars[a["expression"]], "variablesReference": 0}, verdadero, nulo) } sino { responder(req, nulo, falso, "NameError: " + a["expression"]) }
+            retornar nulo
+        }
+        si (cmd == "continue" o cmd == "next") {
+            responder(req, {"allThreadsContinued": verdadero}, verdadero, nulo)
+            correr(cmd == "next")
+            retornar nulo
+        }
+        si (cmd == "disconnect") {
+            responder(req, nulo, verdadero, nulo)
+            retornar nulo
+        }
+        responder(req, nulo, falso, "comando no soportado: " + cmd)
+    }
+    sea t = {
+        "enviar": funcion(d) {
+            est["entrada"] = est["entrada"] + d
+            mientras (verdadero) {
+                sea f = texto_indice(est["entrada"], "\r\n\r\n")
+                si (f < 0) { retornar nulo }
+                sea n = a_numero(texto_recortar(texto_dividir(subcadena(est["entrada"], 0, f), ":")[1]))
+                si (longitud(est["entrada"]) < f + 4 + n) { retornar nulo }
+                sea m = json_parsear(subcadena(est["entrada"], f + 4, f + 4 + n))
+                est["entrada"] = subcadena(est["entrada"], f + 4 + n, longitud(est["entrada"]))
+                si (m["type"] == "request") { atender(m) }
+            }
+        },
+        "recibir": funcion(n) {
+            si (longitud(est["salida"]) < n) { lanzar "depura: el adaptador simulado no tiene más datos" }
+            sea r = subcadena(est["salida"], 0, n)
+            est["salida"] = subcadena(est["salida"], n, longitud(est["salida"]))
+            retornar r
+        },
+        "cerrar": funcion() { nulo }
+    }
+    retornar {"transporte": t, "estado": est}
+}
