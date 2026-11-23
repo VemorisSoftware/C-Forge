@@ -1,0 +1,1384 @@
+// stdlib/huella.cfv — Reglas de detección de patrones al estilo de YARA,
+// escrito desde cero (idea de YARA, BSD-3). Compila reglas con la misma
+// sintaxis y las aplica a bytes o archivos.
+//
+//   · Cadenas de texto con nocase, wide, ascii, fullword, xor y private.
+//   · Cadenas hexadecimales con ??, nibbles (?A, B?), saltos [n-m] y
+//     alternativas ( AA | BB ).
+//   · Expresiones regulares /…/is con clases, cuantificadores (también
+//     perezosos), grupos, alternativas, anclas y \b.
+//   · Condiciones: and/or/not, $a, #a, @a[i], !a[i], "at", "in (a..b)",
+//     filesize, uint8/16/32(be) e int8/16/32(be), aritmética y bits,
+//     "any/all/none/N/N% of", "for … of … : (…)", "for any i in (…) : (…)",
+//     referencias a otras reglas, reglas private y global, etiquetas y meta.
+//
+// En inglés: importar "yara".
+//
+//   importar "huella"
+//   sea reglas = huella_compilar(leer_archivo("reglas.yar"))
+//   para r en huella_escanear_archivo(reglas, "muestra.bin") { mostrar(r["regla"]) }
+
+// ---------- lectura del texto de reglas ----------
+
+funcion _hy_err(st, m) { lanzar "huella: " + m + " (línea " + _hy_linea(st) + ")" }
+
+funcion _hy_linea(st) {
+    sea n = 1
+    sea i = 0
+    mientras (i < st["i"] y i < longitud(st["t"])) {
+        si (byte_en(st["t"], i) == 10) { n = n + 1 }
+        i = i + 1
+    }
+    retornar n
+}
+
+funcion _hy_ws(st) {
+    sea t = st["t"]
+    mientras (st["i"] < longitud(t)) {
+        sea b = byte_en(t, st["i"])
+        si (b == 32 o b == 9 o b == 10 o b == 13) { st["i"] = st["i"] + 1 }
+        sino si (b == 47 y st["i"] + 1 < longitud(t) y byte_en(t, st["i"] + 1) == 47) {
+            mientras (st["i"] < longitud(t) y byte_en(t, st["i"]) != 10) { st["i"] = st["i"] + 1 }
+        } sino si (b == 47 y st["i"] + 1 < longitud(t) y byte_en(t, st["i"] + 1) == 42) {
+            sea fin = bytes_buscar(t, "*/", st["i"] + 2)
+            si (fin < 0) { _hy_err(st, "comentario sin cerrar") }
+            st["i"] = fin + 2
+        } sino { retornar nulo }
+    }
+}
+
+funcion _hy_es_id(b) { retornar (b >= 97 y b <= 122) o (b >= 65 y b <= 90) o (b >= 48 y b <= 57) o b == 95 }
+
+funcion _hy_ident(st) {
+    _hy_ws(st)
+    retornar _hy_ident_pegado(st)
+}
+
+// Identificador justo en la posición actual (sin saltar espacios): "$ at 0".
+funcion _hy_ident_pegado(st) {
+    sea t = st["t"]
+    sea k = st["i"]
+    mientras (k < longitud(t) y _hy_es_id(byte_en(t, k))) { k = k + 1 }
+    sea r = subtexto(t, st["i"], k)
+    st["i"] = k
+    retornar r
+}
+
+funcion _hy_mirar(st, s) {
+    _hy_ws(st)
+    retornar subtexto(st["t"], st["i"], st["i"] + longitud(s)) == s
+}
+
+funcion _hy_mirar_palabra(st, s) {
+    si (_hy_mirar(st, s) == falso) { retornar falso }
+    sea k = st["i"] + longitud(s)
+    retornar k >= longitud(st["t"]) o _hy_es_id(byte_en(st["t"], k)) == falso
+}
+
+funcion _hy_esperar(st, s) {
+    si (_hy_mirar(st, s) == falso) { _hy_err(st, "se esperaba '" + s + "'") }
+    st["i"] = st["i"] + longitud(s)
+}
+
+funcion _hy_texto_lit(st) {
+    _hy_esperar(st, "\"")
+    sea t = st["t"]
+    sea r = ""
+    mientras (verdadero) {
+        si (st["i"] >= longitud(t)) { _hy_err(st, "texto sin cerrar") }
+        sea c = subtexto(t, st["i"], st["i"] + 1)
+        st["i"] = st["i"] + 1
+        si (c == "\"") { retornar r }
+        si (c == "\\") {
+            sea e = subtexto(t, st["i"], st["i"] + 1)
+            st["i"] = st["i"] + 1
+            si (e == "n") { r = r + "\n" }
+            sino si (e == "t") { r = r + "\t" }
+            sino si (e == "r") { r = r + "\r" }
+            sino si (e == "x") {
+                r = r + char_de(_hy_hex(subtexto(t, st["i"], st["i"] + 2)))
+                st["i"] = st["i"] + 2
+            } sino { r = r + e }
+        } sino { r = r + c }
+    }
+}
+
+funcion _hy_hex(h) {
+    sea v = 0
+    sea i = 0
+    mientras (i < longitud(h)) {
+        sea c = texto_indice("0123456789abcdef", texto_minusculas(subtexto(h, i, i + 1)))
+        si (c < 0) { lanzar "huella: hexadecimal inválido '" + h + "'" }
+        v = v * 16 + c
+        i = i + 1
+    }
+    retornar v
+}
+
+funcion _hy_entero(st) {
+    _hy_ws(st)
+    sea t = st["t"]
+    sea k = st["i"]
+    si (subtexto(t, k, k + 2) == "0x") {
+        k = k + 2
+        mientras (k < longitud(t) y texto_indice("0123456789abcdefABCDEF", subtexto(t, k, k + 1)) >= 0) { k = k + 1 }
+        sea v = _hy_hex(subtexto(t, st["i"] + 2, k))
+        st["i"] = k
+        retornar v
+    }
+    mientras (k < longitud(t) y texto_indice("0123456789", subtexto(t, k, k + 1)) >= 0) { k = k + 1 }
+    si (k == st["i"]) { _hy_err(st, "se esperaba un número") }
+    sea v = a_numero(subtexto(t, st["i"], k))
+    si (subtexto(t, k, k + 2) == "KB") {
+        v = v * 1024
+        k = k + 2
+    } sino si (subtexto(t, k, k + 2) == "MB") {
+        v = v * 1048576
+        k = k + 2
+    }
+    st["i"] = k
+    retornar v
+}
+
+// ---------- compilación ----------
+
+/// Compila un texto con reglas YARA. Devuelve {"reglas": [...]}; los errores
+/// se lanzan con la línea.
+funcion huella_compilar(texto) {
+    sea st = {"t": texto, "i": 0}
+    sea reglas = []
+    mientras (verdadero) {
+        _hy_ws(st)
+        si (st["i"] >= longitud(texto)) { romper }
+        si (_hy_mirar_palabra(st, "import") o _hy_mirar_palabra(st, "include")) {
+            sea que = _hy_ident(st)
+            sea m = _hy_texto_lit(st)
+            si (que == "include") { _hy_err(st, "include no está soportado: une los archivos antes de compilar") }
+            si (m != "hash" y m != "math") { _hy_err(st, "módulo '" + m + "' no soportado") }
+            continuar
+        }
+        reglas.agregar(_hy_regla(st, reglas))
+    }
+    retornar {"reglas": reglas}
+}
+
+funcion _hy_regla(st, previas) {
+    sea mods = []
+    mientras (_hy_mirar_palabra(st, "private") o _hy_mirar_palabra(st, "global")) { mods.agregar(_hy_ident(st)) }
+    si (_hy_ident(st) != "rule") { _hy_err(st, "se esperaba 'rule'") }
+    sea nombre = _hy_ident(st)
+    si (nombre == "") { _hy_err(st, "regla sin nombre") }
+    para p en previas { si (p["nombre"] == nombre) { _hy_err(st, "regla repetida " + nombre) } }
+    sea etiquetas = []
+    si (_hy_mirar(st, ":")) {
+        _hy_esperar(st, ":")
+        mientras (_hy_mirar(st, "{") == falso) { etiquetas.agregar(_hy_ident(st)) }
+    }
+    _hy_esperar(st, "{")
+    sea r = {"nombre": nombre, "privada": lista_contiene(mods, "private"), "global": lista_contiene(mods, "global"), "etiquetas": etiquetas, "meta": {}, "cadenas": [], "condicion": nulo}
+    si (_hy_mirar_palabra(st, "meta")) {
+        _hy_ident(st)
+        _hy_esperar(st, ":")
+        mientras (_hy_mirar_palabra(st, "strings") == falso y _hy_mirar_palabra(st, "condition") == falso) {
+            sea k = _hy_ident(st)
+            si (k == "") { _hy_err(st, "meta inválida") }
+            _hy_esperar(st, "=")
+            si (_hy_mirar(st, "\"")) { r["meta"][k] = _hy_texto_lit(st) }
+            sino si (_hy_mirar_palabra(st, "true")) {
+                _hy_ident(st)
+                r["meta"][k] = verdadero
+            } sino si (_hy_mirar_palabra(st, "false")) {
+                _hy_ident(st)
+                r["meta"][k] = falso
+            } sino {
+                sea neg = falso
+                si (_hy_mirar(st, "-")) {
+                    _hy_esperar(st, "-")
+                    neg = verdadero
+                }
+                sea v = _hy_entero(st)
+                si (neg) { v = 0 - v }
+                r["meta"][k] = v
+            }
+        }
+    }
+    si (_hy_mirar_palabra(st, "strings")) {
+        _hy_ident(st)
+        _hy_esperar(st, ":")
+        sea anon = 0
+        mientras (_hy_mirar(st, "$")) {
+            _hy_esperar(st, "$")
+            sea id = "$" + _hy_ident_pegado(st)
+            si (id == "$") {
+                id = "$" + anon
+                anon = anon + 1
+            }
+            para c en r["cadenas"] { si (c["id"] == id) { _hy_err(st, "cadena repetida " + id) } }
+            _hy_esperar(st, "=")
+            r["cadenas"].agregar(_hy_cadena(st, id))
+        }
+    }
+    si (_hy_ident(st) != "condition") { _hy_err(st, "falta 'condition' en la regla " + nombre) }
+    _hy_esperar(st, ":")
+    st["regla"] = r
+    st["previas"] = previas
+    r["condicion"] = _hy_c_o(st)
+    _hy_esperar(st, "}")
+    // Toda cadena tiene que usarse (como en YARA).
+    retornar r
+}
+
+funcion _hy_cadena(st, id) {
+    _hy_ws(st)
+    sea c = {"id": id, "tipo": "", "nocase": falso, "wide": falso, "ascii": falso, "fullword": falso, "private": falso, "xor": nulo}
+    si (_hy_mirar(st, "\"")) {
+        c["tipo"] = "texto"
+        c["valor"] = _hy_texto_lit(st)
+    } sino si (_hy_mirar(st, "{")) {
+        c["tipo"] = "hex"
+        _hy_esperar(st, "{")
+        sea fin = bytes_buscar(st["t"], "}", st["i"])
+        si (fin < 0) { _hy_err(st, "hexadecimal sin cerrar") }
+        c["patron"] = _hy_hex_compilar(subtexto(st["t"], st["i"], fin))
+        st["i"] = fin + 1
+    } sino si (_hy_mirar(st, "/")) {
+        c["tipo"] = "regex"
+        sea re = _hy_regex_lit(st)
+        c["regex"] = re
+    } sino { _hy_err(st, "cadena inválida " + id) }
+    mientras (verdadero) {
+        si (_hy_mirar_palabra(st, "nocase")) { c["nocase"] = verdadero }
+        sino si (_hy_mirar_palabra(st, "wide")) { c["wide"] = verdadero }
+        sino si (_hy_mirar_palabra(st, "ascii")) { c["ascii"] = verdadero }
+        sino si (_hy_mirar_palabra(st, "fullword")) { c["fullword"] = verdadero }
+        sino si (_hy_mirar_palabra(st, "private")) { c["private"] = verdadero }
+        sino si (_hy_mirar_palabra(st, "xor")) {
+            _hy_ident(st)
+            c["xor"] = [0, 255]
+            si (_hy_mirar(st, "(")) {
+                _hy_esperar(st, "(")
+                sea a = _hy_entero(st)
+                sea b = a
+                si (_hy_mirar(st, "-")) {
+                    _hy_esperar(st, "-")
+                    b = _hy_entero(st)
+                }
+                _hy_esperar(st, ")")
+                c["xor"] = [a, b]
+            }
+            continuar
+        } sino si (_hy_mirar_palabra(st, "base64") o _hy_mirar_palabra(st, "base64wide")) { _hy_err(st, "base64 no está soportado todavía") }
+        sino { romper }
+        _hy_ident(st)
+    }
+    si (c["wide"] == falso) { c["ascii"] = verdadero }
+    si (c["tipo"] == "regex" y c["nocase"]) { c["regex"]["nocase"] = verdadero }
+    retornar c
+}
+
+// ---------- cadenas hexadecimales ----------
+
+// Tokens: {"t": "b", "v", "m"} (byte con máscara), {"t": "salto", "min", "max"},
+// {"t": "alt", "ops": [[tokens], ...]}.
+funcion _hy_hex_compilar(h) {
+    sea st = {"t": h, "i": 0}
+    sea r = _hy_hex_seq(st)
+    _hy_ws(st)
+    si (st["i"] < longitud(h)) { lanzar "huella: hexadecimal inválido cerca de '" + subtexto(h, st["i"], st["i"] + 5) + "'" }
+    retornar r
+}
+
+funcion _hy_hex_seq(st) {
+    sea r = []
+    mientras (verdadero) {
+        _hy_ws(st)
+        si (st["i"] >= longitud(st["t"])) { retornar r }
+        sea c = subtexto(st["t"], st["i"], st["i"] + 1)
+        si (c == "|" o c == ")") { retornar r }
+        si (c == "(") {
+            st["i"] = st["i"] + 1
+            sea ops = [_hy_hex_seq(st)]
+            mientras (_hy_mirar(st, "|")) {
+                st["i"] = st["i"] + 1
+                ops.agregar(_hy_hex_seq(st))
+            }
+            _hy_esperar(st, ")")
+            r.agregar({"t": "alt", "ops": ops})
+        } sino si (c == "[") {
+            st["i"] = st["i"] + 1
+            sea fin = bytes_buscar(st["t"], "]", st["i"])
+            sea dentro = texto_recortar(subtexto(st["t"], st["i"], fin))
+            st["i"] = fin + 1
+            si (texto_contiene(dentro, "-")) {
+                sea p = texto_dividir(dentro, "-")
+                sea mn = 0
+                si (texto_recortar(p[0]) != "") { mn = a_numero(texto_recortar(p[0])) }
+                sea mx = -1
+                si (texto_recortar(p[1]) != "") { mx = a_numero(texto_recortar(p[1])) }
+                r.agregar({"t": "salto", "min": mn, "max": mx})
+            } sino { r.agregar({"t": "salto", "min": a_numero(dentro), "max": a_numero(dentro)}) }
+        } sino {
+            sea par = subtexto(st["t"], st["i"], st["i"] + 2)
+            st["i"] = st["i"] + 2
+            sea hi = subtexto(par, 0, 1)
+            sea lo = subtexto(par, 1, 2)
+            sea v = 0
+            sea m = 0
+            si (hi != "?") {
+                v = _hy_hex(hi) * 16
+                m = 240
+            }
+            si (lo != "?") {
+                v = v + _hy_hex(lo)
+                m = m + 15
+            }
+            si (subtexto(par, 0, 1) == "~") { lanzar "huella: el operador ~ en hexadecimales no está soportado" }
+            r.agregar({"t": "b", "v": v, "m": m})
+        }
+    }
+}
+
+// Devuelve las posiciones finales posibles al casar tokens desde p.
+funcion _hy_hex_casar(toks, k, datos, p, salida) {
+    si (k == longitud(toks)) {
+        salida.agregar(p)
+        retornar nulo
+    }
+    sea t = toks[k]
+    si (t["t"] == "b") {
+        si (p < longitud(datos) y bits_y(byte_en(datos, p), t["m"]) == t["v"]) { _hy_hex_casar(toks, k + 1, datos, p + 1, salida) }
+        retornar nulo
+    }
+    si (t["t"] == "salto") {
+        sea mx = t["max"]
+        si (mx < 0) { mx = longitud(datos) - p }
+        sea j = t["min"]
+        mientras (j <= mx y p + j <= longitud(datos)) {
+            _hy_hex_casar(toks, k + 1, datos, p + j, salida)
+            j = j + 1
+        }
+        retornar nulo
+    }
+    para op en t["ops"] {
+        sea fines = []
+        _hy_hex_casar(op, 0, datos, p, fines)
+        para f en fines { _hy_hex_casar(toks, k + 1, datos, f, salida) }
+    }
+}
+
+// ---------- expresiones regulares (sobre bytes) ----------
+
+funcion _hy_regex_lit(st) {
+    _hy_esperar(st, "/")
+    sea t = st["t"]
+    sea k = st["i"]
+    mientras (k < longitud(t) y byte_en(t, k) != 47) {
+        si (byte_en(t, k) == 92) { k = k + 1 }
+        k = k + 1
+    }
+    si (k >= longitud(t)) { _hy_err(st, "expresión regular sin cerrar") }
+    sea patron = subtexto(t, st["i"], k)
+    st["i"] = k + 1
+    sea nocase = falso
+    sea punto_todo = falso
+    mientras (st["i"] < longitud(t) y (subtexto(t, st["i"], st["i"] + 1) == "i" o subtexto(t, st["i"], st["i"] + 1) == "s")) {
+        si (subtexto(t, st["i"], st["i"] + 1) == "i") { nocase = verdadero } sino { punto_todo = verdadero }
+        st["i"] = st["i"] + 1
+    }
+    retornar {"patron": patron, "arbol": _hy_re_compilar(patron), "nocase": nocase, "punto_todo": punto_todo}
+}
+
+funcion _hy_re_compilar(p) {
+    sea st = {"p": p, "i": 0}
+    sea r = _hy_re_alt(st)
+    si (st["i"] < longitud(p)) { lanzar "huella: expresión regular inválida cerca de " + subtexto(p, st["i"], longitud(p)) }
+    retornar r
+}
+
+funcion _hy_re_alt(st) {
+    sea ops = [_hy_re_seq(st)]
+    mientras (st["i"] < longitud(st["p"]) y subtexto(st["p"], st["i"], st["i"] + 1) == "|") {
+        st["i"] = st["i"] + 1
+        ops.agregar(_hy_re_seq(st))
+    }
+    si (longitud(ops) == 1) { retornar ops[0] }
+    retornar {"t": "alt", "ops": ops}
+}
+
+funcion _hy_re_seq(st) {
+    sea items = []
+    mientras (st["i"] < longitud(st["p"])) {
+        sea c = subtexto(st["p"], st["i"], st["i"] + 1)
+        si (c == "|" o c == ")") { romper }
+        sea at = _hy_re_atomo(st)
+        // Cuantificador.
+        si (st["i"] < longitud(st["p"])) {
+            sea q = subtexto(st["p"], st["i"], st["i"] + 1)
+            sea mn = -1
+            sea mx = -1
+            si (q == "*") {
+                mn = 0
+                mx = 1000000000
+                st["i"] = st["i"] + 1
+            } sino si (q == "+") {
+                mn = 1
+                mx = 1000000000
+                st["i"] = st["i"] + 1
+            } sino si (q == "?") {
+                mn = 0
+                mx = 1
+                st["i"] = st["i"] + 1
+            } sino si (q == "{" y st["i"] + 1 < longitud(st["p"]) y texto_indice("0123456789,", subtexto(st["p"], st["i"] + 1, st["i"] + 2)) >= 0) {
+                sea fin = bytes_buscar(st["p"], "}", st["i"])
+                sea dentro = subtexto(st["p"], st["i"] + 1, fin)
+                st["i"] = fin + 1
+                si (texto_contiene(dentro, ",")) {
+                    sea p2 = texto_dividir(dentro, ",")
+                    mn = 0
+                    si (p2[0] != "") { mn = a_numero(p2[0]) }
+                    mx = 1000000000
+                    si (p2[1] != "") { mx = a_numero(p2[1]) }
+                } sino {
+                    mn = a_numero(dentro)
+                    mx = mn
+                }
+            }
+            si (mn >= 0) {
+                sea perezoso = falso
+                si (st["i"] < longitud(st["p"]) y subtexto(st["p"], st["i"], st["i"] + 1) == "?") {
+                    perezoso = verdadero
+                    st["i"] = st["i"] + 1
+                }
+                at = {"t": "rep", "a": at, "min": mn, "max": mx, "perezoso": perezoso}
+            }
+        }
+        items.agregar(at)
+    }
+    retornar {"t": "seq", "items": items}
+}
+
+funcion _hy_re_escape_clase(e) {
+    // Conjunto de 256 booleanos para \d \w \s y sus negaciones.
+    sea r = []
+    sea b = 0
+    mientras (b < 256) {
+        sea d = b >= 48 y b <= 57
+        sea w = d o (b >= 97 y b <= 122) o (b >= 65 y b <= 90) o b == 95
+        sea s = b == 32 o (b >= 9 y b <= 13)
+        sea v = falso
+        si (e == "d") { v = d } sino si (e == "D") { v = d == falso } sino si (e == "w") { v = w } sino si (e == "W") { v = w == falso }
+        sino si (e == "s") { v = s } sino si (e == "S") { v = s == falso }
+        r.agregar(v)
+        b = b + 1
+    }
+    retornar r
+}
+
+funcion _hy_re_byte_escape(st) {
+    // Tras "\": devuelve el byte literal de un escape simple.
+    sea e = subtexto(st["p"], st["i"], st["i"] + 1)
+    st["i"] = st["i"] + 1
+    si (e == "n") { retornar 10 }
+    si (e == "t") { retornar 9 }
+    si (e == "r") { retornar 13 }
+    si (e == "f") { retornar 12 }
+    si (e == "a") { retornar 7 }
+    si (e == "x") {
+        sea v = _hy_hex(subtexto(st["p"], st["i"], st["i"] + 2))
+        st["i"] = st["i"] + 2
+        retornar v
+    }
+    retornar byte_en(e, 0)
+}
+
+funcion _hy_re_atomo(st) {
+    sea p = st["p"]
+    sea c = subtexto(p, st["i"], st["i"] + 1)
+    st["i"] = st["i"] + 1
+    si (c == "(") {
+        si (subtexto(p, st["i"], st["i"] + 2) == "?:") { st["i"] = st["i"] + 2 }
+        sea a = _hy_re_alt(st)
+        si (subtexto(p, st["i"], st["i"] + 1) != ")") { lanzar "huella: falta ')' en la expresión regular" }
+        st["i"] = st["i"] + 1
+        retornar a
+    }
+    si (c == ".") { retornar {"t": "punto"} }
+    si (c == "^") { retornar {"t": "inicio"} }
+    si (c == "$") { retornar {"t": "fin"} }
+    si (c == "[") {
+        sea conj = []
+        sea k = 0
+        mientras (k < 256) {
+            conj.agregar(falso)
+            k = k + 1
+        }
+        sea negado = falso
+        si (subtexto(p, st["i"], st["i"] + 1) == "^") {
+            negado = verdadero
+            st["i"] = st["i"] + 1
+        }
+        sea primero = verdadero
+        mientras (verdadero) {
+            si (st["i"] >= longitud(p)) { lanzar "huella: clase sin cerrar en la expresión regular" }
+            sea x = subtexto(p, st["i"], st["i"] + 1)
+            si (x == "]" y primero == falso) {
+                st["i"] = st["i"] + 1
+                romper
+            }
+            primero = falso
+            st["i"] = st["i"] + 1
+            sea desde = -1
+            si (x == "\\") {
+                sea e = subtexto(p, st["i"], st["i"] + 1)
+                si (texto_indice("dDwWsS", e) >= 0) {
+                    st["i"] = st["i"] + 1
+                    sea cls = _hy_re_escape_clase(e)
+                    k = 0
+                    mientras (k < 256) {
+                        si (cls[k]) { conj[k] = verdadero }
+                        k = k + 1
+                    }
+                    continuar
+                }
+                desde = _hy_re_byte_escape(st)
+            } sino { desde = byte_en(x, 0) }
+            sea hasta = desde
+            si (subtexto(p, st["i"], st["i"] + 1) == "-" y subtexto(p, st["i"] + 1, st["i"] + 2) != "]") {
+                st["i"] = st["i"] + 1
+                sea y2 = subtexto(p, st["i"], st["i"] + 1)
+                st["i"] = st["i"] + 1
+                si (y2 == "\\") { hasta = _hy_re_byte_escape(st) } sino { hasta = byte_en(y2, 0) }
+            }
+            k = desde
+            mientras (k <= hasta) {
+                conj[k] = verdadero
+                k = k + 1
+            }
+        }
+        si (negado) {
+            k = 0
+            mientras (k < 256) {
+                conj[k] = conj[k] == falso
+                k = k + 1
+            }
+        }
+        retornar {"t": "clase", "c": conj}
+    }
+    si (c == "\\") {
+        sea e = subtexto(p, st["i"], st["i"] + 1)
+        si (texto_indice("dDwWsS", e) >= 0) {
+            st["i"] = st["i"] + 1
+            retornar {"t": "clase", "c": _hy_re_escape_clase(e)}
+        }
+        si (e == "b" o e == "B") {
+            st["i"] = st["i"] + 1
+            retornar {"t": "limite", "neg": e == "B"}
+        }
+        retornar {"t": "byte", "v": _hy_re_byte_escape(st)}
+    }
+    retornar {"t": "byte", "v": byte_en(c, 0)}
+}
+
+funcion _hy_minus(b) {
+    si (b >= 65 y b <= 90) { retornar b + 32 }
+    retornar b
+}
+
+funcion _hy_palabra(d, i) {
+    si (i < 0 o i >= longitud(d)) { retornar falso }
+    sea b = byte_en(d, i)
+    retornar (b >= 48 y b <= 57) o (b >= 97 y b <= 122) o (b >= 65 y b <= 90) o b == 95
+}
+
+// Casa el nodo n en d desde p y llama cont(fin) por cada fin posible (en
+// orden de preferencia); devuelve el primer resultado distinto de -1.
+funcion _hy_re(n, d, p, ctx, cont) {
+    sea t = n["t"]
+    si (t == "seq") { retornar _hy_re_items(n["items"], 0, d, p, ctx, cont) }
+    si (t == "alt") {
+        para o en n["ops"] {
+            sea r = _hy_re(o, d, p, ctx, cont)
+            si (r >= 0) { retornar r }
+        }
+        retornar -1
+    }
+    si (t == "rep") { retornar _hy_re_rep(n, 0, d, p, ctx, cont, -1) }
+    si (t == "inicio") {
+        si (p == 0) { retornar cont(p) }
+        retornar -1
+    }
+    si (t == "fin") {
+        si (p == longitud(d)) { retornar cont(p) }
+        retornar -1
+    }
+    si (t == "limite") {
+        sea es = _hy_palabra(d, p - 1) != _hy_palabra(d, p)
+        si (es != n["neg"]) { retornar cont(p) }
+        retornar -1
+    }
+    si (p >= longitud(d)) { retornar -1 }
+    sea b = byte_en(d, p)
+    si (t == "byte") {
+        si (b == n["v"] o (ctx["nocase"] y _hy_minus(b) == _hy_minus(n["v"]))) { retornar cont(p + 1) }
+        retornar -1
+    }
+    si (t == "punto") {
+        si (b != 10 o ctx["punto_todo"]) { retornar cont(p + 1) }
+        retornar -1
+    }
+    si (t == "clase") {
+        sea ok = n["c"][b]
+        si (ok == falso y ctx["nocase"]) {
+            sea alt = b
+            si (b >= 65 y b <= 90) { alt = b + 32 } sino si (b >= 97 y b <= 122) { alt = b - 32 }
+            ok = n["c"][alt]
+        }
+        si (ok) { retornar cont(p + 1) }
+        retornar -1
+    }
+    retornar -1
+}
+
+funcion _hy_re_items(items, k, d, p, ctx, cont) {
+    si (k == longitud(items)) { retornar cont(p) }
+    retornar _hy_re(items[k], d, p, ctx, funcion(q) { retornar _hy_re_items(items, k + 1, d, q, ctx, cont) })
+}
+
+funcion _hy_re_rep(n, veces, d, p, ctx, cont, previa) {
+    // Evita bucles infinitos con repeticiones que no avanzan.
+    si (p == previa) { retornar -1 }
+    si (n["perezoso"]) {
+        si (veces >= n["min"]) {
+            sea r = cont(p)
+            si (r >= 0) { retornar r }
+        }
+        si (veces < n["max"]) { retornar _hy_re(n["a"], d, p, ctx, funcion(q) { retornar _hy_re_rep(n, veces + 1, d, q, ctx, cont, p) }) }
+        retornar -1
+    }
+    si (veces < n["max"]) {
+        sea r = _hy_re(n["a"], d, p, ctx, funcion(q) { retornar _hy_re_rep(n, veces + 1, d, q, ctx, cont, p) })
+        si (r >= 0) { retornar r }
+    }
+    si (veces >= n["min"]) { retornar cont(p) }
+    retornar -1
+}
+
+// ---------- búsqueda de cadenas ----------
+
+funcion _hy_ancho(t) {
+    sea r = ""
+    sea i = 0
+    mientras (i < longitud(t)) {
+        r = r + subtexto(t, i, i + 1) + char_de(0)
+        i = i + 1
+    }
+    retornar r
+}
+
+funcion _hy_bordes_ok(c, d, ini, fin, ancho) {
+    si (c["fullword"] == falso) { retornar verdadero }
+    si (ancho) {
+        sea antes = ini >= 2 y _hy_palabra(d, ini - 2) y byte_en(d, ini - 1) == 0
+        sea despues = fin + 1 < longitud(d) y _hy_palabra(d, fin) y byte_en(d, fin + 1) == 0
+        retornar antes == falso y despues == falso
+    }
+    retornar _hy_palabra(d, ini - 1) == falso y _hy_palabra(d, fin) == falso
+}
+
+funcion _hy_buscar_literal(aguja, d, nocase, salida, c, ancho) {
+    sea n = longitud(aguja)
+    si (n == 0) { retornar nulo }
+    si (nocase == falso) {
+        sea p = bytes_buscar(d, aguja, 0)
+        mientras (p >= 0) {
+            si (_hy_bordes_ok(c, d, p, p + n, ancho)) { salida.agregar([p, n]) }
+            p = bytes_buscar(d, aguja, p + 1)
+        }
+        retornar nulo
+    }
+    sea dl = _hy_minusculas_bytes(d)
+    sea al = _hy_minusculas_bytes(aguja)
+    sea p = bytes_buscar(dl, al, 0)
+    mientras (p >= 0) {
+        si (_hy_bordes_ok(c, d, p, p + n, ancho)) { salida.agregar([p, n]) }
+        p = bytes_buscar(dl, al, p + 1)
+    }
+}
+
+// Minúsculas solo de A-Z (bytes, sin tocar UTF-8).
+funcion _hy_minusculas_bytes(t) {
+    sea partes = []
+    sea i = 0
+    sea ini = 0
+    mientras (i < longitud(t)) {
+        sea b = byte_en(t, i)
+        si (b >= 65 y b <= 90) {
+            partes.agregar(subtexto(t, ini, i))
+            partes.agregar(char_de(b + 32))
+            ini = i + 1
+        }
+        i = i + 1
+    }
+    partes.agregar(subtexto(t, ini, longitud(t)))
+    retornar unir(partes, "")
+}
+
+funcion _hy_casar_cadena(c, d) {
+    sea r = []
+    sea t = c["tipo"]
+    si (t == "texto") {
+        sea variantes = []
+        si (c["xor"] != nulo) {
+            sea k = c["xor"][0]
+            mientras (k <= c["xor"][1]) {
+                sea x = ""
+                sea i = 0
+                mientras (i < longitud(c["valor"])) {
+                    x = x + char_de(bits_xo(byte_en(c["valor"], i), k))
+                    i = i + 1
+                }
+                variantes.agregar(x)
+                k = k + 1
+            }
+        } sino { variantes.agregar(c["valor"]) }
+        para v en variantes {
+            si (c["ascii"]) { _hy_buscar_literal(v, d, c["nocase"], r, c, falso) }
+            si (c["wide"]) { _hy_buscar_literal(_hy_ancho(v), d, c["nocase"], r, c, verdadero) }
+        }
+    } sino si (t == "hex") {
+        sea primero = c["patron"][0]
+        sea p = 0
+        mientras (p < longitud(d)) {
+            si (primero["t"] != "b" o bits_y(byte_en(d, p), primero["m"]) == primero["v"]) {
+                sea fines = []
+                _hy_hex_casar(c["patron"], 0, d, p, fines)
+                si (longitud(fines) > 0) {
+                    // El más corto, como YARA con saltos variables.
+                    sea mejor = fines[0]
+                    para f en fines { si (f < mejor) { mejor = f } }
+                    r.agregar([p, mejor - p])
+                }
+            }
+            p = p + 1
+        }
+    } sino {
+        sea re = c["regex"]
+        sea fn_fin = funcion(q) { retornar q }
+        si (c["ascii"]) {
+            sea p = 0
+            mientras (p < longitud(d)) {
+                sea fin = _hy_re(re["arbol"], d, p, re, fn_fin)
+                si (fin > p y _hy_bordes_ok(c, d, p, fin, falso)) { r.agregar([p, fin - p]) }
+                p = p + 1
+            }
+        }
+        si (c["wide"]) {
+            // Desde cada posición, la vista "estrecha" de los pares X\0 que siguen.
+            sea p = 0
+            mientras (p + 1 < longitud(d)) {
+                si (byte_en(d, p + 1) == 0) {
+                    sea partes = []
+                    sea k = p
+                    mientras (k + 1 < longitud(d) y byte_en(d, k + 1) == 0 y longitud(partes) < 4096) {
+                        partes.agregar(subtexto(d, k, k + 1))
+                        k = k + 2
+                    }
+                    sea fin = _hy_re(re["arbol"], unir(partes, ""), 0, re, fn_fin)
+                    si (fin > 0 y _hy_bordes_ok(c, d, p, p + fin * 2, verdadero)) { r.agregar([p, fin * 2]) }
+                }
+                p = p + 1
+            }
+        }
+    }
+    // Orden y sin duplicados.
+    sea vistos = {}
+    sea limpio = []
+    para m en ordenar(r, funcion(a, b) { retornar (a[0] - b[0]) * 1000000 + (a[1] - b[1]) }) {
+        sea k = "" + m[0]
+        si (tiene_clave(vistos, k) == falso) {
+            vistos[k] = verdadero
+            limpio.agregar(m)
+        }
+    }
+    retornar limpio
+}
+
+// ---------- condiciones ----------
+
+funcion _hy_c_o(st) {
+    sea a = _hy_c_y(st)
+    mientras (_hy_mirar_palabra(st, "or")) {
+        _hy_ident(st)
+        a = {"op": "o", "a": a, "b": _hy_c_y(st)}
+    }
+    retornar a
+}
+
+funcion _hy_c_y(st) {
+    sea a = _hy_c_no(st)
+    mientras (_hy_mirar_palabra(st, "and")) {
+        _hy_ident(st)
+        a = {"op": "y", "a": a, "b": _hy_c_no(st)}
+    }
+    retornar a
+}
+
+funcion _hy_c_no(st) {
+    si (_hy_mirar_palabra(st, "not")) {
+        _hy_ident(st)
+        retornar {"op": "no", "a": _hy_c_no(st)}
+    }
+    retornar _hy_c_rel(st)
+}
+
+funcion _hy_c_rel(st) {
+    sea a = _hy_c_bits(st)
+    para op en ["==", "!=", "<=", ">=", "<", ">"] {
+        si (_hy_mirar(st, op)) {
+            _hy_esperar(st, op)
+            retornar {"op": "cmp", "c": op, "a": a, "b": _hy_c_bits(st)}
+        }
+    }
+    para op en ["contains", "icontains", "startswith", "endswith", "iequals"] {
+        si (_hy_mirar_palabra(st, op)) {
+            _hy_ident(st)
+            retornar {"op": "texto", "c": op, "a": a, "b": _hy_c_bits(st)}
+        }
+    }
+    retornar a
+}
+
+funcion _hy_c_bits(st) {
+    sea a = _hy_c_desp(st)
+    mientras (verdadero) {
+        si (_hy_mirar(st, "|") y _hy_mirar(st, "||") == falso) {
+            _hy_esperar(st, "|")
+            a = {"op": "ar", "c": "|", "a": a, "b": _hy_c_desp(st)}
+        } sino si (_hy_mirar(st, "^")) {
+            _hy_esperar(st, "^")
+            a = {"op": "ar", "c": "^", "a": a, "b": _hy_c_desp(st)}
+        } sino si (_hy_mirar(st, "&") y _hy_mirar(st, "&&") == falso) {
+            _hy_esperar(st, "&")
+            a = {"op": "ar", "c": "&", "a": a, "b": _hy_c_desp(st)}
+        } sino { retornar a }
+    }
+}
+
+funcion _hy_c_desp(st) {
+    sea a = _hy_c_suma(st)
+    mientras (_hy_mirar(st, "<<") o _hy_mirar(st, ">>")) {
+        sea op = subtexto(st["t"], st["i"], st["i"] + 2)
+        st["i"] = st["i"] + 2
+        a = {"op": "ar", "c": op, "a": a, "b": _hy_c_suma(st)}
+    }
+    retornar a
+}
+
+funcion _hy_c_suma(st) {
+    sea a = _hy_c_mul(st)
+    mientras (_hy_mirar(st, "+") o (_hy_mirar(st, "-") y _hy_mirar(st, "->") == falso)) {
+        sea op = subtexto(st["t"], st["i"], st["i"] + 1)
+        st["i"] = st["i"] + 1
+        a = {"op": "ar", "c": op, "a": a, "b": _hy_c_mul(st)}
+    }
+    retornar a
+}
+
+funcion _hy_c_mul(st) {
+    sea a = _hy_c_unario(st)
+    mientras (_hy_mirar(st, "*") o _hy_mirar(st, "\\") o (_hy_mirar(st, "%") y _hy_ws_y_fin_porc(st) == falso)) {
+        sea op = subtexto(st["t"], st["i"], st["i"] + 1)
+        st["i"] = st["i"] + 1
+        a = {"op": "ar", "c": op, "a": a, "b": _hy_c_unario(st)}
+    }
+    retornar a
+}
+
+funcion _hy_ws_y_fin_porc(st) {
+    // "50% of": el % pertenece al cuantificador, no al módulo.
+    sea guardado = st["i"]
+    st["i"] = st["i"] + 1
+    sea es = _hy_mirar_palabra(st, "of")
+    st["i"] = guardado
+    retornar es
+}
+
+funcion _hy_c_unario(st) {
+    si (_hy_mirar(st, "-")) {
+        _hy_esperar(st, "-")
+        retornar {"op": "ar", "c": "-", "a": {"op": "num", "v": 0}, "b": _hy_c_unario(st)}
+    }
+    si (_hy_mirar(st, "~")) {
+        _hy_esperar(st, "~")
+        retornar {"op": "inv", "a": _hy_c_unario(st)}
+    }
+    retornar _hy_c_prim(st)
+}
+
+funcion _hy_c_rango(st) {
+    _hy_esperar(st, "(")
+    sea a = _hy_c_bits(st)
+    _hy_esperar(st, "..")
+    sea b = _hy_c_bits(st)
+    _hy_esperar(st, ")")
+    retornar [a, b]
+}
+
+funcion _hy_c_conjunto(st) {
+    // "them" o ($a, $b*, …): lista de patrones de identificador.
+    si (_hy_mirar_palabra(st, "them")) {
+        _hy_ident(st)
+        retornar {"tipo": "cadenas", "pats": ["$*"]}
+    }
+    _hy_esperar(st, "(")
+    sea pats = []
+    sea reglas = []
+    mientras (verdadero) {
+        si (_hy_mirar(st, "$")) {
+            _hy_esperar(st, "$")
+            sea id = "$" + _hy_ident_pegado(st)
+            si (_hy_mirar(st, "*")) {
+                _hy_esperar(st, "*")
+                id = id + "*"
+            }
+            pats.agregar(id)
+        } sino {
+            sea nm = _hy_ident(st)
+            si (_hy_mirar(st, "*")) {
+                _hy_esperar(st, "*")
+                nm = nm + "*"
+            }
+            reglas.agregar(nm)
+        }
+        si (_hy_mirar(st, ",")) { _hy_esperar(st, ",") } sino { romper }
+    }
+    _hy_esperar(st, ")")
+    si (longitud(reglas) > 0) { retornar {"tipo": "reglas", "pats": reglas} }
+    retornar {"tipo": "cadenas", "pats": pats}
+}
+
+funcion _hy_c_cuantificador(st) {
+    si (_hy_mirar_palabra(st, "any")) {
+        _hy_ident(st)
+        retornar {"q": "any"}
+    }
+    si (_hy_mirar_palabra(st, "all")) {
+        _hy_ident(st)
+        retornar {"q": "all"}
+    }
+    si (_hy_mirar_palabra(st, "none")) {
+        _hy_ident(st)
+        retornar {"q": "none"}
+    }
+    sea n = _hy_c_unario(st)
+    si (_hy_mirar(st, "%")) {
+        _hy_esperar(st, "%")
+        retornar {"q": "porc", "n": n}
+    }
+    retornar {"q": "n", "n": n}
+}
+
+funcion _hy_c_prim(st) {
+    si (_hy_mirar(st, "(")) {
+        _hy_esperar(st, "(")
+        sea a = _hy_c_o(st)
+        _hy_esperar(st, ")")
+        retornar a
+    }
+    si (_hy_mirar_palabra(st, "true")) {
+        _hy_ident(st)
+        retornar {"op": "num", "v": verdadero}
+    }
+    si (_hy_mirar_palabra(st, "false")) {
+        _hy_ident(st)
+        retornar {"op": "num", "v": falso}
+    }
+    si (_hy_mirar_palabra(st, "filesize")) {
+        _hy_ident(st)
+        retornar {"op": "tam"}
+    }
+    si (_hy_mirar(st, "\"")) { retornar {"op": "num", "v": _hy_texto_lit(st)} }
+    si (_hy_mirar_palabra(st, "for")) {
+        _hy_ident(st)
+        sea q = _hy_c_cuantificador(st)
+        si (_hy_mirar_palabra(st, "of")) {
+            _hy_ident(st)
+            sea conj = _hy_c_conjunto(st)
+            _hy_esperar(st, ":")
+            _hy_esperar(st, "(")
+            sea cuerpo = _hy_c_o(st)
+            _hy_esperar(st, ")")
+            retornar {"op": "for_of", "q": q, "conj": conj, "cuerpo": cuerpo}
+        }
+        sea var = _hy_ident(st)
+        si (_hy_ident(st) != "in") { _hy_err(st, "se esperaba 'in' en el for") }
+        sea dom = nulo
+        _hy_esperar(st, "(")
+        sea a = _hy_c_bits(st)
+        si (_hy_mirar(st, "..")) {
+            _hy_esperar(st, "..")
+            dom = {"rango": [a, _hy_c_bits(st)]}
+        } sino {
+            sea vals = [a]
+            mientras (_hy_mirar(st, ",")) {
+                _hy_esperar(st, ",")
+                vals.agregar(_hy_c_bits(st))
+            }
+            dom = {"lista": vals}
+        }
+        _hy_esperar(st, ")")
+        _hy_esperar(st, ":")
+        _hy_esperar(st, "(")
+        sea cuerpo = _hy_c_o(st)
+        _hy_esperar(st, ")")
+        retornar {"op": "for_in", "q": q, "var": var, "dom": dom, "cuerpo": cuerpo}
+    }
+    si (_hy_mirar_palabra(st, "any") o _hy_mirar_palabra(st, "all") o _hy_mirar_palabra(st, "none")) {
+        sea q = _hy_c_cuantificador(st)
+        si (_hy_ident(st) != "of") { _hy_err(st, "se esperaba 'of'") }
+        sea conj = _hy_c_conjunto(st)
+        sea rango = nulo
+        si (_hy_mirar_palabra(st, "in")) {
+            _hy_ident(st)
+            rango = _hy_c_rango(st)
+        }
+        retornar {"op": "of", "q": q, "conj": conj, "rango": rango}
+    }
+    si (_hy_mirar(st, "$")) {
+        _hy_esperar(st, "$")
+        sea id = "$" + _hy_ident_pegado(st)
+        si (_hy_mirar_palabra(st, "at")) {
+            _hy_ident(st)
+            retornar {"op": "at", "id": id, "pos": _hy_c_bits(st)}
+        }
+        si (_hy_mirar_palabra(st, "in")) {
+            _hy_ident(st)
+            retornar {"op": "en", "id": id, "rango": _hy_c_rango(st)}
+        }
+        retornar {"op": "cad", "id": id}
+    }
+    si (_hy_mirar(st, "#")) {
+        _hy_esperar(st, "#")
+        sea id = "$" + _hy_ident_pegado(st)
+        si (_hy_mirar_palabra(st, "in")) {
+            _hy_ident(st)
+            retornar {"op": "cuenta", "id": id, "rango": _hy_c_rango(st)}
+        }
+        retornar {"op": "cuenta", "id": id, "rango": nulo}
+    }
+    si (_hy_mirar(st, "@") o _hy_mirar(st, "!")) {
+        sea que = subtexto(st["t"], st["i"], st["i"] + 1)
+        st["i"] = st["i"] + 1
+        sea id = "$" + _hy_ident_pegado(st)
+        sea idx = {"op": "num", "v": 1}
+        si (_hy_mirar(st, "[")) {
+            _hy_esperar(st, "[")
+            idx = _hy_c_bits(st)
+            _hy_esperar(st, "]")
+        }
+        si (que == "@") { retornar {"op": "pos", "id": id, "i": idx} }
+        retornar {"op": "largo", "id": id, "i": idx}
+    }
+    _hy_ws(st)
+    sea c = subtexto(st["t"], st["i"], st["i"] + 1)
+    si (texto_indice("0123456789", c) >= 0) {
+        sea n = _hy_entero(st)
+        si (_hy_mirar(st, "%") y _hy_ws_y_fin_porc(st)) {
+            _hy_esperar(st, "%")
+            _hy_ident(st)
+            sea conj = _hy_c_conjunto(st)
+            retornar {"op": "of", "q": {"q": "porc", "n": {"op": "num", "v": n}}, "conj": conj, "rango": nulo}
+        }
+        si (_hy_mirar_palabra(st, "of")) {
+            _hy_ident(st)
+            sea conj = _hy_c_conjunto(st)
+            sea rango = nulo
+            si (_hy_mirar_palabra(st, "in")) {
+                _hy_ident(st)
+                rango = _hy_c_rango(st)
+            }
+            retornar {"op": "of", "q": {"q": "n", "n": {"op": "num", "v": n}}, "conj": conj, "rango": rango}
+        }
+        retornar {"op": "num", "v": n}
+    }
+    sea nm = _hy_ident(st)
+    si (nm == "") { _hy_err(st, "expresión inválida cerca de '" + subtexto(st["t"], st["i"], st["i"] + 10) + "'") }
+    para f en ["uint8", "uint16", "uint32", "int8", "int16", "int32", "uint8be", "uint16be", "uint32be", "int8be", "int16be", "int32be"] {
+        si (nm == f) {
+            _hy_esperar(st, "(")
+            sea a = _hy_c_bits(st)
+            _hy_esperar(st, ")")
+            retornar {"op": "leer", "f": f, "a": a}
+        }
+    }
+    // Variable de un for o referencia a otra regla.
+    retornar {"op": "nombre", "n": nm}
+}
+
+// ---------- evaluación ----------
+
+funcion _hy_comodin(pat, id) {
+    si (texto_termina_con(pat, "*")) { retornar texto_empieza_con(id, subtexto(pat, 0, longitud(pat) - 1)) }
+    retornar pat == id
+}
+
+funcion _hy_ids(ctx, conj) {
+    sea r = []
+    si (conj["tipo"] == "reglas") {
+        para p en conj["pats"] { para nm en claves(ctx["resultados"]) { si (_hy_comodin(p, nm) y lista_contiene(r, nm) == falso) { r.agregar(nm) } } }
+        retornar r
+    }
+    para p en conj["pats"] { para c en ctx["regla"]["cadenas"] { si (_hy_comodin(p, c["id"]) y lista_contiene(r, c["id"]) == falso) { r.agregar(c["id"]) } } }
+    retornar r
+}
+
+funcion _hy_bool(v) {
+    si (v == nulo) { retornar falso }
+    si (tipo(v) == "booleano") { retornar v }
+    si (tipo(v) == "texto") { retornar v != "" }
+    retornar v != 0
+}
+
+funcion _hy_cuant(q, n_ok, total, ctx) {
+    si (q["q"] == "any") { retornar n_ok >= 1 }
+    si (q["q"] == "all") { retornar n_ok == total }
+    si (q["q"] == "none") { retornar n_ok == 0 }
+    sea n = _hy_ev(q["n"], ctx)
+    si (n == nulo) { retornar falso }
+    si (q["q"] == "porc") { retornar n_ok * 100 >= n * total }
+    retornar n_ok >= n
+}
+
+funcion _hy_m(ctx, id) {
+    si (tiene_clave(ctx["m"], id) == falso) { lanzar "huella: cadena no definida " + id }
+    retornar ctx["m"][id]
+}
+
+funcion _hy_ev(n, ctx) {
+    sea op = n["op"]
+    si (op == "num") { retornar n["v"] }
+    si (op == "tam") { retornar longitud(ctx["datos"]) }
+    si (op == "y") { retornar _hy_bool(_hy_ev(n["a"], ctx)) y _hy_bool(_hy_ev(n["b"], ctx)) }
+    si (op == "o") { retornar _hy_bool(_hy_ev(n["a"], ctx)) o _hy_bool(_hy_ev(n["b"], ctx)) }
+    si (op == "no") {
+        sea v = _hy_ev(n["a"], ctx)
+        si (v == nulo) { retornar falso }
+        retornar _hy_bool(v) == falso
+    }
+    si (op == "cad") {
+        sea id = n["id"]
+        si (id == "$") { id = ctx["actual"] }
+        retornar longitud(_hy_m(ctx, id)) > 0
+    }
+    si (op == "cuenta") {
+        sea id = n["id"]
+        si (id == "$") { id = ctx["actual"] }
+        sea ms = _hy_m(ctx, id)
+        si (n["rango"] == nulo) { retornar longitud(ms) }
+        sea a = _hy_ev(n["rango"][0], ctx)
+        sea b = _hy_ev(n["rango"][1], ctx)
+        sea k = 0
+        para m en ms { si (m[0] >= a y m[0] <= b) { k = k + 1 } }
+        retornar k
+    }
+    si (op == "at") {
+        sea id = n["id"]
+        si (id == "$") { id = ctx["actual"] }
+        sea pos = _hy_ev(n["pos"], ctx)
+        para m en _hy_m(ctx, id) { si (m[0] == pos) { retornar verdadero } }
+        retornar falso
+    }
+    si (op == "en") {
+        sea id = n["id"]
+        si (id == "$") { id = ctx["actual"] }
+        sea a = _hy_ev(n["rango"][0], ctx)
+        sea b = _hy_ev(n["rango"][1], ctx)
+        para m en _hy_m(ctx, id) { si (m[0] >= a y m[0] <= b) { retornar verdadero } }
+        retornar falso
+    }
+    si (op == "pos" o op == "largo") {
+        sea id = n["id"]
+        si (id == "$") { id = ctx["actual"] }
+        sea ms = _hy_m(ctx, id)
+        sea i = _hy_ev(n["i"], ctx)
+        si (i == nulo o i < 1 o i > longitud(ms)) { retornar nulo }
+        si (op == "pos") { retornar ms[i - 1][0] }
+        retornar ms[i - 1][1]
+    }
+    si (op == "cmp") {
+        sea a = _hy_ev(n["a"], ctx)
+        sea b = _hy_ev(n["b"], ctx)
+        si (a == nulo o b == nulo) { retornar falso }
+        si (tipo(a) == "booleano") { a = si(a, 1, 0) }
+        si (tipo(b) == "booleano") { b = si(b, 1, 0) }
+        sea c = n["c"]
+        si (c == "==") { retornar a == b }
+        si (c == "!=") { retornar a != b }
+        si (c == "<") { retornar a < b }
+        si (c == "<=") { retornar a <= b }
+        si (c == ">") { retornar a > b }
+        retornar a >= b
+    }
+    si (op == "texto") {
+        sea a = _hy_ev(n["a"], ctx)
+        sea b = _hy_ev(n["b"], ctx)
+        si (a == nulo o b == nulo) { retornar falso }
+        sea c = n["c"]
+        si (c == "contains") { retornar bytes_buscar(a, b, 0) >= 0 }
+        si (c == "icontains") { retornar bytes_buscar(_hy_minusculas_bytes(a), _hy_minusculas_bytes(b), 0) >= 0 }
+        si (c == "startswith") { retornar texto_empieza_con(a, b) }
+        si (c == "endswith") { retornar texto_termina_con(a, b) }
+        retornar _hy_minusculas_bytes(a) == _hy_minusculas_bytes(b)
+    }
+    si (op == "ar") {
+        sea a = _hy_ev(n["a"], ctx)
+        sea b = _hy_ev(n["b"], ctx)
+        si (a == nulo o b == nulo) { retornar nulo }
+        si (tipo(a) == "booleano") { a = si(a, 1, 0) }
+        si (tipo(b) == "booleano") { b = si(b, 1, 0) }
+        sea c = n["c"]
+        si (c == "+") { retornar a + b }
+        si (c == "-") { retornar a - b }
+        si (c == "*") { retornar a * b }
+        si (c == "\\") {
+            si (b == 0) { retornar nulo }
+            sea q = piso(absoluto(a) / absoluto(b))
+            si ((a < 0) != (b < 0)) { q = 0 - q }
+            retornar q
+        }
+        si (c == "%") {
+            si (b == 0) { retornar nulo }
+            retornar a - b * (si(a / b < 0, 0 - piso(absoluto(a / b)), piso(a / b)))
+        }
+        si (c == "&") { retornar bits_y(a, b) }
+        si (c == "|") { retornar bits_o(a, b) }
+        si (c == "^") { retornar bits_xo(a, b) }
+        si (c == "<<") { retornar a * potencia(2, b) }
+        retornar piso(a / potencia(2, b))
+    }
+    si (op == "inv") {
+        sea a = _hy_ev(n["a"], ctx)
+        si (a == nulo) { retornar nulo }
+        retornar -1 - a
+    }
+    si (op == "leer") {
+        sea p = _hy_ev(n["a"], ctx)
+        sea f = n["f"]
+        sea ancho = 1
+        si (texto_contiene(f, "16")) { ancho = 2 }
+        si (texto_contiene(f, "32")) { ancho = 4 }
+        si (p == nulo o p < 0 o p + ancho > longitud(ctx["datos"])) { retornar nulo }
+        sea orden = 1
+        si (texto_termina_con(f, "be")) { orden = 0 }
+        sea v = bytes_leer_entero(ctx["datos"], p, ancho, orden)
+        si (texto_empieza_con(f, "int") y v >= potencia(2, ancho * 8 - 1)) { v = v - potencia(2, ancho * 8) }
+        retornar v
+    }
+    si (op == "of") {
+        sea ids = _hy_ids(ctx, n["conj"])
+        sea ok = 0
+        para id en ids {
+            sea v = falso
+            si (n["conj"]["tipo"] == "reglas") { v = ctx["resultados"][id] ?? falso }
+            sino si (n["rango"] != nulo) {
+                sea a = _hy_ev(n["rango"][0], ctx)
+                sea b = _hy_ev(n["rango"][1], ctx)
+                para m en _hy_m(ctx, id) { si (m[0] >= a y m[0] <= b) { v = verdadero } }
+            } sino { v = longitud(_hy_m(ctx, id)) > 0 }
+            si (v) { ok = ok + 1 }
+        }
+        retornar _hy_cuant(n["q"], ok, longitud(ids), ctx)
+    }
+    si (op == "for_of") {
+        sea ids = _hy_ids(ctx, n["conj"])
+        sea ok = 0
+        sea previo = ctx["actual"]
+        para id en ids {
+            ctx["actual"] = id
+            si (_hy_bool(_hy_ev(n["cuerpo"], ctx))) { ok = ok + 1 }
+        }
+        ctx["actual"] = previo
+        retornar _hy_cuant(n["q"], ok, longitud(ids), ctx)
+    }
+    si (op == "for_in") {
+        sea valores = []
+        si (tiene_clave(n["dom"], "rango")) {
+            sea a = _hy_ev(n["dom"]["rango"][0], ctx)
+            sea b = _hy_ev(n["dom"]["rango"][1], ctx)
+            si (a == nulo o b == nulo) { retornar falso }
+            sea i = a
+            mientras (i <= b) {
+                valores.agregar(i)
+                i = i + 1
+            }
+        } sino { para e en n["dom"]["lista"] { valores.agregar(_hy_ev(e, ctx)) } }
+        sea ok = 0
+        sea previo = ctx["vars"][n["var"]] ?? nulo
+        para v en valores {
+            ctx["vars"][n["var"]] = v
+            si (_hy_bool(_hy_ev(n["cuerpo"], ctx))) { ok = ok + 1 }
+        }
+        ctx["vars"][n["var"]] = previo
+        retornar _hy_cuant(n["q"], ok, longitud(valores), ctx)
+    }
+    si (op == "nombre") {
+        si (tiene_clave(ctx["vars"], n["n"]) y ctx["vars"][n["n"]] != nulo) { retornar ctx["vars"][n["n"]] }
+        si (tiene_clave(ctx["resultados"], n["n"])) { retornar ctx["resultados"][n["n"]] }
+        lanzar "huella: identificador desconocido '" + n["n"] + "'"
+    }
+    lanzar "huella: operación desconocida " + op
+}
+
+// ---------- escaneo ----------
+
+/// Aplica las reglas a unos bytes. Devuelve las reglas que coinciden (no las
+/// private): [{"regla", "etiquetas", "meta", "cadenas": [{"id", "desplazamiento", "datos"}]}].
+funcion huella_escanear(reglas, datos) {
+    sea resultados = {}
+    sea salida = []
+    // Las reglas global se evalúan primero: si alguna falla, nada coincide.
+    sea orden = []
+    para r en reglas["reglas"] { si (r["global"]) { orden.agregar(r) } }
+    para r en reglas["reglas"] { si (r["global"] == falso) { orden.agregar(r) } }
+    sea globales_ok = verdadero
+    sea casados = {}
+    para r en orden {
+        sea m = {}
+        para c en r["cadenas"] { m[c["id"]] = _hy_casar_cadena(c, datos) }
+        sea ctx = {"datos": datos, "m": m, "regla": r, "resultados": resultados, "actual": nulo, "vars": {}}
+        sea ok = _hy_bool(_hy_ev(r["condicion"], ctx))
+        si (r["global"] y ok == falso) { globales_ok = falso }
+        resultados[r["nombre"]] = ok
+        casados[r["nombre"]] = m
+    }
+    para r en reglas["reglas"] {
+        si (resultados[r["nombre"]] y globales_ok y r["privada"] == falso) {
+            sea cads = []
+            para c en r["cadenas"] {
+                si (c["private"] == falso) {
+                    para x en casados[r["nombre"]][c["id"]] { cads.agregar({"id": c["id"], "desplazamiento": x[0], "datos": subtexto(datos, x[0], x[0] + x[1])}) }
+                }
+            }
+            salida.agregar({"regla": r["nombre"], "etiquetas": r["etiquetas"], "meta": r["meta"], "cadenas": cads})
+        }
+    }
+    retornar salida
+}
+
+/// Aplica las reglas a un archivo.
+funcion huella_escanear_archivo(reglas, ruta) { retornar huella_escanear(reglas, leer_archivo(ruta)) }
+
+/// Nombres de las reglas que coinciden.
+funcion huella_coincidencias(reglas, datos) {
+    sea r = []
+    para x en huella_escanear(reglas, datos) { r.agregar(x["regla"]) }
+    retornar r
+}
+
+/// ¿El texto de reglas compila? Devuelve nulo o el mensaje de error.
+funcion huella_validar(texto) {
+    intentar {
+        huella_compilar(texto)
+        retornar nulo
+    } capturar (e) { retornar e }
+}

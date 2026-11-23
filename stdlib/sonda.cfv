@@ -1,0 +1,1191 @@
+// stdlib/sonda.cfv — Captura y análisis de paquetes de red al estilo de
+// libpcap/tcpdump, escrito desde cero (idea de libpcap, BSD).
+//
+//   · Archivos .pcap (micro y nanosegundos, ambos órdenes de bytes) y
+//     .pcapng (SHB, IDB, EPB, SPB, varias interfaces): leer y escribir.
+//   · Decodificación por capas: Ethernet, VLAN 802.1Q, Linux SLL/SLL2,
+//     loopback, ARP, IPv4, IPv6 (con cabeceras de extensión), TCP (con
+//     opciones), UDP, ICMP, ICMPv6 y DNS.
+//   · Filtros con la sintaxis de tcpdump: "tcp port 443 and host 10.0.0.1",
+//     "udp and not port 53", "net 192.168.0.0/16", "portrange 8000-8100",
+//     "ether host aa:bb:cc:dd:ee:ff", "len > 100", paréntesis, and/or/not.
+//   · Construcción de paquetes Ethernet/IPv4/IPv6/TCP/UDP/ICMP con sumas de
+//     verificación correctas, y estadísticas de una captura.
+//   · Captura en vivo en Linux (AF_PACKET; requiere root o CAP_NET_RAW).
+//
+// En inglés: importar "libpcap".
+//
+//   importar "sonda"
+//   sea cap = sonda_leer("trafico.pcap")
+//   para p en sonda_filtrar(cap, "tcp port 443") { mostrar(sonda_decodificar(p["datos"], cap["enlace"])["resumen"]) }
+
+importar "sistema"
+
+// ---------- utilidades ----------
+
+funcion _snd_u16(b, i) { retornar bytes_leer_entero(b, i, 2, 0) }
+funcion _snd_u32(b, i) { retornar bytes_leer_entero(b, i, 4, 0) }
+
+funcion _snd_hex2(v) {
+    sea h = "0123456789abcdef"
+    retornar subtexto(h, piso(v / 16), piso(v / 16) + 1) + subtexto(h, v % 16, v % 16 + 1)
+}
+
+/// "aa:bb:cc:dd:ee:ff" de 6 bytes.
+funcion sonda_mac_texto(b) {
+    sea p = []
+    sea i = 0
+    mientras (i < 6) {
+        p.agregar(_snd_hex2(byte_en(b, i)))
+        i = i + 1
+    }
+    retornar unir(p, ":")
+}
+
+/// 6 bytes de "aa:bb:cc:dd:ee:ff" (también con "-").
+funcion sonda_mac_bytes(t) {
+    sea s = texto_reemplazar(texto_minusculas(t), "-", ":")
+    sea r = ""
+    para x en texto_dividir(s, ":") { r = r + char_de(_snd_hex_valor(x)) }
+    si (longitud(r) != 6) { lanzar "sonda: MAC inválida " + t }
+    retornar r
+}
+
+funcion _snd_hex_valor(x) {
+    sea v = 0
+    sea i = 0
+    mientras (i < longitud(x)) {
+        sea c = texto_indice("0123456789abcdef", subtexto(x, i, i + 1))
+        si (c < 0) { lanzar "sonda: hexadecimal inválido " + x }
+        v = v * 16 + c
+        i = i + 1
+    }
+    retornar v
+}
+
+/// "a.b.c.d" de 4 bytes.
+funcion sonda_ipv4_texto(b) { retornar "" + byte_en(b, 0) + "." + byte_en(b, 1) + "." + byte_en(b, 2) + "." + byte_en(b, 3) }
+
+/// 4 bytes de "a.b.c.d".
+funcion sonda_ipv4_bytes(t) {
+    sea p = texto_dividir(t, ".")
+    si (longitud(p) != 4) { lanzar "sonda: IPv4 inválida " + t }
+    sea r = ""
+    para x en p {
+        sea v = a_numero(x)
+        si (v < 0 o v > 255 o v != piso(v)) { lanzar "sonda: IPv4 inválida " + t }
+        r = r + char_de(v)
+    }
+    retornar r
+}
+
+/// Texto IPv6 (RFC 5952: minúsculas, "::" en la racha de ceros más larga).
+funcion sonda_ipv6_texto(b) {
+    sea g = []
+    sea i = 0
+    mientras (i < 8) {
+        g.agregar(_snd_u16(b, i * 2))
+        i = i + 1
+    }
+    // Racha de ceros más larga (de al menos 2 grupos).
+    sea mejor_ini = -1
+    sea mejor_largo = 0
+    i = 0
+    mientras (i < 8) {
+        si (g[i] == 0) {
+            sea j = i
+            mientras (j < 8 y g[j] == 0) { j = j + 1 }
+            si (j - i > mejor_largo) {
+                mejor_ini = i
+                mejor_largo = j - i
+            }
+            i = j
+        } sino { i = i + 1 }
+    }
+    si (mejor_largo < 2) { mejor_ini = -1 }
+    sea partes = []
+    i = 0
+    mientras (i < 8) {
+        si (i == mejor_ini) {
+            si (i == 0) { partes.agregar("") }
+            partes.agregar("")
+            i = i + mejor_largo
+            si (i == 8) { partes.agregar("") }
+        } sino {
+            partes.agregar(_snd_hex_corto(g[i]))
+            i = i + 1
+        }
+    }
+    retornar unir(partes, ":")
+}
+
+funcion _snd_hex_corto(v) {
+    si (v == 0) { retornar "0" }
+    sea h = "0123456789abcdef"
+    sea r = ""
+    sea x = v
+    mientras (x > 0) {
+        r = subtexto(h, x % 16, x % 16 + 1) + r
+        x = piso(x / 16)
+    }
+    retornar r
+}
+
+/// 16 bytes de un texto IPv6 (acepta "::" y un IPv4 final).
+funcion sonda_ipv6_bytes(t) {
+    sea s = texto_minusculas(t)
+    sea cola_v4 = ""
+    sea ult = texto_dividir(s, ":")
+    si (texto_contiene(ult[longitud(ult) - 1], ".")) {
+        cola_v4 = sonda_ipv4_bytes(ult[longitud(ult) - 1])
+        s = subtexto(s, 0, longitud(s) - longitud(ult[longitud(ult) - 1])) + "0:0"
+    }
+    sea izq = s
+    sea der = ""
+    sea doble = texto_indice(s, "::")
+    si (doble >= 0) {
+        izq = subtexto(s, 0, doble)
+        der = subtexto(s, doble + 2, longitud(s))
+    }
+    sea gi = []
+    sea gd = []
+    si (izq != "") { para x en texto_dividir(izq, ":") { gi.agregar(_snd_hex_valor(x)) } }
+    si (der != "") { para x en texto_dividir(der, ":") { gd.agregar(_snd_hex_valor(x)) } }
+    sea total = longitud(gi) + longitud(gd)
+    si ((doble < 0 y total != 8) o total > 8) { lanzar "sonda: IPv6 inválida " + t }
+    sea r = ""
+    para v en gi { r = r + bytes_entero(v, 2, 0) }
+    sea k = 0
+    mientras (k < 8 - total) {
+        r = r + bytes_entero(0, 2, 0)
+        k = k + 1
+    }
+    para v en gd { r = r + bytes_entero(v, 2, 0) }
+    si (cola_v4 != "") { r = subtexto(r, 0, 12) + cola_v4 }
+    retornar r
+}
+
+/// Suma de verificación de Internet (RFC 1071) de unos bytes.
+funcion sonda_suma_verificacion(b) {
+    sea s = 0
+    sea i = 0
+    sea n = longitud(b)
+    mientras (i + 1 < n) {
+        s = s + byte_en(b, i) * 256 + byte_en(b, i + 1)
+        i = i + 2
+    }
+    si (i < n) { s = s + byte_en(b, i) * 256 }
+    mientras (s > 65535) { s = (s % 65536) + piso(s / 65536) }
+    retornar 65535 - s
+}
+
+// ---------- archivos pcap y pcapng ----------
+
+/// Lee un archivo .pcap o .pcapng.
+funcion sonda_leer(ruta) { retornar sonda_de_bytes(leer_archivo(ruta)) }
+
+/// Captura de unos bytes: {"formato", "enlace", "nano", "paquetes": [{"tiempo",
+/// "ts_ns", "datos", "largo_original", "interfaz"}], "interfaces"}.
+funcion sonda_de_bytes(b) {
+    si (longitud(b) < 24) { lanzar "sonda: archivo demasiado corto" }
+    sea m = hex_de_bytes(subtexto(b, 0, 4))
+    si (m == "0a0d0d0a") { retornar _snd_leer_pcapng(b) }
+    sea le = verdadero
+    sea nano = falso
+    si (m == "d4c3b2a1") { le = verdadero }
+    sino si (m == "a1b2c3d4") { le = falso }
+    sino si (m == "4d3cb2a1") { nano = verdadero }
+    sino si (m == "a1b23c4d") {
+        le = falso
+        nano = verdadero
+    } sino { lanzar "sonda: no es pcap ni pcapng (" + m + ")" }
+    sea orden = 0
+    si (le) { orden = 1 }
+    sea enlace = bytes_leer_entero(b, 20, 4, orden) % 65536
+    sea r = {"formato": "pcap", "enlace": enlace, "nano": nano, "largo_maximo": bytes_leer_entero(b, 16, 4, orden), "paquetes": [],
+        "interfaces": [{"enlace": enlace, "nombre": nulo}]}
+    sea p = 24
+    mientras (p + 16 <= longitud(b)) {
+        sea seg = bytes_leer_entero(b, p, 4, orden)
+        sea frac = bytes_leer_entero(b, p + 4, 4, orden)
+        sea incl = bytes_leer_entero(b, p + 8, 4, orden)
+        sea orig = bytes_leer_entero(b, p + 12, 4, orden)
+        si (p + 16 + incl > longitud(b)) { lanzar "sonda: paquete truncado en la posición " + p }
+        sea ns = seg * 1000000000 + frac * 1000
+        si (nano) { ns = seg * 1000000000 + frac }
+        r["paquetes"].agregar({"tiempo": seg + frac / (si(nano, 1000000000, 1000000)), "ts_ns": ns, "datos": subtexto(b, p + 16, p + 16 + incl),
+            "largo_original": orig, "interfaz": 0})
+        p = p + 16 + incl
+    }
+    retornar r
+}
+
+funcion _snd_leer_pcapng(b) {
+    sea r = {"formato": "pcapng", "enlace": 1, "nano": falso, "paquetes": [], "interfaces": []}
+    sea p = 0
+    sea orden = 1
+    sea n = longitud(b)
+    mientras (p + 12 <= n) {
+        sea tipo_b = 0
+        sea largo = 0
+        si (hex_de_bytes(subtexto(b, p, p + 4)) == "0a0d0d0a") {
+            // SHB: el número mágico de orden fija cómo leer el resto.
+            sea bom = hex_de_bytes(subtexto(b, p + 8, p + 12))
+            si (bom == "4d3c2b1a") { orden = 1 } sino si (bom == "1a2b3c4d") { orden = 0 } sino { lanzar "sonda: pcapng con orden desconocido" }
+            tipo_b = 168627466
+            // Cada sección nueva reinicia sus interfaces.
+            r["interfaces"] = []
+        } sino { tipo_b = bytes_leer_entero(b, p, 4, orden) }
+        largo = bytes_leer_entero(b, p + 4, 4, orden)
+        si (largo < 12 o p + largo > n) { lanzar "sonda: bloque pcapng inválido en " + p }
+        sea cuerpo = p + 8
+        si (tipo_b == 1) {
+            sea enlace = bytes_leer_entero(b, cuerpo, 2, orden)
+            sea intf = {"enlace": enlace, "largo_maximo": bytes_leer_entero(b, cuerpo + 4, 4, orden), "resolucion": 1000000, "nombre": nulo}
+            sea q = cuerpo + 8
+            mientras (q + 4 <= p + largo - 4) {
+                sea cod = bytes_leer_entero(b, q, 2, orden)
+                sea ol = bytes_leer_entero(b, q + 2, 2, orden)
+                si (cod == 0) { romper }
+                si (cod == 2) { intf["nombre"] = subtexto(b, q + 4, q + 4 + ol) }
+                si (cod == 9) {
+                    sea v = byte_en(b, q + 4)
+                    si (v >= 128) { intf["resolucion"] = potencia(2, v - 128) } sino { intf["resolucion"] = potencia(10, v) }
+                }
+                q = q + 4 + piso((ol + 3) / 4) * 4
+            }
+            r["interfaces"].agregar(intf)
+            si (longitud(r["interfaces"]) == 1) {
+                r["enlace"] = enlace
+                r["nano"] = intf["resolucion"] == 1000000000
+            }
+        } sino si (tipo_b == 6) {
+            sea idx = bytes_leer_entero(b, cuerpo, 4, orden)
+            sea alto = bytes_leer_entero(b, cuerpo + 4, 4, orden)
+            sea bajo = bytes_leer_entero(b, cuerpo + 8, 4, orden)
+            sea incl = bytes_leer_entero(b, cuerpo + 12, 4, orden)
+            sea orig = bytes_leer_entero(b, cuerpo + 16, 4, orden)
+            sea res = 1000000
+            si (idx < longitud(r["interfaces"])) { res = r["interfaces"][idx]["resolucion"] }
+            sea ticks = alto * 4294967296 + bajo
+            sea seg = piso(ticks / res)
+            sea resto = ticks - seg * res
+            r["paquetes"].agregar({"tiempo": ticks / res, "ts_ns": seg * 1000000000 + redondear(resto * 1000000000 / res), "datos": subtexto(b, cuerpo + 20, cuerpo + 20 + incl),
+                "largo_original": orig, "interfaz": idx})
+        } sino si (tipo_b == 3) {
+            sea orig = bytes_leer_entero(b, cuerpo, 4, orden)
+            sea maximo = largo - 16
+            r["paquetes"].agregar({"tiempo": 0, "ts_ns": 0, "datos": subtexto(b, cuerpo + 4, cuerpo + 4 + minimo(orig, maximo)), "largo_original": orig, "interfaz": 0})
+        }
+        p = p + largo
+    }
+    retornar r
+}
+
+/// Escribe una captura. opciones: {"formato": "pcap" | "pcapng", "enlace": 1, "nano": falso}.
+funcion sonda_escribir(ruta, paquetes, opciones) { escribir_archivo(ruta, sonda_a_bytes(paquetes, opciones)) }
+
+/// Bytes de una captura (paquetes: lista de {"datos", "tiempo" o "ts_ns", "largo_original"}
+/// o una captura entera de sonda_leer).
+funcion sonda_a_bytes(paquetes, opciones) {
+    sea op = opciones ?? {}
+    sea lista = paquetes
+    si (tipo(paquetes) == "mapa") {
+        lista = paquetes["paquetes"]
+        si (tiene_clave(op, "enlace") == falso) { op["enlace"] = paquetes["enlace"] }
+    }
+    sea enlace = op["enlace"] ?? 1
+    sea nano = op["nano"] ?? falso
+    si ((op["formato"] ?? "pcap") == "pcapng") { retornar _snd_pcapng_bytes(lista, enlace, nano) }
+    sea magico = "d4c3b2a1"
+    si (nano) { magico = "4d3cb2a1" }
+    sea partes = [bytes_de_hex(magico) + bytes_entero(2, 2, 1) + bytes_entero(4, 2, 1) + bytes_entero(0, 4, 1) + bytes_entero(0, 4, 1) + bytes_entero(262144, 4, 1) + bytes_entero(enlace, 4, 1)]
+    para p en lista {
+        sea ns = _snd_ns(p)
+        sea seg = piso(ns / 1000000000)
+        sea frac = ns - seg * 1000000000
+        si (nano == falso) { frac = piso(frac / 1000) }
+        sea d = p["datos"]
+        partes.agregar(bytes_entero(seg, 4, 1) + bytes_entero(frac, 4, 1) + bytes_entero(longitud(d), 4, 1) + bytes_entero(p["largo_original"] ?? longitud(d), 4, 1) + d)
+    }
+    retornar unir(partes, "")
+}
+
+funcion _snd_ns(p) {
+    si ((p["ts_ns"] ?? nulo) != nulo) { retornar p["ts_ns"] }
+    sea t = p["tiempo"] ?? 0
+    sea s = piso(t)
+    retornar s * 1000000000 + redondear((t - s) * 1000000) * 1000
+}
+
+funcion _snd_bloque(tipo_b, cuerpo) {
+    sea c = cuerpo
+    mientras (longitud(c) % 4 != 0) { c = c + char_de(0) }
+    sea l = longitud(c) + 12
+    retornar bytes_entero(tipo_b, 4, 1) + bytes_entero(l, 4, 1) + c + bytes_entero(l, 4, 1)
+}
+
+funcion _snd_pcapng_bytes(lista, enlace, nano) {
+    sea shb = _snd_bloque(168627466, bytes_de_hex("4d3c2b1a") + bytes_entero(1, 2, 1) + bytes_entero(0, 2, 1) + bytes_de_hex("ffffffffffffffff") + bytes_entero(0, 4, 1))
+    sea opciones_idb = ""
+    si (nano) { opciones_idb = bytes_entero(9, 2, 1) + bytes_entero(1, 2, 1) + char_de(9) + char_de(0) + char_de(0) + char_de(0) }
+    opciones_idb = opciones_idb + bytes_entero(0, 4, 1)
+    sea idb = _snd_bloque(1, bytes_entero(enlace, 2, 1) + bytes_entero(0, 2, 1) + bytes_entero(262144, 4, 1) + opciones_idb)
+    sea partes = [shb, idb]
+    para p en lista {
+        sea ns = _snd_ns(p)
+        sea ticks = ns
+        si (nano == falso) { ticks = piso(ns / 1000) }
+        sea alto = piso(ticks / 4294967296)
+        sea bajo = ticks - alto * 4294967296
+        sea d = p["datos"]
+        partes.agregar(_snd_bloque(6, bytes_entero(0, 4, 1) + bytes_entero(alto, 4, 1) + bytes_entero(bajo, 4, 1) + bytes_entero(longitud(d), 4, 1) + bytes_entero(p["largo_original"] ?? longitud(d), 4, 1) + d))
+    }
+    retornar unir(partes, "")
+}
+
+// ---------- decodificación ----------
+
+/// Capas de un paquete. enlace: 1 Ethernet (por defecto), 0 loopback BSD,
+/// 101/228/229 IP crudo, 113 Linux SLL, 276 Linux SLL2. Devuelve un mapa
+/// con las capas presentes ("ethernet", "vlan", "arp", "ipv4", "ipv6",
+/// "tcp", "udp", "icmp", "icmpv6", "dns"), "carga" y "resumen".
+funcion sonda_decodificar(datos, enlace) {
+    sea r = {"largo": longitud(datos), "capas": []}
+    sea e = enlace ?? 1
+    sea p = 0
+    sea tipo_eth = -1
+    si (e == 1) {
+        si (longitud(datos) < 14) { retornar _snd_fin(r, datos, 0) }
+        r["ethernet"] = {"destino": sonda_mac_texto(subtexto(datos, 0, 6)), "origen": sonda_mac_texto(subtexto(datos, 6, 12)), "tipo": _snd_u16(datos, 12)}
+        r["capas"].agregar("ethernet")
+        tipo_eth = _snd_u16(datos, 12)
+        p = 14
+        mientras ((tipo_eth == 33024 o tipo_eth == 34984) y p + 4 <= longitud(datos)) {
+            sea tci = _snd_u16(datos, p)
+            si (tiene_clave(r, "vlan") == falso) {
+                r["vlan"] = {"id": tci % 4096, "prioridad": piso(tci / 8192), "tipo": _snd_u16(datos, p + 2)}
+                r["capas"].agregar("vlan")
+            }
+            tipo_eth = _snd_u16(datos, p + 2)
+            p = p + 4
+        }
+    } sino si (e == 113) {
+        si (longitud(datos) < 16) { retornar _snd_fin(r, datos, 0) }
+        r["sll"] = {"tipo_paquete": _snd_u16(datos, 0), "origen": sonda_mac_texto(subtexto(datos, 6, 12) + char_de(0) + char_de(0))}
+        r["capas"].agregar("sll")
+        tipo_eth = _snd_u16(datos, 14)
+        p = 16
+    } sino si (e == 276) {
+        si (longitud(datos) < 20) { retornar _snd_fin(r, datos, 0) }
+        r["sll"] = {"interfaz": _snd_u32(datos, 4), "tipo_paquete": byte_en(datos, 10)}
+        r["capas"].agregar("sll")
+        tipo_eth = _snd_u16(datos, 0)
+        p = 20
+    } sino si (e == 0) {
+        sea fam = bytes_leer_entero(datos, 0, 4, 1)
+        si (fam > 65535) { fam = _snd_u32(datos, 0) }
+        si (fam == 2) { tipo_eth = 2048 } sino { tipo_eth = 34525 }
+        p = 4
+    } sino si (e == 101 o e == 12 o e == 14) {
+        si (longitud(datos) > 0 y piso(byte_en(datos, 0) / 16) == 6) { tipo_eth = 34525 } sino { tipo_eth = 2048 }
+    } sino si (e == 228) { tipo_eth = 2048 }
+    sino si (e == 229) { tipo_eth = 34525 }
+    sino {
+        r["resumen"] = "enlace " + e + " sin decodificar"
+        retornar _snd_fin(r, datos, 0)
+    }
+    si (tipo_eth == 2054) { retornar _snd_arp(r, datos, p) }
+    si (tipo_eth == 2048) { retornar _snd_ipv4(r, datos, p) }
+    si (tipo_eth == 34525) { retornar _snd_ipv6(r, datos, p) }
+    retornar _snd_fin(r, datos, p)
+}
+
+funcion _snd_fin(r, datos, p) {
+    r["carga"] = subtexto(datos, minimo(p, longitud(datos)), longitud(datos))
+    r["resumen"] = r["resumen"] ?? _snd_resumen(r)
+    retornar r
+}
+
+funcion _snd_arp(r, d, p) {
+    si (p + 28 > longitud(d)) { retornar _snd_fin(r, d, p) }
+    sea op = _snd_u16(d, p + 6)
+    r["arp"] = {"operacion": op, "mac_origen": sonda_mac_texto(subtexto(d, p + 8, p + 14)), "ip_origen": sonda_ipv4_texto(subtexto(d, p + 14, p + 18)),
+        "mac_destino": sonda_mac_texto(subtexto(d, p + 18, p + 24)), "ip_destino": sonda_ipv4_texto(subtexto(d, p + 24, p + 28))}
+    r["capas"].agregar("arp")
+    retornar _snd_fin(r, d, p + 28)
+}
+
+funcion _snd_ipv4(r, d, p) {
+    si (p + 20 > longitud(d)) { retornar _snd_fin(r, d, p) }
+    sea vih = byte_en(d, p)
+    sea ihl = (vih % 16) * 4
+    si (piso(vih / 16) != 4 o ihl < 20 o p + ihl > longitud(d)) { retornar _snd_fin(r, d, p) }
+    sea total = _snd_u16(d, p + 2)
+    sea banderas = _snd_u16(d, p + 6)
+    sea ip = {"version": 4, "ihl": ihl, "tos": byte_en(d, p + 1), "largo_total": total, "id": _snd_u16(d, p + 4), "no_fragmentar": piso(banderas / 16384) % 2 == 1,
+        "mas_fragmentos": piso(banderas / 8192) % 2 == 1, "desplazamiento": (banderas % 8192) * 8, "ttl": byte_en(d, p + 8), "protocolo": byte_en(d, p + 9),
+        "suma": _snd_u16(d, p + 10), "origen": sonda_ipv4_texto(subtexto(d, p + 12, p + 16)), "destino": sonda_ipv4_texto(subtexto(d, p + 16, p + 20))}
+    ip["suma_valida"] = sonda_suma_verificacion(subtexto(d, p, p + ihl)) == 0
+    r["ipv4"] = ip
+    r["capas"].agregar("ipv4")
+    sea fin = longitud(d)
+    si (total >= ihl y p + total < fin) { fin = p + total }
+    sea cuerpo = subtexto(d, p + ihl, fin)
+    si (ip["desplazamiento"] > 0) { retornar _snd_fin(r, cuerpo, 0) }
+    retornar _snd_transporte(r, ip["protocolo"], cuerpo, subtexto(d, p + 12, p + 16), subtexto(d, p + 16, p + 20))
+}
+
+funcion _snd_ipv6(r, d, p) {
+    si (p + 40 > longitud(d)) { retornar _snd_fin(r, d, p) }
+    sea w = _snd_u32(d, p)
+    sea ip = {"version": 6, "clase": piso(w / 1048576) % 256, "flujo": w % 1048576, "largo_carga": _snd_u16(d, p + 4), "siguiente": byte_en(d, p + 6),
+        "saltos": byte_en(d, p + 7), "origen": sonda_ipv6_texto(subtexto(d, p + 8, p + 24)), "destino": sonda_ipv6_texto(subtexto(d, p + 24, p + 40)), "extensiones": []}
+    r["ipv6"] = ip
+    r["capas"].agregar("ipv6")
+    sea fin = minimo(longitud(d), p + 40 + ip["largo_carga"])
+    si (ip["largo_carga"] == 0) { fin = longitud(d) }
+    sea siguiente = ip["siguiente"]
+    sea q = p + 40
+    // Cabeceras de extensión: salto a salto, enrutamiento, destino, fragmento.
+    mientras ((siguiente == 0 o siguiente == 43 o siguiente == 60 o siguiente == 44) y q + 8 <= fin) {
+        ip["extensiones"].agregar(siguiente)
+        sea prox = byte_en(d, q)
+        si (siguiente == 44) {
+            ip["fragmento"] = {"desplazamiento": piso(_snd_u16(d, q + 2) / 8) * 8, "mas_fragmentos": _snd_u16(d, q + 2) % 2 == 1, "id": _snd_u32(d, q + 4)}
+            q = q + 8
+            si (ip["fragmento"]["desplazamiento"] > 0) {
+                ip["protocolo"] = prox
+                retornar _snd_fin(r, subtexto(d, q, fin), 0)
+            }
+        } sino { q = q + (byte_en(d, q + 1) + 1) * 8 }
+        siguiente = prox
+    }
+    ip["protocolo"] = siguiente
+    retornar _snd_transporte(r, siguiente, subtexto(d, q, fin), subtexto(d, p + 8, p + 24), subtexto(d, p + 24, p + 40))
+}
+
+funcion _snd_pseudo(origen, destino, proto, largo) {
+    si (longitud(origen) == 4) { retornar origen + destino + char_de(0) + char_de(proto) + bytes_entero(largo, 2, 0) }
+    retornar origen + destino + bytes_entero(largo, 4, 0) + bytes_entero(0, 3, 0) + char_de(proto)
+}
+
+funcion _snd_transporte(r, proto, c, origen, destino) {
+    si (proto == 6 y longitud(c) >= 20) {
+        sea off = piso(byte_en(c, 12) / 16) * 4
+        si (off < 20 o off > longitud(c)) { retornar _snd_fin(r, c, 0) }
+        sea fl = byte_en(c, 13) + (byte_en(c, 12) % 2) * 256
+        sea nombres = ["FIN", "SYN", "RST", "PSH", "ACK", "URG", "ECE", "CWR", "NS"]
+        sea activas = []
+        sea k = 0
+        mientras (k < 9) {
+            si (piso(fl / potencia(2, k)) % 2 == 1) { activas.agregar(nombres[k]) }
+            k = k + 1
+        }
+        sea t = {"puerto_origen": _snd_u16(c, 0), "puerto_destino": _snd_u16(c, 2), "secuencia": _snd_u32(c, 4), "acuse": _snd_u32(c, 8), "desplazamiento": off,
+            "banderas": activas, "ventana": _snd_u16(c, 14), "suma": _snd_u16(c, 16), "urgente": _snd_u16(c, 18), "opciones": _snd_opciones_tcp(subtexto(c, 20, off))}
+        t["suma_valida"] = sonda_suma_verificacion(_snd_pseudo(origen, destino, 6, longitud(c)) + c) == 0
+        r["tcp"] = t
+        r["capas"].agregar("tcp")
+        sea carga = subtexto(c, off, longitud(c))
+        _snd_aplicacion(r, t["puerto_origen"], t["puerto_destino"], carga, verdadero)
+        retornar _snd_fin(r, carga, 0)
+    }
+    si (proto == 17 y longitud(c) >= 8) {
+        sea u = {"puerto_origen": _snd_u16(c, 0), "puerto_destino": _snd_u16(c, 2), "largo": _snd_u16(c, 4), "suma": _snd_u16(c, 6)}
+        sea fin = longitud(c)
+        si (u["largo"] >= 8 y u["largo"] < fin) { fin = u["largo"] }
+        si (u["suma"] == 0 y longitud(origen) == 4) { u["suma_valida"] = verdadero } sino {
+            u["suma_valida"] = sonda_suma_verificacion(_snd_pseudo(origen, destino, 17, fin) + subtexto(c, 0, fin)) == 0
+        }
+        r["udp"] = u
+        r["capas"].agregar("udp")
+        sea carga = subtexto(c, 8, fin)
+        _snd_aplicacion(r, u["puerto_origen"], u["puerto_destino"], carga, falso)
+        retornar _snd_fin(r, carga, 0)
+    }
+    si (proto == 1 y longitud(c) >= 4) {
+        r["icmp"] = {"tipo": byte_en(c, 0), "codigo": byte_en(c, 1), "suma": _snd_u16(c, 2), "suma_valida": sonda_suma_verificacion(c) == 0}
+        si (longitud(c) >= 8 y (byte_en(c, 0) == 0 o byte_en(c, 0) == 8)) {
+            r["icmp"]["id"] = _snd_u16(c, 4)
+            r["icmp"]["secuencia"] = _snd_u16(c, 6)
+        }
+        r["capas"].agregar("icmp")
+        retornar _snd_fin(r, subtexto(c, 8, longitud(c)), 0)
+    }
+    si (proto == 58 y longitud(c) >= 4) {
+        r["icmpv6"] = {"tipo": byte_en(c, 0), "codigo": byte_en(c, 1), "suma": _snd_u16(c, 2),
+            "suma_valida": sonda_suma_verificacion(_snd_pseudo(origen, destino, 58, longitud(c)) + c) == 0}
+        si (longitud(c) >= 8 y (byte_en(c, 0) == 128 o byte_en(c, 0) == 129)) {
+            r["icmpv6"]["id"] = _snd_u16(c, 4)
+            r["icmpv6"]["secuencia"] = _snd_u16(c, 6)
+        }
+        si (longitud(c) >= 24 y (byte_en(c, 0) == 135 o byte_en(c, 0) == 136)) { r["icmpv6"]["objetivo"] = sonda_ipv6_texto(subtexto(c, 8, 24)) }
+        r["capas"].agregar("icmpv6")
+        retornar _snd_fin(r, subtexto(c, 4, longitud(c)), 0)
+    }
+    retornar _snd_fin(r, c, 0)
+}
+
+funcion _snd_opciones_tcp(bo) {
+    sea r = {}
+    sea i = 0
+    mientras (i < longitud(bo)) {
+        sea k = byte_en(bo, i)
+        si (k == 0) { romper }
+        si (k == 1) { i = i + 1 } sino {
+            si (i + 1 >= longitud(bo)) { romper }
+            sea l = byte_en(bo, i + 1)
+            si (l < 2 o i + l > longitud(bo)) { romper }
+            si (k == 2 y l == 4) { r["mss"] = _snd_u16(bo, i + 2) }
+            sino si (k == 3 y l == 3) { r["escala_ventana"] = byte_en(bo, i + 2) }
+            sino si (k == 4) { r["sack_permitido"] = verdadero }
+            sino si (k == 5) {
+                sea bloques = []
+                sea j = i + 2
+                mientras (j + 8 <= i + l) {
+                    bloques.agregar([_snd_u32(bo, j), _snd_u32(bo, j + 4)])
+                    j = j + 8
+                }
+                r["sack"] = bloques
+            } sino si (k == 8 y l == 10) { r["marca_tiempo"] = [_snd_u32(bo, i + 2), _snd_u32(bo, i + 6)] }
+            i = i + l
+        }
+    }
+    retornar r
+}
+
+// DNS sobre UDP 53 o 5353 (y TCP 53 con el largo delante).
+funcion _snd_aplicacion(r, po, pd, carga, es_tcp) {
+    si (po != 53 y pd != 53 y po != 5353 y pd != 5353) { retornar nulo }
+    sea c = carga
+    si (es_tcp) {
+        si (longitud(c) < 2) { retornar nulo }
+        c = subtexto(c, 2, longitud(c))
+    }
+    intentar { r["dns"] = sonda_dns(c) } capturar (e) { retornar nulo }
+    r["capas"].agregar("dns")
+}
+
+funcion _snd_dns_nombre(m, p, saltos) {
+    sea partes = []
+    sea i = p
+    sea fin = -1
+    mientras (verdadero) {
+        si (i >= longitud(m)) { lanzar "dns: nombre truncado" }
+        sea l = byte_en(m, i)
+        si (l == 0) {
+            si (fin < 0) { fin = i + 1 }
+            romper
+        }
+        si (l >= 192) {
+            si (saltos > 20) { lanzar "dns: punteros en bucle" }
+            si (fin < 0) { fin = i + 2 }
+            sea destino = (l % 64) * 256 + byte_en(m, i + 1)
+            sea resto = _snd_dns_nombre(m, destino, saltos + 1)
+            si (resto[0] != "") { partes.agregar(resto[0]) }
+            retornar [unir(partes, "."), fin]
+        }
+        partes.agregar(subtexto(m, i + 1, i + 1 + l))
+        i = i + 1 + l
+    }
+    retornar [unir(partes, "."), fin]
+}
+
+/// Mensaje DNS: {"id", "respuesta", "codigo_op", "rcode", "preguntas":
+/// [{"nombre", "tipo", "clase"}], "respuestas": [{"nombre", "tipo", "ttl", "datos"}], …}.
+funcion sonda_dns(m) {
+    si (longitud(m) < 12) { lanzar "dns: mensaje corto" }
+    sea fl = _snd_u16(m, 2)
+    sea r = {"id": _snd_u16(m, 0), "respuesta": fl >= 32768, "codigo_op": piso(fl / 2048) % 16, "autoritativa": piso(fl / 1024) % 2 == 1,
+        "truncada": piso(fl / 512) % 2 == 1, "recursion_deseada": piso(fl / 256) % 2 == 1, "recursion_disponible": piso(fl / 128) % 2 == 1, "rcode": fl % 16,
+        "preguntas": [], "respuestas": [], "autoridad": [], "adicionales": []}
+    sea cuentas = [_snd_u16(m, 4), _snd_u16(m, 6), _snd_u16(m, 8), _snd_u16(m, 10)]
+    sea p = 12
+    sea i = 0
+    mientras (i < cuentas[0]) {
+        sea nm = _snd_dns_nombre(m, p, 0)
+        p = nm[1]
+        r["preguntas"].agregar({"nombre": nm[0], "tipo": _snd_dns_tipo(_snd_u16(m, p)), "clase": _snd_u16(m, p + 2) % 32768})
+        p = p + 4
+        i = i + 1
+    }
+    sea secciones = ["respuestas", "autoridad", "adicionales"]
+    sea s = 0
+    mientras (s < 3) {
+        i = 0
+        mientras (i < cuentas[s + 1]) {
+            sea nm = _snd_dns_nombre(m, p, 0)
+            p = nm[1]
+            si (p + 10 > longitud(m)) { lanzar "dns: registro truncado" }
+            sea t = _snd_u16(m, p)
+            sea l = _snd_u16(m, p + 8)
+            sea rd = p + 10
+            si (rd + l > longitud(m)) { lanzar "dns: datos truncados" }
+            sea datos = nulo
+            si (t == 1 y l == 4) { datos = sonda_ipv4_texto(subtexto(m, rd, rd + 4)) }
+            sino si (t == 28 y l == 16) { datos = sonda_ipv6_texto(subtexto(m, rd, rd + 16)) }
+            sino si (t == 5 o t == 2 o t == 12) { datos = _snd_dns_nombre(m, rd, 0)[0] }
+            sino si (t == 15) { datos = {"preferencia": _snd_u16(m, rd), "servidor": _snd_dns_nombre(m, rd + 2, 0)[0]} }
+            sino si (t == 16) {
+                sea txt = []
+                sea j = rd
+                mientras (j < rd + l) {
+                    txt.agregar(subtexto(m, j + 1, j + 1 + byte_en(m, j)))
+                    j = j + 1 + byte_en(m, j)
+                }
+                datos = txt
+            } sino { datos = subtexto(m, rd, rd + l) }
+            r[secciones[s]].agregar({"nombre": nm[0], "tipo": _snd_dns_tipo(t), "clase": _snd_u16(m, p + 2) % 32768, "ttl": _snd_u32(m, p + 4), "datos": datos})
+            p = rd + l
+            i = i + 1
+        }
+        s = s + 1
+    }
+    retornar r
+}
+
+funcion _snd_dns_tipo(t) {
+    retornar {"1": "A", "2": "NS", "5": "CNAME", "6": "SOA", "12": "PTR", "15": "MX", "16": "TXT", "28": "AAAA", "33": "SRV", "41": "OPT", "65": "HTTPS", "255": "ANY"}["" + t] ?? t
+}
+
+funcion _snd_resumen(r) {
+    sea ip_o = nulo
+    sea ip_d = nulo
+    si (tiene_clave(r, "ipv4")) {
+        ip_o = r["ipv4"]["origen"]
+        ip_d = r["ipv4"]["destino"]
+    } sino si (tiene_clave(r, "ipv6")) {
+        ip_o = r["ipv6"]["origen"]
+        ip_d = r["ipv6"]["destino"]
+    }
+    si (tiene_clave(r, "dns")) {
+        sea dn = r["dns"]
+        sea q = ""
+        si (longitud(dn["preguntas"]) > 0) { q = " " + dn["preguntas"][0]["tipo"] + " " + dn["preguntas"][0]["nombre"] }
+        sea que = "consulta"
+        si (dn["respuesta"]) {
+            que = "respuesta"
+            sea ds = []
+            para a en dn["respuestas"] { si (tipo(a["datos"]) == "texto") { ds.agregar(a["datos"]) } }
+            si (longitud(ds) > 0) { q = q + " → " + unir(ds, ", ") }
+        }
+        retornar "DNS " + que + q + " (" + ip_o + " → " + ip_d + ")"
+    }
+    si (tiene_clave(r, "tcp")) {
+        sea t = r["tcp"]
+        retornar "TCP " + _snd_extremo(ip_o, t["puerto_origen"]) + " → " + _snd_extremo(ip_d, t["puerto_destino"]) + " [" + unir(t["banderas"], ",") + "] sec=" + t["secuencia"] + " largo=" + longitud(r["carga"] ?? "")
+    }
+    si (tiene_clave(r, "udp")) {
+        sea u = r["udp"]
+        retornar "UDP " + _snd_extremo(ip_o, u["puerto_origen"]) + " → " + _snd_extremo(ip_d, u["puerto_destino"]) + " largo=" + (u["largo"] - 8)
+    }
+    si (tiene_clave(r, "icmp")) {
+        sea nombres = {"0": "eco respuesta", "3": "destino inalcanzable", "8": "eco pedido", "11": "tiempo excedido"}
+        retornar "ICMP " + (nombres["" + r["icmp"]["tipo"]] ?? ("tipo " + r["icmp"]["tipo"])) + " " + ip_o + " → " + ip_d
+    }
+    si (tiene_clave(r, "icmpv6")) {
+        sea nombres = {"128": "eco pedido", "129": "eco respuesta", "133": "solicitud de router", "134": "anuncio de router", "135": "solicitud de vecino", "136": "anuncio de vecino"}
+        retornar "ICMPv6 " + (nombres["" + r["icmpv6"]["tipo"]] ?? ("tipo " + r["icmpv6"]["tipo"])) + " " + ip_o + " → " + ip_d
+    }
+    si (tiene_clave(r, "arp")) {
+        sea a = r["arp"]
+        si (a["operacion"] == 1) { retornar "ARP ¿quién tiene " + a["ip_destino"] + "? pregunta " + a["ip_origen"] }
+        retornar "ARP " + a["ip_origen"] + " está en " + a["mac_origen"]
+    }
+    si (ip_o != nulo) { retornar "IP " + ip_o + " → " + ip_d }
+    si (tiene_clave(r, "ethernet")) { retornar "Ethernet " + r["ethernet"]["origen"] + " → " + r["ethernet"]["destino"] + " tipo 0x" + _snd_hex_corto(r["ethernet"]["tipo"]) }
+    retornar "paquete de " + r["largo"] + " bytes"
+}
+
+funcion _snd_extremo(ip, puerto) {
+    si (ip != nulo y texto_contiene(ip, ":")) { retornar "[" + ip + "]:" + puerto }
+    retornar ip + ":" + puerto
+}
+
+// ---------- filtros (sintaxis de tcpdump) ----------
+
+funcion _snd_tokens(t) {
+    sea r = []
+    sea i = 0
+    mientras (i < longitud(t)) {
+        sea c = subtexto(t, i, i + 1)
+        si (c == " " o c == "\t" o c == "\n") { i = i + 1 }
+        sino si (c == "(" o c == ")") {
+            r.agregar(c)
+            i = i + 1
+        } sino si (c == "!" y subtexto(t, i, i + 2) != "!=") {
+            r.agregar("not")
+            i = i + 1
+        } sino si (subtexto(t, i, i + 2) == "&&") {
+            r.agregar("and")
+            i = i + 2
+        } sino si (subtexto(t, i, i + 2) == "||") {
+            r.agregar("or")
+            i = i + 2
+        } sino si (texto_indice("<>=!", c) >= 0) {
+            sea j = i + 1
+            si (j < longitud(t) y subtexto(t, j, j + 1) == "=") { j = j + 1 }
+            r.agregar(subtexto(t, i, j))
+            i = j
+        } sino {
+            sea j = i
+            mientras (j < longitud(t) y texto_indice(" \t\n()<>=!&|", subtexto(t, j, j + 1)) < 0) { j = j + 1 }
+            r.agregar(texto_minusculas(subtexto(t, i, j)))
+            i = j
+        }
+    }
+    retornar r
+}
+
+/// Compila un filtro de tcpdump a un árbol que usa sonda_coincide.
+funcion sonda_filtro(expr) {
+    sea st = {"t": _snd_tokens(expr), "i": 0}
+    si (longitud(st["t"]) == 0) { retornar {"op": "todo"} }
+    sea a = _snd_f_o(st)
+    si (st["i"] < longitud(st["t"])) { lanzar "sonda: filtro inválido cerca de '" + st["t"][st["i"]] + "'" }
+    retornar a
+}
+
+funcion _snd_ver(st) {
+    si (st["i"] < longitud(st["t"])) { retornar st["t"][st["i"]] }
+    retornar nulo
+}
+
+funcion _snd_tomar(st) {
+    sea v = _snd_ver(st)
+    si (v == nulo) { lanzar "sonda: el filtro termina antes de tiempo" }
+    st["i"] = st["i"] + 1
+    retornar v
+}
+
+funcion _snd_f_o(st) {
+    sea a = _snd_f_y(st)
+    mientras (_snd_ver(st) == "or") {
+        _snd_tomar(st)
+        a = {"op": "o", "a": a, "b": _snd_f_y(st)}
+    }
+    retornar a
+}
+
+funcion _snd_f_y(st) {
+    sea a = _snd_f_no(st)
+    mientras (verdadero) {
+        sea v = _snd_ver(st)
+        si (v == "and") {
+            _snd_tomar(st)
+            a = {"op": "y", "a": a, "b": _snd_f_no(st)}
+        } sino si (v != nulo y v != "or" y v != ")") {
+            // tcpdump permite omitir "and" tras un calificador: "tcp port 80".
+            a = {"op": "y", "a": a, "b": _snd_f_no(st)}
+        } sino { retornar a }
+    }
+}
+
+funcion _snd_f_no(st) {
+    si (_snd_ver(st) == "not") {
+        _snd_tomar(st)
+        retornar {"op": "no", "a": _snd_f_no(st)}
+    }
+    si (_snd_ver(st) == "(") {
+        _snd_tomar(st)
+        sea a = _snd_f_o(st)
+        si (_snd_tomar(st) != ")") { lanzar "sonda: falta ')' en el filtro" }
+        retornar a
+    }
+    retornar _snd_f_primitiva(st)
+}
+
+funcion _snd_f_primitiva(st) {
+    sea v = _snd_tomar(st)
+    sea protos = ["tcp", "udp", "icmp", "icmp6", "arp", "ip", "ip6", "vlan", "dns", "ether"]
+    // "len > 100", "less 64", "greater 1000".
+    si (v == "len") {
+        sea op = _snd_tomar(st)
+        retornar {"op": "largo", "cmp": op, "n": a_numero(_snd_tomar(st))}
+    }
+    si (v == "less") { retornar {"op": "largo", "cmp": "<=", "n": a_numero(_snd_tomar(st))} }
+    si (v == "greater") { retornar {"op": "largo", "cmp": ">=", "n": a_numero(_snd_tomar(st))} }
+    sea dir = "cualquiera"
+    si (v == "src" o v == "dst") {
+        dir = v
+        si (_snd_ver(st) == "or" o _snd_ver(st) == "and") {
+            // "src or dst host X"
+            sea conj = _snd_tomar(st)
+            sea v2 = _snd_tomar(st)
+            si (v2 != "src" y v2 != "dst") { lanzar "sonda: se esperaba src o dst" }
+            dir = "cualquiera"
+            si (conj == "and") { dir = "ambos" }
+        }
+        v = _snd_tomar(st)
+    }
+    si (v == "ether") {
+        sea w = _snd_tomar(st)
+        si (w == "src" o w == "dst") {
+            dir = w
+            w = _snd_tomar(st)
+        }
+        si (w != "host") { retornar {"op": "proto", "p": "ethernet"} }
+        retornar {"op": "mac", "dir": dir, "mac": texto_minusculas(_snd_tomar(st))}
+    }
+    si (v == "host") { retornar {"op": "host", "dir": dir, "ip": _snd_tomar(st)} }
+    si (v == "net") {
+        sea red = _snd_tomar(st)
+        si (_snd_ver(st) == "mask") {
+            _snd_tomar(st)
+            red = red + "/" + _snd_mascara_bits(_snd_tomar(st))
+        }
+        retornar {"op": "red", "dir": dir, "red": red}
+    }
+    si (v == "port") { retornar {"op": "puerto", "dir": dir, "desde": a_numero(_snd_tomar(st)), "hasta": nulo} }
+    si (v == "portrange") {
+        sea rango = texto_dividir(_snd_tomar(st), "-")
+        retornar {"op": "puerto", "dir": dir, "desde": a_numero(rango[0]), "hasta": a_numero(rango[1])}
+    }
+    si (lista_contiene(protos, v)) {
+        // "tcp port 80" = "tcp and port 80"; "vlan 100".
+        si (v == "vlan" y _snd_ver(st) != nulo y texto_indice("0123456789", subtexto(_snd_ver(st), 0, 1)) >= 0) {
+            retornar {"op": "vlan", "id": a_numero(_snd_tomar(st))}
+        }
+        retornar {"op": "proto", "p": v}
+    }
+    si (dir != "cualquiera" o texto_contiene(v, ".") o texto_contiene(v, ":")) {
+        // "src 10.0.0.1" o una dirección suelta.
+        si (texto_contiene(v, "/")) { retornar {"op": "red", "dir": dir, "red": v} }
+        retornar {"op": "host", "dir": dir, "ip": v}
+    }
+    lanzar "sonda: primitiva de filtro desconocida '" + v + "'"
+}
+
+funcion _snd_mascara_bits(m) {
+    sea b = sonda_ipv4_bytes(m)
+    sea n = 0
+    sea i = 0
+    mientras (i < 4) {
+        sea x = byte_en(b, i)
+        mientras (x > 0) {
+            n = n + x % 2
+            x = piso(x / 2)
+        }
+        i = i + 1
+    }
+    retornar n
+}
+
+funcion _snd_ip_crudo(t) {
+    si (texto_contiene(t, ":")) { retornar sonda_ipv6_bytes(t) }
+    retornar sonda_ipv4_bytes(t)
+}
+
+funcion _snd_en_red(ip, red) {
+    sea p = texto_dividir(red, "/")
+    sea base = p[0]
+    // "10.1" o "10.1.2" (redes por clase de tcpdump).
+    si (texto_contiene(base, ":") == falso) {
+        sea octetos = texto_dividir(base, ".")
+        sea bits_por_defecto = 8 * longitud(octetos)
+        mientras (longitud(octetos) < 4) { octetos.agregar("0") }
+        base = unir(octetos, ".")
+        si (longitud(p) == 1) { p = [base, "" + bits_por_defecto] }
+    }
+    si (texto_contiene(ip, ":") != texto_contiene(base, ":")) { retornar falso }
+    sea a = _snd_ip_crudo(ip)
+    sea b = _snd_ip_crudo(base)
+    sea bits = longitud(a) * 8
+    si (longitud(p) > 1) { bits = a_numero(p[1]) }
+    sea i = 0
+    mientras (bits > 0) {
+        sea k = minimo(bits, 8)
+        sea div = potencia(2, 8 - k)
+        si (piso(byte_en(a, i) / div) != piso(byte_en(b, i) / div)) { retornar falso }
+        bits = bits - k
+        i = i + 1
+    }
+    retornar verdadero
+}
+
+funcion _snd_ips(d) {
+    si (tiene_clave(d, "ipv4")) { retornar [d["ipv4"]["origen"], d["ipv4"]["destino"]] }
+    si (tiene_clave(d, "ipv6")) { retornar [d["ipv6"]["origen"], d["ipv6"]["destino"]] }
+    si (tiene_clave(d, "arp")) { retornar [d["arp"]["ip_origen"], d["arp"]["ip_destino"]] }
+    retornar nulo
+}
+
+funcion _snd_puertos(d) {
+    si (tiene_clave(d, "tcp")) { retornar [d["tcp"]["puerto_origen"], d["tcp"]["puerto_destino"]] }
+    si (tiene_clave(d, "udp")) { retornar [d["udp"]["puerto_origen"], d["udp"]["puerto_destino"]] }
+    retornar nulo
+}
+
+funcion _snd_dir(par, dir, prueba) {
+    si (par == nulo) { retornar falso }
+    si (dir == "src") { retornar prueba(par[0]) }
+    si (dir == "dst") { retornar prueba(par[1]) }
+    si (dir == "ambos") { retornar prueba(par[0]) y prueba(par[1]) }
+    retornar prueba(par[0]) o prueba(par[1])
+}
+
+funcion _snd_misma_ip(a, b) {
+    si (texto_contiene(a, ":") != texto_contiene(b, ":")) { retornar falso }
+    intentar { retornar _snd_ip_crudo(a) == _snd_ip_crudo(b) } capturar (e) { retornar falso }
+}
+
+/// ¿El paquete decodificado (de sonda_decodificar) cumple el filtro?
+funcion sonda_coincide(d, f) {
+    sea op = f["op"]
+    si (op == "todo") { retornar verdadero }
+    si (op == "y") { retornar sonda_coincide(d, f["a"]) y sonda_coincide(d, f["b"]) }
+    si (op == "o") { retornar sonda_coincide(d, f["a"]) o sonda_coincide(d, f["b"]) }
+    si (op == "no") { retornar sonda_coincide(d, f["a"]) == falso }
+    si (op == "proto") {
+        sea p = f["p"]
+        si (p == "ip") { retornar tiene_clave(d, "ipv4") }
+        si (p == "ip6") { retornar tiene_clave(d, "ipv6") }
+        si (p == "icmp6") { retornar tiene_clave(d, "icmpv6") }
+        retornar tiene_clave(d, p)
+    }
+    si (op == "vlan") { retornar tiene_clave(d, "vlan") y d["vlan"]["id"] == f["id"] }
+    si (op == "largo") {
+        sea n = d["largo"]
+        sea c = f["cmp"]
+        si (c == ">") { retornar n > f["n"] }
+        si (c == ">=") { retornar n >= f["n"] }
+        si (c == "<") { retornar n < f["n"] }
+        si (c == "<=") { retornar n <= f["n"] }
+        si (c == "==" o c == "=") { retornar n == f["n"] }
+        si (c == "!=") { retornar n != f["n"] }
+        lanzar "sonda: comparación desconocida " + c
+    }
+    si (op == "host") { retornar _snd_dir(_snd_ips(d), f["dir"], funcion(ip) { retornar _snd_misma_ip(ip, f["ip"]) }) }
+    si (op == "red") { retornar _snd_dir(_snd_ips(d), f["dir"], funcion(ip) { retornar _snd_en_red(ip, f["red"]) }) }
+    si (op == "puerto") {
+        sea hasta = f["hasta"] ?? f["desde"]
+        retornar _snd_dir(_snd_puertos(d), f["dir"], funcion(p) { retornar p >= f["desde"] y p <= hasta })
+    }
+    si (op == "mac") {
+        si (tiene_clave(d, "ethernet") == falso) { retornar falso }
+        retornar _snd_dir([d["ethernet"]["origen"], d["ethernet"]["destino"]], f["dir"], funcion(m) { retornar m == f["mac"] })
+    }
+    lanzar "sonda: filtro desconocido " + op
+}
+
+/// Paquetes de una captura que cumplen un filtro de tcpdump.
+funcion sonda_filtrar(captura, expr) {
+    sea f = sonda_filtro(expr)
+    sea r = []
+    para p en captura["paquetes"] {
+        si (sonda_coincide(sonda_decodificar(p["datos"], captura["enlace"]), f)) { r.agregar(p) }
+    }
+    retornar r
+}
+
+/// Estadísticas: paquetes, bytes, duración y conteo por protocolo y por IP.
+funcion sonda_estadisticas(captura) {
+    sea r = {"paquetes": longitud(captura["paquetes"]), "bytes": 0, "protocolos": {}, "origenes": {}, "destinos": {}, "puertos_destino": {}, "duracion": 0}
+    sea t0 = nulo
+    sea t1 = nulo
+    para p en captura["paquetes"] {
+        r["bytes"] = r["bytes"] + (p["largo_original"] ?? longitud(p["datos"]))
+        si (t0 == nulo o p["tiempo"] < t0) { t0 = p["tiempo"] }
+        si (t1 == nulo o p["tiempo"] > t1) { t1 = p["tiempo"] }
+        sea d = sonda_decodificar(p["datos"], captura["enlace"])
+        para c en d["capas"] { r["protocolos"][c] = (r["protocolos"][c] ?? 0) + 1 }
+        sea ips = _snd_ips(d)
+        si (ips != nulo) {
+            r["origenes"][ips[0]] = (r["origenes"][ips[0]] ?? 0) + 1
+            r["destinos"][ips[1]] = (r["destinos"][ips[1]] ?? 0) + 1
+        }
+        sea ps = _snd_puertos(d)
+        si (ps != nulo) { r["puertos_destino"]["" + ps[1]] = (r["puertos_destino"]["" + ps[1]] ?? 0) + 1 }
+    }
+    si (t0 != nulo) { r["duracion"] = t1 - t0 }
+    retornar r
+}
+
+// ---------- construcción de paquetes ----------
+
+/// Construye un paquete con las capas del mapa, con largos y sumas de
+/// verificación calculados: {"ethernet": {"origen", "destino"}, "vlan": {"id"},
+/// "ipv4": {"origen", "destino", "ttl"} o "ipv6": {...}, "tcp": {"puerto_origen",
+/// "puerto_destino", "secuencia", "acuse", "banderas": ["SYN"], "ventana"} o
+/// "udp": {...} o "icmp": {"tipo", "codigo", "id", "secuencia"}, "carga": bytes}.
+funcion sonda_paquete(capas) {
+    sea carga = capas["carga"] ?? ""
+    sea origen_ip = nulo
+    sea destino_ip = nulo
+    sea es6 = tiene_clave(capas, "ipv6")
+    si (tiene_clave(capas, "ipv4")) {
+        origen_ip = sonda_ipv4_bytes(capas["ipv4"]["origen"])
+        destino_ip = sonda_ipv4_bytes(capas["ipv4"]["destino"])
+    }
+    si (es6) {
+        origen_ip = sonda_ipv6_bytes(capas["ipv6"]["origen"])
+        destino_ip = sonda_ipv6_bytes(capas["ipv6"]["destino"])
+    }
+    sea proto = 0
+    sea l4 = carga
+    si (tiene_clave(capas, "tcp")) {
+        sea t = capas["tcp"]
+        proto = 6
+        sea fl = 0
+        sea nombres = ["FIN", "SYN", "RST", "PSH", "ACK", "URG", "ECE", "CWR"]
+        sea k = 0
+        mientras (k < 8) {
+            si (lista_contiene(t["banderas"] ?? [], nombres[k])) { fl = fl + potencia(2, k) }
+            k = k + 1
+        }
+        sea opts = ""
+        si ((t["mss"] ?? nulo) != nulo) { opts = char_de(2) + char_de(4) + bytes_entero(t["mss"], 2, 0) }
+        mientras (longitud(opts) % 4 != 0) { opts = opts + char_de(1) }
+        sea off = (20 + longitud(opts)) / 4
+        sea cab = bytes_entero(t["puerto_origen"] ?? 0, 2, 0) + bytes_entero(t["puerto_destino"] ?? 0, 2, 0) + bytes_entero(t["secuencia"] ?? 0, 4, 0) + bytes_entero(t["acuse"] ?? 0, 4, 0) +
+            char_de(off * 16) + char_de(fl) + bytes_entero(t["ventana"] ?? 65535, 2, 0) + bytes_entero(0, 2, 0) + bytes_entero(0, 2, 0) + opts
+        l4 = cab + carga
+        si (origen_ip != nulo) {
+            sea s = sonda_suma_verificacion(_snd_pseudo(origen_ip, destino_ip, 6, longitud(l4)) + l4)
+            l4 = subtexto(l4, 0, 16) + bytes_entero(s, 2, 0) + subtexto(l4, 18, longitud(l4))
+        }
+    } sino si (tiene_clave(capas, "udp")) {
+        sea u = capas["udp"]
+        proto = 17
+        l4 = bytes_entero(u["puerto_origen"] ?? 0, 2, 0) + bytes_entero(u["puerto_destino"] ?? 0, 2, 0) + bytes_entero(8 + longitud(carga), 2, 0) + bytes_entero(0, 2, 0) + carga
+        si (origen_ip != nulo) {
+            sea s = sonda_suma_verificacion(_snd_pseudo(origen_ip, destino_ip, 17, longitud(l4)) + l4)
+            si (s == 0) { s = 65535 }
+            l4 = subtexto(l4, 0, 6) + bytes_entero(s, 2, 0) + subtexto(l4, 8, longitud(l4))
+        }
+    } sino si (tiene_clave(capas, "icmp")) {
+        sea c = capas["icmp"]
+        proto = 1
+        si (es6) { proto = 58 }
+        l4 = char_de(c["tipo"] ?? 8) + char_de(c["codigo"] ?? 0) + bytes_entero(0, 2, 0) + bytes_entero(c["id"] ?? 0, 2, 0) + bytes_entero(c["secuencia"] ?? 0, 2, 0) + carga
+        sea s = 0
+        si (es6) { s = sonda_suma_verificacion(_snd_pseudo(origen_ip, destino_ip, 58, longitud(l4)) + l4) } sino { s = sonda_suma_verificacion(l4) }
+        l4 = subtexto(l4, 0, 2) + bytes_entero(s, 2, 0) + subtexto(l4, 4, longitud(l4))
+    }
+    sea l3 = l4
+    sea tipo_eth = 0
+    si (tiene_clave(capas, "ipv4")) {
+        sea ip = capas["ipv4"]
+        tipo_eth = 2048
+        sea fl = 0
+        si (ip["no_fragmentar"] ?? falso) { fl = 16384 }
+        sea cab = char_de(69) + char_de(ip["tos"] ?? 0) + bytes_entero(20 + longitud(l4), 2, 0) + bytes_entero(ip["id"] ?? 0, 2, 0) + bytes_entero(fl, 2, 0) +
+            char_de(ip["ttl"] ?? 64) + char_de(ip["protocolo"] ?? proto) + bytes_entero(0, 2, 0) + origen_ip + destino_ip
+        sea s = sonda_suma_verificacion(cab)
+        l3 = subtexto(cab, 0, 10) + bytes_entero(s, 2, 0) + subtexto(cab, 12, 20) + l4
+    } sino si (es6) {
+        sea ip = capas["ipv6"]
+        tipo_eth = 34525
+        l3 = bytes_entero(1610612736 + (ip["flujo"] ?? 0), 4, 0) + bytes_entero(longitud(l4), 2, 0) + char_de(ip["siguiente"] ?? proto) + char_de(ip["saltos"] ?? 64) + origen_ip + destino_ip + l4
+    }
+    si (tiene_clave(capas, "ethernet")) {
+        sea e = capas["ethernet"]
+        sea tipo_final = e["tipo"] ?? tipo_eth
+        sea marco = sonda_mac_bytes(e["destino"] ?? "ff:ff:ff:ff:ff:ff") + sonda_mac_bytes(e["origen"] ?? "00:00:00:00:00:00")
+        si (tiene_clave(capas, "vlan")) { marco = marco + bytes_entero(33024, 2, 0) + bytes_entero((capas["vlan"]["prioridad"] ?? 0) * 8192 + capas["vlan"]["id"], 2, 0) }
+        retornar marco + bytes_entero(tipo_final, 2, 0) + l3
+    }
+    retornar l3
+}
+
+// ---------- captura en vivo (Linux, AF_PACKET) ----------
+
+funcion __sonda_declaraciones() {
+    extern "libc" funcion socket(dominio: entero, tipo_s: entero, protocolo: entero): entero
+    extern "libc" funcion setsockopt(fd: entero, nivel: entero, opcion: entero, valor: puntero, largo: entero): entero
+    extern "libc" funcion bind(fd: entero, dir: puntero, largo: entero): entero
+    extern "libc" funcion recvfrom(fd: entero, buf: puntero, n: largo, banderas: entero, dir: puntero, largo_dir: puntero): largo
+    extern "libc" funcion sendto(fd: entero, buf: puntero, n: largo, banderas: entero, dir: puntero, largo_dir: entero): largo
+    extern "libc" funcion close(fd: entero): entero
+    extern "libc" funcion if_nametoindex(nombre: texto): entero
+}
+
+/// Interfaces de red del sistema (Linux: /sys/class/net).
+funcion sonda_interfaces() {
+    si (es_carpeta("/sys/class/net")) {
+        sea r = listar_carpeta("/sys/class/net")
+        ordenar(r)
+        retornar r
+    }
+    retornar []
+}
+
+/// Abre una captura en vivo. interfaz: nombre ("eth0", "lo") o nulo para
+/// todas. Necesita Linux y root o CAP_NET_RAW. opciones: {"filtro": "tcp",
+/// "largo_maximo": 65535}.
+funcion sonda_abrir(interfaz, opciones) {
+    si (sys_info()["sistema"] != "linux") { lanzar "sonda: la captura en vivo solo está disponible en Linux (usa archivos pcap en otros sistemas)" }
+    __sonda_declaraciones()
+    sea op = opciones ?? {}
+    sea fd = socket(17, 3, 768)
+    si (fd < 0) { lanzar "sonda: no se pudo abrir AF_PACKET (¿falta root o CAP_NET_RAW?)" }
+    si (interfaz != nulo) {
+        sea idx = if_nametoindex(interfaz)
+        si (idx == 0) {
+            close(fd)
+            lanzar "sonda: interfaz desconocida " + interfaz
+        }
+        // sockaddr_ll: familia AF_PACKET, protocolo ETH_P_ALL (orden de red), índice.
+        sea dir = c_desde_bytes(bytes_entero(17, 2, 1) + bytes_entero(3, 2, 0) + bytes_entero(idx, 4, 1) + bytes_entero(0, 12, 1))
+        si (bind(fd, dir, 20) != 0) {
+            c_liberar(dir)
+            close(fd)
+            lanzar "sonda: no se pudo enlazar a " + interfaz
+        }
+        c_liberar(dir)
+    }
+    sea f = nulo
+    si ((op["filtro"] ?? nulo) != nulo) { f = sonda_filtro(op["filtro"]) }
+    retornar {"fd": fd, "interfaz": interfaz, "filtro": f, "largo_maximo": op["largo_maximo"] ?? 65535, "buffer": c_reservar(65536), "enlace": 1, "espera": -1}
+}
+
+funcion _snd_espera(cap, ms) {
+    si (cap["espera"] == ms) { retornar nulo }
+    sea tv = c_reservar(16)
+    c_escribir64(tv, 0, piso(ms / 1000))
+    c_escribir64(tv, 8, (ms % 1000) * 1000)
+    setsockopt(cap["fd"], 1, 20, tv, 16)
+    c_liberar(tv)
+    cap["espera"] = ms
+}
+
+/// Siguiente paquete ({"tiempo", "datos", "largo_original", "decodificado"})
+/// o nulo si pasan espera_ms sin ninguno que cumpla el filtro.
+funcion sonda_siguiente(cap, espera_ms) {
+    __sonda_declaraciones()
+    sea limite = tiempo_ms() + (espera_ms ?? 1000)
+    mientras (verdadero) {
+        sea resta = limite - tiempo_ms()
+        si (resta <= 0) { retornar nulo }
+        _snd_espera(cap, maximo(1, resta))
+        sea n = recvfrom(cap["fd"], cap["buffer"], 65536, 0, 0, 0)
+        si (n > 0) {
+            sea datos = c_bytes(cap["buffer"], minimo(n, cap["largo_maximo"]))
+            sea d = sonda_decodificar(datos, 1)
+            si (cap["filtro"] == nulo o sonda_coincide(d, cap["filtro"])) {
+                retornar {"tiempo": tiempo_actual(), "ts_ns": nulo, "datos": datos, "largo_original": n, "interfaz": 0, "decodificado": d}
+            }
+        }
+    }
+}
+
+/// Envía un marco crudo (Ethernet) por la interfaz de la captura.
+funcion sonda_inyectar(cap, datos) {
+    __sonda_declaraciones()
+    si (cap["interfaz"] == nulo) { lanzar "sonda: para inyectar hay que abrir una interfaz concreta" }
+    sea buf = c_desde_bytes(datos)
+    sea n = sendto(cap["fd"], buf, longitud(datos), 0, 0, 0)
+    c_liberar(buf)
+    retornar n == longitud(datos)
+}
+
+/// Cierra una captura en vivo.
+funcion sonda_cerrar(cap) {
+    __sonda_declaraciones()
+    si (cap["fd"] >= 0) {
+        close(cap["fd"])
+        c_liberar(cap["buffer"])
+        cap["fd"] = -1
+    }
+}
