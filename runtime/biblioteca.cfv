@@ -171,6 +171,116 @@ funcion dyn_formato_g(r, bits) { retornar dyn_formato_cifras(r, bits, 6) }
 
 // Número con cifras significativas: 6 para mostrar (como %g), 15 para JSON
 // (ida y vuelta sin perder datos; los enteros exactos van sin decimales).
+// Entero grande en base 10^9 (vec, la cifra menos significativa primero)
+// por m (m·10^9 cabe en 64 bits).
+funcion dyn_dec_mul(v, m) {
+    sea acarreo = 0
+    sea i = 0
+    mientras (i < vec_largo(v)) {
+        sea t = vec_obtener(v, i) * m + acarreo
+        vec_fijar(v, i, t % 1000000000)
+        acarreo = t / 1000000000
+        i = i + 1
+    }
+    mientras (acarreo > 0) {
+        vec_agregar(v, acarreo % 1000000000)
+        acarreo = acarreo / 1000000000
+    }
+    retornar 0
+}
+
+// Las "cifras" primeras cifras decimales exactas de x (> 0, finito),
+// redondeadas con mitad al par; deja en celda_e el exponente decimal.
+funcion dyn_cifras_exactas(x, cifras, celda_e) {
+    sea exp_bits = __y_bits(__desplazar_der(x, 52), 2047)
+    sea f = __y_bits(x, 4503599627370495)
+    sea p = 0 - 1074
+    si (exp_bits != 0) {
+        f = f + 4503599627370496
+        p = exp_bits - 1075
+    }
+    sea v = vec_nuevo()
+    vec_agregar(v, f % 1000000000)
+    vec_agregar(v, f / 1000000000)
+    sea desplazar = 0
+    si (p >= 0) {
+        sea k = p
+        mientras (k >= 29) {
+            dyn_dec_mul(v, 536870912)
+            k = k - 29
+        }
+        si (k > 0) { dyn_dec_mul(v, __desplazar_izq(1, k)) }
+    } sino {
+        // f / 2^-p = f · 5^-p / 10^-p
+        sea k = 0 - p
+        mientras (k >= 12) {
+            dyn_dec_mul(v, 244140625)
+            k = k - 12
+        }
+        sea q = 1
+        mientras (k > 0) {
+            q = q * 5
+            k = k - 1
+        }
+        si (q > 1) { dyn_dec_mul(v, q) }
+        desplazar = p
+    }
+    mientras (vec_largo(v) > 1 y vec_obtener(v, vec_largo(v) - 1) == 0) { vec_quitar_ultimo(v) }
+    sea d = str_nuevo(vec_largo(v) * 9 + 1)
+    sea i = vec_largo(v) - 1
+    str_agregar(d, str_desde_entero(vec_obtener(v, i)))
+    i = i - 1
+    mientras (i >= 0) {
+        sea parte = str_desde_entero(vec_obtener(v, i))
+        sea relleno = 9 - str_largo(parte)
+        mientras (relleno > 0) {
+            str_agregar_byte(d, 48)
+            relleno = relleno - 1
+        }
+        str_agregar(d, parte)
+        i = i - 1
+    }
+    vec_liberar(v)
+    sea n = str_largo(d)
+    sea e = n - 1 + desplazar
+    sea r = str_nuevo(cifras + 1)
+    si (n <= cifras) {
+        str_agregar(r, d)
+        mientras (str_largo(r) < cifras) { str_agregar_byte(r, 48) }
+    } sino {
+        str_agregar(r, str_rebanar(d, 0, cifras))
+        sea siguiente = str_byte(d, cifras)
+        sea resto = 0
+        sea j = cifras + 1
+        mientras (j < n y resto == 0) {
+            si (str_byte(d, j) != 48) { resto = 1 }
+            j = j + 1
+        }
+        sea subir = siguiente > 53 o (siguiente == 53 y (resto o __y_bits(str_byte(r, cifras - 1), 1) == 1))
+        si (subir) {
+            sea k = cifras - 1
+            sea seguir = 1
+            mientras (seguir y k >= 0) {
+                sea b = str_byte(r, k)
+                si (b == 57) {
+                    __guardar8(str_datos(r) + k, 48)
+                    k = k - 1
+                } sino {
+                    __guardar8(str_datos(r) + k, b + 1)
+                    seguir = 0
+                }
+            }
+            si (seguir) {
+                // 99…9 → 100…0 con un exponente más.
+                __guardar8(str_datos(r), 49)
+                e = e + 1
+            }
+        }
+    }
+    __guardar64(celda_e, e)
+    retornar r
+}
+
 funcion dyn_formato_cifras(r, bits, cifras) {
     sea exponente_bits = __y_bits(__desplazar_der(bits, 52), 2047)
     sea negativo = bits < 0
@@ -183,45 +293,12 @@ funcion dyn_formato_cifras(r, bits, cifras) {
     }
     si (x == 0) { str_agregar_byte(r, 48) retornar 0 }
     si (negativo) { str_agregar_byte(r, 45) }
-    // Exponente decimal e tal que 10^e <= x < 10^(e+1).
-    sea e = 0
-    sea y = x
-    mientras (__f64_menor(y, f_(10)) == 0) {
-        y = __f64_div(y, f_(10))
-        e = e + 1
-    }
-    mientras (__f64_menor(y, f_(1))) {
-        y = __f64_mul(y, f_(10))
-        e = e - 1
-    }
-    // Las cifras significativas como entero m (10^(c-1) <= m < 10^c).
-    sea minimo_m = 1
-    sea k = 1
-    mientras (k < cifras) {
-        minimo_m = minimo_m * 10
-        k = k + 1
-    }
-    sea maximo_m = minimo_m * 10
-    sea m = 0
-    si (e - (cifras - 1) >= 0) {
-        m = f_redondear(__f64_div(x, f_potencia10(e - (cifras - 1))))
-    } sino {
-        si (cifras - 1 - e > 300) {
-            // Subnormales (~1e-310): 10^(c-1-e) se desbordaría; se escala en dos pasos.
-            m = f_redondear(__f64_mul(__f64_mul(x, f_potencia10(300)), f_potencia10(cifras - 1 - e - 300)))
-        } sino {
-            m = f_redondear(__f64_mul(x, f_potencia10(cifras - 1 - e)))
-        }
-    }
-    si (m >= maximo_m) {
-        m = (m + 5) / 10
-        e = e + 1
-    }
-    si (m < minimo_m) {
-        m = m * 10
-        e = e - 1
-    }
-    sea digitos = str_desde_entero(m)
+    // Cifras exactas (el double es f·2^p: se pasa a decimal sin redondeos
+    // intermedios) redondeadas a "cifras" con mitad al par.
+    sea celda_e = mem_reservar(8)
+    sea digitos = dyn_cifras_exactas(x, cifras, celda_e)
+    sea e = __cargar64(celda_e)
+    mem_liberar(celda_e)
     // Quitar ceros finales.
     sea utiles = cifras
     mientras (utiles > 1 y str_byte(digitos, utiles - 1) == 48) { utiles = utiles - 1 }
@@ -989,8 +1066,16 @@ funcion cfv_fecha_ahora() {
 
 funcion sys_info() {
     sea r = map_nuevo()
-    map_fijar(r, "sistema", dyn_texto("linux"))
-    map_fijar(r, "cpu", dyn_texto("x86_64"))
+    // sys_nombre_plataforma(): "Linux x86-64", "macOS ARM64", "Windows x86-64"…
+    sea p = sys_nombre_plataforma()
+    sea so = "linux"
+    si (str_largo(p) >= 5 y str_igual(str_rebanar(p, 0, 5), "macOS")) { so = "macos" }
+    si (str_largo(p) >= 7 y str_igual(str_rebanar(p, 0, 7), "Windows")) { so = "windows" }
+    sea cpu = "x86_64"
+    si (str_largo(p) >= 5 y str_igual(str_rebanar(p, str_largo(p) - 5, str_largo(p)), "ARM64")) { cpu = "arm64" }
+    map_fijar(r, "sistema", dyn_texto(so))
+    map_fijar(r, "cpu", dyn_texto(cpu))
+    map_fijar(r, "plataforma", dyn_texto(p))
     map_fijar(r, "nucleos", dyn_entero(sys_nucleos()))
     retornar dyn_caja(3, r)
 }
@@ -2384,10 +2469,50 @@ funcion http_servidor(id) {
     retornar vec_obtener(v, i)
 }
 
+// IPv4 "a.b.c.d" (o "localhost") como entero; -1 si no es válida.
+funcion http_ip_entero(s) {
+    si (str_igual(s, "localhost")) { retornar 2130706433 }
+    si (str_largo(s) == 0) { retornar 0 }
+    sea r = 0
+    sea parte = 0 - 1
+    sea partes = 0
+    sea i = 0
+    mientras (i <= str_largo(s)) {
+        sea b = 46
+        si (i < str_largo(s)) { b = str_byte(s, i) }
+        si (b == 46) {
+            si (parte < 0 o parte > 255) { retornar 0 - 1 }
+            r = r * 256 + parte
+            partes = partes + 1
+            parte = 0 - 1
+        } sino {
+            si (b < 48 o b > 57) { retornar 0 - 1 }
+            si (parte < 0) { parte = 0 }
+            parte = parte * 10 + b - 48
+            si (parte > 255) { retornar 0 - 1 }
+        }
+        i = i + 1
+    }
+    si (partes != 4) { retornar 0 - 1 }
+    retornar r
+}
+
+// Escucha solo en 127.0.0.1 (este equipo): seguro por defecto. Para
+// atender a otros equipos, servidor_http_escuchar_en("0.0.0.0", puerto) o
+// la variable de entorno CFORGE_HTTP_HOST (p. ej. CFORGE_HTTP_HOST=0.0.0.0
+// en un contenedor).
 funcion servidor_http_escuchar(puerto) {
+    sea h = sys_variable_entorno("CFORGE_HTTP_HOST")
+    si (h == 0) { h = "127.0.0.1" }
+    retornar servidor_http_escuchar_en(dyn_texto(h), puerto)
+}
+
+funcion servidor_http_escuchar_en(host, puerto) {
+    sea ip = http_ip_entero(dyn_texto_de(host, "servidor_http_escuchar_en"))
+    si (ip < 0) { dyn_error(str_concatenar("servidor_http_escuchar_en: dirección IPv4 inválida: ", dyn_dato(host))) }
     sea p = dyn_valor_entero(puerto)
-    si (p < 1 o p > 65535) { dyn_error("servidor_http_escuchar: puerto invalido") }
-    sea fd = sys_red_escuchar(p)
+    si (__y_bits(puerto, 1) != 1 o p < 1 o p > 65535) { dyn_error("servidor_http_escuchar: puerto invalido") }
+    sea fd = sys_red_escuchar(p, ip)
     si (fd == 0 - 1) { dyn_error("servidor_http_escuchar: no se pudo crear socket") }
     si (fd == 0 - 2) { dyn_error(str_concatenar("servidor_http_escuchar: no se pudo enlazar al puerto ", str_desde_entero(p))) }
     si (fd < 0) { dyn_error("servidor_http_escuchar: no se pudo escuchar") }
@@ -2637,14 +2762,33 @@ funcion http_texto_estado(estado) {
     retornar "OK"
 }
 
-funcion servidor_http_responder(id, estado, cuerpo, tipo) {
+funcion servidor_http_responder(id, estado, cuerpo, tipo) { retornar servidor_http_responder_con(id, estado, cuerpo, tipo, 0) }
+
+// ¿Texto seguro para una cabecera? (sin CR, LF ni NUL: evita la inyección
+// de cabeceras y la división de respuestas).
+funcion http_cabecera_segura(s) {
+    sea i = 0
+    mientras (i < str_largo(s)) {
+        sea b = str_byte(s, i)
+        si (b == 13 o b == 10 o b == 0) { retornar 0 }
+        i = i + 1
+    }
+    retornar 1
+}
+
+// Como servidor_http_responder, con un mapa de cabeceras extra
+// ({"Location": "/", "Set-Cookie": "a=1", "Access-Control-Allow-Origin": "*"}).
+// Ya no se agrega CORS por defecto: cada respuesta decide si lo quiere.
+funcion servidor_http_responder_con(id, estado, cuerpo, tipo, cabeceras) {
     sea srv = http_servidor(id)
     sea cliente = __cargar64(srv + 8)
     si (cliente < 0) { dyn_error("servidor_http_responder: sin cliente activo") }
     sea e = dyn_valor_entero(estado)
+    si (__y_bits(estado, 1) != 1 o e < 100 o e > 999) { dyn_error("servidor_http_responder: estado HTTP inválido") }
     sea c = dyn_a_str(cuerpo)
     sea t = "text/plain; charset=utf-8"
     si (dyn_tipo(tipo) == 1) { t = dyn_dato(tipo) }
+    si (http_cabecera_segura(t) == 0) { dyn_error("servidor_http_responder: Content-Type con saltos de línea") }
     sea r = str_nuevo(str_largo(c) + 256)
     str_agregar(r, "HTTP/1.1 ")
     str_agregar(r, str_desde_entero(e))
@@ -2654,7 +2798,45 @@ funcion servidor_http_responder(id, estado, cuerpo, tipo) {
     str_agregar(r, t)
     str_agregar(r, "\r\nContent-Length: ")
     str_agregar(r, str_desde_entero(str_largo(c)))
-    str_agregar(r, "\r\nConnection: close\r\nAccess-Control-Allow-Origin: *\r\n\r\n")
+    str_agregar(r, "\r\nConnection: close\r\n")
+    si (dyn_tipo(cabeceras) == 3) {
+        sea m = dyn_dato(cabeceras)
+        sea orden = dyn_claves_ordenadas(m)
+        sea j = 0
+        mientras (j < vec_largo(orden)) {
+            sea k = vec_obtener(orden, j)
+            sea kl = http_minusculas(k)
+            // Las que arma el servidor no se duplican.
+            si (str_igual(kl, "content-length") == 0 y str_igual(kl, "content-type") == 0 y str_igual(kl, "connection") == 0 y str_igual(kl, "transfer-encoding") == 0) {
+                sea v = map_obtener(m, k)
+                sea valores = vec_nuevo()
+                si (dyn_tipo(v) == 2) {
+                    sea q = 0
+                    mientras (q < vec_largo(dyn_dato(v))) {
+                        vec_agregar(valores, dyn_a_str(vec_obtener(dyn_dato(v), q)))
+                        q = q + 1
+                    }
+                } sino { si (v != 0) { vec_agregar(valores, dyn_a_str(v)) } }
+                si (http_cabecera_segura(k) == 0 o str_buscar(k, ":", 0) >= 0 o str_largo(k) == 0) {
+                    dyn_error(str_concatenar("servidor_http_responder: nombre de cabecera inválido: ", k))
+                }
+                sea q = 0
+                mientras (q < vec_largo(valores)) {
+                    si (http_cabecera_segura(vec_obtener(valores, q)) == 0) {
+                        dyn_error(str_concatenar("servidor_http_responder: la cabecera tiene saltos de línea: ", k))
+                    }
+                    str_agregar(r, k)
+                    str_agregar(r, ": ")
+                    str_agregar(r, vec_obtener(valores, q))
+                    str_agregar(r, "\r\n")
+                    q = q + 1
+                }
+            }
+            j = j + 1
+        }
+        vec_liberar(orden)
+    }
+    str_agregar(r, "\r\n")
     str_agregar(r, c)
     sea enviado = 0
     mientras (enviado < str_largo(r)) {
@@ -3058,8 +3240,23 @@ funcion lista_direccion(l) {
 // Texto de un número sin perder precisión (para JSON y serialización).
 funcion numero_preciso(v) {
     si (dyn_tipo(v) != 4) { retornar a_texto(v) }
+    // inf y nan: sin vuelta atrás que probar.
+    si (__y_bits(__desplazar_der(dyn_dato(v), 52), 2047) == 2047) {
+        sea r = str_nuevo(8)
+        dyn_formato_cifras(r, dyn_dato(v), 15)
+        retornar dyn_texto(r)
+    }
+    // El texto más corto (15, 16 o 17 cifras) que vuelve al mismo double.
+    sea cifras = 15
+    mientras (cifras < 17) {
+        sea r = str_nuevo(32)
+        dyn_formato_cifras(r, dyn_dato(v), cifras)
+        sea de_vuelta = a_numero(dyn_texto(r))
+        si (dyn_tipo(de_vuelta) == 4 y dyn_dato(de_vuelta) == dyn_dato(v)) { retornar dyn_texto(r) }
+        cifras = cifras + 1
+    }
     sea r = str_nuevo(32)
-    dyn_formato_cifras(r, dyn_dato(v), 15)
+    dyn_formato_cifras(r, dyn_dato(v), 17)
     retornar dyn_texto(r)
 }
 
@@ -3566,4 +3763,330 @@ funcion variable_entorno(nombre) {
     sea v = sys_variable_entorno(dyn_texto_de(nombre, "variable_entorno"))
     si (v == 0) { retornar 0 }
     retornar dyn_texto(v)
+}
+
+// ── JSON nativo ───────────────────────────────────────────────────────────
+// json_parsear y json_serializar recorren los bytes una sola vez sobre
+// textos del runtime (antes eran C-Forge dinámico con un mapa de estado y
+// concatenaciones, unas 30 veces más lento).
+
+funcion dyn_json_error(i) {
+    dyn_error(str_concatenar("json_parsear: token inválido en la posición ", str_desde_entero(i)))
+    retornar 0
+}
+
+funcion dyn_json_ws(d, i, n) {
+    mientras (i < n) {
+        sea b = __cargar8(d + i)
+        si (b != 32 y b != 9 y b != 10 y b != 13) { retornar i }
+        i = i + 1
+    }
+    retornar i
+}
+
+funcion dyn_json_hex4(d, i, n) {
+    si (i + 4 > n) { retornar 0 - 1 }
+    sea v = 0
+    sea k = 0
+    mientras (k < 4) {
+        sea b = __cargar8(d + i + k)
+        sea x = 0 - 1
+        si (b >= 48 y b <= 57) { x = b - 48 }
+        si (b >= 97 y b <= 102) { x = b - 87 }
+        si (b >= 65 y b <= 70) { x = b - 55 }
+        si (x < 0) { retornar 0 - 1 }
+        v = v * 16 + x
+        k = k + 1
+    }
+    retornar v
+}
+
+// Texto que empieza en d[i] == '"'; deja la posición siguiente en pos.
+funcion dyn_json_texto(d, i, n, pos) {
+    i = i + 1
+    sea ini = i
+    // Camino rápido: sin escapes.
+    mientras (i < n y __cargar8(d + i) != 34 y __cargar8(d + i) != 92) { i = i + 1 }
+    si (i >= n) { dyn_json_error(i) }
+    sea r = str_nuevo(i - ini + 16)
+    mem_copiar(str_datos(r), d + ini, i - ini)
+    __guardar64(r, i - ini)
+    __guardar8(str_datos(r) + i - ini, 0)
+    mientras (verdadero) {
+        si (i >= n) { dyn_json_error(i) }
+        sea b = __cargar8(d + i)
+        si (b == 34) {
+            __guardar64(pos, i + 1)
+            retornar dyn_texto(r)
+        }
+        si (b == 92) {
+            si (i + 1 >= n) { dyn_json_error(i) }
+            sea e = __cargar8(d + i + 1)
+            i = i + 2
+            si (e == 110) { str_agregar_byte(r, 10) }
+            sino si (e == 116) { str_agregar_byte(r, 9) }
+            sino si (e == 114) { str_agregar_byte(r, 13) }
+            sino si (e == 98) { str_agregar_byte(r, 8) }
+            sino si (e == 102) { str_agregar_byte(r, 12) }
+            sino si (e == 34 o e == 92 o e == 47) { str_agregar_byte(r, e) }
+            sino si (e == 117) {
+                sea c = dyn_json_hex4(d, i, n)
+                si (c < 0) { dyn_json_error(i) }
+                i = i + 4
+                // Par sustituto UTF-16 (emojis y otros fuera del plano básico).
+                si (c >= 55296 y c <= 56319 y i + 6 <= n y __cargar8(d + i) == 92 y __cargar8(d + i + 1) == 117) {
+                    sea c2 = dyn_json_hex4(d, i + 2, n)
+                    si (c2 >= 56320 y c2 <= 57343) {
+                        c = 65536 + (c - 55296) * 1024 + (c2 - 56320)
+                        i = i + 6
+                    }
+                }
+                str_agregar_utf8(r, c)
+            } sino { dyn_json_error(i - 1) }
+        } sino {
+            str_agregar_byte(r, b)
+            i = i + 1
+        }
+    }
+    retornar 0
+}
+
+funcion dyn_json_valor(d, i, n, pos, prof) {
+    i = dyn_json_ws(d, i, n)
+    si (i >= n) { dyn_json_error(i) }
+    si (prof > 5000) { dyn_error("json_parsear: anidamiento demasiado profundo") }
+    sea b = __cargar8(d + i)
+    si (b == 123) {
+        sea m = map_nuevo()
+        i = dyn_json_ws(d, i + 1, n)
+        si (i < n y __cargar8(d + i) == 125) {
+            __guardar64(pos, i + 1)
+            retornar dyn_caja(3, m)
+        }
+        mientras (verdadero) {
+            i = dyn_json_ws(d, i, n)
+            si (i >= n o __cargar8(d + i) != 34) { dyn_json_error(i) }
+            sea k = dyn_json_texto(d, i, n, pos)
+            i = dyn_json_ws(d, __cargar64(pos), n)
+            si (i >= n o __cargar8(d + i) != 58) { dyn_json_error(i) }
+            sea v = dyn_json_valor(d, i + 1, n, pos, prof + 1)
+            map_fijar(m, dyn_dato(k), v)
+            i = dyn_json_ws(d, __cargar64(pos), n)
+            si (i < n y __cargar8(d + i) == 44) { i = i + 1 }
+            sino si (i < n y __cargar8(d + i) == 125) {
+                __guardar64(pos, i + 1)
+                retornar dyn_caja(3, m)
+            } sino { dyn_json_error(i) }
+        }
+    }
+    si (b == 91) {
+        sea l = vec_nuevo()
+        i = dyn_json_ws(d, i + 1, n)
+        si (i < n y __cargar8(d + i) == 93) {
+            __guardar64(pos, i + 1)
+            retornar dyn_caja(2, l)
+        }
+        mientras (verdadero) {
+            vec_agregar(l, dyn_json_valor(d, i, n, pos, prof + 1))
+            i = dyn_json_ws(d, __cargar64(pos), n)
+            si (i < n y __cargar8(d + i) == 44) { i = i + 1 }
+            sino si (i < n y __cargar8(d + i) == 93) {
+                __guardar64(pos, i + 1)
+                retornar dyn_caja(2, l)
+            } sino { dyn_json_error(i) }
+        }
+    }
+    si (b == 34) { retornar dyn_json_texto(d, i, n, pos) }
+    si (b == 116 y i + 4 <= n y __cargar8(d + i + 1) == 114 y __cargar8(d + i + 2) == 117 y __cargar8(d + i + 3) == 101) {
+        __guardar64(pos, i + 4)
+        retornar 4
+    }
+    si (b == 102 y i + 5 <= n y __cargar8(d + i + 1) == 97 y __cargar8(d + i + 2) == 108 y __cargar8(d + i + 3) == 115 y __cargar8(d + i + 4) == 101) {
+        __guardar64(pos, i + 5)
+        retornar 2
+    }
+    si (b == 110 y i + 4 <= n y __cargar8(d + i + 1) == 117 y __cargar8(d + i + 2) == 108 y __cargar8(d + i + 3) == 108) {
+        __guardar64(pos, i + 4)
+        retornar 0
+    }
+    si (b == 45 o (b >= 48 y b <= 57)) {
+        sea ini = i
+        si (b == 45) { i = i + 1 }
+        sea dig = 0
+        sea entero = 1
+        mientras (i < n y __cargar8(d + i) >= 48 y __cargar8(d + i) <= 57) {
+            i = i + 1
+            dig = dig + 1
+        }
+        si (dig == 0) { dyn_json_error(i) }
+        si (i < n y __cargar8(d + i) == 46) {
+            entero = 0
+            i = i + 1
+            sea f = 0
+            mientras (i < n y __cargar8(d + i) >= 48 y __cargar8(d + i) <= 57) {
+                i = i + 1
+                f = f + 1
+            }
+            si (f == 0) { dyn_json_error(i) }
+        }
+        si (i < n y (__cargar8(d + i) == 101 o __cargar8(d + i) == 69)) {
+            entero = 0
+            i = i + 1
+            si (i < n y (__cargar8(d + i) == 43 o __cargar8(d + i) == 45)) { i = i + 1 }
+            sea x = 0
+            mientras (i < n y __cargar8(d + i) >= 48 y __cargar8(d + i) <= 57) {
+                i = i + 1
+                x = x + 1
+            }
+            si (x == 0) { dyn_json_error(i) }
+        }
+        __guardar64(pos, i)
+        // Enteros cortos sin pasar por texto.
+        si (entero y dig <= 15) {
+            sea v = 0
+            sea k = ini
+            si (b == 45) { k = k + 1 }
+            mientras (k < i) {
+                v = v * 10 + __cargar8(d + k) - 48
+                k = k + 1
+            }
+            si (b == 45) { v = 0 - v }
+            retornar dyn_entero(v)
+        }
+        retornar a_numero(dyn_texto(str_rebanar_bytes(d, ini, i)))
+    }
+    dyn_json_error(i)
+    retornar 0
+}
+
+funcion str_rebanar_bytes(d, ini, fin) {
+    sea r = str_nuevo(fin - ini)
+    mem_copiar(str_datos(r), d + ini, fin - ini)
+    __guardar64(r, fin - ini)
+    __guardar8(str_datos(r) + fin - ini, 0)
+    retornar r
+}
+
+funcion dyn_json_parsear(texto) {
+    sea s = dyn_texto_de(texto, "json_parsear")
+    sea d = str_datos(s)
+    sea n = str_largo(s)
+    sea pos = mem_reservar(8)
+    __guardar64(pos, 0)
+    sea v = dyn_json_valor(d, 0, n, pos, 0)
+    sea i = dyn_json_ws(d, __cargar64(pos), n)
+    mem_liberar(pos)
+    si (i != n) { dyn_json_error(i) }
+    retornar v
+}
+
+funcion dyn_json_escapar_en(r, s) {
+    sea d = str_datos(s)
+    sea n = str_largo(s)
+    str_agregar_byte(r, 34)
+    sea i = 0
+    sea hex = "0123456789abcdef"
+    mientras (i < n) {
+        sea b = __cargar8(d + i)
+        si (b == 34) { str_agregar(r, "\\\"") }
+        sino si (b == 92) { str_agregar(r, "\\\\") }
+        sino si (b == 10) { str_agregar(r, "\\n") }
+        sino si (b == 13) { str_agregar(r, "\\r") }
+        sino si (b == 9) { str_agregar(r, "\\t") }
+        sino si (b < 32) {
+            str_agregar(r, "\\u00")
+            str_agregar_byte(r, str_byte(hex, b / 16))
+            str_agregar_byte(r, str_byte(hex, b % 16))
+        } sino { str_agregar_byte(r, b) }
+        i = i + 1
+    }
+    str_agregar_byte(r, 34)
+    retornar 0
+}
+
+funcion dyn_json_escapar(t) {
+    sea r = str_nuevo(str_largo(dyn_texto_de(t, "json_escapar")) + 2)
+    dyn_json_escapar_en(r, dyn_dato(t))
+    retornar dyn_texto(r)
+}
+
+// Agrega v en JSON; sangria < 0: compacto; si no, bonito con esa sangría.
+funcion dyn_json_agregar(r, v, sangria, prof) {
+    si (prof > 5000) { dyn_error("json_serializar: anidamiento demasiado profundo (¿hay un ciclo?)") }
+    sea t = dyn_tipo(v)
+    si (t == 0) { str_agregar(r, "null") retornar 0 }
+    si (t == 5) {
+        si (v == 4) { str_agregar(r, "true") } sino { str_agregar(r, "false") }
+        retornar 0
+    }
+    si (t == 6 o t == 4) { str_agregar(r, dyn_dato(numero_preciso(v))) retornar 0 }
+    si (t == 1) { dyn_json_escapar_en(r, dyn_dato(v)) retornar 0 }
+    si (t == 2) {
+        sea l = dyn_dato(v)
+        si (vec_largo(l) == 0) { str_agregar(r, "[]") retornar 0 }
+        str_agregar_byte(r, 91)
+        sea i = 0
+        sea hija = sangria
+        si (sangria >= 0) { hija = sangria + 1 }
+        mientras (i < vec_largo(l)) {
+            si (i > 0) { str_agregar_byte(r, 44) }
+            si (sangria >= 0) { dyn_json_sangria(r, hija) }
+            dyn_json_agregar(r, vec_obtener(l, i), hija, prof + 1)
+            i = i + 1
+        }
+        si (sangria >= 0) { dyn_json_sangria(r, sangria) }
+        str_agregar_byte(r, 93)
+        retornar 0
+    }
+    si (t == 3) {
+        sea m = dyn_dato(v)
+        si (map_tamano(m) == 0) {
+            str_agregar_byte(r, 123)
+            str_agregar_byte(r, 125)
+            retornar 0
+        }
+        str_agregar_byte(r, 123)
+        sea orden = dyn_claves_ordenadas(m)
+        sea j = 0
+        sea hija = sangria
+        si (sangria >= 0) { hija = sangria + 1 }
+        mientras (j < vec_largo(orden)) {
+            sea k = vec_obtener(orden, j)
+            si (j > 0) { str_agregar_byte(r, 44) }
+            si (sangria >= 0) { dyn_json_sangria(r, hija) }
+            dyn_json_escapar_en(r, k)
+            str_agregar_byte(r, 58)
+            si (sangria >= 0) { str_agregar_byte(r, 32) }
+            dyn_json_agregar(r, map_obtener(m, k), hija, prof + 1)
+            j = j + 1
+        }
+        vec_liberar(orden)
+        si (sangria >= 0) { dyn_json_sangria(r, sangria) }
+        str_agregar_byte(r, 125)
+        retornar 0
+    }
+    dyn_error("json_serializar: valor no serializable")
+    retornar 0
+}
+
+funcion dyn_json_sangria(r, n) {
+    str_agregar_byte(r, 10)
+    sea i = 0
+    mientras (i < n) {
+        str_agregar(r, "  ")
+        i = i + 1
+    }
+    retornar 0
+}
+
+funcion dyn_json_serializar(v) {
+    sea r = str_nuevo(64)
+    dyn_json_agregar(r, v, 0 - 1, 0)
+    retornar dyn_texto(r)
+}
+
+funcion dyn_json_bonito(v) {
+    sea r = str_nuevo(64)
+    dyn_json_agregar(r, v, 0, 0)
+    retornar dyn_texto(r)
 }

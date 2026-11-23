@@ -42,7 +42,10 @@ Nada marcado como 📐 debe aparecer en c-forge.org como si ya existiera.
   JSON (`"{\"a\": 1}"`) y GLSL (`"main() {"`) no necesitan escapes. Una
   llave doble nunca interpola: `"{{nombre}}"` queda literal (plantillas), y
   tampoco una llave con `:` o `;` dentro (`"a{color:red}"`, `"{a: 1}"`) ni con
-  una coma fuera de paréntesis (`"*.{cfv,txt}"`). `\{` y
+  una coma fuera de paréntesis (`"*.{cfv,txt}"`). Tampoco interpola si
+  la expresión no tiene sentido ahí: un nombre que no es variable ni función
+  conocida o dos nombres seguidos (`"{Binding Nombre}"`, `"{B29F-CA47}"`,
+  `"<b>{nombre}</b>"` sin variable `nombre`) quedan literales. `\{` y
   `\}` siguen siendo llaves literales. Escapes: `\n`, `\t`, `\"`, `\\`.
 - Números decimales (`42`, `3.14`) y con exponente (`1e5`, `2.5e-3`, `6.02E+23`).
 
@@ -73,6 +76,11 @@ Tras un `.` las palabras no se traducen (`objeto.in` es un campo llamado `in`).
 
 `numero`, `texto`, `booleano`, `lista`, `mapa`, `nulo`, funciones y objetos de
 clase.
+
+`==` y `!=` comparan listas y mapas por contenido (`[1, [2]] == [1, [2]]`,
+`{"a": 1} == {"a": 1}` y `[] == []` son `verdadero`; el orden de las claves
+no importa). Los objetos de clase se comparan por identidad, y
+`es_mismo(a, b)` (`is_same`) dice si dos valores son el mismo objeto.
 
 ### 3.1b Verificación de tipos antes de ejecutar ✅ (4.2)
 
@@ -305,8 +313,11 @@ mostrar(sqlite3_libversion())       // 3.45.1
   AAPCS64 (macOS Apple Silicon) y Microsoft x64 (Windows).
 - `"libc"` y `"libm"` se resuelven solos; para otras librerías, nombre corto o
   ruta.
-- Límites actuales: hasta 8 parámetros; sin funciones variádicas (`printf`);
-  sin estructuras por valor.
+- Sin límite práctico de parámetros: los que no caben en registros (System V:
+  6 enteros y 8 flotantes; AAPCS64: 8 y 8; Windows: 4) van por la pila en
+  ranuras de 8 bytes. Las variádicas (`printf`) funcionan en Linux y macOS
+  Intel declarando los tipos de la llamada; en macOS Apple Silicon y Windows
+  siguen otras reglas y no están soportadas. Sin estructuras por valor.
 
 📐 Siguiente: `importar c "sqlite3.h"` lee la cabecera y declara las funciones
 automáticamente; estructuras C por valor y callbacks.
@@ -693,7 +704,11 @@ Los programas sin `extern` siguen siendo estáticos y sin libc.
   `mutex_crear/bloquear/desbloquear` con `futex`. El asignador de memoria se
   protege con `xchg` atómico. El proceso termina con `exit_group`.
 - **Servidor HTTP** (`servidor_http_escuchar/solicitud/responder/cerrar`)
-  con syscalls de sockets; lee el cuerpo según `Content-Length`.
+  con syscalls de sockets; lee el cuerpo según `Content-Length`. Escucha solo
+  en `127.0.0.1` salvo que se pida otra dirección
+  (`servidor_http_escuchar_en("0.0.0.0", 8080)` o `CFORGE_HTTP_HOST`), no
+  agrega CORS por su cuenta y `servidor_http_responder_con(id, estado, cuerpo,
+  tipo, cabeceras)` envía cabeceras propias (rechaza saltos de línea).
 - **SDL2** (`runtime/sdl.cfv`, escrito en C-Forge sobre `extern`): se incluye
   solo si el programa usa `sdl_`; SDL2_ttf/SDL2_image opcionales.
 - **Sintaxis:** `x?.campo`, ternario `c ? a : b`, `expr?` (propaga un

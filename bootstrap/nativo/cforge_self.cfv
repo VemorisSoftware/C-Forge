@@ -658,6 +658,7 @@ funcion alias_funcion(nombre) {
     si (str_igual(nombre, "json_valid")) { retornar "json_valido" }
     si (str_igual(nombre, "keys")) { retornar "claves" }
     si (str_igual(nombre, "contains")) { retornar "contiene" }
+    si (str_igual(nombre, "is_same")) { retornar "es_mismo" }
     si (str_igual(nombre, "split")) { retornar "texto_dividir" }
     si (str_igual(nombre, "join")) { retornar "texto_unir" }
     si (str_igual(nombre, "trim")) { retornar "texto_recortar" }
@@ -2796,7 +2797,11 @@ funcion tok_tipo_en(c, salto) {
 // "main() {" (GLSL) quedan como texto literal; también si dentro hay ":" o
 // ";" (CSS, objetos de JS). Una llave doble "{{" nunca
 // interpola: "{{nombre}}" llega tal cual (plantillas tipo Handlebars).
-funcion abre_interpolacion(lexema, i) {
+// Además, la expresión tiene que tener sentido aquí: cada nombre debe ser
+// una variable o función conocida y no puede haber dos nombres seguidos.
+// Así "{Binding Nombre}" (XAML), "{B29F-CA47}" (GUID) o "<b>{nombre}</b>"
+// sin variable nombre quedan como texto literal en vez de fallar.
+funcion abre_interpolacion(c, lexema, i) {
     si (str_byte(lexema, i) != 123 o i + 1 >= str_largo(lexema) - 1) { retornar 0 }
     si (str_byte(lexema, i + 1) == 123) { retornar 0 }
     si (i > 0) { si (str_byte(lexema, i - 1) == 123 y (i < 2 o str_byte(lexema, i - 2) != 92)) { retornar 0 } }
@@ -2818,22 +2823,70 @@ funcion abre_interpolacion(lexema, i) {
         si (b == 123) { nivel = nivel + 1 }
         si (b == 125) {
             nivel = nivel - 1
-            si (nivel == 0) { retornar 1 }
+            si (nivel == 0) { retornar interpolacion_resuelve(c, str_rebanar(lexema, i + 1, k)) }
         }
         k = k + 1
     }
     retornar 0
 }
 
+funcion es_palabra_operador(n) {
+    retornar str_igual(n, "y") o str_igual(n, "o") o str_igual(n, "no")
+}
+
+funcion es_palabra_valor(n) {
+    retornar str_igual(n, "verdadero") o str_igual(n, "falso") o str_igual(n, "nulo") o str_igual(n, "esto") o str_igual(n, "si")
+}
+
+// ¿El contenido de "{…}" es una expresión que se puede compilar aquí?
+funcion interpolacion_resuelve(c, texto) {
+    sea tokens = tokenizar(texto)
+    sea i = 0
+    sea antes_operando = 0                                     // el token anterior cierra un operando
+    sea tras_punto_ = 0
+    mientras (i < vec_largo(tokens)) {
+        sea t = vec_obtener(tokens, i)
+        sea tipo = __cargar64(t)
+        sea lex = __cargar64(t + 8)
+        si (tipo == 5) { retornar 1 }
+        si (tipo == 1) {
+            sea n = lex
+            sea a = alias_ingles(n)
+            si (a != 0 y tras_punto_ == 0) { n = a }
+            si (tras_punto_ == 0 y es_palabra_operador(n)) {
+                antes_operando = 0
+            } sino {
+                si (antes_operando) { retornar 0 }
+                si (tras_punto_ == 0 y es_palabra_valor(n) == 0) {
+                    si (resolver(c, n) == 0 y buscar_funcion(c, n) == 0 y alias_funcion(n) == 0) { retornar 0 }
+                }
+                antes_operando = 1
+            }
+            tras_punto_ = 0
+        } sino {
+            si (tipo == 2 o tipo == 3) {
+                si (antes_operando) { retornar 0 }
+                antes_operando = 1
+                tras_punto_ = 0
+            } sino {
+                tras_punto_ = str_igual(lex, ".")
+                antes_operando = str_igual(lex, ")") o str_igual(lex, "]")
+            }
+        }
+        i = i + 1
+    }
+    retornar 1
+}
+
 // ¿Tiene el literal alguna interpolación?
-funcion tiene_interpolacion(lexema) {
+funcion tiene_interpolacion(c, lexema) {
     sea i = 1
     mientras (i < str_largo(lexema) - 1) {
         sea b = str_byte(lexema, i)
         si (b == 92) {
             i = i + 2
         } sino {
-            si (abre_interpolacion(lexema, i)) { retornar 1 }
+            si (abre_interpolacion(c, lexema, i)) { retornar 1 }
             i = i + 1
         }
     }
@@ -2874,7 +2927,7 @@ funcion texto_interpolado(c, lexema) {
             str_agregar_byte(parte, str_byte(lexema, i + 1))
             i = i + 2
         } sino {
-            si (abre_interpolacion(lexema, i)) {
+            si (abre_interpolacion(c, lexema, i)) {
                 si (str_largo(parte) > 1) {
                     str_agregar_byte(parte, 34)
                     empujar(c)
@@ -2922,7 +2975,7 @@ funcion primaria_dinamica(c) {
     si (tipo == 2) { numero_dinamico(c) retornar 0 }
     si (tipo == 3) {
         sea lexema = __cargar64(avanzar(c) + 8)
-        si (tiene_interpolacion(lexema)) {
+        si (tiene_interpolacion(c, lexema)) {
             texto_interpolado(c, lexema)
             fijar_tipo(c, 2)
             retornar 0
