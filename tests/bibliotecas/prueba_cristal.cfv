@@ -1,0 +1,109 @@
+// Pruebas de cristal (apps con interfaz web al estilo Tauri). El puente JS
+// se probó aparte con Node y con Chrome sin cabeza.
+importar "cristal"
+funcion eq(a, b, q) { afirmar(("" + a) == ("" + b), q + ": [" + a + "] != [" + b + "]") }
+
+sea app = cristal_app({"titulo": "Prueba", "frontend": {
+    "index.html": "<!doctype html><html><head><title>x</title></head><body>hola</body></html>",
+    "app.js": "console.log(1)", "estilo.css": "body\{}", "img/logo.svg": "<svg/>", "sin_head.html": "<html lang=es><p>hola</p></html>"}})
+app["puerto"] = 4321
+sea T = app["token"]
+afirmar(longitud(T) == 32, "token de 128 bits")
+funcion pedir(metodo, ruta, cab, cuerpo) {
+    sea c = {"host": "127.0.0.1:4321"}
+    para k en claves(cab ?? {}) { c[k] = cab[k] }
+    retornar cristal_manejar(app, {"metodo": metodo, "ruta": ruta, "cabeceras": c, "cuerpo": cuerpo ?? ""})
+}
+funcion ipc(cmd, args, cab) {
+    sea c = {"x-cristal": T, "origin": "http://127.0.0.1:4321", "content-type": "application/json"}
+    para k en claves(cab ?? {}) { c[k] = cab[k] }
+    sea r = pedir("POST", "/" + T + "/__ipc", c, json_serializar({"cmd": cmd, "args": args}))
+    retornar json_parsear(r["cuerpo"])
+}
+
+// Archivos del frontend.
+sea r = pedir("GET", "/" + T + "/", nulo, nulo)
+eq([r["estado"], r["cabeceras"]["content-type"]], [200, "text/html; charset=utf-8"], "index.html")
+afirmar(texto_contiene(r["cuerpo"], "<head><script>(function()") y texto_contiene(r["cuerpo"], "window.__TAURI__"), "puente inyectado")
+afirmar(texto_contiene(r["cuerpo"], T), "token en el puente")
+afirmar(texto_contiene(r["cabeceras"]["content-security-policy"], "default-src 'self'"), "CSP")
+eq([r["cabeceras"]["x-content-type-options"], r["cabeceras"]["x-frame-options"], tiene_clave(r["cabeceras"], "access-control-allow-origin")], ["nosniff", "DENY", falso], "cabeceras de seguridad")
+eq(pedir("GET", "/" + T + "/app.js?v=2", nulo, nulo)["cabeceras"]["content-type"], "text/javascript; charset=utf-8", "JS con query")
+eq(pedir("GET", "/" + T + "/img/logo.svg", nulo, nulo)["cabeceras"]["content-type"], "image/svg+xml", "subcarpeta")
+afirmar(texto_contiene(pedir("GET", "/" + T + "/sin_head.html", nulo, nulo)["cuerpo"], "<html lang=es><script>"), "inyección sin <head>")
+eq(pedir("GET", "/" + T, nulo, nulo)["estado"], 302, "redirige a la barra")
+eq(pedir("GET", "/" + T + "/no.js", nulo, nulo)["estado"], 404, "no existe")
+// Seguridad.
+eq(pedir("GET", "/", nulo, nulo)["estado"], 404, "sin token")
+eq(pedir("GET", "/otro/index.html", nulo, nulo)["estado"], 404, "token equivocado")
+eq(pedir("GET", "/" + T + "/../" + T + "/index.html", nulo, nulo)["estado"], 400, "ruta con ..")
+eq(pedir("GET", "/" + T + "/%2e%2e/secreto", nulo, nulo)["estado"], 400, "ruta con %2e%2e")
+eq(pedir("GET", "/" + T + "/", {"host": "malo.ejemplo:4321"}, nulo)["estado"], 403, "Host ajeno (DNS rebinding)")
+eq(pedir("GET", "/" + T + "/", {"host": "localhost:4321"}, nulo)["estado"], 200, "localhost")
+eq(pedir("PUT", "/" + T + "/index.html", nulo, nulo)["estado"], 405, "método")
+
+// IPC: comandos registrados, errores y argumentos.
+cristal_comando(app, "sumar", funcion(a, ap) { retornar a["a"] + a["b"] })
+cristal_comando(app, "falla", funcion(a, ap) { lanzar "algo salió mal" })
+cristal_comando(app, "contar", funcion(a, ap) {
+    ap["estado"]["n"] = (ap["estado"]["n"] ?? 0) + 1
+    retornar ap["estado"]["n"]
+})
+eq(ipc("sumar", {"a": 2, "b": 40}, nulo), {"ok": verdadero, "valor": 42}, "invoke")
+eq(ipc("falla", {}, nulo), {"error": "algo salió mal", "ok": falso}, "error del comando")
+eq(ipc("rm", {}, nulo), {"error": "comando no permitido: rm", "ok": falso}, "comando no registrado")
+ipc("contar", {}, nulo)
+eq(ipc("contar", {}, nulo)["valor"], 2, "estado del backend")
+eq(ipc("sumar", {"a": 1, "b": 1}, {"x-cristal": "otro"})["error"], "token inválido", "IPC sin el token")
+eq(ipc("sumar", {"a": 1, "b": 1}, {"origin": "https://malo.ejemplo"})["error"], "origen no permitido", "IPC desde otro origen")
+eq(pedir("GET", "/" + T + "/__ipc", {"x-cristal": T}, nulo)["estado"], 405, "IPC solo por POST")
+eq(json_parsear(pedir("POST", "/" + T + "/__ipc", {"x-cristal": T}, "{malo")["cuerpo"])["error"], "JSON inválido", "JSON inválido")
+
+// Eventos en los dos sentidos.
+sea vistos = []
+cristal_escuchar(app, "clic", funcion(d, ap) {
+    vistos.agregar(d)
+    cristal_emitir(ap, "eco", {"valor": d})
+})
+eq(ipc("__emitir", {"evento": "clic", "datos": 7}, nulo)["ok"], verdadero, "emit desde JS")
+eq(vistos, [7], "oyente del backend")
+cristal_emitir(app, "aviso", "hola")
+sea ev = ipc("__eventos", {"desde": 0}, nulo)["valor"]
+eq([ev["siguiente"], ev["eventos"][0]["evento"], ev["eventos"][0]["datos"]["valor"], ev["eventos"][1]["datos"]], [2, "eco", 7, "hola"], "eventos al frontend")
+eq(longitud(ipc("__eventos", {"desde": 2}, nulo)["valor"]["eventos"]), 0, "eventos desde un índice")
+app["max_eventos"] = 3
+sea k = 0
+mientras (k < 5) {
+    cristal_emitir(app, "n", k)
+    k = k + 1
+}
+sea ev2 = ipc("__eventos", {"desde": 0}, nulo)["valor"]
+eq([ev2["siguiente"], longitud(ev2["eventos"]), ev2["eventos"][0]["datos"]], [7, 3, 2], "se guardan los últimos eventos")
+ipc("__latido", {}, nulo)
+afirmar(app["ultimo_latido"] != nulo, "latido")
+ipc("__cerrar", {}, nulo)
+eq(app["cerrar"], verdadero, "close() desde JS")
+
+// Servidor real en 127.0.0.1.
+sea web = cristal_app({"frontend": {"index.html": "<html><head></head><body>ok</body></html>"}})
+cristal_comando(web, "doble", funcion(a, ap) { retornar a["x"] * 2 })
+sea puerto = cristal_servir(web, 0)
+afirmar(puerto >= 20000, "puerto")
+afirmar(texto_empieza_con(cristal_url(web), "http://127.0.0.1:" + puerto + "/"), "url")
+funcion http(texto) {
+    sea c = net_conectar("127.0.0.1", puerto)
+    net_enviar(c, texto)
+    cristal_atender(web, 50)
+    sea r = net_recibir_todo(c)
+    net_cerrar(c)
+    retornar r
+}
+sea resp = http("GET /" + web["token"] + "/ HTTP/1.1\r\nHost: 127.0.0.1:" + puerto + "\r\n\r\n")
+afirmar(texto_empieza_con(resp, "HTTP/1.1 200 OK\r\n") y texto_contiene(resp, "content-security-policy:") y texto_contiene(resp, "<body>ok</body>"), "GET por TCP")
+sea cuerpo = "\{\"cmd\":\"doble\",\"args\":\{\"x\":21}}"
+sea resp2 = http("POST /" + web["token"] + "/__ipc HTTP/1.1\r\nHost: 127.0.0.1:" + puerto + "\r\nX-Cristal: " + web["token"] + "\r\nContent-Type: application/json\r\nContent-Length: " + longitud(cuerpo) + "\r\n\r\n" + cuerpo)
+afirmar(texto_termina_con(resp2, "\{\"ok\":true,\"valor\":42}"), "IPC por TCP: " + resp2)
+sea resp3 = http("HEAD /" + web["token"] + "/ HTTP/1.1\r\nHost: 127.0.0.1:" + puerto + "\r\n\r\n")
+afirmar(texto_termina_con(resp3, "\r\n\r\n"), "HEAD sin cuerpo")
+cristal_cerrar(web)
+mostrar("[OK] cristal")
