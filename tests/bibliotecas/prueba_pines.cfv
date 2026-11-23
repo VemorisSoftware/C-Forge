@@ -1,0 +1,137 @@
+// Pruebas de pines (GPIO, I2C, SPI y PWM con el simulador y la
+// codificación exacta de las estructuras del kernel).
+importar "pines"
+funcion eq(a, b, q) { afirmar(("" + a) == ("" + b), q + ": [" + a + "] != [" + b + "]") }
+
+// Estructura gpio_v2_line_request idéntica a la de linux/gpio.h (volcada con gcc).
+sea esperado = texto_recortar(leer_archivo("tests/bibliotecas/datos/pines-pedido.hex"))
+eq(hex_de_bytes(_pi_pedido_bytes([17, 27], "cforge", 10, [1, 0], nulo, 0)), esperado, "pedido como en C")
+eq(longitud(_pi_pedido_bytes([1], "x", 4, nulo, 5000, 0)), 592, "tamaño del pedido")
+eq(longitud(_pi_spi_xfer_bytes({"tx": "abc"}, {"velocidad": 500000, "bits": 8})), 32, "spi_ioc_transfer")
+eq(_PI_K["SPI_MSG1"] - 32 * 65536 + 2 * 32 * 65536, 1077963520, "SPI_IOC_MESSAGE(2)")
+// Sin placa no hay chips (y no falla).
+afirmar(tipo(pines_chips()) == "lista", "lista de chips")
+
+// GPIO simulado.
+sea chip = pines_simulado(32, nulo)
+sea led = pines_pedir(chip, 17, {"modo": "salida", "valor": 0, "consumidor": "led"})
+eq(pines_sim_nivel(chip, 17), 0, "salida en 0")
+pines_escribir(led, 1)
+eq(pines_sim_nivel(chip, 17), 1, "salida en 1")
+eq(pines_leer(led), 1, "leer una salida")
+sea inf = pines_info(chip, 17)
+eq([inf["consumidor"], inf["direccion"], inf["usada"]], ["led", "salida", verdadero], "info")
+eq(pines_linea_por_nombre(chip, "GPIO17"), 17, "por nombre")
+// Línea ocupada.
+sea ocupada = falso
+intentar { pines_pedir(chip, 17, nulo) } capturar (e) { ocupada = contiene(e, "ocupada") }
+afirmar(ocupada, "ocupada")
+// Activo bajo invierte el nivel eléctrico.
+pines_configurar(led, {"activo_bajo": verdadero, "valor": 1})
+eq(pines_sim_nivel(chip, 17), 0, "activo bajo")
+pines_soltar(led)
+eq(pines_info(chip, 17)["usada"], falso, "soltada")
+// Entrada con resistencia hacia arriba y botón a tierra.
+sea boton = pines_pedir(chip, 27, {"modo": "entrada", "sesgo": "arriba", "flancos": "ambos", "antirrebote_us": 1000})
+eq(pines_leer(boton), 1, "resistencia arriba")
+eq(pines_info(chip, 27)["sesgo"], "arriba", "info del sesgo")
+pines_sim_poner(chip, 27, 0, 10000000)
+eq(pines_leer(boton), 0, "botón apretado")
+pines_sim_poner(chip, 27, 1, 10000500)
+pines_sim_poner(chip, 27, 0, 10000900)
+pines_sim_poner(chip, 27, nulo, 20000000)
+sea ev = pines_eventos(boton, 0)
+eq(longitud(ev), 2, "el antirrebote descarta los rebotes")
+eq([ev[0]["flanco"], ev[1]["flanco"]], ["bajada", "subida"], "flancos")
+eq(pines_eventos(boton, 0), [], "cola vacía")
+// Solo flanco de bajada y activo bajo (flancos lógicos).
+sea b2 = pines_pedir(chip, [5, 6], {"modo": "entrada", "sesgo": "abajo", "activo_bajo": verdadero, "flancos": "bajada"})
+eq(pines_leer(b2), [1, 1], "activo bajo con resistencia abajo")
+pines_sim_poner(chip, 6, 1, nulo)
+eq(pines_leer(b2), [1, 0], "varias líneas")
+eq(pines_eventos(b2)[0]["linea"], 6, "evento de la línea 6")
+// Drenador abierto: con 1 queda flotando (lo fija lo de afuera).
+sea od = pines_pedir(chip, 4, {"modo": "salida", "drenador": "abierto", "valor": 0})
+eq(pines_sim_nivel(chip, 4), 0, "drenador en 0")
+pines_escribir(od, 1)
+pines_sim_poner(chip, 4, 0, nulo)
+eq(pines_sim_nivel(chip, 4), 0, "otro dispositivo tira a 0")
+sea mal = falso
+intentar { pines_pedir(chip, 99, nulo) } capturar (e) { mal = verdadero }
+afirmar(mal, "línea inexistente")
+// Conector de la Raspberry Pi.
+eq([pines_bcm(11), pines_bcm(6), pines_fisico(17), pines_fisico(2)], [17, "GND", 11, 3], "conector")
+
+// I2C simulado con un BMP280 (ejemplo del datasheet de Bosch).
+sea bus = pines_i2c_simulado()
+sea regs = {"208": 88}
+sea cal = bytes_de_hex("706b436718fc7d8e43d6d00b270b8c00f9ff8c3cf8c67017")
+sea i = 0
+mientras (i < 24) {
+    regs["" + (136 + i)] = byte_en(cal, i)
+    i = i + 1
+}
+para par en [[247, 101], [248, 90], [249, 192], [250, 126], [251, 237], [252, 0]] { regs["" + par[0]] = par[1] }
+sea dev = pines_sim_i2c(bus, 118, regs)
+eq(pines_i2c_escanear(bus), [118], "escaneo")
+sea s = pines_bme280(bus, 118)
+eq([s["T1"], s["T2"], s["T3"], s["P1"], s["P9"]], [27504, 26435, -1000, 36477, 6000], "calibración")
+eq(dev["registros"]["244"], 39, "modo normal")
+sea m = pines_bme280_leer(s)
+eq(redondear(m["temperatura"] * 100), 2508, "temperatura del datasheet")
+eq(redondear(m["presion"] * 100), 10065327, "presión del datasheet")
+afirmar(tiene_clave(m, "humedad") == falso, "BMP280 sin humedad")
+// BME280 con humedad.
+regs["208"] = 96
+para par en [[161, 75], [225, 112], [226, 1], [227, 0], [228, 19], [229, 38], [230, 3], [231, 30], [253, 120], [254, 0]] { regs["" + par[0]] = par[1] }
+sea h = pines_bme280_leer(pines_bme280(bus, 118))
+afirmar(h["humedad"] >= 0 y h["humedad"] <= 100, "humedad en rango " + h["humedad"])
+// Registros y lectura con inicio repetido.
+pines_i2c_escribir_registro(bus, 118, 16, "abc")
+eq(pines_i2c_leer_registro(bus, 118, 16, 3), "abc", "registros")
+eq(pines_i2c_leer_byte(bus, 118, 17), 98, "un byte")
+sea nack = falso
+intentar { pines_i2c_leer(bus, 80, 1) } capturar (e) { nack = contiene(e, "NACK") }
+afirmar(nack, "NACK")
+
+// SSD1306 por I2C simulado.
+sea bus2 = pines_i2c_simulado()
+sea oled_dev = pines_sim_i2c(bus2, 60, nulo)
+sea oled = pines_ssd1306(bus2, 60, 128, 32)
+sea ini = oled_dev["escrituras"][0]
+eq([byte_en(ini, 0), byte_en(ini, 1), byte_en(ini, 5)], [0, 174, 31], "inicio (multiplex 32)")
+pines_ssd1306_pixel(oled, 3, 10, verdadero)
+eq(oled["buf"][128 + 3], 4, "bit del píxel")
+pines_ssd1306_pixel(oled, 3, 10, falso)
+eq(oled["buf"][131], 0, "apagar")
+pines_ssd1306_texto(oled, 0, 0, "Hola")
+afirmar(oled["buf"][0] + oled["buf"][1] + oled["buf"][2] > 0, "texto en el búfer")
+pines_ssd1306_mostrar(oled)
+eq(longitud(oled_dev["escrituras"]), 1 + 1 + 512 / 16, "escrituras de la imagen")
+eq(byte_en(oled_dev["escrituras"][2], 0), 64, "byte de datos")
+
+// SPI simulado: lazo y un dispositivo que responde.
+sea lazo = pines_spi_simulado(nulo)
+eq(pines_spi_transferir(lazo, "hola"), "hola", "lazo")
+funcion mcp3008(tx) {
+    // Conversor MCP3008: canal en el segundo byte, responde 10 bits.
+    sea canal = piso(byte_en(tx, 1) / 16) % 8
+    sea v = 100 * (canal + 1)
+    retornar char_de(0) + char_de(piso(v / 256)) + char_de(v % 256)
+}
+sea adc = pines_spi_simulado(mcp3008)
+sea rx = pines_spi_transferir(adc, char_de(1) + char_de(128 + 2 * 16) + char_de(0))
+eq((byte_en(rx, 1) % 4) * 256 + byte_en(rx, 2), 300, "MCP3008 canal 2")
+eq(longitud(pines_spi_transferencias(lazo, [{"tx": "ab"}, {"rx_n": 3}])[1]), 3, "solo lectura")
+
+// PWM con un sysfs falso.
+sea raiz = "/tmp/cforge-pwm-" + tiempo_ms()
+crear_carpeta(raiz)
+crear_carpeta(raiz + "/pwmchip0")
+crear_carpeta(raiz + "/pwmchip0/pwm1")
+sea pwm = pines_pwm(0, 1, raiz)
+pines_pwm_configurar(pwm, {"frecuencia": 1000, "ciclo": 0.25, "activo": verdadero})
+eq([leer_archivo(raiz + "/pwmchip0/pwm1/period"), leer_archivo(raiz + "/pwmchip0/pwm1/duty_cycle"), leer_archivo(raiz + "/pwmchip0/pwm1/enable")], ["1000000", "250000", "1"], "pwm")
+pines_pwm_servo(pwm, 90, nulo)
+eq([leer_archivo(raiz + "/pwmchip0/pwm1/period"), leer_archivo(raiz + "/pwmchip0/pwm1/duty_cycle")], ["20000000", "1500000"], "servo")
+mostrar("[OK] pines")

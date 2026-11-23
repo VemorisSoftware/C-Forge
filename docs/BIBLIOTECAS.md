@@ -21,7 +21,7 @@ Estado: ✅ ya existe en C-Forge · 🔗 se usa hoy vía `cforge bindgen`,
 | 2 | `bodega` | SQL embebido en un archivo | SQLite | ✅ `sqlite` / `db` |
 | 3 | `rayo_json` | JSON ultrarrápido | cJSON, simdjson | ✅ `json` · 🛠 SIMD |
 | 4 | `ventana` | Ventanas, audio y entrada | SDL2, Raylib | ✅ `juego` / `sdl` |
-| 5 | `panel` | GUI de modo inmediato | Dear ImGui | 🛠 |
+| 5 | `panel` / `imgui` | GUI de modo inmediato | Dear ImGui | ✅ `es` / `en` |
 | 6 | `latido` / `eventloop` | Bucle de eventos asíncrono | libuv | ✅ `latido` |
 | 7 | `boveda` | Criptografía moderna | OpenSSL, libsodium | ✅ `crypto` / `tls` |
 | 8 | `pixel` | Imágenes y tipografías | stb_image, stb_truetype | ✅ `imagen` / `fuente` |
@@ -109,7 +109,7 @@ Estado: ✅ ya existe en C-Forge · 🔗 se usa hoy vía `cforge bindgen`,
 | 78 | `estilos` / `tailwind` | Utilidades de estilo y temas | Tailwind | ✅ `estilos` |
 | 79 | `retoque` | Procesamiento de imágenes | ImageSharp | ✅ `imagen` (básico) |
 | 80 | `trazo` | Vectores en GPU | Vello | 🛠 |
-| 81 | `mini_gui` | GUI embebible mínima | Nuklear | 🛠 |
+| 81 | `mini_gui` / `nuklear` | GUI embebible mínima | Nuklear | ✅ `es` / `en` |
 
 ### C. Redes, seguridad y sistemas distribuidos
 
@@ -176,13 +176,13 @@ Estado: ✅ ya existe en C-Forge · 🔗 se usa hoy vía `cforge bindgen`,
 | # | Nombre | Para qué | Inspiración | Estado |
 |---|---|---|---|---|
 | 127 | `sonido` | Reproducir y capturar audio | miniaudio | ✅ `audio` |
-| 128 | `mezcla` / `mixer` | Mezclador y decodificadores | Rodio | ✅ WAV · `mezcla` (FLAC y mezcla) · 🛠 MP3/OGG |
+| 128 | `mezcla` / `mixer` | Mezclador y decodificadores | Rodio | ✅ WAV · `mezcla` (FLAC y mezcla) · `mezcla_mp3` / `mp3` · `mezcla_vorbis` / `vorbis` |
 | 129 | `estudio` | Audio en tiempo real | PortAudio | 🔗 |
 | 130 | `entidades` / `entities` | ECS de alto rendimiento | EnTT | ✅ `entidades` |
 | 131 | `navegacion` / `navmesh` | Pathfinding y NavMesh | Recast & Detour | ✅ `navegacion` |
 | 132 | `serie` / `serialport` | Puertos serie (Arduino) | serialport | ✅ `serie` |
 | 133 | `mando` | Dispositivos USB HID | hidapi | 🔗 |
-| 134 | `pines` | GPIO, I2C y SPI | rppal | 🛠 |
+| 134 | `pines` / `gpio` | GPIO, I2C y SPI | rppal | ✅ `es` / `en` |
 | 135 | `rebote` | Física 2D determinista | Chipmunk2D | ✅ `fisica2d` |
 | 136 | `espacial` / `audio3d` | Audio 3D | OpenAL | ✅ `espacial` |
 

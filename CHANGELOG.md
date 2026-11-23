@@ -69,6 +69,19 @@ Sitio oficial: [c-forge.org](https://c-forge.org)
   `llamada`/`protobuf` (.proto, binario como protoc, marcos gRPC),
   `recolecta`/`crawler` (cookies RFC 6265, formularios, robots.txt,
   rastreo) y `sensor`/`mqtt` (paquetes MQTT, QoS 2, mini broker).
+- Lote 26 de bibliotecas (con alias en inglés y pruebas en ambos idiomas):
+  `panel`/`imgui` (GUI de modo inmediato al estilo de Dear ImGui: ventanas
+  que se mueven, pliegan, apilan y desplazan, y los elementos de siempre,
+  con lista de comandos de dibujo para cualquier motor), `mini_gui`/`nuklear`
+  (al estilo de Nuklear, con filas dinámicas y estáticas y propiedades) y
+  `pines`/`gpio` (GPIO por el uAPI v2 del kernel, I2C, SPI y PWM, con
+  simulador, el conector de la Raspberry Pi y controladores de BME280 y
+  SSD1306), `mezcla_mp3`/`mp3` (decodificador MP3 propio: MPEG-1, 2 y 2.5
+  capa III, CBR y VBR, estéreo conjunto, bloques cortos, ID3v2 y recorte
+  sin huecos de LAME; difiere en a lo más 1 de 32767 de ffmpeg) y
+  `mezcla_vorbis`/`vorbis` (decodificador Ogg Vorbis propio con IMDCT por
+  FFT, etiquetas y largo exacto por el gránulo). `mezcla_abrir` ahora abre
+  también MP3 y Ogg Vorbis.
 - Lote 25 de bibliotecas (con alias en inglés y pruebas en ambos idiomas):
   `nucleo`/`ebpf` (máquina virtual de eBPF: ensamblador, desensamblador,
   verificador, intérprete exacto de 64 bits, mapas, ayudas y carga de ELF
