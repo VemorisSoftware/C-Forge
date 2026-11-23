@@ -74,7 +74,10 @@ Sitio oficial: [c-forge.org](https://c-forge.org)
   verificador, intérprete exacto de 64 bits, mapas, ayudas y carga de ELF
   de clang; 1800 programas al azar dan lo mismo que el kernel de Linux) y
   `jit`/`jit_asm` (IR de bloques a código máquina x86-64 y ARM64, con
-  compilador de expresiones; se ejecuta en Linux x86-64).
+  compilador de expresiones; se ejecuta en Linux x86-64) e
+  `intermedio`/`ssa_ir` (SSA al estilo LLVM: lector, verificador,
+  intérprete, mem2reg, plegado, CSE, LICM, código muerto, simplificar el
+  grafo y bajada a `jit`).
 - Lote 24 de bibliotecas (con alias en inglés y pruebas en ambos idiomas):
   `sombreador`/`shader` (WGSL a GLSL 450 y ES 3.0, MSL, HLSL y WGSL con
   comprobación de tipos y reflexión; las salidas de los shaders de

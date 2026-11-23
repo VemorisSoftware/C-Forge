@@ -314,7 +314,7 @@ Estado: ✅ ya existe en C-Forge · 🔗 se usa hoy vía `cforge bindgen`,
 |---|---|---|---|---|
 | 227 | `asistente` | Servidor de lenguaje | LSP | ✅ `cforge lsp` |
 | 228 | `depura` / `dap` | Depuración paso a paso | DAP | ✅ `depura` |
-| 229 | `intermedio` | Optimización de código intermedio | LLVM, MLIR | 🛠 (v5) |
+| 229 | `intermedio` / `ssa_ir` | Optimización de código intermedio | LLVM, MLIR | ✅ `es` / `en` |
 | 230 | `gramatica` / `parser` | Combinadores de parsers | Pest, Nom | ✅ `gramatica` |
 | 231 | `analiza` | Compilador como servicio | Roslyn | 🛠 |
 | 232 | `nucleo` / `ebpf` | Programas en el kernel | eBPF | ✅ `nucleo` |
