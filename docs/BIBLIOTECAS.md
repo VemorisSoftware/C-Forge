@@ -126,7 +126,7 @@ Estado: ✅ ya existe en C-Forge · 🔗 se usa hoy vía `cforge bindgen`,
 | 90 | `sonda` | Captura de paquetes | libpcap | 🔗 |
 | 91 | `consenso` / `raft` | Consenso distribuido | Raft | ✅ `consenso` |
 | 92 | `sensor` / `mqtt` | Mensajería IoT | MQTT | ✅ `sensor` |
-| 93 | `directo` | Audio/video P2P | WebRTC | 🛠 |
+| 93 | `directo` | Audio/video P2P | WebRTC | ✅ `directo` / `webrtc` |
 | 94 | `transporte` | Transferencia multiprotocolo | libcurl | ✅ HTTP en `red` · 🔗 |
 | 95 | `freno` / `ratelimit` | Límite de peticiones | Governor | ✅ `freno` |
 | 96 | `consola_remota` | SSH y SFTP | libssh2 | 🔗 |
