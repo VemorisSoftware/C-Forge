@@ -1,0 +1,728 @@
+// stdlib/escritorio.cfv — Apps de escritorio con marcado XAML, estilos y
+// enlaces de datos al estilo de Avalonia (MVVM), sobre el motor de "nativa".
+//
+// La vista se escribe en XAML (Window, StackPanel, Grid, DockPanel, Border,
+// TextBlock, Button, TextBox, CheckBox, RadioButton, ToggleSwitch, Slider,
+// ProgressBar, ComboBox, ScrollViewer, ItemsControl, ListBox, Separator) y se
+// enlaza a un modelo (un mapa):
+//   · {Binding Nombre}: lee del modelo; en TextBox.Text, CheckBox.IsChecked,
+//     Slider.Value, ComboBox.SelectedItem, etc. también escribe (dos vías).
+//   · {Binding !Activo}, {Binding Total, StringFormat='Total: {0:F2}'},
+//     {Binding Cliente.Nombre}, {Binding} (el dato actual de la plantilla).
+//   · Propiedades calculadas: si el valor del modelo es una función, se llama
+//     con el modelo.
+//   · Comandos: Command="{Binding Guardar}" llama modelo["Guardar"](modelo,
+//     parámetro; "AlCambiar" u "OnPropertyChanged" avisan cada cambio); en plantillas, {Binding $parent[ItemsControl].DataContext.Borrar}.
+//   · Estilos: <Window.Styles><Style Selector="Button.primario"> con tipos,
+//     .clases, #nombres, :disabled, descendientes (espacio) e hijos (>).
+// Idea de Avalonia (MIT), escrito desde cero. En inglés: importar "avalonia".
+//
+// Ojo: en los textos de C-Forge, {nombre} se interpola; dentro de un texto
+// escribe \{Binding …} (o lee el XAML de un archivo .axaml).
+//
+//   importar "escritorio"
+//   sea modelo = {"Nombre": "", "Saludar": funcion(m, p) { m["Saludo"] = "Hola, " + m["Nombre"] }, "Saludo": ""}
+//   sea v = escritorio_ventana(leer_archivo("hola.axaml"), modelo)
+//   // hola.axaml:
+//   // <Window Title='Hola' Width='300' Height='150'>
+//   //   <StackPanel Margin='10' Spacing='8'>
+//   //     <TextBox Text='{Binding Nombre}' Watermark='Tu nombre'/>
+//   //     <Button Content='Saludar' Command='{Binding Saludar}'/>
+//   //     <TextBlock Text='{Binding Saludo}'/>
+//   //   </StackPanel></Window>
+//   escritorio_ejecutar(v)
+
+importar "xml"
+importar "nativa"
+
+// ---------- valores ----------
+
+sea _EO_COLORES = {"white": "#ffffff", "black": "#000000", "red": "#ff0000", "green": "#008000", "blue": "#0000ff", "gray": "#808080", "grey": "#808080",
+    "lightgray": "#d3d3d3", "darkgray": "#a9a9a9", "yellow": "#ffff00", "orange": "#ffa500", "purple": "#800080", "transparent": "#00000000",
+    "whitesmoke": "#f5f5f5", "steelblue": "#4682b4", "navy": "#000080", "teal": "#008080", "crimson": "#dc143c", "gold": "#ffd700",
+    "silver": "#c0c0c0", "darkblue": "#00008b", "lightblue": "#add8e6", "darkgreen": "#006400", "dimgray": "#696969", "royalblue": "#4169e1"}
+
+funcion _eo_hex2(s, i) {
+    sea r = 0
+    sea k = 0
+    mientras (k < 2) {
+        sea c = byte_en(s, i + k)
+        sea d = c - 48
+        si (c >= 97) { d = c - 87 } sino si (c >= 65) { d = c - 55 }
+        r = r * 16 + d
+        k = k + 1
+    }
+    retornar r
+}
+
+/// Color de XAML: "#rgb", "#rrggbb", "#aarrggbb" o un nombre (Red, White…).
+funcion escritorio_color(v) {
+    si (v == nulo) { retornar nulo }
+    si (tipo(v) == "lista") { retornar v }
+    sea s = "" + v
+    si (subtexto(s, 0, 1) != "#") { s = _EO_COLORES[texto_minusculas(s)] ?? "#000000" }
+    si (longitud(s) == 4) { s = "#" + subtexto(s, 1, 2) + subtexto(s, 1, 2) + subtexto(s, 2, 3) + subtexto(s, 2, 3) + subtexto(s, 3, 4) + subtexto(s, 3, 4) }
+    si (longitud(s) == 9) { retornar [_eo_hex2(s, 3), _eo_hex2(s, 5), _eo_hex2(s, 7), _eo_hex2(s, 1)] }
+    retornar [_eo_hex2(s, 1), _eo_hex2(s, 3), _eo_hex2(s, 5), 255]
+}
+
+// Grosor de XAML ("10", "10,5" o "izq,arriba,der,abajo") → [arriba, der, abajo, izq].
+funcion _eo_grosor(v) {
+    si (v == nulo) { retornar nulo }
+    si (tipo(v) == "numero") { retornar [v, v, v, v] }
+    sea p = []
+    para x en separar(texto_reemplazar("" + v, " ", ","), ",") { si (x != "") { p.agregar(a_numero(x)) } }
+    si (longitud(p) == 1) { retornar [p[0], p[0], p[0], p[0]] }
+    si (longitud(p) == 2) { retornar [p[1], p[0], p[1], p[0]] }
+    retornar [p[1], p[2], p[3], p[0]]
+}
+
+funcion _eo_num(v, defecto) {
+    si (v == nulo) { retornar defecto }
+    si (tipo(v) == "numero") { retornar v }
+    intentar { retornar a_numero("" + v) } capturar (e) { retornar defecto }
+}
+
+funcion _eo_bool(v) {
+    si (v == nulo) { retornar falso }
+    si (tipo(v) == "booleano") { retornar v }
+    sea s = texto_minusculas("" + v)
+    retornar s == "true" o s == "verdadero" o s == "1"
+}
+
+// ---------- enlaces ----------
+
+// Analiza "{Binding Ruta, StringFormat='…'}" → {"ruta", "negar", "formato"} o nulo.
+funcion _eo_enlace(v) {
+    si (tipo(v) != "texto") { retornar nulo }
+    sea s = texto_recortar(v)
+    si (texto_empieza_con(s, "{Binding") == falso) { retornar nulo }
+    sea cuerpo = texto_recortar(subtexto(s, 8, longitud(s) - 1))
+    sea r = {"ruta": "", "negar": falso, "formato": nulo}
+    // StringFormat puede tener comas dentro de las comillas.
+    sea i = texto_indice(cuerpo, "StringFormat")
+    si (i >= 0) {
+        sea resto = subtexto(cuerpo, i, longitud(cuerpo))
+        sea valor = texto_recortar(subtexto(resto, texto_indice(resto, "=") + 1, longitud(resto)))
+        sea q = subtexto(valor, 0, 1)
+        si (q == "'" o q == "\"") {
+            sea b = texto_indice(subtexto(valor, 1, longitud(valor)), q)
+            r["formato"] = subtexto(valor, 1, 1 + b)
+        } sino { r["formato"] = valor }
+        cuerpo = texto_recortar(subtexto(cuerpo, 0, i))
+        si (texto_termina_con(cuerpo, ",")) { cuerpo = texto_recortar(subtexto(cuerpo, 0, longitud(cuerpo) - 1)) }
+    }
+    para parte en separar(cuerpo, ",") {
+        sea p = texto_recortar(parte)
+        si (texto_empieza_con(p, "Path=")) { p = subtexto(p, 5, longitud(p)) }
+        si (p != "" y texto_indice(p, "=") < 0) { r["ruta"] = p }
+    }
+    si (texto_empieza_con(r["ruta"], "!")) {
+        r["negar"] = verdadero
+        r["ruta"] = subtexto(r["ruta"], 1, longitud(r["ruta"]))
+    }
+    retornar r
+}
+
+// Busca el objeto dueño y la clave final de una ruta: [obj, clave] o nulo.
+funcion _eo_dueno(ctx, ruta) {
+    sea datos = ctx["datos"]
+    sea partes = separar(ruta, ".")
+    si (longitud(partes) > 0 y texto_empieza_con(partes[0], "$parent[")) {
+        sea tipo_buscado = subtexto(partes[0], 8, longitud(partes[0]) - 1)
+        sea encontrado = nulo
+        para a en ctx["ancestros"] { si (a["tipo"] == tipo_buscado) { encontrado = a } }
+        si (encontrado == nulo) { retornar nulo }
+        datos = encontrado["datos"]
+        eliminar(partes, 0)
+        si (longitud(partes) > 0 y partes[0] == "DataContext") { eliminar(partes, 0) }
+    } sino si (longitud(partes) > 0 y texto_empieza_con(partes[0], "#")) {
+        sea nombre = subtexto(partes[0], 1, longitud(partes[0]))
+        para a en ctx["ancestros"] { si (a["nombre"] == nombre) { datos = a["datos"] } }
+        eliminar(partes, 0)
+        si (longitud(partes) > 0 y partes[0] == "DataContext") { eliminar(partes, 0) }
+    }
+    si (longitud(partes) == 0) { retornar [nulo, nulo, datos] }
+    sea obj = datos
+    sea i = 0
+    mientras (i < longitud(partes) - 1) {
+        si (tipo(obj) != "mapa") { retornar nulo }
+        obj = obj[partes[i]] ?? nulo
+        i = i + 1
+    }
+    si (tipo(obj) != "mapa") { retornar nulo }
+    retornar [obj, partes[longitud(partes) - 1], nulo]
+}
+
+funcion _eo_leer(ctx, en) {
+    sea v = nulo
+    si (en["ruta"] == "") { v = ctx["datos"] } sino {
+        sea d = _eo_dueno(ctx, en["ruta"])
+        si (d == nulo) { retornar nulo }
+        si (d[0] == nulo) { v = d[2] } sino {
+            v = d[0][d[1]] ?? nulo
+            // Propiedad calculada.
+            si (tipo(v) == "funcion") { v = v(d[0]) }
+        }
+    }
+    si (en["negar"]) { v = _eo_bool(v) == falso }
+    si (en["formato"] != nulo) { v = _eo_formatear(en["formato"], v) }
+    retornar v
+}
+
+funcion _eo_formatear(f, v) {
+    sea i = texto_indice(f, "{0")
+    si (i < 0) { retornar f }
+    sea j = i + texto_indice(subtexto(f, i, longitud(f)), "}")
+    sea espec = subtexto(f, i + 2, j)
+    sea txt = "" + v
+    si (texto_empieza_con(espec, ":") y tipo(v) == "numero") {
+        sea e = subtexto(espec, 1, longitud(espec))
+        sea dec = 0
+        si (longitud(e) > 1) { dec = a_numero(subtexto(e, 1, longitud(e))) }
+        txt = _eo_decimales(v, dec)
+    }
+    retornar subtexto(f, 0, i) + txt + subtexto(f, j + 1, longitud(f))
+}
+
+funcion _eo_decimales(v, dec) {
+    sea f = 1
+    sea k = 0
+    mientras (k < dec) {
+        f = f * 10
+        k = k + 1
+    }
+    sea n = redondear(absoluto(v) * f)
+    sea entero_p = piso(n / f)
+    sea frac = "" + (n - entero_p * f)
+    mientras (longitud(frac) < dec) { frac = "0" + frac }
+    sea signo = ""
+    si (v < 0 y n > 0) { signo = "-" }
+    si (dec == 0) { retornar signo + entero_p }
+    retornar signo + entero_p + "." + frac
+}
+
+// ---------- estilos ----------
+
+funcion _eo_selector(s) {
+    // "StackPanel > Button.a:disabled" → lista de [combinador, simple].
+    sea partes = []
+    sea t = texto_reemplazar(s, ">", " > ")
+    sea comb = " "
+    para tok en separar(t, " ") {
+        si (tok == "") { continuar }
+        si (tok == ">") { comb = ">" } sino {
+            partes.agregar([comb, _eo_simple(tok)])
+            comb = " "
+        }
+    }
+    retornar partes
+}
+
+funcion _eo_simple(tok) {
+    sea r = {"tipo": nulo, "clases": [], "nombre": nulo, "pseudo": []}
+    sea actual = ""
+    sea modo = "tipo"
+    sea cs = texto_codigos(tok)
+    sea i = 0
+    mientras (i <= longitud(cs)) {
+        sea c = -1
+        si (i < longitud(cs)) { c = cs[i] }
+        si (c == 46 o c == 35 o c == 58 o c == -1) {
+            si (actual != "") {
+                si (modo == "tipo") { r["tipo"] = actual }
+                si (modo == "clase") { r["clases"].agregar(actual) }
+                si (modo == "nombre") { r["nombre"] = actual }
+                si (modo == "pseudo") { r["pseudo"].agregar(actual) }
+            }
+            actual = ""
+            si (c == 46) { modo = "clase" }
+            si (c == 35) { modo = "nombre" }
+            si (c == 58) { modo = "pseudo" }
+        } sino { actual = actual + caracter(c) }
+        i = i + 1
+    }
+    retornar r
+}
+
+funcion _eo_cumple_simple(s, e) {
+    si (s["tipo"] != nulo y s["tipo"] != e["tipo"]) { retornar falso }
+    si (s["nombre"] != nulo y s["nombre"] != e["nombre"]) { retornar falso }
+    para c en s["clases"] { si (contiene(e["clases"], c) == falso) { retornar falso } }
+    para p en s["pseudo"] {
+        si (p == "disabled" y e["habilitado"]) { retornar falso }
+        si (p == "checked" y (e["marcado"] ?? falso) == falso) { retornar falso }
+        si (p != "disabled" y p != "checked") { retornar falso }
+    }
+    retornar verdadero
+}
+
+// e: elemento actual; cadena: ancestros (del más lejano al padre).
+funcion _eo_cumple(sel, e, cadena) {
+    sea n = longitud(sel)
+    si (_eo_cumple_simple(sel[n - 1][1], e) == falso) { retornar falso }
+    sea i = n - 2
+    sea j = longitud(cadena) - 1
+    sea comb = sel[n - 1][0]
+    mientras (i >= 0) {
+        sea s = sel[i][1]
+        si (comb == ">") {
+            si (j < 0 o _eo_cumple_simple(s, cadena[j]) == falso) { retornar falso }
+            j = j - 1
+        } sino {
+            mientras (j >= 0 y _eo_cumple_simple(s, cadena[j]) == falso) { j = j - 1 }
+            si (j < 0) { retornar falso }
+            j = j - 1
+        }
+        comb = sel[i][0]
+        i = i - 1
+    }
+    retornar verdadero
+}
+
+funcion _eo_recoger_estilos(nodo, salida) {
+    si (tipo(nodo) != "mapa") { retornar nulo }
+    si (texto_termina_con(nodo["nombre"], ".Styles")) {
+        para st en nodo["hijos"] {
+            si (tipo(st) == "mapa" y st["nombre"] == "Style") {
+                sea setters = {}
+                para s en st["hijos"] {
+                    si (tipo(s) == "mapa" y s["nombre"] == "Setter") { setters[s["atributos"]["Property"]] = s["atributos"]["Value"] }
+                }
+                salida.agregar({"selector": _eo_selector(st["atributos"]["Selector"] ?? ""), "setters": setters})
+            }
+        }
+        retornar nulo
+    }
+    para h en nodo["hijos"] { _eo_recoger_estilos(h, salida) }
+}
+
+// ---------- vista ----------
+
+funcion _eo_elementos(nodo) {
+    sea r = []
+    para h en nodo["hijos"] { si (tipo(h) == "mapa" y texto_indice(h["nombre"], ".") < 0) { r.agregar(h) } }
+    retornar r
+}
+
+funcion _eo_propiedad_hija(nodo, nombre) {
+    para h en nodo["hijos"] { si (tipo(h) == "mapa" y h["nombre"] == nombre) { retornar h } }
+    retornar nulo
+}
+
+// Atributo crudo: local, si no el de los estilos (el último gana).
+funcion _eo_crudo(ctx, nodo, e, prop) {
+    sea a = nodo["atributos"]
+    si (tiene_clave(a, prop)) { retornar a[prop] }
+    sea v = nulo
+    para st en ctx["estilos"] {
+        si (tiene_clave(st["setters"], prop) y longitud(st["selector"]) > 0 y _eo_cumple(st["selector"], e, ctx["cadena"])) { v = st["setters"][prop] }
+    }
+    retornar v
+}
+
+funcion _eo_valor(ctx, nodo, e, prop, defecto) {
+    sea c = _eo_crudo(ctx, nodo, e, prop)
+    si (c == nulo) { retornar defecto }
+    sea en = _eo_enlace(c)
+    si (en != nulo) {
+        sea v = _eo_leer(ctx, en)
+        si (v == nulo) { retornar defecto }
+        retornar v
+    }
+    retornar c
+}
+
+// Mensaje para escribir en el modelo (enlaces de dos vías).
+funcion _eo_escritor(ctx, nodo, e, prop) {
+    sea c = _eo_crudo(ctx, nodo, e, prop)
+    sea en = _eo_enlace(c)
+    si (en == nulo o en["ruta"] == "") { retornar nulo }
+    sea d = _eo_dueno(ctx, en["ruta"])
+    si (d == nulo o d[0] == nulo) { retornar nulo }
+    sea obj = d[0]
+    sea clave = d[1]
+    sea negar = en["negar"]
+    retornar funcion(v) {
+        sea val = v
+        si (negar) { val = v == falso }
+        retornar {"tipo": "fijar", "obj": obj, "clave": clave, "valor": val}
+    }
+}
+
+funcion _eo_comando(ctx, nodo, e) {
+    sea c = _eo_crudo(ctx, nodo, e, "Command")
+    sea en = _eo_enlace(c)
+    si (en == nulo) { retornar nulo }
+    sea d = _eo_dueno(ctx, en["ruta"])
+    si (d == nulo o d[0] == nulo) { retornar nulo }
+    sea f = d[0][d[1]] ?? nulo
+    si (f == nulo) { retornar nulo }
+    sea param = _eo_valor(ctx, nodo, e, "CommandParameter", nulo)
+    retornar {"tipo": "comando", "obj": d[0], "fn": f, "param": param}
+}
+
+funcion _eo_info(ctx, nodo, datos) {
+    sea a = nodo["atributos"]
+    sea clases = []
+    para c en separar("" + (a["Classes"] ?? ""), " ") { si (c != "") { clases.agregar(c) } }
+    sea nombre = a["Name"] ?? (a["x:Name"] ?? nulo)
+    retornar {"tipo": nodo["nombre"], "clases": clases, "nombre": nombre, "habilitado": verdadero, "datos": datos}
+}
+
+// Convierte un elemento XAML en un widget de nativa (o nulo si no se ve).
+funcion _eo_widget(ctx, nodo) {
+    sea e = _eo_info(ctx, nodo, ctx["datos"])
+    // DataContext propio.
+    sea ctx2 = ctx
+    sea dc = nodo["atributos"]["DataContext"] ?? nulo
+    si (dc != nulo) {
+        ctx2 = _eo_copiar_ctx(ctx)
+        ctx2["datos"] = _eo_valor(ctx, nodo, e, "DataContext", nulo)
+        e["datos"] = ctx2["datos"]
+    }
+    e["habilitado"] = _eo_bool(_eo_valor(ctx2, nodo, e, "IsEnabled", "True"))
+    si (e["tipo"] == "CheckBox" o e["tipo"] == "ToggleSwitch" o e["tipo"] == "RadioButton") { e["marcado"] = _eo_bool(_eo_valor(ctx2, nodo, e, "IsChecked", falso)) }
+    si (_eo_bool(_eo_valor(ctx2, nodo, e, "IsVisible", "True")) == falso) { retornar nulo }
+    sea hijo_ctx = _eo_copiar_ctx(ctx2)
+    hijo_ctx["cadena"] = ctx2["cadena"] + [e]
+    hijo_ctx["ancestros"] = ctx2["ancestros"] + [e]
+    sea w = _eo_control(hijo_ctx, ctx2, nodo, e)
+    si (w == nulo) { retornar nulo }
+    retornar _eo_comunes(ctx2, nodo, e, w)
+}
+
+funcion _eo_copiar_ctx(ctx) {
+    sea r = {}
+    para k en claves(ctx) { r[k] = ctx[k] }
+    retornar r
+}
+
+// Margin, Width, Height y alineaciones (comunes a todos).
+funcion _eo_comunes(ctx, nodo, e, w) {
+    sea ancho = _eo_valor(ctx, nodo, e, "Width", nulo)
+    sea alto = _eo_valor(ctx, nodo, e, "Height", nulo)
+    si (ancho != nulo) { w["ancho"] = _eo_num(ancho, 0) }
+    si (alto != nulo) { w["alto"] = _eo_num(alto, 0) }
+    sea ha = _eo_valor(ctx, nodo, e, "HorizontalAlignment", nulo)
+    sea va = _eo_valor(ctx, nodo, e, "VerticalAlignment", nulo)
+    si (ha == "Stretch" y ancho == nulo) { w["ancho"] = "llenar" }
+    si (va == "Stretch" y alto == nulo) { w["alto"] = "llenar" }
+    sea margen = _eo_grosor(_eo_valor(ctx, nodo, e, "Margin", nulo))
+    sea alinear = (ha == "Center" o ha == "Right" o va == "Center" o va == "Bottom")
+    si (margen == nulo y alinear == falso) { retornar w }
+    sea mapa_a = {"Left": "inicio", "Center": "centro", "Right": "fin", "Top": "inicio", "Bottom": "fin", "Stretch": "inicio"}
+    sea op = {"relleno": margen ?? 0, "alinear_x": mapa_a[ha ?? "Left"] ?? "inicio", "alinear_y": mapa_a[va ?? "Top"] ?? "inicio"}
+    si (ha == "Center" o ha == "Right") { op["ancho"] = "llenar" }
+    si (va == "Center" o va == "Bottom") { op["alto"] = "llenar" }
+    sea c = nativa_contenedor(w, op)
+    c["_celda"] = w["_celda"] ?? nulo
+    retornar c
+}
+
+funcion _eo_contenido(ctx, nodo, e, defecto_texto) {
+    sea els = _eo_elementos(nodo)
+    si (longitud(els) > 0) { retornar _eo_widget(ctx, els[0]) }
+    sea c = _eo_valor(ctx, nodo, e, "Content", nulo)
+    si (c == nulo) {
+        sea t = texto_recortar(xml_contenido(nodo))
+        si (t != "") { c = t } sino { c = defecto_texto ?? "" }
+    }
+    retornar nativa_texto("" + c, nulo)
+}
+
+funcion _eo_texto_op(ctx, nodo, e) {
+    sea op = {}
+    sea fs = _eo_valor(ctx, nodo, e, "FontSize", nulo)
+    si (fs != nulo) { op["tam"] = _eo_num(fs, 12) }
+    sea fg = _eo_valor(ctx, nodo, e, "Foreground", nulo)
+    si (fg != nulo) { op["color"] = escritorio_color(fg) }
+    sea ta = _eo_valor(ctx, nodo, e, "TextAlignment", nulo)
+    si (ta != nulo) {
+        op["alinear"] = {"Left": "inicio", "Center": "centro", "Right": "fin"}[ta] ?? "inicio"
+        op["ancho"] = "llenar"
+    }
+    si (_eo_crudo(ctx, nodo, e, "TextWrapping") == "NoWrap") { op["ajustar_lineas"] = falso }
+    retornar op
+}
+
+funcion _eo_hijos(ctx, nodo) {
+    sea r = []
+    para h en _eo_elementos(nodo) {
+        sea w = _eo_widget(ctx, h)
+        si (w != nulo) { r.agregar(w) }
+    }
+    retornar r
+}
+
+funcion _eo_plantilla(nodo, nombre) {
+    sea p = _eo_propiedad_hija(nodo, nombre + ".ItemTemplate")
+    si (p == nulo) { retornar nulo }
+    para h en p["hijos"] {
+        si (tipo(h) == "mapa" y h["nombre"] == "DataTemplate") {
+            sea els = _eo_elementos(h)
+            si (longitud(els) > 0) { retornar els[0] }
+        }
+    }
+    retornar nulo
+}
+
+funcion _eo_items(ctx, ctx_propio, nodo, e) {
+    sea fuente = _eo_valor(ctx_propio, nodo, e, "ItemsSource", nulo)
+    si (fuente == nulo) { retornar [] }
+    sea plantilla = _eo_plantilla(nodo, e["tipo"])
+    sea r = []
+    para item en fuente {
+        si (plantilla == nulo) { r.agregar([item, nativa_texto("" + item, nulo)]) } sino {
+            sea c2 = _eo_copiar_ctx(ctx)
+            c2["datos"] = item
+            r.agregar([item, _eo_widget(c2, plantilla)])
+        }
+    }
+    retornar r
+}
+
+funcion _eo_control(ctx, ctx_propio, nodo, e) {
+    sea t = e["tipo"]
+    sea op_id = e["nombre"]
+    si (t == "StackPanel") {
+        sea op = {"espacio": _eo_num(_eo_valor(ctx_propio, nodo, e, "Spacing", 0), 0), "id": op_id}
+        sea hs = _eo_hijos(ctx, nodo)
+        sea horizontal = _eo_valor(ctx_propio, nodo, e, "Orientation", "Vertical") == "Horizontal"
+        // Un StackPanel da espacio infinito en su dirección: ahí nadie llena.
+        para h en hs {
+            si (horizontal y (h["ancho"] == "llenar" o tipo(h["ancho"]) == "mapa")) { h["ancho"] = "ajustar" }
+            si (horizontal == falso y (h["alto"] == "llenar" o tipo(h["alto"]) == "mapa")) { h["alto"] = "ajustar" }
+        }
+        si (horizontal) { retornar nativa_fila(hs, op) }
+        // En Avalonia los hijos de un StackPanel vertical se estiran a lo ancho.
+        op["ancho"] = "llenar"
+        retornar nativa_columna(hs, op)
+    }
+    si (t == "Grid") {
+        sea celdas = []
+        para h en _eo_elementos(nodo) {
+            sea w = _eo_widget(ctx, h)
+            si (w != nulo) {
+                sea a = h["atributos"]
+                celdas.agregar(nativa_celda(w, _eo_num(a["Grid.Row"] ?? 0, 0), _eo_num(a["Grid.Column"] ?? 0, 0), _eo_num(a["Grid.RowSpan"] ?? 1, 1), _eo_num(a["Grid.ColumnSpan"] ?? 1, 1)))
+            }
+        }
+        retornar nativa_rejilla(celdas, {"filas": _eo_valor(ctx_propio, nodo, e, "RowDefinitions", "*"), "columnas": _eo_valor(ctx_propio, nodo, e, "ColumnDefinitions", "*"), "id": op_id})
+    }
+    si (t == "DockPanel") {
+        sea items = []
+        para h en _eo_elementos(nodo) {
+            sea w = _eo_widget(ctx, h)
+            si (w != nulo) { items.agregar([h["atributos"]["DockPanel.Dock"] ?? "Left", w]) }
+        }
+        retornar _eo_dock(items, 0)
+    }
+    si (t == "Border") {
+        sea fondo = escritorio_color(_eo_valor(ctx_propio, nodo, e, "Background", nulo))
+        sea borde = nulo
+        si (_eo_num(_eo_valor(ctx_propio, nodo, e, "BorderThickness", 0), 1) > 0) { borde = escritorio_color(_eo_valor(ctx_propio, nodo, e, "BorderBrush", nulo)) }
+        sea hs = _eo_hijos(ctx, nodo)
+        sea hijo = nativa_espacio(nulo, nulo)
+        si (longitud(hs) > 0) { hijo = hs[0] }
+        retornar nativa_contenedor(hijo, {"fondo": fondo, "borde": borde, "radio": _eo_num(_eo_valor(ctx_propio, nodo, e, "CornerRadius", 0), 0),
+            "relleno": _eo_grosor(_eo_valor(ctx_propio, nodo, e, "Padding", 0)), "id": op_id, "ancho": "llenar", "alto": "llenar"})
+    }
+    si (t == "TextBlock" o t == "Label") {
+        sea txt = _eo_valor(ctx_propio, nodo, e, "Text", nulo)
+        si (txt == nulo) { txt = _eo_valor(ctx_propio, nodo, e, "Content", nulo) }
+        si (txt == nulo) { txt = texto_recortar(xml_contenido(nodo)) }
+        sea op = _eo_texto_op(ctx_propio, nodo, e)
+        op["id"] = op_id
+        retornar nativa_texto("" + txt, op)
+    }
+    si (t == "Button") {
+        sea msg = nulo
+        si (e["habilitado"]) { msg = _eo_comando(ctx_propio, nodo, e) }
+        sea estilo = "secundario"
+        si (contiene(e["clases"], "accent") o contiene(e["clases"], "primario")) { estilo = "primario" }
+        sea op = {"estilo": estilo, "id": op_id, "fondo": escritorio_color(_eo_valor(ctx_propio, nodo, e, "Background", nulo)),
+            "color": escritorio_color(_eo_valor(ctx_propio, nodo, e, "Foreground", nulo))}
+        sea pad = _eo_valor(ctx_propio, nodo, e, "Padding", nulo)
+        si (pad != nulo) { op["relleno"] = _eo_grosor(pad) }
+        sea cr = _eo_valor(ctx_propio, nodo, e, "CornerRadius", nulo)
+        si (cr != nulo) { op["radio"] = _eo_num(cr, 4) }
+        retornar nativa_boton(_eo_contenido(ctx, nodo, e, ""), msg, op)
+    }
+    si (t == "TextBox") {
+        sea esc = _eo_escritor(ctx_propio, nodo, e, "Text")
+        si (esc == nulo) { esc = funcion(v) { retornar nulo } }
+        sea enviar = nulo
+        sea kb = _eo_propiedad_hija(nodo, "TextBox.KeyBindings")
+        si (kb != nulo) {
+            para k en _eo_elementos(kb) {
+                si ((k["atributos"]["Gesture"] ?? "") == "Enter") { enviar = _eo_comando(ctx_propio, k, _eo_info(ctx_propio, k, ctx_propio["datos"])) }
+            }
+        }
+        retornar nativa_entrada(_eo_valor(ctx_propio, nodo, e, "Watermark", ""), _eo_valor(ctx_propio, nodo, e, "Text", ""), esc,
+            {"al_enviar": enviar, "secreto": _eo_crudo(ctx_propio, nodo, e, "PasswordChar") != nulo, "id": op_id})
+    }
+    si (t == "CheckBox" o t == "ToggleSwitch") {
+        sea esc = _eo_escritor(ctx_propio, nodo, e, "IsChecked")
+        si (esc == nulo o e["habilitado"] == falso) { esc = funcion(v) { retornar nulo } }
+        sea et = "" + (_eo_valor(ctx_propio, nodo, e, "Content", nulo) ?? texto_recortar(xml_contenido(nodo)))
+        sea w = nulo
+        si (t == "CheckBox") { w = nativa_casilla(et, e["marcado"], esc) } sino { w = nativa_interruptor(et, e["marcado"], esc) }
+        w["id"] = op_id
+        retornar w
+    }
+    si (t == "RadioButton") {
+        sea esc = _eo_escritor(ctx_propio, nodo, e, "IsChecked")
+        sea grupo = nodo["atributos"]["GroupName"] ?? "_"
+        sea miembros = ctx["grupos"][grupo] ?? nulo
+        si (miembros == nulo) {
+            miembros = []
+            ctx["grupos"][grupo] = miembros
+        }
+        si (esc != nulo) { miembros.agregar(esc) }
+        sea propio = esc
+        sea al_elegir = funcion(v) {
+            sea l = []
+            para m en miembros { si (m != propio) { l.agregar(m(falso)) } }
+            si (propio != nulo) { l.agregar(propio(verdadero)) }
+            retornar {"tipo": "varios", "lista": l}
+        }
+        sea et = "" + (_eo_valor(ctx_propio, nodo, e, "Content", nulo) ?? texto_recortar(xml_contenido(nodo)))
+        sea w = nativa_radio(et, verdadero, e["marcado"], al_elegir)
+        w["id"] = op_id
+        retornar w
+    }
+    si (t == "Slider") {
+        sea esc = _eo_escritor(ctx_propio, nodo, e, "Value")
+        si (esc == nulo) { esc = funcion(v) { retornar nulo } }
+        sea paso = 0
+        si (_eo_bool(_eo_valor(ctx_propio, nodo, e, "IsSnapToTickEnabled", falso))) { paso = _eo_num(_eo_valor(ctx_propio, nodo, e, "TickFrequency", 1), 1) }
+        retornar nativa_deslizador(_eo_num(_eo_valor(ctx_propio, nodo, e, "Minimum", 0), 0), _eo_num(_eo_valor(ctx_propio, nodo, e, "Maximum", 100), 100),
+            _eo_num(_eo_valor(ctx_propio, nodo, e, "Value", 0), 0), esc, {"paso": paso, "id": op_id})
+    }
+    si (t == "ProgressBar") {
+        retornar nativa_progreso(_eo_num(_eo_valor(ctx_propio, nodo, e, "Minimum", 0), 0), _eo_num(_eo_valor(ctx_propio, nodo, e, "Maximum", 100), 100),
+            _eo_num(_eo_valor(ctx_propio, nodo, e, "Value", 0), 0), nulo)
+    }
+    si (t == "ComboBox") {
+        sea esc = _eo_escritor(ctx_propio, nodo, e, "SelectedItem")
+        si (esc == nulo) { esc = funcion(v) { retornar nulo } }
+        sea lista = _eo_valor(ctx_propio, nodo, e, "ItemsSource", nulo)
+        si (lista == nulo) {
+            lista = []
+            para h en _eo_elementos(nodo) { lista.agregar(texto_recortar(xml_contenido(h))) }
+        }
+        retornar nativa_selector(lista, _eo_valor(ctx_propio, nodo, e, "SelectedItem", nulo), esc, {"marcador": _eo_valor(ctx_propio, nodo, e, "PlaceholderText", "Elegir…"), "id": op_id})
+    }
+    si (t == "ScrollViewer") {
+        sea hs = _eo_hijos(ctx, nodo)
+        sea hijo = nativa_espacio(nulo, nulo)
+        si (longitud(hs) > 0) { hijo = hs[0] }
+        retornar nativa_desplazable(hijo, {"id": op_id})
+    }
+    si (t == "ItemsControl") {
+        sea hs = []
+        para par en _eo_items(ctx, ctx_propio, nodo, e) { si (par[1] != nulo) { hs.agregar(par[1]) } }
+        retornar nativa_columna(hs, {"espacio": _eo_num(_eo_valor(ctx_propio, nodo, e, "Spacing", 0), 0), "ancho": "llenar", "id": op_id})
+    }
+    si (t == "ListBox") {
+        sea esc = _eo_escritor(ctx_propio, nodo, e, "SelectedItem")
+        sea sel = _eo_valor(ctx_propio, nodo, e, "SelectedItem", nulo)
+        sea hs = []
+        para par en _eo_items(ctx, ctx_propio, nodo, e) {
+            sea msg = nulo
+            si (esc != nulo) { msg = esc(par[0]) }
+            sea fondo = [0, 0, 0, 0]
+            si (sel != nulo y par[0] == sel) { fondo = [94, 124, 226, 60] }
+            hs.agregar(nativa_boton(par[1], msg, {"estilo": "texto", "ancho": "llenar", "fondo": fondo, "color": [20, 20, 20, 255], "radio": 2}))
+        }
+        retornar nativa_columna(hs, {"ancho": "llenar", "id": op_id})
+    }
+    si (t == "Separator") { retornar nativa_separador() }
+    si (t == "Panel" o t == "Canvas") { retornar nativa_columna(_eo_hijos(ctx, nodo), {"id": op_id}) }
+    lanzar "escritorio: control no soportado <" + t + ">"
+}
+
+funcion _eo_dock(items, i) {
+    si (i >= longitud(items)) { retornar nativa_espacio(nulo, nulo) }
+    sea lado = items[i][0]
+    sea w = items[i][1]
+    si (i == longitud(items) - 1) {
+        // El último llena lo que queda.
+        si (w["ancho"] == "ajustar") { w["ancho"] = "llenar" }
+        si (w["alto"] == "ajustar") { w["alto"] = "llenar" }
+        retornar w
+    }
+    sea resto = _eo_dock(items, i + 1)
+    si (lado == "Top") { retornar nativa_columna([w, resto], {"ancho": "llenar", "alto": "llenar"}) }
+    si (lado == "Bottom") { retornar nativa_columna([resto, w], {"ancho": "llenar", "alto": "llenar"}) }
+    si (lado == "Right") { retornar nativa_fila([resto, w], {"ancho": "llenar", "alto": "llenar"}) }
+    retornar nativa_fila([w, resto], {"ancho": "llenar", "alto": "llenar"})
+}
+
+// ---------- ventana ----------
+
+funcion _eo_actualizar(v, m) {
+    si (m == nulo) { retornar nulo }
+    si (m["tipo"] == "varios") {
+        para x en m["lista"] { _eo_actualizar(v, x) }
+        retornar nulo
+    }
+    si (m["tipo"] == "fijar") {
+        m["obj"][m["clave"]] = m["valor"]
+        sea aviso = v["modelo"]["AlCambiar"] ?? (v["modelo"]["OnPropertyChanged"] ?? nulo)
+        si (aviso != nulo) { aviso(v["modelo"], m["clave"]) }
+    }
+    si (m["tipo"] == "comando") { m["fn"](m["obj"], m["param"]) }
+}
+
+/// Crea una ventana desde XAML con un modelo (mapa) como DataContext.
+funcion escritorio_ventana(xaml, modelo) {
+    sea raiz = xml_analizar(xaml)
+    si (raiz["nombre"] != "Window" y raiz["nombre"] != "UserControl") { lanzar "escritorio: la raíz debe ser <Window>" }
+    sea estilos = []
+    _eo_recoger_estilos(raiz, estilos)
+    sea a = raiz["atributos"]
+    sea v = {"raiz": raiz, "modelo": modelo, "estilos": estilos, "titulo": a["Title"] ?? "C-Forge",
+        "ancho": _eo_num(a["Width"] ?? 640, 640), "alto": _eo_num(a["Height"] ?? 480, 480)}
+    sea tema = "claro"
+    si ((a["RequestedThemeVariant"] ?? "") == "Dark") { tema = "oscuro" }
+    v["app"] = nativa_app({"estado": modelo, "titulo": v["titulo"], "tema": tema,
+        "actualizar": funcion(est, m) { _eo_actualizar(v, m) },
+        "vista": funcion(est) {
+            sea ctx = {"datos": modelo, "estilos": estilos, "cadena": [], "ancestros": [], "grupos": {}}
+            sea e = _eo_info(ctx, raiz, modelo)
+            ctx["cadena"] = [e]
+            ctx["ancestros"] = [e]
+            sea hs = _eo_hijos(ctx, raiz)
+            sea fondo = escritorio_color(a["Background"] ?? nulo)
+            sea contenido = nativa_espacio(nulo, nulo)
+            si (longitud(hs) > 0) { contenido = hs[0] }
+            retornar nativa_contenedor(contenido, {"ancho": "llenar", "alto": "llenar", "fondo": fondo, "relleno": _eo_grosor(a["Padding"] ?? 0)})
+        }})
+    retornar v
+}
+
+/// Prepara la ventana sin pantalla (para pruebas o para dibujar).
+funcion escritorio_simular(v) {
+    nativa_simular(v["app"], v["ancho"], v["alto"])
+    retornar v
+}
+
+/// Vuelve a dibujar después de cambiar el modelo desde afuera.
+funcion escritorio_refrescar(v) { nativa_disponer(v["app"], v["ancho"], v["alto"]) }
+
+funcion escritorio_modelo(v) { retornar v["modelo"] }
+funcion escritorio_clic(v, x, y) { nativa_clic(v["app"], x, y) }
+/// Clic en el control con ese Name o que muestra ese texto.
+funcion escritorio_clic_en(v, texto_o_nombre) { nativa_clic_en(v["app"], texto_o_nombre) }
+funcion escritorio_buscar(v, texto_o_nombre) { retornar nativa_buscar(v["app"], texto_o_nombre) }
+funcion escritorio_escribir(v, texto) { nativa_escribir(v["app"], texto) }
+funcion escritorio_tecla(v, tecla, mayus) { nativa_tecla(v["app"], tecla, mayus) }
+funcion escritorio_mover(v, x, y) { nativa_mover(v["app"], x, y) }
+funcion escritorio_presionar(v, x, y) { nativa_presionar(v["app"], x, y) }
+funcion escritorio_soltar(v, x, y) { nativa_soltar(v["app"], x, y) }
+funcion escritorio_rueda(v, delta) { nativa_rueda(v["app"], delta) }
+funcion escritorio_dibujar(v, lienzo) { retornar nativa_dibujar(v["app"], lienzo) }
+/// Abre la ventana (SDL) y la corre hasta cerrarla.
+funcion escritorio_ejecutar(v) { nativa_ejecutar(v["app"], v["ancho"], v["alto"]) }

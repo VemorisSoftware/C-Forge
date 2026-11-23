@@ -1,0 +1,1209 @@
+// stdlib/nativa.cfv — GUI reactiva al estilo de Iced (arquitectura Elm):
+// el programa tiene un estado, una función vista(estado) que devuelve un
+// árbol de widgets y una función actualizar(estado, mensaje). Los widgets
+// no guardan datos de la app: al tocarlos producen mensajes. El foco, el
+// cursor del texto, el desplazamiento y lo que está presionado lo guarda el
+// motor por posición en el árbol (o por "id").
+//
+// Disposición tipo flex con largos "llenar", "ajustar", un número fijo o
+// {"porcion": n}; temas claro y oscuro; texto con ajuste de línea; botones,
+// entradas de texto (cursor, selección con mayúsculas, Tab, Enter),
+// casillas, radios, interruptores, deslizadores, barras de progreso,
+// selectores desplegables, áreas con desplazamiento y suscripciones de
+// tiempo. Dibuja con los comandos de "panel" sobre un lienzo de
+// "graficos", así funciona igual en una ventana SDL o sin pantalla (para
+// pruebas: nativa_simular, nativa_clic, nativa_escribir…).
+// Idea de Iced (MIT), escrito desde cero. En inglés: importar "iced".
+//
+//   importar "nativa"
+//   sea app = nativa_app({
+//       "estado": {"cuenta": 0},
+//       "actualizar": funcion(e, m) { si (m == "mas") { e["cuenta"] = e["cuenta"] + 1 } },
+//       "vista": funcion(e) {
+//           retornar nativa_columna([nativa_texto("" + e["cuenta"], nulo), nativa_boton("+1", "mas", nulo)], {"espacio": 8})
+//       }
+//   })
+//   nativa_ejecutar(app, 320, 200)
+
+importar "graficos"
+importar "fuente"
+importar "panel"
+importar "juego"
+
+// ---------- temas ----------
+
+funcion _na_tema(nombre) {
+    si (nombre == "oscuro") {
+        retornar {"fondo": [32, 34, 37, 255], "texto": [236, 236, 236, 255], "apagado": [140, 140, 150, 255], "primario": [94, 124, 226, 255],
+            "primario_caliente": [118, 145, 236, 255], "primario_presionado": [74, 100, 200, 255], "superficie": [48, 51, 56, 255], "superficie_caliente": [60, 64, 70, 255],
+            "borde": [80, 84, 92, 255], "borde_foco": [94, 124, 226, 255], "peligro": [195, 66, 63, 255], "exito": [18, 102, 79, 255], "seleccion": [94, 124, 226, 110],
+            "sobre_primario": [255, 255, 255, 255]}
+    }
+    retornar {"fondo": [255, 255, 255, 255], "texto": [20, 20, 20, 255], "apagado": [120, 120, 128, 255], "primario": [94, 124, 226, 255],
+        "primario_caliente": [118, 145, 236, 255], "primario_presionado": [74, 100, 200, 255], "superficie": [240, 241, 244, 255], "superficie_caliente": [226, 228, 233, 255],
+        "borde": [200, 203, 210, 255], "borde_foco": [94, 124, 226, 255], "peligro": [195, 66, 63, 255], "exito": [18, 102, 79, 255], "seleccion": [94, 124, 226, 90],
+        "sobre_primario": [255, 255, 255, 255]}
+}
+
+// ---------- widgets ----------
+
+funcion _na_op(op) { retornar op ?? {} }
+
+/// Texto. opciones: "tam", "color", "alinear" ("inicio", "centro", "fin"),
+/// "ancho", "alto", "ajustar_lineas" (verdadero por defecto).
+funcion nativa_texto(t, opciones) {
+    sea op = _na_op(opciones)
+    retornar {"w": "texto", "texto": "" + t, "tam": op["tam"] ?? nulo, "color": op["color"] ?? nulo, "alinear": _na_a(op["alinear"] ?? "inicio"),
+        "ancho": _na_l(op["ancho"] ?? nulo) ?? "ajustar", "alto": _na_l(op["alto"] ?? nulo) ?? "ajustar", "ajustar_lineas": op["ajustar_lineas"] ?? verdadero, "id": op["id"] ?? nulo}
+}
+
+/// Botón con un texto o un widget. Si mensaje es nulo queda deshabilitado.
+/// opciones: "estilo" ("primario", "secundario", "peligro", "exito",
+/// "texto"), "relleno", "ancho", "alto".
+funcion nativa_boton(contenido, mensaje, opciones) {
+    sea op = _na_op(opciones)
+    sea hijo = contenido
+    si (tipo(contenido) != "mapa") { hijo = nativa_texto(contenido, nulo) }
+    retornar {"w": "boton", "hijo": hijo, "mensaje": mensaje, "estilo": {"primary": "primario", "secondary": "secundario", "danger": "peligro", "success": "exito", "text": "texto"}[op["estilo"] ?? "primario"] ?? (op["estilo"] ?? "primario"), "relleno": _na_relleno(op["relleno"] ?? [5, 10]),
+        "ancho": _na_l(op["ancho"] ?? nulo) ?? "ajustar", "alto": _na_l(op["alto"] ?? nulo) ?? "ajustar", "id": op["id"] ?? nulo,
+        "fondo": op["fondo"] ?? nulo, "color": op["color"] ?? nulo, "radio": op["radio"] ?? 4}
+}
+
+// Sinónimos en inglés para largos y alineaciones.
+funcion _na_l(v) {
+    si (v == nulo) { retornar nulo }
+    si (v == "fill") { retornar "llenar" }
+    si (v == "shrink") { retornar "ajustar" }
+    si (tipo(v) == "mapa" y tiene_clave(v, "portion")) { retornar {"porcion": v["portion"]} }
+    retornar v
+}
+
+funcion _na_a(v) { retornar {"start": "inicio", "center": "centro", "end": "fin"}[v] ?? v }
+
+funcion _na_relleno(r) {
+    si (tipo(r) == "numero") { retornar [r, r, r, r] }
+    si (longitud(r) == 2) { retornar [r[0], r[1], r[0], r[1]] }
+    retornar r
+}
+
+funcion _na_largo_hijos(hijos, eje) {
+    para h en hijos {
+        sea l = h[eje] ?? "ajustar"
+        si (l == "llenar" o tipo(l) == "mapa") { retornar "llenar" }
+    }
+    retornar "ajustar"
+}
+
+/// Columna. opciones: "espacio", "relleno", "alinear" (eje cruzado:
+/// "inicio", "centro", "fin"), "ancho", "alto", "ancho_max".
+funcion nativa_columna(hijos, opciones) {
+    sea op = _na_op(opciones)
+    sea hs = _na_filtrar(hijos)
+    retornar {"w": "columna", "hijos": hs, "espacio": op["espacio"] ?? 0, "relleno": _na_relleno(op["relleno"] ?? 0), "alinear": _na_a(op["alinear"] ?? "inicio"),
+        "ancho": _na_l(op["ancho"] ?? nulo) ?? _na_largo_hijos(hs, "ancho"), "alto": _na_l(op["alto"] ?? nulo) ?? _na_largo_hijos(hs, "alto"), "ancho_max": op["ancho_max"] ?? nulo, "id": op["id"] ?? nulo}
+}
+
+/// Fila: como la columna pero horizontal.
+funcion nativa_fila(hijos, opciones) {
+    sea op = _na_op(opciones)
+    sea hs = _na_filtrar(hijos)
+    retornar {"w": "fila", "hijos": hs, "espacio": op["espacio"] ?? 0, "relleno": _na_relleno(op["relleno"] ?? 0), "alinear": _na_a(op["alinear"] ?? "inicio"),
+        "ancho": _na_l(op["ancho"] ?? nulo) ?? _na_largo_hijos(hs, "ancho"), "alto": _na_l(op["alto"] ?? nulo) ?? _na_largo_hijos(hs, "alto"), "id": op["id"] ?? nulo}
+}
+
+funcion _na_filtrar(hijos) {
+    sea r = []
+    para h en hijos { si (h != nulo) { r.agregar(h) } }
+    retornar r
+}
+
+/// Contenedor con relleno, alineación, fondo y borde. opciones: "relleno",
+/// "ancho", "alto", "centrar_x", "centrar_y", "fondo", "borde", "radio",
+/// "alinear_x", "alinear_y".
+funcion nativa_contenedor(hijo, opciones) {
+    sea op = _na_op(opciones)
+    sea ax = _na_a(op["alinear_x"] ?? "inicio")
+    sea ay = _na_a(op["alinear_y"] ?? "inicio")
+    si (op["centrar_x"] ?? falso) { ax = "centro" }
+    si (op["centrar_y"] ?? falso) { ay = "centro" }
+    retornar {"w": "contenedor", "hijo": hijo, "relleno": _na_relleno(op["relleno"] ?? 0), "ancho": _na_l(op["ancho"] ?? nulo) ?? _na_largo_hijos([hijo], "ancho"),
+        "alto": _na_l(op["alto"] ?? nulo) ?? _na_largo_hijos([hijo], "alto"), "ax": ax, "ay": ay, "fondo": op["fondo"] ?? nulo, "borde": op["borde"] ?? nulo,
+        "radio": op["radio"] ?? 0, "id": op["id"] ?? nulo}
+}
+
+/// Entrada de texto. al_cambiar(nuevo_texto) devuelve el mensaje.
+/// opciones: "al_enviar" (mensaje con Enter), "secreto", "ancho", "id".
+funcion nativa_entrada(marcador, valor, al_cambiar, opciones) {
+    sea op = _na_op(opciones)
+    retornar {"w": "entrada", "marcador": marcador ?? "", "valor": "" + (valor ?? ""), "al_cambiar": al_cambiar, "al_enviar": op["al_enviar"] ?? nulo,
+        "secreto": op["secreto"] ?? falso, "ancho": _na_l(op["ancho"] ?? nulo) ?? "llenar", "alto": "ajustar", "relleno": 5, "id": op["id"] ?? nulo}
+}
+
+/// Casilla con etiqueta. al_cambiar(bool) devuelve el mensaje.
+funcion nativa_casilla(etiqueta, marcado, al_cambiar) {
+    retornar {"w": "casilla", "etiqueta": etiqueta, "marcado": marcado, "al_cambiar": al_cambiar, "ancho": "ajustar", "alto": "ajustar", "id": nulo}
+}
+
+/// Interruptor (toggler). al_cambiar(bool) devuelve el mensaje.
+funcion nativa_interruptor(etiqueta, activo, al_cambiar) {
+    retornar {"w": "interruptor", "etiqueta": etiqueta ?? "", "marcado": activo, "al_cambiar": al_cambiar, "ancho": "ajustar", "alto": "ajustar", "id": nulo}
+}
+
+/// Opción de radio: al elegirla, al_elegir(valor) devuelve el mensaje.
+funcion nativa_radio(etiqueta, valor, seleccionado, al_elegir) {
+    retornar {"w": "radio", "etiqueta": etiqueta, "valor": valor, "marcado": valor == seleccionado, "al_elegir": al_elegir, "ancho": "ajustar", "alto": "ajustar", "id": nulo}
+}
+
+/// Deslizador entre min y max. al_cambiar(v) devuelve el mensaje.
+/// opciones: "paso", "ancho".
+funcion nativa_deslizador(min, max, valor, al_cambiar, opciones) {
+    sea op = _na_op(opciones)
+    retornar {"w": "deslizador", "min": min, "max": max, "valor": valor, "al_cambiar": al_cambiar, "paso": op["paso"] ?? 1, "ancho": _na_l(op["ancho"] ?? nulo) ?? "llenar", "alto": "ajustar", "id": op["id"] ?? nulo}
+}
+
+/// Barra de progreso.
+funcion nativa_progreso(min, max, valor, opciones) {
+    sea op = _na_op(opciones)
+    retornar {"w": "progreso", "min": min, "max": max, "valor": valor, "ancho": _na_l(op["ancho"] ?? nulo) ?? "llenar", "alto": _na_l(op["alto"] ?? nulo) ?? 10, "id": nulo}
+}
+
+/// Espacio vacío (ancho y alto: número, "llenar" o "ajustar").
+funcion nativa_espacio(ancho, alto) { retornar {"w": "espacio", "ancho": ancho ?? "ajustar", "alto": alto ?? "ajustar", "id": nulo} }
+
+/// Línea separadora horizontal.
+funcion nativa_separador() { retornar {"w": "separador", "ancho": "llenar", "alto": 1, "id": nulo} }
+
+/// Área con desplazamiento vertical. opciones: "alto", "ancho", "id".
+funcion nativa_desplazable(hijo, opciones) {
+    sea op = _na_op(opciones)
+    retornar {"w": "desplazable", "hijo": hijo, "ancho": _na_l(op["ancho"] ?? nulo) ?? "llenar", "alto": _na_l(op["alto"] ?? nulo) ?? "llenar", "id": op["id"] ?? nulo}
+}
+
+/// Selector desplegable (pick list). al_elegir(opcion) devuelve el mensaje.
+funcion nativa_selector(opciones_lista, seleccionada, al_elegir, opciones) {
+    sea op = _na_op(opciones)
+    retornar {"w": "selector", "lista": opciones_lista, "seleccionada": seleccionada, "al_elegir": al_elegir, "marcador": op["marcador"] ?? "Elegir…",
+        "ancho": _na_l(op["ancho"] ?? nulo) ?? "ajustar", "alto": "ajustar", "id": op["id"] ?? nulo}
+}
+
+/// Rejilla con filas y columnas. definiciones: "auto", un número de
+/// píxeles, "*" o "2*" (proporcional). Los hijos se ubican con nativa_celda.
+/// opciones: "filas", "columnas", "espacio", "ancho", "alto".
+funcion nativa_rejilla(hijos, opciones) {
+    sea op = _na_op(opciones)
+    retornar {"w": "rejilla", "hijos": _na_filtrar(hijos), "filas": _na_defs(op["filas"] ?? ["*"]), "columnas": _na_defs(op["columnas"] ?? ["*"]),
+        "espacio": op["espacio"] ?? 0, "ancho": _na_l(op["ancho"] ?? nulo) ?? "llenar", "alto": _na_l(op["alto"] ?? nulo) ?? "llenar", "id": op["id"] ?? nulo}
+}
+
+/// Ubica un widget en la rejilla (fila y columna desde 0, con tramos).
+funcion nativa_celda(hijo, fila, columna, tramo_filas, tramo_columnas) {
+    sea r = {}
+    para k en claves(hijo) { r[k] = hijo[k] }
+    r["_celda"] = [fila ?? 0, columna ?? 0, tramo_filas ?? 1, tramo_columnas ?? 1]
+    retornar r
+}
+
+funcion _na_defs(l) {
+    sea lista = l
+    si (tipo(l) == "texto") { lista = separar(l, ",") }
+    sea r = []
+    para d0 en lista {
+        sea d = d0
+        si (tipo(d) == "texto") { d = texto_recortar(d) }
+        si (tipo(d) == "numero") { r.agregar(["px", d]) }
+        sino si (d == "auto" o d == "Auto") { r.agregar(["auto", 0]) }
+        sino si (texto_termina_con(d, "*")) {
+            sea pesos = 1
+            si (longitud(d) > 1) { pesos = a_numero(subtexto(d, 0, longitud(d) - 1)) }
+            r.agregar(["estrella", pesos])
+        } sino { r.agregar(["px", a_numero(d)]) }
+    }
+    retornar r
+}
+
+funcion _na_tramos(defs, total, espacio, medidas, estirar) {
+    sea n = longitud(defs)
+    sea r = []
+    sea fijo = espacio * maximo(0, n - 1)
+    sea pesos = 0
+    sea i = 0
+    mientras (i < n) {
+        sea d = defs[i]
+        si (d[0] == "px") { r.agregar(d[1]) }
+        sino si (d[0] == "auto" o estirar == falso) { r.agregar(medidas[i]) }
+        sino {
+            r.agregar(-1)
+            pesos = pesos + d[1]
+        }
+        si (r[i] >= 0) { fijo = fijo + r[i] }
+        i = i + 1
+    }
+    sea libre = maximo(0, total - fijo)
+    i = 0
+    mientras (i < n) {
+        si (r[i] < 0) { r[i] = libre * defs[i][1] / pesos }
+        i = i + 1
+    }
+    retornar r
+}
+
+funcion _na_suma_tramo(t, desde, cuantos, espacio) {
+    sea s = 0
+    sea k = desde
+    mientras (k < desde + cuantos y k < longitud(t)) {
+        s = s + t[k]
+        k = k + 1
+    }
+    retornar s + espacio * maximo(0, cuantos - 1)
+}
+
+funcion _na_rejilla(ctx, w, max_w, max_h) {
+    sea ancho = _na_resolver(w["ancho"], max_w, max_w)
+    sea alto = _na_resolver(w["alto"], max_h, max_h)
+    sea nc = longitud(w["columnas"])
+    sea nf = longitud(w["filas"])
+    sea esp = w["espacio"]
+    // Columnas: medida natural de los hijos de un solo tramo.
+    sea med_c = []
+    sea i = 0
+    mientras (i < nc) {
+        med_c.agregar(0)
+        i = i + 1
+    }
+    para h en w["hijos"] {
+        sea c = h["_celda"] ?? [0, 0, 1, 1]
+        si (c[3] == 1 y c[1] < nc) { med_c[c[1]] = maximo(med_c[c[1]], _na_medir_natural(ctx, h, ancho, alto)["r"][2]) }
+    }
+    sea cols = _na_tramos(w["columnas"], ancho, esp, med_c, w["ancho"] != "ajustar" y _NA_INTRINSECO[0] == 0)
+    sea med_f = []
+    i = 0
+    mientras (i < nf) {
+        med_f.agregar(0)
+        i = i + 1
+    }
+    para h en w["hijos"] {
+        sea c = h["_celda"] ?? [0, 0, 1, 1]
+        si (c[2] == 1 y c[0] < nf) { med_f[c[0]] = maximo(med_f[c[0]], _na_medir_natural(ctx, h, _na_suma_tramo(cols, c[1], c[3], esp), alto)["r"][3]) }
+    }
+    sea filas = _na_tramos(w["filas"], alto, esp, med_f, w["alto"] != "ajustar" y _NA_INTRINSECO[0] == 0)
+    sea nodos = []
+    para h en w["hijos"] {
+        sea c = h["_celda"] ?? [0, 0, 1, 1]
+        sea cw = _na_suma_tramo(cols, c[1], c[3], esp)
+        sea chh = _na_suma_tramo(filas, c[0], c[2], esp)
+        sea nd = _na_disponer(ctx, h, cw, chh)
+        nd["r"][0] = _na_suma_tramo(cols, 0, c[1], esp) + esp * minimo(1, c[1])
+        nd["r"][1] = _na_suma_tramo(filas, 0, c[0], esp) + esp * minimo(1, c[0])
+        nodos.agregar(nd)
+    }
+    sea tot_w = _na_suma_tramo(cols, 0, nc, esp)
+    sea tot_h = _na_suma_tramo(filas, 0, nf, esp)
+    retornar {"w": w, "r": [0, 0, _na_resolver(w["ancho"], tot_w, max_w), _na_resolver(w["alto"], tot_h, max_h)], "hijos": nodos}
+}
+
+// ---------- medidas ----------
+
+funcion _na_tam(ctx, w) { retornar w["tam"] ?? ctx["tam"] }
+
+funcion _na_medir(ctx, t, tam) { retornar texto_medir(ctx["fuente"], t, tam)["ancho"] }
+
+// Parte el texto en líneas que caben en ancho_max.
+funcion _na_lineas(ctx, t, tam, ancho_max, ajustar) {
+    sea r = []
+    para parrafo en separar(t, "\n") {
+        si (ajustar == falso o ancho_max == nulo o _na_medir(ctx, parrafo, tam) <= ancho_max) { r.agregar(parrafo) } sino {
+            sea actual = ""
+            para palabra en separar(parrafo, " ") {
+                sea prueba = palabra
+                si (actual != "") { prueba = actual + " " + palabra }
+                si (_na_medir(ctx, prueba, tam) <= ancho_max o actual == "") { actual = prueba } sino {
+                    r.agregar(actual)
+                    actual = palabra
+                }
+            }
+            r.agregar(actual)
+        }
+    }
+    retornar r
+}
+
+// Mientras se mide el tamaño natural (columnas y filas "auto"), lo que
+// llena se comporta como si se ajustara al contenido.
+sea _NA_INTRINSECO = [0]
+
+funcion _na_medir_natural(ctx, w, max_w, max_h) {
+    _NA_INTRINSECO[0] = _NA_INTRINSECO[0] + 1
+    sea r = nulo
+    intentar { r = _na_disponer(ctx, w, max_w, max_h) } capturar (e) {
+        _NA_INTRINSECO[0] = _NA_INTRINSECO[0] - 1
+        lanzar e
+    }
+    _NA_INTRINSECO[0] = _NA_INTRINSECO[0] - 1
+    retornar r
+}
+
+funcion _na_resolver(largo, contenido, max) {
+    si (tipo(largo) == "numero") { retornar minimo(largo, max) }
+    si (largo == "llenar" o tipo(largo) == "mapa") {
+        si (_NA_INTRINSECO[0] > 0) { retornar minimo(contenido, max) }
+        retornar max
+    }
+    retornar minimo(contenido, max)
+}
+
+funcion _na_porcion(l) {
+    si (l == "llenar") { retornar 1 }
+    si (tipo(l) == "mapa") { retornar l["porcion"] ?? 1 }
+    retornar 0
+}
+
+// Disposición: devuelve un nodo {"w", "r": [x, y, ancho, alto], "hijos"}
+// con posiciones relativas al padre.
+funcion _na_disponer(ctx, w, max_w, max_h) {
+    sea t = w["w"]
+    sea tam = ctx["tam"]
+    si (t == "texto") {
+        sea tt = _na_tam(ctx, w)
+        sea lim = max_w
+        si (tipo(w["ancho"]) == "numero") { lim = minimo(lim, w["ancho"]) }
+        sea lineas = _na_lineas(ctx, w["texto"], tt, lim, w["ajustar_lineas"])
+        sea ancho = 0
+        para l en lineas { ancho = maximo(ancho, _na_medir(ctx, l, tt)) }
+        retornar {"w": w, "r": [0, 0, _na_resolver(w["ancho"], ancho, max_w), _na_resolver(w["alto"], longitud(lineas) * tt * 1.3, max_h)], "hijos": [], "lineas": lineas}
+    }
+    si (t == "boton" o t == "contenedor") {
+        sea p = w["relleno"]
+        sea interior_w = _na_resolver(w["ancho"], max_w, max_w) - p[1] - p[3]
+        sea interior_h = _na_resolver(w["alto"], max_h, max_h) - p[0] - p[2]
+        sea h = _na_disponer(ctx, w["hijo"], maximo(0, interior_w), maximo(0, interior_h))
+        sea ancho = _na_resolver(w["ancho"], h["r"][2] + p[1] + p[3], max_w)
+        sea alto = _na_resolver(w["alto"], h["r"][3] + p[0] + p[2], max_h)
+        sea libre_x = ancho - p[1] - p[3] - h["r"][2]
+        sea libre_y = alto - p[0] - p[2] - h["r"][3]
+        sea ax = w["ax"] ?? "centro"
+        sea ay = w["ay"] ?? "centro"
+        h["r"][0] = p[3] + _na_alinear(ax, libre_x)
+        h["r"][1] = p[0] + _na_alinear(ay, libre_y)
+        retornar {"w": w, "r": [0, 0, ancho, alto], "hijos": [h]}
+    }
+    si (t == "columna" o t == "fila") { retornar _na_flex(ctx, w, max_w, max_h, t == "columna") }
+    si (t == "rejilla") { retornar _na_rejilla(ctx, w, max_w, max_h) }
+    si (t == "entrada") {
+        retornar {"w": w, "r": [0, 0, _na_resolver(w["ancho"], 200, max_w), minimo(max_h, tam * 1.3 + 12)], "hijos": []}
+    }
+    si (t == "casilla" o t == "radio" o t == "interruptor") {
+        sea caja = tam + 4
+        si (t == "interruptor") { caja = (tam + 4) * 2 }
+        sea et = w["etiqueta"] ?? ""
+        sea ancho = caja
+        si (et != "") { ancho = caja + 8 + _na_medir(ctx, et, tam) }
+        retornar {"w": w, "r": [0, 0, minimo(ancho, max_w), minimo(max_h, maximo(caja, tam * 1.3))], "hijos": []}
+    }
+    si (t == "deslizador") { retornar {"w": w, "r": [0, 0, _na_resolver(w["ancho"], 200, max_w), minimo(max_h, 22)], "hijos": []} }
+    si (t == "progreso") { retornar {"w": w, "r": [0, 0, _na_resolver(w["ancho"], 200, max_w), _na_resolver(w["alto"], 10, max_h)], "hijos": []} }
+    si (t == "espacio") { retornar {"w": w, "r": [0, 0, _na_resolver(w["ancho"], 0, max_w), _na_resolver(w["alto"], 0, max_h)], "hijos": []} }
+    si (t == "separador") { retornar {"w": w, "r": [0, 0, max_w, 1], "hijos": []} }
+    si (t == "desplazable") {
+        sea ancho = _na_resolver(w["ancho"], max_w, max_w)
+        sea alto = _na_resolver(w["alto"], max_h, max_h)
+        sea h = _na_disponer(ctx, w["hijo"], ancho - 10, 1000000)
+        retornar {"w": w, "r": [0, 0, ancho, alto], "hijos": [h], "contenido": h["r"][3]}
+    }
+    si (t == "selector") {
+        sea ancho = 0
+        para o en w["lista"] { ancho = maximo(ancho, _na_medir(ctx, "" + o, tam)) }
+        ancho = maximo(ancho, _na_medir(ctx, w["marcador"], tam))
+        retornar {"w": w, "r": [0, 0, _na_resolver(w["ancho"], ancho + 34, max_w), minimo(max_h, tam * 1.3 + 12)], "hijos": []}
+    }
+    lanzar "nativa: widget desconocido " + t
+}
+
+funcion _na_alinear(a, libre) {
+    si (a == "centro") { retornar maximo(0, libre) / 2 }
+    si (a == "fin") { retornar maximo(0, libre) }
+    retornar 0
+}
+
+// Flex: primero los hijos que no llenan, después se reparte lo que sobra.
+funcion _na_flex(ctx, w, max_w, max_h, vertical) {
+    sea p = w["relleno"]
+    sea total_w = _na_resolver(w["ancho"], max_w, max_w)
+    sea total_h = _na_resolver(w["alto"], max_h, max_h)
+    si ((w["ancho_max"] ?? nulo) != nulo) { total_w = minimo(total_w, w["ancho_max"]) }
+    sea disp_w = maximo(0, total_w - p[1] - p[3])
+    sea disp_h = maximo(0, total_h - p[0] - p[2])
+    sea hijos = w["hijos"]
+    sea n = longitud(hijos)
+    sea nodos = []
+    sea usado = w["espacio"] * maximo(0, n - 1)
+    sea porciones = 0
+    para h en hijos {
+        sea l = h["alto"]
+        si (vertical == falso) { l = h["ancho"] }
+        sea por = _na_porcion(l ?? "ajustar")
+        si (por > 0) {
+            porciones = porciones + por
+            nodos.agregar(nulo)
+        } sino {
+            sea nd = nulo
+            si (vertical) { nd = _na_disponer(ctx, h, disp_w, maximo(0, disp_h - usado)) } sino { nd = _na_disponer(ctx, h, maximo(0, disp_w - usado), disp_h) }
+            si (vertical) { usado = usado + nd["r"][3] } sino { usado = usado + nd["r"][2] }
+            nodos.agregar(nd)
+        }
+    }
+    sea libre = 0
+    si (vertical) { libre = maximo(0, disp_h - usado) } sino { libre = maximo(0, disp_w - usado) }
+    // Si la caja se ajusta al contenido, los que llenan no reciben extra.
+    sea me_ajusto = (vertical y w["alto"] == "ajustar") o (vertical == falso y w["ancho"] == "ajustar") o _NA_INTRINSECO[0] > 0
+    sea i = 0
+    mientras (i < n) {
+        si (nodos[i] == nulo) {
+            sea h = hijos[i]
+            sea l = h["alto"]
+            si (vertical == falso) { l = h["ancho"] }
+            sea parte = 0
+            si (me_ajusto == falso) { parte = libre * _na_porcion(l) / porciones }
+            sea nd = nulo
+            si (vertical) {
+                nd = _na_disponer(ctx, h, disp_w, parte)
+                nd["r"][3] = parte
+            } sino {
+                nd = _na_disponer(ctx, h, parte, disp_h)
+                nd["r"][2] = parte
+            }
+            nodos[i] = nd
+        }
+        i = i + 1
+    }
+    // Tamaño propio y posiciones.
+    sea cruz = 0
+    sea principal = 0
+    para nd en nodos {
+        si (vertical) {
+            cruz = maximo(cruz, nd["r"][2])
+            principal = principal + nd["r"][3]
+        } sino {
+            cruz = maximo(cruz, nd["r"][3])
+            principal = principal + nd["r"][2]
+        }
+    }
+    principal = principal + w["espacio"] * maximo(0, n - 1)
+    sea ancho = 0
+    sea alto = 0
+    si (vertical) {
+        ancho = _na_resolver(w["ancho"], cruz + p[1] + p[3], max_w)
+        alto = _na_resolver(w["alto"], principal + p[0] + p[2], max_h)
+    } sino {
+        ancho = _na_resolver(w["ancho"], principal + p[1] + p[3], max_w)
+        alto = _na_resolver(w["alto"], cruz + p[0] + p[2], max_h)
+    }
+    si ((w["ancho_max"] ?? nulo) != nulo) { ancho = minimo(ancho, w["ancho_max"]) }
+    sea pos = 0
+    para nd en nodos {
+        si (vertical) {
+            nd["r"][0] = p[3] + _na_alinear(w["alinear"], ancho - p[1] - p[3] - nd["r"][2])
+            nd["r"][1] = p[0] + pos
+            pos = pos + nd["r"][3] + w["espacio"]
+        } sino {
+            nd["r"][0] = p[3] + pos
+            nd["r"][1] = p[0] + _na_alinear(w["alinear"], alto - p[0] - p[2] - nd["r"][3])
+            pos = pos + nd["r"][2] + w["espacio"]
+        }
+    }
+    retornar {"w": w, "r": [0, 0, ancho, alto], "hijos": nodos}
+}
+
+// Posiciones absolutas, claves de estado y lista plana para buscar.
+funcion _na_absolutos(nd, ox, oy, camino, plano) {
+    nd["r"][0] = nd["r"][0] + ox
+    nd["r"][1] = nd["r"][1] + oy
+    nd["clave"] = nd["w"]["id"] ?? camino
+    plano.agregar(nd)
+    sea dy = 0
+    si (nd["w"]["w"] == "desplazable") { dy = nd["desplazamiento"] ?? 0 }
+    sea i = 0
+    para h en nd["hijos"] {
+        h["dentro_de"] = nd["dentro_de"] ?? nulo
+        si (nd["w"]["w"] == "desplazable") { h["dentro_de"] = nd }
+        _na_absolutos(h, nd["r"][0], nd["r"][1] - dy, camino + "/" + i, plano)
+        i = i + 1
+    }
+}
+
+// ---------- app ----------
+
+/// Crea la app. opciones: "estado", "actualizar" fn(estado, mensaje)
+/// (puede cambiar el estado o devolver uno nuevo), "vista" fn(estado),
+/// "suscripciones" fn(estado) → [{"cada": ms, "mensaje": m}], "titulo",
+/// "tema" ("claro" u "oscuro"), "fuente", "tam".
+funcion nativa_app(opciones) {
+    sea op = opciones
+    sea f = op["fuente"] ?? nulo
+    si (f == nulo) { f = fuente_basica() }
+    retornar {"estado": op["estado"] ?? {}, "actualizar": op["actualizar"], "vista": op["vista"], "suscripciones": op["suscripciones"] ?? nulo,
+        "titulo": op["titulo"] ?? "C-Forge", "tema": _na_tema({"dark": "oscuro", "light": "claro"}[op["tema"] ?? "claro"] ?? (op["tema"] ?? "claro")), "fuente": f, "tam": op["tam"] ?? 12,
+        "ui": {}, "foco": nulo, "presionado": nulo, "arrastre": nulo, "raton": [-1, -1], "abierto": nulo, "mensajes": [], "tiempo": 0, "relojes": {},
+        "arbol": nulo, "plano": [], "ancho": 0, "alto": 0, "mayus": falso}
+}
+
+/// Estado actual de la app.
+funcion nativa_estado(app) { retornar app["estado"] }
+
+funcion _na_ui(app, clave) {
+    sea u = app["ui"][clave] ?? nulo
+    si (u == nulo) {
+        u = {"cursor": -1, "ancla": -1, "desplazamiento": 0}
+        app["ui"][clave] = u
+    }
+    retornar u
+}
+
+/// Rehace la vista y la disposición para un tamaño de ventana.
+funcion nativa_disponer(app, ancho, alto) {
+    app["ancho"] = ancho
+    app["alto"] = alto
+    sea w = app["vista"](app["estado"])
+    sea raiz = _na_disponer(app, w, ancho, alto)
+    // Desplazamientos guardados (se aplican antes de absolutizar).
+    _na_marcar_desplazables(app, raiz, "r")
+    sea plano = []
+    _na_absolutos(raiz, 0, 0, "r", plano)
+    app["arbol"] = raiz
+    app["plano"] = plano
+    retornar raiz
+}
+
+funcion _na_marcar_desplazables(app, nd, camino) {
+    sea clave = nd["w"]["id"] ?? camino
+    si (nd["w"]["w"] == "desplazable") {
+        sea u = _na_ui(app, clave)
+        sea maximo_d = maximo(0, nd["contenido"] - nd["r"][3])
+        u["desplazamiento"] = minimo(maximo(0, u["desplazamiento"]), maximo_d)
+        nd["desplazamiento"] = u["desplazamiento"]
+    }
+    sea i = 0
+    para h en nd["hijos"] {
+        _na_marcar_desplazables(app, h, camino + "/" + i)
+        i = i + 1
+    }
+}
+
+funcion _na_dentro(p, r) { retornar p[0] >= r[0] y p[1] >= r[1] y p[0] < r[0] + r[2] y p[1] < r[1] + r[3] }
+
+// Widget interactivo bajo el punto (el último en la lista plana gana).
+funcion _na_bajo(app, p) {
+    sea r = nulo
+    para nd en app["plano"] {
+        sea t = nd["w"]["w"]
+        si (t != "columna" y t != "fila" y t != "rejilla" y t != "contenedor" y t != "texto" y t != "espacio" y t != "separador" y _na_dentro(p, nd["r"])) {
+            sea visible = verdadero
+            sea d = nd["dentro_de"] ?? nulo
+            si (d != nulo y _na_dentro(p, d["r"]) == falso) { visible = falso }
+            si (visible) { r = nd }
+        }
+    }
+    retornar r
+}
+
+funcion _na_emitir(app, m) { si (m != nulo) { app["mensajes"].agregar(m) } }
+
+// Aplica los mensajes pendientes y rehace la vista.
+funcion _na_procesar(app) {
+    mientras (longitud(app["mensajes"]) > 0) {
+        sea m = eliminar(app["mensajes"], 0)
+        sea r = app["actualizar"](app["estado"], m)
+        si (r != nulo) { app["estado"] = r }
+    }
+    nativa_disponer(app, app["ancho"], app["alto"])
+}
+
+funcion _na_valor_deslizador(nd, x) {
+    sea w = nd["w"]
+    sea u = minimo(1, maximo(0, (x - nd["r"][0] - 7) / maximo(1, nd["r"][2] - 14)))
+    sea v = w["min"] + u * (w["max"] - w["min"])
+    sea paso = w["paso"]
+    si (paso > 0) { v = w["min"] + redondear((v - w["min"]) / paso) * paso }
+    retornar minimo(w["max"], maximo(w["min"], v))
+}
+
+funcion _na_buscar_clave(app, clave) {
+    para nd en app["plano"] { si (nd["clave"] == clave) { retornar nd } }
+    retornar nulo
+}
+
+// Posición del cursor más cercana a x dentro de una entrada.
+funcion _na_cursor_en(app, nd, x) {
+    sea v = _na_mostrar_valor(nd["w"])
+    sea n = longitud(texto_codigos(v))
+    sea mejor = n
+    sea k = 0
+    mientras (k <= n) {
+        sea px = nd["r"][0] + 6 + _na_medir(app, _na_prefijo(v, k), app["tam"])
+        si (px >= x) {
+            mejor = k
+            si (k > 0) {
+                sea antes = nd["r"][0] + 6 + _na_medir(app, _na_prefijo(v, k - 1), app["tam"])
+                si (x - antes < px - x) { mejor = k - 1 }
+            }
+            romper
+        }
+        k = k + 1
+    }
+    retornar mejor
+}
+
+funcion _na_prefijo(t, k) {
+    sea cs = texto_codigos(t)
+    sea r = ""
+    sea i = 0
+    mientras (i < k y i < longitud(cs)) {
+        r = r + caracter(cs[i])
+        i = i + 1
+    }
+    retornar r
+}
+
+funcion _na_mostrar_valor(w) {
+    si (w["secreto"]) {
+        sea r = ""
+        sea i = 0
+        mientras (i < longitud(texto_codigos(w["valor"]))) {
+            r = r + "*"
+            i = i + 1
+        }
+        retornar r
+    }
+    retornar w["valor"]
+}
+
+// ---------- eventos ----------
+
+/// Mueve el ratón.
+funcion nativa_mover(app, x, py) {
+    app["raton"] = [x, py]
+    sea a = app["arrastre"]
+    si (a != nulo) {
+        sea nd = _na_buscar_clave(app, a)
+        si (nd != nulo y nd["w"]["w"] == "deslizador") {
+            sea v = _na_valor_deslizador(nd, x)
+            si (v != nd["w"]["valor"]) { _na_emitir(app, nd["w"]["al_cambiar"](v)) }
+        } sino si (nd != nulo y nd["w"]["w"] == "entrada") {
+            sea u = _na_ui(app, a)
+            u["cursor"] = _na_cursor_en(app, nd, x)
+        }
+        _na_procesar(app)
+    }
+}
+
+/// Presiona el botón izquierdo en (x, y).
+funcion nativa_presionar(app, x, py) {
+    app["raton"] = [x, py]
+    // Primero, la lista abierta de un selector (va encima de todo).
+    si (app["abierto"] != nulo) {
+        sea sel = _na_buscar_clave(app, app["abierto"])
+        app["abierto"] = nulo
+        si (sel != nulo) {
+            sea op = _na_opciones_rect(app, sel)
+            sea i = 0
+            para r en op {
+                si (_na_dentro([x, py], r)) {
+                    _na_emitir(app, sel["w"]["al_elegir"](sel["w"]["lista"][i]))
+                    _na_procesar(app)
+                    retornar nulo
+                }
+                i = i + 1
+            }
+            si (_na_dentro([x, py], sel["r"])) {
+                _na_procesar(app)
+                retornar nulo
+            }
+        }
+    }
+    sea nd = _na_bajo(app, [x, py])
+    sea foco_antes = app["foco"]
+    app["foco"] = nulo
+    si (nd == nulo) { retornar nulo }
+    sea w = nd["w"]
+    sea t = w["w"]
+    app["presionado"] = nd["clave"]
+    si (t == "entrada") {
+        app["foco"] = nd["clave"]
+        sea u = _na_ui(app, nd["clave"])
+        u["cursor"] = _na_cursor_en(app, nd, x)
+        u["ancla"] = u["cursor"]
+        app["arrastre"] = nd["clave"]
+    } sino si (t == "deslizador") {
+        app["arrastre"] = nd["clave"]
+        sea v = _na_valor_deslizador(nd, x)
+        si (v != w["valor"]) { _na_emitir(app, w["al_cambiar"](v)) }
+        _na_procesar(app)
+    } sino si (t == "selector") {
+        app["abierto"] = nd["clave"]
+    }
+}
+
+/// Suelta el botón izquierdo en (x, y).
+funcion nativa_soltar(app, x, py) {
+    app["raton"] = [x, py]
+    sea pres = app["presionado"]
+    app["presionado"] = nulo
+    app["arrastre"] = nulo
+    si (pres == nulo) { retornar nulo }
+    sea nd = _na_bajo(app, [x, py])
+    si (nd == nulo o nd["clave"] != pres) { retornar nulo }
+    sea w = nd["w"]
+    sea t = w["w"]
+    si (t == "boton") { _na_emitir(app, w["mensaje"]) }
+    sino si (t == "casilla" o t == "interruptor") { _na_emitir(app, w["al_cambiar"](w["marcado"] == falso)) }
+    sino si (t == "radio") { _na_emitir(app, w["al_elegir"](w["valor"])) }
+    _na_procesar(app)
+}
+
+/// Clic completo (presionar y soltar) en (x, y).
+funcion nativa_clic(app, x, py) {
+    nativa_presionar(app, x, py)
+    nativa_soltar(app, x, py)
+}
+
+/// Rueda del ratón (positivo: hacia abajo) en la posición actual.
+funcion nativa_rueda(app, delta) {
+    sea p = app["raton"]
+    sea mejor = nulo
+    para nd en app["plano"] { si (nd["w"]["w"] == "desplazable" y _na_dentro(p, nd["r"])) { mejor = nd } }
+    si (mejor == nulo) { retornar nulo }
+    sea u = _na_ui(app, mejor["clave"])
+    u["desplazamiento"] = u["desplazamiento"] + delta * 20
+    nativa_disponer(app, app["ancho"], app["alto"])
+}
+
+funcion _na_entrada_foco(app) {
+    si (app["foco"] == nulo) { retornar nulo }
+    retornar _na_buscar_clave(app, app["foco"])
+}
+
+funcion _na_reemplazar_seleccion(app, nd, u, nuevo) {
+    sea cs = texto_codigos(nd["w"]["valor"])
+    si (u["cursor"] < 0 o u["cursor"] > longitud(cs)) { u["cursor"] = longitud(cs) }
+    si (u["ancla"] < 0 o u["ancla"] > longitud(cs)) { u["ancla"] = u["cursor"] }
+    sea a = minimo(u["cursor"], u["ancla"])
+    sea b = maximo(u["cursor"], u["ancla"])
+    sea r = _na_prefijo(nd["w"]["valor"], a) + nuevo + _na_sufijo(cs, b)
+    u["cursor"] = a + longitud(texto_codigos(nuevo))
+    u["ancla"] = u["cursor"]
+    retornar r
+}
+
+funcion _na_sufijo(cs, b) {
+    sea r = ""
+    sea i = b
+    mientras (i < longitud(cs)) {
+        r = r + caracter(cs[i])
+        i = i + 1
+    }
+    retornar r
+}
+
+/// Escribe texto en la entrada que tiene el foco.
+funcion nativa_escribir(app, texto) {
+    sea nd = _na_entrada_foco(app)
+    si (nd == nulo) { retornar nulo }
+    sea u = _na_ui(app, nd["clave"])
+    sea nuevo = _na_reemplazar_seleccion(app, nd, u, texto)
+    _na_emitir(app, nd["w"]["al_cambiar"](nuevo))
+    _na_procesar(app)
+}
+
+/// Tecla especial: "enter", "tab", "borrar" (retroceso), "suprimir",
+/// "izquierda", "derecha", "inicio", "fin", "escape". Con mayus verdadero,
+/// las flechas extienden la selección.
+funcion nativa_tecla(app, tecla_dada, mayus) {
+    sea con_mayus = mayus ?? falso
+    sea tecla = {"backspace": "borrar", "delete": "suprimir", "left": "izquierda", "right": "derecha", "home": "inicio", "end": "fin"}[tecla_dada] ?? tecla_dada
+    si (tecla == "escape") {
+        app["abierto"] = nulo
+        app["foco"] = nulo
+        retornar nulo
+    }
+    si (tecla == "tab") {
+        // Siguiente entrada.
+        sea entradas = []
+        para nd en app["plano"] { si (nd["w"]["w"] == "entrada") { entradas.agregar(nd["clave"]) } }
+        si (longitud(entradas) == 0) { retornar nulo }
+        sea i = 0
+        sea siguiente = entradas[0]
+        mientras (i < longitud(entradas)) {
+            si (entradas[i] == app["foco"]) { siguiente = entradas[(i + 1) % longitud(entradas)] }
+            i = i + 1
+        }
+        app["foco"] = siguiente
+        sea u = _na_ui(app, siguiente)
+        sea nd = _na_buscar_clave(app, siguiente)
+        u["cursor"] = longitud(texto_codigos(nd["w"]["valor"]))
+        u["ancla"] = 0
+        retornar nulo
+    }
+    sea nd = _na_entrada_foco(app)
+    si (nd == nulo) { retornar nulo }
+    sea w = nd["w"]
+    sea u = _na_ui(app, nd["clave"])
+    sea n = longitud(texto_codigos(w["valor"]))
+    si (u["cursor"] < 0 o u["cursor"] > n) { u["cursor"] = n }
+    si (u["ancla"] < 0 o u["ancla"] > n) { u["ancla"] = u["cursor"] }
+    si (tecla == "enter") {
+        _na_emitir(app, w["al_enviar"])
+        _na_procesar(app)
+        retornar nulo
+    }
+    si (tecla == "borrar" o tecla == "suprimir") {
+        si (u["cursor"] == u["ancla"]) {
+            si (tecla == "borrar" y u["cursor"] > 0) { u["ancla"] = u["cursor"] - 1 }
+            si (tecla == "suprimir" y u["cursor"] < n) { u["ancla"] = u["cursor"] + 1 }
+        }
+        si (u["cursor"] != u["ancla"]) {
+            _na_emitir(app, w["al_cambiar"](_na_reemplazar_seleccion(app, nd, u, "")))
+            _na_procesar(app)
+        }
+        retornar nulo
+    }
+    sea c = u["cursor"]
+    si (tecla == "izquierda") { c = maximo(0, c - 1) }
+    si (tecla == "derecha") { c = minimo(n, c + 1) }
+    si (tecla == "inicio") { c = 0 }
+    si (tecla == "fin") { c = n }
+    u["cursor"] = c
+    si (con_mayus == falso) { u["ancla"] = c }
+}
+
+/// Selección de la entrada con foco: [desde, hasta] o nulo.
+funcion nativa_seleccion(app) {
+    sea nd = _na_entrada_foco(app)
+    si (nd == nulo) { retornar nulo }
+    sea u = _na_ui(app, nd["clave"])
+    retornar [minimo(u["cursor"], u["ancla"]), maximo(u["cursor"], u["ancla"])]
+}
+
+/// Avanza el reloj ms milisegundos y dispara las suscripciones.
+funcion nativa_avanzar(app, ms) {
+    app["tiempo"] = app["tiempo"] + ms
+    si (app["suscripciones"] == nulo) { retornar nulo }
+    sea i = 0
+    para s0 en app["suscripciones"](app["estado"]) {
+        sea s = {"cada": s0["cada"] ?? s0["every"], "mensaje": s0["mensaje"] ?? s0["message"]}
+        sea clave = "" + i + ":" + s["cada"]
+        sea ultimo = app["relojes"][clave] ?? 0
+        mientras (app["tiempo"] - ultimo >= s["cada"]) {
+            ultimo = ultimo + s["cada"]
+            _na_emitir(app, s["mensaje"])
+        }
+        app["relojes"][clave] = ultimo
+        i = i + 1
+    }
+    _na_procesar(app)
+}
+
+/// Envía un mensaje como si viniera de un widget.
+funcion nativa_enviar(app, mensaje) {
+    _na_emitir(app, mensaje)
+    _na_procesar(app)
+}
+
+// ---------- dibujo ----------
+
+funcion _na_cmd_rect(l, r, c, radio, rc) { l.agregar({"t": "rect", "r": [r[0], r[1], r[2], r[3]], "c": c, "radio": radio, "recorte": rc}) }
+funcion _na_cmd_borde(l, r, c, rc) { l.agregar({"t": "borde", "r": [r[0], r[1], r[2], r[3]], "c": c, "recorte": rc}) }
+funcion _na_cmd_texto(l, x, py, t, c, rc, tam) {
+    sea cmd = {"t": "texto", "x": x, "y": py, "texto": t, "c": c, "recorte": rc}
+    si (tam != nulo) { cmd["tam"] = tam }
+    l.agregar(cmd)
+}
+
+funcion _na_interseccion(a, b) {
+    sea x0 = maximo(a[0], b[0])
+    sea y0 = maximo(a[1], b[1])
+    sea x1 = minimo(a[0] + a[2], b[0] + b[2])
+    sea y1 = minimo(a[1] + a[3], b[1] + b[3])
+    retornar [x0, y0, maximo(0, x1 - x0), maximo(0, y1 - y0)]
+}
+
+funcion _na_colores_boton(tema, estilo, caliente, presionado, deshabilitado) {
+    sea fondo = tema["primario"]
+    sea texto = tema["sobre_primario"]
+    si (estilo == "secundario") {
+        fondo = tema["superficie"]
+        texto = tema["texto"]
+        si (caliente) { fondo = tema["superficie_caliente"] }
+    } sino si (estilo == "peligro") { fondo = tema["peligro"] }
+    sino si (estilo == "exito") { fondo = tema["exito"] }
+    sino si (estilo == "texto") {
+        fondo = [0, 0, 0, 0]
+        texto = tema["primario"]
+    } sino {
+        si (presionado) { fondo = tema["primario_presionado"] } sino si (caliente) { fondo = tema["primario_caliente"] }
+    }
+    si (deshabilitado) {
+        fondo = [fondo[0], fondo[1], fondo[2], piso(fondo[3] / 2)]
+        texto = [texto[0], texto[1], texto[2], 140]
+    }
+    retornar [fondo, texto]
+}
+
+funcion _na_opciones_rect(app, nd) {
+    sea r = []
+    sea alto = app["tam"] * 1.3 + 8
+    sea py = nd["r"][1] + nd["r"][3]
+    para o en nd["w"]["lista"] {
+        r.agregar([nd["r"][0], py, nd["r"][2], alto])
+        py = py + alto
+    }
+    retornar r
+}
+
+funcion _na_dibujar_nodo(app, nd, l, rc, color_texto) {
+    sea w = nd["w"]
+    sea t = w["w"]
+    sea r = nd["r"]
+    sea tema = app["tema"]
+    sea tam = app["tam"]
+    sea caliente = _na_dentro(app["raton"], r)
+    si (t == "texto") {
+        sea tt = _na_tam(app, w)
+        sea py = r[1] + tt * 0.15
+        sea c = w["color"] ?? color_texto
+        para linea en nd["lineas"] {
+            sea x = r[0] + _na_alinear(w["alinear"], r[2] - _na_medir(app, linea, tt))
+            _na_cmd_texto(l, x, py, linea, c, rc, w["tam"])
+            py = py + tt * 1.3
+        }
+        retornar nulo
+    }
+    si (t == "boton") {
+        sea cols = _na_colores_boton(tema, w["estilo"], caliente, app["presionado"] == nd["clave"], w["mensaje"] == nulo)
+        si (w["fondo"] != nulo) { cols[0] = w["fondo"] }
+        si (w["color"] != nulo) { cols[1] = w["color"] }
+        si (cols[0][3] > 0) { _na_cmd_rect(l, r, cols[0], w["radio"], rc) }
+        para h en nd["hijos"] { _na_dibujar_nodo(app, h, l, rc, cols[1]) }
+        retornar nulo
+    }
+    si (t == "contenedor") {
+        si (w["fondo"] != nulo) { _na_cmd_rect(l, r, w["fondo"], w["radio"], rc) }
+        si (w["borde"] != nulo) { _na_cmd_borde(l, r, w["borde"], rc) }
+        para h en nd["hijos"] { _na_dibujar_nodo(app, h, l, rc, color_texto) }
+        retornar nulo
+    }
+    si (t == "columna" o t == "fila" o t == "rejilla") {
+        para h en nd["hijos"] { _na_dibujar_nodo(app, h, l, rc, color_texto) }
+        retornar nulo
+    }
+    si (t == "entrada") {
+        sea foco = app["foco"] == nd["clave"]
+        _na_cmd_rect(l, r, tema["fondo"], 3, rc)
+        sea cb = tema["borde"]
+        si (foco) { cb = tema["borde_foco"] }
+        _na_cmd_borde(l, r, cb, rc)
+        sea rci = _na_interseccion(rc, [r[0] + 2, r[1] + 2, r[2] - 4, r[3] - 4])
+        sea v = _na_mostrar_valor(w)
+        sea ty = r[1] + (r[3] - tam) / 2
+        si (foco) {
+            sea u = _na_ui(app, nd["clave"])
+            sea n = longitud(texto_codigos(v))
+            sea cur = u["cursor"]
+            si (cur < 0 o cur > n) { cur = n }
+            sea an = u["ancla"]
+            si (an < 0 o an > n) { an = cur }
+            si (an != cur) {
+                sea xa = r[0] + 6 + _na_medir(app, _na_prefijo(v, minimo(an, cur)), tam)
+                sea xb = r[0] + 6 + _na_medir(app, _na_prefijo(v, maximo(an, cur)), tam)
+                _na_cmd_rect(l, [xa, r[1] + 4, xb - xa, r[3] - 8], tema["seleccion"], 0, rci)
+            }
+            sea xc = r[0] + 6 + _na_medir(app, _na_prefijo(v, cur), tam)
+            _na_cmd_rect(l, [xc, r[1] + 4, 1, r[3] - 8], tema["texto"], 0, rci)
+        }
+        si (v == "") { _na_cmd_texto(l, r[0] + 6, ty, w["marcador"], tema["apagado"], rci) } sino { _na_cmd_texto(l, r[0] + 6, ty, v, tema["texto"], rci) }
+        retornar nulo
+    }
+    si (t == "casilla" o t == "radio") {
+        sea caja = tam + 4
+        sea by = r[1] + (r[3] - caja) / 2
+        sea cr = [r[0], by, caja, caja]
+        sea radio = 3
+        si (t == "radio") { radio = caja / 2 }
+        si (w["marcado"]) { _na_cmd_rect(l, cr, tema["primario"], radio, rc) } sino {
+            _na_cmd_rect(l, cr, tema["fondo"], radio, rc)
+            _na_cmd_borde(l, cr, tema["borde"], rc)
+        }
+        si (w["marcado"] y t == "casilla") {
+            l.agregar({"t": "linea", "p": [cr[0] + 4, cr[1] + caja / 2, cr[0] + caja / 2 - 1, cr[1] + caja - 5], "c": tema["sobre_primario"], "recorte": rc})
+            l.agregar({"t": "linea", "p": [cr[0] + caja / 2 - 1, cr[1] + caja - 5, cr[0] + caja - 4, cr[1] + 4], "c": tema["sobre_primario"], "recorte": rc})
+        }
+        si (w["marcado"] y t == "radio") { _na_cmd_rect(l, [cr[0] + 5, cr[1] + 5, caja - 10, caja - 10], tema["sobre_primario"], (caja - 10) / 2, rc) }
+        _na_cmd_texto(l, r[0] + caja + 8, r[1] + (r[3] - tam) / 2, w["etiqueta"], color_texto, rc)
+        retornar nulo
+    }
+    si (t == "interruptor") {
+        sea alto_i = tam + 4
+        sea ancho_i = alto_i * 2
+        sea by = r[1] + (r[3] - alto_i) / 2
+        sea fondo = tema["borde"]
+        si (w["marcado"]) { fondo = tema["primario"] }
+        _na_cmd_rect(l, [r[0], by, ancho_i, alto_i], fondo, alto_i / 2, rc)
+        sea px = r[0] + 2
+        si (w["marcado"]) { px = r[0] + ancho_i - alto_i + 2 }
+        _na_cmd_rect(l, [px, by + 2, alto_i - 4, alto_i - 4], [255, 255, 255, 255], (alto_i - 4) / 2, rc)
+        si (w["etiqueta"] != "") { _na_cmd_texto(l, r[0] + ancho_i + 8, r[1] + (r[3] - tam) / 2, w["etiqueta"], color_texto, rc) }
+        retornar nulo
+    }
+    si (t == "deslizador") {
+        sea cy = r[1] + r[3] / 2
+        sea u = (w["valor"] - w["min"]) / maximo(0.000001, w["max"] - w["min"])
+        sea x = r[0] + 7 + u * (r[2] - 14)
+        _na_cmd_rect(l, [r[0] + 7, cy - 2, r[2] - 14, 4], tema["borde"], 2, rc)
+        _na_cmd_rect(l, [r[0] + 7, cy - 2, x - r[0] - 7, 4], tema["primario"], 2, rc)
+        _na_cmd_rect(l, [x - 7, cy - 7, 14, 14], tema["primario"], 7, rc)
+        retornar nulo
+    }
+    si (t == "progreso") {
+        sea u = minimo(1, maximo(0, (w["valor"] - w["min"]) / maximo(0.000001, w["max"] - w["min"])))
+        _na_cmd_rect(l, r, tema["superficie_caliente"], r[3] / 2, rc)
+        si (u > 0) { _na_cmd_rect(l, [r[0], r[1], r[2] * u, r[3]], tema["primario"], r[3] / 2, rc) }
+        retornar nulo
+    }
+    si (t == "separador") {
+        _na_cmd_rect(l, r, tema["borde"], 0, rc)
+        retornar nulo
+    }
+    si (t == "desplazable") {
+        sea rci = _na_interseccion(rc, r)
+        para h en nd["hijos"] { _na_dibujar_nodo(app, h, l, rci, color_texto) }
+        si (nd["contenido"] > r[3]) {
+            sea alto_barra = maximo(20, r[3] * r[3] / nd["contenido"])
+            sea py = r[1] + (r[3] - alto_barra) * nd["desplazamiento"] / maximo(1, nd["contenido"] - r[3])
+            _na_cmd_rect(l, [r[0] + r[2] - 6, py, 4, alto_barra], tema["apagado"], 2, rc)
+        }
+        retornar nulo
+    }
+    si (t == "selector") {
+        _na_cmd_rect(l, r, tema["fondo"], 3, rc)
+        _na_cmd_borde(l, r, tema["borde"], rc)
+        sea txt = w["marcador"]
+        sea c = tema["apagado"]
+        si (w["seleccionada"] != nulo) {
+            txt = "" + w["seleccionada"]
+            c = tema["texto"]
+        }
+        _na_cmd_texto(l, r[0] + 8, r[1] + (r[3] - tam) / 2, txt, c, rc)
+        sea ax = r[0] + r[2] - 16
+        sea ay = r[1] + r[3] / 2 - 2
+        l.agregar({"t": "tri", "p": [ax - 4, ay, ax + 4, ay, ax, ay + 5], "c": tema["texto"], "recorte": rc})
+        retornar nulo
+    }
+}
+
+/// Lista de comandos de dibujo (formato de "panel") de la vista actual.
+funcion nativa_comandos(app) {
+    si (app["arbol"] == nulo) { retornar [] }
+    sea l = []
+    sea pantalla = [0, 0, app["ancho"], app["alto"]]
+    _na_cmd_rect(l, pantalla, app["tema"]["fondo"], 0, pantalla)
+    _na_dibujar_nodo(app, app["arbol"], l, pantalla, app["tema"]["texto"])
+    // La lista abierta de un selector va encima.
+    si (app["abierto"] != nulo) {
+        sea sel = _na_buscar_clave(app, app["abierto"])
+        si (sel != nulo) {
+            sea i = 0
+            para r en _na_opciones_rect(app, sel) {
+                sea o = sel["w"]["lista"][i]
+                sea fondo = app["tema"]["fondo"]
+                sea c = app["tema"]["texto"]
+                si (_na_dentro(app["raton"], r) o o == sel["w"]["seleccionada"]) {
+                    fondo = app["tema"]["primario"]
+                    c = app["tema"]["sobre_primario"]
+                }
+                _na_cmd_rect(l, r, fondo, 0, pantalla)
+                _na_cmd_borde(l, r, app["tema"]["borde"], pantalla)
+                _na_cmd_texto(l, r[0] + 8, r[1] + (r[3] - app["tam"]) / 2, "" + o, c, pantalla)
+                i = i + 1
+            }
+        }
+    }
+    retornar l
+}
+
+/// Dibuja la vista en un lienzo de "graficos".
+funcion nativa_dibujar(app, lienzo) {
+    retornar panel_dibujar(lienzo, {"fuente": app["fuente"], "tam": app["tam"]}, nativa_comandos(app))
+}
+
+/// Prepara la app sin ventana (para pruebas o para dibujar en un lienzo).
+funcion nativa_simular(app, ancho, alto) {
+    nativa_disponer(app, ancho, alto)
+    retornar app
+}
+
+/// Rectángulo [x, y, ancho, alto] del primer widget que muestra ese texto
+/// (o con ese "id"); nulo si no está.
+funcion nativa_buscar(app, texto_o_id) {
+    para nd en app["plano"] {
+        sea w = nd["w"]
+        si ((w["id"] ?? nulo) == texto_o_id) { retornar nd["r"] }
+        si (w["w"] == "texto" y w["texto"] == texto_o_id) { retornar nd["r"] }
+        si ((w["w"] == "casilla" o w["w"] == "radio" o w["w"] == "interruptor") y w["etiqueta"] == texto_o_id) { retornar nd["r"] }
+        si (w["w"] == "entrada" y w["marcador"] == texto_o_id) { retornar nd["r"] }
+    }
+    retornar nulo
+}
+
+/// Clic en el centro del widget que muestra ese texto (o con ese "id").
+funcion nativa_clic_en(app, texto_o_id) {
+    sea r = nativa_buscar(app, texto_o_id)
+    si (r == nulo) { lanzar "nativa_clic_en: no encontré " + texto_o_id }
+    nativa_clic(app, r[0] + r[2] / 2, r[1] + r[3] / 2)
+}
+
+// ---------- ventana ----------
+
+funcion _na_tecla_sdl(sc) {
+    si (sc >= 4 y sc <= 29) { retornar ["texto", char_de(97 + sc - 4)] }
+    si (sc >= 30 y sc <= 38) { retornar ["texto", char_de(49 + sc - 30)] }
+    si (sc == 39) { retornar ["texto", "0"] }
+    si (sc == 44) { retornar ["texto", " "] }
+    si (sc == 40) { retornar ["tecla", "enter"] }
+    si (sc == 41) { retornar ["tecla", "escape"] }
+    si (sc == 42) { retornar ["tecla", "borrar"] }
+    si (sc == 43) { retornar ["tecla", "tab"] }
+    si (sc == 76) { retornar ["tecla", "suprimir"] }
+    si (sc == 79) { retornar ["tecla", "derecha"] }
+    si (sc == 80) { retornar ["tecla", "izquierda"] }
+    si (sc == 74) { retornar ["tecla", "inicio"] }
+    si (sc == 77) { retornar ["tecla", "fin"] }
+    retornar nulo
+}
+
+/// Abre una ventana SDL y corre la app hasta que se cierre.
+funcion nativa_ejecutar(app, ancho, alto) {
+    sea j = motor_crear(app["titulo"], ancho, alto, 60)
+    nativa_disponer(app, ancho, alto)
+    sea lienzo = lienzo_crear(ancho, alto)
+    sea antes = sdl_ticks()
+    mientras (j["corriendo"]) {
+        para e en sdl_eventos() {
+            si (e["salir"] ?? falso) { j["corriendo"] = falso }
+            sea tp = e["tipo"]
+            si (tp == 1024) { nativa_mover(app, e["x"], e["y"]) }
+            si (tp == 1025) { nativa_presionar(app, e["x"], e["y"]) }
+            si (tp == 1026) { nativa_soltar(app, e["x"], e["y"]) }
+            si (tp == 768) {
+                sea k = _na_tecla_sdl(e["tecla"])
+                si (k != nulo y k[0] == "texto") { nativa_escribir(app, k[1]) }
+                si (k != nulo y k[0] == "tecla") { nativa_tecla(app, k[1], falso) }
+            }
+        }
+        sea ahora = sdl_ticks()
+        nativa_avanzar(app, ahora - antes)
+        antes = ahora
+        nativa_dibujar(app, lienzo)
+        motor_dibujar_lienzo(j, lienzo, 0, 0)
+        motor_presentar(j)
+        sdl_esperar(16)
+    }
+    motor_cerrar(j)
+}

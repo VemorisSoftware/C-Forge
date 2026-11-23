@@ -1,0 +1,1085 @@
+// stdlib/trazo.cfv — Gráficos vectoriales al estilo Vello: una escena
+// codificada (caminos, pinceles, transformaciones y capas) que se dibuja en
+// mosaicos de 16×16 con cobertura analítica por área.
+//
+// Tubería (la misma de Vello, hecha en la CPU):
+//   1. Aplanado de curvas con la fórmula de Wang (tolerancia 0,05 px).
+//   2. Expansión de trazos a rellenos (uniones, extremos y guiones).
+//   3. Rasterizado por acumulación de área en mosaicos dispersos: los
+//      mosaicos vacíos no se tocan y los que quedan cubiertos del todo se
+//      pintan como sólidos (el «backdrop» de Vello).
+//   4. Pintura (color, degradados lineal/radial/cónico con pad, repeat y
+//      reflect) y capas con recorte, opacidad y modos de mezcla.
+//
+// Uso:
+//   importar "trazo"
+//   sea e = trazo_escena()
+//   sea c = trazo_camino()
+//   trazo_circulo(c, 50, 50, 40)
+//   trazo_rellenar(e, c, "#3070ff", nulo)
+//   imagen_guardar(trazo_renderizar(e, 100, 100, nulo), "circulo.png")
+
+importar "imagen"
+
+sea _TV_MOSAICO = 16
+
+// ---------- caminos ----------
+
+/// Camino vacío (lista de órdenes: m, l, q, c, z).
+funcion trazo_camino() { retornar {"ops": []} }
+funcion trazo_mover(c, x, y) { c["ops"].agregar(["m", x, y]) }
+funcion trazo_linea(c, x, y) { c["ops"].agregar(["l", x, y]) }
+funcion trazo_cuadratica(c, x1, y1, x, y) { c["ops"].agregar(["q", x1, y1, x, y]) }
+funcion trazo_curva(c, x1, y1, x2, y2, x, y) { c["ops"].agregar(["c", x1, y1, x2, y2, x, y]) }
+funcion trazo_cerrar(c) { c["ops"].agregar(["z"]) }
+
+funcion trazo_rectangulo(c, x, y, w, h) {
+    trazo_mover(c, x, y)
+    trazo_linea(c, x + w, y)
+    trazo_linea(c, x + w, y + h)
+    trazo_linea(c, x, y + h)
+    trazo_cerrar(c)
+}
+
+funcion trazo_elipse(c, cx, cy, rx, ry) {
+    sea k = 0.5522847498307936
+    trazo_mover(c, cx + rx, cy)
+    trazo_curva(c, cx + rx, cy + ry * k, cx + rx * k, cy + ry, cx, cy + ry)
+    trazo_curva(c, cx - rx * k, cy + ry, cx - rx, cy + ry * k, cx - rx, cy)
+    trazo_curva(c, cx - rx, cy - ry * k, cx - rx * k, cy - ry, cx, cy - ry)
+    trazo_curva(c, cx + rx * k, cy - ry, cx + rx, cy - ry * k, cx + rx, cy)
+    trazo_cerrar(c)
+}
+
+funcion trazo_circulo(c, cx, cy, r) { trazo_elipse(c, cx, cy, r, r) }
+
+funcion trazo_rectangulo_redondeado(c, x, y, w, h, r) {
+    sea rr = minimo(r, minimo(w, h) / 2)
+    sea k = 0.5522847498307936 * rr
+    trazo_mover(c, x + rr, y)
+    trazo_linea(c, x + w - rr, y)
+    trazo_curva(c, x + w - rr + k, y, x + w, y + rr - k, x + w, y + rr)
+    trazo_linea(c, x + w, y + h - rr)
+    trazo_curva(c, x + w, y + h - rr + k, x + w - rr + k, y + h, x + w - rr, y + h)
+    trazo_linea(c, x + rr, y + h)
+    trazo_curva(c, x + rr - k, y + h, x, y + h - rr + k, x, y + h - rr)
+    trazo_linea(c, x, y + rr)
+    trazo_curva(c, x, y + rr - k, x + rr - k, y, x + rr, y)
+    trazo_cerrar(c)
+}
+
+funcion _tv_num(s, i, n) {
+    sea k = i
+    si (k < n y (byte_en(s, k) == 45 o byte_en(s, k) == 43)) { k = k + 1 }
+    sea punto = falso
+    mientras (k < n) {
+        sea ch = byte_en(s, k)
+        si (ch >= 48 y ch <= 57) { k = k + 1 } sino si (ch == 46 y punto == falso) {
+            punto = verdadero
+            k = k + 1
+        } sino si ((ch == 101 o ch == 69) y k > i) {
+            k = k + 1
+            si (k < n y (byte_en(s, k) == 45 o byte_en(s, k) == 43)) { k = k + 1 }
+        } sino { romper }
+    }
+    retornar [a_numero(subtexto(s, i, k)), k]
+}
+
+/// Camino desde el atributo d de SVG (M L H V Q T C S Z, absolutos y relativos).
+funcion trazo_camino_svg(d) {
+    sea c = trazo_camino()
+    sea n = longitud(d)
+    sea i = 0
+    sea cmd = ""
+    sea x = 0
+    sea py = 0
+    sea sx = 0
+    sea sy = 0
+    sea cx = 0
+    sea cy = 0
+    sea ult = ""
+    mientras (i < n) {
+        sea ch = byte_en(d, i)
+        si (ch == 32 o ch == 44 o ch == 10 o ch == 9 o ch == 13) {
+            i = i + 1
+            continuar
+        }
+        si ((ch >= 65 y ch <= 90) o (ch >= 97 y ch <= 122)) {
+            cmd = char_de(ch)
+            i = i + 1
+            si (cmd == "Z" o cmd == "z") {
+                trazo_cerrar(c)
+                x = sx
+                py = sy
+                ult = "z"
+            }
+            continuar
+        }
+        // Lee los números que pide la orden.
+        sea cuantos = {"M": 2, "L": 2, "H": 1, "V": 1, "Q": 4, "T": 2, "C": 6, "S": 4}[texto_mayusculas(cmd)] ?? 0
+        si (cuantos == 0) { lanzar "trazo_camino_svg: orden no soportada " + cmd }
+        sea v = []
+        sea k = 0
+        mientras (k < cuantos) {
+            mientras (i < n y (byte_en(d, i) == 32 o byte_en(d, i) == 44)) { i = i + 1 }
+            sea r = _tv_num(d, i, n)
+            v.agregar(r[0])
+            i = r[1]
+            k = k + 1
+        }
+        sea rel = cmd == texto_minusculas(cmd)
+        sea ox = 0
+        sea oy = 0
+        si (rel) {
+            ox = x
+            oy = py
+        }
+        sea u = texto_mayusculas(cmd)
+        si (u == "M") {
+            x = v[0] + ox
+            py = v[1] + oy
+            trazo_mover(c, x, py)
+            sx = x
+            sy = py
+            // Las siguientes parejas son líneas.
+            si (rel) { cmd = "l" } sino { cmd = "L" }
+        } sino si (u == "L") {
+            x = v[0] + ox
+            py = v[1] + oy
+            trazo_linea(c, x, py)
+        } sino si (u == "H") {
+            x = v[0] + ox
+            trazo_linea(c, x, py)
+        } sino si (u == "V") {
+            py = v[0] + oy
+            trazo_linea(c, x, py)
+        } sino si (u == "Q" o u == "T") {
+            sea x1 = 0
+            sea y1 = 0
+            si (u == "Q") {
+                x1 = v[0] + ox
+                y1 = v[1] + oy
+                x = v[2] + ox
+                py = v[3] + oy
+            } sino {
+                x1 = x
+                y1 = py
+                si (ult == "q") {
+                    x1 = 2 * x - cx
+                    y1 = 2 * py - cy
+                }
+                x = v[0] + ox
+                py = v[1] + oy
+            }
+            trazo_cuadratica(c, x1, y1, x, py)
+            cx = x1
+            cy = y1
+            ult = "q"
+            continuar
+        } sino si (u == "C" o u == "S") {
+            sea x1 = 0
+            sea y1 = 0
+            sea x2 = 0
+            sea y2 = 0
+            si (u == "C") {
+                x1 = v[0] + ox
+                y1 = v[1] + oy
+                x2 = v[2] + ox
+                y2 = v[3] + oy
+                x = v[4] + ox
+                py = v[5] + oy
+            } sino {
+                x1 = x
+                y1 = py
+                si (ult == "c") {
+                    x1 = 2 * x - cx
+                    y1 = 2 * py - cy
+                }
+                x2 = v[0] + ox
+                y2 = v[1] + oy
+                x = v[2] + ox
+                py = v[3] + oy
+            }
+            trazo_curva(c, x1, y1, x2, y2, x, py)
+            cx = x2
+            cy = y2
+            ult = "c"
+            continuar
+        }
+        ult = ""
+    }
+    retornar c
+}
+
+// ---------- transformaciones [a b c d e f] ----------
+
+funcion trazo_identidad() { retornar [1, 0, 0, 1, 0, 0] }
+funcion trazo_traslacion(x, y) { retornar [1, 0, 0, 1, x, y] }
+funcion trazo_escala(sx, sy) { retornar [sx, 0, 0, sy ?? sx, 0, 0] }
+funcion trazo_rotacion(a) { retornar [coseno(a), seno(a), 0 - seno(a), coseno(a), 0, 0] }
+/// m1 aplicada después de m2.
+funcion trazo_componer(m1, m2) {
+    retornar [m1[0] * m2[0] + m1[2] * m2[1], m1[1] * m2[0] + m1[3] * m2[1], m1[0] * m2[2] + m1[2] * m2[3], m1[1] * m2[2] + m1[3] * m2[3],
+        m1[0] * m2[4] + m1[2] * m2[5] + m1[4], m1[1] * m2[4] + m1[3] * m2[5] + m1[5]]
+}
+funcion _tv_ap(m, x, y) { retornar [m[0] * x + m[2] * y + m[4], m[1] * x + m[3] * y + m[5]] }
+funcion _tv_inv(m) {
+    sea det = m[0] * m[3] - m[1] * m[2]
+    si (absoluto(det) < 0.000000000001) { retornar [0, 0, 0, 0, 0, 0] }
+    sea a = m[3] / det
+    sea b = 0 - m[1] / det
+    sea c = 0 - m[2] / det
+    sea d = m[0] / det
+    retornar [a, b, c, d, 0 - (a * m[4] + c * m[5]), 0 - (b * m[4] + d * m[5])]
+}
+funcion _tv_escala(m) { retornar raiz(absoluto(m[0] * m[3] - m[1] * m[2])) }
+
+// ---------- colores y pinceles ----------
+
+funcion _tv_hex(s, i) {
+    sea r = 0
+    sea k = 0
+    mientras (k < 2) {
+        sea c = byte_en(s, i + k)
+        sea d = c - 48
+        si (c >= 97) { d = c - 87 } sino si (c >= 65) { d = c - 55 }
+        r = r * 16 + d
+        k = k + 1
+    }
+    retornar r
+}
+
+/// Color: "#rgb", "#rrggbb", "#rrggbbaa" o [r, g, b, a] de 0 a 255
+/// (alfa opcional). Devuelve [r, g, b, a] de 0 a 1 premultiplicado.
+funcion trazo_color(c) {
+    sea r = 0
+    sea g = 0
+    sea b = 0
+    sea a = 255
+    si (tipo(c) == "texto") {
+        sea s = c
+        si (longitud(s) == 4) { s = "#" + subtexto(c, 1, 2) + subtexto(c, 1, 2) + subtexto(c, 2, 3) + subtexto(c, 2, 3) + subtexto(c, 3, 4) + subtexto(c, 3, 4) }
+        r = _tv_hex(s, 1)
+        g = _tv_hex(s, 3)
+        b = _tv_hex(s, 5)
+        si (longitud(s) >= 9) { a = _tv_hex(s, 7) }
+    } sino {
+        r = c[0]
+        g = c[1]
+        b = c[2]
+        si (longitud(c) > 3) { a = c[3] }
+    }
+    sea al = a / 255
+    retornar [r / 255 * al, g / 255 * al, b / 255 * al, al]
+}
+
+funcion _tv_paradas(paradas) {
+    sea r = []
+    para p en paradas { r.agregar([p[0], trazo_color(p[1])]) }
+    retornar r
+}
+
+/// Degradado lineal de (x0, y0) a (x1, y1). paradas: [[0, color], [1, color]].
+/// extension: "pad" (por defecto), "repeat" o "reflect".
+funcion trazo_lineal(x0, y0, x1, y1, paradas, extension) {
+    retornar {"tipo": "lineal", "p": [x0, y0, x1, y1], "paradas": _tv_paradas(paradas), "ext": extension ?? "pad"}
+}
+/// Degradado radial de dos círculos (c0, r0) → (c1, r1).
+funcion trazo_radial(x0, y0, r0, x1, y1, r1, paradas, extension) {
+    retornar {"tipo": "radial", "p": [x0, y0, r0, x1, y1, r1], "paradas": _tv_paradas(paradas), "ext": extension ?? "pad"}
+}
+/// Degradado cónico (barrido) alrededor de (cx, cy) entre dos ángulos.
+funcion trazo_conico(cx, cy, angulo0, angulo1, paradas, extension) {
+    retornar {"tipo": "conico", "p": [cx, cy, angulo0, angulo1], "paradas": _tv_paradas(paradas), "ext": extension ?? "pad"}
+}
+
+funcion _tv_pincel(p) {
+    si (tipo(p) == "mapa") { retornar p }
+    retornar {"tipo": "solido", "color": trazo_color(p)}
+}
+
+// ---------- escena ----------
+
+/// Escena vacía: una lista de órdenes de dibujo que se puede anexar a otras.
+funcion trazo_escena() { retornar {"cmds": []} }
+
+/// Rellena un camino. opciones: "regla" ("nonzero" o "evenodd"),
+/// "transformacion", "transformacion_pincel".
+funcion trazo_rellenar(e, camino, pincel, opciones) {
+    sea op = opciones ?? {}
+    e["cmds"].agregar({"tipo": "relleno", "camino": camino, "pincel": _tv_pincel(pincel), "regla": op["regla"] ?? "nonzero",
+        "m": op["transformacion"] ?? [1, 0, 0, 1, 0, 0], "mp": op["transformacion_pincel"] ?? nulo})
+}
+
+/// Traza un camino. opciones: "grosor" (1), "union" ("miter", "round",
+/// "bevel"), "extremo" ("butt", "round", "square"), "inglete" (4),
+/// "guiones" (lista), "desfase", "transformacion", "transformacion_pincel".
+funcion trazo_trazar(e, camino, pincel, opciones) {
+    sea op = opciones ?? {}
+    e["cmds"].agregar({"tipo": "trazo", "camino": camino, "pincel": _tv_pincel(pincel), "grosor": op["grosor"] ?? 1, "union": op["union"] ?? "miter",
+        "extremo": op["extremo"] ?? "butt", "inglete": op["inglete"] ?? 4, "guiones": op["guiones"] ?? nulo, "desfase": op["desfase"] ?? 0,
+        "m": op["transformacion"] ?? [1, 0, 0, 1, 0, 0], "mp": op["transformacion_pincel"] ?? nulo})
+}
+
+/// Abre una capa: lo que se dibuje hasta trazo_cerrar_capa se recorta con
+/// el camino y se mezcla con "mezcla" (normal, multiply, screen, overlay,
+/// darken, lighten, color-dodge, color-burn, hard-light, soft-light,
+/// difference, exclusion) y "alfa".
+funcion trazo_abrir_capa(e, recorte, opciones) {
+    sea op = opciones ?? {}
+    e["cmds"].agregar({"tipo": "capa", "camino": recorte, "mezcla": op["mezcla"] ?? "normal", "alfa": op["alfa"] ?? 1, "m": op["transformacion"] ?? [1, 0, 0, 1, 0, 0]})
+}
+funcion trazo_cerrar_capa(e) { e["cmds"].agregar({"tipo": "fin_capa"}) }
+
+/// Anexa otra escena (fragmento) con una transformación.
+funcion trazo_anexar(e, otra, m) {
+    para c en otra["cmds"] {
+        sea k = {}
+        para cl en claves(c) { k[cl] = c[cl] }
+        si (tiene_clave(k, "m")) { k["m"] = trazo_componer(m ?? [1, 0, 0, 1, 0, 0], k["m"]) }
+        e["cmds"].agregar(k)
+    }
+}
+
+/// Cantidad de órdenes de la escena.
+funcion trazo_tamano(e) { retornar longitud(e["cmds"]) }
+
+// ---------- aplanado ----------
+
+// Polilíneas [[x, y], ...] por subcamino, con marca de cerrado:
+// [{"p": [...], "cerrado": bool, "esquinas": [índices de vértices reales]}]
+funcion _tv_aplanar(camino, m, tol) {
+    sea subs = []
+    sea actual = nulo
+    sea x = 0
+    sea py = 0
+    para o en camino["ops"] {
+        sea t = o[0]
+        si (t == "m") {
+            si (actual != nulo y longitud(actual["p"]) > 0) { subs.agregar(actual) }
+            x = o[1]
+            py = o[2]
+            actual = {"p": [_tv_ap(m, x, py)], "cerrado": falso, "esquinas": [0]}
+        } sino si (t == "z") {
+            si (actual != nulo) {
+                actual["cerrado"] = verdadero
+                subs.agregar(actual)
+                sea ini = actual["p"][0]
+                sea inv = _tv_inv(m)
+                sea l = _tv_ap(inv, ini[0], ini[1])
+                x = l[0]
+                py = l[1]
+                actual = {"p": [ini], "cerrado": falso, "esquinas": [0]}
+            }
+        } sino {
+            si (actual == nulo) { actual = {"p": [_tv_ap(m, x, py)], "cerrado": falso, "esquinas": [0]} }
+            sea p0 = _tv_ap(m, x, py)
+            si (t == "l") {
+                x = o[1]
+                py = o[2]
+                actual["p"].agregar(_tv_ap(m, x, py))
+            } sino si (t == "q") {
+                sea p1 = _tv_ap(m, o[1], o[2])
+                sea p2 = _tv_ap(m, o[3], o[4])
+                sea dd = raiz((p0[0] - 2 * p1[0] + p2[0]) * (p0[0] - 2 * p1[0] + p2[0]) + (p0[1] - 2 * p1[1] + p2[1]) * (p0[1] - 2 * p1[1] + p2[1]))
+                sea nseg = maximo(1, techo(raiz(dd / (4 * tol))))
+                sea k = 1
+                mientras (k <= nseg) {
+                    sea u = k / nseg
+                    sea w = 1 - u
+                    actual["p"].agregar([w * w * p0[0] + 2 * w * u * p1[0] + u * u * p2[0], w * w * p0[1] + 2 * w * u * p1[1] + u * u * p2[1]])
+                    k = k + 1
+                }
+                x = o[3]
+                py = o[4]
+            } sino si (t == "c") {
+                sea p1 = _tv_ap(m, o[1], o[2])
+                sea p2 = _tv_ap(m, o[3], o[4])
+                sea p3 = _tv_ap(m, o[5], o[6])
+                // Fórmula de Wang.
+                sea ax = p0[0] - 2 * p1[0] + p2[0]
+                sea ay = p0[1] - 2 * p1[1] + p2[1]
+                sea bx = p1[0] - 2 * p2[0] + p3[0]
+                sea by = p1[1] - 2 * p2[1] + p3[1]
+                sea dd = maximo(raiz(ax * ax + ay * ay), raiz(bx * bx + by * by))
+                sea nseg = maximo(1, techo(raiz(3 * dd / (4 * tol))))
+                sea k = 1
+                mientras (k <= nseg) {
+                    sea u = k / nseg
+                    sea w = 1 - u
+                    sea a0 = w * w * w
+                    sea a1 = 3 * w * w * u
+                    sea a2 = 3 * w * u * u
+                    sea a3 = u * u * u
+                    actual["p"].agregar([a0 * p0[0] + a1 * p1[0] + a2 * p2[0] + a3 * p3[0], a0 * p0[1] + a1 * p1[1] + a2 * p2[1] + a3 * p3[1]])
+                    k = k + 1
+                }
+                x = o[5]
+                py = o[6]
+            }
+            actual["esquinas"].agregar(longitud(actual["p"]) - 1)
+        }
+    }
+    si (actual != nulo y longitud(actual["p"]) > 1) { subs.agregar(actual) }
+    retornar subs
+}
+
+// ---------- trazos → rellenos ----------
+
+funcion _tv_area(poly) {
+    sea a = 0
+    sea n = longitud(poly)
+    sea i = 0
+    mientras (i < n) {
+        sea p = poly[i]
+        sea q = poly[(i + 1) % n]
+        a = a + p[0] * q[1] - q[0] * p[1]
+        i = i + 1
+    }
+    retornar a / 2
+}
+
+// Agrega un polígono con orientación positiva (para unir con nonzero).
+funcion _tv_poly(salida, poly) {
+    si (longitud(poly) < 3) { retornar nulo }
+    si (_tv_area(poly) < 0) {
+        sea r = []
+        sea i = longitud(poly) - 1
+        mientras (i >= 0) {
+            r.agregar(poly[i])
+            i = i - 1
+        }
+        salida.agregar(r)
+    } sino { salida.agregar(poly) }
+}
+
+funcion _tv_acos(v) { retornar 1.5707963267948966 - arcoseno(v) }
+
+funcion _tv_disco(salida, c, r, tol) {
+    sea n = maximo(8, techo(3.141592653589793 / _tv_acos(maximo(-1, 1 - tol / maximo(r, 0.0001)))))
+    n = minimo(n, 128)
+    sea poly = []
+    sea k = 0
+    mientras (k < n) {
+        sea a = 2 * 3.141592653589793 * k / n
+        poly.agregar([c[0] + r * coseno(a), c[1] + r * seno(a)])
+        k = k + 1
+    }
+    _tv_poly(salida, poly)
+}
+
+funcion _tv_guiones(sub, patron, desfase) {
+    sea pts = sub["p"]
+    si (sub["cerrado"]) { pts = pts + [pts[0]] }
+    sea total = 0
+    para v en patron { total = total + v }
+    si (total <= 0) { retornar [sub] }
+    sea pos = desfase % total
+    si (pos < 0) { pos = pos + total }
+    sea idx = 0
+    mientras (pos >= patron[idx]) {
+        pos = pos - patron[idx]
+        idx = (idx + 1) % longitud(patron)
+    }
+    sea resto = patron[idx] - pos
+    sea encendido = idx % 2 == 0
+    sea salida = []
+    sea actual = []
+    si (encendido) { actual = [pts[0]] }
+    sea i = 0
+    mientras (i < longitud(pts) - 1) {
+        sea a = pts[i]
+        sea b = pts[i + 1]
+        sea largo = raiz((b[0] - a[0]) * (b[0] - a[0]) + (b[1] - a[1]) * (b[1] - a[1]))
+        sea hecho = 0
+        mientras (largo - hecho > resto) {
+            hecho = hecho + resto
+            sea u = hecho / largo
+            sea p = [a[0] + (b[0] - a[0]) * u, a[1] + (b[1] - a[1]) * u]
+            si (encendido) {
+                actual.agregar(p)
+                salida.agregar({"p": actual, "cerrado": falso, "esquinas": [0, longitud(actual) - 1]})
+                actual = []
+            } sino { actual = [p] }
+            encendido = encendido == falso
+            idx = (idx + 1) % longitud(patron)
+            resto = patron[idx]
+        }
+        resto = resto - (largo - hecho)
+        si (encendido) { actual.agregar(b) }
+        i = i + 1
+    }
+    si (encendido y longitud(actual) > 1) { salida.agregar({"p": actual, "cerrado": falso, "esquinas": [0, longitud(actual) - 1]}) }
+    retornar salida
+}
+
+// Arco de radio r alrededor de c desde el ángulo a0 barriendo «barrido».
+funcion _tv_arco(salida, c, r, a0, barrido, tol) {
+    sea paso = 2 * _tv_acos(maximo(-1, 1 - tol / maximo(r, 0.0001)))
+    sea n = maximo(1, minimo(64, techo(absoluto(barrido) / maximo(paso, 0.01))))
+    sea k = 1
+    mientras (k < n) {
+        sea a = a0 + barrido * k / n
+        salida.agregar([c[0] + r * coseno(a), c[1] + r * seno(a)])
+        k = k + 1
+    }
+}
+
+// Un solo contorno por subcamino (lado izquierdo de ida, derecho de vuelta),
+// así los bordes no se cuentan dos veces al rasterizar.
+funcion _tv_expandir(sub, hw, union, extremo, inglete, tol, salida) {
+    sea pts = []
+    para p en sub["p"] {
+        si (longitud(pts) == 0 o absoluto(p[0] - pts[longitud(pts) - 1][0]) + absoluto(p[1] - pts[longitud(pts) - 1][1]) > 0.000001) { pts.agregar(p) }
+    }
+    sea cerrado = sub["cerrado"]
+    si (cerrado y longitud(pts) > 2 y absoluto(pts[0][0] - pts[longitud(pts) - 1][0]) + absoluto(pts[0][1] - pts[longitud(pts) - 1][1]) < 0.000001) { eliminar(pts, longitud(pts) - 1) }
+    sea n = longitud(pts)
+    si (n == 1 o (cerrado y n == 2)) {
+        si (extremo == "round") { _tv_disco(salida, pts[0], hw, tol) }
+        si (extremo == "square") { _tv_poly(salida, [[pts[0][0] - hw, pts[0][1] - hw], [pts[0][0] + hw, pts[0][1] - hw], [pts[0][0] + hw, pts[0][1] + hw], [pts[0][0] - hw, pts[0][1] + hw]]) }
+        si (n == 1) { retornar nulo }
+        cerrado = falso
+    }
+    sea reales = {}
+    para k en sub["esquinas"] { reales["" + k] = verdadero }
+    // Direcciones unitarias de cada segmento.
+    sea segs = n - 1
+    si (cerrado) { segs = n }
+    sea dir = []
+    sea i = 0
+    mientras (i < segs) {
+        sea a = pts[i]
+        sea b = pts[(i + 1) % n]
+        sea l = raiz((b[0] - a[0]) * (b[0] - a[0]) + (b[1] - a[1]) * (b[1] - a[1]))
+        dir.agregar([(b[0] - a[0]) / l, (b[1] - a[1]) / l])
+        i = i + 1
+    }
+    sea izq = []
+    sea der = []
+    // Unión en el vértice p entre las direcciones d0 y d1.
+    sea unir_en = funcion(p, d0, d1, tipo_u) {
+        sea giro = d0[0] * d1[1] - d0[1] * d1[0]
+        sea punto = d0[0] * d1[0] + d0[1] * d1[1]
+        sea n0 = [0 - d0[1] * hw, d0[0] * hw]
+        sea n1 = [0 - d1[1] * hw, d1[0] * hw]
+        si (absoluto(giro) < 0.000000001 y punto > 0) {
+            izq.agregar([p[0] + n1[0], p[1] + n1[1]])
+            der.agregar([p[0] - n1[0], p[1] - n1[1]])
+            retornar nulo
+        }
+        // giro > 0: el lado izquierdo (+n) queda adentro.
+        sea s = -1
+        sea adentro = izq
+        sea afuera = der
+        si (giro < 0) {
+            s = 1
+            adentro = der
+            afuera = izq
+        }
+        sea si_ = 0 - s
+        adentro.agregar([p[0] + si_ * n0[0], p[1] + si_ * n0[1]])
+        adentro.agregar(p)
+        adentro.agregar([p[0] + si_ * n1[0], p[1] + si_ * n1[1]])
+        sea o0 = [p[0] + s * n0[0], p[1] + s * n0[1]]
+        sea o1 = [p[0] + s * n1[0], p[1] + s * n1[1]]
+        afuera.agregar(o0)
+        si (tipo_u == "round") {
+            sea a0 = _tv_atan2(s * n0[1], s * n0[0])
+            sea a1 = _tv_atan2(s * n1[1], s * n1[0])
+            sea bar = a1 - a0
+            mientras (bar > 3.141592653589793) { bar = bar - 2 * 3.141592653589793 }
+            mientras (bar < -3.141592653589793) { bar = bar + 2 * 3.141592653589793 }
+            _tv_arco(afuera, p, hw, a0, bar, tol)
+        } sino si (tipo_u == "miter") {
+            sea mit = 1 / raiz(maximo(0.000001, (1 + punto) / 2))
+            si (mit <= inglete) {
+                sea bx = o0[0] - o1[0]
+                sea by = o0[1] - o1[1]
+                sea tt = (by * d1[0] - bx * d1[1]) / giro
+                afuera.agregar([o0[0] + d0[0] * tt, o0[1] + d0[1] * tt])
+            }
+        }
+        afuera.agregar(o1)
+    }
+    si (cerrado) {
+        sea k = 0
+        mientras (k < n) {
+            sea tu = "bevel"
+            si (tiene_clave(reales, "" + k) o k == 0) { tu = union }
+            unir_en(pts[k], dir[(k - 1 + segs) % segs], dir[k], tu)
+            k = k + 1
+        }
+        // El lado derecho va al revés para que el anillo quede hueco.
+        sea r = []
+        sea k2 = longitud(der) - 1
+        mientras (k2 >= 0) {
+            r.agregar(der[k2])
+            k2 = k2 - 1
+        }
+        salida.agregar(izq)
+        salida.agregar(r)
+        retornar nulo
+    }
+    sea d0 = dir[0]
+    sea a = pts[0]
+    sea ini = a
+    si (extremo == "square") { ini = [a[0] - d0[0] * hw, a[1] - d0[1] * hw] }
+    izq.agregar([ini[0] - d0[1] * hw, ini[1] + d0[0] * hw])
+    der.agregar([ini[0] + d0[1] * hw, ini[1] - d0[0] * hw])
+    sea j = 1
+    mientras (j < n - 1) {
+        sea tu = "bevel"
+        si (tiene_clave(reales, "" + j)) { tu = union }
+        unir_en(pts[j], dir[j - 1], dir[j], tu)
+        j = j + 1
+    }
+    sea dl = dir[segs - 1]
+    sea b = pts[n - 1]
+    sea fin = b
+    si (extremo == "square") { fin = [b[0] + dl[0] * hw, b[1] + dl[1] * hw] }
+    izq.agregar([fin[0] - dl[1] * hw, fin[1] + dl[0] * hw])
+    der.agregar([fin[0] + dl[1] * hw, fin[1] - dl[0] * hw])
+    sea poly = izq
+    si (extremo == "round") {
+        // De +n a −n pasando por la dirección de avance.
+        sea a0 = _tv_atan2(dl[0], 0 - dl[1])
+        _tv_arco(poly, b, hw, a0, 0 - 3.141592653589793, tol)
+    }
+    sea k = longitud(der) - 1
+    mientras (k >= 0) {
+        poly.agregar(der[k])
+        k = k - 1
+    }
+    si (extremo == "round") {
+        sea a0 = _tv_atan2(0 - d0[0], d0[1])
+        _tv_arco(poly, a, hw, a0, 0 - 3.141592653589793, tol)
+    }
+    salida.agregar(poly)
+}
+
+// Polígonos (en coordenadas del dispositivo) para una orden.
+funcion _tv_poligonos(cmd, tol) {
+    sea m = cmd["m"]
+    si (cmd["tipo"] == "trazo") {
+        // Se expande en coordenadas locales y después se transforma.
+        sea esc = maximo(_tv_escala(m), 0.0001)
+        sea subs = _tv_aplanar(cmd["camino"], [1, 0, 0, 1, 0, 0], tol / esc)
+        si (cmd["guiones"] != nulo) {
+            sea g = []
+            para s en subs { g = g + _tv_guiones(s, cmd["guiones"], cmd["desfase"]) }
+            subs = g
+        }
+        sea polys = []
+        para s en subs { _tv_expandir(s, cmd["grosor"] / 2, cmd["union"], cmd["extremo"], cmd["inglete"], tol / esc, polys) }
+        sea r = []
+        para poly en polys {
+            sea t = []
+            para p en poly { t.agregar(_tv_ap(m, p[0], p[1])) }
+            r.agregar(t)
+        }
+        retornar [r, "nonzero"]
+    }
+    sea r = []
+    para s en _tv_aplanar(cmd["camino"], m, tol) { r.agregar(s["p"]) }
+    retornar [r, cmd["regla"] ?? "nonzero"]
+}
+
+// ---------- rasterizado en mosaicos ----------
+
+// Acumulación de área (como font-rs y la etapa fine de Vello) en mosaicos
+// dispersos de 16×16. Devuelve {"mosaicos": {indice: lista}, ...}.
+funcion _tv_acumular(polys, w, h) {
+    sea T = _TV_MOSAICO
+    sea tw = techo(w / T)
+    sea mos = {}
+    sea y0 = h
+    sea y1 = 0
+    para poly en polys {
+        sea n = longitud(poly)
+        sea i = 0
+        mientras (i < n) {
+            sea a = poly[i]
+            sea b = poly[(i + 1) % n]
+            _tv_linea_x(mos, a[0], a[1], b[0], b[1], w, h, tw)
+            y0 = minimo(y0, minimo(a[1], b[1]))
+            y1 = maximo(y1, maximo(a[1], b[1]))
+            i = i + 1
+        }
+    }
+    retornar {"mosaicos": mos, "tw": tw, "fy0": maximo(0, piso(y0 / T)), "fy1": minimo(techo(h / T) - 1, piso(y1 / T))}
+}
+
+// Recorta en x = 0: lo que queda a la izquierda pasa a ser vertical en x = 0.
+funcion _tv_linea_x(mos, x0, y0, x1, y1, w, h, tw) {
+    si (x0 >= 0 y x1 >= 0) { retornar _tv_linea(mos, x0, y0, x1, y1, w, h, tw) }
+    si (x0 < 0 y x1 < 0) { retornar _tv_linea(mos, 0, y0, 0, y1, w, h, tw) }
+    sea u = (0 - x0) / (x1 - x0)
+    sea ym = y0 + (y1 - y0) * u
+    si (x0 < 0) {
+        _tv_linea(mos, 0, y0, 0, ym, w, h, tw)
+        _tv_linea(mos, 0, ym, x1, y1, w, h, tw)
+    } sino {
+        _tv_linea(mos, x0, y0, 0, ym, w, h, tw)
+        _tv_linea(mos, 0, ym, 0, y1, w, h, tw)
+    }
+}
+
+funcion _tv_dep(mos, x, y, v, w, tw) {
+    si (x >= w) { retornar nulo }
+    sea T = _TV_MOSAICO
+    sea tx = piso(x / T)
+    sea ty = piso(y / T)
+    sea clave = "" + (ty * tw + tx)
+    sea t = mos[clave] ?? nulo
+    si (t == nulo) {
+        t = _tv_lista(T * T, 0)
+        mos[clave] = t
+    }
+    sea k = (y % T) * T + (x % T)
+    t[k] = t[k] + v
+}
+
+funcion _tv_lista(n, v) {
+    sea r = []
+    sea i = 0
+    mientras (i < n) {
+        r.agregar(v)
+        i = i + 1
+    }
+    retornar r
+}
+
+funcion _tv_linea(mos, ax, ay, bx, by, w, h, tw) {
+    si (ay == by) { retornar nulo }
+    sea dir = 1
+    sea p0x = ax
+    sea p0y = ay
+    sea p1x = bx
+    sea p1y = by
+    si (ay > by) {
+        dir = -1
+        p0x = bx
+        p0y = by
+        p1x = ax
+        p1y = ay
+    }
+    si (p1y <= 0 o p0y >= h) { retornar nulo }
+    sea dxdy = (p1x - p0x) / (p1y - p0y)
+    sea x = p0x
+    si (p0y < 0) {
+        x = x - p0y * dxdy
+        p0y = 0
+    }
+    sea fin = minimo(h, techo(p1y))
+    sea yy = piso(p0y)
+    mientras (yy < fin) {
+        sea dy = minimo(yy + 1, p1y) - maximo(yy, p0y)
+        sea xn = x + dxdy * dy
+        sea d = dy * dir
+        sea xa = minimo(x, xn)
+        sea xb = maximo(x, xn)
+        sea x0f = piso(xa)
+        sea x0i = piso(x0f)
+        sea x1c = techo(xb)
+        sea x1i = piso(x1c)
+        si (x1i <= x0i + 1) {
+            sea xmf = 0.5 * (x + xn) - x0f
+            _tv_dep(mos, x0i, yy, d - d * xmf, w, tw)
+            _tv_dep(mos, x0i + 1, yy, d * xmf, w, tw)
+        } sino {
+            sea s = 1 / (xb - xa)
+            sea fr0 = xa - x0f
+            sea a0 = 0.5 * s * (1 - fr0) * (1 - fr0)
+            sea fr1 = xb - x1c + 1
+            sea am = 0.5 * s * fr1 * fr1
+            _tv_dep(mos, x0i, yy, d * a0, w, tw)
+            si (x1i == x0i + 2) { _tv_dep(mos, x0i + 1, yy, d * (1 - a0 - am), w, tw) } sino {
+                sea a1 = s * (1.5 - fr0)
+                _tv_dep(mos, x0i + 1, yy, d * (a1 - a0), w, tw)
+                sea xi = x0i + 2
+                mientras (xi < x1i - 1) {
+                    _tv_dep(mos, xi, yy, d * s, w, tw)
+                    xi = xi + 1
+                }
+                sea a2 = a1 + (x1i - x0i - 3) * s
+                _tv_dep(mos, x1i - 1, yy, d * (1 - a2 - am), w, tw)
+            }
+            _tv_dep(mos, x1i, yy, d * am, w, tw)
+        }
+        x = xn
+        yy = yy + 1
+    }
+}
+
+funcion _tv_cob(a, regla) {
+    si (regla == "evenodd") {
+        sea v = absoluto(a) % 2
+        si (v > 1) { retornar 2 - v }
+        retornar v
+    }
+    retornar minimo(absoluto(a), 1)
+}
+
+// Recorre los píxeles cubiertos: fn(x, y, cobertura). Los mosaicos sin
+// bordes heredan la cobertura de su fila (sólidos o vacíos).
+funcion _tv_cubrir(acc, w, h, regla, fn) {
+    sea T = _TV_MOSAICO
+    sea tw = acc["tw"]
+    sea mos = acc["mosaicos"]
+    sea ty = acc["fy0"]
+    mientras (ty <= acc["fy1"]) {
+        sea suma = _tv_lista(T, 0)
+        sea tx = 0
+        mientras (tx < tw) {
+            sea t = mos["" + (ty * tw + tx)] ?? nulo
+            sea fila = 0
+            mientras (fila < T) {
+                sea y = ty * T + fila
+                si (y < h) {
+                    sea s = suma[fila]
+                    sea col = 0
+                    sea base = fila * T
+                    mientras (col < T) {
+                        sea x = tx * T + col
+                        si (x >= w) { romper }
+                        si (t != nulo) { s = s + t[base + col] }
+                        sea c = _tv_cob(s, regla)
+                        si (c > 0.0005) { fn(x, y, minimo(c, 1)) }
+                        col = col + 1
+                    }
+                    suma[fila] = s
+                }
+                fila = fila + 1
+            }
+            tx = tx + 1
+        }
+        ty = ty + 1
+    }
+}
+
+// ---------- pintura y mezcla ----------
+
+funcion _tv_parada(paradas, u) {
+    sea n = longitud(paradas)
+    si (u <= paradas[0][0]) { retornar paradas[0][1] }
+    si (u >= paradas[n - 1][0]) { retornar paradas[n - 1][1] }
+    sea i = 1
+    mientras (i < n) {
+        si (u <= paradas[i][0]) {
+            sea a = paradas[i - 1]
+            sea b = paradas[i]
+            sea k = 0
+            si (b[0] > a[0]) { k = (u - a[0]) / (b[0] - a[0]) }
+            retornar [a[1][0] + (b[1][0] - a[1][0]) * k, a[1][1] + (b[1][1] - a[1][1]) * k, a[1][2] + (b[1][2] - a[1][2]) * k, a[1][3] + (b[1][3] - a[1][3]) * k]
+        }
+        i = i + 1
+    }
+    retornar paradas[n - 1][1]
+}
+
+funcion _tv_ext(u, ext) {
+    si (ext == "repeat") { retornar u - piso(u) }
+    si (ext == "reflect") {
+        sea v = absoluto(u) % 2
+        si (v > 1) { retornar 2 - v }
+        retornar v
+    }
+    retornar u
+}
+
+funcion _tv_muestra(p, inv, x, y) {
+    si (p["tipo"] == "solido") { retornar p["color"] }
+    sea q = _tv_ap(inv, x + 0.5, y + 0.5)
+    sea g = p["p"]
+    sea u = 0
+    si (p["tipo"] == "lineal") {
+        sea dx = g[2] - g[0]
+        sea dy = g[3] - g[1]
+        sea l2 = dx * dx + dy * dy
+        si (l2 > 0) { u = ((q[0] - g[0]) * dx + (q[1] - g[1]) * dy) / l2 }
+    } sino si (p["tipo"] == "radial") {
+        // Dos círculos: busca el mayor t con radio r(t) >= 0 que pasa por q.
+        sea cdx = g[3] - g[0]
+        sea cdy = g[4] - g[1]
+        sea dr = g[5] - g[2]
+        sea pdx = q[0] - g[0]
+        sea pdy = q[1] - g[1]
+        sea a = cdx * cdx + cdy * cdy - dr * dr
+        sea b = pdx * cdx + pdy * cdy + g[2] * dr
+        sea c = pdx * pdx + pdy * pdy - g[2] * g[2]
+        si (absoluto(a) < 0.000001) {
+            si (absoluto(b) < 0.000001) { retornar [0, 0, 0, 0] }
+            u = c / (2 * b)
+        } sino {
+            sea disc = b * b - a * c
+            si (disc < 0) { retornar [0, 0, 0, 0] }
+            sea t1 = (b + raiz(disc)) / a
+            sea t2 = (b - raiz(disc)) / a
+            u = maximo(t1, t2)
+            si (g[2] + u * dr < 0) { u = minimo(t1, t2) }
+            si (g[2] + u * dr < 0) { retornar [0, 0, 0, 0] }
+        }
+    } sino {
+        sea ang = _tv_atan2(q[1] - g[1], q[0] - g[0])
+        si (ang < 0) { ang = ang + 2 * 3.141592653589793 }
+        u = (ang - g[2]) / (g[3] - g[2])
+    }
+    retornar _tv_parada(p["paradas"], _tv_ext(u, p["ext"]))
+}
+
+funcion _tv_atan2(yv, xv) {
+    si (xv > 0) { retornar arcotangente(yv / xv) }
+    si (xv < 0 y yv >= 0) { retornar arcotangente(yv / xv) + 3.141592653589793 }
+    si (xv < 0) { retornar arcotangente(yv / xv) - 3.141592653589793 }
+    si (yv > 0) { retornar 1.5707963267948966 }
+    si (yv < 0) { retornar -1.5707963267948966 }
+    retornar 0
+}
+
+funcion _tv_mezcla_canal(modo, cb, cs) {
+    si (modo == "multiply") { retornar cb * cs }
+    si (modo == "screen") { retornar cb + cs - cb * cs }
+    si (modo == "overlay") { retornar _tv_mezcla_canal("hard-light", cs, cb) }
+    si (modo == "darken") { retornar minimo(cb, cs) }
+    si (modo == "lighten") { retornar maximo(cb, cs) }
+    si (modo == "color-dodge") {
+        si (cb == 0) { retornar 0 }
+        si (cs >= 1) { retornar 1 }
+        retornar minimo(1, cb / (1 - cs))
+    }
+    si (modo == "color-burn") {
+        si (cb >= 1) { retornar 1 }
+        si (cs <= 0) { retornar 0 }
+        retornar 1 - minimo(1, (1 - cb) / cs)
+    }
+    si (modo == "hard-light") {
+        si (cs <= 0.5) { retornar cb * 2 * cs }
+        retornar _tv_mezcla_canal("screen", cb, 2 * cs - 1)
+    }
+    si (modo == "soft-light") {
+        si (cs <= 0.5) { retornar cb - (1 - 2 * cs) * cb * (1 - cb) }
+        sea dd = raiz(cb)
+        si (cb <= 0.25) { dd = ((16 * cb - 12) * cb + 4) * cb }
+        retornar cb + (2 * cs - 1) * (dd - cb)
+    }
+    si (modo == "difference") { retornar absoluto(cb - cs) }
+    si (modo == "exclusion") { retornar cb + cs - 2 * cb * cs }
+    retornar cs
+}
+
+// src premultiplicado sobre dst (buffer plano RGBA en flotantes) con modo.
+funcion _tv_componer(buf, i, s, modo) {
+    sea sa = s[3]
+    si (sa <= 0) { retornar nulo }
+    sea da = buf[i + 3]
+    si (modo == "normal" o da <= 0) {
+        buf[i] = s[0] + buf[i] * (1 - sa)
+        buf[i + 1] = s[1] + buf[i + 1] * (1 - sa)
+        buf[i + 2] = s[2] + buf[i + 2] * (1 - sa)
+        buf[i + 3] = sa + da * (1 - sa)
+        retornar nulo
+    }
+    // W3C: co = cs·(1 − αb) + cb·(1 − αs) + αs·αb·B(Cb, Cs).
+    sea k = 0
+    mientras (k < 3) {
+        sea cs = s[k] / sa
+        sea cb = buf[i + k] / da
+        buf[i + k] = s[k] * (1 - da) + buf[i + k] * (1 - sa) + sa * da * _tv_mezcla_canal(modo, cb, cs)
+        k = k + 1
+    }
+    buf[i + 3] = sa + da * (1 - sa)
+}
+
+// ---------- render ----------
+
+/// Dibuja la escena en una imagen (formato del módulo imagen). opciones:
+/// "fondo" (color, transparente por defecto), "tolerancia" (0.05).
+funcion trazo_renderizar(e, ancho, alto, opciones) {
+    sea op = opciones ?? {}
+    sea tol = op["tolerancia"] ?? 0.05
+    sea buf = _tv_lista(ancho * alto * 4, 0)
+    si ((op["fondo"] ?? nulo) != nulo) {
+        sea f = trazo_color(op["fondo"])
+        sea i = 0
+        mientras (i < ancho * alto) {
+            buf[i * 4] = f[0]
+            buf[i * 4 + 1] = f[1]
+            buf[i * 4 + 2] = f[2]
+            buf[i * 4 + 3] = f[3]
+            i = i + 1
+        }
+    }
+    sea pila = []
+    sea estad = {"mosaicos": 0}
+    para cmd en e["cmds"] {
+        si (cmd["tipo"] == "capa") {
+            sea mascara = _tv_lista(ancho * alto, 0)
+            si (cmd["camino"] != nulo) {
+                sea pr = _tv_poligonos({"tipo": "relleno", "camino": cmd["camino"], "m": cmd["m"], "regla": "nonzero"}, tol)
+                _tv_cubrir(_tv_acumular(pr[0], ancho, alto), ancho, alto, pr[1], funcion(x, y, c) { mascara[y * ancho + x] = c })
+            } sino {
+                sea i = 0
+                mientras (i < ancho * alto) {
+                    mascara[i] = 1
+                    i = i + 1
+                }
+            }
+            pila.agregar({"buf": buf, "mascara": mascara, "mezcla": cmd["mezcla"], "alfa": cmd["alfa"]})
+            buf = _tv_lista(ancho * alto * 4, 0)
+        } sino si (cmd["tipo"] == "fin_capa") {
+            si (longitud(pila) == 0) { lanzar "trazo: trazo_cerrar_capa sin capa abierta" }
+            sea capa = eliminar(pila, longitud(pila) - 1)
+            sea abajo = capa["buf"]
+            sea i = 0
+            mientras (i < ancho * alto) {
+                sea k = capa["mascara"][i] * capa["alfa"]
+                si (k > 0 y buf[i * 4 + 3] > 0) { _tv_componer(abajo, i * 4, [buf[i * 4] * k, buf[i * 4 + 1] * k, buf[i * 4 + 2] * k, buf[i * 4 + 3] * k], capa["mezcla"]) }
+                i = i + 1
+            }
+            buf = abajo
+        } sino {
+            sea pr = _tv_poligonos(cmd, tol)
+            sea acc = _tv_acumular(pr[0], ancho, alto)
+            estad["mosaicos"] = estad["mosaicos"] + longitud(claves(acc["mosaicos"]))
+            sea p = cmd["pincel"]
+            sea inv = _tv_inv(cmd["mp"] ?? cmd["m"])
+            sea b = buf
+            _tv_cubrir(acc, ancho, alto, pr[1], funcion(x, y, c) {
+                sea s = _tv_muestra(p, inv, x, y)
+                _tv_componer(b, (y * ancho + x) * 4, [s[0] * c, s[1] * c, s[2] * c, s[3] * c], "normal")
+            })
+        }
+    }
+    si (longitud(pila) > 0) { lanzar "trazo: quedan capas abiertas" }
+    // A imagen RGBA de 8 bits (sin premultiplicar).
+    sea img = imagen_nueva(ancho, alto)
+    sea y = 0
+    mientras (y < alto) {
+        sea x = 0
+        mientras (x < ancho) {
+            sea i = (y * ancho + x) * 4
+            sea a = buf[i + 3]
+            si (a > 0) {
+                sea r = minimo(255, piso(buf[i] / a * 255 + 0.5))
+                sea g = minimo(255, piso(buf[i + 1] / a * 255 + 0.5))
+                sea bb = minimo(255, piso(buf[i + 2] / a * 255 + 0.5))
+                imagen_fijar_pixel(img, x, y, [r, g, bb, minimo(255, piso(a * 255 + 0.5))])
+            }
+            x = x + 1
+        }
+        y = y + 1
+    }
+    img["estadisticas"] = estad
+    retornar img
+}
+
+/// Cobertura de un camino relleno como lista ancho×alto de 0 a 1 (sin
+/// pintar): sirve para máscaras y pruebas.
+funcion trazo_cobertura(camino, ancho, alto, opciones) {
+    sea op = opciones ?? {}
+    sea r = _tv_lista(ancho * alto, 0)
+    sea pr = _tv_poligonos({"tipo": "relleno", "camino": camino, "m": op["transformacion"] ?? [1, 0, 0, 1, 0, 0], "regla": op["regla"] ?? "nonzero"}, op["tolerancia"] ?? 0.05)
+    _tv_cubrir(_tv_acumular(pr[0], ancho, alto), ancho, alto, pr[1], funcion(x, y, c) { r[y * ancho + x] = c })
+    retornar r
+}

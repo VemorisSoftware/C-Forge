@@ -69,6 +69,22 @@ Sitio oficial: [c-forge.org](https://c-forge.org)
   `llamada`/`protobuf` (.proto, binario como protoc, marcos gRPC),
   `recolecta`/`crawler` (cookies RFC 6265, formularios, robots.txt,
   rastreo) y `sensor`/`mqtt` (paquetes MQTT, QoS 2, mini broker).
+- Lote 29 de bibliotecas (con alias en inglés y pruebas en ambos idiomas):
+  `rayo_json`/`simdjson` (JSON bajo demanda con punteros RFC 6901 que salta
+  lo que no se pide con búsquedas nativas, validación estricta con línea,
+  columna y UTF-8, minificado, NDJSON y un parser completo unas 8 veces más
+  rápido que `json_parsear` en documentos grandes), `trazo`/`vello`
+  (vectores al estilo Vello: escena codificada, aplanado con la fórmula de
+  Wang, expansión de trazos, mosaicos de 16×16 con cobertura por área,
+  degradados lineal/radial/cónico, capas con recorte y 12 modos de mezcla;
+  comparado con librsvg), `nativa`/`iced` (GUI reactiva al estilo Iced:
+  arquitectura Elm, disposición flex y rejilla, entradas con cursor y
+  selección, casillas, radios, interruptores, deslizadores, selectores,
+  desplazamiento y suscripciones, probada sin ventana) y
+  `escritorio`/`avalonia` (XAML con estilos por selector, enlaces de datos
+  de dos vías, comandos, plantillas, Grid, DockPanel y StackPanel sobre
+  `nativa`).
+- `panel_dibujar` respeta el tamaño de texto de cada comando ("tam").
 - Lote 28 de bibliotecas (con alias en inglés y pruebas en ambos idiomas):
   `malla`/`libp2p` (libp2p propio: identidad Ed25519 y PeerId, multiaddr,
   multistream-select, Noise XX con la firma de libp2p, yamux, identify,
