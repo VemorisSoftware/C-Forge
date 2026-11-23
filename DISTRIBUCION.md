@@ -34,9 +34,24 @@ una dependencia de Python.
 
 ## Windows
 
-GitHub Actions compila `cforge.exe` con MSVC y publica el ejecutable al crear un
-tag. El manifiesto WinGet es una plantilla y no debe enviarse hasta confirmar el
-hash del artefacto y una ejecución física limpia en Windows x64.
+GitHub Actions compila `cforge.exe` y publica `cforge-VERSION-windows-x64.zip`
+(ejecutable + `stdlib`) al crear un tag.
+
+### WinGet
+
+Paquete `VemorisSoftware.CForgeLang` (`winget install VemorisSoftware.CForgeLang`).
+Tras publicar una release:
+
+```sh
+sh packaging/winget/generar.sh VERSION       # → dist-winget/manifests/v/VemorisSoftware/CForgeLang/VERSION/
+```
+
+El script toma el SHA256 del zip de `SHA256SUMS`. Los manifiestos se copian al
+fork `VemorisSoftware/winget-pkgs` y se envían como PR a `microsoft/winget-pkgs`.
+WinGet instala el zip como portable y deja un enlace simbólico en `Links`;
+`cforge.exe` sigue ese enlace para hallar su `stdlib` (desde la versión siguiente a 4.9.0; el CI de
+Windows lo prueba). El primer envío (3.7.0, PR #414662) se cerró y tenía la
+licencia y las URL equivocadas.
 
 ## Límite de soporte
 

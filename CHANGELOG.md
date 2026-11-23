@@ -4,6 +4,12 @@ Sitio oficial: [c-forge.org](https://c-forge.org)
 
 ## Sin publicar
 
+- **WinGet:** en Windows, `cforge.exe` sigue los enlaces simbólicos para
+  hallar su `stdlib` (WinGet lo instala con un enlace en `Links`), y
+  `packaging/winget/generar.sh VERSION` arma los manifiestos de
+  `VemorisSoftware.CForgeLang` con la licencia, las URL y el SHA256
+  correctos. El CI de Windows prueba la instalación con enlace y valida los
+  manifiestos.
 - **Cambio de comportamiento — `==` compara listas y mapas por contenido:**
   `[1, [2]] == [1, [2]]`, `[] == []` y `{"a": 1} == {"a": 1}` ahora son
   `verdadero` (antes comparaban la referencia). Los objetos de clase siguen
