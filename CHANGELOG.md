@@ -2,8 +2,13 @@
 
 Sitio oficial: [c-forge.org](https://c-forge.org)
 
-## Sin publicar
+## 5.0.0 — 2026-11-23
 
+- **Licencia aclarada en c-forge.org:** el sitio decía "código abierto,
+  licencia MIT", pero C-Forge tiene licencia propietaria (`LICENSE`): el
+  código se puede ver y evaluar, y usarlo en producción, modificarlo o
+  redistribuirlo requiere autorización escrita de Vemoris Group. El sitio,
+  `releases.json` y el registro de paquetes ya lo dicen así.
 - **WinGet:** en Windows, `cforge.exe` sigue los enlaces simbólicos para
   hallar su `stdlib` (WinGet lo instala con un enlace en `Links`), y
   `packaging/winget/generar.sh VERSION` arma los manifiestos de
