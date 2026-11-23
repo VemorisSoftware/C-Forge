@@ -232,7 +232,7 @@ Estado: ✅ ya existe en C-Forge · 🔗 se usa hoy vía `cforge bindgen`,
 
 | # | Nombre | Para qué | Inspiración | Estado |
 |---|---|---|---|---|
-| 167 | `territorio` | Datos geoespaciales | GDAL | 🔗 |
+| 167 | `territorio` | Datos geoespaciales | GDAL | ✅ `territorio` / `gdal` (vectoriales) |
 | 168 | `proyeccion` | Sistemas de coordenadas | PROJ | ✅ `proyeccion` / `proj` |
 | 169 | `geometria` / `geo` | Operaciones espaciales | GEOS, Turf | ✅ `geometria` |
 | 170 | `panal` / `hexgrid` | Índice hexagonal del planeta | H3 | ✅ `panal` |

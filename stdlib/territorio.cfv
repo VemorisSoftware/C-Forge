@@ -1,0 +1,940 @@
+// stdlib/territorio.cfv — Datos geoespaciales vectoriales al estilo de
+// GDAL/OGR: capas con geometrías y atributos que se leen y escriben en
+// Shapefile (.shp, .shx, .dbf, .prj, .cpg), GeoJSON, WKT y WKB, y se
+// pueden reproyectar con el módulo proyeccion.
+//
+//   · Shapefile: puntos, multipuntos, líneas y polígonos (también Z y M al
+//     leer), anillos y huecos según la regla del formato (exterior horario),
+//     atributos C, N, F, L y D en el .dbf con codificación del .cpg.
+//   · WKT y WKB (ISO, Z, little y big endian), con POINT, LINESTRING,
+//     POLYGON, MULTI* y GEOMETRYCOLLECTION.
+//   · GeoJSON (Feature y FeatureCollection), límites, área y filtrado.
+// Las geometrías usan la forma de GeoJSON: {"tipo": "Polygon",
+// "coordenadas": [...]}. Idea de GDAL (MIT), escrito desde cero. En
+// inglés: importar "gdal".
+//
+//   importar "territorio"
+//   sea capa = territorio_leer_shp("comunas")          // comunas.shp/.shx/.dbf
+//   territorio_a_geojson(capa)
+//   territorio_escribir_shp(territorio_reproyectar(capa, "EPSG:4326", "EPSG:32719"), "comunas_utm")
+
+importar "json"
+importar "proyeccion"
+
+// ---------- números binarios ----------
+
+funcion _tr_de_ieee(b, p, le) {
+    // Double IEEE 754 de 8 bytes (le: little endian).
+    sea bs = []
+    sea k = 0
+    mientras (k < 8) {
+        si (le) { bs.agregar(byte_en(b, p + k)) } sino { bs.agregar(byte_en(b, p + 7 - k)) }
+        k = k + 1
+    }
+    sea s = 1
+    si (bs[7] >= 128) { s = -1 }
+    sea ex = (bs[7] % 128) * 16 + piso(bs[6] / 16)
+    sea mant = (bs[6] % 16) * 281474976710656
+    sea m2 = 0
+    k = 5
+    mientras (k >= 0) {
+        m2 = m2 * 256 + bs[k]
+        k = k - 1
+    }
+    mant = mant + m2
+    si (ex == 2047) {
+        si (mant == 0) { retornar s * 1e308 * 10 }
+        retornar 0 / 0
+    }
+    si (ex == 0) { retornar s * mant * potencia(2, -1074) }
+    retornar s * (1 + mant / 4503599627370496) * potencia(2, ex - 1023)
+}
+
+funcion _tr_ieee(v, le) {
+    sea s = 0
+    sea m = v
+    si (v < 0) {
+        s = 1
+        m = 0 - v
+    }
+    sea ex = 0
+    sea mant = 0
+    si (m != 0) {
+        sea k = 0
+        mientras (m >= 2) {
+            m = m / 2
+            k = k + 1
+        }
+        mientras (m < 1 y k > -1022) {
+            m = m * 2
+            k = k - 1
+        }
+        si (m < 1) { mant = redondear(m * 4503599627370496) } sino {
+            ex = k + 1023
+            mant = redondear((m - 1) * 4503599627370496)
+            si (mant >= 4503599627370496) {
+                mant = 0
+                ex = ex + 1
+            }
+        }
+    }
+    sea lo = mant % 281474976710656
+    sea hi4 = piso(mant / 281474976710656)
+    sea bs = []
+    sea k = 0
+    mientras (k < 6) {
+        bs.agregar(lo % 256)
+        lo = piso(lo / 256)
+        k = k + 1
+    }
+    bs.agregar((ex % 16) * 16 + hi4)
+    bs.agregar(s * 128 + piso(ex / 16))
+    sea r = ""
+    k = 0
+    mientras (k < 8) {
+        si (le) { r = r + char_de(bs[k]) } sino { r = r + char_de(bs[7 - k]) }
+        k = k + 1
+    }
+    retornar r
+}
+
+funcion _tr_le32(b, i) { retornar bytes_leer_entero(b, i, 4, 1) }
+funcion _tr_be32(b, i) { retornar bytes_leer_entero(b, i, 4, 0) }
+
+// ---------- geometrías ----------
+
+/// Geometría: tipo de GeoJSON ("Point", "LineString", "Polygon",
+/// "MultiPoint", "MultiLineString", "MultiPolygon", "GeometryCollection").
+funcion territorio_geometria(tipo_g, coordenadas) { retornar {"tipo": tipo_g, "coordenadas": coordenadas} }
+
+funcion _tr_area_anillo(a) {
+    sea s = 0
+    sea i = 0
+    mientras (i < longitud(a) - 1) {
+        s = s + a[i][0] * a[i + 1][1] - a[i + 1][0] * a[i][1]
+        i = i + 1
+    }
+    retornar s / 2
+}
+
+funcion _tr_punto_en_anillo(p, a) {
+    sea dentro = falso
+    sea i = 0
+    sea j = longitud(a) - 1
+    mientras (i < longitud(a)) {
+        sea xi = a[i][0]
+        sea yi = a[i][1]
+        sea xj = a[j][0]
+        sea yj = a[j][1]
+        si ((yi > p[1]) != (yj > p[1]) y p[0] < (xj - xi) * (p[1] - yi) / (yj - yi) + xi) { dentro = dentro == falso }
+        j = i
+        i = i + 1
+    }
+    retornar dentro
+}
+
+/// Área (plana, en unidades de las coordenadas al cuadrado) de un polígono o multipolígono.
+funcion territorio_area(g) {
+    si (g == nulo) { retornar 0 }
+    si (g["tipo"] == "Polygon") {
+        sea s = 0
+        sea i = 0
+        para a en g["coordenadas"] {
+            si (i == 0) { s = s + absoluto(_tr_area_anillo(a)) } sino { s = s - absoluto(_tr_area_anillo(a)) }
+            i = i + 1
+        }
+        retornar s
+    }
+    si (g["tipo"] == "MultiPolygon") {
+        sea s = 0
+        para p en g["coordenadas"] { s = s + territorio_area({"tipo": "Polygon", "coordenadas": p}) }
+        retornar s
+    }
+    retornar 0
+}
+
+/// ¿El punto [x, y] está dentro del polígono o multipolígono (fuera de los huecos)?
+funcion territorio_contiene(g, p) {
+    si (g["tipo"] == "MultiPolygon") {
+        para pol en g["coordenadas"] { si (territorio_contiene({"tipo": "Polygon", "coordenadas": pol}, p)) { retornar verdadero } }
+        retornar falso
+    }
+    si (g["tipo"] != "Polygon") { retornar falso }
+    sea anillos = g["coordenadas"]
+    si (_tr_punto_en_anillo(p, anillos[0]) == falso) { retornar falso }
+    sea i = 1
+    mientras (i < longitud(anillos)) {
+        si (_tr_punto_en_anillo(p, anillos[i])) { retornar falso }
+        i = i + 1
+    }
+    retornar verdadero
+}
+
+funcion _tr_puntos(g, salida) {
+    si (g == nulo) { retornar nulo }
+    sea t = g["tipo"]
+    sea c = g["coordenadas"]
+    si (t == "Point") { salida.agregar(c) }
+    sino si (t == "LineString" o t == "MultiPoint") { para p en c { salida.agregar(p) } }
+    sino si (t == "Polygon" o t == "MultiLineString") { para a en c { para p en a { salida.agregar(p) } } }
+    sino si (t == "MultiPolygon") { para pol en c { para a en pol { para p en a { salida.agregar(p) } } } }
+    sino si (t == "GeometryCollection") { para h en c { _tr_puntos(h, salida) } }
+}
+
+/// Límites [xmin, ymin, xmax, ymax] de una geometría o de una capa.
+funcion territorio_limites(g) {
+    sea pts = []
+    si (tiene_clave(g, "entidades")) { para e en g["entidades"] { _tr_puntos(e["geometria"], pts) } } sino { _tr_puntos(g, pts) }
+    si (longitud(pts) == 0) { retornar nulo }
+    sea r = [pts[0][0], pts[0][1], pts[0][0], pts[0][1]]
+    para p en pts {
+        r[0] = minimo(r[0], p[0])
+        r[1] = minimo(r[1], p[1])
+        r[2] = maximo(r[2], p[0])
+        r[3] = maximo(r[3], p[1])
+    }
+    retornar r
+}
+
+// ---------- capas ----------
+
+/// Capa vacía. campos: [{"nombre", "tipo": "C"|"N"|"F"|"L"|"D", "largo", "decimales"}].
+funcion territorio_capa(campos, prj) { retornar {"campos": campos ?? [], "entidades": [], "prj": prj} }
+
+/// Agrega una entidad (geometría + atributos).
+funcion territorio_agregar(capa, geometria, atributos) { capa["entidades"].agregar({"geometria": geometria, "atributos": atributos ?? {}}) }
+
+/// Entidades que cumplen la condición fn(entidad).
+funcion territorio_filtrar(capa, fn) {
+    sea r = territorio_capa(capa["campos"], capa["prj"])
+    para e en capa["entidades"] { si (fn(e)) { r["entidades"].agregar(e) } }
+    retornar r
+}
+
+funcion _tr_map_coords(c, f, prof) {
+    si (prof == 0) { retornar f(c) }
+    sea r = []
+    para x en c { r.agregar(_tr_map_coords(x, f, prof - 1)) }
+    retornar r
+}
+
+funcion _tr_prof(t) {
+    retornar {"Point": 0, "LineString": 1, "MultiPoint": 1, "Polygon": 2, "MultiLineString": 2, "MultiPolygon": 3}[t] ?? 0
+}
+
+/// Aplica f([x, y, …]) → [x', y', …] a cada coordenada.
+funcion territorio_transformar_geometria(g, f) {
+    si (g == nulo) { retornar nulo }
+    si (g["tipo"] == "GeometryCollection") {
+        sea hs = []
+        para h en g["coordenadas"] { hs.agregar(territorio_transformar_geometria(h, f)) }
+        retornar {"tipo": "GeometryCollection", "coordenadas": hs}
+    }
+    retornar {"tipo": g["tipo"], "coordenadas": _tr_map_coords(g["coordenadas"], f, _tr_prof(g["tipo"]))}
+}
+
+/// Reproyecta una capa (códigos EPSG o cadenas PROJ del módulo proyeccion).
+funcion territorio_reproyectar(capa, desde, hacia) {
+    sea r = territorio_capa(capa["campos"], nulo)
+    sea f = funcion(p) {
+        sea q = proyeccion_transformar(desde, hacia, [p[0], p[1]])
+        si (longitud(p) > 2) { retornar [q[0], q[1], p[2]] }
+        retornar q
+    }
+    para e en capa["entidades"] { r["entidades"].agregar({"geometria": territorio_transformar_geometria(e["geometria"], f), "atributos": e["atributos"]}) }
+    retornar r
+}
+
+// ---------- WKT ----------
+
+funcion _tr_wkt_coords(c, prof) {
+    si (prof == 0) {
+        sea p = []
+        para v en c { p.agregar(_tr_num_texto(v)) }
+        retornar unir(p, " ")
+    }
+    sea partes = []
+    para x en c {
+        si (prof == 1) { partes.agregar(_tr_wkt_coords(x, 0)) } sino { partes.agregar("(" + _tr_wkt_coords(x, prof - 1) + ")") }
+    }
+    retornar unir(partes, ", ")
+}
+
+funcion _tr_num_texto(v) {
+    si (v == piso(v) y absoluto(v) < 1e15) { retornar "" + piso(v) }
+    retornar json_serializar(v)
+}
+
+funcion _tr_dim_z(g) {
+    sea pts = []
+    _tr_puntos(g, pts)
+    retornar longitud(pts) > 0 y longitud(pts[0]) > 2
+}
+
+/// Geometría a WKT.
+funcion territorio_a_wkt(g) {
+    si (g == nulo) { retornar "GEOMETRYCOLLECTION EMPTY" }
+    sea nombres = {"Point": "POINT", "LineString": "LINESTRING", "Polygon": "POLYGON", "MultiPoint": "MULTIPOINT", "MultiLineString": "MULTILINESTRING",
+        "MultiPolygon": "MULTIPOLYGON", "GeometryCollection": "GEOMETRYCOLLECTION"}
+    sea n = nombres[g["tipo"]]
+    si (_tr_dim_z(g) y g["tipo"] != "GeometryCollection") { n = n + " Z" }
+    sea c = g["coordenadas"]
+    si (g["tipo"] == "GeometryCollection") {
+        sea hs = []
+        para h en c { hs.agregar(territorio_a_wkt(h)) }
+        retornar n + " (" + unir(hs, ", ") + ")"
+    }
+    si (g["tipo"] == "MultiPoint") {
+        sea ps = []
+        para p en c { ps.agregar("(" + _tr_wkt_coords(p, 0) + ")") }
+        retornar n + " (" + unir(ps, ", ") + ")"
+    }
+    retornar n + " (" + _tr_wkt_coords(c, _tr_prof(g["tipo"])) + ")"
+}
+
+funcion _tr_wkt_lista(t, st) {
+    // Lee "( … )" con anidamiento: devuelve listas de números o de listas.
+    _tr_ws(t, st)
+    si (subtexto(t, st[0], st[0] + 1) != "(") { lanzar "territorio: WKT inválido en la posición " + st[0] }
+    st[0] = st[0] + 1
+    sea r = []
+    mientras (verdadero) {
+        _tr_ws(t, st)
+        sea c = subtexto(t, st[0], st[0] + 1)
+        si (c == "(") { r.agregar(_tr_wkt_lista(t, st)) } sino {
+            // Una coordenada: números separados por espacios.
+            sea nums = []
+            mientras (verdadero) {
+                _tr_ws(t, st)
+                sea k = st[0]
+                mientras (k < longitud(t) y texto_indice("0123456789.-+eE", subtexto(t, k, k + 1)) >= 0) { k = k + 1 }
+                si (k == st[0]) { romper }
+                nums.agregar(a_numero(subtexto(t, st[0], k)))
+                st[0] = k
+            }
+            r.agregar(nums)
+        }
+        _tr_ws(t, st)
+        sea d = subtexto(t, st[0], st[0] + 1)
+        st[0] = st[0] + 1
+        si (d == ")") { retornar r }
+        si (d != ",") { lanzar "territorio: WKT inválido cerca de '" + d + "'" }
+    }
+}
+
+funcion _tr_ws(t, st) { mientras (st[0] < longitud(t) y (subtexto(t, st[0], st[0] + 1) == " " o subtexto(t, st[0], st[0] + 1) == "\n" o subtexto(t, st[0], st[0] + 1) == "\t")) { st[0] = st[0] + 1 } }
+
+funcion _tr_wkt_geom(t, st) {
+    _tr_ws(t, st)
+    sea k = st[0]
+    mientras (k < longitud(t) y texto_indice("ABCDEFGHIJKLMNOPQRSTUVWXYZ", texto_mayusculas(subtexto(t, k, k + 1))) >= 0) { k = k + 1 }
+    sea nombre = texto_mayusculas(subtexto(t, st[0], k))
+    st[0] = k
+    _tr_ws(t, st)
+    // Sufijos Z, M o ZM.
+    sea k2 = st[0]
+    mientras (k2 < longitud(t) y texto_indice("ZM", texto_mayusculas(subtexto(t, k2, k2 + 1))) >= 0) { k2 = k2 + 1 }
+    st[0] = k2
+    _tr_ws(t, st)
+    sea tipos = {"POINT": "Point", "LINESTRING": "LineString", "POLYGON": "Polygon", "MULTIPOINT": "MultiPoint", "MULTILINESTRING": "MultiLineString",
+        "MULTIPOLYGON": "MultiPolygon", "GEOMETRYCOLLECTION": "GeometryCollection"}
+    sea tg = tipos[nombre] ?? nulo
+    si (tg == nulo) { lanzar "territorio: tipo WKT desconocido " + nombre }
+    si (texto_empieza_con(texto_mayusculas(subtexto(t, st[0], st[0] + 5)), "EMPTY")) {
+        st[0] = st[0] + 5
+        retornar {"tipo": tg, "coordenadas": []}
+    }
+    si (tg == "GeometryCollection") {
+        st[0] = st[0] + 1
+        sea hs = []
+        mientras (verdadero) {
+            hs.agregar(_tr_wkt_geom(t, st))
+            _tr_ws(t, st)
+            sea d = subtexto(t, st[0], st[0] + 1)
+            st[0] = st[0] + 1
+            si (d == ")") { romper }
+        }
+        retornar {"tipo": tg, "coordenadas": hs}
+    }
+    sea l = _tr_wkt_lista(t, st)
+    si (tg == "Point") { retornar {"tipo": tg, "coordenadas": l[0]} }
+    si (tg == "MultiPoint") {
+        // Acepta "MULTIPOINT ((1 2), (3 4))" y "MULTIPOINT (1 2, 3 4)".
+        sea ps = []
+        para x en l {
+            si (longitud(x) > 0 y tipo(x[0]) == "lista") { ps.agregar(x[0]) } sino { ps.agregar(x) }
+        }
+        retornar {"tipo": tg, "coordenadas": ps}
+    }
+    retornar {"tipo": tg, "coordenadas": l}
+}
+
+/// WKT a geometría.
+funcion territorio_de_wkt(t) { retornar _tr_wkt_geom(t, [0]) }
+
+// ---------- WKB ----------
+
+funcion _tr_wkb_tipo(t) { retornar {"Point": 1, "LineString": 2, "Polygon": 3, "MultiPoint": 4, "MultiLineString": 5, "MultiPolygon": 6, "GeometryCollection": 7}[t] }
+
+funcion _tr_wkb_punto(p, le, z) {
+    sea r = _tr_ieee(p[0], le) + _tr_ieee(p[1], le)
+    si (z) { r = r + _tr_ieee(p[2] ?? 0, le) }
+    retornar r
+}
+
+/// Geometría a WKB (con big_endian verdadero, orden de red).
+funcion territorio_a_wkb(g, big_endian) {
+    sea le = (big_endian ?? falso) == falso
+    sea z = _tr_dim_z(g)
+    retornar _tr_wkb(g, le, z)
+}
+
+funcion _tr_u32(n, le) {
+    si (le) { retornar bytes_entero(n, 4, 1) }
+    retornar bytes_entero(n, 4, 0)
+}
+
+funcion _tr_wkb(g, le, z) {
+    sea t = _tr_wkb_tipo(g["tipo"])
+    // Z con el bit alto (como GEOS, Shapely y PostGIS); al leer se acepta también ISO (1000 + tipo).
+    si (z y g["tipo"] != "GeometryCollection") { t = t + 2147483648 }
+    sea r = char_de(0)
+    si (le) { r = char_de(1) }
+    sea c = g["coordenadas"]
+    r = r + _tr_u32(t, le)
+    sea tg = g["tipo"]
+    si (tg == "Point") { retornar r + _tr_wkb_punto(c, le, z) }
+    si (tg == "LineString") {
+        r = r + _tr_u32(longitud(c), le)
+        para p en c { r = r + _tr_wkb_punto(p, le, z) }
+        retornar r
+    }
+    si (tg == "Polygon") {
+        r = r + _tr_u32(longitud(c), le)
+        para a en c {
+            r = r + _tr_u32(longitud(a), le)
+            para p en a { r = r + _tr_wkb_punto(p, le, z) }
+        }
+        retornar r
+    }
+    sea hijo = {"MultiPoint": "Point", "MultiLineString": "LineString", "MultiPolygon": "Polygon"}[tg] ?? nulo
+    r = r + _tr_u32(longitud(c), le)
+    para h en c {
+        si (tg == "GeometryCollection") { r = r + _tr_wkb(h, le, _tr_dim_z(h)) } sino { r = r + _tr_wkb({"tipo": hijo, "coordenadas": h}, le, z) }
+    }
+    retornar r
+}
+
+/// WKB (ISO o EWKB con bandera Z) a geometría.
+funcion territorio_de_wkb(b) {
+    sea st = [0]
+    retornar _tr_de_wkb(b, st)
+}
+
+funcion _tr_de_wkb(b, st) {
+    sea le = byte_en(b, st[0]) == 1
+    sea t = 0
+    si (le) { t = _tr_le32(b, st[0] + 1) } sino { t = _tr_be32(b, st[0] + 1) }
+    st[0] = st[0] + 5
+    sea z = falso
+    sea m = falso
+    // EWKB: banderas en los bits altos.
+    si (t >= 2147483648) {
+        z = verdadero
+        t = t - 2147483648
+    }
+    si (t >= 1073741824) {
+        m = verdadero
+        t = t - 1073741824
+    }
+    si (t >= 3000) {
+        z = verdadero
+        m = verdadero
+        t = t - 3000
+    } sino si (t >= 2000) {
+        m = verdadero
+        t = t - 2000
+    } sino si (t >= 1000) {
+        z = verdadero
+        t = t - 1000
+    }
+    sea dims = 2
+    si (z) { dims = dims + 1 }
+    si (m) { dims = dims + 1 }
+    sea leer_u32 = funcion() {
+        sea v = 0
+        si (le) { v = _tr_le32(b, st[0]) } sino { v = _tr_be32(b, st[0]) }
+        st[0] = st[0] + 4
+        retornar v
+    }
+    sea leer_punto = funcion() {
+        sea p = []
+        sea k = 0
+        mientras (k < dims) {
+            si (k < 2 o (z y k == 2)) { p.agregar(_tr_de_ieee(b, st[0], le)) }
+            st[0] = st[0] + 8
+            k = k + 1
+        }
+        retornar p
+    }
+    sea nombres = ["", "Point", "LineString", "Polygon", "MultiPoint", "MultiLineString", "MultiPolygon", "GeometryCollection"]
+    si (t < 1 o t > 7) { lanzar "territorio: tipo WKB no soportado " + t }
+    sea tg = nombres[t]
+    si (tg == "Point") { retornar {"tipo": tg, "coordenadas": leer_punto()} }
+    si (tg == "LineString") {
+        sea n = leer_u32()
+        sea l = []
+        sea i = 0
+        mientras (i < n) {
+            l.agregar(leer_punto())
+            i = i + 1
+        }
+        retornar {"tipo": tg, "coordenadas": l}
+    }
+    si (tg == "Polygon") {
+        sea na = leer_u32()
+        sea anillos = []
+        sea i = 0
+        mientras (i < na) {
+            sea n = leer_u32()
+            sea a = []
+            sea j = 0
+            mientras (j < n) {
+                a.agregar(leer_punto())
+                j = j + 1
+            }
+            anillos.agregar(a)
+            i = i + 1
+        }
+        retornar {"tipo": tg, "coordenadas": anillos}
+    }
+    sea n = leer_u32()
+    sea hs = []
+    sea i = 0
+    mientras (i < n) {
+        sea h = _tr_de_wkb(b, st)
+        si (tg == "GeometryCollection") { hs.agregar(h) } sino { hs.agregar(h["coordenadas"]) }
+        i = i + 1
+    }
+    retornar {"tipo": tg, "coordenadas": hs}
+}
+
+// ---------- GeoJSON ----------
+
+funcion _tr_gj_geom(g) {
+    si (g == nulo) { retornar nulo }
+    si (g["tipo"] == "GeometryCollection") {
+        sea hs = []
+        para h en g["coordenadas"] { hs.agregar(_tr_gj_geom(h)) }
+        retornar {"type": "GeometryCollection", "geometries": hs}
+    }
+    retornar {"type": g["tipo"], "coordinates": g["coordenadas"]}
+}
+
+funcion _tr_de_gj_geom(g) {
+    si (g == nulo) { retornar nulo }
+    si (g["type"] == "GeometryCollection") {
+        sea hs = []
+        para h en g["geometries"] { hs.agregar(_tr_de_gj_geom(h)) }
+        retornar {"tipo": "GeometryCollection", "coordenadas": hs}
+    }
+    retornar {"tipo": g["type"], "coordenadas": g["coordinates"]}
+}
+
+/// Capa a texto GeoJSON (FeatureCollection).
+funcion territorio_a_geojson(capa) {
+    sea fs = []
+    para e en capa["entidades"] { fs.agregar({"type": "Feature", "geometry": _tr_gj_geom(e["geometria"]), "properties": e["atributos"]}) }
+    retornar json_serializar({"type": "FeatureCollection", "features": fs})
+}
+
+/// Texto GeoJSON (FeatureCollection, Feature o geometría) a capa.
+funcion territorio_de_geojson(texto) {
+    sea d = json_parsear(texto)
+    sea capa = territorio_capa([], nulo)
+    sea feats = []
+    si (d["type"] == "FeatureCollection") { feats = d["features"] } sino si (d["type"] == "Feature") { feats = [d] } sino { feats = [{"geometry": d, "properties": {}}] }
+    sea campos = {}
+    para f en feats {
+        sea props = f["properties"] ?? {}
+        si (props == nulo) { props = {} }
+        para k en claves(props) { si (tiene_clave(campos, k) == falso) { campos[k] = props[k] } }
+        territorio_agregar(capa, _tr_de_gj_geom(f["geometry"] ?? nulo), props)
+    }
+    para k en claves(campos) {
+        sea v = campos[k]
+        sea tc = "C"
+        si (tipo(v) == "numero") { tc = "F" } sino si (tipo(v) == "booleano") { tc = "L" }
+        capa["campos"].agregar({"nombre": k, "tipo": tc})
+    }
+    retornar capa
+}
+
+// ---------- Shapefile ----------
+
+funcion _tr_dbf_leer(b, codificacion) {
+    si (b == nulo) { retornar [[], []] }
+    sea n = _tr_le32(b, 4)
+    sea cab = bytes_leer_entero(b, 8, 2, 1)
+    sea largo_reg = bytes_leer_entero(b, 10, 2, 1)
+    sea campos = []
+    sea i = 32
+    mientras (i < cab - 1 y byte_en(b, i) != 13) {
+        sea nom = subtexto(b, i, i + 11)
+        sea z = bytes_buscar(nom, char_de(0), 0)
+        si (z >= 0) { nom = subtexto(nom, 0, z) }
+        campos.agregar({"nombre": nom, "tipo": subtexto(b, i + 11, i + 12), "largo": byte_en(b, i + 16), "decimales": byte_en(b, i + 17)})
+        i = i + 32
+    }
+    sea regs = []
+    sea k = 0
+    mientras (k < n) {
+        sea p = cab + k * largo_reg
+        sea borrado = subtexto(b, p, p + 1) == "*"
+        sea a = {}
+        sea off = p + 1
+        para c en campos {
+            sea crudo = subtexto(b, off, off + c["largo"])
+            sea v = texto_recortar(crudo)
+            sea t = c["tipo"]
+            si (t == "N" o t == "F") {
+                si (v == "" o texto_empieza_con(v, "*")) { a[c["nombre"]] = nulo } sino { a[c["nombre"]] = a_numero(v) }
+            } sino si (t == "L") {
+                si (v == "T" o v == "t" o v == "Y" o v == "y") { a[c["nombre"]] = verdadero } sino si (v == "F" o v == "f" o v == "N" o v == "n") { a[c["nombre"]] = falso } sino { a[c["nombre"]] = nulo }
+            } sino si (t == "D") {
+                si (longitud(v) == 8) { a[c["nombre"]] = subtexto(v, 0, 4) + "-" + subtexto(v, 4, 6) + "-" + subtexto(v, 6, 8) } sino { a[c["nombre"]] = nulo }
+            } sino {
+                si (codificacion == "latin1") {
+                    sea s = ""
+                    para cp en _tr_bytes_lista(v) { s = s + caracter(cp) }
+                    v = s
+                }
+                a[c["nombre"]] = v
+            }
+            off = off + c["largo"]
+        }
+        si (borrado == falso) { regs.agregar(a) } sino { regs.agregar(nulo) }
+        k = k + 1
+    }
+    retornar [campos, regs]
+}
+
+funcion _tr_bytes_lista(t) {
+    sea r = []
+    sea i = 0
+    mientras (i < longitud(t)) {
+        r.agregar(byte_en(t, i))
+        i = i + 1
+    }
+    retornar r
+}
+
+funcion _tr_shp_geom(b, p, n) {
+    si (n < 4) { retornar nulo }
+    sea t = _tr_le32(b, p)
+    si (t == 0) { retornar nulo }
+    sea base = t % 10
+    sea con_z = t >= 10 y t < 20
+    si (base == 1) {
+        sea pt = [_tr_de_ieee(b, p + 4, verdadero), _tr_de_ieee(b, p + 12, verdadero)]
+        si (con_z) { pt.agregar(_tr_de_ieee(b, p + 20, verdadero)) }
+        retornar {"tipo": "Point", "coordenadas": pt}
+    }
+    si (base == 8) {
+        sea np = _tr_le32(b, p + 36)
+        sea pts = []
+        sea i = 0
+        mientras (i < np) {
+            pts.agregar([_tr_de_ieee(b, p + 40 + i * 16, verdadero), _tr_de_ieee(b, p + 48 + i * 16, verdadero)])
+            i = i + 1
+        }
+        si (con_z) {
+            sea zb = p + 40 + np * 16 + 16
+            i = 0
+            mientras (i < np) {
+                pts[i].agregar(_tr_de_ieee(b, zb + i * 8, verdadero))
+                i = i + 1
+            }
+        }
+        retornar {"tipo": "MultiPoint", "coordenadas": pts}
+    }
+    si (base == 3 o base == 5) {
+        sea npartes = _tr_le32(b, p + 36)
+        sea np = _tr_le32(b, p + 40)
+        sea partes = []
+        sea i = 0
+        mientras (i < npartes) {
+            partes.agregar(_tr_le32(b, p + 44 + i * 4))
+            i = i + 1
+        }
+        sea pb = p + 44 + npartes * 4
+        sea zb = pb + np * 16 + 16
+        sea anillos = []
+        i = 0
+        mientras (i < npartes) {
+            sea ini = partes[i]
+            sea fin = np
+            si (i + 1 < npartes) { fin = partes[i + 1] }
+            sea a = []
+            sea j = ini
+            mientras (j < fin) {
+                sea pt = [_tr_de_ieee(b, pb + j * 16, verdadero), _tr_de_ieee(b, pb + j * 16 + 8, verdadero)]
+                si (con_z) { pt.agregar(_tr_de_ieee(b, zb + j * 8, verdadero)) }
+                a.agregar(pt)
+                j = j + 1
+            }
+            anillos.agregar(a)
+            i = i + 1
+        }
+        si (base == 3) {
+            si (longitud(anillos) == 1) { retornar {"tipo": "LineString", "coordenadas": anillos[0]} }
+            retornar {"tipo": "MultiLineString", "coordenadas": anillos}
+        }
+        // Polígonos: los anillos horarios (área negativa en y hacia arriba)
+        // son exteriores; los antihorarios, huecos del exterior que los contiene.
+        sea polis = []
+        sea huecos = []
+        para a en anillos {
+            si (_tr_area_anillo(a) <= 0) { polis.agregar([a]) } sino { huecos.agregar(a) }
+        }
+        para h en huecos {
+            sea puesto = falso
+            para pol en polis {
+                si (puesto == falso y _tr_punto_en_anillo(h[0], pol[0])) {
+                    pol.agregar(h)
+                    puesto = verdadero
+                }
+            }
+            si (puesto == falso) { polis.agregar([h]) }
+        }
+        si (longitud(polis) == 1) { retornar {"tipo": "Polygon", "coordenadas": polis[0]} }
+        retornar {"tipo": "MultiPolygon", "coordenadas": polis}
+    }
+    lanzar "territorio: tipo de shape no soportado " + t
+}
+
+/// Lee un Shapefile (ruta sin extensión o con .shp): capa con
+/// "entidades", "campos", "prj" (WKT del .prj) y "tipo_shp".
+funcion territorio_leer_shp(ruta) {
+    sea base = ruta
+    si (texto_termina_con(texto_minusculas(base), ".shp")) { base = subtexto(base, 0, longitud(base) - 4) }
+    sea shp = leer_archivo(base + ".shp")
+    si (_tr_be32(shp, 0) != 9994) { lanzar "territorio: no es un .shp" }
+    sea cod = "utf-8"
+    si (existe_archivo(base + ".cpg")) {
+        sea c = texto_minusculas(texto_recortar(leer_archivo(base + ".cpg")))
+        si (texto_contiene(c, "8859") o texto_contiene(c, "1252") o c == "latin1") { cod = "latin1" }
+    }
+    sea dbf = nulo
+    si (existe_archivo(base + ".dbf")) { dbf = leer_archivo(base + ".dbf") }
+    sea db = _tr_dbf_leer(dbf, cod)
+    sea prj = nulo
+    si (existe_archivo(base + ".prj")) { prj = texto_recortar(leer_archivo(base + ".prj")) }
+    sea capa = {"campos": db[0], "entidades": [], "prj": prj, "tipo_shp": _tr_le32(shp, 32)}
+    sea total = _tr_be32(shp, 24) * 2
+    sea p = 100
+    sea k = 0
+    mientras (p + 8 <= total) {
+        sea n = _tr_be32(shp, p + 4) * 2
+        sea g = _tr_shp_geom(shp, p + 8, n)
+        sea a = {}
+        si (k < longitud(db[1]) y db[1][k] != nulo) { a = db[1][k] }
+        si (k >= longitud(db[1]) o db[1][k] != nulo) { capa["entidades"].agregar({"geometria": g, "atributos": a}) }
+        p = p + 8 + n
+        k = k + 1
+    }
+    retornar capa
+}
+
+funcion _tr_bbox(pts) {
+    si (longitud(pts) == 0) { retornar [0, 0, 0, 0] }
+    sea r = [pts[0][0], pts[0][1], pts[0][0], pts[0][1]]
+    para q en pts {
+        r[0] = minimo(r[0], q[0])
+        r[1] = minimo(r[1], q[1])
+        r[2] = maximo(r[2], q[0])
+        r[3] = maximo(r[3], q[1])
+    }
+    retornar r
+}
+
+funcion _tr_orientar(a, horario) {
+    sea area = _tr_area_anillo(a)
+    si ((area < 0) == horario) { retornar a }
+    sea r = []
+    sea i = longitud(a) - 1
+    mientras (i >= 0) {
+        r.agregar(a[i])
+        i = i - 1
+    }
+    retornar r
+}
+
+funcion _tr_shp_contenido(g, tipo_shp) {
+    si (g == nulo) { retornar bytes_entero(0, 4, 1) }
+    sea t = g["tipo"]
+    sea c = g["coordenadas"]
+    si (tipo_shp == 1) { retornar bytes_entero(1, 4, 1) + _tr_ieee(c[0], verdadero) + _tr_ieee(c[1], verdadero) }
+    si (tipo_shp == 8) {
+        sea pts = c
+        si (t == "Point") { pts = [c] }
+        sea r = bytes_entero(8, 4, 1)
+        para v en _tr_bbox(pts) { r = r + _tr_ieee(v, verdadero) }
+        r = r + bytes_entero(longitud(pts), 4, 1)
+        para q en pts { r = r + _tr_ieee(q[0], verdadero) + _tr_ieee(q[1], verdadero) }
+        retornar r
+    }
+    // Líneas y polígonos: lista de partes.
+    sea partes = []
+    si (t == "LineString") { partes = [c] }
+    sino si (t == "MultiLineString") { partes = c }
+    sino si (t == "Polygon") {
+        sea i = 0
+        para a en c {
+            partes.agregar(_tr_orientar(a, i == 0))
+            i = i + 1
+        }
+    } sino si (t == "MultiPolygon") {
+        para pol en c {
+            sea i = 0
+            para a en pol {
+                partes.agregar(_tr_orientar(a, i == 0))
+                i = i + 1
+            }
+        }
+    }
+    sea pts = []
+    para pa en partes { para q en pa { pts.agregar(q) } }
+    sea r = bytes_entero(tipo_shp, 4, 1)
+    para v en _tr_bbox(pts) { r = r + _tr_ieee(v, verdadero) }
+    r = r + bytes_entero(longitud(partes), 4, 1) + bytes_entero(longitud(pts), 4, 1)
+    sea ini = 0
+    para pa en partes {
+        r = r + bytes_entero(ini, 4, 1)
+        ini = ini + longitud(pa)
+    }
+    para q en pts { r = r + _tr_ieee(q[0], verdadero) + _tr_ieee(q[1], verdadero) }
+    retornar r
+}
+
+funcion _tr_tipo_shp(capa) {
+    para e en capa["entidades"] {
+        sea g = e["geometria"]
+        si (g != nulo) {
+            sea t = g["tipo"]
+            si (t == "Point") { retornar 1 }
+            si (t == "MultiPoint") { retornar 8 }
+            si (t == "LineString" o t == "MultiLineString") { retornar 3 }
+            si (t == "Polygon" o t == "MultiPolygon") { retornar 5 }
+        }
+    }
+    retornar 0
+}
+
+funcion _tr_rellenar(t, n, derecha) {
+    sea s = t
+    si (longitud(s) > n) { s = subtexto(s, 0, n) }
+    mientras (longitud(s) < n) {
+        si (derecha) { s = " " + s } sino { s = s + " " }
+    }
+    retornar s
+}
+
+funcion _tr_dbf_escribir(capa) {
+    sea campos = []
+    para c en capa["campos"] {
+        sea t = c["tipo"] ?? "C"
+        sea largo = c["largo"] ?? 0
+        sea dec = c["decimales"] ?? 0
+        si (largo == 0) {
+            si (t == "C") { largo = 80 } sino si (t == "N") { largo = 18 } sino si (t == "F") {
+                largo = 19
+                si (dec == 0) { dec = 8 }
+            } sino si (t == "L") { largo = 1 } sino si (t == "D") { largo = 8 }
+        }
+        campos.agregar({"nombre": subtexto(c["nombre"], 0, minimo(10, longitud(c["nombre"]))), "clave": c["nombre"], "tipo": t, "largo": largo, "decimales": dec})
+    }
+    sea largo_reg = 1
+    para c en campos { largo_reg = largo_reg + c["largo"] }
+    sea n = longitud(capa["entidades"])
+    sea cab = 32 + 32 * longitud(campos) + 1
+    sea h = char_de(3) + char_de(126) + char_de(11) + char_de(23) + bytes_entero(n, 4, 1) + bytes_entero(cab, 2, 1) + bytes_entero(largo_reg, 2, 1)
+    mientras (longitud(h) < 32) { h = h + char_de(0) }
+    para c en campos {
+        sea d = c["nombre"]
+        mientras (longitud(d) < 11) { d = d + char_de(0) }
+        d = d + c["tipo"] + bytes_entero(0, 4, 1) + char_de(c["largo"]) + char_de(c["decimales"])
+        mientras (longitud(d) < 32) { d = d + char_de(0) }
+        h = h + d
+    }
+    h = h + char_de(13)
+    sea partes = [h]
+    para e en capa["entidades"] {
+        sea r = " "
+        para c en campos {
+            sea v = e["atributos"][c["clave"]] ?? nulo
+            sea t = c["tipo"]
+            sea s = ""
+            si (v == nulo) { s = "" }
+            sino si (t == "N") { s = "" + redondear(v) }
+            sino si (t == "F") {
+                s = "" + v
+                si (tipo(v) == "numero" y c["decimales"] > 0) { s = _tr_fijo(v, c["decimales"]) }
+            } sino si (t == "L") {
+                si (v) { s = "T" } sino { s = "F" }
+            } sino si (t == "D") { s = texto_reemplazar("" + v, "-", "") }
+            sino { s = "" + v }
+            // Corta el texto sin partir un carácter UTF-8.
+            si (longitud(s) > c["largo"]) {
+                s = subtexto(s, 0, c["largo"])
+                mientras (longitud(s) > 0 y byte_en(s, longitud(s) - 1) >= 128 y byte_en(s, longitud(s) - 1) < 192) { s = subtexto(s, 0, longitud(s) - 1) }
+                si (longitud(s) > 0 y byte_en(s, longitud(s) - 1) >= 192) { s = subtexto(s, 0, longitud(s) - 1) }
+            }
+            r = r + _tr_rellenar(s, c["largo"], t == "N" o t == "F")
+        }
+        partes.agregar(r)
+    }
+    partes.agregar(char_de(26))
+    retornar unir(partes, "")
+}
+
+funcion _tr_fijo(v, dec) {
+    sea f = potencia(10, dec)
+    sea n = redondear(absoluto(v) * f)
+    sea e = piso(n / f)
+    sea fr = "" + (n - e * f)
+    mientras (longitud(fr) < dec) { fr = "0" + fr }
+    sea s = ""
+    si (v < 0 y n > 0) { s = "-" }
+    retornar s + e + "." + fr
+}
+
+/// Escribe un Shapefile (ruta sin extensión): .shp, .shx, .dbf, .cpg
+/// (UTF-8) y .prj si la capa trae "prj".
+funcion territorio_escribir_shp(capa, ruta) {
+    sea base = ruta
+    si (texto_termina_con(texto_minusculas(base), ".shp")) { base = subtexto(base, 0, longitud(base) - 4) }
+    sea t = _tr_tipo_shp(capa)
+    sea regs = []
+    sea indice = []
+    sea off = 50
+    sea k = 1
+    para e en capa["entidades"] {
+        sea cont = _tr_shp_contenido(e["geometria"], t)
+        regs.agregar(bytes_entero(k, 4, 0) + bytes_entero(longitud(cont) / 2, 4, 0) + cont)
+        indice.agregar(bytes_entero(off, 4, 0) + bytes_entero(longitud(cont) / 2, 4, 0))
+        off = off + 4 + longitud(cont) / 2
+        k = k + 1
+    }
+    sea bb = territorio_limites(capa) ?? [0, 0, 0, 0]
+    sea cabecera = funcion(largo_palabras) {
+        sea h = bytes_entero(9994, 4, 0) + bytes_entero(0, 20, 0) + bytes_entero(largo_palabras, 4, 0) + bytes_entero(1000, 4, 1) + bytes_entero(t, 4, 1)
+        para v en bb { h = h + _tr_ieee(v, verdadero) }
+        retornar h + _tr_ieee(0, verdadero) + _tr_ieee(0, verdadero) + _tr_ieee(0, verdadero) + _tr_ieee(0, verdadero)
+    }
+    escribir_archivo(base + ".shp", cabecera(off) + unir(regs, ""))
+    escribir_archivo(base + ".shx", cabecera(50 + 4 * longitud(indice)) + unir(indice, ""))
+    escribir_archivo(base + ".dbf", _tr_dbf_escribir(capa))
+    escribir_archivo(base + ".cpg", "UTF-8")
+    si ((capa["prj"] ?? nulo) != nulo) { escribir_archivo(base + ".prj", capa["prj"]) }
+}
