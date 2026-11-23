@@ -118,7 +118,7 @@ Estado: ✅ ya existe en C-Forge · 🔗 se usa hoy vía `cforge bindgen`,
 | 82 | `llamada` / `protobuf` | RPC binario | gRPC, Protobuf | ✅ `llamada` |
 | 83 | `veloz` / `quinn` | QUIC y HTTP/3 | Quinn | ✅ `es` / `en` |
 | 84 | `buzon` / `zeromq` | Mensajería entre procesos | ZeroMQ | ✅ `buzon` |
-| 85 | `malla` | Redes P2P | libp2p | 🛠 |
+| 85 | `malla` / `libp2p` | Redes P2P | libp2p | ✅ `es` / `en` |
 | 86 | `tunel` / `wireguard` | VPN criptográfica | WireGuard | ✅ `tunel` |
 | 87 | `certifica` / `acme` | Certificados HTTPS automáticos | ACME | ✅ `certifica` |
 | 88 | `ficha` | Tokens JWT/JWE | jose | ✅ `auth` (JWT) |
@@ -256,7 +256,7 @@ Estado: ✅ ya existe en C-Forge · 🔗 se usa hoy vía `cforge bindgen`,
 | 183 | `manipulador` / `gizmo3d` | Gizmos 3D de editor | ImGuizmo | ✅ `manipulador` |
 | 184 | `optimalla` / `meshopt` | Optimizar mallas y LOD | meshoptimizer | ✅ `optimalla` |
 | 185 | `textura` / `texcompress` | Compresión de texturas | Basis Universal | ✅ `textura` |
-| 186 | `solido` | Física 3D multinúcleo | Jolt | ✅ `fisica3d` (básica) · 🛠 |
+| 186 | `solido` | Física 3D multinúcleo | Jolt | ✅ `solido` / `jolt` |
 | 187 | `determinista` / `fixedphysics` | Física reproducible | Rapier | ✅ `determinista` |
 | 188 | `inmersiva` | Realidad virtual y aumentada | OpenXR | 🔗 |
 | 189 | `sombreador` / `shader` | Traducir shaders | naga | ✅ `sombreador` |
@@ -316,7 +316,7 @@ Estado: ✅ ya existe en C-Forge · 🔗 se usa hoy vía `cforge bindgen`,
 | 228 | `depura` / `dap` | Depuración paso a paso | DAP | ✅ `depura` |
 | 229 | `intermedio` / `ssa_ir` | Optimización de código intermedio | LLVM, MLIR | ✅ `es` / `en` |
 | 230 | `gramatica` / `parser` | Combinadores de parsers | Pest, Nom | ✅ `gramatica` |
-| 231 | `analiza` | Compilador como servicio | Roslyn | 🛠 |
+| 231 | `analiza` / `code_analysis` | Compilador como servicio | Roslyn | ✅ `es` / `en` |
 | 232 | `nucleo` / `ebpf` | Programas en el kernel | eBPF | ✅ `nucleo` |
 | 233 | `anillo` / `iouring` | E/S asíncrona en Linux | io_uring | ✅ `anillo` |
 | 234 | `ventanas_api` | APIs nativas de Windows | windows (Rust) | ✅ runtime Windows · 🛠 |

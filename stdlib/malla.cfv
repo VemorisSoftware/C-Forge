@@ -1,0 +1,781 @@
+// stdlib/malla.cfv — redes P2P al estilo de libp2p en C-Forge puro:
+// identidad Ed25519 y PeerId (base58 "12D3KooW…"), multiaddr (texto y
+// binario: ip4, ip6, dns, tcp, udp, quic-v1, p2p), multistream-select 1.0,
+// canal seguro Noise XX con la firma de libp2p, multiplexado yamux (flujos,
+// ventanas, ping y cierre), y los protocolos identify (/ipfs/id/1.0.0) y
+// ping (/ipfs/ping/1.0.0), más protocolos propios de pedido y respuesta.
+// El núcleo no hace E/S: también funciona en memoria. Interopera con
+// js-libp2p. Idea de libp2p (MIT/Apache-2.0), escrito desde cero.
+// En inglés: importar "libp2p".
+//
+//   importar "malla"
+//   sea yo = malla_nodo(nulo)
+//   mostrar(malla_peer_id(yo))
+//   sea c = malla_conectar(yo, "/ip4/127.0.0.1/tcp/4001/p2p/12D3KooW…")
+//   mostrar(malla_ping(c))
+//   mostrar(malla_identificar(c)["agente"])
+
+importar "apreton"
+importar "semilla"
+
+funcion __malla_declaraciones() {
+    extern "libc" funcion socket(dominio: entero, tipo_s: entero, protocolo: entero): entero
+    extern "libc" funcion setsockopt(fd: entero, nivel: entero, opcion: entero, valor: puntero, largo: entero): entero
+    extern "libc" funcion bind(fd: entero, dir: puntero, largo: entero): entero
+    extern "libc" funcion listen(fd: entero, cola: entero): entero
+    extern "libc" funcion accept(fd: entero, dir: puntero, largo: puntero): entero
+    extern "libc" funcion close(fd: entero): entero
+}
+
+// ---------- varint y protobuf mínimo ----------
+
+funcion _ml_uvarint(v) {
+    sea r = ""
+    sea x = v
+    mientras (x >= 128) {
+        r = r + char_de(128 + x % 128)
+        x = piso(x / 128)
+    }
+    retornar r + char_de(x)
+}
+
+// [valor, siguiente] o nulo si no alcanza.
+funcion _ml_leer_uvarint(d, p) {
+    sea v = 0
+    sea m = 1
+    sea i = p
+    mientras (i < longitud(d)) {
+        sea b = byte_en(d, i)
+        v = v + (b % 128) * m
+        m = m * 128
+        i = i + 1
+        si (b < 128) { retornar [v, i] }
+        si (i - p > 9) { lanzar "malla: varint demasiado largo" }
+    }
+    retornar nulo
+}
+
+funcion _ml_pb_bytes(campo, datos) { retornar _ml_uvarint(campo * 8 + 2) + _ml_uvarint(longitud(datos)) + datos }
+funcion _ml_pb_varint(campo, v) { retornar _ml_uvarint(campo * 8) + _ml_uvarint(v) }
+
+// Campos de un mensaje: mapa de número a lista de valores (bytes o enteros).
+funcion _ml_pb_leer(d) {
+    sea r = {}
+    sea p = 0
+    mientras (p < longitud(d)) {
+        sea k = _ml_leer_uvarint(d, p)
+        si (k == nulo) { lanzar "malla: protobuf cortado" }
+        sea campo = piso(k[0] / 8)
+        sea tipo_c = k[0] % 8
+        p = k[1]
+        sea v = nulo
+        si (tipo_c == 0) {
+            sea x = _ml_leer_uvarint(d, p)
+            v = x[0]
+            p = x[1]
+        } sino si (tipo_c == 2) {
+            sea l = _ml_leer_uvarint(d, p)
+            v = subtexto(d, l[1], l[1] + l[0])
+            p = l[1] + l[0]
+        } sino si (tipo_c == 1) {
+            v = subtexto(d, p, p + 8)
+            p = p + 8
+        } sino si (tipo_c == 5) {
+            v = subtexto(d, p, p + 4)
+            p = p + 4
+        } sino { lanzar "malla: tipo de protobuf " + tipo_c }
+        si (tiene_clave(r, "" + campo) == falso) { r["" + campo] = [] }
+        r["" + campo].agregar(v)
+    }
+    retornar r
+}
+
+// ---------- identidad ----------
+
+/// Nodo con identidad Ed25519. opciones: "semilla" (32 bytes, para una
+/// identidad fija), "agente" (agentVersion), "direcciones".
+funcion malla_nodo(opciones) {
+    sea op = opciones ?? {}
+    sea s = op["semilla"] ?? bytes_aleatorios(32)
+    sea pub = ed25519_publica(s)
+    sea n = {"semilla": s, "publica": pub, "protocolos": {}, "agente": op["agente"] ?? "c-forge/malla", "direcciones": op["direcciones"] ?? [], "conexiones": []}
+    n["clave_pb"] = _ml_pb_varint(1, 1) + _ml_pb_bytes(2, pub)
+    n["id"] = _ml_peer_id_de_clave(n["clave_pb"])
+    retornar n
+}
+
+funcion _ml_peer_id_de_clave(clave_pb) {
+    si (longitud(clave_pb) <= 42) { retornar char_de(0) + _ml_uvarint(longitud(clave_pb)) + clave_pb }
+    retornar char_de(18) + char_de(32) + sha256_bytes(clave_pb)
+}
+
+/// PeerId del nodo en base58 ("12D3KooW…").
+funcion malla_peer_id(n) { retornar semilla_base58(n["id"]) }
+
+/// Convierte un PeerId de texto (base58 o CID en base32 "b…") a bytes.
+funcion malla_peer_id_bytes(texto) {
+    si (texto_empieza_con(texto, "1") o texto_empieza_con(texto, "Qm")) { retornar semilla_de_base58(texto) }
+    si (texto_empieza_con(texto, "b")) {
+        // CIDv1 libp2p-key (0x72) en base32 minúscula.
+        sea d = _ml_base32_dec(subtexto(texto, 1, longitud(texto)))
+        sea v = _ml_leer_uvarint(d, 0)
+        sea c = _ml_leer_uvarint(d, v[1])
+        retornar subtexto(d, c[1], longitud(d))
+    }
+    lanzar "malla: PeerId no reconocido: " + texto
+}
+
+funcion _ml_base32_dec(t) {
+    sea alfa = "abcdefghijklmnopqrstuvwxyz234567"
+    sea r = ""
+    sea acc = 0
+    sea bits = 0
+    sea i = 0
+    mientras (i < longitud(t)) {
+        sea v = texto_indice(alfa, subtexto(t, i, i + 1))
+        acc = acc * 32 + v
+        bits = bits + 5
+        si (bits >= 8) {
+            bits = bits - 8
+            r = r + char_de(piso(acc / potencia(2, bits)) % 256)
+            acc = acc % potencia(2, bits)
+        }
+        i = i + 1
+    }
+    retornar r
+}
+
+// Clave pública (protobuf) → bytes Ed25519 o error.
+funcion _ml_clave_ed25519(pb) {
+    sea c = _ml_pb_leer(pb)
+    si ((c["1"] ?? [0])[0] != 1) { lanzar "malla: solo se aceptan identidades Ed25519" }
+    retornar c["2"][0]
+}
+
+// ---------- multiaddr ----------
+
+sea _ML_PROTOS = {"ip4": [4, 32], "tcp": [6, 16], "udp": [273, 16], "ip6": [41, 128], "dns": [53, -1], "dns4": [54, -1], "dns6": [55, -1], "dnsaddr": [56, -1],
+    "p2p": [421, -1], "ipfs": [421, -1], "quic-v1": [461, 0], "quic": [460, 0], "ws": [477, 0], "wss": [478, 0], "tls": [448, 0], "noise": [454, 0], "webtransport": [465, 0], "p2p-circuit": [290, 0]}
+
+/// Multiaddr de texto → [[protocolo, valor]].
+funcion malla_multiaddr(texto) {
+    sea partes = texto_dividir(texto, "/")
+    sea r = []
+    sea i = 1
+    mientras (i < longitud(partes)) {
+        sea p = partes[i]
+        si (p != "") {
+            si (tiene_clave(_ML_PROTOS, p) == falso) { lanzar "malla: protocolo de multiaddr desconocido: " + p }
+            si (_ML_PROTOS[p][1] == 0) { r.agregar([p, nulo]) } sino {
+                r.agregar([p, partes[i + 1]])
+                i = i + 1
+            }
+        }
+        i = i + 1
+    }
+    retornar r
+}
+
+/// Multiaddr a bytes (formato binario).
+funcion malla_multiaddr_bytes(texto) {
+    sea r = ""
+    para c en malla_multiaddr(texto) {
+        sea info = _ML_PROTOS[c[0]]
+        r = r + _ml_uvarint(info[0])
+        si (c[0] == "ip4") { para x en texto_dividir(c[1], ".") { r = r + char_de(a_numero(x)) } }
+        sino si (c[0] == "tcp" o c[0] == "udp") { r = r + char_de(piso(a_numero(c[1]) / 256)) + char_de(a_numero(c[1]) % 256) }
+        sino si (c[0] == "ip6") { r = r + _ml_ip6(c[1]) }
+        sino si (c[0] == "p2p" o c[0] == "ipfs") {
+            sea b = malla_peer_id_bytes(c[1])
+            r = r + _ml_uvarint(longitud(b)) + b
+        } sino si (info[1] == -1) { r = r + _ml_uvarint(longitud(c[1])) + c[1] }
+    }
+    retornar r
+}
+
+funcion _ml_ip6(t) {
+    sea mitades = texto_dividir(t, "::")
+    sea izq = []
+    sea der = []
+    si (mitades[0] != "") { izq = texto_dividir(mitades[0], ":") }
+    si (longitud(mitades) > 1 y mitades[1] != "") { der = texto_dividir(mitades[1], ":") }
+    sea grupos = []
+    para g en izq { grupos.agregar(g) }
+    mientras (longitud(grupos) + longitud(der) < 8) { grupos.agregar("0") }
+    para g en der { grupos.agregar(g) }
+    sea r = ""
+    para g en grupos {
+        sea v = _ml_hex_num(g)
+        r = r + char_de(piso(v / 256)) + char_de(v % 256)
+    }
+    retornar r
+}
+
+funcion _ml_hex_num(g) {
+    sea v = 0
+    sea i = 0
+    mientras (i < longitud(g)) {
+        v = v * 16 + texto_indice("0123456789abcdef", texto_minusculas(subtexto(g, i, i + 1)))
+        i = i + 1
+    }
+    retornar v
+}
+
+/// Multiaddr binario → texto.
+funcion malla_multiaddr_texto(b) {
+    sea r = ""
+    sea p = 0
+    mientras (p < longitud(b)) {
+        sea c = _ml_leer_uvarint(b, p)
+        p = c[1]
+        sea nombre = nulo
+        para k en claves(_ML_PROTOS) { si (_ML_PROTOS[k][0] == c[0] y k != "ipfs" y nombre == nulo) { nombre = k } }
+        si (nombre == nulo) { lanzar "malla: código de multiaddr desconocido " + c[0] }
+        r = r + "/" + nombre
+        si (nombre == "ip4") {
+            r = r + "/" + byte_en(b, p) + "." + byte_en(b, p + 1) + "." + byte_en(b, p + 2) + "." + byte_en(b, p + 3)
+            p = p + 4
+        } sino si (nombre == "tcp" o nombre == "udp") {
+            r = r + "/" + (byte_en(b, p) * 256 + byte_en(b, p + 1))
+            p = p + 2
+        } sino si (nombre == "ip6") {
+            sea g = []
+            sea k = 0
+            mientras (k < 8) {
+                sea x = texto_minusculas(hex_de_bytes(subtexto(b, p + 2 * k, p + 2 * k + 2)))
+                mientras (longitud(x) > 1 y texto_empieza_con(x, "0")) { x = subtexto(x, 1, longitud(x)) }
+                g.agregar(x)
+                k = k + 1
+            }
+            r = r + "/" + unir(g, ":")
+            p = p + 16
+        } sino si (_ML_PROTOS[nombre][1] == -1) {
+            sea l = _ml_leer_uvarint(b, p)
+            sea v = subtexto(b, l[1], l[1] + l[0])
+            si (nombre == "p2p") { v = semilla_base58(v) }
+            r = r + "/" + v
+            p = l[1] + l[0]
+        }
+    }
+    retornar r
+}
+
+// ---------- conexión (sin E/S) ----------
+
+sea _ML_MS = "/multistream/1.0.0\n"
+
+funcion _ml_ms_msj(t) {
+    sea x = t + "\n"
+    retornar _ml_uvarint(longitud(x)) + x
+}
+
+// Saca un mensaje multistream del búfer (sin el "\n") o nulo.
+funcion _ml_ms_leer(c, campo) {
+    sea d = c[campo]
+    sea l = _ml_leer_uvarint(d, 0)
+    si (l == nulo o l[1] + l[0] > longitud(d)) { retornar nulo }
+    sea m = subtexto(d, l[1], l[1] + l[0])
+    c[campo] = subtexto(d, l[1] + l[0], longitud(d))
+    si (texto_termina_con(m, "\n")) { m = subtexto(m, 0, longitud(m) - 1) }
+    retornar m
+}
+
+/// Conexión sin E/S. rol: "iniciador" o "respondedor". esperado: PeerId
+/// (bytes) del otro lado, si se conoce.
+funcion malla_conexion(nodo, rol, esperado) {
+    sea c = {"nodo": nodo, "rol": rol, "fase": "ms_seguridad", "entrada": "", "salida": "", "plano": "", "esperado": esperado, "par": nulo, "flujos": {},
+        "sig_flujo": 1, "error": nulo, "cerrado": falso, "eventos": [], "pings": {}, "noise": nulo}
+    si (rol == "respondedor") { c["sig_flujo"] = 2 }
+    c["estatica"] = apreton_claves(nulo)
+    si (rol == "iniciador") { c["salida"] = _ml_ms_msj("/multistream/1.0.0") + _ml_ms_msj("/noise") }
+    retornar c
+}
+
+funcion _ml_fallar(c, msj) {
+    c["error"] = msj
+    c["cerrado"] = verdadero
+    lanzar "malla: " + msj
+}
+
+/// Bytes para mandar por la red (y los quita).
+funcion malla_salida(c) {
+    sea s = c["salida"]
+    c["salida"] = ""
+    retornar s
+}
+
+funcion _ml_carga_noise(c) {
+    sea firma = ed25519_firmar(c["nodo"]["semilla"], "noise-libp2p-static-key:" + c["estatica"]["publica"])
+    retornar _ml_pb_bytes(1, c["nodo"]["clave_pb"]) + _ml_pb_bytes(2, firma)
+}
+
+funcion _ml_verificar_carga(c, carga) {
+    sea campos = _ml_pb_leer(carga)
+    sea clave_pb = campos["1"][0]
+    sea firma = campos["2"][0]
+    sea pub = _ml_clave_ed25519(clave_pb)
+    si (ed25519_verificar(pub, "noise-libp2p-static-key:" + apreton_remota(c["noise"]), firma) == falso) { _ml_fallar(c, "la firma de la clave estática del otro no es válida") }
+    sea id = _ml_peer_id_de_clave(clave_pb)
+    si (c["esperado"] != nulo y id != c["esperado"]) { _ml_fallar(c, "el otro lado no es el PeerId esperado") }
+    c["par"] = id
+    c["clave_par"] = clave_pb
+}
+
+funcion _ml_noise_enviar(c, m) { c["salida"] = c["salida"] + _ml_u16(longitud(m)) + m }
+funcion _ml_u16(n) { retornar char_de(piso(n / 256)) + char_de(n % 256) }
+
+// Texto plano para el canal seguro (se cifra en trozos).
+funcion _ml_seguro(c, datos) {
+    sea p = 0
+    mientras (p < longitud(datos)) {
+        sea trozo = subtexto(datos, p, minimo(longitud(datos), p + 65000))
+        _ml_noise_enviar(c, apreton_cifrar(c["transporte"], trozo))
+        p = p + 65000
+    }
+}
+
+/// Procesa bytes recibidos de la red.
+funcion malla_entrada(c, datos) {
+    c["entrada"] = c["entrada"] + datos
+    sea seguir = verdadero
+    mientras (seguir y c["cerrado"] == falso) {
+        seguir = falso
+        sea f = c["fase"]
+        si (f == "ms_seguridad") {
+            sea m = _ml_ms_leer(c, "entrada")
+            si (m != nulo) {
+                seguir = verdadero
+                si (m == "/multistream/1.0.0") {
+                    si (c["rol"] == "respondedor") { c["salida"] = c["salida"] + _ml_ms_msj("/multistream/1.0.0") }
+                } sino si (m == "/noise") {
+                    si (c["rol"] == "respondedor") { c["salida"] = c["salida"] + _ml_ms_msj("/noise") }
+                    c["noise"] = apreton_nuevo("XX", c["rol"] == "iniciador", {"estatica": c["estatica"]})
+                    c["fase"] = "noise"
+                    si (c["rol"] == "iniciador") { _ml_noise_enviar(c, apreton_escribir(c["noise"], "")) }
+                } sino si (m == "na") { _ml_fallar(c, "el otro lado no acepta /noise") }
+                sino si (c["rol"] == "respondedor") { c["salida"] = c["salida"] + _ml_ms_msj("na") }
+            }
+        } sino si (f == "noise") {
+            si (longitud(c["entrada"]) >= 2) {
+                sea l = byte_en(c["entrada"], 0) * 256 + byte_en(c["entrada"], 1)
+                si (longitud(c["entrada"]) >= 2 + l) {
+                    sea m = subtexto(c["entrada"], 2, 2 + l)
+                    c["entrada"] = subtexto(c["entrada"], 2 + l, longitud(c["entrada"]))
+                    seguir = verdadero
+                    sea carga = ""
+                    intentar { carga = apreton_leer(c["noise"], m) } capturar (e) { _ml_fallar(c, "Noise: " + e) }
+                    sea paso = c["noise"]["paso"]
+                    si (c["rol"] == "respondedor" y paso == 1) { _ml_noise_enviar(c, apreton_escribir(c["noise"], _ml_carga_noise(c))) }
+                    sino si (c["rol"] == "iniciador" y paso == 2) {
+                        _ml_verificar_carga(c, carga)
+                        _ml_noise_enviar(c, apreton_escribir(c["noise"], _ml_carga_noise(c)))
+                    } sino si (c["rol"] == "respondedor" y paso == 3) { _ml_verificar_carga(c, carga) }
+                    si (apreton_listo(c["noise"])) {
+                        c["transporte"] = apreton_transporte(c["noise"])
+                        c["fase"] = "ms_mux"
+                        si (c["rol"] == "iniciador") { _ml_seguro(c, _ml_ms_msj("/multistream/1.0.0") + _ml_ms_msj("/yamux/1.0.0")) }
+                    }
+                }
+            }
+        } sino {
+            // Canal seguro: descifrar marcos.
+            si (longitud(c["entrada"]) >= 2) {
+                sea l = byte_en(c["entrada"], 0) * 256 + byte_en(c["entrada"], 1)
+                si (longitud(c["entrada"]) >= 2 + l) {
+                    sea m = subtexto(c["entrada"], 2, 2 + l)
+                    c["entrada"] = subtexto(c["entrada"], 2 + l, longitud(c["entrada"]))
+                    intentar { c["plano"] = c["plano"] + apreton_descifrar(c["transporte"], m) } capturar (e) { _ml_fallar(c, "no se pudo descifrar un marco Noise") }
+                    seguir = verdadero
+                }
+            }
+            si (_ml_plano(c)) { seguir = verdadero }
+        }
+    }
+}
+
+// Procesa el texto plano del canal seguro; devuelve si avanzó.
+funcion _ml_plano(c) {
+    sea avanzo = falso
+    mientras (verdadero) {
+        si (c["fase"] == "ms_mux") {
+            sea m = _ml_ms_leer(c, "plano")
+            si (m == nulo) { retornar avanzo }
+            avanzo = verdadero
+            si (m == "/multistream/1.0.0") {
+                si (c["rol"] == "respondedor") { _ml_seguro(c, _ml_ms_msj("/multistream/1.0.0")) }
+            } sino si (m == "/yamux/1.0.0") {
+                si (c["rol"] == "respondedor") { _ml_seguro(c, _ml_ms_msj("/yamux/1.0.0")) }
+                c["fase"] = "yamux"
+                c["eventos"].agregar({"tipo": "conectado"})
+            } sino si (m == "na") { _ml_fallar(c, "el otro lado no acepta yamux") }
+            sino si (c["rol"] == "respondedor") { _ml_seguro(c, _ml_ms_msj("na")) }
+        } sino si (c["fase"] == "yamux") {
+            si (longitud(c["plano"]) < 12) { retornar avanzo }
+            sea d = c["plano"]
+            sea tipo_y = byte_en(d, 1)
+            sea banderas = byte_en(d, 2) * 256 + byte_en(d, 3)
+            sea id = bytes_leer_entero(d, 4, 4, 0)
+            sea largo = bytes_leer_entero(d, 8, 4, 0)
+            si (tipo_y == 0 y longitud(d) < 12 + largo) { retornar avanzo }
+            sea cuerpo = ""
+            si (tipo_y == 0) {
+                cuerpo = subtexto(d, 12, 12 + largo)
+                c["plano"] = subtexto(d, 12 + largo, longitud(d))
+            } sino { c["plano"] = subtexto(d, 12, longitud(d)) }
+            avanzo = verdadero
+            _ml_yamux(c, tipo_y, banderas, id, largo, cuerpo)
+        } sino { retornar avanzo }
+    }
+}
+
+// ---------- yamux ----------
+
+sea _ML_VENTANA = 262144
+
+funcion _ml_y_marco(tipo_y, banderas, id, largo) { retornar char_de(0) + char_de(tipo_y) + char_de(piso(banderas / 256)) + char_de(banderas % 256) + bytes_entero(id, 4, 0) + bytes_entero(largo, 4, 0) }
+
+funcion _ml_flujo_nuevo(c, id, protocolo, saliente) {
+    sea f = {"id": id, "protocolo": protocolo, "saliente": saliente, "fase": "ms", "buf": "", "datos": "", "fin_rec": falso, "fin_env": falso, "cerrado": falso,
+        "ventana_env": _ML_VENTANA, "ventana_rec": _ML_VENTANA, "pendiente": "", "abierto": falso, "aceptado": falso}
+    c["flujos"]["" + id] = f
+    retornar f
+}
+
+/// Abre un flujo con un protocolo (negocia multistream). Devuelve el id.
+funcion malla_abrir_flujo(c, protocolo) {
+    sea id = c["sig_flujo"]
+    c["sig_flujo"] = id + 2
+    sea f = _ml_flujo_nuevo(c, id, protocolo, verdadero)
+    _ml_seguro(c, _ml_y_marco(1, 1, id, 0))
+    f["abierto"] = verdadero
+    _ml_flujo_escribir_crudo(c, f, _ml_ms_msj("/multistream/1.0.0") + _ml_ms_msj(protocolo))
+    retornar id
+}
+
+funcion _ml_flujo_escribir_crudo(c, f, datos) {
+    f["pendiente"] = f["pendiente"] + datos
+    _ml_vaciar_flujo(c, f)
+}
+
+funcion _ml_vaciar_flujo(c, f) {
+    mientras (longitud(f["pendiente"]) > 0 y f["ventana_env"] > 0) {
+        sea n = minimo(minimo(longitud(f["pendiente"]), f["ventana_env"]), 16384)
+        sea trozo = subtexto(f["pendiente"], 0, n)
+        f["pendiente"] = subtexto(f["pendiente"], n, longitud(f["pendiente"]))
+        f["ventana_env"] = f["ventana_env"] - n
+        _ml_seguro(c, _ml_y_marco(0, 0, f["id"], n) + trozo)
+    }
+    si (f["fin_env"] y longitud(f["pendiente"]) == 0 y (f["fin_mandado"] ?? falso) == falso) {
+        f["fin_mandado"] = verdadero
+        _ml_seguro(c, _ml_y_marco(1, 4, f["id"], 0))
+    }
+}
+
+/// Escribe datos en un flujo (después de negociar el protocolo).
+funcion malla_flujo_escribir(c, id, datos) { _ml_flujo_escribir_crudo(c, c["flujos"]["" + id], datos) }
+
+/// Cierra el lado de escritura del flujo (FIN).
+funcion malla_flujo_cerrar(c, id) {
+    sea f = c["flujos"]["" + id]
+    f["fin_env"] = verdadero
+    _ml_vaciar_flujo(c, f)
+}
+
+/// Lee lo recibido en un flujo: {"datos", "fin", "listo" (protocolo aceptado), "rechazado"}.
+funcion malla_flujo_leer(c, id) {
+    sea f = c["flujos"]["" + id]
+    sea d = f["datos"]
+    f["datos"] = ""
+    retornar {"datos": d, "fin": f["fin_rec"], "listo": f["aceptado"], "rechazado": f["fase"] == "rechazado"}
+}
+
+funcion _ml_yamux(c, tipo_y, banderas, id, largo, cuerpo) {
+    si (tipo_y == 2) {
+        // Ping: se responde con ACK y el mismo valor.
+        si (bits_y(banderas, 1) != 0) { _ml_seguro(c, _ml_y_marco(2, 2, 0, largo)) }
+        si (bits_y(banderas, 2) != 0) { c["pings"]["" + largo] = verdadero }
+        retornar nulo
+    }
+    si (tipo_y == 3) {
+        c["cerrado"] = verdadero
+        c["eventos"].agregar({"tipo": "cerrado"})
+        retornar nulo
+    }
+    sea f = c["flujos"]["" + id] ?? nulo
+    si (f == nulo) {
+        si (bits_y(banderas, 1) == 0) { retornar nulo }
+        f = _ml_flujo_nuevo(c, id, nulo, falso)
+        // ACK con la ventana inicial.
+        _ml_seguro(c, _ml_y_marco(1, 2, id, 0))
+    }
+    si (tipo_y == 1) {
+        f["ventana_env"] = f["ventana_env"] + largo
+        _ml_vaciar_flujo(c, f)
+    } sino si (tipo_y == 0 y longitud(cuerpo) > 0) {
+        f["ventana_rec"] = f["ventana_rec"] - longitud(cuerpo)
+        si (f["ventana_rec"] < _ML_VENTANA / 2) {
+            _ml_seguro(c, _ml_y_marco(1, 0, id, _ML_VENTANA - f["ventana_rec"]))
+            f["ventana_rec"] = _ML_VENTANA
+        }
+        f["buf"] = f["buf"] + cuerpo
+    }
+    si (bits_y(banderas, 8) != 0) {
+        f["fin_rec"] = verdadero
+        f["cerrado"] = verdadero
+    }
+    si (bits_y(banderas, 4) != 0) { f["fin_rec"] = verdadero }
+    _ml_flujo_proceso(c, f)
+}
+
+// Negociación y protocolos incorporados.
+funcion _ml_flujo_proceso(c, f) {
+    si (f["fase"] == "ms") {
+        sea seguir = verdadero
+        mientras (seguir) {
+            seguir = falso
+            sea m = _ml_ms_leer(f, "buf")
+            si (m != nulo) {
+                seguir = verdadero
+                si (m == "/multistream/1.0.0") {
+                    si (f["saliente"] == falso) { _ml_flujo_escribir_crudo(c, f, _ml_ms_msj("/multistream/1.0.0")) }
+                } sino si (m == "na") {
+                    f["fase"] = "rechazado"
+                    seguir = falso
+                } sino si (f["saliente"]) {
+                    si (m == f["protocolo"]) {
+                        f["fase"] = "datos"
+                        f["aceptado"] = verdadero
+                        seguir = falso
+                    }
+                } sino {
+                    si (_ml_soporta(c, m)) {
+                        f["protocolo"] = m
+                        _ml_flujo_escribir_crudo(c, f, _ml_ms_msj(m))
+                        f["fase"] = "datos"
+                        f["aceptado"] = verdadero
+                        seguir = falso
+                        _ml_al_abrir(c, f)
+                    } sino { _ml_flujo_escribir_crudo(c, f, _ml_ms_msj("na")) }
+                }
+            }
+        }
+    }
+    si (f["fase"] == "datos") {
+        f["datos"] = f["datos"] + f["buf"]
+        f["buf"] = ""
+        si (f["saliente"] == falso) { _ml_servir(c, f) }
+    }
+}
+
+funcion _ml_soporta(c, p) { retornar p == "/ipfs/ping/1.0.0" o p == "/ipfs/id/1.0.0" o tiene_clave(c["nodo"]["protocolos"], p) }
+
+funcion _ml_al_abrir(c, f) {
+    si (f["protocolo"] == "/ipfs/id/1.0.0") {
+        malla_flujo_escribir(c, f["id"], _ml_uvarint(longitud(_ml_identify(c))) + _ml_identify(c))
+        malla_flujo_cerrar(c, f["id"])
+    }
+    c["eventos"].agregar({"tipo": "flujo", "id": f["id"], "protocolo": f["protocolo"]})
+}
+
+funcion _ml_identify(c) {
+    sea n = c["nodo"]
+    sea r = _ml_pb_bytes(5, "ipfs/0.1.0") + _ml_pb_bytes(6, n["agente"]) + _ml_pb_bytes(1, n["clave_pb"])
+    para a en n["direcciones"] { r = r + _ml_pb_bytes(2, malla_multiaddr_bytes(a)) }
+    para p en ["/ipfs/ping/1.0.0", "/ipfs/id/1.0.0"] { r = r + _ml_pb_bytes(3, p) }
+    para p en claves(n["protocolos"]) { r = r + _ml_pb_bytes(3, p) }
+    si ((c["observada"] ?? nulo) != nulo) { r = r + _ml_pb_bytes(4, c["observada"]) }
+    retornar r
+}
+
+// Protocolos entrantes: ping hace eco; los propios responden al recibir FIN.
+funcion _ml_servir(c, f) {
+    si (f["protocolo"] == "/ipfs/ping/1.0.0") {
+        mientras (longitud(f["datos"]) >= 32) {
+            malla_flujo_escribir(c, f["id"], subtexto(f["datos"], 0, 32))
+            f["datos"] = subtexto(f["datos"], 32, longitud(f["datos"]))
+        }
+        si (f["fin_rec"]) { malla_flujo_cerrar(c, f["id"]) }
+    } sino si (tiene_clave(c["nodo"]["protocolos"], f["protocolo"]) y f["fin_rec"] y (f["respondido"] ?? falso) == falso) {
+        f["respondido"] = verdadero
+        sea resp = c["nodo"]["protocolos"][f["protocolo"]](f["datos"], malla_peer_id_texto(c))
+        f["datos"] = ""
+        malla_flujo_escribir(c, f["id"], resp ?? "")
+        malla_flujo_cerrar(c, f["id"])
+    }
+}
+
+/// Registra un protocolo de pedido y respuesta: manejador(pedido, peer) → respuesta.
+funcion malla_manejar(nodo, protocolo, manejador) { nodo["protocolos"][protocolo] = manejador }
+
+/// PeerId (texto) del otro lado de la conexión.
+funcion malla_peer_id_texto(c) {
+    si (c["par"] == nulo) { retornar nulo }
+    retornar semilla_base58(c["par"])
+}
+
+/// ¿Está lista la conexión (canal seguro y yamux)?
+funcion malla_lista(c) { retornar c["fase"] == "yamux" }
+
+/// Eventos (conectado, flujo, cerrado) y los quita.
+funcion malla_eventos(c) {
+    sea r = c["eventos"]
+    c["eventos"] = []
+    retornar r
+}
+
+/// Cierra la sesión yamux (GoAway).
+funcion malla_despedir(c) {
+    si (c["fase"] == "yamux" y c["cerrado"] == falso) { _ml_seguro(c, _ml_y_marco(3, 0, 0, 0)) }
+    c["cerrado"] = verdadero
+}
+
+// ---------- sobre TCP ----------
+
+// Bombea la conexión hasta que cond(c) sea verdadero o pase el tiempo.
+funcion _ml_bombear(c, cond, espera_ms) {
+    sea inicio = tiempo_ms()
+    mientras (cond(c) == falso) {
+        si (tiempo_ms() - inicio > espera_ms) { lanzar "malla: tiempo de espera agotado" }
+        sea s = malla_salida(c)
+        si (longitud(s) > 0) { net_enviar(c["fd"], s) }
+        sea d = net_recibir(c["fd"], 65536)
+        si (d == "") {
+            si (c["cerrado_red"] ?? falso) { lanzar "malla: la conexión se cerró" }
+        } sino { malla_entrada(c, d) }
+        si (c["error"] != nulo) { lanzar "malla: " + c["error"] }
+    }
+    sea s = malla_salida(c)
+    si (longitud(s) > 0) { net_enviar(c["fd"], s) }
+}
+
+/// Conecta a un multiaddr (/ip4/…/tcp/…[/p2p/…] o /dns/…/tcp/…).
+funcion malla_conectar(nodo, multiaddr) {
+    sea host = nulo
+    sea puerto = nulo
+    sea esperado = nulo
+    para p en malla_multiaddr(multiaddr) {
+        si (p[0] == "ip4" o p[0] == "dns" o p[0] == "dns4" o p[0] == "ip6") { host = p[1] }
+        si (p[0] == "tcp") { puerto = a_numero(p[1]) }
+        si (p[0] == "p2p" o p[0] == "ipfs") { esperado = malla_peer_id_bytes(p[1]) }
+    }
+    si (host == nulo o puerto == nulo) { lanzar "malla: el multiaddr necesita una IP o DNS y un puerto TCP" }
+    sea fd = net_conectar(host, puerto)
+    net_espera(fd, 50)
+    sea c = malla_conexion(nodo, "iniciador", esperado)
+    c["fd"] = fd
+    c["observada"] = malla_multiaddr_bytes("/ip4/" + host + "/tcp/" + puerto)
+    _ml_bombear(c, funcion(x) { retornar malla_lista(x) }, 10000)
+    nodo["conexiones"].agregar(c)
+    retornar c
+}
+
+/// Escucha en un puerto TCP; devuelve el socket.
+funcion malla_escuchar(nodo, puerto) {
+    sea fd = socket(2, 1, 0)
+    si (fd < 0) { lanzar "malla: no se pudo crear el socket" }
+    sea uno = c_reservar(4)
+    c_escribir32(uno, 0, 1)
+    si (existe_archivo("/proc/meminfo")) { setsockopt(fd, 1, 2, uno, 4) } sino { setsockopt(fd, 65535, 4, uno, 4) }
+    c_liberar(uno)
+    sea dir = char_de(2) + char_de(0)
+    si (existe_archivo("/proc/meminfo") == falso) { dir = char_de(16) + char_de(2) }
+    dir = dir + char_de(piso(puerto / 256)) + char_de(puerto % 256)
+    mientras (longitud(dir) < 16) { dir = dir + char_de(0) }
+    sea pd = c_desde_bytes(dir)
+    sea r = bind(fd, pd, 16)
+    c_liberar(pd)
+    si (r != 0) {
+        close(fd)
+        lanzar "malla: no se pudo escuchar en el puerto " + puerto
+    }
+    listen(fd, 16)
+    nodo["direcciones"].agregar("/ip4/127.0.0.1/tcp/" + puerto)
+    retornar fd
+}
+
+/// Acepta una conexión y hace el apretón como respondedor.
+funcion malla_aceptar(nodo, escucha) {
+    sea fd = accept(escucha, c_reservar(16), c_reservar(4))
+    si (fd < 0) { lanzar "malla: accept falló" }
+    net_espera(fd, 50)
+    sea c = malla_conexion(nodo, "respondedor", nulo)
+    c["fd"] = fd
+    _ml_bombear(c, funcion(x) { retornar malla_lista(x) }, 10000)
+    nodo["conexiones"].agregar(c)
+    retornar c
+}
+
+/// Atiende la conexión (protocolos entrantes) durante ms milisegundos o
+/// hasta que el otro la cierre.
+funcion malla_atender(c, ms) {
+    intentar { _ml_bombear(c, funcion(x) { retornar x["cerrado"] }, ms) } capturar (e) { }
+}
+
+/// Ping: devuelve el tiempo de ida y vuelta en ms.
+funcion malla_ping(c) {
+    sea id = malla_abrir_flujo(c, "/ipfs/ping/1.0.0")
+    sea dato = bytes_aleatorios(32)
+    sea t0 = tiempo_ms()
+    malla_flujo_escribir(c, id, dato)
+    sea acum = [""]
+    _ml_bombear(c, funcion(x) {
+        sea l = malla_flujo_leer(x, id)
+        acum[0] = acum[0] + l["datos"]
+        si (l["rechazado"]) { lanzar "malla: el otro no acepta ping" }
+        retornar longitud(acum[0]) >= 32
+    }, 10000)
+    si (subtexto(acum[0], 0, 32) != dato) { lanzar "malla: el ping volvió distinto" }
+    malla_flujo_cerrar(c, id)
+    retornar tiempo_ms() - t0
+}
+
+/// Identify: {"agente", "version", "protocolos", "direcciones", "observada", "peer_id"}.
+funcion malla_identificar(c) {
+    sea id = malla_abrir_flujo(c, "/ipfs/id/1.0.0")
+    sea acum = [""]
+    _ml_bombear(c, funcion(x) {
+        sea l = malla_flujo_leer(x, id)
+        acum[0] = acum[0] + l["datos"]
+        si (l["rechazado"]) { lanzar "malla: el otro no acepta identify" }
+        retornar l["fin"]
+    }, 10000)
+    retornar malla_identify_leer(acum[0])
+}
+
+/// Decodifica un mensaje identify (con su largo adelante).
+funcion malla_identify_leer(d) {
+    sea l = _ml_leer_uvarint(d, 0)
+    sea campos = _ml_pb_leer(subtexto(d, l[1], l[1] + l[0]))
+    sea dirs = []
+    para a en campos["2"] ?? [] { intentar { dirs.agregar(malla_multiaddr_texto(a)) } capturar (e) { } }
+    sea obs = nulo
+    si (tiene_clave(campos, "4")) { intentar { obs = malla_multiaddr_texto(campos["4"][0]) } capturar (e) { } }
+    sea pid = nulo
+    si (tiene_clave(campos, "1")) { pid = semilla_base58(_ml_peer_id_de_clave(campos["1"][0])) }
+    retornar {"version": (campos["5"] ?? [""])[0], "agente": (campos["6"] ?? [""])[0], "protocolos": campos["3"] ?? [], "direcciones": dirs, "observada": obs, "peer_id": pid}
+}
+
+/// Pedido y respuesta con un protocolo propio: manda datos, cierra y espera la respuesta.
+funcion malla_pedir(c, protocolo, datos) {
+    sea id = malla_abrir_flujo(c, protocolo)
+    malla_flujo_escribir(c, id, datos)
+    malla_flujo_cerrar(c, id)
+    sea acum = [""]
+    _ml_bombear(c, funcion(x) {
+        sea l = malla_flujo_leer(x, id)
+        acum[0] = acum[0] + l["datos"]
+        si (l["rechazado"]) { lanzar "malla: el otro no acepta " + protocolo }
+        retornar l["fin"]
+    }, 10000)
+    retornar acum[0]
+}
+
+/// Cierra la conexión TCP.
+funcion malla_cerrar(c) {
+    intentar {
+        malla_despedir(c)
+        sea s = malla_salida(c)
+        si (longitud(s) > 0) { net_enviar(c["fd"], s) }
+    } capturar (e) { }
+    net_cerrar(c["fd"])
+}

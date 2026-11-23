@@ -69,6 +69,18 @@ Sitio oficial: [c-forge.org](https://c-forge.org)
   `llamada`/`protobuf` (.proto, binario como protoc, marcos gRPC),
   `recolecta`/`crawler` (cookies RFC 6265, formularios, robots.txt,
   rastreo) y `sensor`/`mqtt` (paquetes MQTT, QoS 2, mini broker).
+- Lote 28 de bibliotecas (con alias en inglés y pruebas en ambos idiomas):
+  `malla`/`libp2p` (libp2p propio: identidad Ed25519 y PeerId, multiaddr,
+  multistream-select, Noise XX con la firma de libp2p, yamux, identify,
+  ping y protocolos propios; interopera con js-libp2p en los dos sentidos)
+  y `analiza`/`code_analysis` (el compilador como servicio: tokens, árbol
+  con recuperación de errores, diagnósticos, definición, referencias,
+  completado, información, renombrar, símbolos y plegado; lee los 405
+  módulos de la stdlib sin errores de sintaxis) y `solido`/`jolt` (física
+  3D de cuerpos rígidos: esferas, cajas, cápsulas y planos, contactos con
+  SAT y recorte, solver con arranque en caliente, fricción y rebote,
+  restricciones de punto, distancia/cuerda, bisagra con límites y fija,
+  islas, sueño, rayos y consultas por esfera).
 - `aes_gcm_cifrar` y `aes_gcm_descifrar` aceptan claves de 16 bytes
   (AES-128-GCM) además de las de 32.
 - Lote 27 de bibliotecas (con alias en inglés y pruebas en ambos idiomas):

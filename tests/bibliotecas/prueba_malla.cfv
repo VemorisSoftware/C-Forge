@@ -1,0 +1,79 @@
+// Pruebas de malla (libp2p): identidad, multiaddr y conexión en memoria.
+importar "malla"
+funcion eq(a, b, q) { afirmar(("" + a) == ("" + b), q + ": [" + a + "] != [" + b + "]") }
+
+// PeerId de una semilla fija (el mismo que calculan go-libp2p y js-libp2p).
+sea a = malla_nodo({"semilla": bytes_de_hex("0101010101010101010101010101010101010101010101010101010101010101"), "agente": "nodo-a"})
+eq(malla_peer_id(a), "12D3KooWK99VoVxNE7XzyBwXEzW7xhK7Gpv85r9F3V3fyKSUKPH5", "PeerId")
+eq(malla_peer_id_bytes(malla_peer_id(a)), a["id"], "PeerId de ida y vuelta")
+// Multiaddr.
+eq(hex_de_bytes(malla_multiaddr_bytes("/ip4/127.0.0.1/tcp/4001")), "047f000001060fa1", "ip4/tcp")
+eq(hex_de_bytes(malla_multiaddr_bytes("/ip4/1.2.3.4/udp/443/quic-v1")), "0401020304910201bbcd03", "udp/quic-v1")
+eq(malla_multiaddr_texto(malla_multiaddr_bytes("/ip6/::1/tcp/80")), "/ip6/0:0:0:0:0:0:0:1/tcp/80", "ip6")
+sea ma = "/dns4/ejemplo.cl/tcp/443/p2p/" + malla_peer_id(a)
+eq(malla_multiaddr_texto(malla_multiaddr_bytes(ma)), ma, "dns4 y p2p")
+eq(malla_multiaddr("/ip4/10.0.0.1/tcp/1/p2p/x"), [["ip4", "10.0.0.1"], ["tcp", "1"], ["p2p", "x"]], "partes")
+
+// Dos nodos en memoria.
+sea b = malla_nodo({"agente": "nodo-b"})
+malla_manejar(b, "/eco/1.0.0", funcion(pedido, peer) { retornar "eco(" + longitud(pedido) + "):" + subtexto(pedido, 0, 10) })
+funcion pasar(x, y) {
+    sea i = 0
+    mientras (i < 30) {
+        malla_entrada(y, malla_salida(x))
+        malla_entrada(x, malla_salida(y))
+        i = i + 1
+    }
+}
+sea ca = malla_conexion(a, "iniciador", b["id"])
+sea cb = malla_conexion(b, "respondedor", nulo)
+pasar(ca, cb)
+afirmar(malla_lista(ca) y malla_lista(cb), "Noise y yamux listos")
+eq([malla_peer_id_texto(ca), malla_peer_id_texto(cb)], [malla_peer_id(b), malla_peer_id(a)], "identidades verificadas")
+// Pedido y respuesta.
+sea f = malla_abrir_flujo(ca, "/eco/1.0.0")
+malla_flujo_escribir(ca, f, "hola mundo!")
+malla_flujo_cerrar(ca, f)
+pasar(ca, cb)
+eq(malla_flujo_leer(ca, f)["datos"], "eco(11):hola mundo", "eco")
+// Más que la ventana de yamux (256 KiB): hacen falta actualizaciones de ventana.
+sea grande = ""
+mientras (longitud(grande) < 300000) { grande = grande + "0123456789abcdef" }
+sea f2 = malla_abrir_flujo(ca, "/eco/1.0.0")
+malla_flujo_escribir(ca, f2, grande)
+malla_flujo_cerrar(ca, f2)
+pasar(ca, cb)
+eq(malla_flujo_leer(ca, f2)["datos"], "eco(300000):0123456789", "300 KB por yamux")
+// Identify.
+sea f3 = malla_abrir_flujo(ca, "/ipfs/id/1.0.0")
+pasar(ca, cb)
+sea inf = malla_identify_leer(malla_flujo_leer(ca, f3)["datos"])
+eq([inf["agente"], inf["peer_id"], contiene(inf["protocolos"], "/eco/1.0.0")], ["nodo-b", malla_peer_id(b), verdadero], "identify")
+// Ping.
+sea f4 = malla_abrir_flujo(ca, "/ipfs/ping/1.0.0")
+sea dato = bytes_aleatorios(32)
+malla_flujo_escribir(ca, f4, dato)
+pasar(ca, cb)
+eq(malla_flujo_leer(ca, f4)["datos"] == dato, verdadero, "ping")
+// Protocolo que el otro no tiene.
+sea f5 = malla_abrir_flujo(ca, "/no/existe/1.0.0")
+pasar(ca, cb)
+afirmar(malla_flujo_leer(ca, f5)["rechazado"], "na")
+// Ping de yamux.
+malla_entrada(cb, "")
+cb["salida"] = cb["salida"]
+_ml_seguro(ca, _ml_y_marco(2, 1, 0, 77))
+pasar(ca, cb)
+afirmar(tiene_clave(ca["pings"], "77"), "ping de yamux")
+// GoAway.
+malla_despedir(ca)
+pasar(ca, cb)
+afirmar(cb["cerrado"], "go away")
+// Si el otro no es el PeerId esperado, se corta.
+sea otro = malla_nodo(nulo)
+sea cx = malla_conexion(a, "iniciador", otro["id"])
+sea cy = malla_conexion(b, "respondedor", nulo)
+sea msj = ""
+intentar { pasar(cx, cy) } capturar (e) { msj = e }
+afirmar(contiene(msj, "PeerId esperado"), "PeerId equivocado")
+mostrar("[OK] malla")
