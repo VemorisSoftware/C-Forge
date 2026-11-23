@@ -196,7 +196,7 @@ Estado: ✅ ya existe en C-Forge · 🔗 se usa hoy vía `cforge bindgen`,
 | 140 | `vigia` / `notify` | Vigilar cambios en archivos | Notify | ✅ `vigia` |
 | 141 | `rastreo` / `glob` | Búsqueda recursiva con comodines | Walkdir, Glob | ✅ `rastreo` |
 | 142 | `sistema` / `sysinfo` | CPU, RAM y procesos | sysinfo | ✅ `sistema` |
-| 143 | `historia` | Repositorios Git nativos | libgit2 | 🔗 |
+| 143 | `historia` | Repositorios Git nativos | libgit2 | ✅ `historia` / `libgit2` |
 | 144 | `contenedor` / `docker` | Controlar Docker | Bollard | ✅ `contenedor` |
 | 145 | `version` | Versionado semántico | semver | ✅ gestor de paquetes |
 | 146 | `cronometro` / `bench` | Micro-benchmarks estadísticos | Criterion | ✅ `cronometro` |
@@ -232,20 +232,20 @@ Estado: ✅ ya existe en C-Forge · 🔗 se usa hoy vía `cforge bindgen`,
 
 | # | Nombre | Para qué | Inspiración | Estado |
 |---|---|---|---|---|
-| 167 | `territorio` | Datos geoespaciales | GDAL | 🔗 |
-| 168 | `proyeccion` | Sistemas de coordenadas | PROJ | 🔗 |
+| 167 | `territorio` | Datos geoespaciales | GDAL | ✅ `territorio` / `gdal` (vectoriales) |
+| 168 | `proyeccion` | Sistemas de coordenadas | PROJ | ✅ `proyeccion` / `proj` |
 | 169 | `geometria` / `geo` | Operaciones espaciales | GEOS, Turf | ✅ `geometria` |
 | 170 | `panal` / `hexgrid` | Índice hexagonal del planeta | H3 | ✅ `panal` |
 | 171 | `ciencia` / `science` | Optimización e interpolación | SciPy | ✅ `ciencia` |
 | 172 | `fourier` / `fft` | FFT rápida | FFTW | ✅ `fourier` |
-| 173 | `blas` | Matrices de alto rendimiento | OpenBLAS | 🔗 |
+| 173 | `blas` | Matrices de alto rendimiento | OpenBLAS | ✅ `blas` / `openblas` |
 | 174 | `malla_geo` / `geometry2d` | Geometría computacional | CGAL | ✅ `malla_geo` |
 | 175 | `robotica` | Física para robótica | MuJoCo | 🔗 |
 | 176 | `cuaternion` / `quaternion` | Álgebra lineal y transformaciones | nalgebra | ✅ `cuaternion` |
 | 177 | `astro` / `astronomy` | Órbitas y efemérides | NOVAS | ✅ `astro` |
 | 178 | `molecula` | Quimioinformática | RDKit | 🔗 |
 | 179 | `genoma` / `bio` | Bioinformática | Rust-Bio | ✅ `genoma` |
-| 180 | `cientifica` | Funciones especiales y EDO | GSL | 🔗 |
+| 180 | `cientifica` | Funciones especiales y EDO | GSL | ✅ `cientifica` / `gsl` |
 | 181 | `grafos` / `graph` | Grafos y rutas | petgraph | ✅ `grafos` |
 
 ### J. Motores de juego y realidad virtual
