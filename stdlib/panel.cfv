@@ -1,0 +1,1138 @@
+// stdlib/panel.cfv — GUI de modo inmediato al estilo de Dear ImGui, en
+// C-Forge puro. Cada cuadro se describe la interfaz con llamadas simples
+// (si (panel_boton(ctx, "Guardar")) { … }) y el panel devuelve una lista de
+// comandos de dibujo (rectángulos, texto, líneas, triángulos, cada uno con
+// su recorte) que se pintan en un lienzo de "graficos" o en cualquier otro
+// motor. Ventanas que se mueven, se pliegan, cambian de tamaño, se apilan y
+// se desplazan con la rueda; texto, botones, casillas, radios,
+// deslizadores, arrastres, entrada de texto con cursor, combos, listas,
+// seleccionables, árboles, cabeceras plegables, pestañas, tablas, barra de
+// progreso, editor de color, ayudas emergentes y filas con columnas fijas.
+// La entrada (ratón, rueda, teclas y texto) la pasa el programa en cada
+// cuadro, así que funciona igual con SDL, X11, el navegador o pruebas.
+// Idea de Dear ImGui (MIT), escrito desde cero. En inglés: importar "imgui".
+//
+//   importar "panel"
+//   sea ctx = panel_contexto(nulo)
+//   sea v = 0.5
+//   panel_cuadro(ctx, {"raton": [10, 10], "botones": [falso, falso, falso]})
+//   si (panel_ventana(ctx, "Hola", {"x": 20, "y": 20, "ancho": 240, "alto": 160})) {
+//       panel_texto(ctx, "¡Hola, C-Forge!")
+//       v = panel_deslizador(ctx, "valor", v, 0, 1, nulo)
+//       si (panel_boton(ctx, "Aceptar", nulo)) { mostrar("clic") }
+//   }
+//   panel_fin_ventana(ctx)
+//   sea lista = panel_terminar(ctx)
+//   sea l = lienzo_crear(320, 240)
+//   panel_dibujar(l, ctx, lista)
+
+importar "graficos"
+importar "fuente"
+
+funcion _pl_estilo_oscuro() {
+    retornar {
+        "fondo_ventana": [15, 15, 15, 240], "titulo": [10, 10, 10, 255], "titulo_activo": [41, 74, 122, 255],
+        "borde": [110, 110, 128, 128], "marco": [41, 74, 122, 138], "marco_caliente": [66, 150, 250, 102], "marco_activo": [66, 150, 250, 171],
+        "boton": [66, 150, 250, 102], "boton_caliente": [66, 150, 250, 255], "boton_activo": [15, 135, 250, 255],
+        "texto": [255, 255, 255, 255], "texto_apagado": [128, 128, 128, 255], "marca": [66, 150, 250, 255],
+        "agarre": [61, 133, 224, 255], "agarre_activo": [66, 150, 250, 255],
+        "cabecera": [66, 150, 250, 79], "cabecera_caliente": [66, 150, 250, 204], "cabecera_activa": [66, 150, 250, 255],
+        "separador": [110, 110, 128, 128], "barra": [5, 5, 5, 135], "barra_agarre": [79, 79, 79, 255],
+        "popup": [20, 20, 20, 240], "progreso": [230, 179, 0, 255], "seleccion": [66, 150, 250, 89],
+        "relleno": 8, "espacio": 4, "relleno_marco": 4, "redondeo": 0, "sangria": 16, "barra_ancho": 10
+    }
+}
+
+funcion _pl_estilo_claro() {
+    sea e = _pl_estilo_oscuro()
+    e["fondo_ventana"] = [240, 240, 240, 255]
+    e["titulo"] = [244, 244, 244, 255]
+    e["titulo_activo"] = [209, 209, 209, 255]
+    e["texto"] = [0, 0, 0, 255]
+    e["texto_apagado"] = [153, 153, 153, 255]
+    e["marco"] = [255, 255, 255, 255]
+    e["borde"] = [0, 0, 0, 77]
+    e["popup"] = [255, 255, 255, 250]
+    e["barra"] = [250, 250, 250, 135]
+    e["barra_agarre"] = [175, 175, 175, 204]
+    retornar e
+}
+
+/// Crea un contexto. opciones: "fuente" (de "fuente"; por defecto la de
+/// mapa de bits 6×12), "tam" (alto del texto), "estilo" ("oscuro", "claro"
+/// o un mapa con los colores que cambian).
+funcion panel_contexto(opciones) {
+    sea op = opciones ?? {}
+    sea estilo = _pl_estilo_oscuro()
+    sea e = op["estilo"] ?? "oscuro"
+    si (e == "claro") { estilo = _pl_estilo_claro() }
+    sino si (tipo(e) == "mapa") { para k en claves(e) { estilo[k] = e[k] } }
+    sea f = op["fuente"] ?? nulo
+    si (f == nulo) { f = fuente_basica() }
+    retornar {
+        "fuente": f, "tam": op["tam"] ?? 12, "estilo": estilo,
+        "ventanas": {}, "orden": [], "estado": {}, "activo": nulo, "foco": nulo,
+        "entrada": {"raton": [-1, -1], "botones": [falso, falso, falso], "rueda": 0, "teclas": [], "texto": ""},
+        "antes": [falso, falso, falso], "cuadro": 0, "pila": [], "actual": nulo,
+        "ultimo": {"id": nulo, "rect": [0, 0, 0, 0], "caliente": falso, "cambio": falso},
+        "popup": nulo, "popup_pedido": nulo, "ayuda": nulo, "bajo_raton": nulo, "quiere_raton": falso, "quiere_teclado": falso
+    }
+}
+
+// ---------- utilidades ----------
+
+funcion _pl_etiqueta(t) {
+    sea i = texto_indice(t, "##")
+    si (i < 0) { retornar t }
+    retornar subtexto(t, 0, i)
+}
+
+funcion _pl_ancho(ctx, t) { retornar texto_medir(ctx["fuente"], t, ctx["tam"])["ancho"] }
+
+funcion _pl_dentro(p, r) { retornar p[0] >= r[0] y p[1] >= r[1] y p[0] < r[0] + r[2] y p[1] < r[1] + r[3] }
+
+funcion _pl_interseccion(a, b) {
+    sea x0 = maximo(a[0], b[0])
+    sea y0 = maximo(a[1], b[1])
+    sea x1 = minimo(a[0] + a[2], b[0] + b[2])
+    sea y1 = minimo(a[1] + a[3], b[1] + b[3])
+    retornar [x0, y0, maximo(0, x1 - x0), maximo(0, y1 - y0)]
+}
+
+funcion _pl_limitar(v, a, b) {
+    si (v < a) { retornar a }
+    si (v > b) { retornar b }
+    retornar v
+}
+
+funcion _pl_utf8(cp) {
+    si (cp < 128) { retornar char_de(cp) }
+    si (cp < 2048) { retornar char_de(192 + piso(cp / 64)) + char_de(128 + cp % 64) }
+    si (cp < 65536) { retornar char_de(224 + piso(cp / 4096)) + char_de(128 + piso(cp / 64) % 64) + char_de(128 + cp % 64) }
+    retornar char_de(240 + piso(cp / 262144)) + char_de(128 + piso(cp / 4096) % 64) + char_de(128 + piso(cp / 64) % 64) + char_de(128 + cp % 64)
+}
+
+funcion _pl_de_codigos(cs, desde, hasta) {
+    sea r = ""
+    sea i = desde
+    mientras (i < hasta) {
+        r = r + _pl_utf8(cs[i])
+        i = i + 1
+    }
+    retornar r
+}
+
+funcion _pl_tecla(ctx, nombre) { retornar contiene(ctx["entrada"]["teclas"] ?? [], nombre) }
+
+funcion _pl_pulsado(ctx, b) { retornar ctx["entrada"]["botones"][b] y ctx["antes"][b] == falso }
+funcion _pl_soltado(ctx, b) { retornar ctx["entrada"]["botones"][b] == falso y ctx["antes"][b] }
+funcion _pl_abajo(ctx, b) { retornar ctx["entrada"]["botones"][b] }
+
+funcion _pl_fmt(v, dec) {
+    si (dec <= 0) { retornar "" + redondear(v) }
+    sea k = potencia(10, dec)
+    sea n = redondear(abs(v) * k)
+    sea ent = piso(n / k)
+    sea fr = "" + (n % k)
+    mientras (longitud(fr) < dec) { fr = "0" + fr }
+    sea s = ""
+    si (v < 0 y n != 0) { s = "-" }
+    retornar s + ent + "." + fr
+}
+
+// ---------- comandos de dibujo ----------
+
+funcion _pl_cmd(ctx, c) {
+    sea w = ctx["actual"]
+    c["recorte"] = w["recorte"]
+    w["cmds"].agregar(c)
+}
+
+funcion _pl_rect(ctx, r, color, radio) { _pl_cmd(ctx, {"t": "rect", "r": r, "c": color, "radio": radio ?? 0}) }
+funcion _pl_borde(ctx, r, color) { _pl_cmd(ctx, {"t": "borde", "r": r, "c": color}) }
+funcion _pl_texto_en(ctx, x, py, t, color) { _pl_cmd(ctx, {"t": "texto", "x": x, "y": py, "texto": t, "c": color}) }
+funcion _pl_linea(ctx, x0, y0, x1, y1, color) { _pl_cmd(ctx, {"t": "linea", "p": [x0, y0, x1, y1], "c": color}) }
+funcion _pl_tri(ctx, p, color) { _pl_cmd(ctx, {"t": "tri", "p": p, "c": color}) }
+
+funcion _pl_flecha(ctx, x, py, tam, abajo, color) {
+    si (abajo) { _pl_tri(ctx, [x, py + tam * 0.25, x + tam, py + tam * 0.25, x + tam / 2, py + tam * 0.85], color) }
+    sino { _pl_tri(ctx, [x + tam * 0.25, py, x + tam * 0.85, py + tam / 2, x + tam * 0.25, py + tam], color) }
+}
+
+// ---------- cuadro ----------
+
+/// Empieza un cuadro con la entrada actual: "raton" [x, y], "botones"
+/// [izquierdo, derecho, medio], "rueda" (líneas, positivo hacia arriba),
+/// "teclas" (lista: izquierda, derecha, arriba, abajo, inicio, fin,
+/// retroceso, suprimir, intro, tab, escape) y "texto" (lo tecleado).
+funcion panel_cuadro(ctx, entrada) {
+    sea e = entrada ?? {}
+    ctx["entrada"] = {"raton": e["raton"] ?? [-1, -1], "botones": e["botones"] ?? [falso, falso, falso], "rueda": e["rueda"] ?? 0, "teclas": e["teclas"] ?? [], "texto": e["texto"] ?? ""}
+    ctx["cuadro"] = ctx["cuadro"] + 1
+    // Ventana bajo el ratón según las posiciones del cuadro anterior (de arriba hacia abajo).
+    sea bajo = nulo
+    si (ctx["popup"] != nulo y _pl_dentro(ctx["entrada"]["raton"], ctx["popup"]["rect"])) { bajo = "##popup" }
+    sea i = longitud(ctx["orden"]) - 1
+    mientras (bajo == nulo y i >= 0) {
+        sea w = ctx["ventanas"][ctx["orden"][i]]
+        si (w["visto"] == ctx["cuadro"] - 1 y _pl_dentro(ctx["entrada"]["raton"], w["rect"])) { bajo = ctx["orden"][i] }
+        i = i - 1
+    }
+    ctx["bajo_raton"] = bajo
+    si (_pl_pulsado(ctx, 0)) {
+        si (bajo != nulo y bajo != "##popup") { _pl_al_frente(ctx, bajo) }
+        // Clic fuera del popup lo cierra.
+        si (ctx["popup"] != nulo y bajo != "##popup") { ctx["popup"] = nulo }
+        // Clic fuera del campo de texto le quita el foco.
+        ctx["foco_pedido"] = nulo
+    }
+    ctx["popup_pedido"] = ctx["popup"]
+    ctx["ayuda"] = nulo
+    ctx["pila"] = []
+    ctx["listas"] = []
+    ctx["hubo_foco"] = falso
+}
+
+funcion _pl_al_frente(ctx, titulo) {
+    sea n = []
+    para t en ctx["orden"] { si (t != titulo) { n.agregar(t) } }
+    n.agregar(titulo)
+    ctx["orden"] = n
+}
+
+/// Termina el cuadro y devuelve la lista de comandos de dibujo en orden.
+funcion panel_terminar(ctx) {
+    sea lista = []
+    para t en ctx["orden"] {
+        sea w = ctx["ventanas"][t]
+        si (w["visto"] == ctx["cuadro"]) { para c en w["cmds"] { lista.agregar(c) } }
+    }
+    si (ctx["popup"] != nulo y tiene_clave(ctx["popup"], "cmds")) { para c en ctx["popup"]["cmds"] { lista.agregar(c) } }
+    si (ctx["ayuda"] != nulo) { para c en ctx["ayuda"] { lista.agregar(c) } }
+    si (_pl_abajo(ctx, 0) == falso y _pl_abajo(ctx, 1) == falso) { ctx["activo"] = nulo }
+    si (_pl_pulsado(ctx, 0) y ctx["hubo_foco"] == falso) { ctx["foco"] = nulo }
+    ctx["quiere_raton"] = ctx["bajo_raton"] != nulo o ctx["activo"] != nulo
+    ctx["quiere_teclado"] = ctx["foco"] != nulo
+    ctx["antes"] = [ctx["entrada"]["botones"][0], ctx["entrada"]["botones"][1], ctx["entrada"]["botones"][2]]
+    ctx["ultima_lista"] = lista
+    retornar lista
+}
+
+/// ¿El ratón está sobre la interfaz (y el programa debería ignorarlo)?
+funcion panel_quiere_raton(ctx) { retornar ctx["quiere_raton"] }
+/// ¿Hay un campo de texto con el foco?
+funcion panel_quiere_teclado(ctx) { retornar ctx["quiere_teclado"] }
+
+// ---------- ventanas ----------
+
+/// Abre una ventana. opciones: "x", "y", "ancho", "alto" (iniciales),
+/// "fija" (no se mueve), "sin_titulo", "sin_redimensionar", "plegada".
+/// Devuelve si el contenido está visible. Siempre hay que llamar a
+/// panel_fin_ventana.
+funcion panel_ventana(ctx, titulo, opciones) {
+    sea op = opciones ?? {}
+    sea es = ctx["estilo"]
+    si (tiene_clave(ctx["ventanas"], titulo) == falso) {
+        ctx["ventanas"][titulo] = {"x": op["x"] ?? 60, "y": op["y"] ?? 60, "ancho": op["ancho"] ?? 300, "alto": op["alto"] ?? 200, "plegada": op["plegada"] ?? falso, "scroll": 0, "contenido": 0, "visto": -1, "rect": [0, 0, 0, 0]}
+        ctx["orden"].agregar(titulo)
+    }
+    sea w = ctx["ventanas"][titulo]
+    w["visto"] = ctx["cuadro"]
+    w["cmds"] = []
+    w["titulo"] = titulo
+    w["op"] = op
+    sea alto_titulo = ctx["tam"] + es["relleno_marco"] * 2
+    si (op["sin_titulo"] ?? falso) { alto_titulo = 0 }
+    sea arriba = ctx["orden"][longitud(ctx["orden"]) - 1] == titulo
+    sea encima = ctx["bajo_raton"] == titulo
+    sea raton = ctx["entrada"]["raton"]
+    // Mover, plegar y cambiar de tamaño.
+    sea r_titulo = [w["x"], w["y"], w["ancho"], alto_titulo]
+    sea r_plegar = [w["x"] + es["relleno_marco"], w["y"], ctx["tam"] + 2, alto_titulo]
+    sea r_tam = [w["x"] + w["ancho"] - 12, w["y"] + w["alto"] - 12, 12, 12]
+    si (encima y _pl_pulsado(ctx, 0)) {
+        si (alto_titulo > 0 y _pl_dentro(raton, r_plegar)) { w["plegada"] = w["plegada"] == falso }
+        sino si (w["plegada"] == falso y (op["sin_redimensionar"] ?? falso) == falso y _pl_dentro(raton, r_tam)) {
+            ctx["activo"] = titulo + "#tam"
+            ctx["agarre"] = [raton[0] - w["ancho"], raton[1] - w["alto"]]
+        } sino si ((op["fija"] ?? falso) == falso y (_pl_dentro(raton, r_titulo) o alto_titulo == 0)) {
+            ctx["activo"] = titulo + "#mover"
+            ctx["agarre"] = [raton[0] - w["x"], raton[1] - w["y"]]
+        } sino si (_pl_dentro(raton, [w["x"], w["y"], w["ancho"], w["alto"]])) {
+            // El fondo también mueve la ventana (como en ImGui) si nada más toma el clic.
+            si ((op["fija"] ?? falso) == falso) {
+                ctx["activo"] = titulo + "#fondo"
+                ctx["agarre"] = [raton[0] - w["x"], raton[1] - w["y"]]
+            }
+        }
+    }
+    si (_pl_abajo(ctx, 0)) {
+        si (ctx["activo"] == titulo + "#mover" o ctx["activo"] == titulo + "#fondo") {
+            w["x"] = raton[0] - ctx["agarre"][0]
+            w["y"] = raton[1] - ctx["agarre"][1]
+        } sino si (ctx["activo"] == titulo + "#tam") {
+            w["ancho"] = maximo(80, raton[0] - ctx["agarre"][0])
+            w["alto"] = maximo(alto_titulo + 30, raton[1] - ctx["agarre"][1])
+        }
+    }
+    sea alto_vis = w["alto"]
+    si (w["plegada"]) { alto_vis = alto_titulo }
+    w["rect"] = [w["x"], w["y"], w["ancho"], alto_vis]
+    sea todo = [-100000, -100000, 200000, 200000]
+    sea marco = {"titulo": titulo, "cmds": w["cmds"], "recorte": todo, "w": w}
+    ctx["pila"].agregar(marco)
+    ctx["actual"] = marco
+    // Fondo y título.
+    si (w["plegada"] == falso) { _pl_rect(ctx, [w["x"], w["y"], w["ancho"], w["alto"]], es["fondo_ventana"], es["redondeo"]) }
+    si (alto_titulo > 0) {
+        sea ct = es["titulo"]
+        si (arriba) { ct = es["titulo_activo"] }
+        _pl_rect(ctx, r_titulo, ct, 0)
+        _pl_flecha(ctx, w["x"] + es["relleno_marco"] + 1, w["y"] + es["relleno_marco"], ctx["tam"] - 2, w["plegada"] == falso, es["texto"])
+        marco["recorte"] = [w["x"], w["y"], w["ancho"] - 4, alto_titulo]
+        _pl_texto_en(ctx, w["x"] + es["relleno_marco"] * 2 + ctx["tam"] + 2, w["y"] + es["relleno_marco"], _pl_etiqueta(titulo), es["texto"])
+        marco["recorte"] = todo
+    }
+    _pl_borde(ctx, w["rect"], es["borde"])
+    // Zona de contenido.
+    sea cx = w["x"] + es["relleno"]
+    sea cy = w["y"] + alto_titulo + es["relleno"]
+    sea ancho_c = w["ancho"] - es["relleno"] * 2
+    sea alto_c = w["alto"] - alto_titulo - es["relleno"] * 2
+    si (w["contenido"] > alto_c) { ancho_c = ancho_c - es["barra_ancho"] }
+    marco["contenido_rect"] = [cx, cy, ancho_c, alto_c]
+    marco["recorte"] = [w["x"] + 1, w["y"] + alto_titulo, w["ancho"] - 2, w["alto"] - alto_titulo - 1]
+    marco["x0"] = cx
+    marco["y0"] = cy - w["scroll"]
+    marco["cx"] = cx
+    marco["cy"] = cy - w["scroll"]
+    marco["sangria"] = 0
+    marco["max_y"] = marco["cy"]
+    marco["misma"] = nulo
+    marco["prev"] = [cx, marco["cy"], 0, 0]
+    marco["fila"] = nulo
+    marco["ancho_item"] = nulo
+    marco["encima"] = encima
+    retornar w["plegada"] == falso
+}
+
+/// Cierra la ventana abierta con panel_ventana.
+funcion panel_fin_ventana(ctx) {
+    sea marco = ctx["actual"]
+    sea w = marco["w"]
+    sea es = ctx["estilo"]
+    si (w["plegada"] == falso) {
+        sea cr = marco["contenido_rect"]
+        w["contenido"] = marco["max_y"] - marco["y0"]
+        sea sobra = maximo(0, w["contenido"] - cr[3])
+        si (marco["encima"] y ctx["entrada"]["rueda"] != 0) { w["scroll"] = w["scroll"] - ctx["entrada"]["rueda"] * (ctx["tam"] + es["espacio"]) * 3 }
+        // Barra de desplazamiento.
+        si (sobra > 0) {
+            marco["recorte"] = [-100000, -100000, 200000, 200000]
+            sea bx = w["x"] + w["ancho"] - es["barra_ancho"] - 2
+            sea by = cr[1]
+            sea bh = cr[3]
+            _pl_rect(ctx, [bx, by, es["barra_ancho"], bh], es["barra"], 0)
+            sea agarre_h = maximo(12, bh * cr[3] / w["contenido"])
+            sea id = w["titulo"] + "#barra"
+            sea raton = ctx["entrada"]["raton"]
+            si (marco["encima"] y _pl_pulsado(ctx, 0) y _pl_dentro(raton, [bx, by, es["barra_ancho"], bh])) {
+                ctx["activo"] = id
+                ctx["agarre"] = [raton[1], w["scroll"]]
+            }
+            si (ctx["activo"] == id y _pl_abajo(ctx, 0)) { w["scroll"] = ctx["agarre"][1] + (raton[1] - ctx["agarre"][0]) * sobra / maximo(1, bh - agarre_h) }
+            w["scroll"] = _pl_limitar(w["scroll"], 0, sobra)
+            sea ay = by + (bh - agarre_h) * w["scroll"] / sobra
+            _pl_rect(ctx, [bx + 1, ay, es["barra_ancho"] - 2, agarre_h], es["barra_agarre"], 0)
+        } sino { w["scroll"] = 0 }
+        // Agarre para cambiar el tamaño.
+        si ((w["op"]["sin_redimensionar"] ?? falso) == falso) {
+            marco["recorte"] = [-100000, -100000, 200000, 200000]
+            sea gx = w["x"] + w["ancho"]
+            sea gy = w["y"] + w["alto"]
+            sea cg = es["boton"]
+            si (ctx["activo"] == w["titulo"] + "#tam") { cg = es["boton_activo"] }
+            _pl_tri(ctx, [gx - 1, gy - 12, gx - 1, gy - 1, gx - 12, gy - 1], cg)
+        }
+    }
+    sea p = ctx["pila"]
+    ctx["pila"] = _pl_sin_ultimo(p)
+    si (longitud(ctx["pila"]) > 0) { ctx["actual"] = ctx["pila"][longitud(ctx["pila"]) - 1] } sino { ctx["actual"] = nulo }
+}
+
+funcion _pl_sin_ultimo(l) {
+    sea r = []
+    sea i = 0
+    mientras (i < longitud(l) - 1) {
+        r.agregar(l[i])
+        i = i + 1
+    }
+    retornar r
+}
+
+// ---------- distribución ----------
+
+funcion _pl_alto_marco(ctx) { retornar ctx["tam"] + ctx["estilo"]["relleno_marco"] * 2 }
+
+funcion _pl_ancho_disponible(ctx) {
+    sea m = ctx["actual"]
+    retornar m["contenido_rect"][0] + m["contenido_rect"][2] - m["cx"]
+}
+
+// Reserva el lugar de un elemento y devuelve su rectángulo.
+funcion _pl_item(ctx, ancho, alto) {
+    sea m = ctx["actual"]
+    sea es = ctx["estilo"]
+    sea x = m["x0"] + m["sangria"]
+    sea py = m["cy"]
+    si (m["misma"] != nulo) {
+        x = m["prev"][0] + m["prev"][2] + m["misma"]
+        py = m["prev"][1]
+        m["misma"] = nulo
+    }
+    sea w = ancho
+    si (m["fila"] != nulo) {
+        sea f = m["fila"]
+        si (f["i"] >= longitud(f["anchos"])) {
+            // Fila llena: empieza otra igual.
+            f["i"] = 0
+            f["y"] = f["y"] + f["alto"] + es["espacio"]
+        }
+        sea disp = m["contenido_rect"][0] + m["contenido_rect"][2] - (m["x0"] + m["sangria"])
+        sea total = 0
+        para a en f["anchos"] { si (a > 1) { total = total + a } }
+        sea libre = disp - total - es["espacio"] * (longitud(f["anchos"]) - 1)
+        x = m["x0"] + m["sangria"]
+        sea k = 0
+        mientras (k < f["i"]) {
+            x = x + _pl_ancho_col(f["anchos"][k], libre) + es["espacio"]
+            k = k + 1
+        }
+        w = _pl_ancho_col(f["anchos"][f["i"]], libre)
+        py = f["y"]
+        alto = f["alto"]
+        f["i"] = f["i"] + 1
+        m["cy"] = py + alto + es["espacio"]
+    } sino {
+        m["cy"] = maximo(m["cy"], py + alto + es["espacio"])
+        si (m["prev"][1] == py y m["prev"][3] > alto) { m["cy"] = maximo(m["cy"], py + m["prev"][3] + es["espacio"]) }
+    }
+    si (w == nulo o w <= 0) { w = maximo(10, m["contenido_rect"][0] + m["contenido_rect"][2] - x + (w ?? 0)) }
+    m["prev"] = [x, py, w, alto]
+    m["max_y"] = maximo(m["max_y"], py + alto)
+    retornar [x, py, w, alto]
+}
+
+funcion _pl_ancho_col(a, libre) {
+    si (a > 1) { retornar a }
+    retornar maximo(4, libre * a)
+}
+
+/// El próximo elemento va en la misma línea que el anterior.
+funcion panel_misma_linea(ctx, espacio) { ctx["actual"]["misma"] = espacio ?? ctx["estilo"]["espacio"] * 2 }
+
+/// Espacio vertical.
+funcion panel_espacio(ctx, alto) { _pl_item(ctx, 1, alto ?? ctx["estilo"]["espacio"]) }
+
+/// Línea horizontal.
+funcion panel_separador(ctx) {
+    sea r = _pl_item(ctx, nulo, 1)
+    _pl_rect(ctx, [r[0], r[1], r[2], 1], ctx["estilo"]["separador"], 0)
+}
+
+funcion panel_sangrar(ctx) { ctx["actual"]["sangria"] = ctx["actual"]["sangria"] + ctx["estilo"]["sangria"] }
+funcion panel_desangrar(ctx) { ctx["actual"]["sangria"] = maximo(0, ctx["actual"]["sangria"] - ctx["estilo"]["sangria"]) }
+
+/// Ancho de los próximos elementos con ancho propio (deslizadores,
+/// entradas, combos). nulo vuelve al ancho por defecto; negativo deja ese
+/// margen a la derecha.
+funcion panel_ancho_elementos(ctx, ancho) { ctx["actual"]["ancho_item"] = ancho }
+
+/// Distribuye los próximos elementos en filas de columnas: anchos en
+/// píxeles (> 1) o fracciones del espacio que sobra (≤ 1). nulo la termina.
+funcion panel_fila(ctx, alto, anchos) {
+    sea m = ctx["actual"]
+    si (anchos == nulo) {
+        m["fila"] = nulo
+        retornar nulo
+    }
+    m["fila"] = {"alto": alto ?? _pl_alto_marco(ctx), "anchos": anchos, "i": 0, "y": m["cy"]}
+}
+
+funcion _pl_ancho_campo(ctx, etiqueta) {
+    sea m = ctx["actual"]
+    sea a = m["ancho_item"]
+    si (m["fila"] != nulo) { retornar nulo }
+    si (a == nulo) {
+        sea disp = _pl_ancho_disponible(ctx) - m["sangria"]
+        sea l = _pl_etiqueta(etiqueta)
+        si (l == "") { retornar disp }
+        retornar maximo(30, piso(disp * 0.65))
+    }
+    si (a < 0) { retornar _pl_ancho_disponible(ctx) - m["sangria"] + a }
+    retornar a
+}
+
+// Etiqueta a la derecha de un campo (como en ImGui).
+funcion _pl_etiqueta_derecha(ctx, r, etiqueta) {
+    sea l = _pl_etiqueta(etiqueta)
+    si (l != "" y ctx["actual"]["fila"] == nulo) {
+        sea m = ctx["actual"]
+        sea x = r[0] + r[2] + ctx["estilo"]["espacio"]
+        _pl_texto_en(ctx, x, r[1] + ctx["estilo"]["relleno_marco"], l, ctx["estilo"]["texto"])
+        m["prev"] = [r[0], r[1], r[2] + ctx["estilo"]["espacio"] + _pl_ancho(ctx, l), r[3]]
+        m["max_y"] = maximo(m["max_y"], r[1] + r[3])
+    }
+}
+
+// ---------- interacción ----------
+
+funcion _pl_id(ctx, etiqueta) { retornar ctx["actual"]["titulo"] + "/" + etiqueta }
+
+funcion _pl_caliente(ctx, r) {
+    sea m = ctx["actual"]
+    si (m["encima"] == falso) { retornar falso }
+    sea p = ctx["entrada"]["raton"]
+    retornar _pl_dentro(p, r) y _pl_dentro(p, m["recorte"]) y (ctx["activo"] == nulo o texto_termina_con(ctx["activo"], "#fondo"))
+}
+
+// Lógica de botón: {"caliente", "clic", "sostenido"}.
+funcion _pl_boton_logica(ctx, id, r) {
+    sea cal = _pl_caliente(ctx, r)
+    si (cal y _pl_pulsado(ctx, 0)) { ctx["activo"] = id }
+    sea sostenido = ctx["activo"] == id y _pl_abajo(ctx, 0)
+    sea clic = ctx["activo"] == id y _pl_soltado(ctx, 0) y _pl_dentro(ctx["entrada"]["raton"], r)
+    si (ctx["activo"] == id) { cal = _pl_dentro(ctx["entrada"]["raton"], r) }
+    ctx["ultimo"] = {"id": id, "rect": r, "caliente": cal, "cambio": clic, "activo": ctx["activo"] == id}
+    retornar {"caliente": cal, "clic": clic, "sostenido": sostenido}
+}
+
+/// ¿El ratón está sobre el último elemento?
+funcion panel_ultimo_caliente(ctx) { retornar ctx["ultimo"]["caliente"] }
+/// ¿El último elemento cambió su valor (o se hizo clic) en este cuadro?
+funcion panel_ultimo_cambio(ctx) { retornar ctx["ultimo"]["cambio"] }
+/// Rectángulo [x, y, ancho, alto] del último elemento.
+funcion panel_ultimo_rect(ctx) { retornar ctx["ultimo"]["rect"] }
+
+/// Ayuda emergente junto al ratón si el último elemento está caliente.
+funcion panel_ayuda(ctx, texto) {
+    si (ctx["ultimo"]["caliente"] == falso) { retornar falso }
+    sea es = ctx["estilo"]
+    sea p = ctx["entrada"]["raton"]
+    sea t = texto_medir(ctx["fuente"], texto, ctx["tam"])
+    sea r = [p[0] + 14, p[1] + 16, t["ancho"] + es["relleno"] * 2, t["alto"] + es["relleno_marco"] * 2]
+    sea todo = [-100000, -100000, 200000, 200000]
+    ctx["ayuda"] = [
+        {"t": "rect", "r": r, "c": es["popup"], "radio": 0, "recorte": todo},
+        {"t": "borde", "r": r, "c": es["borde"], "recorte": todo},
+        {"t": "texto", "x": r[0] + es["relleno"], "y": r[1] + piso((r[3] - ctx["tam"]) / 2), "texto": texto, "c": es["texto"], "recorte": todo}
+    ]
+    retornar verdadero
+}
+
+// ---------- elementos ----------
+
+/// Texto (admite varias líneas).
+funcion panel_texto(ctx, texto) { panel_texto_color(ctx, texto, nulo) }
+
+funcion panel_texto_color(ctx, texto, color) {
+    sea t = texto_medir(ctx["fuente"], texto, ctx["tam"])
+    sea m = ctx["actual"]
+    sea centrar = 0
+    si (m["misma"] != nulo y m["prev"][3] > t["alto"]) { centrar = piso((m["prev"][3] - t["alto"]) / 2) }
+    sea r = _pl_item(ctx, t["ancho"], t["alto"] + centrar)
+    _pl_texto_en(ctx, r[0], r[1] + centrar, texto, color ?? ctx["estilo"]["texto"])
+    ctx["ultimo"] = {"id": nulo, "rect": r, "caliente": _pl_caliente(ctx, r), "cambio": falso}
+}
+
+/// Texto apagado.
+funcion panel_texto_apagado(ctx, texto) { panel_texto_color(ctx, texto, ctx["estilo"]["texto_apagado"]) }
+
+/// "etiqueta: valor" alineado.
+funcion panel_etiqueta(ctx, etiqueta, valor) {
+    sea r = _pl_item(ctx, nulo, ctx["tam"])
+    _pl_texto_en(ctx, r[0], r[1], "" + valor, ctx["estilo"]["texto"])
+    _pl_texto_en(ctx, r[0] + piso(r[2] * 0.65) + ctx["estilo"]["espacio"], r[1], etiqueta, ctx["estilo"]["texto"])
+}
+
+/// Botón. opciones: "ancho", "alto". Devuelve verdadero en el cuadro del clic.
+funcion panel_boton(ctx, etiqueta, opciones) {
+    sea op = opciones ?? {}
+    sea es = ctx["estilo"]
+    sea l = _pl_etiqueta(etiqueta)
+    sea r = _pl_item(ctx, op["ancho"] ?? (_pl_ancho(ctx, l) + es["relleno_marco"] * 2 + 4), op["alto"] ?? _pl_alto_marco(ctx))
+    sea b = _pl_boton_logica(ctx, _pl_id(ctx, etiqueta), r)
+    sea c = es["boton"]
+    si (b["sostenido"] y b["caliente"]) { c = es["boton_activo"] } sino si (b["caliente"]) { c = es["boton_caliente"] }
+    _pl_rect(ctx, r, c, es["redondeo"])
+    sea tw = _pl_ancho(ctx, l)
+    _pl_texto_en(ctx, r[0] + maximo(es["relleno_marco"], piso((r[2] - tw) / 2)), r[1] + piso((r[3] - ctx["tam"]) / 2), l, es["texto"])
+    retornar b["clic"]
+}
+
+/// Botón pequeño (sin relleno vertical).
+funcion panel_boton_chico(ctx, etiqueta) { retornar panel_boton(ctx, etiqueta, {"alto": ctx["tam"] + 2}) }
+
+/// Casilla. Devuelve el nuevo valor.
+funcion panel_casilla(ctx, etiqueta, valor) {
+    sea es = ctx["estilo"]
+    sea l = _pl_etiqueta(etiqueta)
+    sea lado = _pl_alto_marco(ctx)
+    sea r = _pl_item(ctx, lado + es["espacio"] + _pl_ancho(ctx, l), lado)
+    sea b = _pl_boton_logica(ctx, _pl_id(ctx, etiqueta), r)
+    sea c = es["marco"]
+    si (b["sostenido"] y b["caliente"]) { c = es["marco_activo"] } sino si (b["caliente"]) { c = es["marco_caliente"] }
+    _pl_rect(ctx, [r[0], r[1], lado, lado], c, es["redondeo"])
+    sea v = valor
+    si (b["clic"]) { v = valor == falso }
+    si (v) {
+        sea p = 4
+        _pl_linea(ctx, r[0] + p, r[1] + lado / 2, r[0] + lado * 0.42, r[1] + lado - p - 1, es["marca"])
+        _pl_linea(ctx, r[0] + lado * 0.42, r[1] + lado - p - 1, r[0] + lado - p, r[1] + p, es["marca"])
+        _pl_rect(ctx, [r[0] + p, r[1] + p, lado - p * 2, lado - p * 2], es["marca"], 0)
+    }
+    _pl_texto_en(ctx, r[0] + lado + es["espacio"], r[1] + piso((r[3] - ctx["tam"]) / 2), l, es["texto"])
+    retornar v
+}
+
+/// Botón de radio: devuelve verdadero si se eligió en este cuadro.
+funcion panel_radio(ctx, etiqueta, activo) {
+    sea es = ctx["estilo"]
+    sea l = _pl_etiqueta(etiqueta)
+    sea lado = _pl_alto_marco(ctx)
+    sea r = _pl_item(ctx, lado + es["espacio"] + _pl_ancho(ctx, l), lado)
+    sea b = _pl_boton_logica(ctx, _pl_id(ctx, etiqueta), r)
+    sea c = es["marco"]
+    si (b["caliente"]) { c = es["marco_caliente"] }
+    _pl_cmd(ctx, {"t": "circulo", "x": r[0] + lado / 2, "y": r[1] + lado / 2, "radio": lado / 2, "c": c})
+    si (activo) { _pl_cmd(ctx, {"t": "circulo", "x": r[0] + lado / 2, "y": r[1] + lado / 2, "radio": lado / 2 - 4, "c": es["marca"]}) }
+    _pl_texto_en(ctx, r[0] + lado + es["espacio"], r[1] + piso((r[3] - ctx["tam"]) / 2), l, es["texto"])
+    retornar b["clic"]
+}
+
+/// Deslizador. opciones: "decimales" (3 por defecto; 0 para enteros),
+/// "formato" (función del valor al texto). Devuelve el nuevo valor.
+funcion panel_deslizador(ctx, etiqueta, valor, minimo_, maximo_, opciones) {
+    sea op = opciones ?? {}
+    sea es = ctx["estilo"]
+    sea r = _pl_item(ctx, _pl_ancho_campo(ctx, etiqueta), _pl_alto_marco(ctx))
+    sea id = _pl_id(ctx, etiqueta)
+    sea b = _pl_boton_logica(ctx, id, r)
+    sea v = valor
+    sea dec = op["decimales"] ?? 3
+    sea agarre = maximo(10, minimo(r[2] / 6, 14))
+    si (b["sostenido"] y maximo_ != minimo_) {
+        sea t = _pl_limitar((ctx["entrada"]["raton"][0] - r[0] - agarre / 2) / maximo(1, r[2] - agarre), 0, 1)
+        v = minimo_ + (maximo_ - minimo_) * t
+        si (dec == 0) { v = redondear(v) }
+    }
+    ctx["ultimo"]["cambio"] = v != valor
+    sea c = es["marco"]
+    si (b["sostenido"]) { c = es["marco_activo"] } sino si (b["caliente"]) { c = es["marco_caliente"] }
+    _pl_rect(ctx, r, c, es["redondeo"])
+    sea t = 0
+    si (maximo_ != minimo_) { t = _pl_limitar((v - minimo_) / (maximo_ - minimo_), 0, 1) }
+    sea ca = es["agarre"]
+    si (b["sostenido"]) { ca = es["agarre_activo"] }
+    _pl_rect(ctx, [r[0] + 2 + (r[2] - agarre - 4) * t, r[1] + 2, agarre, r[3] - 4], ca, es["redondeo"])
+    sea txt = ""
+    si (tiene_clave(op, "formato")) { txt = op["formato"](v) } sino { txt = _pl_fmt(v, dec) }
+    _pl_texto_en(ctx, r[0] + piso((r[2] - _pl_ancho(ctx, txt)) / 2), r[1] + piso((r[3] - ctx["tam"]) / 2), txt, es["texto"])
+    _pl_etiqueta_derecha(ctx, r, etiqueta)
+    retornar v
+}
+
+/// Deslizador de enteros.
+funcion panel_deslizador_entero(ctx, etiqueta, valor, minimo_, maximo_) { retornar panel_deslizador(ctx, etiqueta, valor, minimo_, maximo_, {"decimales": 0}) }
+
+/// Campo que se arrastra para cambiar el número. opciones: "velocidad"
+/// (por píxel), "minimo", "maximo", "decimales".
+funcion panel_arrastrar(ctx, etiqueta, valor, opciones) {
+    sea op = opciones ?? {}
+    sea es = ctx["estilo"]
+    sea r = _pl_item(ctx, _pl_ancho_campo(ctx, etiqueta), _pl_alto_marco(ctx))
+    sea id = _pl_id(ctx, etiqueta)
+    sea antes_activo = ctx["activo"] == id
+    sea b = _pl_boton_logica(ctx, id, r)
+    sea v = valor
+    sea x = ctx["entrada"]["raton"][0]
+    si (b["sostenido"]) {
+        si (antes_activo == falso) { ctx["estado"][id] = [x, valor] }
+        sea e = ctx["estado"][id] ?? [x, valor]
+        v = e[1] + (x - e[0]) * (op["velocidad"] ?? 1)
+        si (tiene_clave(op, "minimo")) { v = maximo(op["minimo"], v) }
+        si (tiene_clave(op, "maximo")) { v = minimo(op["maximo"], v) }
+        si ((op["decimales"] ?? 0) == 0) { v = redondear(v) }
+    }
+    ctx["ultimo"]["cambio"] = v != valor
+    sea c = es["marco"]
+    si (b["sostenido"]) { c = es["marco_activo"] } sino si (b["caliente"]) { c = es["marco_caliente"] }
+    _pl_rect(ctx, r, c, es["redondeo"])
+    sea txt = _pl_fmt(v, op["decimales"] ?? 0)
+    _pl_texto_en(ctx, r[0] + piso((r[2] - _pl_ancho(ctx, txt)) / 2), r[1] + piso((r[3] - ctx["tam"]) / 2), txt, es["texto"])
+    _pl_etiqueta_derecha(ctx, r, etiqueta)
+    retornar v
+}
+
+/// Entrada de texto de una línea. opciones: "maximo" (caracteres),
+/// "pista" (texto gris cuando está vacía), "contrasena". Devuelve el
+/// texto; panel_ultimo_cambio dice si cambió y la tecla intro lo confirma
+/// (panel_texto_confirmado).
+funcion panel_entrada_texto(ctx, etiqueta, texto, opciones) {
+    sea op = opciones ?? {}
+    sea es = ctx["estilo"]
+    sea r = _pl_item(ctx, _pl_ancho_campo(ctx, etiqueta), _pl_alto_marco(ctx))
+    sea id = _pl_id(ctx, etiqueta)
+    sea cal = _pl_caliente(ctx, r)
+    sea cs = texto_codigos(texto)
+    sea est = ctx["estado"][id] ?? {"cursor": longitud(cs), "desp": 0}
+    si (cal y _pl_pulsado(ctx, 0)) {
+        ctx["foco"] = id
+        ctx["hubo_foco"] = verdadero
+        // Cursor donde se hizo clic.
+        sea x = ctx["entrada"]["raton"][0] - r[0] - es["relleno_marco"] + est["desp"]
+        sea i = 0
+        mientras (i < longitud(cs) y _pl_ancho(ctx, _pl_de_codigos(cs, 0, i + 1)) - _pl_ancho(ctx, _pl_utf8(cs[i])) / 2 < x) { i = i + 1 }
+        est["cursor"] = i
+    }
+    sea enfocado = ctx["foco"] == id
+    si (enfocado y _pl_pulsado(ctx, 0)) { ctx["hubo_foco"] = ctx["hubo_foco"] o cal }
+    sea confirmado = falso
+    si (enfocado) {
+        sea c = _pl_limitar(est["cursor"], 0, longitud(cs))
+        para t en ctx["entrada"]["teclas"] {
+            si (t == "izquierda") { c = maximo(0, c - 1) }
+            sino si (t == "derecha") { c = minimo(longitud(cs), c + 1) }
+            sino si (t == "inicio") { c = 0 }
+            sino si (t == "fin") { c = longitud(cs) }
+            sino si (t == "retroceso" y c > 0) {
+                cs = texto_codigos(_pl_de_codigos(cs, 0, c - 1) + _pl_de_codigos(cs, c, longitud(cs)))
+                c = c - 1
+            } sino si (t == "suprimir" y c < longitud(cs)) {
+                cs = texto_codigos(_pl_de_codigos(cs, 0, c) + _pl_de_codigos(cs, c + 1, longitud(cs)))
+            } sino si (t == "intro") { confirmado = verdadero }
+            sino si (t == "escape") { ctx["foco"] = nulo }
+        }
+        sea nuevo = texto_codigos(ctx["entrada"]["texto"])
+        para cp en nuevo {
+            si (cp >= 32 y longitud(cs) < (op["maximo"] ?? 100000)) {
+                cs = texto_codigos(_pl_de_codigos(cs, 0, c) + _pl_utf8(cp) + _pl_de_codigos(cs, c, longitud(cs)))
+                c = c + 1
+            }
+        }
+        est["cursor"] = c
+    }
+    sea res = _pl_de_codigos(cs, 0, longitud(cs))
+    ctx["estado"][id] = est
+    ctx["ultimo"] = {"id": id, "rect": r, "caliente": cal, "cambio": res != texto, "confirmado": confirmado}
+    sea c = es["marco"]
+    si (enfocado) { c = es["marco_activo"] } sino si (cal) { c = es["marco_caliente"] }
+    _pl_rect(ctx, r, c, es["redondeo"])
+    sea vis = res
+    si (op["contrasena"] ?? falso) {
+        vis = ""
+        para k en cs { vis = vis + "*" }
+    }
+    // Desplazamiento para que el cursor se vea.
+    sea interior = r[2] - es["relleno_marco"] * 2
+    sea cx = _pl_ancho(ctx, _pl_de_codigos(texto_codigos(vis), 0, minimo(est["cursor"], longitud(cs))))
+    si (cx - est["desp"] > interior) { est["desp"] = cx - interior }
+    si (cx - est["desp"] < 0) { est["desp"] = cx }
+    sea m = ctx["actual"]
+    sea guardado = m["recorte"]
+    m["recorte"] = _pl_interseccion(guardado, [r[0] + 2, r[1], r[2] - 4, r[3]])
+    si (res == "" y enfocado == falso y tiene_clave(op, "pista")) { _pl_texto_en(ctx, r[0] + es["relleno_marco"], r[1] + piso((r[3] - ctx["tam"]) / 2), op["pista"], es["texto_apagado"]) }
+    sino { _pl_texto_en(ctx, r[0] + es["relleno_marco"] - est["desp"], r[1] + piso((r[3] - ctx["tam"]) / 2), vis, es["texto"]) }
+    si (enfocado) { _pl_rect(ctx, [r[0] + es["relleno_marco"] + cx - est["desp"], r[1] + 3, 1, r[3] - 6], es["texto"], 0) }
+    m["recorte"] = guardado
+    _pl_etiqueta_derecha(ctx, r, etiqueta)
+    retornar res
+}
+
+/// ¿Se pulsó intro en la última entrada de texto?
+funcion panel_texto_confirmado(ctx) { retornar ctx["ultimo"]["confirmado"] ?? falso }
+
+/// Elemento seleccionable de una lista. Devuelve verdadero al hacer clic.
+funcion panel_seleccionable(ctx, etiqueta, seleccionado) {
+    sea es = ctx["estilo"]
+    sea r = _pl_item(ctx, nulo, ctx["tam"] + 2)
+    sea b = _pl_boton_logica(ctx, _pl_id(ctx, etiqueta), r)
+    si (seleccionado o b["caliente"]) {
+        sea c = es["cabecera"]
+        si (b["sostenido"]) { c = es["cabecera_activa"] } sino si (b["caliente"]) { c = es["cabecera_caliente"] }
+        _pl_rect(ctx, r, c, 0)
+    }
+    _pl_texto_en(ctx, r[0] + 2, r[1] + 1, _pl_etiqueta(etiqueta), es["texto"])
+    retornar b["clic"]
+}
+
+/// Combo desplegable. Devuelve el índice elegido.
+funcion panel_combo(ctx, etiqueta, indice, opciones_) {
+    sea es = ctx["estilo"]
+    sea r = _pl_item(ctx, _pl_ancho_campo(ctx, etiqueta), _pl_alto_marco(ctx))
+    sea id = _pl_id(ctx, etiqueta)
+    sea b = _pl_boton_logica(ctx, id, r)
+    sea abierto = ctx["popup"] != nulo y ctx["popup"]["id"] == id
+    si (b["clic"]) {
+        si (abierto) { ctx["popup"] = nulo } sino {
+            sea alto = (ctx["tam"] + 2) * longitud(opciones_) + es["relleno_marco"] * 2
+            ctx["popup"] = {"id": id, "rect": [r[0], r[1] + r[3], r[2], alto]}
+        }
+        abierto = ctx["popup"] != nulo
+    }
+    sea c = es["marco"]
+    si (b["caliente"] o abierto) { c = es["marco_caliente"] }
+    _pl_rect(ctx, r, c, es["redondeo"])
+    sea lado = r[3]
+    _pl_rect(ctx, [r[0] + r[2] - lado, r[1], lado, lado], es["boton"], 0)
+    _pl_flecha(ctx, r[0] + r[2] - lado + piso(lado / 4), r[1] + piso(lado / 4), piso(lado / 2), verdadero, es["texto"])
+    sea txt = ""
+    si (indice != nulo y indice >= 0 y indice < longitud(opciones_)) { txt = "" + opciones_[indice] }
+    sea m = ctx["actual"]
+    sea guardado = m["recorte"]
+    m["recorte"] = _pl_interseccion(guardado, [r[0], r[1], r[2] - lado, r[3]])
+    _pl_texto_en(ctx, r[0] + es["relleno_marco"], r[1] + piso((r[3] - ctx["tam"]) / 2), txt, es["texto"])
+    m["recorte"] = guardado
+    _pl_etiqueta_derecha(ctx, r, etiqueta)
+    sea res = indice
+    si (abierto y b["clic"] == falso) {
+        // El popup se dibuja encima de todo.
+        sea p = ctx["popup"]
+        sea todo = [-100000, -100000, 200000, 200000]
+        p["cmds"] = [{"t": "rect", "r": p["rect"], "c": es["popup"], "radio": 0, "recorte": todo}, {"t": "borde", "r": p["rect"], "c": es["borde"], "recorte": todo}]
+        sea py = p["rect"][1] + es["relleno_marco"]
+        sea i = 0
+        sea raton = ctx["entrada"]["raton"]
+        para o_ en opciones_ {
+            sea ri = [p["rect"][0] + 1, py, p["rect"][2] - 2, ctx["tam"] + 2]
+            sea cal = ctx["bajo_raton"] == "##popup" y _pl_dentro(raton, ri)
+            si (cal o i == indice) {
+                sea ci = es["cabecera"]
+                si (cal) { ci = es["cabecera_caliente"] }
+                p["cmds"].agregar({"t": "rect", "r": ri, "c": ci, "radio": 0, "recorte": todo})
+            }
+            p["cmds"].agregar({"t": "texto", "x": ri[0] + es["relleno_marco"], "y": py + 1, "texto": "" + o_, "c": es["texto"], "recorte": todo})
+            si (cal y _pl_soltado(ctx, 0) y ctx["popup_clic"] == verdadero) {
+                res = i
+                ctx["popup"] = nulo
+            }
+            py = py + ctx["tam"] + 2
+            i = i + 1
+        }
+        si (ctx["bajo_raton"] == "##popup" y _pl_pulsado(ctx, 0)) { ctx["popup_clic"] = verdadero }
+        si (_pl_soltado(ctx, 0) y ctx["bajo_raton"] != "##popup") { ctx["popup_clic"] = falso }
+        si (ctx["popup"] == nulo) { ctx["popup_clic"] = falso }
+    }
+    ctx["ultimo"] = {"id": id, "rect": r, "caliente": b["caliente"], "cambio": res != indice}
+    retornar res
+}
+
+/// Lista de elementos con selección. alto_items: cuántos se ven.
+funcion panel_lista(ctx, etiqueta, indice, items, alto_items) {
+    sea es = ctx["estilo"]
+    sea n = alto_items ?? minimo(longitud(items), 7)
+    sea fila = ctx["tam"] + 2
+    sea r = _pl_item(ctx, _pl_ancho_campo(ctx, etiqueta), fila * n + 4)
+    sea id = _pl_id(ctx, etiqueta)
+    sea est = ctx["estado"][id] ?? {"scroll": 0}
+    _pl_rect(ctx, r, es["marco"], es["redondeo"])
+    sea cal = _pl_caliente(ctx, r)
+    si (cal y ctx["entrada"]["rueda"] != 0) {
+        est["scroll"] = _pl_limitar(est["scroll"] - ctx["entrada"]["rueda"], 0, maximo(0, longitud(items) - n))
+        ctx["entrada"]["rueda"] = 0
+    }
+    sea res = indice
+    sea m = ctx["actual"]
+    sea guardado = m["recorte"]
+    m["recorte"] = _pl_interseccion(guardado, [r[0], r[1] + 2, r[2], r[3] - 4])
+    sea i = est["scroll"]
+    mientras (i < longitud(items) y i < est["scroll"] + n) {
+        sea ri = [r[0] + 2, r[1] + 2 + (i - est["scroll"]) * fila, r[2] - 4, fila]
+        sea b = _pl_boton_logica(ctx, id + "#" + i, ri)
+        si (i == indice o b["caliente"]) {
+            sea c = es["cabecera"]
+            si (b["caliente"]) { c = es["cabecera_caliente"] }
+            _pl_rect(ctx, ri, c, 0)
+        }
+        _pl_texto_en(ctx, ri[0] + 2, ri[1] + 1, "" + items[i], es["texto"])
+        si (b["clic"]) { res = i }
+        i = i + 1
+    }
+    m["recorte"] = guardado
+    ctx["estado"][id] = est
+    _pl_etiqueta_derecha(ctx, r, etiqueta)
+    ctx["ultimo"] = {"id": id, "rect": r, "caliente": cal, "cambio": res != indice}
+    retornar res
+}
+
+/// Nodo de árbol. Si devuelve verdadero, hay que cerrarlo con
+/// panel_fin_arbol. opciones: "abierto" (al principio), "hoja".
+funcion panel_arbol(ctx, etiqueta, opciones) {
+    sea op = opciones ?? {}
+    sea es = ctx["estilo"]
+    sea id = _pl_id(ctx, etiqueta)
+    sea abierto = ctx["estado"][id] ?? (op["abierto"] ?? falso)
+    sea r = _pl_item(ctx, nulo, ctx["tam"] + 2)
+    sea b = _pl_boton_logica(ctx, id, r)
+    si (b["clic"] y (op["hoja"] ?? falso) == falso) { abierto = abierto == falso }
+    ctx["estado"][id] = abierto
+    si (b["caliente"]) { _pl_rect(ctx, r, es["cabecera_caliente"], 0) }
+    si ((op["hoja"] ?? falso) == falso) { _pl_flecha(ctx, r[0] + 1, r[1] + 1, ctx["tam"] - 2, abierto, es["texto"]) }
+    _pl_texto_en(ctx, r[0] + ctx["tam"] + 4, r[1] + 1, _pl_etiqueta(etiqueta), es["texto"])
+    ctx["ultimo"]["cambio"] = b["clic"]
+    si (abierto y (op["hoja"] ?? falso) == falso) {
+        panel_sangrar(ctx)
+        retornar verdadero
+    }
+    retornar falso
+}
+
+funcion panel_fin_arbol(ctx) { panel_desangrar(ctx) }
+
+/// Cabecera plegable: devuelve si está abierta (no necesita cierre).
+funcion panel_cabecera(ctx, etiqueta, opciones) {
+    sea op = opciones ?? {}
+    sea es = ctx["estilo"]
+    sea id = _pl_id(ctx, etiqueta)
+    sea abierto = ctx["estado"][id] ?? (op["abierto"] ?? falso)
+    sea r = _pl_item(ctx, nulo, _pl_alto_marco(ctx))
+    sea b = _pl_boton_logica(ctx, id, r)
+    si (b["clic"]) { abierto = abierto == falso }
+    ctx["estado"][id] = abierto
+    sea c = es["cabecera"]
+    si (b["sostenido"]) { c = es["cabecera_activa"] } sino si (b["caliente"]) { c = es["cabecera_caliente"] }
+    _pl_rect(ctx, r, c, es["redondeo"])
+    _pl_flecha(ctx, r[0] + es["relleno_marco"], r[1] + es["relleno_marco"] + 1, ctx["tam"] - 2, abierto, es["texto"])
+    _pl_texto_en(ctx, r[0] + es["relleno_marco"] * 2 + ctx["tam"], r[1] + piso((r[3] - ctx["tam"]) / 2), _pl_etiqueta(etiqueta), es["texto"])
+    ctx["ultimo"]["cambio"] = b["clic"]
+    retornar abierto
+}
+
+/// Pestañas: devuelve el índice de la pestaña activa.
+funcion panel_pestanas(ctx, etiqueta, nombres, indice) {
+    sea es = ctx["estilo"]
+    sea res = indice
+    sea primero = verdadero
+    sea i = 0
+    para n en nombres {
+        si (primero == falso) { panel_misma_linea(ctx, 2) }
+        primero = falso
+        sea w = _pl_ancho(ctx, n) + es["relleno_marco"] * 4
+        sea r = _pl_item(ctx, w, _pl_alto_marco(ctx))
+        sea b = _pl_boton_logica(ctx, _pl_id(ctx, etiqueta + "#" + i), r)
+        sea c = es["cabecera"]
+        si (i == indice) { c = es["cabecera_activa"] } sino si (b["caliente"]) { c = es["cabecera_caliente"] }
+        _pl_rect(ctx, r, c, 0)
+        _pl_texto_en(ctx, r[0] + es["relleno_marco"] * 2, r[1] + piso((r[3] - ctx["tam"]) / 2), n, es["texto"])
+        si (b["clic"]) { res = i }
+        i = i + 1
+    }
+    // Línea bajo las pestañas.
+    sea m = ctx["actual"]
+    sea rl = _pl_item(ctx, nulo, 1)
+    _pl_rect(ctx, [rl[0], rl[1] - es["espacio"] - 1, rl[2], 2], es["cabecera_activa"], 0)
+    ctx["ultimo"]["cambio"] = res != indice
+    retornar res
+}
+
+/// Barra de progreso (fracción de 0 a 1). texto nulo muestra el porcentaje.
+funcion panel_progreso(ctx, fraccion, texto) {
+    sea es = ctx["estilo"]
+    sea r = _pl_item(ctx, _pl_ancho_campo(ctx, ""), _pl_alto_marco(ctx))
+    _pl_rect(ctx, r, es["marco"], es["redondeo"])
+    sea f = _pl_limitar(fraccion, 0, 1)
+    si (f > 0) { _pl_rect(ctx, [r[0], r[1], r[2] * f, r[3]], es["progreso"], es["redondeo"]) }
+    sea t = texto ?? ("" + redondear(f * 100) + "%")
+    _pl_texto_en(ctx, r[0] + piso((r[2] - _pl_ancho(ctx, t)) / 2), r[1] + piso((r[3] - ctx["tam"]) / 2), t, es["texto"])
+}
+
+/// Editor de color [r, g, b] (0–255): muestra de color y tres arrastres.
+funcion panel_color(ctx, etiqueta, color) {
+    sea es = ctx["estilo"]
+    sea lado = _pl_alto_marco(ctx)
+    sea total = _pl_ancho_campo(ctx, etiqueta)
+    sea cada = maximo(20, piso((total - lado - es["espacio"] * 3) / 3))
+    sea res = [color[0], color[1], color[2]]
+    sea nombres = ["R", "G", "B"]
+    sea i = 0
+    sea guardado = ctx["actual"]["ancho_item"]
+    mientras (i < 3) {
+        si (i > 0) { panel_misma_linea(ctx, es["espacio"]) }
+        ctx["actual"]["ancho_item"] = cada
+        res[i] = panel_arrastrar(ctx, "##" + etiqueta + nombres[i], color[i], {"minimo": 0, "maximo": 255})
+        i = i + 1
+    }
+    ctx["actual"]["ancho_item"] = guardado
+    panel_misma_linea(ctx, es["espacio"])
+    sea r = _pl_item(ctx, lado, lado)
+    _pl_rect(ctx, r, [res[0], res[1], res[2], 255], 0)
+    _pl_borde(ctx, r, es["borde"])
+    _pl_etiqueta_derecha(ctx, r, etiqueta)
+    ctx["ultimo"]["cambio"] = res[0] != color[0] o res[1] != color[1] o res[2] != color[2]
+    retornar res
+}
+
+/// Tabla con cabecera: columnas (nombres), filas (listas). Devuelve el
+/// índice de la fila clicada en este cuadro o nulo. opciones: "anchos"
+/// (fracciones o píxeles), "seleccion" (fila marcada).
+funcion panel_tabla(ctx, etiqueta, columnas, filas, opciones) {
+    sea op = opciones ?? {}
+    sea es = ctx["estilo"]
+    sea n = longitud(columnas)
+    sea anchos = op["anchos"] ?? nulo
+    si (anchos == nulo) {
+        anchos = []
+        para c en columnas { anchos.agregar(1 / n) }
+    }
+    sea alto = ctx["tam"] + 4
+    sea r0 = _pl_item(ctx, nulo, alto * (longitud(filas) + 1))
+    sea disp = r0[2]
+    sea fijos = 0
+    para a en anchos { si (a > 1) { fijos = fijos + a } }
+    sea libre = disp - fijos
+    sea xs = []
+    sea x = r0[0]
+    para a en anchos {
+        xs.agregar(x)
+        x = x + _pl_ancho_col(a, libre)
+    }
+    xs.agregar(r0[0] + disp)
+    _pl_rect(ctx, [r0[0], r0[1], disp, alto], es["cabecera"], 0)
+    sea m = ctx["actual"]
+    sea guardado = m["recorte"]
+    sea j = 0
+    para c en columnas {
+        m["recorte"] = _pl_interseccion(guardado, [xs[j], r0[1], xs[j + 1] - xs[j] - 2, r0[3]])
+        _pl_texto_en(ctx, xs[j] + 3, r0[1] + 2, "" + c, es["texto"])
+        j = j + 1
+    }
+    sea res = nulo
+    sea i = 0
+    sea id = _pl_id(ctx, etiqueta)
+    m["recorte"] = guardado
+    para f en filas {
+        sea ry = r0[1] + alto * (i + 1)
+        sea rf = [r0[0], ry, disp, alto]
+        sea b = _pl_boton_logica(ctx, id + "#" + i, rf)
+        si (i == (op["seleccion"] ?? -1)) { _pl_rect(ctx, rf, es["cabecera_activa"], 0) }
+        sino si (b["caliente"]) { _pl_rect(ctx, rf, es["cabecera_caliente"], 0) }
+        sino si (i % 2 == 1) { _pl_rect(ctx, rf, [255, 255, 255, 10], 0) }
+        sea k = 0
+        para v en f {
+            si (k < n) {
+                m["recorte"] = _pl_interseccion(guardado, [xs[k], ry, xs[k + 1] - xs[k] - 2, alto])
+                _pl_texto_en(ctx, xs[k] + 3, ry + 2, "" + v, es["texto"])
+                m["recorte"] = guardado
+            }
+            k = k + 1
+        }
+        si (b["clic"]) { res = i }
+        i = i + 1
+    }
+    sea k = 1
+    mientras (k < n) {
+        _pl_rect(ctx, [xs[k] - 1, r0[1], 1, r0[3]], es["separador"], 0)
+        k = k + 1
+    }
+    _pl_borde(ctx, r0, es["borde"])
+    ctx["ultimo"] = {"id": id, "rect": r0, "caliente": _pl_caliente(ctx, r0), "cambio": res != nulo}
+    retornar res
+}
+
+// ---------- dibujo en un lienzo ----------
+
+/// Pinta la lista de comandos (de panel_terminar) en un lienzo.
+funcion panel_dibujar(lienzo, ctx, lista) {
+    sea f = ctx["fuente"]
+    sea tam = ctx["tam"]
+    sea pantalla = [0, 0, lienzo["ancho"], lienzo["alto"]]
+    para c en lista {
+        sea rc = _pl_interseccion(c["recorte"], pantalla)
+        si (rc[2] > 0 y rc[3] > 0) {
+            sea t = c["t"]
+            si (t == "rect") {
+                sea r = [piso(c["r"][0]), piso(c["r"][1]), piso(c["r"][2]), piso(c["r"][3])]
+                sea ri = _pl_interseccion(r, rc)
+                si (ri[2] > 0 y ri[3] > 0) {
+                    si (c["radio"] > 0 y ri[0] == r[0] y ri[1] == r[1] y ri[2] == r[2] y ri[3] == r[3]) { lienzo_rectangulo_redondeado(lienzo, r[0], r[1], r[2], r[3], c["radio"], c["c"]) }
+                    sino { lienzo_rectangulo(lienzo, ri[0], ri[1], ri[2], ri[3], c["c"]) }
+                }
+            } sino si (t == "borde") {
+                sea r = [piso(c["r"][0]), piso(c["r"][1]), piso(c["r"][2]), piso(c["r"][3])]
+                para lado en [[r[0], r[1], r[2], 1], [r[0], r[1] + r[3] - 1, r[2], 1], [r[0], r[1], 1, r[3]], [r[0] + r[2] - 1, r[1], 1, r[3]]] {
+                    sea ri = _pl_interseccion(lado, rc)
+                    si (ri[2] > 0 y ri[3] > 0) { lienzo_rectangulo(lienzo, ri[0], ri[1], ri[2], ri[3], c["c"]) }
+                }
+            } sino si (t == "texto") {
+                _pl_dibujar_texto(lienzo, f, tam, c["texto"], piso(c["x"]), piso(c["y"]), c["c"], rc)
+            } sino si (t == "linea") {
+                sea p = c["p"]
+                si (_pl_dentro([p[0], p[1]], rc) y _pl_dentro([p[2], p[3]], rc)) { lienzo_linea(lienzo, p[0], p[1], p[2], p[3], c["c"], 2) }
+            } sino si (t == "tri") {
+                sea p = c["p"]
+                si (_pl_dentro([p[0], p[1]], rc) y _pl_dentro([p[2], p[3]], rc) y _pl_dentro([p[4], p[5]], rc)) { lienzo_triangulo2d(lienzo, p[0], p[1], p[2], p[3], p[4], p[5], c["c"]) }
+            } sino si (t == "circulo") {
+                si (_pl_dentro([c["x"] - c["radio"], c["y"] - c["radio"]], rc) y _pl_dentro([c["x"] + c["radio"] - 1, c["y"] + c["radio"] - 1], rc)) { lienzo_circulo(lienzo, c["x"], c["y"], c["radio"], c["c"]) }
+            }
+        }
+    }
+    retornar lienzo
+}
+
+funcion _pl_dibujar_texto(l, f, tam, texto, x, py, color, rc) {
+    si (f["tipo"] != "bits") {
+        // Fuentes TrueType: carácter por carácter, solo los que caben en el recorte.
+        sea px = x
+        para cp en texto_codigos(texto) {
+            sea ch = _pl_utf8(cp)
+            sea w = texto_medir(f, ch, tam)["ancho"]
+            si (px >= rc[0] y px + w <= rc[0] + rc[2] y py >= rc[1] y py + tam <= rc[1] + rc[3]) { lienzo_texto(l, f, ch, px, py, tam, color) }
+            px = px + w
+        }
+        retornar nulo
+    }
+    sea k = maximo(1, piso(tam / f["alto"] + 0.5))
+    sea fy = py
+    para linea en separar(texto, "\n") {
+        sea fx = x
+        para cp en texto_codigos(linea) {
+            si (fx + f["ancho"] * k > rc[0] y fx < rc[0] + rc[2] y fy + f["alto"] * k > rc[1] y fy < rc[1] + rc[3]) {
+                sea c = cp
+                si (c < 32 o c > 126) { c = 63 }
+                sea base = (c - 32) * f["alto"]
+                sea fila = 0
+                mientras (fila < f["alto"]) {
+                    sea bits = byte_en(f["datos"], base + fila)
+                    si (bits != 0) {
+                        sea col = 0
+                        mientras (col < f["ancho"]) {
+                            si (piso(bits / potencia(2, f["ancho"] - 1 - col)) % 2 == 1) {
+                                sea r = _pl_interseccion([fx + col * k, fy + fila * k, k, k], rc)
+                                si (r[2] > 0 y r[3] > 0) { lienzo_rectangulo(l, r[0], r[1], r[2], r[3], color) }
+                            }
+                            col = col + 1
+                        }
+                    }
+                    fila = fila + 1
+                }
+            }
+            fx = fx + f["ancho"] * k
+        }
+        fy = fy + f["alto"] * k
+    }
+}
+
+/// Atajo: termina el cuadro y lo pinta en un lienzo nuevo del tamaño dado.
+funcion panel_imagen(ctx, ancho, alto, fondo) {
+    sea lista = panel_terminar(ctx)
+    sea l = lienzo_crear(ancho, alto)
+    lienzo_limpiar(l, fondo ?? [45, 55, 72, 255])
+    retornar panel_dibujar(l, ctx, lista)
+}
+
+/// Convierte el estado de "juego" (SDL2) en la entrada de un cuadro.
+/// eventos: lista de {"tipo": "tecla"|"texto"|"rueda", …} si el programa
+/// los junta; si no, solo ratón.
+funcion panel_entrada_de(raton_x, raton_y, izquierdo, derecho, rueda, teclas, texto) {
+    retornar {"raton": [raton_x, raton_y], "botones": [izquierdo, derecho, falso], "rueda": rueda ?? 0, "teclas": teclas ?? [], "texto": texto ?? ""}
+}

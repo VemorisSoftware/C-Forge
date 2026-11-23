@@ -1,0 +1,971 @@
+// stdlib/pines.cfv — GPIO, I2C, SPI y PWM para Raspberry Pi y otras placas
+// Linux, al estilo de rppal: líneas GPIO por el dispositivo de caracteres
+// del kernel (uAPI v2: entrada, salida, activo bajo, resistencias de
+// arriba y abajo, drenador abierto, antirrebote y eventos de flanco con
+// marca de tiempo), I2C por /dev/i2c-N (escritura, lectura, escritura y
+// lectura con inicio repetido, registros y escaneo del bus), SPI por
+// spidev (modo, bits, velocidad, transferencias encadenadas) y PWM por
+// sysfs. Trae un simulador de chip GPIO, bus I2C y bus SPI para probar
+// sin placa, el mapa de los 40 pines de la Raspberry Pi y controladores
+// para el sensor BME280/BMP280 y la pantalla OLED SSD1306.
+// Idea de rppal (MIT/Apache-2.0), escrito desde cero. En inglés:
+// importar "gpio".
+//
+//   importar "pines"
+//   sea chip = pines_chip("/dev/gpiochip0")
+//   sea led = pines_pedir(chip, 17, {"modo": "salida"})
+//   pines_escribir(led, 1)
+//   sea boton = pines_pedir(chip, 27, {"modo": "entrada", "sesgo": "arriba", "flancos": "bajada"})
+//   para e en pines_eventos(boton, 5000) { mostrar(e) }
+
+importar "fuente"
+
+funcion __pines_declaraciones() {
+    extern "libc" funcion open(ruta: texto, banderas: entero, modo: entero): entero
+    extern "libc" funcion close(fd: entero): entero
+    extern "libc" funcion read(fd: entero, buf: puntero, n: entero): largo
+    extern "libc" funcion write(fd: entero, datos: texto, n: entero): largo
+    extern "libc" funcion ioctl(fd: entero, req: largo, p: puntero): entero
+    extern "libc" funcion poll(fds: puntero, n: entero, espera: entero): entero
+}
+
+// ---------- constantes del kernel (linux/gpio.h, i2c-dev.h, spidev.h) ----------
+
+sea _PI_K = {
+    "CHIPINFO": 2151986177, "LINEINFO": 3238048773, "GETLINE": 3260068871, "SETCONFIG": 3239097357,
+    "GETVAL": 3222320142, "SETVAL": 3222320143,
+    "I2C_SLAVE": 1795, "I2C_RDWR": 1799, "I2C_FUNCS": 1797,
+    "SPI_MSG1": 1075866368, "SPI_WR_MODE": 1073834753, "SPI_WR_BITS": 1073834755, "SPI_WR_SPEED": 1074031364, "SPI_WR_MODE32": 1074031365
+}
+// Banderas de línea (GPIO_V2_LINE_FLAG_*).
+sea _PI_F = {"usada": 1, "activo_bajo": 2, "entrada": 4, "salida": 8, "subida": 16, "bajada": 32, "drenador": 64, "fuente": 128, "arriba": 256, "abajo": 512, "sin_sesgo": 1024, "reloj_real": 2048}
+
+funcion _pi_bit(v, b) { retornar piso(v / b) % 2 == 1 }
+
+funcion _pi_cadena(t, n) {
+    sea r = t
+    si (longitud(r) > n - 1) { r = subtexto(r, 0, n - 1) }
+    mientras (longitud(r) < n) { r = r + char_de(0) }
+    retornar r
+}
+
+funcion _pi_de_cadena(t) {
+    sea i = texto_indice(t, char_de(0))
+    si (i < 0) { retornar t }
+    retornar subtexto(t, 0, i)
+}
+
+funcion _pi_ceros(n) {
+    sea r = ""
+    sea bloque = char_de(0) + char_de(0) + char_de(0) + char_de(0) + char_de(0) + char_de(0) + char_de(0) + char_de(0)
+    mientras (longitud(r) + 8 <= n) { r = r + bloque }
+    mientras (longitud(r) < n) { r = r + char_de(0) }
+    retornar r
+}
+
+funcion _pi_u32(n) { retornar bytes_entero(n, 4, 1) }
+funcion _pi_u64(n) { retornar bytes_entero(n, 8, 1) }
+
+// ---------- chips ----------
+
+/// Chips GPIO del sistema: [{"ruta", "nombre", "etiqueta", "lineas"}].
+funcion pines_chips() {
+    sea r = []
+    si (existe_archivo("/dev") == falso) { retornar r }
+    para n en listar_carpeta("/dev") {
+        si (texto_empieza_con(n, "gpiochip")) {
+            intentar {
+                sea c = pines_chip("/dev/" + n)
+                r.agregar({"ruta": c["ruta"], "nombre": c["nombre"], "etiqueta": c["etiqueta"], "lineas": c["lineas"]})
+                pines_cerrar(c)
+            } capturar (e) { }
+        }
+    }
+    retornar r
+}
+
+/// Abre un chip GPIO por ruta ("/dev/gpiochip0"), número o etiqueta
+/// ("pinctrl-rp1" en la Raspberry Pi 5).
+funcion pines_chip(cual) {
+    sea ruta = cual
+    si (tipo(cual) == "numero") { ruta = "/dev/gpiochip" + cual }
+    sino si (texto_empieza_con(cual, "/") == falso) {
+        ruta = nulo
+        para c en pines_chips() { si (c["etiqueta"] == cual o c["nombre"] == cual) { ruta = c["ruta"] } }
+        si (ruta == nulo) { lanzar "pines: no hay un chip GPIO '" + cual + "'" }
+    }
+    sea fd = open(ruta, 524290, 0)
+    si (fd < 0) { lanzar "pines: no se pudo abrir " + ruta + " (¿existe y tienes permiso? suele hacer falta el grupo gpio)" }
+    sea buf = c_reservar(68)
+    si (ioctl(fd, _PI_K["CHIPINFO"], buf) < 0) {
+        c_liberar(buf)
+        close(fd)
+        lanzar "pines: " + ruta + " no responde como chip GPIO"
+    }
+    sea b = c_bytes(buf, 68)
+    c_liberar(buf)
+    retornar {"tipo": "real", "ruta": ruta, "fd": fd, "nombre": _pi_de_cadena(subtexto(b, 0, 32)), "etiqueta": _pi_de_cadena(subtexto(b, 32, 64)), "lineas": bytes_leer_entero(b, 64, 4, 1)}
+}
+
+/// Cierra un chip, bus o pedido.
+funcion pines_cerrar(x) {
+    si (x["tipo"] == "real" y (x["fd"] ?? -1) >= 0) {
+        close(x["fd"])
+        x["fd"] = -1
+    }
+}
+
+/// Chip simulado con n líneas (opciones: "nombres", "etiqueta").
+funcion pines_simulado(n, opciones) {
+    sea op = opciones ?? {}
+    sea lineas = []
+    sea i = 0
+    mientras (i < n) {
+        sea nombre = "GPIO" + i
+        si (tiene_clave(op, "nombres") y i < longitud(op["nombres"])) { nombre = op["nombres"][i] }
+        lineas.agregar({"nombre": nombre, "consumidor": "", "flags": 0, "externo": nulo, "salida": 0, "antirrebote": 0, "ultimo_ns": -1000000000000, "pedido": nulo})
+        i = i + 1
+    }
+    retornar {"tipo": "sim", "ruta": "sim", "nombre": "gpiochip-sim", "etiqueta": op["etiqueta"] ?? "simulado", "lineas": n, "sim": lineas, "reloj": 0}
+}
+
+/// Información de una línea.
+funcion pines_info(chip, linea) {
+    sea nombre = ""
+    sea consumidor = ""
+    sea flags = 0
+    sea antirrebote = 0
+    si (chip["tipo"] == "sim") {
+        sea l = chip["sim"][linea]
+        nombre = l["nombre"]
+        consumidor = l["consumidor"]
+        flags = l["flags"]
+        antirrebote = l["antirrebote"]
+    } sino {
+        sea pedido = _pi_u32(0) + _pi_u32(0) + _pi_u32(0) + _pi_u32(0) + _pi_u32(0) + _pi_u32(0) + _pi_u32(0) + _pi_u32(0)
+        pedido = pedido + pedido + _pi_u32(linea) + _pi_ceros(256 - 68)
+        sea buf = c_desde_bytes(pedido)
+        sea r = ioctl(chip["fd"], _PI_K["LINEINFO"], buf)
+        sea b = c_bytes(buf, 256)
+        c_liberar(buf)
+        si (r < 0) { lanzar "pines: no se pudo leer la línea " + linea }
+        nombre = _pi_de_cadena(subtexto(b, 0, 32))
+        consumidor = _pi_de_cadena(subtexto(b, 32, 64))
+        flags = bytes_leer_entero(b, 72, 8, 1)
+        sea na = bytes_leer_entero(b, 68, 4, 1)
+        sea k = 0
+        mientras (k < na) {
+            si (bytes_leer_entero(b, 80 + k * 16, 4, 1) == 3) { antirrebote = bytes_leer_entero(b, 88 + k * 16, 4, 1) }
+            k = k + 1
+        }
+    }
+    sea dir = "entrada"
+    si (_pi_bit(flags, 8)) { dir = "salida" }
+    sea flancos = nulo
+    si (_pi_bit(flags, 16) y _pi_bit(flags, 32)) { flancos = "ambos" } sino si (_pi_bit(flags, 16)) { flancos = "subida" } sino si (_pi_bit(flags, 32)) { flancos = "bajada" }
+    sea sesgo = nulo
+    si (_pi_bit(flags, 256)) { sesgo = "arriba" } sino si (_pi_bit(flags, 512)) { sesgo = "abajo" } sino si (_pi_bit(flags, 1024)) { sesgo = "ninguno" }
+    sea drenador = nulo
+    si (_pi_bit(flags, 64)) { drenador = "abierto" } sino si (_pi_bit(flags, 128)) { drenador = "fuente" }
+    retornar {"linea": linea, "nombre": nombre, "consumidor": consumidor, "usada": _pi_bit(flags, 1), "direccion": dir, "activo_bajo": _pi_bit(flags, 2), "flancos": flancos, "sesgo": sesgo, "drenador": drenador, "antirrebote_us": antirrebote}
+}
+
+/// Número de la línea con ese nombre (por ejemplo "GPIO17"), o nulo.
+funcion pines_linea_por_nombre(chip, nombre) {
+    sea i = 0
+    mientras (i < chip["lineas"]) {
+        si (pines_info(chip, i)["nombre"] == nombre) { retornar i }
+        i = i + 1
+    }
+    retornar nulo
+}
+
+// Banderas a partir de las opciones.
+funcion _pi_flags(op) {
+    sea f = 0
+    sea modo = op["modo"] ?? "entrada"
+    si (modo == "salida") { f = f + _PI_F["salida"] } sino { f = f + _PI_F["entrada"] }
+    si (op["activo_bajo"] ?? falso) { f = f + _PI_F["activo_bajo"] }
+    sea s = op["sesgo"] ?? nulo
+    si (s == "arriba") { f = f + _PI_F["arriba"] } sino si (s == "abajo") { f = f + _PI_F["abajo"] } sino si (s == "ninguno") { f = f + _PI_F["sin_sesgo"] }
+    sea d = op["drenador"] ?? nulo
+    si (d == "abierto") { f = f + _PI_F["drenador"] } sino si (d == "fuente") { f = f + _PI_F["fuente"] }
+    sea fl = op["flancos"] ?? nulo
+    si (fl != nulo) {
+        si (modo == "salida") { lanzar "pines: los flancos solo valen en entrada" }
+        si (fl == "subida" o fl == "ambos") { f = f + _PI_F["subida"] }
+        si (fl == "bajada" o fl == "ambos") { f = f + _PI_F["bajada"] }
+    }
+    si (op["reloj_real"] ?? falso) { f = f + _PI_F["reloj_real"] }
+    retornar f
+}
+
+funcion _pi_lista(x) {
+    si (tipo(x) == "lista") { retornar x }
+    retornar [x]
+}
+
+// gpio_v2_line_config (272 bytes).
+funcion _pi_config_bytes(flags, n, valores, antirrebote) {
+    sea attrs = []
+    si (valores != nulo) {
+        sea bits = 0
+        sea mascara = 0
+        sea i = 0
+        mientras (i < n) {
+            si (valores[i] != nulo) {
+                mascara = mascara + potencia(2, i)
+                si (valores[i] != 0 y valores[i] != falso) { bits = bits + potencia(2, i) }
+            }
+            i = i + 1
+        }
+        attrs.agregar(_pi_u32(2) + _pi_u32(0) + _pi_u64(bits) + _pi_u64(mascara))
+    }
+    si (antirrebote != nulo y antirrebote > 0) { attrs.agregar(_pi_u32(3) + _pi_u32(0) + _pi_u32(antirrebote) + _pi_u32(0) + _pi_u64(potencia(2, n) - 1)) }
+    sea c = _pi_u64(flags) + _pi_u32(longitud(attrs)) + _pi_ceros(20)
+    para a en attrs { c = c + a }
+    retornar c + _pi_ceros(272 - longitud(c))
+}
+
+// gpio_v2_line_request (592 bytes).
+funcion _pi_pedido_bytes(lineas, consumidor, flags, valores, antirrebote, buffer_eventos) {
+    sea b = ""
+    para l en lineas { b = b + _pi_u32(l) }
+    b = b + _pi_ceros(256 - longitud(b))
+    b = b + _pi_cadena(consumidor, 32)
+    b = b + _pi_config_bytes(flags, longitud(lineas), valores, antirrebote)
+    b = b + _pi_u32(longitud(lineas)) + _pi_u32(buffer_eventos) + _pi_ceros(20) + _pi_u32(0)
+    retornar b
+}
+
+/// Pide una o varias líneas. opciones: "modo" ("entrada" o "salida"),
+/// "valor" (inicial de salida; uno o lista), "activo_bajo", "sesgo"
+/// ("arriba", "abajo", "ninguno"), "drenador" ("abierto", "fuente"),
+/// "flancos" ("subida", "bajada", "ambos"), "antirrebote_us",
+/// "consumidor", "reloj_real".
+funcion pines_pedir(chip, lineas, opciones) {
+    sea op = opciones ?? {}
+    sea ls = _pi_lista(lineas)
+    si (longitud(ls) == 0 o longitud(ls) > 64) { lanzar "pines: hay que pedir de 1 a 64 líneas" }
+    para l en ls { si (l < 0 o l >= chip["lineas"]) { lanzar "pines: la línea " + l + " no existe (el chip tiene " + chip["lineas"] + ")" } }
+    sea flags = _pi_flags(op)
+    sea valores = nulo
+    si ((op["modo"] ?? "entrada") == "salida") {
+        sea v = op["valor"] ?? 0
+        si (tipo(v) == "lista") { valores = v } sino {
+            valores = []
+            para l en ls { valores.agregar(v) }
+        }
+    }
+    sea consumidor = op["consumidor"] ?? "cforge"
+    sea p = {"tipo": chip["tipo"], "chip": chip, "lineas": ls, "flags": flags, "fd": -1, "op": op, "unico": tipo(lineas) != "lista"}
+    si (chip["tipo"] == "sim") {
+        para l en ls {
+            sea sl = chip["sim"][l]
+            si (sl["pedido"] != nulo) { lanzar "pines: la línea " + l + " está ocupada (dispositivo ocupado)" }
+        }
+        sea i = 0
+        para l en ls {
+            sea sl = chip["sim"][l]
+            sl["pedido"] = p
+            sl["consumidor"] = consumidor
+            sl["flags"] = flags + 1
+            sl["antirrebote"] = op["antirrebote_us"] ?? 0
+            si (valores != nulo) { sl["salida"] = _pi_fisico(flags, valores[i]) }
+            i = i + 1
+        }
+        p["eventos"] = []
+        retornar p
+    }
+    sea b = _pi_pedido_bytes(ls, consumidor, flags, valores, op["antirrebote_us"] ?? nulo, 0)
+    sea buf = c_desde_bytes(b)
+    sea r = ioctl(chip["fd"], _PI_K["GETLINE"], buf)
+    sea res = c_bytes(buf, 592)
+    c_liberar(buf)
+    si (r < 0) { lanzar "pines: no se pudieron pedir las líneas " + ls + " (¿ocupadas por otro programa?)" }
+    p["fd"] = bytes_leer_entero(res, 588, 4, 1)
+    retornar p
+}
+
+// Nivel eléctrico a partir del lógico (activo bajo invierte).
+funcion _pi_fisico(flags, v) {
+    sea b = 0
+    si (v != 0 y v != falso y v != nulo) { b = 1 }
+    si (_pi_bit(flags, 2)) { retornar 1 - b }
+    retornar b
+}
+
+// Nivel eléctrico que ve una línea simulada.
+funcion _pi_sim_nivel(sl) {
+    si (_pi_bit(sl["flags"], 8)) {
+        // Drenador abierto: solo tira a 0; con 1 queda flotando (resistencia externa o lo que haya).
+        si (_pi_bit(sl["flags"], 64) y sl["salida"] == 1) { retornar sl["externo"] ?? 1 }
+        si (_pi_bit(sl["flags"], 128) y sl["salida"] == 0) { retornar sl["externo"] ?? 0 }
+        retornar sl["salida"]
+    }
+    si (sl["externo"] != nulo) { retornar sl["externo"] }
+    si (_pi_bit(sl["flags"], 256)) { retornar 1 }
+    retornar 0
+}
+
+/// Lee los valores lógicos (uno o una lista, según cómo se pidieron).
+funcion pines_leer(pedido) {
+    sea vals = []
+    si (pedido["tipo"] == "sim") {
+        para l en pedido["lineas"] {
+            sea sl = pedido["chip"]["sim"][l]
+            vals.agregar(_pi_fisico(pedido["flags"], _pi_sim_nivel(sl)))
+        }
+    } sino {
+        sea n = longitud(pedido["lineas"])
+        sea buf = c_desde_bytes(_pi_u64(0) + _pi_u64(potencia(2, n) - 1))
+        sea r = ioctl(pedido["fd"], _PI_K["GETVAL"], buf)
+        sea b = c_bytes(buf, 16)
+        c_liberar(buf)
+        si (r < 0) { lanzar "pines: no se pudieron leer los valores" }
+        sea bits = bytes_leer_entero(b, 0, 8, 1)
+        sea i = 0
+        mientras (i < n) {
+            si (_pi_bit(bits, potencia(2, i))) { vals.agregar(1) } sino { vals.agregar(0) }
+            i = i + 1
+        }
+    }
+    si (pedido["unico"]) { retornar vals[0] }
+    retornar vals
+}
+
+/// Escribe valores lógicos (uno o una lista; nulo deja esa línea igual).
+funcion pines_escribir(pedido, valores) {
+    sea vs = _pi_lista(valores)
+    si (_pi_bit(pedido["flags"], 8) == falso) { lanzar "pines: la línea está como entrada" }
+    si (pedido["tipo"] == "sim") {
+        sea i = 0
+        para l en pedido["lineas"] {
+            si (i < longitud(vs) y vs[i] != nulo) { pedido["chip"]["sim"][l]["salida"] = _pi_fisico(pedido["flags"], vs[i]) }
+            i = i + 1
+        }
+        retornar nulo
+    }
+    sea bits = 0
+    sea mascara = 0
+    sea i = 0
+    mientras (i < longitud(pedido["lineas"])) {
+        si (i < longitud(vs) y vs[i] != nulo) {
+            mascara = mascara + potencia(2, i)
+            si (vs[i] != 0 y vs[i] != falso) { bits = bits + potencia(2, i) }
+        }
+        i = i + 1
+    }
+    sea buf = c_desde_bytes(_pi_u64(bits) + _pi_u64(mascara))
+    sea r = ioctl(pedido["fd"], _PI_K["SETVAL"], buf)
+    c_liberar(buf)
+    si (r < 0) { lanzar "pines: no se pudieron escribir los valores" }
+}
+
+/// Cambia la configuración de un pedido (mismas opciones que pines_pedir).
+funcion pines_configurar(pedido, opciones) {
+    sea op = {}
+    para k en claves(pedido["op"]) { op[k] = pedido["op"][k] }
+    para k en claves(opciones) { op[k] = opciones[k] }
+    sea flags = _pi_flags(op)
+    sea valores = nulo
+    si ((op["modo"] ?? "entrada") == "salida") {
+        sea v = op["valor"] ?? 0
+        si (tipo(v) == "lista") { valores = v } sino {
+            valores = []
+            para l en pedido["lineas"] { valores.agregar(v) }
+        }
+    }
+    si (pedido["tipo"] == "sim") {
+        sea i = 0
+        para l en pedido["lineas"] {
+            sea sl = pedido["chip"]["sim"][l]
+            sl["flags"] = flags + 1
+            sl["antirrebote"] = op["antirrebote_us"] ?? 0
+            si (valores != nulo) { sl["salida"] = _pi_fisico(flags, valores[i]) }
+            i = i + 1
+        }
+    } sino {
+        sea buf = c_desde_bytes(_pi_config_bytes(flags, longitud(pedido["lineas"]), valores, op["antirrebote_us"] ?? nulo))
+        sea r = ioctl(pedido["fd"], _PI_K["SETCONFIG"], buf)
+        c_liberar(buf)
+        si (r < 0) { lanzar "pines: no se pudo cambiar la configuración" }
+    }
+    pedido["op"] = op
+    pedido["flags"] = flags
+}
+
+/// Eventos de flanco: espera hasta espera_ms (0 no espera) y devuelve
+/// [{"linea", "flanco" ("subida"/"bajada"), "ns", "seq"}].
+funcion pines_eventos(pedido, espera_ms) {
+    si (pedido["tipo"] == "sim") {
+        sea r = pedido["eventos"]
+        pedido["eventos"] = []
+        retornar r
+    }
+    sea r = []
+    sea pf = c_desde_bytes(_pi_u32(pedido["fd"]) + bytes_entero(1, 2, 1) + bytes_entero(0, 2, 1))
+    sea n = poll(pf, 1, espera_ms ?? 0)
+    c_liberar(pf)
+    si (n <= 0) { retornar r }
+    sea buf = c_reservar(48 * 16)
+    sea leidos = read(pedido["fd"], buf, 48 * 16)
+    sea b = ""
+    si (leidos > 0) { b = c_bytes(buf, leidos) }
+    c_liberar(buf)
+    sea i = 0
+    mientras (i + 48 <= longitud(b)) {
+        sea id = bytes_leer_entero(b, i + 8, 4, 1)
+        sea fl = "subida"
+        si (id == 2) { fl = "bajada" }
+        r.agregar({"linea": bytes_leer_entero(b, i + 12, 4, 1), "flanco": fl, "ns": bytes_leer_entero(b, i, 8, 1), "seq": bytes_leer_entero(b, i + 16, 4, 1)})
+        i = i + 48
+    }
+    retornar r
+}
+
+/// Suelta las líneas pedidas.
+funcion pines_soltar(pedido) {
+    si (pedido["tipo"] == "sim") {
+        para l en pedido["lineas"] {
+            sea sl = pedido["chip"]["sim"][l]
+            sl["pedido"] = nulo
+            sl["consumidor"] = ""
+            sl["flags"] = 0
+        }
+        retornar nulo
+    }
+    pines_cerrar(pedido)
+}
+
+/// Simulador: pone el nivel eléctrico que llega desde afuera a una línea
+/// (nulo la deja flotando). ns: marca de tiempo (para el antirrebote).
+funcion pines_sim_poner(chip, linea, nivel, ns) {
+    sea sl = chip["sim"][linea]
+    sea t = ns ?? (chip["reloj"] + 1000000)
+    chip["reloj"] = t
+    sea antes = _pi_sim_nivel(sl)
+    sl["externo"] = nivel
+    sea despues = _pi_sim_nivel(sl)
+    sea p = sl["pedido"]
+    si (p != nulo y antes != despues y _pi_bit(sl["flags"], 4)) {
+        // Flanco lógico (activo bajo invierte).
+        sea logico_antes = _pi_fisico(p["flags"], antes)
+        sea logico = _pi_fisico(p["flags"], despues)
+        sea fl = "bajada"
+        si (logico > logico_antes) { fl = "subida" }
+        sea quiere = (fl == "subida" y _pi_bit(p["flags"], 16)) o (fl == "bajada" y _pi_bit(p["flags"], 32))
+        si (quiere y (t - sl["ultimo_ns"]) >= sl["antirrebote"] * 1000) {
+            sl["ultimo_ns"] = t
+            chip["seq"] = (chip["seq"] ?? 0) + 1
+            p["eventos"].agregar({"linea": linea, "flanco": fl, "ns": t, "seq": chip["seq"]})
+        }
+    }
+}
+
+/// Simulador: nivel eléctrico de una línea (lo que vería un multímetro).
+funcion pines_sim_nivel(chip, linea) { retornar _pi_sim_nivel(chip["sim"][linea]) }
+
+// ---------- Raspberry Pi ----------
+
+sea _PI_HEADER = [nulo, "3V3", "5V", 2, "5V", 3, "GND", 4, 14, "GND", 15, 17, 18, 27, "GND", 22, 23, "3V3", 24, 10, "GND", 9, 25, 11, 8, "GND", 7, 0, 1, 5, "GND", 6, 12, 13, "GND", 19, 16, 26, 20, "GND", 21]
+
+/// Modelo de la placa (de /proc/device-tree/model) o nulo.
+funcion pines_placa() {
+    si (existe_archivo("/proc/device-tree/model") == falso) { retornar nulo }
+    retornar _pi_de_cadena(leer_archivo("/proc/device-tree/model"))
+}
+
+/// Número BCM del pin físico (1–40) del conector de la Raspberry Pi, o el
+/// texto "3V3", "5V" o "GND".
+funcion pines_bcm(fisico) {
+    si (fisico < 1 o fisico > 40) { lanzar "pines: el conector tiene los pines 1 a 40" }
+    retornar _PI_HEADER[fisico]
+}
+
+/// Pin físico de un número BCM.
+funcion pines_fisico(bcm) {
+    sea i = 1
+    mientras (i <= 40) {
+        si (_PI_HEADER[i] == bcm) { retornar i }
+        i = i + 1
+    }
+    retornar nulo
+}
+
+/// Chip GPIO del conector según la placa (pinctrl-rp1 en la Pi 5).
+funcion pines_chip_placa() {
+    para c en pines_chips() { si (c["etiqueta"] == "pinctrl-rp1") { retornar pines_chip(c["ruta"]) } }
+    para c en pines_chips() { si (texto_empieza_con(c["etiqueta"], "pinctrl-bcm")) { retornar pines_chip(c["ruta"]) } }
+    retornar pines_chip("/dev/gpiochip0")
+}
+
+// ---------- I2C ----------
+
+/// Abre un bus I2C por número (/dev/i2c-N) o ruta.
+funcion pines_i2c(bus) {
+    sea ruta = bus
+    si (tipo(bus) == "numero") { ruta = "/dev/i2c-" + bus }
+    sea fd = open(ruta, 524290, 0)
+    si (fd < 0) { lanzar "pines: no se pudo abrir " + ruta + " (¿activaste I2C y estás en el grupo i2c?)" }
+    retornar {"tipo": "real", "ruta": ruta, "fd": fd, "dir": -1}
+}
+
+/// Bus I2C simulado. Los dispositivos se agregan con pines_sim_i2c.
+funcion pines_i2c_simulado() { retornar {"tipo": "sim", "ruta": "sim", "dispositivos": {}, "registro": []} }
+
+/// Agrega un dispositivo simulado de registros en la dirección dada.
+/// registros: mapa de número de registro a byte (los que falten valen 0).
+/// La primera escritura de cada transacción fija el puntero de registro
+/// y las siguientes escriben con incremento automático.
+funcion pines_sim_i2c(bus, dir, registros) {
+    sea d = {"registros": registros ?? {}, "puntero": 0, "escrituras": []}
+    bus["dispositivos"]["" + dir] = d
+    retornar d
+}
+
+// Transacciones: [{"dir", "escribir": bytes} o {"dir", "leer": n}].
+funcion _pi_i2c_transaccion(bus, mensajes) {
+    si (bus["tipo"] == "sim") {
+        sea res = []
+        para m en mensajes {
+            sea d = bus["dispositivos"]["" + m["dir"]] ?? nulo
+            si (d == nulo) { lanzar "pines: nadie responde en la dirección 0x" + hex_de_bytes(char_de(m["dir"])) + " (NACK)" }
+            si (tiene_clave(m, "escribir")) {
+                sea b = m["escribir"]
+                d["escrituras"].agregar(b)
+                bus["registro"].agregar(["w", m["dir"], b])
+                si (longitud(b) > 0) {
+                    d["puntero"] = byte_en(b, 0)
+                    sea i = 1
+                    mientras (i < longitud(b)) {
+                        d["registros"]["" + d["puntero"]] = byte_en(b, i)
+                        d["puntero"] = (d["puntero"] + 1) % 256
+                        i = i + 1
+                    }
+                }
+            } sino {
+                sea t = ""
+                sea i = 0
+                mientras (i < m["leer"]) {
+                    t = t + char_de(d["registros"]["" + d["puntero"]] ?? 0)
+                    d["puntero"] = (d["puntero"] + 1) % 256
+                    i = i + 1
+                }
+                bus["registro"].agregar(["r", m["dir"], t])
+                res.agregar(t)
+            }
+        }
+        retornar res
+    }
+    // I2C_RDWR con i2c_msg {u16 addr, u16 flags, u16 len, u8 *buf}.
+    sea bufs = []
+    sea msgs = ""
+    para m en mensajes {
+        sea p = nulo
+        sea largo = 0
+        sea fl = 0
+        si (tiene_clave(m, "escribir")) {
+            largo = longitud(m["escribir"])
+            p = c_desde_bytes(m["escribir"] + char_de(0))
+        } sino {
+            largo = m["leer"]
+            fl = 1
+            p = c_reservar(maximo(1, largo))
+        }
+        bufs.agregar([p, largo, fl])
+        msgs = msgs + bytes_entero(m["dir"], 2, 1) + bytes_entero(fl, 2, 1) + bytes_entero(largo, 2, 1) + _pi_ceros(2) + _pi_u64(0)
+    }
+    sea pm = c_desde_bytes(msgs)
+    sea i = 0
+    para b en bufs {
+        c_escribir64(pm, i * 16 + 8, b[0])
+        i = i + 1
+    }
+    sea datos = c_desde_bytes(_pi_u64(0) + _pi_u32(longitud(mensajes)) + _pi_u32(0))
+    c_escribir64(datos, 0, pm)
+    sea r = ioctl(bus["fd"], _PI_K["I2C_RDWR"], datos)
+    sea res = []
+    para b en bufs {
+        si (b[2] == 1 y r >= 0) { res.agregar(c_bytes(b[0], b[1])) }
+        c_liberar(b[0])
+    }
+    c_liberar(pm)
+    c_liberar(datos)
+    si (r < 0) { lanzar "pines: la transacción I2C falló (¿no hay nada en esa dirección?)" }
+    retornar res
+}
+
+/// Escribe bytes a un dispositivo.
+funcion pines_i2c_escribir(bus, dir, bytes) { _pi_i2c_transaccion(bus, [{"dir": dir, "escribir": bytes}]) }
+
+/// Lee n bytes de un dispositivo.
+funcion pines_i2c_leer(bus, dir, n) { retornar _pi_i2c_transaccion(bus, [{"dir": dir, "leer": n}])[0] }
+
+/// Escribe y luego lee con inicio repetido (sin soltar el bus).
+funcion pines_i2c_escribir_leer(bus, dir, bytes, n) { retornar _pi_i2c_transaccion(bus, [{"dir": dir, "escribir": bytes}, {"dir": dir, "leer": n}])[0] }
+
+/// Lee n bytes desde un registro.
+funcion pines_i2c_leer_registro(bus, dir, registro, n) { retornar pines_i2c_escribir_leer(bus, dir, char_de(registro), n) }
+
+/// Lee un byte de un registro.
+funcion pines_i2c_leer_byte(bus, dir, registro) { retornar byte_en(pines_i2c_leer_registro(bus, dir, registro, 1), 0) }
+
+/// Escribe bytes desde un registro (o un solo byte si es un número).
+funcion pines_i2c_escribir_registro(bus, dir, registro, datos) {
+    sea b = datos
+    si (tipo(datos) == "numero") { b = char_de(datos) }
+    pines_i2c_escribir(bus, dir, char_de(registro) + b)
+}
+
+/// Direcciones (0x08–0x77) donde responde algún dispositivo.
+funcion pines_i2c_escanear(bus) {
+    sea r = []
+    sea d = 8
+    mientras (d <= 119) {
+        intentar {
+            _pi_i2c_transaccion(bus, [{"dir": d, "leer": 1}])
+            r.agregar(d)
+        } capturar (e) { }
+        d = d + 1
+    }
+    retornar r
+}
+
+// ---------- SPI ----------
+
+/// Abre /dev/spidevB.C. opciones: "velocidad" (Hz, 1 MHz por defecto),
+/// "modo" (0–3), "bits" (8).
+funcion pines_spi(bus, cs, opciones) {
+    sea op = opciones ?? {}
+    sea ruta = "/dev/spidev" + bus + "." + cs
+    sea fd = open(ruta, 524290, 0)
+    si (fd < 0) { lanzar "pines: no se pudo abrir " + ruta + " (¿activaste SPI?)" }
+    sea s = {"tipo": "real", "ruta": ruta, "fd": fd, "velocidad": op["velocidad"] ?? 1000000, "modo": op["modo"] ?? 0, "bits": op["bits"] ?? 8}
+    _pi_spi_ioctl(s, _PI_K["SPI_WR_MODE"], char_de(s["modo"]))
+    _pi_spi_ioctl(s, _PI_K["SPI_WR_BITS"], char_de(s["bits"]))
+    _pi_spi_ioctl(s, _PI_K["SPI_WR_SPEED"], _pi_u32(s["velocidad"]))
+    retornar s
+}
+
+funcion _pi_spi_ioctl(s, req, b) {
+    sea p = c_desde_bytes(b)
+    sea r = ioctl(s["fd"], req, p)
+    c_liberar(p)
+    si (r < 0) { lanzar "pines: el controlador SPI rechazó la configuración" }
+}
+
+/// Bus SPI simulado: responder(tx) devuelve los bytes recibidos (por
+/// defecto, lazo: devuelve lo mismo que se envía).
+funcion pines_spi_simulado(responder) { retornar {"tipo": "sim", "responder": responder, "registro": [], "velocidad": 1000000, "modo": 0, "bits": 8} }
+
+/// Transferencia dúplex: envía bytes y devuelve lo recibido (mismo largo).
+funcion pines_spi_transferir(spi, bytes) { retornar pines_spi_transferencias(spi, [{"tx": bytes}])[0] }
+
+// spi_ioc_transfer (32 bytes).
+funcion _pi_spi_xfer_bytes(t, s) {
+    sea largo = longitud(t["tx"] ?? "")
+    si (tiene_clave(t, "rx_n")) { largo = maximo(largo, t["rx_n"]) }
+    sea cs = 0
+    si (t["cs_cambio"] ?? falso) { cs = 1 }
+    retornar _pi_u64(0) + _pi_u64(0) + _pi_u32(largo) + _pi_u32(t["velocidad"] ?? s["velocidad"]) + bytes_entero(t["espera_us"] ?? 0, 2, 1) + char_de(t["bits"] ?? s["bits"]) + char_de(cs) + _pi_u32(0)
+}
+
+/// Varias transferencias con el CS bajo entre ellas: [{"tx", "rx_n",
+/// "velocidad", "espera_us", "cs_cambio", "bits"}]. Devuelve lo recibido
+/// en cada una.
+funcion pines_spi_transferencias(spi, lista) {
+    si (spi["tipo"] == "sim") {
+        sea res = []
+        para t en lista {
+            sea tx = t["tx"] ?? ""
+            si (tiene_clave(t, "rx_n")) { mientras (longitud(tx) < t["rx_n"]) { tx = tx + char_de(0) } }
+            sea rx = tx
+            si (spi["responder"] != nulo) { rx = spi["responder"](tx) }
+            spi["registro"].agregar(tx)
+            res.agregar(rx)
+        }
+        retornar res
+    }
+    sea xs = ""
+    sea bufs = []
+    para t en lista {
+        sea largo = longitud(t["tx"] ?? "")
+        si (tiene_clave(t, "rx_n")) { largo = maximo(largo, t["rx_n"]) }
+        sea tx = t["tx"] ?? ""
+        mientras (longitud(tx) < largo) { tx = tx + char_de(0) }
+        sea ptx = c_desde_bytes(tx + char_de(0))
+        sea prx = c_reservar(maximo(1, largo))
+        bufs.agregar([ptx, prx, largo])
+        xs = xs + _pi_spi_xfer_bytes(t, spi)
+    }
+    sea px = c_desde_bytes(xs)
+    sea i = 0
+    para b en bufs {
+        c_escribir64(px, i * 32, b[0])
+        c_escribir64(px, i * 32 + 8, b[1])
+        i = i + 1
+    }
+    // SPI_IOC_MESSAGE(n): el tamaño va en los bits 16–29.
+    sea req = _PI_K["SPI_MSG1"] - 32 * 65536 + longitud(lista) * 32 * 65536
+    sea r = ioctl(spi["fd"], req, px)
+    sea res = []
+    para b en bufs {
+        si (r >= 0) { res.agregar(c_bytes(b[1], b[2])) }
+        c_liberar(b[0])
+        c_liberar(b[1])
+    }
+    c_liberar(px)
+    si (r < 0) { lanzar "pines: la transferencia SPI falló" }
+    retornar res
+}
+
+// ---------- PWM por sysfs ----------
+
+/// Canal PWM (exporta /sys/class/pwm/pwmchipC/pwmN). raiz: para pruebas.
+funcion pines_pwm(chip, canal, raiz) {
+    sea base = (raiz ?? "/sys/class/pwm") + "/pwmchip" + chip
+    si (existe_archivo(base) == falso) { lanzar "pines: no existe " + base + " (¿activaste el overlay de PWM?)" }
+    sea dir = base + "/pwm" + canal
+    si (existe_archivo(dir) == falso) {
+        escribir_archivo(base + "/export", "" + canal)
+        sea k = 0
+        mientras (existe_archivo(dir) == falso y k < 50) {
+            dormir(10)
+            k = k + 1
+        }
+    }
+    retornar {"dir": dir, "base": base, "canal": canal, "periodo": nulo}
+}
+
+/// Configura el PWM: "frecuencia" (Hz) o "periodo_ns", "ciclo" (0–1) o
+/// "activo_ns", "polaridad" ("normal"/"invertida"), "activo".
+funcion pines_pwm_configurar(pwm, opciones) {
+    sea op = opciones ?? {}
+    sea periodo = op["periodo_ns"] ?? nulo
+    si (tiene_clave(op, "frecuencia")) { periodo = redondear(1000000000 / op["frecuencia"]) }
+    si (periodo != nulo) {
+        // El ciclo no puede quedar mayor que el período mientras se cambia.
+        si (pwm["periodo"] != nulo y periodo < pwm["periodo"]) { escribir_archivo(pwm["dir"] + "/duty_cycle", "0") }
+        escribir_archivo(pwm["dir"] + "/period", "" + periodo)
+        pwm["periodo"] = periodo
+    }
+    si (tiene_clave(op, "polaridad")) {
+        sea p = "normal"
+        si (op["polaridad"] == "invertida") { p = "inversed" }
+        escribir_archivo(pwm["dir"] + "/polarity", p)
+    }
+    sea activo = op["activo_ns"] ?? nulo
+    si (tiene_clave(op, "ciclo")) {
+        si (pwm["periodo"] == nulo) { lanzar "pines: falta el período antes del ciclo" }
+        activo = redondear(pwm["periodo"] * _pi_limitar(op["ciclo"], 0, 1))
+    }
+    si (activo != nulo) { escribir_archivo(pwm["dir"] + "/duty_cycle", "" + activo) }
+    si (tiene_clave(op, "activo")) {
+        sea v = "0"
+        si (op["activo"]) { v = "1" }
+        escribir_archivo(pwm["dir"] + "/enable", v)
+    }
+}
+
+/// Posición de un servo: ángulo 0–180 entre 1 y 2 ms a 50 Hz (ajustable
+/// con opciones "min_us", "max_us").
+funcion pines_pwm_servo(pwm, angulo, opciones) {
+    sea op = opciones ?? {}
+    sea mn = op["min_us"] ?? 1000
+    sea mx = op["max_us"] ?? 2000
+    si (pwm["periodo"] != 20000000) { pines_pwm_configurar(pwm, {"periodo_ns": 20000000}) }
+    pines_pwm_configurar(pwm, {"activo_ns": redondear((mn + (mx - mn) * _pi_limitar(angulo, 0, 180) / 180) * 1000), "activo": verdadero})
+}
+
+funcion _pi_limitar(v, a, b) {
+    si (v < a) { retornar a }
+    si (v > b) { retornar b }
+    retornar v
+}
+
+// ---------- BME280 / BMP280 ----------
+
+funcion _pi_s16(b, i) {
+    sea v = byte_en(b, i) + byte_en(b, i + 1) * 256
+    si (v >= 32768) { retornar v - 65536 }
+    retornar v
+}
+funcion _pi_u16(b, i) { retornar byte_en(b, i) + byte_en(b, i + 1) * 256 }
+
+/// Sensor BME280 (o BMP280, sin humedad) en la dirección dada (0x76 o
+/// 0x77). Lee la calibración y lo pone en modo normal con sobremuestreo ×1.
+funcion pines_bme280(bus, dir) {
+    sea id = pines_i2c_leer_byte(bus, dir, 208)
+    si (id != 96 y id != 88 y id != 86 y id != 87) { lanzar "pines: en 0x" + hex_de_bytes(char_de(dir)) + " no hay un BME280/BMP280 (id " + id + ")" }
+    sea c = pines_i2c_leer_registro(bus, dir, 136, 24)
+    sea s = {"bus": bus, "dir": dir, "humedad": id == 96,
+        "T1": _pi_u16(c, 0), "T2": _pi_s16(c, 2), "T3": _pi_s16(c, 4),
+        "P1": _pi_u16(c, 6), "P2": _pi_s16(c, 8), "P3": _pi_s16(c, 10), "P4": _pi_s16(c, 12), "P5": _pi_s16(c, 14),
+        "P6": _pi_s16(c, 16), "P7": _pi_s16(c, 18), "P8": _pi_s16(c, 20), "P9": _pi_s16(c, 22)}
+    si (s["humedad"]) {
+        s["H1"] = pines_i2c_leer_byte(bus, dir, 161)
+        sea h = pines_i2c_leer_registro(bus, dir, 225, 7)
+        s["H2"] = _pi_s16(h, 0)
+        s["H3"] = byte_en(h, 2)
+        sea e4 = byte_en(h, 3)
+        sea e5 = byte_en(h, 4)
+        sea e6 = byte_en(h, 5)
+        s["H4"] = e4 * 16 + e5 % 16
+        si (e4 >= 128) { s["H4"] = s["H4"] - 4096 }
+        s["H5"] = e6 * 16 + piso(e5 / 16)
+        si (e6 >= 128) { s["H5"] = s["H5"] - 4096 }
+        s["H6"] = byte_en(h, 6)
+        si (s["H6"] >= 128) { s["H6"] = s["H6"] - 256 }
+        pines_i2c_escribir_registro(bus, dir, 242, 1)
+    }
+    pines_i2c_escribir_registro(bus, dir, 245, 0)
+    pines_i2c_escribir_registro(bus, dir, 244, 39)
+    retornar s
+}
+
+/// Compensación del datasheet de Bosch (versión en coma flotante).
+/// Devuelve {"temperatura" °C, "presion" Pa, "humedad" %}.
+funcion pines_bme280_compensar(s, adc_t, adc_p, adc_h) {
+    sea v1 = (adc_t / 16384.0 - s["T1"] / 1024.0) * s["T2"]
+    sea d = adc_t / 131072.0 - s["T1"] / 8192.0
+    sea v2 = d * d * s["T3"]
+    sea t_fine = v1 + v2
+    sea temp = t_fine / 5120.0
+    sea p1 = t_fine / 2.0 - 64000.0
+    sea p2 = p1 * p1 * s["P6"] / 32768.0
+    p2 = p2 + p1 * s["P5"] * 2.0
+    p2 = p2 / 4.0 + s["P4"] * 65536.0
+    p1 = (s["P3"] * p1 * p1 / 524288.0 + s["P2"] * p1) / 524288.0
+    p1 = (1.0 + p1 / 32768.0) * s["P1"]
+    sea pres = 0
+    si (p1 != 0) {
+        pres = 1048576.0 - adc_p
+        pres = (pres - p2 / 4096.0) * 6250.0 / p1
+        sea q1 = s["P9"] * pres * pres / 2147483648.0
+        sea q2 = pres * s["P8"] / 32768.0
+        pres = pres + (q1 + q2 + s["P7"]) / 16.0
+    }
+    sea r = {"temperatura": temp, "presion": pres}
+    si (s["humedad"] y adc_h != nulo) {
+        sea h = t_fine - 76800.0
+        h = (adc_h - (s["H4"] * 64.0 + s["H5"] / 16384.0 * h)) * (s["H2"] / 65536.0 * (1.0 + s["H6"] / 67108864.0 * h * (1.0 + s["H3"] / 67108864.0 * h)))
+        h = h * (1.0 - s["H1"] * h / 524288.0)
+        r["humedad"] = _pi_limitar(h, 0, 100)
+    }
+    retornar r
+}
+
+/// Lee temperatura, presión y (en el BME280) humedad.
+funcion pines_bme280_leer(s) {
+    sea n = 6
+    si (s["humedad"]) { n = 8 }
+    sea b = pines_i2c_leer_registro(s["bus"], s["dir"], 247, n)
+    sea adc_p = byte_en(b, 0) * 4096 + byte_en(b, 1) * 16 + piso(byte_en(b, 2) / 16)
+    sea adc_t = byte_en(b, 3) * 4096 + byte_en(b, 4) * 16 + piso(byte_en(b, 5) / 16)
+    sea adc_h = nulo
+    si (s["humedad"]) { adc_h = byte_en(b, 6) * 256 + byte_en(b, 7) }
+    retornar pines_bme280_compensar(s, adc_t, adc_p, adc_h)
+}
+
+// ---------- SSD1306 ----------
+
+/// Pantalla OLED SSD1306 por I2C (0x3C), de 128×64 o 128×32.
+funcion pines_ssd1306(bus, dir, ancho, alto) {
+    sea w = ancho ?? 128
+    sea h = alto ?? 64
+    sea com = 18
+    si (h == 32) { com = 2 }
+    sea init = [174, 213, 128, 168, h - 1, 211, 0, 64, 141, 20, 32, 0, 161, 200, 218, com, 129, 207, 217, 241, 219, 64, 164, 166, 46, 175]
+    sea t = char_de(0)
+    para c en init { t = t + char_de(c) }
+    pines_i2c_escribir(bus, dir, t)
+    sea buf = []
+    sea i = 0
+    mientras (i < w * h / 8) {
+        buf.agregar(0)
+        i = i + 1
+    }
+    retornar {"bus": bus, "dir": dir, "ancho": w, "alto": h, "buf": buf}
+}
+
+/// Enciende o apaga un píxel del búfer.
+funcion pines_ssd1306_pixel(p, x, py, encendido) {
+    si (x < 0 o py < 0 o x >= p["ancho"] o py >= p["alto"]) { retornar nulo }
+    sea i = piso(py / 8) * p["ancho"] + x
+    sea bit = potencia(2, py % 8)
+    sea tiene = _pi_bit(p["buf"][i], bit)
+    si (encendido y tiene == falso) { p["buf"][i] = p["buf"][i] + bit }
+    si (encendido == falso y tiene) { p["buf"][i] = p["buf"][i] - bit }
+}
+
+/// Borra el búfer.
+funcion pines_ssd1306_limpiar(p) {
+    sea i = 0
+    mientras (i < longitud(p["buf"])) {
+        p["buf"][i] = 0
+        i = i + 1
+    }
+}
+
+/// Texto con la fuente de mapa de bits 6×12.
+funcion pines_ssd1306_texto(p, x, py, texto) {
+    sea f = fuente_basica()
+    sea fx = x
+    para cp en texto_codigos(texto) {
+        sea c = cp
+        si (c < 32 o c > 126) { c = 63 }
+        sea fila = 0
+        mientras (fila < f["alto"]) {
+            sea bits = byte_en(f["datos"], (c - 32) * f["alto"] + fila)
+            sea col = 0
+            mientras (col < f["ancho"]) {
+                si (piso(bits / potencia(2, f["ancho"] - 1 - col)) % 2 == 1) { pines_ssd1306_pixel(p, fx + col, py + fila, verdadero) }
+                col = col + 1
+            }
+            fila = fila + 1
+        }
+        fx = fx + f["ancho"]
+    }
+}
+
+/// Copia una imagen (de "imagen" o un lienzo) con umbral de brillo.
+funcion pines_ssd1306_imagen(p, img, umbral) {
+    sea u = umbral ?? 128
+    sea py = 0
+    mientras (py < minimo(p["alto"], img["alto"])) {
+        sea x = 0
+        mientras (x < minimo(p["ancho"], img["ancho"])) {
+            sea k = (py * img["ancho"] + x) * 4
+            sea brillo = (byte_en(img["pixeles"], k) + byte_en(img["pixeles"], k + 1) + byte_en(img["pixeles"], k + 2)) / 3
+            pines_ssd1306_pixel(p, x, py, brillo >= u)
+            x = x + 1
+        }
+        py = py + 1
+    }
+}
+
+/// Manda el búfer a la pantalla.
+funcion pines_ssd1306_mostrar(p) {
+    sea cmd = char_de(0) + char_de(33) + char_de(0) + char_de(p["ancho"] - 1) + char_de(34) + char_de(0) + char_de(p["alto"] / 8 - 1)
+    pines_i2c_escribir(p["bus"], p["dir"], cmd)
+    sea i = 0
+    mientras (i < longitud(p["buf"])) {
+        sea t = char_de(64)
+        sea k = 0
+        mientras (k < 16 y i + k < longitud(p["buf"])) {
+            t = t + char_de(p["buf"][i + k])
+            k = k + 1
+        }
+        pines_i2c_escribir(p["bus"], p["dir"], t)
+        i = i + 16
+    }
+}
+
+/// Contraste (0–255) e inversión de la pantalla.
+funcion pines_ssd1306_contraste(p, valor) { pines_i2c_escribir(p["bus"], p["dir"], char_de(0) + char_de(129) + char_de(valor)) }
+funcion pines_ssd1306_invertir(p, si_) {
+    sea c = 166
+    si (si_) { c = 167 }
+    pines_i2c_escribir(p["bus"], p["dir"], char_de(0) + char_de(c))
+}
