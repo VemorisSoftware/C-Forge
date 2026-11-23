@@ -1,0 +1,1525 @@
+// stdlib/directo.cfv — WebRTC propio: conexiones P2P con canales de datos
+// y transporte SRTP para audio y video.
+//
+//   · ICE (RFC 8445) con candidatos de equipo y STUN (RFC 8489):
+//     MESSAGE-INTEGRITY, FINGERPRINT, nominación agresiva y respuestas.
+//   · DTLS 1.2 (RFC 6347) cliente y servidor: ECDHE P-256 o X25519, firmas
+//     ECDSA P-256, AES-128-GCM, extended master secret, use_srtp, cookies,
+//     reensamblado de fragmentos y retransmisión de vuelos.
+//   · SCTP sobre DTLS (RFC 8261) con DATA/SACK, fragmentación, mensajes
+//     ordenados y desordenados, retransmisión y CRC32c.
+//   · Canales de datos (DCEP, RFC 8832): texto y binario.
+//   · SDP de oferta y respuesta, con huella sha-256 del certificado.
+//   · SRTP AES_CM_128_HMAC_SHA1_80 (RFC 3711) con claves del exportador
+//     DTLS-SRTP, y paquetes RTP.
+// Todo es sin E/S (entrada, salida, tic) y hay envoltorios para UDP.
+// Interopera con aiortc. Idea de WebRTC (libwebrtc, BSD), escrito desde
+// cero. En inglés: importar "webrtc".
+//
+//   importar "directo"
+//   sea a = directo_par(nulo)
+//   sea b = directo_par(nulo)
+//   directo_vincular(a, 0)
+//   directo_vincular(b, 0)
+//   sea oferta = directo_oferta(a)
+//   directo_aplicar_respuesta(a, directo_respuesta(b, oferta))
+//   sea canal = directo_canal(a, "chat", nulo)
+//   directo_atender([a, b], 2000)
+//   directo_enviar(a, canal, "hola")
+
+importar "blindaje"
+
+// ---------- utilidades ----------
+
+funcion _dr_u8(n) { retornar char_de(n) }
+funcion _dr_u16(n) { retornar bytes_entero(n, 2, 0) }
+funcion _dr_u24(n) { retornar bytes_entero(n, 3, 0) }
+funcion _dr_u32(n) { retornar bytes_entero(n, 4, 0) }
+funcion _dr_l8(t, i) { retornar byte_en(t, i) }
+funcion _dr_l16(t, i) { retornar bytes_leer_entero(t, i, 2, 0) }
+funcion _dr_l24(t, i) { retornar bytes_leer_entero(t, i, 3, 0) }
+funcion _dr_l32(t, i) { retornar bytes_leer_entero(t, i, 4, 0) }
+funcion _dr_sub(t, a, n) { retornar subtexto(t, a, a + n) }
+funcion _dr_v8(b) { retornar char_de(longitud(b)) + b }
+funcion _dr_v16(b) { retornar _dr_u16(longitud(b)) + b }
+funcion _dr_v24(b) { retornar _dr_u24(longitud(b)) + b }
+
+funcion _dr_hmac_sha1(clave, msj) {
+    sea k = clave
+    si (longitud(k) > 64) { k = sha1_bytes(k) }
+    mientras (longitud(k) < 64) { k = k + char_de(0) }
+    sea ip = bytes_xor(k, _dr_repetir(char_de(54), 64))
+    sea op = bytes_xor(k, _dr_repetir(char_de(92), 64))
+    retornar sha1_bytes(op + sha1_bytes(ip + msj))
+}
+
+funcion _dr_repetir(c, n) {
+    sea r = ""
+    sea i = 0
+    mientras (i < n) {
+        r = r + c
+        i = i + 1
+    }
+    retornar r
+}
+
+sea _DR_CRC32C = []
+
+funcion _dr_crc32c(datos) {
+    si (longitud(_DR_CRC32C) == 0) {
+        sea i = 0
+        mientras (i < 256) {
+            sea c = i
+            sea k = 0
+            mientras (k < 8) {
+                si (c % 2 == 1) { c = __o_exclusivo_dr(piso(c / 2), 2197175160) } sino { c = piso(c / 2) }
+                k = k + 1
+            }
+            _DR_CRC32C.agregar(c)
+            i = i + 1
+        }
+    }
+    sea crc = 4294967295
+    sea n = longitud(datos)
+    sea i = 0
+    mientras (i < n) {
+        crc = __o_exclusivo_dr(_DR_CRC32C[__o_exclusivo_dr(crc, byte_en(datos, i)) % 256], piso(crc / 256))
+        i = i + 1
+    }
+    retornar __o_exclusivo_dr(crc, 4294967295)
+}
+
+funcion __o_exclusivo_dr(a, b) { retornar bits_xo(a, b) }
+
+funcion _dr_aleatorio_texto(n) {
+    sea abc = "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789"
+    sea b = bytes_aleatorios(n)
+    sea r = ""
+    sea i = 0
+    mientras (i < n) {
+        sea k = byte_en(b, i) % 62
+        r = r + subtexto(abc, k, k + 1)
+        i = i + 1
+    }
+    retornar r
+}
+
+funcion _dr_ip_bytes(ip) {
+    sea r = ""
+    para p en texto_dividir(ip, ".") { r = r + char_de(a_numero(p)) }
+    retornar r
+}
+
+funcion _dr_ip_texto(b) { retornar "" + byte_en(b, 0) + "." + byte_en(b, 1) + "." + byte_en(b, 2) + "." + byte_en(b, 3) }
+
+// ---------- STUN ----------
+
+sea _DR_MAGIA = 554869826
+
+/// Arma un mensaje STUN. atributos: lista de [tipo, valor]. clave: si no es
+/// nula, agrega MESSAGE-INTEGRITY; siempre agrega FINGERPRINT.
+funcion directo_stun_armar(tipo_m, txid, atributos, clave) {
+    sea cuerpo = ""
+    para a en atributos {
+        sea v = a[1]
+        cuerpo = cuerpo + _dr_u16(a[0]) + _dr_u16(longitud(v)) + v
+        mientras (longitud(cuerpo) % 4 != 0) { cuerpo = cuerpo + char_de(0) }
+    }
+    sea cab = _dr_u16(tipo_m)
+    si (clave != nulo) {
+        sea parcial = cab + _dr_u16(longitud(cuerpo) + 24) + _dr_u32(_DR_MAGIA) + txid + cuerpo
+        cuerpo = cuerpo + _dr_u16(8) + _dr_u16(20) + _dr_hmac_sha1(clave, parcial)
+    }
+    sea parcial2 = cab + _dr_u16(longitud(cuerpo) + 8) + _dr_u32(_DR_MAGIA) + txid + cuerpo
+    sea fp = bits_xo(crc32(parcial2), 1398035790)
+    retornar parcial2 + _dr_u16(32808) + _dr_u16(4) + _dr_u32(fp)
+}
+
+/// ¿Parece STUN? (primer byte 0–3 y cookie mágica).
+funcion directo_es_stun(p) { retornar longitud(p) >= 20 y byte_en(p, 0) < 4 y _dr_l32(p, 4) == _DR_MAGIA }
+
+/// Lee un mensaje STUN: {"tipo", "txid", "atributos": {tipo: valor}, "orden"}.
+/// clave: si no es nula, verifica MESSAGE-INTEGRITY ("integro").
+funcion directo_stun_leer(p, clave) {
+    si (directo_es_stun(p) == falso) { retornar nulo }
+    sea largo = _dr_l16(p, 2)
+    si (20 + largo > longitud(p)) { retornar nulo }
+    sea r = {"tipo": _dr_l16(p, 0), "txid": _dr_sub(p, 8, 12), "atributos": {}, "orden": [], "integro": falso, "huella": falso}
+    sea i = 20
+    mientras (i + 4 <= 20 + largo) {
+        sea t = _dr_l16(p, i)
+        sea n = _dr_l16(p, i + 2)
+        sea v = _dr_sub(p, i + 4, n)
+        si (t == 8 y clave != nulo) {
+            sea parcial = _dr_sub(p, 0, 2) + _dr_u16(i - 20 + 24) + _dr_sub(p, 4, i - 4)
+            r["integro"] = _dr_hmac_sha1(clave, parcial) == v
+        }
+        si (t == 32808) { r["huella"] = bits_xo(crc32(_dr_u16(_dr_l16(p, 0)) + _dr_u16(i - 20 + 8) + _dr_sub(p, 4, i - 4)), 1398035790) == _dr_l32(v, 0) }
+        r["atributos"]["" + t] = v
+        r["orden"].agregar(t)
+        i = i + 4 + n
+        mientras (i % 4 != 0) { i = i + 1 }
+    }
+    retornar r
+}
+
+funcion _dr_xor_dir(ip, puerto) {
+    retornar char_de(0) + char_de(1) + _dr_u16(bits_xo(puerto, 8466)) + bytes_xor(_dr_ip_bytes(ip), _dr_u32(_DR_MAGIA))
+}
+
+funcion _dr_leer_xor_dir(v) {
+    retornar [_dr_ip_texto(bytes_xor(_dr_sub(v, 4, 4), _dr_u32(_DR_MAGIA))), bits_xo(_dr_l16(v, 2), 8466)]
+}
+
+// ---------- DTLS 1.2: PRF y registros ----------
+
+funcion _dr_prf(secreto, etiqueta, semilla, largo) {
+    sea s = etiqueta + semilla
+    sea r = ""
+    sea a = s
+    mientras (longitud(r) < largo) {
+        a = hmac_sha256_bytes(secreto, a)
+        r = r + hmac_sha256_bytes(secreto, a + s)
+    }
+    retornar subtexto(r, 0, largo)
+}
+
+funcion _dr_mensaje_hs(tipo_m, seq, cuerpo) {
+    retornar _dr_u8(tipo_m) + _dr_u24(longitud(cuerpo)) + _dr_u16(seq) + _dr_u24(0) + _dr_u24(longitud(cuerpo)) + cuerpo
+}
+
+funcion _dr_registro(d, tipo_r, datos) {
+    sea epoca = d["epoca_tx"]
+    sea seq = d["seq_tx"]["" + epoca] ?? 0
+    d["seq_tx"]["" + epoca] = seq + 1
+    sea seq8 = _dr_u16(epoca) + bytes_entero(seq, 6, 0)
+    si (epoca == 0) { retornar _dr_u8(tipo_r) + _dr_u16(65277) + seq8 + _dr_v16(datos) }
+    sea k = d["claves"]
+    sea nonce = k["iv_tx"] + seq8
+    sea aad = seq8 + _dr_u8(tipo_r) + _dr_u16(65277) + _dr_u16(longitud(datos))
+    sea c = aes_gcm_cifrar(k["tx"], nonce, datos, aad)
+    retornar _dr_u8(tipo_r) + _dr_u16(65277) + seq8 + _dr_v16(seq8 + c)
+}
+
+// ---------- DTLS 1.2: estado ----------
+
+/// Conexión DTLS sin E/S. rol: "cliente" o "servidor". opciones:
+/// "certificado" (de blindaje_emitir con clave P-256), "huella_remota"
+/// (sha-256 del certificado del otro, en hex con dos puntos o sin ellos),
+/// "srtp" (verdadero para negociar use_srtp), "cookie" (servidor: pide
+/// cookie con HelloVerifyRequest).
+funcion directo_dtls(rol, opciones) {
+    sea op = opciones ?? {}
+    sea cert = op["certificado"] ?? nulo
+    si (cert == nulo) { cert = directo_certificado() }
+    retornar {"rol": rol, "cert": cert, "huella_remota": op["huella_remota"] ?? nulo, "srtp": op["srtp"] ?? verdadero, "pedir_cookie": op["cookie"] ?? falso,
+        "estado": "inicio", "epoca_tx": 0, "epoca_rx": 0, "seq_tx": {}, "seq_hs_tx": 0, "seq_hs_rx": 0, "pendientes": {}, "transcripcion": "",
+        "salida": [], "vuelo": [], "ultimo_envio": 0, "espera": 1000, "recibido": [], "claves": nulo, "aleatorio_c": nulo, "aleatorio_s": nulo,
+        "ems": falso, "perfil_srtp": nulo, "cert_remoto": nulo, "error": nulo, "ccs_rx": falso, "ventana_rx": {}, "max_rx": -1, "cookie": "",
+        "secreto_cookie": bytes_aleatorios(16), "ahora": 0}
+}
+
+/// Certificado autofirmado P-256 para DTLS (el que usa WebRTC).
+funcion directo_certificado() {
+    retornar blindaje_emitir(["WebRTC"], {"clave": blindaje_clave_nueva("P-256"), "dias": 30})
+}
+
+/// Huella sha-256 de un certificado DER, como en SDP ("AB:CD:…").
+funcion directo_huella(der) {
+    sea h = texto_mayusculas(hex_de_bytes(sha256_bytes(der)))
+    sea partes = []
+    sea i = 0
+    mientras (i < longitud(h)) {
+        partes.agregar(subtexto(h, i, i + 2))
+        i = i + 2
+    }
+    retornar unir(partes, ":")
+}
+
+funcion _dr_huella_norm(h) { retornar texto_minusculas(texto_reemplazar(h, ":", "")) }
+
+funcion _dr_enviar_vuelo(d, mensajes) {
+    // mensajes: lista de [tipo_registro, datos, epoca]
+    d["vuelo"] = mensajes
+    d["ultimo_envio"] = d["ahora"]
+    _dr_transmitir_vuelo(d)
+}
+
+funcion _dr_transmitir_vuelo(d) {
+    sea epoca_guardada = d["epoca_tx"]
+    sea paquete = ""
+    para m en d["vuelo"] {
+        d["epoca_tx"] = m[2]
+        sea r = _dr_registro(d, m[0], m[1])
+        si (longitud(paquete) + longitud(r) > 1200 y paquete != "") {
+            d["salida"].agregar(paquete)
+            paquete = ""
+        }
+        paquete = paquete + r
+    }
+    si (paquete != "") { d["salida"].agregar(paquete) }
+    d["epoca_tx"] = epoca_guardada
+}
+
+funcion _dr_hs(d, tipo_m, cuerpo) {
+    sea m = _dr_mensaje_hs(tipo_m, d["seq_hs_tx"], cuerpo)
+    d["seq_hs_tx"] = d["seq_hs_tx"] + 1
+    d["transcripcion"] = d["transcripcion"] + m
+    retornar m
+}
+
+funcion _dr_extensiones_cliente(d) {
+    sea ext = ""
+    ext = ext + _dr_u16(23) + _dr_u16(0)
+    ext = ext + _dr_u16(65281) + _dr_v16(char_de(0))
+    ext = ext + _dr_u16(10) + _dr_v16(_dr_v16(_dr_u16(29) + _dr_u16(23)))
+    ext = ext + _dr_u16(11) + _dr_v16(_dr_v8(char_de(0)))
+    ext = ext + _dr_u16(13) + _dr_v16(_dr_v16(_dr_u16(1027)))
+    si (d["srtp"]) { ext = ext + _dr_u16(14) + _dr_v16(_dr_v16(_dr_u16(1) + _dr_u16(7)) + char_de(0)) }
+    retornar ext
+}
+
+funcion _dr_client_hello(d) {
+    si (d["aleatorio_c"] == nulo) { d["aleatorio_c"] = bytes_aleatorios(32) }
+    // Suites: ECDHE-ECDSA-AES128-GCM-SHA256.
+    retornar _dr_u16(65277) + d["aleatorio_c"] + _dr_v8("") + _dr_v8(d["cookie"]) + _dr_v16(_dr_u16(49195)) + _dr_v8(char_de(0)) + _dr_v16(_dr_extensiones_cliente(d))
+}
+
+/// Empieza el saludo (el cliente manda su ClientHello).
+funcion directo_dtls_iniciar(d, ahora) {
+    d["ahora"] = ahora ?? 0
+    si (d["rol"] != "cliente") { retornar nulo }
+    d["estado"] = "esperando_servidor"
+    d["transcripcion"] = ""
+    _dr_enviar_vuelo(d, [[22, _dr_hs(d, 1, _dr_client_hello(d)), 0]])
+}
+
+/// Datagramas para enviar.
+funcion directo_dtls_salida(d) {
+    sea r = d["salida"]
+    d["salida"] = []
+    retornar r
+}
+
+/// Datos de aplicación recibidos.
+funcion directo_dtls_leer(d) {
+    sea r = d["recibido"]
+    d["recibido"] = []
+    retornar r
+}
+
+funcion directo_dtls_listo(d) { retornar d["estado"] == "conectado" }
+
+/// Envía datos de aplicación.
+funcion directo_dtls_escribir(d, datos) {
+    si (d["estado"] != "conectado") { lanzar "directo_dtls: todavía no está conectado" }
+    d["salida"].agregar(_dr_registro(d, 23, datos))
+}
+
+/// Retransmite el último vuelo si no hubo respuesta a tiempo.
+funcion directo_dtls_tic(d, ahora) {
+    d["ahora"] = ahora
+    si (longitud(d["vuelo"]) > 0 y d["estado"] != "conectado" y d["estado"] != "inicio" y ahora - d["ultimo_envio"] >= d["espera"]) {
+        d["ultimo_envio"] = ahora
+        d["espera"] = minimo(d["espera"] * 2, 60000)
+        _dr_transmitir_vuelo(d)
+    }
+}
+
+/// Exportador de claves (RFC 5705), p. ej. "EXTRACTOR-dtls_srtp".
+funcion directo_dtls_exportar(d, etiqueta, largo) {
+    retornar _dr_prf(d["claves"]["maestro"], etiqueta, d["aleatorio_c"] + d["aleatorio_s"], largo)
+}
+
+/// Mete un datagrama recibido.
+funcion directo_dtls_entrada(d, datagrama, ahora) {
+    d["ahora"] = ahora ?? d["ahora"]
+    si (d["estado"] == "fallido" o d["estado"] == "cerrado") { retornar nulo }
+    sea i = 0
+    sea n = longitud(datagrama)
+    mientras (i + 13 <= n y d["estado"] != "fallido") {
+        sea tipo_r = byte_en(datagrama, i)
+        sea epoca = _dr_l16(datagrama, i + 3)
+        sea seq = bytes_leer_entero(datagrama, i + 5, 6, 0)
+        sea largo = _dr_l16(datagrama, i + 11)
+        si (i + 13 + largo > n) { retornar nulo }
+        sea cuerpo = _dr_sub(datagrama, i + 13, largo)
+        sea seq8 = _dr_sub(datagrama, i + 3, 8)
+        i = i + 13 + largo
+        si (epoca == 1 y d["claves"] != nulo) {
+            sea k = d["claves"]
+            si (longitud(cuerpo) < 24) { continuar }
+            sea texto = nulo
+            intentar {
+                texto = aes_gcm_descifrar(k["rx"], k["iv_rx"] + _dr_sub(cuerpo, 0, 8), subtexto(cuerpo, 8, longitud(cuerpo)), seq8 + _dr_u8(tipo_r) + _dr_u16(65277) + _dr_u16(longitud(cuerpo) - 24))
+            } capturar (e) { continuar }
+            // Repeticiones.
+            si (tiene_clave(d["ventana_rx"], "" + seq)) { continuar }
+            d["ventana_rx"]["" + seq] = verdadero
+            cuerpo = texto
+        } sino si (epoca != 0) { continuar }
+        si (tipo_r == 20) { d["ccs_rx"] = verdadero }
+        sino si (tipo_r == 21) {
+            si (longitud(cuerpo) >= 2 y byte_en(cuerpo, 1) == 0) { d["estado"] = "cerrado" }
+            sino si (longitud(cuerpo) >= 2) { d["error"] = "alerta " + byte_en(cuerpo, 1) }
+        } sino si (tipo_r == 23) {
+            si (d["estado"] == "conectado" y epoca == 1) { d["recibido"].agregar(cuerpo) }
+        } sino si (tipo_r == 22) { _dr_fragmentos(d, cuerpo, epoca) }
+    }
+}
+
+// Junta fragmentos de mensajes de saludo y los procesa en orden.
+funcion _dr_fragmentos(d, cuerpo, epoca) {
+    sea i = 0
+    mientras (i + 12 <= longitud(cuerpo) y d["estado"] != "fallido") {
+        sea tipo_m = byte_en(cuerpo, i)
+        sea largo = _dr_l24(cuerpo, i + 1)
+        sea seq = _dr_l16(cuerpo, i + 4)
+        sea desde = _dr_l24(cuerpo, i + 6)
+        sea fl = _dr_l24(cuerpo, i + 9)
+        sea frag = _dr_sub(cuerpo, i + 12, fl)
+        i = i + 12 + fl
+        si (seq < d["seq_hs_rx"]) {
+            // Vuelo repetido del otro: retransmitimos el nuestro.
+            si (longitud(d["vuelo"]) > 0 y d["ahora"] - d["ultimo_envio"] > 100) {
+                d["ultimo_envio"] = d["ahora"]
+                _dr_transmitir_vuelo(d)
+            }
+            continuar
+        }
+        sea clave = "" + seq
+        sea p = d["pendientes"][clave] ?? nulo
+        si (p == nulo) {
+            p = {"tipo": tipo_m, "largo": largo, "partes": {}, "epoca": epoca}
+            d["pendientes"][clave] = p
+        }
+        p["partes"]["" + desde] = frag
+        // ¿Ya está completo el siguiente?
+        mientras (verdadero) {
+            sea sig = d["pendientes"]["" + d["seq_hs_rx"]] ?? nulo
+            si (sig == nulo) { romper }
+            sea armado = _dr_armar(sig)
+            si (armado == nulo) { romper }
+            d["pendientes"]["" + d["seq_hs_rx"]] = nulo
+            sea seq_m = d["seq_hs_rx"]
+            d["seq_hs_rx"] = d["seq_hs_rx"] + 1
+            sea entero_m = _dr_u8(sig["tipo"]) + _dr_u24(sig["largo"]) + _dr_u16(seq_m) + _dr_u24(0) + _dr_u24(sig["largo"]) + armado
+            intentar { _dr_mensaje(d, sig["tipo"], armado, entero_m, sig["epoca"]) } capturar (e) {
+                d["error"] = "" + e
+                d["estado"] = "fallido"
+                d["salida"].agregar(_dr_registro(d, 21, char_de(2) + char_de(40)))
+                retornar nulo
+            }
+        }
+    }
+}
+
+funcion _dr_armar(p) {
+    sea r = ""
+    mientras (longitud(r) < p["largo"]) {
+        sea parte = p["partes"]["" + longitud(r)] ?? nulo
+        si (parte == nulo) {
+            // Puede haber fragmentos que se solapan: busca uno que empiece antes.
+            sea encontrado = falso
+            para k en claves(p["partes"]) {
+                sea desde = a_numero(k)
+                sea f = p["partes"][k]
+                si (desde < longitud(r) y desde + longitud(f) > longitud(r)) {
+                    r = r + subtexto(f, longitud(r) - desde, longitud(f))
+                    encontrado = verdadero
+                    romper
+                }
+            }
+            si (encontrado == falso) { retornar nulo }
+        } sino { r = r + parte }
+    }
+    retornar subtexto(r, 0, p["largo"])
+}
+
+funcion _dr_ext_leer(b, i0, fin) {
+    sea r = {}
+    sea i = i0
+    mientras (i + 4 <= fin) {
+        sea t = _dr_l16(b, i)
+        sea n = _dr_l16(b, i + 2)
+        r["" + t] = _dr_sub(b, i + 4, n)
+        i = i + 4 + n
+    }
+    retornar r
+}
+
+funcion _dr_firma_ecdsa(d, msj) {
+    sea clave = d["cert"]["clave"]
+    retornar _bl_ecdsa_firmar(_bl_curva("P-256"), clave["privada"], sha256_bytes(msj))
+}
+
+funcion _dr_verificar_cert(d, certs) {
+    si (longitud(certs) == 0) { lanzar "el otro no mandó certificado" }
+    sea der = certs[0]
+    si (d["huella_remota"] != nulo y _dr_huella_norm(d["huella_remota"]) != hex_de_bytes(sha256_bytes(der))) { lanzar "la huella del certificado no coincide" }
+    d["cert_remoto"] = blindaje_certificado(der)
+}
+
+funcion _dr_leer_certs(b) {
+    sea total = _dr_l24(b, 0)
+    sea i = 3
+    sea r = []
+    mientras (i < 3 + total) {
+        sea n = _dr_l24(b, i)
+        r.agregar(_dr_sub(b, i + 3, n))
+        i = i + 3 + n
+    }
+    retornar r
+}
+
+funcion _dr_firma_verificar(d, msj, firma_tls) {
+    sea alg = _dr_l16(firma_tls, 0)
+    sea firma = _dr_sub(firma_tls, 4, _dr_l16(firma_tls, 2))
+    sea clave = d["cert_remoto"]["clave"]
+    si (alg == 1027) { retornar _bl_verificar(clave, "ecdsa_secp256r1_sha256", msj, firma) }
+    si (alg == 1025) { retornar _bl_verificar(clave, "rsa_pkcs1_sha256", msj, firma) }
+    si (alg == 2052) { retornar _bl_verificar(clave, "rsa_pss_rsae_sha256", msj, firma) }
+    retornar falso
+}
+
+funcion _dr_claves(d) {
+    sea kb = _dr_prf(d["claves"]["maestro"], "key expansion", d["aleatorio_s"] + d["aleatorio_c"], 40)
+    sea ck = _dr_sub(kb, 0, 16)
+    sea sk = _dr_sub(kb, 16, 16)
+    sea civ = _dr_sub(kb, 32, 4)
+    sea siv = _dr_sub(kb, 36, 4)
+    si (d["rol"] == "cliente") {
+        d["claves"]["tx"] = ck
+        d["claves"]["rx"] = sk
+        d["claves"]["iv_tx"] = civ
+        d["claves"]["iv_rx"] = siv
+    } sino {
+        d["claves"]["tx"] = sk
+        d["claves"]["rx"] = ck
+        d["claves"]["iv_tx"] = siv
+        d["claves"]["iv_rx"] = civ
+    }
+}
+
+funcion _dr_maestro(d, pms) {
+    sea m = ""
+    si (d["ems"]) { m = _dr_prf(pms, "extended master secret", sha256_bytes(d["transcripcion"]), 48) } sino { m = _dr_prf(pms, "master secret", d["aleatorio_c"] + d["aleatorio_s"], 48) }
+    d["claves"] = {"maestro": m}
+    _dr_claves(d)
+}
+
+funcion _dr_finished(d, etiqueta) { retornar _dr_prf(d["claves"]["maestro"], etiqueta, sha256_bytes(d["transcripcion"]), 12) }
+
+funcion _dr_ecdhe_par(grupo) {
+    si (grupo == 29) {
+        sea priv = bytes_aleatorios(32)
+        retornar {"grupo": 29, "privada": priv, "publica": x25519_base(priv)}
+    }
+    sea p = _bl_ec_par(_bl_curva("P-256"))
+    retornar {"grupo": 23, "privada": p["privada"], "publica": p["publica"]}
+}
+
+funcion _dr_ecdhe_secreto(par, publica_remota) {
+    si (par["grupo"] == 29) { retornar x25519(par["privada"], publica_remota) }
+    retornar _bl_ecdh(_bl_curva("P-256"), par["privada"], publica_remota)
+}
+
+funcion _dr_cert_msj(d) { retornar _dr_v24(_dr_v24(d["cert"]["der"])) }
+
+funcion _dr_mensaje(d, tipo_m, b, entero_m, epoca) {
+    si (d["rol"] == "cliente") { _dr_mensaje_cliente(d, tipo_m, b, entero_m) } sino { _dr_mensaje_servidor(d, tipo_m, b, entero_m, epoca) }
+}
+
+funcion _dr_mensaje_cliente(d, tipo_m, b, entero_m) {
+    si (tipo_m == 3) {
+        // HelloVerifyRequest: repetimos el ClientHello con la cookie.
+        sea n = byte_en(b, 2)
+        d["cookie"] = _dr_sub(b, 3, n)
+        d["transcripcion"] = ""
+        _dr_enviar_vuelo(d, [[22, _dr_hs(d, 1, _dr_client_hello(d)), 0]])
+        retornar nulo
+    }
+    si (tipo_m == 2) {
+        d["aleatorio_s"] = _dr_sub(b, 2, 32)
+        sea sid = byte_en(b, 34)
+        sea p = 35 + sid
+        sea suite = _dr_l16(b, p)
+        si (suite != 49195) { lanzar "suite no soportada " + suite }
+        p = p + 3
+        si (p + 2 <= longitud(b)) {
+            sea ext = _dr_ext_leer(b, p + 2, p + 2 + _dr_l16(b, p))
+            d["ems"] = tiene_clave(ext, "23")
+            si (tiene_clave(ext, "14")) { d["perfil_srtp"] = _dr_l16(ext["14"], 2) }
+        }
+        d["transcripcion"] = d["transcripcion"] + entero_m
+        d["vuelo"] = []
+        retornar nulo
+    }
+    d["transcripcion"] = d["transcripcion"] + entero_m
+    si (tipo_m == 11) { _dr_verificar_cert(d, _dr_leer_certs(b)) }
+    sino si (tipo_m == 12) {
+        // ServerKeyExchange: curva, punto y firma.
+        sea grupo = _dr_l16(b, 1)
+        sea n = byte_en(b, 3)
+        sea publica = _dr_sub(b, 4, n)
+        sea params = _dr_sub(b, 0, 4 + n)
+        si (_dr_firma_verificar(d, d["aleatorio_c"] + d["aleatorio_s"] + params, subtexto(b, 4 + n, longitud(b))) == falso) { lanzar "firma del ServerKeyExchange inválida" }
+        d["ecdhe"] = _dr_ecdhe_par(grupo)
+        d["ecdhe_remota"] = publica
+    } sino si (tipo_m == 13) { d["pide_cert"] = verdadero }
+    sino si (tipo_m == 14) {
+        // ServerHelloDone: nuestro vuelo.
+        sea vuelo = []
+        si (d["pide_cert"] ?? falso) { vuelo.agregar([22, _dr_hs(d, 11, _dr_cert_msj(d)), 0]) }
+        vuelo.agregar([22, _dr_hs(d, 16, _dr_v8(d["ecdhe"]["publica"])), 0])
+        _dr_maestro(d, _dr_ecdhe_secreto(d["ecdhe"], d["ecdhe_remota"]))
+        si (d["pide_cert"] ?? falso) {
+            sea firma = _dr_firma_ecdsa(d, d["transcripcion"])
+            vuelo.agregar([22, _dr_hs(d, 15, _dr_u16(1027) + _dr_v16(firma)), 0])
+        }
+        vuelo.agregar([20, char_de(1), 0])
+        sea fin = _dr_finished(d, "client finished")
+        vuelo.agregar([22, _dr_hs(d, 20, fin), 1])
+        d["epoca_tx"] = 1
+        d["estado"] = "esperando_fin"
+        _dr_enviar_vuelo(d, vuelo)
+    } sino si (tipo_m == 20) {
+        // Finished del servidor: se calcula sin el propio Finished.
+        sea t = d["transcripcion"]
+        d["transcripcion"] = subtexto(t, 0, longitud(t) - longitud(entero_m))
+        sea esperado = _dr_finished(d, "server finished")
+        d["transcripcion"] = t
+        si (esperado != b) { lanzar "Finished del servidor inválido" }
+        d["estado"] = "conectado"
+        d["vuelo"] = []
+    }
+}
+
+funcion _dr_cookie_de(d, b) { retornar subtexto(hmac_sha256_bytes(d["secreto_cookie"], _dr_sub(b, 2, 32)), 0, 16) }
+
+funcion _dr_mensaje_servidor(d, tipo_m, b, entero_m, epoca) {
+    si (tipo_m == 1) {
+        si (d["estado"] != "inicio" y d["estado"] != "cookie") { retornar nulo }
+        sea p = 2 + 32
+        sea sid = byte_en(b, p)
+        p = p + 1 + sid
+        sea nc = byte_en(b, p)
+        sea cookie = _dr_sub(b, p + 1, nc)
+        p = p + 1 + nc
+        si (d["pedir_cookie"] y cookie != _dr_cookie_de(d, b)) {
+            // HelloVerifyRequest (no entra en la transcripción).
+            sea hvr = _dr_mensaje_hs(3, d["seq_hs_tx"], _dr_u16(65279) + _dr_v8(_dr_cookie_de(d, b)))
+            d["estado"] = "cookie"
+            d["salida"].agregar(_dr_registro(d, 22, hvr))
+            retornar nulo
+        }
+        sea suites = _dr_sub(b, p + 2, _dr_l16(b, p))
+        p = p + 2 + _dr_l16(b, p)
+        p = p + 1 + byte_en(b, p)
+        sea ext = {}
+        si (p + 2 <= longitud(b)) { ext = _dr_ext_leer(b, p + 2, p + 2 + _dr_l16(b, p)) }
+        sea tiene = falso
+        sea k = 0
+        mientras (k < longitud(suites)) {
+            si (_dr_l16(suites, k) == 49195) { tiene = verdadero }
+            k = k + 2
+        }
+        si (tiene == falso) { lanzar "el cliente no ofrece ECDHE-ECDSA-AES128-GCM-SHA256" }
+        // El primer ClientHello con cookie empieza la transcripción.
+        d["transcripcion"] = entero_m
+        d["aleatorio_c"] = _dr_sub(b, 2, 32)
+        d["aleatorio_s"] = bytes_aleatorios(32)
+        d["ems"] = tiene_clave(ext, "23")
+        sea grupo = 23
+        si (tiene_clave(ext, "10")) {
+            sea g = ext["10"]
+            sea j = 2
+            sea hay23 = falso
+            sea hay29 = falso
+            mientras (j < longitud(g)) {
+                si (_dr_l16(g, j) == 23) { hay23 = verdadero }
+                si (_dr_l16(g, j) == 29) { hay29 = verdadero }
+                j = j + 2
+            }
+            si (hay29 y hay23 == falso) { grupo = 29 }
+        }
+        sea ext_s = ""
+        si (d["ems"]) { ext_s = ext_s + _dr_u16(23) + _dr_u16(0) }
+        ext_s = ext_s + _dr_u16(65281) + _dr_v16(char_de(0))
+        ext_s = ext_s + _dr_u16(11) + _dr_v16(_dr_v8(char_de(0)))
+        si (d["srtp"] y tiene_clave(ext, "14")) {
+            sea perfiles = ext["14"]
+            sea j = 2
+            mientras (j < 2 + _dr_l16(perfiles, 0)) {
+                si (_dr_l16(perfiles, j) == 1) { d["perfil_srtp"] = 1 }
+                j = j + 2
+            }
+            si (d["perfil_srtp"] != nulo) { ext_s = ext_s + _dr_u16(14) + _dr_v16(_dr_v16(_dr_u16(1)) + char_de(0)) }
+        }
+        sea sh = _dr_u16(65277) + d["aleatorio_s"] + _dr_v8(bytes_aleatorios(16)) + _dr_u16(49195) + char_de(0) + _dr_v16(ext_s)
+        d["ecdhe"] = _dr_ecdhe_par(grupo)
+        sea params = _dr_u8(3) + _dr_u16(grupo) + _dr_v8(d["ecdhe"]["publica"])
+        sea firma = _dr_firma_ecdsa(d, d["aleatorio_c"] + d["aleatorio_s"] + params)
+        sea vuelo = []
+        d["seq_hs_tx"] = d["seq_hs_rx"] - 1
+        vuelo.agregar([22, _dr_hs(d, 2, sh), 0])
+        vuelo.agregar([22, _dr_hs(d, 11, _dr_cert_msj(d)), 0])
+        vuelo.agregar([22, _dr_hs(d, 12, params + _dr_u16(1027) + _dr_v16(firma)), 0])
+        // CertificateRequest: ecdsa_sign, ecdsa_secp256r1_sha256, sin CA.
+        vuelo.agregar([22, _dr_hs(d, 13, _dr_v8(char_de(64)) + _dr_v16(_dr_u16(1027) + _dr_u16(1025)) + _dr_u16(0)), 0])
+        vuelo.agregar([22, _dr_hs(d, 14, ""), 0])
+        d["estado"] = "esperando_cliente"
+        _dr_enviar_vuelo(d, vuelo)
+        retornar nulo
+    }
+    si (tipo_m == 11) {
+        d["transcripcion"] = d["transcripcion"] + entero_m
+        _dr_verificar_cert(d, _dr_leer_certs(b))
+        retornar nulo
+    }
+    si (tipo_m == 16) {
+        d["transcripcion"] = d["transcripcion"] + entero_m
+        sea publica = _dr_sub(b, 1, byte_en(b, 0))
+        _dr_maestro(d, _dr_ecdhe_secreto(d["ecdhe"], publica))
+        retornar nulo
+    }
+    si (tipo_m == 15) {
+        si (_dr_firma_verificar(d, d["transcripcion"], b) == falso) { lanzar "CertificateVerify inválido" }
+        d["transcripcion"] = d["transcripcion"] + entero_m
+        retornar nulo
+    }
+    si (tipo_m == 20) {
+        si (d["cert_remoto"] == nulo) { lanzar "el cliente no mandó certificado" }
+        si (_dr_finished(d, "client finished") != b) { lanzar "Finished del cliente inválido" }
+        d["transcripcion"] = d["transcripcion"] + entero_m
+        sea fin = _dr_finished(d, "server finished")
+        d["estado"] = "conectado"
+        _dr_enviar_vuelo(d, [[20, char_de(1), 0], [22, _dr_hs(d, 20, fin), 1]])
+        d["epoca_tx"] = 1
+        retornar nulo
+    }
+}
+
+// ---------- SCTP sobre DTLS ----------
+
+sea _DR_2_32 = 4294967296
+
+funcion _dr_tsn(a, n) { retornar (a + n) % _DR_2_32 }
+// ¿a < b en aritmética de números de serie?
+funcion _dr_tsn_menor(a, b) {
+    si (a == b) { retornar falso }
+    sea d = (b - a + _DR_2_32) % _DR_2_32
+    retornar d < 2147483648
+}
+
+funcion _dr_chunk(tipo_c, banderas, valor) {
+    sea c = _dr_u8(tipo_c) + _dr_u8(banderas) + _dr_u16(longitud(valor) + 4) + valor
+    mientras (longitud(c) % 4 != 0) { c = c + char_de(0) }
+    retornar c
+}
+
+/// Asociación SCTP sin E/S (va dentro de DTLS). opciones: "puerto" (5000).
+funcion directo_sctp(opciones) {
+    sea op = opciones ?? {}
+    retornar {"puerto": op["puerto"] ?? 5000, "puerto_remoto": op["puerto_remoto"] ?? 5000, "tag_local": 1 + piso(_dr_l32(bytes_aleatorios(4), 0) / 2),
+        "tag_remoto": 0, "tsn_tx": piso(_dr_l32(bytes_aleatorios(4), 0) / 4), "tsn_rx": nulo, "estado": "cerrada", "salida": [], "enviados": [],
+        "fuera": {}, "partes": {}, "ssn_tx": {}, "ssn_rx": {}, "en_espera": {}, "entregados": [], "cola": [], "cookie": nulo, "ahora": 0,
+        "rto": 1000, "dups": [], "init": nulo, "ultimo_init": 0, "reinicios": [], "seq_reconf": piso(_dr_l32(bytes_aleatorios(4), 0) / 4), "reconf_rx": nulo}
+}
+
+funcion _dr_sctp_paquete(s, chunks, tag) {
+    sea t = tag ?? s["tag_remoto"]
+    sea cuerpo = _dr_u16(s["puerto"]) + _dr_u16(s["puerto_remoto"]) + _dr_u32(t) + _dr_u32(0) + unir(chunks, "")
+    sea crc = _dr_crc32c(cuerpo)
+    retornar subtexto(cuerpo, 0, 8) + bytes_entero(crc, 4, 1) + subtexto(cuerpo, 12, longitud(cuerpo))
+}
+
+funcion _dr_sctp_init_valor(s) {
+    // Parámetros: Forward-TSN y extensiones (RE-CONFIG y FORWARD-TSN).
+    sea params = _dr_u16(49152) + _dr_u16(4) + _dr_u16(32776) + _dr_u16(6) + char_de(130) + char_de(192) + _dr_u16(0)
+    retornar _dr_u32(s["tag_local"]) + _dr_u32(131072) + _dr_u16(65535) + _dr_u16(65535) + _dr_u32(s["tsn_tx"]) + params
+}
+
+/// Empieza la asociación (manda INIT).
+funcion directo_sctp_iniciar(s, ahora) {
+    s["ahora"] = ahora ?? s["ahora"]
+    s["estado"] = "cookie_espera"
+    s["init"] = _dr_chunk(1, 0, _dr_sctp_init_valor(s))
+    s["ultimo_init"] = s["ahora"]
+    s["salida"].agregar(_dr_sctp_paquete(s, [s["init"]], 0))
+}
+
+funcion directo_sctp_salida(s) {
+    sea r = s["salida"]
+    s["salida"] = []
+    retornar r
+}
+
+/// Mensajes recibidos: [{"stream", "ppid", "datos"}].
+funcion directo_sctp_leer(s) {
+    sea r = s["entregados"]
+    s["entregados"] = []
+    retornar r
+}
+
+/// Envía un mensaje por un stream (se fragmenta si hace falta).
+funcion directo_sctp_enviar(s, stream, ppid, datos, desordenado) {
+    si (s["estado"] != "establecida") {
+        s["cola"].agregar([stream, ppid, datos, desordenado])
+        retornar nulo
+    }
+    sea ssn = s["ssn_tx"]["" + stream] ?? 0
+    si ((desordenado ?? falso) == falso) { s["ssn_tx"]["" + stream] = (ssn + 1) % 65536 }
+    sea n = longitud(datos)
+    sea maximo_c = 1100
+    sea i = 0
+    sea chunks = []
+    mientras (i < n o (n == 0 y i == 0)) {
+        sea parte = subtexto(datos, i, minimo(n, i + maximo_c))
+        sea banderas = 0
+        si (i == 0) { banderas = banderas + 2 }
+        si (i + maximo_c >= n) { banderas = banderas + 1 }
+        si (desordenado ?? falso) { banderas = banderas + 4 }
+        sea tsn = s["tsn_tx"]
+        s["tsn_tx"] = _dr_tsn(tsn, 1)
+        sea ch = _dr_chunk(0, banderas, _dr_u32(tsn) + _dr_u16(stream) + _dr_u16(ssn) + _dr_u32(ppid) + parte)
+        s["enviados"].agregar({"tsn": tsn, "chunk": ch, "enviado": s["ahora"], "confirmado": falso})
+        chunks.agregar(ch)
+        i = i + maximo_c
+        si (n == 0) { romper }
+    }
+    _dr_sctp_mandar_chunks(s, chunks)
+}
+
+funcion _dr_sctp_mandar_chunks(s, chunks) {
+    sea grupo = []
+    sea largo = 0
+    para c en chunks {
+        si (largo + longitud(c) > 1150 y longitud(grupo) > 0) {
+            s["salida"].agregar(_dr_sctp_paquete(s, grupo, nulo))
+            grupo = []
+            largo = 0
+        }
+        grupo.agregar(c)
+        largo = largo + longitud(c)
+    }
+    si (longitud(grupo) > 0) { s["salida"].agregar(_dr_sctp_paquete(s, grupo, nulo)) }
+}
+
+/// Retransmisiones (INIT, COOKIE ECHO y DATA sin confirmar).
+funcion directo_sctp_tic(s, ahora) {
+    s["ahora"] = ahora
+    si ((s["estado"] == "cookie_espera" o s["estado"] == "cookie_eco") y ahora - s["ultimo_init"] >= s["rto"]) {
+        s["ultimo_init"] = ahora
+        si (s["estado"] == "cookie_espera") { s["salida"].agregar(_dr_sctp_paquete(s, [s["init"]], 0)) } sino { s["salida"].agregar(_dr_sctp_paquete(s, [s["cookie"]], nulo)) }
+    }
+    si (s["estado"] == "establecida") {
+        sea repetir = []
+        para e en s["enviados"] {
+            si (e["confirmado"] == falso y ahora - e["enviado"] >= s["rto"]) {
+                e["enviado"] = ahora
+                repetir.agregar(e["chunk"])
+            }
+        }
+        si (longitud(repetir) > 0) { _dr_sctp_mandar_chunks(s, repetir) }
+    }
+}
+
+funcion _dr_sctp_sack(s) {
+    sea gaps = ""
+    sea n = 0
+    // Bloques de huecos: TSN recibidos más allá del acumulado.
+    sea offs = []
+    para k en claves(s["fuera"]) {
+        sea tsn = a_numero(k)
+        offs.agregar((tsn - s["tsn_rx"] + _DR_2_32) % _DR_2_32)
+    }
+    offs = ordenar(offs)
+    sea i = 0
+    mientras (i < longitud(offs)) {
+        sea ini = offs[i]
+        sea fin = ini
+        mientras (i + 1 < longitud(offs) y offs[i + 1] == fin + 1) {
+            i = i + 1
+            fin = offs[i]
+        }
+        gaps = gaps + _dr_u16(ini) + _dr_u16(fin)
+        n = n + 1
+        i = i + 1
+    }
+    sea dups = ""
+    para d en s["dups"] { dups = dups + _dr_u32(d) }
+    sea nd = longitud(s["dups"])
+    s["dups"] = []
+    retornar _dr_chunk(3, 0, _dr_u32(s["tsn_rx"]) + _dr_u32(131072) + _dr_u16(n) + _dr_u16(nd) + gaps + dups)
+}
+
+funcion _dr_sctp_establecida(s) {
+    s["estado"] = "establecida"
+    sea cola = s["cola"]
+    s["cola"] = []
+    para m en cola { directo_sctp_enviar(s, m[0], m[1], m[2], m[3]) }
+}
+
+/// Mete un paquete SCTP recibido (los datos de aplicación de DTLS).
+funcion directo_sctp_entrada(s, p, ahora) {
+    s["ahora"] = ahora ?? s["ahora"]
+    si (longitud(p) < 12) { retornar nulo }
+    sea crc = bytes_leer_entero(p, 8, 4, 1)
+    sea sin = subtexto(p, 0, 8) + _dr_u32(0) + subtexto(p, 12, longitud(p))
+    si (_dr_crc32c(sin) != crc) { retornar nulo }
+    s["puerto_remoto"] = _dr_l16(p, 0)
+    sea i = 12
+    sea hubo_datos = falso
+    sea respuesta = []
+    mientras (i + 4 <= longitud(p)) {
+        sea tipo_c = byte_en(p, i)
+        sea banderas = byte_en(p, i + 1)
+        sea largo = _dr_l16(p, i + 2)
+        si (largo < 4) { romper }
+        sea v = _dr_sub(p, i + 4, largo - 4)
+        i = i + largo
+        mientras (i % 4 != 0) { i = i + 1 }
+        si (tipo_c == 1) {
+            // INIT: respondemos INIT ACK con una cookie.
+            s["tag_remoto"] = _dr_l32(v, 0)
+            s["tsn_rx"] = _dr_tsn(_dr_l32(v, 12), _DR_2_32 - 1)
+            sea cookie = bytes_aleatorios(16)
+            s["mi_cookie"] = cookie
+            sea valor = _dr_sctp_init_valor(s) + _dr_u16(7) + _dr_u16(4 + longitud(cookie)) + cookie
+            s["salida"].agregar(_dr_sctp_paquete(s, [_dr_chunk(2, 0, valor)], nulo))
+        } sino si (tipo_c == 2) {
+            si (s["estado"] != "cookie_espera") { continuar }
+            s["tag_remoto"] = _dr_l32(v, 0)
+            s["tsn_rx"] = _dr_tsn(_dr_l32(v, 12), _DR_2_32 - 1)
+            // Busca el parámetro State Cookie (7).
+            sea j = 16
+            mientras (j + 4 <= longitud(v)) {
+                sea pt = _dr_l16(v, j)
+                sea pl = _dr_l16(v, j + 2)
+                si (pt == 7) { s["cookie"] = _dr_chunk(10, 0, _dr_sub(v, j + 4, pl - 4)) }
+                j = j + pl
+                mientras (j % 4 != 0) { j = j + 1 }
+            }
+            s["estado"] = "cookie_eco"
+            s["ultimo_init"] = s["ahora"]
+            s["salida"].agregar(_dr_sctp_paquete(s, [s["cookie"]], nulo))
+        } sino si (tipo_c == 10) {
+            respuesta.agregar(_dr_chunk(11, 0, ""))
+            si (s["estado"] != "establecida") { _dr_sctp_establecida(s) }
+        } sino si (tipo_c == 11) {
+            si (s["estado"] == "cookie_eco") { _dr_sctp_establecida(s) }
+        } sino si (tipo_c == 0) {
+            hubo_datos = verdadero
+            _dr_sctp_datos(s, banderas, v)
+        } sino si (tipo_c == 3) {
+            _dr_sctp_recibir_sack(s, v)
+        } sino si (tipo_c == 4) {
+            respuesta.agregar(_dr_chunk(5, 0, v))
+        } sino si (tipo_c == 6) {
+            s["estado"] = "abortada"
+        } sino si (tipo_c == 7) {
+            respuesta.agregar(_dr_chunk(8, 0, ""))
+            s["estado"] = "cerrada"
+        } sino si (tipo_c == 8) {
+            respuesta.agregar(_dr_chunk(14, 0, ""))
+            s["estado"] = "cerrada"
+        } sino si (tipo_c == 192) {
+            sea nuevo = _dr_l32(v, 0)
+            si (s["tsn_rx"] != nulo y _dr_tsn_menor(s["tsn_rx"], nuevo)) {
+                s["tsn_rx"] = nuevo
+                _dr_sctp_avanzar(s)
+            }
+            hubo_datos = verdadero
+        } sino si (tipo_c == 130) {
+            sea r = _dr_sctp_reconf(s, v)
+            si (r != nulo) { respuesta.agregar(r) }
+        }
+    }
+    si (hubo_datos y s["tsn_rx"] != nulo) { respuesta.agregar(_dr_sctp_sack(s)) }
+    si (longitud(respuesta) > 0) { s["salida"].agregar(_dr_sctp_paquete(s, respuesta, nulo)) }
+}
+
+funcion _dr_sctp_datos(s, banderas, v) {
+    sea tsn = _dr_l32(v, 0)
+    si (s["tsn_rx"] == nulo) { retornar nulo }
+    si (tsn == s["tsn_rx"] o _dr_tsn_menor(tsn, s["tsn_rx"]) o tiene_clave(s["fuera"], "" + tsn)) {
+        s["dups"].agregar(tsn)
+        retornar nulo
+    }
+    s["fuera"]["" + tsn] = {"tsn": tsn, "banderas": banderas, "stream": _dr_l16(v, 4), "ssn": _dr_l16(v, 6), "ppid": _dr_l32(v, 8), "datos": subtexto(v, 12, longitud(v))}
+    _dr_sctp_avanzar(s)
+}
+
+// Avanza el TSN acumulado y arma los mensajes completos.
+funcion _dr_sctp_avanzar(s) {
+    mientras (verdadero) {
+        sea sig = _dr_tsn(s["tsn_rx"], 1)
+        sea c = s["fuera"]["" + sig] ?? nulo
+        si (c == nulo) { romper }
+        s["fuera"]["" + sig] = nulo
+        sea nuevo_fuera = {}
+        para k en claves(s["fuera"]) { si (s["fuera"][k] != nulo) { nuevo_fuera[k] = s["fuera"][k] } }
+        s["fuera"] = nuevo_fuera
+        s["tsn_rx"] = sig
+        sea clave = "" + c["stream"]
+        sea partes = s["partes"][clave] ?? []
+        si (c["banderas"] % 4 >= 2) { partes = [] }
+        partes.agregar(c)
+        s["partes"][clave] = partes
+        si (c["banderas"] % 2 == 1) {
+            s["partes"][clave] = []
+            sea datos = ""
+            para x en partes { datos = datos + x["datos"] }
+            sea m = {"stream": c["stream"], "ppid": c["ppid"], "datos": datos, "ssn": c["ssn"]}
+            si (c["banderas"] % 8 >= 4) { s["entregados"].agregar(m) } sino { _dr_sctp_en_orden(s, m) }
+        }
+    }
+}
+
+funcion _dr_sctp_en_orden(s, m) {
+    sea clave = "" + m["stream"]
+    sea esperado = s["ssn_rx"][clave] ?? 0
+    sea espera = s["en_espera"][clave] ?? {}
+    espera["" + m["ssn"]] = m
+    mientras (tiene_clave(espera, "" + esperado) y espera["" + esperado] != nulo) {
+        s["entregados"].agregar(espera["" + esperado])
+        espera["" + esperado] = nulo
+        esperado = (esperado + 1) % 65536
+    }
+    s["ssn_rx"][clave] = esperado
+    s["en_espera"][clave] = espera
+}
+
+funcion _dr_sctp_recibir_sack(s, v) {
+    sea cum = _dr_l32(v, 0)
+    sea ngaps = _dr_l16(v, 8)
+    sea quedan = []
+    para e en s["enviados"] {
+        si (e["tsn"] == cum o _dr_tsn_menor(e["tsn"], cum)) { } sino {
+            sea j = 0
+            mientras (j < ngaps) {
+                sea ini = _dr_tsn(cum, _dr_l16(v, 12 + j * 4))
+                sea fin = _dr_tsn(cum, _dr_l16(v, 14 + j * 4))
+                si ((e["tsn"] == ini o _dr_tsn_menor(ini, e["tsn"])) y (e["tsn"] == fin o _dr_tsn_menor(e["tsn"], fin))) { e["confirmado"] = verdadero }
+                j = j + 1
+            }
+            quedan.agregar(e)
+        }
+    }
+    s["enviados"] = quedan
+}
+
+// RE-CONFIG: el otro reinicia streams (cierra canales). Contestamos que sí.
+funcion _dr_sctp_reconf(s, v) {
+    sea j = 0
+    sea resp = ""
+    mientras (j + 4 <= longitud(v)) {
+        sea pt = _dr_l16(v, j)
+        sea pl = _dr_l16(v, j + 2)
+        si (pt == 13) {
+            sea seq = _dr_l32(v, j + 4)
+            sea k = j + 16
+            mientras (k + 2 <= j + pl) {
+                s["reinicios"].agregar(_dr_l16(v, k))
+                s["ssn_rx"]["" + _dr_l16(v, k)] = 0
+                k = k + 2
+            }
+            resp = resp + _dr_u16(16) + _dr_u16(12) + _dr_u32(seq) + _dr_u32(1)
+        }
+        j = j + pl
+        mientras (j % 4 != 0) { j = j + 1 }
+    }
+    si (resp == "") { retornar nulo }
+    retornar _dr_chunk(130, 0, resp)
+}
+
+/// Pide cerrar streams (al cerrar un canal de datos).
+funcion directo_sctp_reiniciar(s, streams) {
+    si (s["estado"] != "establecida") { retornar nulo }
+    sea lista = ""
+    para st en streams { lista = lista + _dr_u16(st) }
+    sea seq = s["seq_reconf"]
+    s["seq_reconf"] = _dr_tsn(seq, 1)
+    sea param = _dr_u16(13) + _dr_u16(16 + longitud(lista)) + _dr_u32(seq) + _dr_u32(seq) + _dr_u32(_dr_tsn(s["tsn_tx"], _DR_2_32 - 1)) + lista
+    s["salida"].agregar(_dr_sctp_paquete(s, [_dr_chunk(130, 0, param)], nulo))
+}
+
+// ---------- SDP ----------
+
+/// Lee un SDP: {"ufrag", "pwd", "huella", "setup", "candidatos": [[ip, puerto]], "sctp_puerto", "medios"}.
+funcion directo_sdp_leer(sdp) {
+    sea r = {"ufrag": nulo, "pwd": nulo, "huella": nulo, "setup": "actpass", "candidatos": [], "sctp_puerto": 5000, "mid": "0", "medios": []}
+    para l0 en separar(texto_reemplazar(sdp, "\r", ""), "\n") {
+        sea l = texto_recortar(l0)
+        si (texto_empieza_con(l, "m=")) { r["medios"].agregar(subtexto(l, 2, longitud(l))) }
+        si (texto_empieza_con(l, "a=ice-ufrag:")) { r["ufrag"] = subtexto(l, 12, longitud(l)) }
+        si (texto_empieza_con(l, "a=ice-pwd:")) { r["pwd"] = subtexto(l, 10, longitud(l)) }
+        si (texto_empieza_con(l, "a=fingerprint:sha-256 ")) { r["huella"] = subtexto(l, 22, longitud(l)) }
+        si (texto_empieza_con(l, "a=setup:")) { r["setup"] = subtexto(l, 8, longitud(l)) }
+        si (texto_empieza_con(l, "a=sctp-port:")) { r["sctp_puerto"] = a_numero(subtexto(l, 12, longitud(l))) }
+        si (texto_empieza_con(l, "a=mid:")) { r["mid"] = subtexto(l, 6, longitud(l)) }
+        si (texto_empieza_con(l, "a=candidate:")) {
+            sea p = separar(subtexto(l, 12, longitud(l)), " ")
+            // fundación componente transporte prioridad ip puerto typ tipo
+            si (longitud(p) >= 8 y texto_minusculas(p[2]) == "udp" y texto_indice(p[4], ":") < 0 y p[1] == "1") { r["candidatos"].agregar([p[4], a_numero(p[5]), a_numero(p[3])]) }
+        }
+    }
+    retornar r
+}
+
+funcion _dr_sdp(p, setup) {
+    sea l = ["v=0", "o=- " + p["sesion"] + " 2 IN IP4 127.0.0.1", "s=-", "t=0 0", "a=group:BUNDLE " + p["mid"], "a=msid-semantic: WMS",
+        "m=application 9 UDP/DTLS/SCTP webrtc-datachannel", "c=IN IP4 0.0.0.0", "a=ice-ufrag:" + p["ufrag"], "a=ice-pwd:" + p["pwd"],
+        "a=fingerprint:sha-256 " + directo_huella(p["cert"]["der"]), "a=setup:" + setup, "a=mid:" + p["mid"], "a=sctp-port:5000", "a=max-message-size:262144"]
+    sea k = 1
+    para c en p["candidatos"] {
+        l.agregar("a=candidate:" + k + " 1 udp " + c[2] + " " + c[0] + " " + c[1] + " typ host")
+        k = k + 1
+    }
+    l.agregar("a=end-of-candidates")
+    retornar unir(l, "\r\n") + "\r\n"
+}
+
+// ---------- conexión (peer) ----------
+
+/// Conexión WebRTC. opciones: "ip" (para el candidato local; 127.0.0.1).
+funcion directo_par(opciones) {
+    sea op = opciones ?? {}
+    retornar {"ufrag": _dr_aleatorio_texto(8), "pwd": _dr_aleatorio_texto(24), "cert": op["certificado"] ?? directo_certificado(), "ip": op["ip"] ?? "127.0.0.1",
+        "sesion": "" + (1000000 + piso(_dr_l32(bytes_aleatorios(4), 0) / 4096)), "mid": "0", "candidatos": [], "remoto": nulo, "controlando": falso,
+        "desempate": bytes_aleatorios(8), "elegido": nulo, "pedidos": {}, "ultimo_chequeo": -100000, "dtls": nulo, "sctp": nulo, "rol_dtls": nulo,
+        "canales": {}, "eventos": [], "salida": [], "ahora": 0, "sock": nulo, "proximo_id": nulo, "estado": "nuevo", "srtp": nulo, "rtp_recibidos": []}
+}
+
+/// Oferta SDP (este lado controla ICE y será servidor DTLS).
+funcion directo_oferta(p) {
+    p["controlando"] = verdadero
+    p["setup"] = "actpass"
+    retornar _dr_sdp(p, "actpass")
+}
+
+/// Recibe una oferta y devuelve la respuesta (este lado será cliente DTLS).
+funcion directo_respuesta(p, oferta) {
+    p["remoto"] = directo_sdp_leer(oferta)
+    si (p["remoto"]["pwd"] == nulo) { lanzar "directo: la oferta no tiene ice-pwd" }
+    p["mid"] = p["remoto"]["mid"]
+    p["controlando"] = falso
+    p["rol_dtls"] = "cliente"
+    si (p["remoto"]["setup"] == "active") { p["rol_dtls"] = "servidor" }
+    sea setup = "active"
+    si (p["rol_dtls"] == "servidor") { setup = "passive" }
+    _dr_preparar(p)
+    retornar _dr_sdp(p, setup)
+}
+
+/// Aplica la respuesta en el lado que ofertó.
+funcion directo_aplicar_respuesta(p, respuesta) {
+    p["remoto"] = directo_sdp_leer(respuesta)
+    p["rol_dtls"] = "servidor"
+    si (p["remoto"]["setup"] == "passive") { p["rol_dtls"] = "cliente" }
+    _dr_preparar(p)
+}
+
+/// Agrega un candidato remoto (ICE incremental): [ip, puerto].
+funcion directo_candidato(p, ip, puerto) { p["remoto"]["candidatos"].agregar([ip, puerto, 1]) }
+
+funcion _dr_preparar(p) {
+    p["dtls"] = directo_dtls(p["rol_dtls"], {"certificado": p["cert"], "huella_remota": p["remoto"]["huella"]})
+    p["sctp"] = directo_sctp({"puerto_remoto": p["remoto"]["sctp_puerto"]})
+    // Los ids de canal: pares para el cliente DTLS, impares para el servidor.
+    si (p["rol_dtls"] == "cliente") { p["proximo_id"] = 0 } sino { p["proximo_id"] = 1 }
+    p["estado"] = "conectando"
+}
+
+funcion _dr_evento(p, e) { p["eventos"].agregar(e) }
+
+/// Eventos: {"tipo": "conectado" | "canal" | "abierto" | "mensaje" | "cerrado", …}.
+funcion directo_eventos(p) {
+    sea r = p["eventos"]
+    p["eventos"] = []
+    retornar r
+}
+
+funcion directo_conectado(p) { retornar p["estado"] == "conectado" }
+
+/// Abre un canal de datos. opciones: "desordenado", "protocolo".
+/// Devuelve el id del canal.
+funcion directo_canal(p, etiqueta, opciones) {
+    sea op = opciones ?? {}
+    si (p["proximo_id"] == nulo) { lanzar "directo_canal: primero hay que negociar (oferta y respuesta)" }
+    sea id = p["proximo_id"]
+    p["proximo_id"] = id + 2
+    sea desordenado = op["desordenado"] ?? falso
+    p["canales"]["" + id] = {"id": id, "etiqueta": etiqueta, "protocolo": op["protocolo"] ?? "", "abierto": falso, "desordenado": desordenado}
+    sea tipo_c = 0
+    si (desordenado) { tipo_c = 128 }
+    sea abrir = _dr_u8(3) + _dr_u8(tipo_c) + _dr_u16(0) + _dr_u32(0) + _dr_u16(longitud(etiqueta)) + _dr_u16(longitud(op["protocolo"] ?? "")) + etiqueta + (op["protocolo"] ?? "")
+    directo_sctp_enviar(p["sctp"], id, 50, abrir, falso)
+    retornar id
+}
+
+/// Envía por un canal: texto o, con binario verdadero, bytes.
+funcion directo_enviar(p, canal, datos, binario) {
+    sea c = p["canales"]["" + canal] ?? nulo
+    si (c == nulo) { lanzar "directo_enviar: canal desconocido " + canal }
+    sea ppid = 51
+    si (binario ?? falso) { ppid = 53 }
+    si (longitud(datos) == 0) { ppid = ppid + 5 }
+    sea d = datos
+    si (longitud(d) == 0) { d = char_de(0) }
+    directo_sctp_enviar(p["sctp"], canal, ppid, d, c["desordenado"])
+}
+
+/// Cierra un canal.
+funcion directo_cerrar_canal(p, canal) {
+    directo_sctp_reiniciar(p["sctp"], [canal])
+    p["canales"]["" + canal] = nulo
+}
+
+funcion directo_etiqueta(p, canal) {
+    sea c = p["canales"]["" + canal] ?? nulo
+    si (c == nulo) { retornar nulo }
+    retornar c["etiqueta"]
+}
+
+funcion _dr_dcep(p, m) {
+    sea st = m["stream"]
+    sea d = m["datos"]
+    si (m["ppid"] == 50) {
+        si (byte_en(d, 0) == 3) {
+            sea ll = _dr_l16(d, 8)
+            sea lp = _dr_l16(d, 10)
+            sea etiqueta = _dr_sub(d, 12, ll)
+            p["canales"]["" + st] = {"id": st, "etiqueta": etiqueta, "protocolo": _dr_sub(d, 12 + ll, lp), "abierto": verdadero, "desordenado": byte_en(d, 1) >= 128}
+            directo_sctp_enviar(p["sctp"], st, 50, char_de(2), falso)
+            _dr_evento(p, {"tipo": "canal", "canal": st, "etiqueta": etiqueta})
+        } sino si (byte_en(d, 0) == 2) {
+            sea c = p["canales"]["" + st] ?? nulo
+            si (c != nulo) {
+                c["abierto"] = verdadero
+                _dr_evento(p, {"tipo": "abierto", "canal": st, "etiqueta": c["etiqueta"]})
+            }
+        }
+        retornar nulo
+    }
+    sea datos = d
+    si (m["ppid"] == 56 o m["ppid"] == 57) { datos = "" }
+    _dr_evento(p, {"tipo": "mensaje", "canal": st, "datos": datos, "binario": m["ppid"] == 53 o m["ppid"] == 57})
+}
+
+// ---------- ICE ----------
+
+funcion _dr_prioridad(p) { retornar 2130706431 }
+
+funcion _dr_chequeos(p) {
+    si (p["remoto"] == nulo o p["estado"] == "nuevo") { retornar nulo }
+    sea intervalo = 50
+    si (p["elegido"] != nulo) { intervalo = 2500 }
+    si (p["ahora"] - p["ultimo_chequeo"] < intervalo) { retornar nulo }
+    p["ultimo_chequeo"] = p["ahora"]
+    sea destinos = p["remoto"]["candidatos"]
+    si (p["elegido"] != nulo) { destinos = [p["elegido"]] }
+    para c en destinos {
+        sea txid = bytes_aleatorios(12)
+        sea attrs = [[6, p["remoto"]["ufrag"] + ":" + p["ufrag"]], [36, _dr_u32(_dr_prioridad(p))]]
+        si (p["controlando"]) {
+            attrs.agregar([32810, p["desempate"]])
+            attrs.agregar([37, ""])
+        } sino { attrs.agregar([32809, p["desempate"]]) }
+        p["pedidos"][hex_de_bytes(txid)] = [c[0], c[1]]
+        p["salida"].agregar([directo_stun_armar(1, txid, attrs, p["remoto"]["pwd"]), c[0], c[1]])
+    }
+}
+
+funcion _dr_elegir(p, ip, puerto) {
+    si (p["elegido"] != nulo) { retornar nulo }
+    p["elegido"] = [ip, puerto]
+    si (p["rol_dtls"] == "cliente") { directo_dtls_iniciar(p["dtls"], p["ahora"]) }
+}
+
+funcion _dr_stun(p, datos, ip, puerto) {
+    sea tipo_m = _dr_l16(datos, 0)
+    si (tipo_m == 1) {
+        sea m = directo_stun_leer(datos, p["pwd"])
+        si (m == nulo o m["integro"] == falso) { retornar nulo }
+        sea usuario = m["atributos"]["6"] ?? ""
+        si (texto_empieza_con(usuario, p["ufrag"] + ":") == falso) { retornar nulo }
+        p["salida"].agregar([directo_stun_armar(257, m["txid"], [[32, _dr_xor_dir(ip, puerto)]], p["pwd"]), ip, puerto])
+        // Candidato reflejo del otro.
+        sea conocido = falso
+        para c en p["remoto"]["candidatos"] { si (c[0] == ip y c[1] == puerto) { conocido = verdadero } }
+        si (conocido == falso) { p["remoto"]["candidatos"].agregar([ip, puerto, 1]) }
+        si (p["controlando"] == falso y tiene_clave(m["atributos"], "37")) { _dr_elegir(p, ip, puerto) }
+        retornar nulo
+    }
+    si (tipo_m == 257) {
+        sea m = directo_stun_leer(datos, p["remoto"]["pwd"])
+        si (m == nulo) { retornar nulo }
+        sea clave = hex_de_bytes(m["txid"])
+        si (tiene_clave(p["pedidos"], clave) == falso o p["pedidos"][clave] == nulo) { retornar nulo }
+        p["pedidos"][clave] = nulo
+        si (p["controlando"]) { _dr_elegir(p, ip, puerto) }
+    }
+}
+
+// ---------- entrada, salida y tiempo ----------
+
+/// Mete un datagrama recibido desde (ip, puerto).
+funcion directo_entrada(p, datos, ip, puerto, ahora) {
+    p["ahora"] = ahora ?? p["ahora"]
+    si (longitud(datos) == 0) { retornar nulo }
+    sea b = byte_en(datos, 0)
+    si (b < 4) {
+        _dr_stun(p, datos, ip, puerto)
+    } sino si (b >= 20 y b <= 63) {
+        si (p["dtls"] == nulo) { retornar nulo }
+        si (p["elegido"] == nulo) { p["elegido"] = [ip, puerto] }
+        directo_dtls_entrada(p["dtls"], datos, p["ahora"])
+        _dr_despues_dtls(p)
+    } sino si (b >= 128 y b <= 191) {
+        si (p["srtp"] != nulo) {
+            intentar {
+                p["rtp_recibidos"].agregar(directo_srtp_desproteger(p["srtp"]["rx"], datos))
+            } capturar (e) { }
+        }
+    }
+    _dr_mover(p)
+}
+
+funcion _dr_despues_dtls(p) {
+    sea d = p["dtls"]
+    si (directo_dtls_listo(d) y p["estado"] == "conectando") {
+        p["estado"] = "conectado"
+        si (d["perfil_srtp"] == 1) { p["srtp"] = directo_srtp_contextos(d) }
+        _dr_evento(p, {"tipo": "conectado"})
+        si (p["rol_dtls"] == "cliente") { directo_sctp_iniciar(p["sctp"], p["ahora"]) }
+    }
+    si (d["estado"] == "fallido" y p["estado"] != "fallido") {
+        p["estado"] = "fallido"
+        _dr_evento(p, {"tipo": "error", "mensaje": d["error"]})
+    }
+    para x en directo_dtls_leer(d) { directo_sctp_entrada(p["sctp"], x, p["ahora"]) }
+}
+
+// Mueve datos entre capas (SCTP → DTLS → red; SCTP → canales).
+funcion _dr_mover(p) {
+    si (p["sctp"] != nulo) {
+        para m en directo_sctp_leer(p["sctp"]) { _dr_dcep(p, m) }
+        si (longitud(p["sctp"]["reinicios"]) > 0) {
+            para st en p["sctp"]["reinicios"] {
+                si ((p["canales"]["" + st] ?? nulo) != nulo) {
+                    p["canales"]["" + st] = nulo
+                    _dr_evento(p, {"tipo": "cerrado", "canal": st})
+                }
+            }
+            p["sctp"]["reinicios"] = []
+        }
+        si (directo_dtls_listo(p["dtls"])) {
+            para x en directo_sctp_salida(p["sctp"]) { directo_dtls_escribir(p["dtls"], x) }
+        }
+    }
+    si (p["dtls"] != nulo y p["elegido"] != nulo) {
+        para x en directo_dtls_salida(p["dtls"]) { p["salida"].agregar([x, p["elegido"][0], p["elegido"][1]]) }
+    }
+}
+
+/// Avanza el reloj: chequeos ICE y retransmisiones.
+funcion directo_tic(p, ahora) {
+    p["ahora"] = ahora
+    _dr_chequeos(p)
+    si (p["dtls"] != nulo) { directo_dtls_tic(p["dtls"], ahora) }
+    si (p["sctp"] != nulo) { directo_sctp_tic(p["sctp"], ahora) }
+    _dr_mover(p)
+}
+
+/// Datagramas para enviar: [[datos, ip, puerto]].
+funcion directo_salida(p) {
+    _dr_mover(p)
+    sea r = p["salida"]
+    p["salida"] = []
+    retornar r
+}
+
+/// Agrega un candidato local (sin socket: para usar la API sin E/S).
+funcion directo_candidato_local(p, ip, puerto) { p["candidatos"].agregar([ip, puerto, 2130706431]) }
+
+// ---------- UDP ----------
+
+/// Abre un socket UDP (puerto 0: uno libre al azar) y agrega el candidato.
+funcion directo_vincular(p, puerto) {
+    sea s = nulo
+    sea pt = puerto
+    si (pt == 0) {
+        sea intentos = 0
+        mientras (s == nulo y intentos < 50) {
+            pt = 20000 + _dr_l16(bytes_aleatorios(2), 0) % 40000
+            intentar { s = udp_crear(pt) } capturar (e) { s = nulo }
+            intentos = intentos + 1
+        }
+    } sino { s = udp_crear(pt) }
+    p["sock"] = s
+    p["candidatos"].agregar([p["ip"], pt, 2130706431])
+    retornar pt
+}
+
+/// Lee lo que haya llegado, avanza el reloj y manda lo pendiente.
+funcion directo_procesar(p) {
+    sea ahora = tiempo_ms()
+    mientras (verdadero) {
+        sea r = udp_recibir(p["sock"])
+        si (r == nulo) { romper }
+        directo_entrada(p, r["datos"], r["origen"], r["puerto"], ahora)
+    }
+    directo_tic(p, ahora)
+    para x en directo_salida(p) { udp_enviar(p["sock"], x[1], x[2], x[0]) }
+}
+
+/// Atiende varias conexiones hasta que pasen ms milisegundos o hasta que
+/// condicion() devuelva verdadero.
+funcion directo_atender(pares, ms, condicion) {
+    sea fin = tiempo_ms() + ms
+    mientras (tiempo_ms() < fin) {
+        para p en pares { directo_procesar(p) }
+        si (condicion != nulo y condicion()) { retornar verdadero }
+        dormir(2)
+    }
+    retornar falso
+}
+
+funcion directo_cerrar(p) {
+    si (p["dtls"] != nulo y directo_dtls_listo(p["dtls"])) {
+        p["dtls"]["salida"].agregar(_dr_registro(p["dtls"], 21, char_de(1) + char_de(0)))
+        _dr_mover(p)
+        para x en directo_salida(p) { si (p["sock"] != nulo) { udp_enviar(p["sock"], x[1], x[2], x[0]) } }
+    }
+    si (p["sock"] != nulo) { udp_cerrar(p["sock"]) }
+    p["estado"] = "cerrado"
+}
+
+// ---------- RTP y SRTP ----------
+
+/// Arma un paquete RTP. campos: "pt", "seq", "ts", "ssrc", "marcador", "carga".
+funcion directo_rtp_armar(c) {
+    sea b1 = c["pt"] % 128
+    si (c["marcador"] ?? falso) { b1 = b1 + 128 }
+    retornar char_de(128) + char_de(b1) + _dr_u16(c["seq"] % 65536) + _dr_u32(c["ts"] % _DR_2_32) + _dr_u32(c["ssrc"]) + (c["carga"] ?? "")
+}
+
+funcion _dr_rtp_cabecera(p) {
+    sea cc = byte_en(p, 0) % 16
+    sea n = 12 + 4 * cc
+    si (byte_en(p, 0) % 32 >= 16) { n = n + 4 + 4 * _dr_l16(p, n + 2) }
+    retornar n
+}
+
+/// Lee un paquete RTP: {"pt", "seq", "ts", "ssrc", "marcador", "carga"}.
+funcion directo_rtp_leer(p) {
+    sea n = _dr_rtp_cabecera(p)
+    retornar {"version": piso(byte_en(p, 0) / 64), "marcador": byte_en(p, 1) >= 128, "pt": byte_en(p, 1) % 128, "seq": _dr_l16(p, 2), "ts": _dr_l32(p, 4),
+        "ssrc": _dr_l32(p, 8), "carga": subtexto(p, n, longitud(p))}
+}
+
+funcion _dr_aes_cm(clave_exp, iv, n) {
+    // Flujo AES en modo contador (los 16 bits bajos cuentan).
+    sea r = ""
+    sea i = 0
+    sea base = _dr_l16(iv, 14)
+    mientras (longitud(r) < n) {
+        sea bloque = subtexto(iv, 0, 14) + _dr_u16((base + i) % 65536)
+        si (base + i >= 65536) { bloque = subtexto(iv, 0, 12) + _dr_u16((_dr_l16(iv, 12) + 1) % 65536) + _dr_u16((base + i) % 65536) }
+        r = r + aes_bloque(clave_exp, bloque)
+        i = i + 1
+    }
+    retornar subtexto(r, 0, n)
+}
+
+funcion _dr_srtp_derivar(clave, sal, etiqueta, n) {
+    sea x = bytes_xor(sal, _dr_repetir(char_de(0), 7) + char_de(etiqueta) + _dr_repetir(char_de(0), 6))
+    retornar _dr_aes_cm(clave, x + _dr_u16(0), n)
+}
+
+/// Contexto SRTP (AES_CM_128_HMAC_SHA1_80) desde la clave y la sal maestras.
+funcion directo_srtp(clave_maestra, sal_maestra) {
+    retornar {"k": _dr_srtp_derivar(clave_maestra, sal_maestra, 0, 16), "a": _dr_srtp_derivar(clave_maestra, sal_maestra, 1, 20),
+        "s": _dr_srtp_derivar(clave_maestra, sal_maestra, 2, 14), "roc": {}, "ultimo": {}}
+}
+
+/// Contextos {"tx", "rx"} desde una conexión DTLS con use_srtp.
+funcion directo_srtp_contextos(d) {
+    sea m = directo_dtls_exportar(d, "EXTRACTOR-dtls_srtp", 60)
+    sea ck = _dr_sub(m, 0, 16)
+    sea sk = _dr_sub(m, 16, 16)
+    sea cs = _dr_sub(m, 32, 14)
+    sea ss = _dr_sub(m, 46, 14)
+    si (d["rol"] == "cliente") { retornar {"tx": directo_srtp(ck, cs), "rx": directo_srtp(sk, ss)} }
+    retornar {"tx": directo_srtp(sk, ss), "rx": directo_srtp(ck, cs)}
+}
+
+funcion _dr_srtp_iv(ctx, ssrc, indice) {
+    sea x = ctx["s"] + _dr_u16(0)
+    sea m = _dr_u32(0) + _dr_u32(ssrc) + bytes_entero(indice, 6, 0) + _dr_u16(0)
+    retornar bytes_xor(x, m)
+}
+
+/// Cifra y autentica un paquete RTP.
+funcion directo_srtp_proteger(ctx, rtp) {
+    sea n = _dr_rtp_cabecera(rtp)
+    sea ssrc = _dr_l32(rtp, 8)
+    sea seq = _dr_l16(rtp, 2)
+    sea clave = "" + ssrc
+    sea roc = ctx["roc"][clave] ?? 0
+    sea ultimo = ctx["ultimo"][clave] ?? nulo
+    si (ultimo != nulo y seq < ultimo y ultimo - seq > 32768) { roc = roc + 1 }
+    ctx["roc"][clave] = roc
+    ctx["ultimo"][clave] = seq
+    sea indice = roc * 65536 + seq
+    sea carga = subtexto(rtp, n, longitud(rtp))
+    sea cifrada = bytes_xor(carga, _dr_aes_cm(ctx["k"], _dr_srtp_iv(ctx, ssrc, indice), longitud(carga)))
+    sea paquete = subtexto(rtp, 0, n) + cifrada
+    retornar paquete + subtexto(_dr_hmac_sha1(ctx["a"], paquete + _dr_u32(roc)), 0, 10)
+}
+
+/// Verifica y descifra un paquete SRTP (lanza un error si la etiqueta falla).
+funcion directo_srtp_desproteger(ctx, srtp) {
+    si (longitud(srtp) < 22) { lanzar "srtp: paquete corto" }
+    sea paquete = subtexto(srtp, 0, longitud(srtp) - 10)
+    sea etiqueta = subtexto(srtp, longitud(srtp) - 10, longitud(srtp))
+    sea n = _dr_rtp_cabecera(paquete)
+    sea ssrc = _dr_l32(paquete, 8)
+    sea seq = _dr_l16(paquete, 2)
+    sea clave = "" + ssrc
+    sea roc = ctx["roc"][clave] ?? 0
+    sea ultimo = ctx["ultimo"][clave] ?? nulo
+    // Estimación del ROC (RFC 3711, 3.3.1).
+    sea v = roc
+    si (ultimo != nulo) {
+        si (ultimo < 32768) {
+            si (seq - ultimo > 32768) { v = roc - 1 }
+        } sino {
+            si (ultimo - 32768 > seq) { v = roc + 1 }
+        }
+    }
+    si (v < 0) { v = 0 }
+    si (subtexto(_dr_hmac_sha1(ctx["a"], paquete + _dr_u32(v)), 0, 10) != etiqueta) { lanzar "srtp: autenticación fallida" }
+    si (ultimo == nulo o v > roc o (v == roc y seq > ultimo)) {
+        ctx["roc"][clave] = v
+        ctx["ultimo"][clave] = seq
+    }
+    sea indice = v * 65536 + seq
+    sea carga = subtexto(paquete, n, longitud(paquete))
+    retornar subtexto(paquete, 0, n) + bytes_xor(carga, _dr_aes_cm(ctx["k"], _dr_srtp_iv(ctx, ssrc, indice), longitud(carga)))
+}
+
+/// Envía un paquete RTP (se protege con SRTP) por la conexión.
+funcion directo_enviar_rtp(p, rtp) {
+    si (p["srtp"] == nulo o p["elegido"] == nulo) { lanzar "directo_enviar_rtp: no hay SRTP negociado todavía" }
+    p["salida"].agregar([directo_srtp_proteger(p["srtp"]["tx"], rtp), p["elegido"][0], p["elegido"][1]])
+}
+
+/// Paquetes RTP recibidos (ya descifrados).
+funcion directo_rtp_recibidos(p) {
+    sea r = p["rtp_recibidos"]
+    p["rtp_recibidos"] = []
+    retornar r
+}

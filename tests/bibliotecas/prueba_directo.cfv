@@ -1,0 +1,193 @@
+// Pruebas de directo (WebRTC propio). Los vectores de STUN salen de aioice
+// y los de SRTP de libsrtp (pylibsrtp); la interoperabilidad con aiortc y
+// con OpenSSL (DTLS) se probó aparte.
+importar "directo"
+funcion eq(a, b, q) { afirmar(("" + a) == ("" + b), q + ": [" + a + "] != [" + b + "]") }
+
+// STUN: el mismo pedido y la misma respuesta que arma aioice.
+sea txid = bytes_de_hex("b7e7a701bc34d686fa87dfae")
+sea pedido = bytes_de_hex("000100442112a442b7e7a701bc34d686fa87dfae000600096576746a3a68367659000000002400046e7f1eff80290008932ff9b151263b3600080014479c61d1ef00b8e332b36d7fe14132690e7d5d6b802800041880fc01")
+eq(directo_stun_armar(1, txid, [[6, "evtj:h6vY"], [36, bytes_entero(1853824767, 4, 0)], [32809, bytes_de_hex("932ff9b151263b36")]], "VOkJxbRl1RmTxUk/WvJxBt") == pedido, verdadero, "STUN igual a aioice")
+sea m = directo_stun_leer(pedido, "VOkJxbRl1RmTxUk/WvJxBt")
+eq([m["tipo"], m["integro"], m["huella"], m["atributos"]["6"]], [1, verdadero, verdadero, "evtj:h6vY"], "STUN leído")
+eq(directo_stun_leer(pedido, "otra clave")["integro"], falso, "MESSAGE-INTEGRITY con otra clave")
+sea resp = directo_stun_armar(257, txid, [[32, _dr_xor_dir("192.0.2.1", 32853)]], "VOkJxbRl1RmTxUk/WvJxBt")
+eq(hex_de_bytes(resp), "0101002c2112a442b7e7a701bc34d686fa87dfae002000080001a147e112a6430008001474c9371ebf3148548518699c3e3174c20dd9e68a80280004fae4043a", "XOR-MAPPED-ADDRESS")
+eq(directo_es_stun("hola"), falso, "no es STUN")
+
+// SRTP: igual a libsrtp, con el cambio de ROC al pasar de 65535 a 0.
+sea tx = directo_srtp(bytes_de_hex("000102030405060708090a0b0c0d0e0f"), bytes_de_hex("6465666768696a6b6c6d6e6f7071"))
+sea rx = directo_srtp(bytes_de_hex("000102030405060708090a0b0c0d0e0f"), bytes_de_hex("6465666768696a6b6c6d6e6f7071"))
+sea esperados = ["80e0fffe00003039deadbeef33e5b1d0e68268fe9b844756a57c9a9d85f2e7aa2bed3e3c845a2c390b32e0f53674238d495c1705cfca",
+    "80e0ffff0000303adeadbeef612f08dbd8e443b955282dc407b9a5c6923c42a1f2bd1c3e497304d28889f2594af9d4a6468526e998e9",
+    "80e000000000303bdeadbeef06a2a3b7c6f1417571ac302377149710b48701b80e7a091336976af3c44cab57c44ed4929e907a8c1931",
+    "80e000010000303cdeadbeef95c1bd2c1b3999b0d8ed5617510885b253552b6b0e68d06bf652f430c7dfc68a455290ec879986d2f088"]
+sea i = 0
+mientras (i < 4) {
+    sea rtp = directo_rtp_armar({"pt": 96, "marcador": verdadero, "seq": 65534 + i, "ts": 12345 + i, "ssrc": 3735928559, "carga": "hola srtp desde python 123456789"})
+    eq(hex_de_bytes(directo_srtp_proteger(tx, rtp)), esperados[i], "SRTP igual a libsrtp " + i)
+    eq(directo_srtp_desproteger(rx, bytes_de_hex(esperados[i])), rtp, "SRTP descifrado " + i)
+    i = i + 1
+}
+sea malo = bytes_de_hex(esperados[0])
+malo = subtexto(malo, 0, 20) + char_de(bits_xo(byte_en(malo, 20), 1)) + subtexto(malo, 21, longitud(malo))
+sea fallo = falso
+intentar { directo_srtp_desproteger(directo_srtp(bytes_de_hex("000102030405060708090a0b0c0d0e0f"), bytes_de_hex("6465666768696a6b6c6d6e6f7071")), malo) } capturar (e) { fallo = verdadero }
+eq(fallo, verdadero, "SRTP rechaza paquetes alterados")
+eq(directo_rtp_leer(directo_rtp_armar({"pt": 111, "seq": 7, "ts": 960, "ssrc": 9, "carga": "x"})), {"carga": "x", "marcador": falso, "pt": 111, "seq": 7, "ssrc": 9, "ts": 960, "version": 2}, "RTP")
+
+// DTLS 1.2 en memoria, con cookie (HelloVerifyRequest) y huellas.
+sea c = directo_dtls("cliente", nulo)
+sea s = directo_dtls("servidor", {"cookie": verdadero})
+c["huella_remota"] = directo_huella(s["cert"]["der"])
+s["huella_remota"] = directo_huella(c["cert"]["der"])
+directo_dtls_iniciar(c, 0)
+sea vueltas = 0
+mientras (vueltas < 10 y (directo_dtls_listo(c) == falso o directo_dtls_listo(s) == falso)) {
+    para p en directo_dtls_salida(c) { directo_dtls_entrada(s, p, 0) }
+    para p en directo_dtls_salida(s) { directo_dtls_entrada(c, p, 0) }
+    vueltas = vueltas + 1
+}
+eq([c["estado"], s["estado"], c["ems"], c["perfil_srtp"], vueltas], ["conectado", "conectado", verdadero, 1, 3], "saludo DTLS con cookie")
+directo_dtls_escribir(c, "hola")
+para p en directo_dtls_salida(c) { directo_dtls_entrada(s, p, 0) }
+eq(directo_dtls_leer(s), ["hola"], "datos de aplicación")
+eq(directo_dtls_exportar(c, "EXTRACTOR-dtls_srtp", 60) == directo_dtls_exportar(s, "EXTRACTOR-dtls_srtp", 60), verdadero, "exportador")
+// Huella equivocada: el saludo falla.
+sea c2 = directo_dtls("cliente", {"huella_remota": "00:11"})
+sea s2 = directo_dtls("servidor", nulo)
+directo_dtls_iniciar(c2, 0)
+vueltas = 0
+mientras (vueltas < 5) {
+    para p en directo_dtls_salida(c2) { directo_dtls_entrada(s2, p, 0) }
+    para p en directo_dtls_salida(s2) { directo_dtls_entrada(c2, p, 0) }
+    vueltas = vueltas + 1
+}
+eq([c2["estado"], c2["error"]], ["fallido", "la huella del certificado no coincide"], "huella incorrecta")
+// Vuelos perdidos: se retransmiten con el reloj.
+sea c3 = directo_dtls("cliente", nulo)
+sea s3 = directo_dtls("servidor", nulo)
+directo_dtls_iniciar(c3, 0)
+directo_dtls_salida(c3)
+directo_dtls_tic(c3, 1500)
+sea t = 1500
+vueltas = 0
+mientras (vueltas < 6 y directo_dtls_listo(c3) == falso) {
+    para p en directo_dtls_salida(c3) { directo_dtls_entrada(s3, p, t) }
+    sea vuelo_s = directo_dtls_salida(s3)
+    si (vueltas > 0) { para p en vuelo_s { directo_dtls_entrada(c3, p, t) } }
+    t = t + 1500
+    directo_dtls_tic(c3, t)
+    directo_dtls_tic(s3, t)
+    vueltas = vueltas + 1
+}
+eq(directo_dtls_listo(c3), verdadero, "retransmisión de vuelos")
+
+// Conexión completa sin E/S: ICE, DTLS, SCTP y canales, con pérdidas.
+funcion par(ip, puerto) {
+    sea p = directo_par({"ip": ip})
+    directo_candidato_local(p, ip, puerto)
+    retornar p
+}
+sea a = par("10.0.0.1", 1111)
+sea b = par("10.0.0.2", 2222)
+sea oferta = directo_oferta(a)
+afirmar(texto_contiene(oferta, "a=setup:actpass") y texto_contiene(oferta, "a=candidate:1 1 udp 2130706431 10.0.0.1 1111 typ host"), "SDP de oferta")
+sea respuesta = directo_respuesta(b, oferta)
+afirmar(texto_contiene(respuesta, "a=setup:active"), "SDP de respuesta")
+directo_aplicar_respuesta(a, respuesta)
+eq([a["rol_dtls"], b["rol_dtls"], a["controlando"], b["controlando"]], ["servidor", "cliente", verdadero, falso], "roles")
+sea perder = [0]
+funcion red(desde, hacia, ip, puerto, reloj) {
+    para x en directo_salida(desde) {
+        perder[0] = perder[0] + 1
+        // Se pierde uno de cada siete datagramas.
+        si (perder[0] % 7 != 3) { directo_entrada(hacia, x[0], ip, puerto, reloj) }
+    }
+}
+sea ca = directo_canal(a, "chat", nulo)
+sea cu = directo_canal(a, "rapido", {"desordenado": verdadero})
+sea reloj = 0
+sea grande = ""
+i = 0
+mientras (i < 500) {
+    grande = grande + "fragmento" + i + ";"
+    i = i + 1
+}
+sea enviado = falso
+sea en_b = []
+sea en_a = []
+sea pasos = 0
+mientras (pasos < 400 y (longitud(en_b) < 4 o longitud(en_a) < 1)) {
+    reloj = reloj + 60
+    directo_tic(a, reloj)
+    directo_tic(b, reloj)
+    red(a, b, "10.0.0.1", 1111, reloj)
+    red(b, a, "10.0.0.2", 2222, reloj)
+    si (enviado == falso y directo_conectado(a) y a["sctp"]["estado"] == "establecida") {
+        directo_enviar(a, ca, "hola")
+        directo_enviar(a, ca, grande)
+        directo_enviar(a, cu, bytes_de_hex("00ff10"), verdadero)
+        directo_enviar(a, ca, "")
+        enviado = verdadero
+    }
+    para e en directo_eventos(b) {
+        si (e["tipo"] == "mensaje") { en_b.agregar(e) }
+        si (e["tipo"] == "canal" y e["etiqueta"] == "chat") { directo_enviar(b, e["canal"], "respuesta") }
+    }
+    para e en directo_eventos(a) { si (e["tipo"] == "mensaje") { en_a.agregar(e) } }
+    pasos = pasos + 1
+}
+eq([directo_conectado(a), directo_conectado(b), a["elegido"], b["elegido"]], [verdadero, verdadero, ["10.0.0.2", 2222], ["10.0.0.1", 1111]], "ICE elige el par")
+eq(longitud(en_b), 4, "mensajes recibidos en b")
+sea por_texto = {}
+para e en en_b { por_texto["" + e["canal"] + ":" + longitud(e["datos"])] = e }
+eq(por_texto["1:4"]["datos"], "hola", "texto")
+eq(por_texto["1:" + longitud(grande)]["datos"] == grande, verdadero, "mensaje grande fragmentado (con pérdidas)")
+eq([por_texto["3:3"]["binario"], hex_de_bytes(por_texto["3:3"]["datos"])], [verdadero, "00ff10"], "binario en canal desordenado")
+eq([por_texto["1:0"]["datos"], por_texto["1:0"]["binario"]], ["", falso], "mensaje vacío")
+// El orden se respeta en el canal ordenado.
+sea orden_chat = []
+para e en en_b { si (e["canal"] == 1) { orden_chat.agregar(longitud(e["datos"])) } }
+eq(orden_chat, [4, longitud(grande), 0], "orden")
+eq([en_a[0]["datos"], directo_etiqueta(a, en_a[0]["canal"])], ["respuesta", "chat"], "respuesta por el mismo canal")
+// SRTP por la conexión.
+directo_enviar_rtp(b, directo_rtp_armar({"pt": 111, "seq": 1, "ts": 960, "ssrc": 42, "carga": "audio"}))
+para x en directo_salida(b) { directo_entrada(a, x[0], "10.0.0.2", 2222, reloj) }
+eq(directo_rtp_leer(directo_rtp_recibidos(a)[0])["carga"], "audio", "RTP por SRTP")
+// Cerrar un canal avisa al otro.
+directo_cerrar_canal(a, cu)
+sea cerrado = falso
+pasos = 0
+mientras (pasos < 20 y cerrado == falso) {
+    reloj = reloj + 60
+    directo_tic(a, reloj)
+    directo_tic(b, reloj)
+    para x en directo_salida(a) { directo_entrada(b, x[0], "10.0.0.1", 1111, reloj) }
+    para x en directo_salida(b) { directo_entrada(a, x[0], "10.0.0.2", 2222, reloj) }
+    para e en directo_eventos(b) { si (e["tipo"] == "cerrado" y e["canal"] == cu) { cerrado = verdadero } }
+    pasos = pasos + 1
+}
+eq(cerrado, verdadero, "cierre de canal (RE-CONFIG)")
+// SDP de aiortc.
+sea sdp_py = "v=0\r\no=- 4004406435 4004406435 IN IP4 0.0.0.0\r\ns=-\r\nt=0 0\r\na=group:BUNDLE 0\r\nm=application 9 UDP/DTLS/SCTP webrtc-datachannel\r\nc=IN IP4 0.0.0.0\r\na=mid:0\r\na=sctp-port:5000\r\na=ice-ufrag:YshT\r\na=ice-pwd:jdOBnktyYyeATsENH9BrQB\r\na=candidate:0a2b 1 udp 2130706431 192.0.2.2 35524 typ host\r\na=candidate:0a2c 1 udp 2130706431 fe80::1 35525 typ host\r\na=fingerprint:sha-256 AC:FC:E8\r\na=fingerprint:sha-384 FC:07\r\na=setup:actpass\r\n"
+sea l = directo_sdp_leer(sdp_py)
+eq([l["ufrag"], l["pwd"], l["huella"], l["setup"], l["candidatos"], l["sctp_puerto"]], ["YshT", "jdOBnktyYyeATsENH9BrQB", "AC:FC:E8", "actpass", [["192.0.2.2", 35524, 2130706431]], 5000], "SDP de aiortc")
+
+// Lo mismo por UDP real en 127.0.0.1.
+sea ua = directo_par(nulo)
+sea ub = directo_par(nulo)
+directo_vincular(ua, 0)
+directo_vincular(ub, 0)
+directo_aplicar_respuesta(ua, directo_respuesta(ub, directo_oferta(ua)))
+sea canal = directo_canal(ua, "udp", nulo)
+directo_enviar(ua, canal, "por udp")
+sea llegado = nulo
+directo_atender([ua, ub], 15000, funcion() {
+    para e en directo_eventos(ub) { si (e["tipo"] == "mensaje") { llegado = e["datos"] } }
+    retornar llegado != nulo
+})
+eq(llegado, "por udp", "UDP")
+directo_cerrar(ua)
+directo_cerrar(ub)
+mostrar("[OK] directo")
