@@ -1,0 +1,87 @@
+importar "cartero"
+funcion igual(a, b, q) { afirmar(("" + a) == ("" + b), q + ": [" + a + "] != [" + b + "]") }
+// Contra un servidor HTTP real (Python) se probaron GET con parámetros,
+// JSON, formularios, cabeceras por defecto y reintentos con Retry-After.
+igual(cartero_parametros({"a": 1, "b": "x y", "c": [1, 2], "d": nulo, "e": {"f": verdadero}}, nulo), "a=1&b=x%20y&c=1&c=2&e%5Bf%5D=true", "parámetros")
+igual([cartero_parametros({"c": [1, 2]}, "corchetes"), cartero_parametros({"c": [1, 2]}, "indices"), cartero_parametros({"c": [1, 2]}, "coma")], ["c%5B%5D=1&c%5B%5D=2", "c%5B0%5D=1&c%5B1%5D=2", "c=1%2C2"], "estilos")
+igual([cartero_unir_url("http://x/v1/", "/a"), cartero_unir_url("http://x/v1", "a"), cartero_unir_url("http://x", "https://y/z"), cartero_unir_url("", "/a")], ["http://x/v1/a", "http://x/v1/a", "https://y/z", "/a"], "unir url")
+sea Q = caracter(34)
+funcion j(t) { retornar texto_reemplazar(texto_reemplazar(t, "«", caracter(123)), "»", caracter(125)) }
+sea fallos = {"n": 0}
+sea sim = cartero_simulado({
+    "GET /v1/usuarios": funcion(p) { retornar {"estado": 200, "cabeceras": {"Content-Type": "application/json"}, "cuerpo": j("[«" + Q + "id" + Q + ": 1»]")} },
+    "POST /v1/usuarios": funcion(p) { retornar {"estado": 201, "cabeceras": {"Content-Type": p["cabeceras"]["Content-Type"]}, "cuerpo": p["cuerpo"]} },
+    "GET /v1/inestable": funcion(p) {
+        fallos["n"] = fallos["n"] + 1
+        si (fallos["n"] < 3) { retornar {"estado": 503, "cabeceras": {"Retry-After": "2"}, "cuerpo": ""} }
+        retornar {"estado": 200, "cabeceras": {"Content-Type": "text/plain"}, "cuerpo": "listo"}
+    },
+    "GET /v1/privado": funcion(p) {
+        si ((p["cabeceras"]["Authorization"] ?? "") == "Bearer nuevo") { retornar {"estado": 200, "cabeceras": {}, "cuerpo": "secreto"} }
+        retornar {"estado": 401, "cabeceras": {}, "cuerpo": ""}
+    },
+    "GET /v1/roto": {"estado": 200, "cabeceras": {"Content-Type": "application/json"}, "cuerpo": "{no"}
+})
+sea esperas = []
+sea api = cartero_crear({"base": "https://api.x/v1", "cabeceras": {"X-App": "demo"}, "adaptador": sim["adaptador"], "reintentos": 3, "espera": 100, "dormir": funcion(ms) { esperas.agregar(ms) }})
+sea r = cartero_get(api, "/usuarios", {"parametros": {"pagina": 2}})
+igual([r["estado"], r["datos"][0]["id"], sim["historial"][0]["url"], sim["historial"][0]["cabeceras"]["X-App"]], [200, 1, "https://api.x/v1/usuarios?pagina=2", "demo"], "GET")
+r = cartero_post(api, "usuarios", {"nombre": "Ana"}, nulo)
+igual([r["estado"], r["datos"]["nombre"], sim["historial"][1]["cabeceras"]["Content-Type"]], [201, "Ana", "application/json"], "POST JSON")
+igual([cartero_get(api, "inestable", nulo)["datos"], esperas], ["listo", [2000, 2000]], "reintentos con Retry-After")
+// Sin Retry-After, espera exponencial; POST no se reintenta.
+sea e1 = nulo
+intentar { cartero_post(api, "inestable2", nulo, nulo) } capturar (e) { e1 = e }
+igual([e1["codigo"], e1["respuesta"]["estado"], e1["intentos"], e1["respuesta"]["datos"]["error"]], ["ESTADO", 404, 1, "no existe"], "error de estado")
+e1 = nulo
+intentar { cartero_get(api, "roto", nulo) } capturar (e) { e1 = e }
+igual(e1["codigo"], "JSON_INVALIDO", "JSON inválido")
+// Interceptores: orden y quitar.
+sea orden = []
+sea i1 = cartero_interceptor_peticion(api, funcion(p) {
+    orden.agregar("ida1")
+    retornar p
+}, nulo)
+cartero_interceptor_peticion(api, funcion(p) {
+    orden.agregar("ida2")
+    p["cabeceras"]["X-Traza"] = "t"
+    retornar p
+}, nulo)
+cartero_interceptor_respuesta(api, funcion(r) {
+    orden.agregar("vuelta")
+    r["datos"] = {"envuelto": r["datos"]}
+    retornar r
+}, nulo)
+r = cartero_get(api, "usuarios", nulo)
+igual([orden, r["datos"]["envuelto"][0]["id"], sim["historial"][longitud(sim["historial"]) - 1]["cabeceras"]["X-Traza"]], [["ida2", "ida1", "vuelta"], 1, "t"], "interceptores")
+cartero_quitar_interceptor(api, i1)
+igual(longitud(api["ida"]), 1, "quitar")
+// Renovar token en un interceptor de error y repetir.
+sea priv = cartero_extender(api, {"token": "viejo"})
+sea renovado = {"n": 0}
+cartero_interceptor_respuesta(priv, nulo, funcion(e) {
+    si (e["codigo"] == "ESTADO" y e["respuesta"]["estado"] == 401 y renovado["n"] == 0) {
+        renovado["n"] = 1
+        sea p = e["peticion"]
+        p["cabeceras"]["Authorization"] = "Bearer nuevo"
+        p["token"] = nulo
+        retornar cartero_repetir(cartero_crear({"adaptador": sim["adaptador"]}), p)
+    }
+    lanzar e
+})
+igual([cartero_get(priv, "privado", nulo)["datos"], renovado["n"]], ["secreto", 1], "renovar token")
+// Autenticación básica, formulario y cancelación.
+sea b = cartero_crear({"adaptador": sim["adaptador"], "auth": {"usuario": "ana", "clave": "s3"}})
+cartero_post(b, "https://api.x/v1/usuarios", {"a": "1 2"}, {"cabeceras": {"Content-Type": "application/x-www-form-urlencoded"}})
+sea ult = sim["historial"][longitud(sim["historial"]) - 1]
+igual([ult["cabeceras"]["Authorization"], ult["cuerpo"]], ["Basic YW5hOnMz", "a=1%202"], "básica y formulario")
+sea f = cartero_ficha()
+cartero_cancelar(f, "ya no")
+e1 = nulo
+intentar { cartero_get(b, "https://api.x/v1/usuarios", {"cancelar": f}) } capturar (e) { e1 = e }
+igual([cartero_es_cancelacion(e1), cartero_mensaje(e1)], [verdadero, "ya no"], "cancelar")
+// validar_estado y todas.
+igual(cartero_get(b, "https://api.x/v1/nada", {"validar_estado": funcion(s) { retornar s < 500 }})["estado"], 404, "validar_estado")
+sea t = cartero_todas(b, [{"url": "https://api.x/v1/usuarios"}, {"url": "https://api.x/v1/nada"}], verdadero)
+igual([t[0]["estado"], t[1]["codigo"]], [200, "ESTADO"], "todas")
+mostrar("[OK] cartero")

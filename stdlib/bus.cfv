@@ -1,0 +1,890 @@
+// stdlib/bus.cfv — D-Bus para Linux: codificación completa del formato de
+// cable (todos los tipos básicos, arreglos, diccionarios, estructuras,
+// variantes, ambos órdenes de bytes), mensajes con sus campos de cabecera,
+// autenticación EXTERNAL, conexión al bus de sesión o del sistema (socket
+// unix, también abstracto), llamadas a métodos, señales con reglas de
+// coincidencia, pedir nombres, y exportar objetos propios con
+// Introspectable, Properties (Get, GetAll, Set y PropertiesChanged) y Peer.
+// Probado contra dbus-daemon y dbus-python. Idea de zbus (MIT). En
+// inglés: importar "dbus".
+//
+//   importar "bus"
+//   sea c = bus_conectar("sesion", nulo)
+//   mostrar(bus_llamar(c, "org.freedesktop.DBus", "/org/freedesktop/DBus",
+//       "org.freedesktop.DBus", "ListNames", "", []))
+
+funcion __bus_declaraciones() {
+    extern "libc" funcion socket(dominio: entero, tipo_s: entero, proto: entero): entero
+    extern "libc" funcion connect(fd: entero, dir: puntero, largo: entero): entero
+    extern "libc" funcion read(fd: entero, buf: puntero, n: entero): largo
+    extern "libc" funcion write(fd: entero, datos: texto, n: entero): largo
+    extern "libc" funcion close(fd: entero): entero
+    extern "libc" funcion getuid(): entero
+}
+
+// ---------- firmas ----------
+
+sea _BU_LL = caracter(123)
+sea _BU_RR = caracter(125)
+sea _BU_ALIN = {"y": 1, "b": 4, "n": 2, "q": 2, "i": 4, "u": 4, "x": 8, "t": 8, "d": 8, "s": 4, "o": 4, "g": 1, "a": 4, "(": 8, "v": 1, "h": 4}
+_BU_ALIN[_BU_LL] = 8
+sea _BU_ASV = "a" + _BU_LL + "sv" + _BU_RR
+
+/// Normaliza una firma: acepta « » en lugar de llaves (que en los textos de
+/// C-Forge interpolan), por ejemplo "a«sv»".
+funcion bus_firma(f) { retornar texto_reemplazar(texto_reemplazar(f ?? "", "«", _BU_LL), "»", _BU_RR) }
+
+// Índice donde termina el tipo completo que empieza en i.
+funcion _bu_fin_tipo(f, i) {
+    sea c = subcadena(f, i, i + 1)
+    si (c == "a") { retornar _bu_fin_tipo(f, i + 1) }
+    si (c == "(" o c == _BU_LL) {
+        sea cierre = ")"
+        si (c == _BU_LL) { cierre = _BU_RR }
+        sea j = i + 1
+        mientras (subcadena(f, j, j + 1) != cierre) {
+            si (j >= longitud(f)) { lanzar "bus: firma sin cerrar '" + f + "'" }
+            j = _bu_fin_tipo(f, j)
+        }
+        retornar j + 1
+    }
+    si (tiene_clave(_BU_ALIN, c) == falso) { lanzar "bus: tipo desconocido '" + c + "' en '" + f + "'" }
+    retornar i + 1
+}
+
+/// Divide una firma en sus tipos completos: "a«sv»is" → ["a{sv}", "i", "s"].
+funcion bus_tipos(firma) {
+    firma = bus_firma(firma)
+    sea r = []
+    sea i = 0
+    mientras (i < longitud(firma)) {
+        sea j = _bu_fin_tipo(firma, i)
+        r.agregar(subcadena(firma, i, j))
+        i = j
+    }
+    retornar r
+}
+
+/// Variante con firma explícita (para "v").
+funcion bus_variante(firma, valor) { retornar {"__firma__": bus_firma(firma), "valor": valor} }
+
+// Firma que se infiere para una variante sin firma explícita.
+funcion bus_inferir(v) {
+    si (tipo(v) == "mapa" y tiene_clave(v, "__firma__")) { retornar v["__firma__"] }
+    si (v == verdadero o v == falso) { retornar "b" }
+    si (tipo(v) == "texto") { retornar "s" }
+    si (tipo(v) == "lista") {
+        si (longitud(v) == 0) { retornar "av" }
+        sea f = bus_inferir(v[0])
+        para x en v { si (bus_inferir(x) != f) { retornar "av" } }
+        retornar "a" + f
+    }
+    si (tipo(v) == "mapa") { retornar _BU_ASV }
+    si (tipo(v) == "numero") {
+        si (v == piso(v) y v >= -2147483648 y v <= 2147483647 y contiene("" + v, ".") == falso) { retornar "i" }
+        si (v == piso(v) y contiene("" + v, ".") == falso y contiene("" + v, "e") == falso) { retornar "x" }
+        retornar "d"
+    }
+    lanzar "bus: no sé la firma de " + v
+}
+
+// ---------- IEEE 754 doble ----------
+
+funcion _bu_ieee(v) {
+    sea s = 0
+    sea m = v
+    si (v < 0) {
+        s = 1
+        m = 0 - v
+    }
+    sea ex = 0
+    sea mant = 0
+    si (("" + m) == "nan") {
+        ex = 2047
+        mant = 1
+    } sino si (m > 1.7976931348623157e308) { ex = 2047 } sino si (m != 0) {
+        sea k = 0
+        mientras (m >= 2) {
+            m = m / 2
+            k = k + 1
+        }
+        mientras (m < 1 y k > -1022) {
+            m = m * 2
+            k = k - 1
+        }
+        si (m < 1) { mant = redondear(m * potencia(2, 52)) } sino {
+            ex = k + 1023
+            mant = redondear((m - 1) * potencia(2, 52))
+            si (mant >= potencia(2, 52)) {
+                mant = 0
+                ex = ex + 1
+            }
+        }
+    }
+    sea lo = mant % 4294967296
+    sea hi = piso(mant / 4294967296) + ex * 1048576 + s * 2147483648
+    retornar [lo, hi]
+}
+
+funcion _bu_de_ieee(lo, hi) {
+    sea s = 1
+    si (hi >= 2147483648) {
+        s = -1
+        hi = hi - 2147483648
+    }
+    sea ex = piso(hi / 1048576)
+    sea mant = (hi % 1048576) * 4294967296 + lo
+    si (ex == 2047) {
+        si (mant == 0) { retornar s * 1e308 * 10 }
+        retornar 1e308 * 10 - 1e308 * 10
+    }
+    si (ex == 0) { retornar s * mant * potencia(2, -1074) }
+    retornar s * (1 + mant / potencia(2, 52)) * potencia(2, ex - 1023)
+}
+
+// ---------- escritura ----------
+
+funcion _bu_escritor() { retornar {"p": [], "n": 0} }
+
+funcion _bu_poner(st, t) {
+    st["p"].agregar(t)
+    st["n"] = st["n"] + longitud(t)
+}
+
+funcion _bu_alinear(st, a) {
+    mientras (st["n"] % a != 0) { _bu_poner(st, caracter(0)) }
+}
+
+funcion _bu_u32(v) { retornar bytes_entero(v, 4, 1) }
+
+funcion _bu_esc(st, f, v) {
+    sea c = subcadena(f, 0, 1)
+    _bu_alinear(st, _BU_ALIN[c])
+    si (c == "y") { _bu_poner(st, bytes_entero(v % 256, 1, 1)) }
+    sino si (c == "b") {
+        sea x = 0
+        si (v == verdadero o v == 1) { x = 1 }
+        _bu_poner(st, _bu_u32(x))
+    }
+    sino si (c == "n" o c == "q") {
+        sea x = v
+        si (x < 0) { x = x + 65536 }
+        _bu_poner(st, bytes_entero(x, 2, 1))
+    }
+    sino si (c == "i" o c == "u" o c == "h") {
+        sea x = v
+        si (x < 0) { x = x + 4294967296 }
+        _bu_poner(st, _bu_u32(x))
+    }
+    sino si (c == "x" o c == "t") {
+        sea lo = v % 4294967296
+        si (lo < 0) { lo = lo + 4294967296 }
+        sea hi = piso(v / 4294967296) % 4294967296
+        si (hi < 0) { hi = hi + 4294967296 }
+        _bu_poner(st, _bu_u32(lo) + _bu_u32(hi))
+    }
+    sino si (c == "d") {
+        sea w = _bu_ieee(v)
+        _bu_poner(st, _bu_u32(w[0]) + _bu_u32(w[1]))
+    }
+    sino si (c == "s" o c == "o") {
+        sea t = "" + v
+        _bu_poner(st, _bu_u32(longitud(t)) + t + caracter(0))
+    }
+    sino si (c == "g") { _bu_poner(st, bytes_entero(longitud(v), 1, 1) + v + caracter(0)) }
+    sino si (c == "v") {
+        sea fv = bus_inferir(v)
+        sea x = v
+        si (tipo(v) == "mapa" y tiene_clave(v, "__firma__")) { x = v["valor"] }
+        _bu_poner(st, bytes_entero(longitud(fv), 1, 1) + fv + caracter(0))
+        _bu_esc(st, fv, x)
+    }
+    sino si (c == "a") {
+        sea idx = longitud(st["p"])
+        _bu_poner(st, _bu_u32(0))
+        sea elem = subcadena(f, 1, longitud(f))
+        _bu_alinear(st, _BU_ALIN[subcadena(elem, 0, 1)])
+        sea inicio = st["n"]
+        si (subcadena(elem, 0, 1) == _BU_LL) {
+            sea tk = bus_tipos(subcadena(elem, 1, longitud(elem) - 1))
+            para k en claves(v ?? {}) {
+                _bu_alinear(st, 8)
+                sea kk = k
+                si (contiene("ynqiuxth", tk[0])) { kk = a_numero(k) }
+                si (tk[0] == "d") { kk = a_numero(k) }
+                si (tk[0] == "b") { kk = (k == "verdadero") }
+                _bu_esc(st, tk[0], kk)
+                _bu_esc(st, tk[1], v[k])
+            }
+        } sino si (elem == "y" y tipo(v) == "texto") {
+            _bu_poner(st, v)
+        } sino {
+            para x en v ?? [] { _bu_esc(st, elem, x) }
+        }
+        st["p"][idx] = _bu_u32(st["n"] - inicio)
+    }
+    sino si (c == "(") {
+        sea tk = bus_tipos(subcadena(f, 1, longitud(f) - 1))
+        sea i = 0
+        mientras (i < longitud(tk)) {
+            _bu_esc(st, tk[i], v[i])
+            i = i + 1
+        }
+    }
+    sino { lanzar "bus: no se puede escribir el tipo '" + f + "'" }
+}
+
+/// Codifica valores según una firma (little endian; desplazamiento inicial
+/// para la alineación, normalmente 0).
+funcion bus_codificar(firma, valores) {
+    firma = bus_firma(firma)
+    sea st = _bu_escritor()
+    sea tk = bus_tipos(firma)
+    si (longitud(tk) != longitud(valores ?? [])) { lanzar "bus: la firma '" + firma + "' pide " + longitud(tk) + " valores y llegaron " + longitud(valores ?? []) }
+    sea i = 0
+    mientras (i < longitud(tk)) {
+        _bu_esc(st, tk[i], valores[i])
+        i = i + 1
+    }
+    retornar unir(st["p"], "")
+}
+
+// ---------- lectura ----------
+
+funcion _bu_lector(datos, pos, le) { retornar {"b": datos, "p": pos, "le": le, "base": 0} }
+
+funcion _bu_lalinear(st, a) {
+    mientras ((st["p"] - st["base"]) % a != 0) { st["p"] = st["p"] + 1 }
+}
+
+funcion _bu_lnum(st, n) {
+    si (st["p"] + n > longitud(st["b"])) { lanzar "bus: mensaje truncado" }
+    sea orden = 0
+    si (st["le"]) { orden = 1 }
+    sea v = bytes_leer_entero(st["b"], st["p"], n, orden)
+    st["p"] = st["p"] + n
+    retornar v
+}
+
+funcion _bu_lee(st, f) {
+    sea c = subcadena(f, 0, 1)
+    _bu_lalinear(st, _BU_ALIN[c])
+    si (c == "y") { retornar _bu_lnum(st, 1) }
+    si (c == "b") { retornar _bu_lnum(st, 4) != 0 }
+    si (c == "q") { retornar _bu_lnum(st, 2) }
+    si (c == "n") {
+        sea v = _bu_lnum(st, 2)
+        si (v >= 32768) { v = v - 65536 }
+        retornar v
+    }
+    si (c == "u" o c == "h") { retornar _bu_lnum(st, 4) }
+    si (c == "i") {
+        sea v = _bu_lnum(st, 4)
+        si (v >= 2147483648) { v = v - 4294967296 }
+        retornar v
+    }
+    si (c == "x" o c == "t" o c == "d") {
+        sea a = _bu_lnum(st, 4)
+        sea b = _bu_lnum(st, 4)
+        sea lo = a
+        sea hi = b
+        si (st["le"] == falso) {
+            lo = b
+            hi = a
+        }
+        si (c == "d") { retornar _bu_de_ieee(lo, hi) }
+        si (c == "x" y hi >= 2147483648) { retornar (hi - 4294967296) * 4294967296 + lo }
+        retornar hi * 4294967296 + lo
+    }
+    si (c == "s" o c == "o") {
+        sea n = _bu_lnum(st, 4)
+        sea t = subcadena(st["b"], st["p"], st["p"] + n)
+        st["p"] = st["p"] + n + 1
+        retornar t
+    }
+    si (c == "g") {
+        sea n = _bu_lnum(st, 1)
+        sea t = subcadena(st["b"], st["p"], st["p"] + n)
+        st["p"] = st["p"] + n + 1
+        retornar t
+    }
+    si (c == "v") {
+        sea fv = _bu_lee(st, "g")
+        retornar bus_variante(fv, _bu_lee(st, fv))
+    }
+    si (c == "a") {
+        sea n = _bu_lnum(st, 4)
+        sea elem = subcadena(f, 1, longitud(f))
+        _bu_lalinear(st, _BU_ALIN[subcadena(elem, 0, 1)])
+        sea fin = st["p"] + n
+        si (subcadena(elem, 0, 1) == _BU_LL) {
+            sea tk = bus_tipos(subcadena(elem, 1, longitud(elem) - 1))
+            sea m = {}
+            mientras (st["p"] < fin) {
+                _bu_lalinear(st, 8)
+                sea k = _bu_lee(st, tk[0])
+                m["" + k] = _bu_lee(st, tk[1])
+            }
+            retornar m
+        }
+        sea l = []
+        mientras (st["p"] < fin) { l.agregar(_bu_lee(st, elem)) }
+        retornar l
+    }
+    si (c == "(") {
+        sea tk = bus_tipos(subcadena(f, 1, longitud(f) - 1))
+        sea l = []
+        para t en tk { l.agregar(_bu_lee(st, t)) }
+        retornar l
+    }
+    lanzar "bus: no se puede leer el tipo '" + f + "'"
+}
+
+/// Decodifica valores según una firma (le: verdadero = little endian).
+funcion bus_decodificar(firma, datos, le) {
+    firma = bus_firma(firma)
+    sea st = _bu_lector(datos, 0, le ?? verdadero)
+    sea r = []
+    para t en bus_tipos(firma) { r.agregar(_bu_lee(st, t)) }
+    retornar r
+}
+
+/// Quita las variantes ({"__firma__", "valor"}) de forma recursiva.
+funcion bus_simple(v) {
+    si (tipo(v) == "mapa") {
+        si (tiene_clave(v, "__firma__")) { retornar bus_simple(v["valor"]) }
+        sea r = {}
+        para k en claves(v) { r[k] = bus_simple(v[k]) }
+        retornar r
+    }
+    si (tipo(v) == "lista") {
+        sea r = []
+        para x en v { r.agregar(bus_simple(x)) }
+        retornar r
+    }
+    retornar v
+}
+
+// ---------- mensajes ----------
+
+sea _BU_TIPOS_MSG = {"llamada": 1, "retorno": 2, "error": 3, "senal": 4}
+sea _BU_CAMPOS = [["ruta", 1, "o"], ["interfaz", 2, "s"], ["miembro", 3, "s"], ["error", 4, "s"], ["responde_a", 5, "u"], ["destino", 6, "s"], ["remitente", 7, "s"], ["firma", 8, "g"], ["fds", 9, "u"]]
+
+/// Arma un mensaje. m: {"tipo": "llamada"|"retorno"|"error"|"senal",
+/// "serial", "ruta", "interfaz", "miembro", "error", "responde_a",
+/// "destino", "firma", "cuerpo": [valores], "sin_respuesta"}.
+funcion bus_mensaje(m) {
+    sea firma = bus_firma(m["firma"] ?? "")
+    m["firma"] = firma
+    sea cuerpo = bus_codificar(firma, m["cuerpo"] ?? [])
+    sea campos = []
+    para c en _BU_CAMPOS {
+        sea v = m[c[0]] ?? nulo
+        si (c[0] == "firma" y firma == "") { v = nulo }
+        si (v != nulo) { campos.agregar([c[1], bus_variante(c[2], v)]) }
+    }
+    sea banderas = 0
+    si ((m["sin_respuesta"] ?? falso) == verdadero) { banderas = banderas + 1 }
+    si ((m["sin_autoarranque"] ?? falso) == verdadero) { banderas = banderas + 2 }
+    sea st = _bu_escritor()
+    _bu_poner(st, "l")
+    _bu_esc(st, "y", _BU_TIPOS_MSG[m["tipo"]])
+    _bu_esc(st, "y", banderas)
+    _bu_esc(st, "y", 1)
+    _bu_esc(st, "u", longitud(cuerpo))
+    _bu_esc(st, "u", m["serial"])
+    _bu_esc(st, "a(yv)", campos)
+    _bu_alinear(st, 8)
+    retornar unir(st["p"], "") + cuerpo
+}
+
+/// Largo total del mensaje a partir de sus primeros 16 bytes.
+funcion bus_largo_mensaje(cabeza) {
+    sea le = subcadena(cabeza, 0, 1) == "l"
+    sea st = _bu_lector(cabeza, 4, le)
+    sea cuerpo = _bu_lnum(st, 4)
+    st["p"] = 12
+    sea campos = _bu_lnum(st, 4)
+    sea h = 16 + campos
+    mientras (h % 8 != 0) { h = h + 1 }
+    retornar h + cuerpo
+}
+
+/// Decodifica un mensaje completo.
+funcion bus_leer_mensaje(datos) {
+    sea e = subcadena(datos, 0, 1)
+    si (e != "l" y e != "B") { lanzar "bus: orden de bytes desconocido" }
+    sea le = e == "l"
+    sea st = _bu_lector(datos, 1, le)
+    sea t = _bu_lnum(st, 1)
+    sea banderas = _bu_lnum(st, 1)
+    sea version = _bu_lnum(st, 1)
+    si (version != 1) { lanzar "bus: versión de protocolo " + version }
+    sea largo = _bu_lnum(st, 4)
+    sea serial = _bu_lnum(st, 4)
+    sea campos = _bu_lee(st, "a(yv)")
+    sea nombres = ["", "llamada", "retorno", "error", "senal"]
+    sea m = {"tipo": nombres[t] ?? "otro", "serial": serial, "sin_respuesta": (banderas % 2) == 1, "ruta": nulo, "interfaz": nulo, "miembro": nulo, "error": nulo, "responde_a": nulo, "destino": nulo, "remitente": nulo, "firma": "", "fds": nulo}
+    para c en campos {
+        para d en _BU_CAMPOS { si (d[1] == c[0]) { m[d[0]] = c[1]["valor"] } }
+    }
+    _bu_lalinear(st, 8)
+    sea cuerpo = subcadena(datos, st["p"], st["p"] + largo)
+    m["cuerpo"] = bus_decodificar(m["firma"], cuerpo, le)
+    retornar m
+}
+
+// ---------- transporte ----------
+
+funcion _bu_unix(ruta, abstracto) {
+    __bus_declaraciones()
+    sea fd = socket(1, 1, 0)
+    si (fd < 0) { lanzar "bus: no se pudo crear el socket" }
+    sea dir = bytes_entero(1, 2, 1)
+    si (abstracto) { dir = dir + caracter(0) }
+    dir = dir + ruta
+    sea largo = longitud(dir)
+    si (abstracto == falso) {
+        dir = dir + caracter(0)
+        largo = largo + 1
+    }
+    mientras (longitud(dir) % 4 != 0) { dir = dir + caracter(0) }
+    sea a = c_reservar(112)
+    sea i = 0
+    mientras (i < 112) {
+        sea w = 0
+        si (i < longitud(dir)) { w = bytes_leer_entero(dir, i, 4, 1) }
+        c_escribir32(a, i, w)
+        i = i + 4
+    }
+    si (connect(fd, a, largo) != 0) {
+        close(fd)
+        lanzar "bus: no se pudo conectar a " + ruta
+    }
+    sea buf = c_reservar(65536)
+    sea pend = [""]
+    retornar {
+        "enviar": funcion(d) {
+            sea total = 0
+            mientras (total < longitud(d)) {
+                sea n = write(fd, subcadena(d, total, longitud(d)), longitud(d) - total)
+                si (n <= 0) { lanzar "bus: no se pudo escribir" }
+                total = total + n
+            }
+        },
+        "recibir": funcion(n) {
+            mientras (longitud(pend[0]) < n) {
+                sea k = read(fd, buf, 65536)
+                si (k <= 0) { lanzar "bus: conexión cerrada" }
+                pend[0] = pend[0] + c_bytes(buf, k)
+            }
+            sea r = subcadena(pend[0], 0, n)
+            pend[0] = subcadena(pend[0], n, longitud(pend[0]))
+            retornar r
+        },
+        "cerrar": funcion() { close(fd) }
+    }
+}
+
+/// Par de transportes en memoria conectados entre sí (para pruebas
+/// punto a punto). Si un lado espera datos y no hay, llama a su
+/// "al_vaciar" (por ejemplo para que el otro lado atienda).
+funcion bus_tubo() {
+    sea a = {"buf": ""}
+    sea b = {"buf": ""}
+    sea fab = funcion(yo, otro) {
+        sea t = {"al_vaciar": nulo}
+        t["enviar"] = funcion(d) { otro["buf"] = otro["buf"] + d }
+        t["recibir"] = funcion(n) {
+            sea vueltas = 0
+            mientras (longitud(yo["buf"]) < n) {
+                si (t["al_vaciar"] == nulo o vueltas > 100) { lanzar "bus: el tubo está vacío" }
+                t["al_vaciar"]()
+                vueltas = vueltas + 1
+            }
+            sea r = subcadena(yo["buf"], 0, n)
+            yo["buf"] = subcadena(yo["buf"], n, longitud(yo["buf"]))
+            retornar r
+        }
+        t["hay"] = funcion() { retornar longitud(yo["buf"]) > 0 }
+        t["cerrar"] = funcion() { nulo }
+        retornar t
+    }
+    retornar [fab(a, b), fab(b, a)]
+}
+
+funcion _bu_direccion(d) {
+    sea r = d ?? "sesion"
+    si (r == "sesion") {
+        r = variable_entorno("DBUS_SESSION_BUS_ADDRESS")
+        si (r == nulo o r == "") { lanzar "bus: no hay DBUS_SESSION_BUS_ADDRESS" }
+    }
+    si (r == "sistema") {
+        r = variable_entorno("DBUS_SYSTEM_BUS_ADDRESS")
+        si (r == nulo o r == "") { r = "unix:path=/run/dbus/system_bus_socket" }
+    }
+    // Varias direcciones separadas por ';': se usa la primera unix.
+    para parte en texto_dividir(r, ";") {
+        si (texto_empieza_con(parte, "unix:")) {
+            sea m = {}
+            para kv en texto_dividir(subcadena(parte, 5, longitud(parte)), ",") {
+                sea i = texto_indice(kv, "=")
+                si (i > 0) { m[subcadena(kv, 0, i)] = _bu_desescapar(subcadena(kv, i + 1, longitud(kv))) }
+            }
+            si (tiene_clave(m, "path")) { retornar {"ruta": m["path"], "abstracto": falso} }
+            si (tiene_clave(m, "abstract")) { retornar {"ruta": m["abstract"], "abstracto": verdadero} }
+        }
+    }
+    lanzar "bus: dirección no soportada '" + r + "'"
+}
+
+funcion _bu_desescapar(t) {
+    si (contiene(t, "%") == falso) { retornar t }
+    sea r = []
+    sea i = 0
+    mientras (i < longitud(t)) {
+        si (subcadena(t, i, i + 1) == "%") {
+            r.agregar(bytes_de_hex(subcadena(t, i + 1, i + 3)))
+            i = i + 3
+        } sino {
+            r.agregar(subcadena(t, i, i + 1))
+            i = i + 1
+        }
+    }
+    retornar unir(r, "")
+}
+
+// ---------- conexión ----------
+
+/// Conecta al bus. direccion: "sesion" (por defecto), "sistema" o una
+/// dirección D-Bus ("unix:path=…", "unix:abstract=…"). opciones:
+/// "transporte" (ya abierto), "uid", "p2p" (sin autenticación ni Hello,
+/// para tubos en memoria).
+funcion bus_conectar(direccion, opciones) {
+    sea op = opciones ?? {}
+    sea t = op["transporte"] ?? nulo
+    si (t == nulo) {
+        sea d = _bu_direccion(direccion)
+        t = _bu_unix(d["ruta"], d["abstracto"])
+    }
+    sea c = {"t": t, "serial": 0, "nombre": nulo, "guid": nulo, "objetos": {}, "senales": [], "esperando": {}, "abierta": verdadero}
+    si (op["p2p"] ?? falso) { retornar c }
+    // SASL EXTERNAL con el uid en hexadecimal ASCII.
+    sea uid = op["uid"] ?? nulo
+    si (uid == nulo) {
+        __bus_declaraciones()
+        uid = getuid()
+    }
+    t["enviar"](caracter(0) + "AUTH EXTERNAL " + hex_de_bytes("" + uid) + "\r\n")
+    sea l = _bu_linea(t)
+    si (texto_empieza_con(l, "OK ") == falso) { lanzar "bus: autenticación rechazada (" + l + ")" }
+    c["guid"] = subcadena(l, 3, longitud(l))
+    t["enviar"]("BEGIN\r\n")
+    c["nombre"] = bus_llamar(c, "org.freedesktop.DBus", "/org/freedesktop/DBus", "org.freedesktop.DBus", "Hello", "", [])[0]
+    retornar c
+}
+
+funcion _bu_linea(t) {
+    sea p = []
+    mientras (verdadero) {
+        sea ch = t["recibir"](1)
+        si (ch == "\n") {
+            sea l = unir(p, "")
+            si (texto_termina_con(l, "\r")) { l = subcadena(l, 0, longitud(l) - 1) }
+            retornar l
+        }
+        p.agregar(ch)
+    }
+}
+
+funcion _bu_enviar(c, m) {
+    c["serial"] = c["serial"] + 1
+    m["serial"] = c["serial"]
+    c["t"]["enviar"](bus_mensaje(m))
+    retornar c["serial"]
+}
+
+funcion _bu_recibir(c) {
+    sea cabeza = c["t"]["recibir"](16)
+    sea total = bus_largo_mensaje(cabeza)
+    retornar bus_leer_mensaje(cabeza + c["t"]["recibir"](total - 16))
+}
+
+// Procesa un mensaje entrante: responde llamadas, guarda señales y
+// respuestas. Devuelve el mensaje.
+funcion _bu_despachar(c, m) {
+    si (m["tipo"] == "llamada") { _bu_atender_llamada(c, m) }
+    sino si (m["tipo"] == "senal") { c["senales"].agregar(m) }
+    sino si (m["responde_a"] != nulo) { c["esperando"]["" + m["responde_a"]] = m }
+    retornar m
+}
+
+/// Llama a un método y devuelve la lista de valores de respuesta. Lanza
+/// {"nombre", "mensaje"} si el otro lado responde con error.
+funcion bus_llamar(c, destino, ruta, interfaz, metodo, firma, args) {
+    sea s = _bu_enviar(c, {"tipo": "llamada", "destino": destino, "ruta": ruta, "interfaz": interfaz, "miembro": metodo, "firma": firma ?? "", "cuerpo": args ?? []})
+    mientras (tiene_clave(c["esperando"], "" + s) == falso) { _bu_despachar(c, _bu_recibir(c)) }
+    sea r = c["esperando"]["" + s]
+    quitar_clave(c["esperando"], "" + s)
+    si (r["tipo"] == "error") {
+        sea texto = ""
+        si (longitud(r["cuerpo"]) > 0 y tipo(r["cuerpo"][0]) == "texto") { texto = r["cuerpo"][0] }
+        lanzar {"nombre": r["error"], "mensaje": texto}
+    }
+    retornar r["cuerpo"]
+}
+
+/// Llama sin esperar respuesta.
+funcion bus_llamar_sin_respuesta(c, destino, ruta, interfaz, metodo, firma, args) {
+    _bu_enviar(c, {"tipo": "llamada", "destino": destino, "ruta": ruta, "interfaz": interfaz, "miembro": metodo, "firma": firma ?? "", "cuerpo": args ?? [], "sin_respuesta": verdadero})
+}
+
+/// Texto de un error de bus_llamar.
+funcion bus_error_texto(e) {
+    si (tipo(e) == "mapa" y tiene_clave(e, "nombre")) { retornar e["nombre"] + ": " + e["mensaje"] }
+    retornar "" + e
+}
+
+/// Lee una propiedad de otro objeto.
+funcion bus_propiedad(c, destino, ruta, interfaz, nombre) {
+    retornar bus_simple(bus_llamar(c, destino, ruta, "org.freedesktop.DBus.Properties", "Get", "ss", [interfaz, nombre])[0])
+}
+
+/// Todas las propiedades de una interfaz de otro objeto.
+funcion bus_propiedades(c, destino, ruta, interfaz) {
+    retornar bus_simple(bus_llamar(c, destino, ruta, "org.freedesktop.DBus.Properties", "GetAll", "s", [interfaz])[0])
+}
+
+/// Pide un nombre en el bus. banderas: 1 permitir reemplazo, 2 reemplazar,
+/// 4 no encolar. Devuelve 1 (dueño), 2 (en cola), 3 (existe) o 4 (ya era dueño).
+funcion bus_pedir_nombre(c, nombre, banderas) {
+    retornar bus_llamar(c, "org.freedesktop.DBus", "/org/freedesktop/DBus", "org.freedesktop.DBus", "RequestName", "su", [nombre, banderas ?? 4])[0]
+}
+
+funcion bus_soltar_nombre(c, nombre) {
+    retornar bus_llamar(c, "org.freedesktop.DBus", "/org/freedesktop/DBus", "org.freedesktop.DBus", "ReleaseName", "s", [nombre])[0]
+}
+
+/// Regla de coincidencia a partir de un mapa: {"tipo", "remitente",
+/// "interfaz", "miembro", "ruta", "ruta_espacio", "destino", "arg0"…}.
+funcion bus_regla(m) {
+    sea nombres = {"tipo": "type", "remitente": "sender", "interfaz": "interface", "miembro": "member", "ruta": "path", "ruta_espacio": "path_namespace", "destino": "destination"}
+    sea tipos = {"senal": "signal", "llamada": "method_call", "retorno": "method_return", "error": "error"}
+    sea p = []
+    para k en claves(m) {
+        sea v = "" + m[k]
+        si (k == "tipo") { v = tipos[v] ?? v }
+        sea nk = nombres[k] ?? k
+        p.agregar(nk + "='" + texto_reemplazar(v, "'", "'\\''") + "'")
+    }
+    retornar unir(p, ",")
+}
+
+/// Suscribe a señales (AddMatch). regla: texto o mapa para bus_regla.
+funcion bus_escuchar(c, regla) {
+    sea r = regla
+    si (tipo(regla) == "mapa") { r = bus_regla(regla) }
+    bus_llamar(c, "org.freedesktop.DBus", "/org/freedesktop/DBus", "org.freedesktop.DBus", "AddMatch", "s", [r])
+    retornar r
+}
+
+/// Emite una señal.
+funcion bus_emitir(c, ruta, interfaz, nombre, firma, args) {
+    _bu_enviar(c, {"tipo": "senal", "ruta": ruta, "interfaz": interfaz, "miembro": nombre, "firma": firma ?? "", "cuerpo": args ?? []})
+}
+
+/// Siguiente señal recibida (bloquea; atiende llamadas entrantes mientras).
+funcion bus_siguiente(c) {
+    mientras (longitud(c["senales"]) == 0) { _bu_despachar(c, _bu_recibir(c)) }
+    sea s = c["senales"][0]
+    sea r = []
+    sea i = 1
+    mientras (i < longitud(c["senales"])) {
+        r.agregar(c["senales"][i])
+        i = i + 1
+    }
+    c["senales"] = r
+    retornar s
+}
+
+/// Espera una señal concreta (descarta las demás). interfaz o miembro
+/// pueden ser nulo.
+funcion bus_esperar_senal(c, interfaz, miembro) {
+    mientras (verdadero) {
+        sea s = bus_siguiente(c)
+        si ((interfaz == nulo o s["interfaz"] == interfaz) y (miembro == nulo o s["miembro"] == miembro)) { retornar s }
+    }
+}
+
+/// Lee y procesa un mensaje entrante (para servidores); lo devuelve.
+funcion bus_atender(c) { retornar _bu_despachar(c, _bu_recibir(c)) }
+
+/// Procesa mensajes hasta que no quede nada en el transporte (si el
+/// transporte sabe decirlo con "hay").
+funcion bus_atender_pendientes(c) {
+    sea hay = c["t"]["hay"] ?? nulo
+    si (hay == nulo) { retornar 0 }
+    sea n = 0
+    mientras (hay()) {
+        bus_atender(c)
+        n = n + 1
+    }
+    retornar n
+}
+
+funcion bus_cerrar(c) {
+    si (c["abierta"]) {
+        c["abierta"] = falso
+        sea f = c["t"]["cerrar"] ?? nulo
+        si (f != nulo) { f() }
+    }
+}
+
+// ---------- objetos exportados ----------
+
+/// Exporta una interfaz en una ruta. metodos: {nombre: {"entrada": firma,
+/// "salida": firma, "fn": función(args, mensaje) → lista de valores}}.
+/// propiedades: {nombre: {"firma", "valor", "escribible", "al_cambiar"}}.
+/// senales: {nombre: firma} (solo para la introspección).
+/// Una función puede lanzar {"nombre": "x.y.Error", "mensaje": "…"}.
+funcion bus_exportar(c, ruta, interfaz, metodos, propiedades, senales) {
+    si (tiene_clave(c["objetos"], ruta) == falso) { c["objetos"][ruta] = {} }
+    para k en claves(metodos ?? {}) {
+        metodos[k]["entrada"] = bus_firma(metodos[k]["entrada"] ?? "")
+        metodos[k]["salida"] = bus_firma(metodos[k]["salida"] ?? "")
+    }
+    para k en claves(propiedades ?? {}) { propiedades[k]["firma"] = bus_firma(propiedades[k]["firma"]) }
+    sea sn = {}
+    para k en claves(senales ?? {}) { sn[k] = bus_firma(senales[k]) }
+    c["objetos"][ruta][interfaz] = {"metodos": metodos ?? {}, "propiedades": propiedades ?? {}, "senales": sn}
+}
+
+funcion bus_retirar(c, ruta) { quitar_clave(c["objetos"], ruta) }
+
+/// Cambia una propiedad propia y emite PropertiesChanged.
+funcion bus_cambiar_propiedad(c, ruta, interfaz, nombre, valor) {
+    sea p = c["objetos"][ruta][interfaz]["propiedades"][nombre]
+    p["valor"] = valor
+    sea cambios = {}
+    cambios[nombre] = bus_variante(p["firma"], valor)
+    bus_emitir(c, ruta, "org.freedesktop.DBus.Properties", "PropertiesChanged", "s" + _BU_ASV + "as", [interfaz, cambios, []])
+}
+
+funcion _bu_responder(c, m, firma, valores) {
+    si (m["sin_respuesta"]) { retornar nulo }
+    _bu_enviar(c, {"tipo": "retorno", "responde_a": m["serial"], "destino": m["remitente"], "firma": firma ?? "", "cuerpo": valores ?? []})
+}
+
+funcion _bu_responder_error(c, m, nombre, texto) {
+    si (m["sin_respuesta"]) { retornar nulo }
+    _bu_enviar(c, {"tipo": "error", "responde_a": m["serial"], "destino": m["remitente"], "error": nombre, "firma": "s", "cuerpo": [texto]})
+}
+
+funcion _bu_xml(t) { retornar texto_reemplazar(texto_reemplazar(texto_reemplazar(texto_reemplazar(t, "&", "&amp;"), "<", "&lt;"), ">", "&gt;"), caracter(34), "&quot;") }
+
+/// XML de introspección de una ruta propia.
+funcion bus_introspeccion(c, ruta) {
+    sea Q = caracter(34)
+    sea l = ["<!DOCTYPE node PUBLIC " + Q + "-//freedesktop//DTD D-BUS Object Introspection 1.0//EN" + Q + " " + Q + "http://www.freedesktop.org/standards/dbus/1.0/introspect.dtd" + Q + ">", "<node>"]
+    sea obj = c["objetos"][ruta] ?? nulo
+    si (obj != nulo) {
+        sea todas = ["org.freedesktop.DBus.Introspectable", "org.freedesktop.DBus.Peer", "org.freedesktop.DBus.Properties"]
+        para i en todas { l.agregar("  <interface name=" + Q + i + Q + "/>") }
+        para nom en ordenar(claves(obj)) {
+            sea it = obj[nom]
+            l.agregar("  <interface name=" + Q + _bu_xml(nom) + Q + ">")
+            para mn en ordenar(claves(it["metodos"])) {
+                sea md = it["metodos"][mn]
+                l.agregar("    <method name=" + Q + _bu_xml(mn) + Q + ">")
+                para t en bus_tipos(md["entrada"] ?? "") { l.agregar("      <arg type=" + Q + _bu_xml(t) + Q + " direction=" + Q + "in" + Q + "/>") }
+                para t en bus_tipos(md["salida"] ?? "") { l.agregar("      <arg type=" + Q + _bu_xml(t) + Q + " direction=" + Q + "out" + Q + "/>") }
+                l.agregar("    </method>")
+            }
+            para sn en ordenar(claves(it["senales"])) {
+                l.agregar("    <signal name=" + Q + _bu_xml(sn) + Q + ">")
+                para t en bus_tipos(it["senales"][sn]) { l.agregar("      <arg type=" + Q + _bu_xml(t) + Q + "/>") }
+                l.agregar("    </signal>")
+            }
+            para pn en ordenar(claves(it["propiedades"])) {
+                sea pd = it["propiedades"][pn]
+                sea acceso = "read"
+                si ((pd["escribible"] ?? falso) == verdadero) { acceso = "readwrite" }
+                l.agregar("    <property name=" + Q + _bu_xml(pn) + Q + " type=" + Q + _bu_xml(pd["firma"]) + Q + " access=" + Q + acceso + Q + "/>")
+            }
+            l.agregar("  </interface>")
+        }
+    }
+    // Hijos directos.
+    sea pref = ruta
+    si (texto_termina_con(pref, "/") == falso) { pref = pref + "/" }
+    sea hijos = {}
+    para r en claves(c["objetos"]) {
+        si (texto_empieza_con(r, pref) y r != ruta) {
+            sea resto = subcadena(r, longitud(pref), longitud(r))
+            hijos[texto_dividir(resto, "/")[0]] = verdadero
+        }
+    }
+    para h en ordenar(claves(hijos)) { l.agregar("  <node name=" + Q + _bu_xml(h) + Q + "/>") }
+    l.agregar("</node>")
+    retornar unir(l, "\n")
+}
+
+funcion _bu_atender_llamada(c, m) {
+    sea i = m["interfaz"]
+    sea mb = m["miembro"]
+    si (i == "org.freedesktop.DBus.Peer") {
+        si (mb == "Ping") { retornar _bu_responder(c, m, "", []) }
+        si (mb == "GetMachineId") {
+            sea id = "00000000000000000000000000000000"
+            intentar { id = texto_recortar(leer_archivo("/etc/machine-id")) } capturar (e) { nulo }
+            retornar _bu_responder(c, m, "s", [id])
+        }
+    }
+    si (i == "org.freedesktop.DBus.Introspectable" y mb == "Introspect") { retornar _bu_responder(c, m, "s", [bus_introspeccion(c, m["ruta"])]) }
+    sea obj = c["objetos"][m["ruta"]] ?? nulo
+    si (obj == nulo) { retornar _bu_responder_error(c, m, "org.freedesktop.DBus.Error.UnknownObject", "No existe el objeto " + m["ruta"]) }
+    si (i == "org.freedesktop.DBus.Properties") {
+        sea it = obj[m["cuerpo"][0]] ?? nulo
+        si (it == nulo) { retornar _bu_responder_error(c, m, "org.freedesktop.DBus.Error.UnknownInterface", "No existe la interfaz " + m["cuerpo"][0]) }
+        si (mb == "GetAll") {
+            sea r = {}
+            para k en claves(it["propiedades"]) { r[k] = bus_variante(it["propiedades"][k]["firma"], it["propiedades"][k]["valor"]) }
+            retornar _bu_responder(c, m, _BU_ASV, [r])
+        }
+        sea pd = it["propiedades"][m["cuerpo"][1]] ?? nulo
+        si (pd == nulo) { retornar _bu_responder_error(c, m, "org.freedesktop.DBus.Error.UnknownProperty", "No existe la propiedad " + m["cuerpo"][1]) }
+        si (mb == "Get") { retornar _bu_responder(c, m, "v", [bus_variante(pd["firma"], pd["valor"])]) }
+        si (mb == "Set") {
+            si ((pd["escribible"] ?? falso) == falso) { retornar _bu_responder_error(c, m, "org.freedesktop.DBus.Error.PropertyReadOnly", "La propiedad " + m["cuerpo"][1] + " es de solo lectura") }
+            sea v = bus_simple(m["cuerpo"][2])
+            sea cb = pd["al_cambiar"] ?? nulo
+            si (cb != nulo) { cb(v) }
+            _bu_responder(c, m, "", [])
+            retornar bus_cambiar_propiedad(c, m["ruta"], m["cuerpo"][0], m["cuerpo"][1], v)
+        }
+    }
+    // Sin interfaz: se busca el método en todas.
+    sea it = nulo
+    si (i != nulo) { it = obj[i] ?? nulo } sino {
+        para k en claves(obj) { si (tiene_clave(obj[k]["metodos"], mb)) { it = obj[k] } }
+    }
+    si (it == nulo) { retornar _bu_responder_error(c, m, "org.freedesktop.DBus.Error.UnknownInterface", "No existe la interfaz " + i) }
+    sea md = it["metodos"][mb] ?? nulo
+    si (md == nulo) { retornar _bu_responder_error(c, m, "org.freedesktop.DBus.Error.UnknownMethod", "No existe el método " + mb) }
+    si ((md["entrada"] ?? "") != m["firma"]) { retornar _bu_responder_error(c, m, "org.freedesktop.DBus.Error.InvalidArgs", "Se esperaba la firma '" + (md["entrada"] ?? "") + "' y llegó '" + m["firma"] + "'") }
+    sea r = nulo
+    sea err = nulo
+    intentar { r = md["fn"](m["cuerpo"], m) } capturar (e) { err = e }
+    si (err != nulo) {
+        si (tipo(err) == "mapa" y tiene_clave(err, "nombre")) { retornar _bu_responder_error(c, m, err["nombre"], err["mensaje"] ?? "") }
+        retornar _bu_responder_error(c, m, "org.freedesktop.DBus.Error.Failed", "" + err)
+    }
+    sea salida = md["salida"] ?? ""
+    si (salida == "") { r = [] } sino si (longitud(bus_tipos(salida)) == 1 y (tipo(r) != "lista" o subcadena(salida, 0, 1) == "a" o subcadena(salida, 0, 1) == "(")) {
+        // Un solo valor de salida se puede devolver sin envolver; las listas
+        // se envuelven si la firma es de arreglo o estructura y no vienen ya
+        // envueltas (una lista con un único elemento-lista).
+        si (tipo(r) != "lista" o longitud(r) != 1 o tipo(r[0]) != "lista") { r = [r] }
+    }
+    _bu_responder(c, m, salida, r)
+}

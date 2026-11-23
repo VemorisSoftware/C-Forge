@@ -65,6 +65,14 @@ Sitio oficial: [c-forge.org](https://c-forge.org)
   `llamada`/`protobuf` (.proto, binario como protoc, marcos gRPC),
   `recolecta`/`crawler` (cookies RFC 6265, formularios, robots.txt,
   rastreo) y `sensor`/`mqtt` (paquetes MQTT, QoS 2, mini broker).
+- Lote 20 de bibliotecas (con alias en inglés y pruebas en ambos idiomas):
+  `memoria_rapida`/`redisx` (Redis con RESP3 y clústeres: ranuras, MOVED y
+  ASK, tuberías por nodo; probado contra un clúster real), `cartero`/
+  `httpclient` (cliente HTTP con interceptores, reintentos y cancelación),
+  `bus`/`dbus` (D-Bus completo, interopera con dbus-daemon y dbus-python),
+  `contenedor`/`docker` (API del motor de Docker, probada contra dockerd),
+  `entorno`/`testcontainers` (contenedores desechables para pruebas) y
+  `senal`/`signalr` (cliente de SignalR probado contra ASP.NET Core 8).
 - Lote 19 de bibliotecas (con alias en inglés y pruebas en ambos idiomas):
   `cofre`/`embeddb` (base B+tree ACID con copia en escritura y recuperación
   ante caídas), `huesped`/`wasm` (intérprete de WebAssembly, igual que

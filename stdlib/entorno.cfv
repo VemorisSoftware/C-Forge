@@ -1,0 +1,285 @@
+// stdlib/entorno.cfv — servicios reales en pruebas, al estilo
+// Testcontainers: levanta contenedores desechables, espera a que estén
+// listos (una línea en los logs, un puerto que acepta conexiones, una URL
+// HTTP que responde, un comando que sale bien o el healthcheck), da el
+// host y los puertos publicados, y los limpia siempre (también los que
+// quedaron de corridas anteriores, por su etiqueta de sesión). Trae
+// recetas para Redis, PostgreSQL, MySQL, NATS, RabbitMQ y genéricos.
+// Sobre "contenedor". Idea de Testcontainers (MIT). En inglés:
+// importar "testcontainers".
+//
+//   importar "entorno"
+//   entorno_con(entorno_redis(nulo), funcion(e) {
+//       sea r = redis_conectar(entorno_host(e), entorno_puerto(e, 6379), nulo)
+//   })
+
+importar "contenedor"
+
+sea _EN_SESION = nulo
+
+/// Id de la sesión actual (etiqueta "cforge.entorno.sesion").
+funcion entorno_sesion() {
+    si (_EN_SESION == nulo) { _EN_SESION = hex_de_bytes(bytes_aleatorios(6)) }
+    retornar _EN_SESION
+}
+
+sea _EN_CLIENTE = nulo
+
+/// Cliente de Docker que usa entorno (se puede cambiar para pruebas).
+funcion entorno_cliente(c) {
+    si (c != nulo) { _EN_CLIENTE = c }
+    si (_EN_CLIENTE == nulo) { _EN_CLIENTE = contenedor_cliente(nulo, nulo) }
+    retornar _EN_CLIENTE
+}
+
+funcion _en_ahora() { retornar tiempo_ms() }
+
+// ---------- estrategias de espera ----------
+
+/// Espera una línea en los logs (texto contenido; veces: cuántas).
+funcion entorno_esperar_log(texto, veces) { retornar {"tipo": "log", "texto": texto, "veces": veces ?? 1} }
+
+/// Espera a que un puerto del contenedor acepte conexiones TCP desde afuera.
+funcion entorno_esperar_puerto(puerto) { retornar {"tipo": "puerto", "puerto": puerto} }
+
+/// Espera a que GET http://host:puerto/ruta devuelva el estado (200 por defecto).
+funcion entorno_esperar_http(puerto, ruta, estado) { retornar {"tipo": "http", "puerto": puerto, "ruta": ruta ?? "/", "estado": estado ?? 200} }
+
+/// Espera a que un comando dentro del contenedor salga con código 0.
+funcion entorno_esperar_comando(cmd) { retornar {"tipo": "comando", "cmd": cmd} }
+
+/// Espera a que el healthcheck de la imagen diga "healthy".
+funcion entorno_esperar_salud() { retornar {"tipo": "salud"} }
+
+/// Todas las esperas, en orden.
+funcion entorno_esperar_todas(lista) { retornar {"tipo": "todas", "lista": lista} }
+
+funcion _en_cumple(e, w) {
+    sea d = e["cliente"]
+    si (w["tipo"] == "log") {
+        sea l = contenedor_logs(d, e["id"], nulo)
+        sea t = l["stdout"] + l["stderr"]
+        sea n = 0
+        sea i = 0
+        mientras (verdadero) {
+            sea k = texto_indice(subcadena(t, i, longitud(t)), w["texto"])
+            si (k < 0) { retornar n >= w["veces"] }
+            n = n + 1
+            i = i + k + longitud(w["texto"])
+        }
+    }
+    si (w["tipo"] == "puerto") {
+        sea ok = falso
+        intentar {
+            sea s = net_conectar(entorno_host(e), entorno_puerto(e, w["puerto"]))
+            net_cerrar(s)
+            ok = verdadero
+        } capturar (x) { ok = falso }
+        retornar ok
+    }
+    si (w["tipo"] == "http") {
+        sea ok = falso
+        intentar { ok = http_solicitud("GET", "http://" + entorno_host(e) + ":" + entorno_puerto(e, w["puerto"]) + w["ruta"], {})["estado"] == w["estado"] } capturar (x) { ok = falso }
+        retornar ok
+    }
+    si (w["tipo"] == "comando") { retornar contenedor_ejecutar(d, e["id"], w["cmd"], nulo)["codigo"] == 0 }
+    si (w["tipo"] == "salud") { retornar contenedor_estado(d, e["id"])["salud"] == "healthy" }
+    si (w["tipo"] == "todas") {
+        para x en w["lista"] { si (_en_cumple(e, x) == falso) { retornar falso } }
+        retornar verdadero
+    }
+    lanzar "entorno: espera desconocida " + w["tipo"]
+}
+
+// ---------- ciclo de vida ----------
+
+/// Definición de un contenedor: las opciones de contenedor_crear (imagen,
+/// cmd, env, etiquetas, red, alias…) más "puertos" (lista de puertos del
+/// contenedor a publicar en puertos libres), "esperar" (una estrategia),
+/// "tiempo_ms" (límite de espera, 60 s), "archivos" ({ruta absoluta:
+/// contenido} copiados antes de iniciar) y "bajar" (verdadero: bajar la
+/// imagen si falta).
+funcion entorno_contenedor(imagen, opciones) {
+    sea oc = {"imagen": imagen}
+    para k en claves(opciones ?? {}) { oc[k] = opciones[k] }
+    retornar oc
+}
+
+/// Inicia el contenedor y espera a que esté listo. Devuelve el entorno
+/// {"id", "cliente", "dc", "puertos": {}}.
+funcion entorno_iniciar(dc) {
+    sea d = entorno_cliente(nulo)
+    si (contenedor_hay_imagen(d, dc["imagen"]) == falso) {
+        si ((dc["bajar"] ?? verdadero) == verdadero) { contenedor_bajar(d, dc["imagen"]) } sino { lanzar "entorno: falta la imagen " + dc["imagen"] }
+    }
+    sea oc = {}
+    para k en claves(dc) { si (k != "puertos" y k != "esperar" y k != "archivos" y k != "tiempo_ms" y k != "bajar") { oc[k] = dc[k] } }
+    sea et = {}
+    para k en claves(dc["etiquetas"] ?? {}) { et[k] = dc["etiquetas"][k] }
+    et["cforge.entorno"] = "verdadero"
+    et["cforge.entorno.sesion"] = entorno_sesion()
+    oc["etiquetas"] = et
+    sea pm = {}
+    para p en dc["puertos"] ?? [] { pm["" + p] = 0 }
+    si (longitud(claves(pm)) > 0) { oc["puertos"] = pm }
+    sea id = contenedor_crear(d, oc)
+    sea e = {"id": id, "cliente": d, "dc": dc, "puertos": {}, "parado": falso}
+    intentar {
+        si ((dc["archivos"] ?? nulo) != nulo) {
+            para ruta en claves(dc["archivos"]) {
+                sea partes = texto_dividir(ruta, "/")
+                sea nombre = partes[longitud(partes) - 1]
+                sea carpeta = subcadena(ruta, 0, longitud(ruta) - longitud(nombre))
+                si (carpeta == "") { carpeta = "/" }
+                sea m = {}
+                m[nombre] = dc["archivos"][ruta]
+                contenedor_copiar_dentro(d, id, carpeta, m)
+            }
+        }
+        contenedor_iniciar(d, id)
+        sea w = dc["esperar"] ?? nulo
+        si (w == nulo y longitud(dc["puertos"] ?? []) > 0) { w = entorno_esperar_puerto(dc["puertos"][0]) }
+        si (w != nulo) {
+            sea limite = _en_ahora() + (dc["tiempo_ms"] ?? 60000)
+            sea listo = falso
+            mientras (listo == falso) {
+                listo = _en_cumple(e, w)
+                si (listo == falso) {
+                    sea st = contenedor_estado(d, id)
+                    si (st["corriendo"] == falso y st["estado"] == "exited") {
+                        sea l = contenedor_logs(d, id, {"cola": 20})
+                        lanzar "entorno: el contenedor terminó antes de estar listo (código " + st["codigo"] + "):\n" + l["stdout"] + l["stderr"]
+                    }
+                    si (_en_ahora() > limite) { lanzar "entorno: se acabó el tiempo esperando a " + dc["imagen"] }
+                    dormir(dc["intervalo_ms"] ?? 200)
+                }
+            }
+        }
+    } capturar (x) {
+        intentar { contenedor_borrar(d, id, verdadero, verdadero) } capturar (y) { nulo }
+        lanzar x
+    }
+    retornar e
+}
+
+/// Host desde el que se alcanzan los puertos publicados.
+funcion entorno_host(e) {
+    sea h = variable_entorno("TESTCONTAINERS_HOST_OVERRIDE")
+    si (h != nulo y h != "") { retornar h }
+    sea dir = e["cliente"]["direccion"] ?? ""
+    si (texto_empieza_con(dir, "tcp://")) { retornar texto_dividir(texto_dividir(dir, "://")[1], ":")[0] }
+    retornar "127.0.0.1"
+}
+
+/// Puerto del host publicado para un puerto del contenedor.
+funcion entorno_puerto(e, puerto) {
+    sea k = "" + puerto
+    si (tiene_clave(e["puertos"], k) == falso) { e["puertos"][k] = contenedor_puerto(e["cliente"], e["id"], k) }
+    retornar e["puertos"][k]
+}
+
+/// "host:puerto" listo para conectar.
+funcion entorno_direccion(e, puerto) { retornar entorno_host(e) + ":" + entorno_puerto(e, puerto) }
+
+/// Ejecuta un comando dentro: {"codigo", "stdout", "stderr"}.
+funcion entorno_ejecutar(e, cmd) { retornar contenedor_ejecutar(e["cliente"], e["id"], cmd, nulo) }
+
+funcion entorno_logs(e) {
+    sea l = contenedor_logs(e["cliente"], e["id"], nulo)
+    retornar l["stdout"] + l["stderr"]
+}
+
+/// Para y borra el contenedor (con sus volúmenes anónimos).
+funcion entorno_parar(e) {
+    si (e["parado"] == verdadero) { retornar nulo }
+    e["parado"] = verdadero
+    contenedor_borrar(e["cliente"], e["id"], verdadero, verdadero)
+}
+
+/// Inicia, llama a fn(e) y para siempre (aunque fn lance). Devuelve lo que
+/// devuelve fn.
+funcion entorno_con(dc, fn) {
+    sea e = entorno_iniciar(dc)
+    sea r = nulo
+    sea err = nulo
+    intentar { r = fn(e) } capturar (x) { err = x }
+    entorno_parar(e)
+    si (err != nulo) { lanzar err }
+    retornar r
+}
+
+/// Varios contenedores en una red propia (se alcanzan por su alias).
+/// defs: {alias: definición}. Devuelve {"red", "servicios": {alias: e}}.
+funcion entorno_grupo(defs) {
+    sea d = entorno_cliente(nulo)
+    sea nombre = "cforge-" + entorno_sesion() + "-" + hex_de_bytes(bytes_aleatorios(3))
+    sea red = contenedor_crear_red(d, nombre, {"cforge.entorno": "verdadero", "cforge.entorno.sesion": entorno_sesion()})
+    sea g = {"red": red, "nombre_red": nombre, "servicios": {}}
+    intentar {
+        para alias en claves(defs) {
+            sea dc = {}
+            para k en claves(defs[alias]) { dc[k] = defs[alias][k] }
+            dc["red"] = nombre
+            dc["alias"] = [alias]
+            g["servicios"][alias] = entorno_iniciar(dc)
+        }
+    } capturar (x) {
+        entorno_parar_grupo(g)
+        lanzar x
+    }
+    retornar g
+}
+
+funcion entorno_parar_grupo(g) {
+    para k en claves(g["servicios"]) { intentar { entorno_parar(g["servicios"][k]) } capturar (x) { nulo } }
+    intentar { contenedor_borrar_red(entorno_cliente(nulo), g["red"]) } capturar (x) { nulo }
+}
+
+/// Borra todo lo que dejó entorno (contenedores y redes). sesion: nulo =
+/// todas las sesiones. Devuelve cuántos contenedores borró.
+funcion entorno_limpiar(sesion) {
+    sea d = entorno_cliente(nulo)
+    sea filtro = "cforge.entorno=verdadero"
+    si (sesion != nulo) { filtro = "cforge.entorno.sesion=" + sesion }
+    sea n = 0
+    para c en contenedor_listar(d, verdadero, {"label": [filtro]}) {
+        intentar {
+            contenedor_borrar(d, c["Id"], verdadero, verdadero)
+            n = n + 1
+        } capturar (x) { nulo }
+    }
+    intentar {
+        para r en contenedor_redes(d, {"label": [filtro]}) { intentar { contenedor_borrar_red(d, r["Id"]) } capturar (x) { nulo } }
+    } capturar (x) { nulo }
+    retornar n
+}
+
+// ---------- recetas ----------
+
+funcion _en_receta(imagen, base, opciones) {
+    sea oc = {}
+    para k en claves(base) { oc[k] = base[k] }
+    para k en claves(opciones ?? {}) { oc[k] = opciones[k] }
+    retornar entorno_contenedor(oc["imagen"] ?? imagen, oc)
+}
+
+/// Redis listo en el puerto 6379.
+funcion entorno_redis(opciones) { retornar _en_receta("redis:7-alpine", {"puertos": [6379], "esperar": entorno_esperar_log("Ready to accept connections", 1)}, opciones) }
+
+/// PostgreSQL (usuario, clave y base "prueba"); el log de listo sale dos
+/// veces porque la imagen reinicia tras inicializar.
+funcion entorno_postgres(opciones) { retornar _en_receta("postgres:16-alpine", {"puertos": [5432], "env": {"POSTGRES_USER": "prueba", "POSTGRES_PASSWORD": "prueba", "POSTGRES_DB": "prueba"}, "esperar": entorno_esperar_todas([entorno_esperar_log("database system is ready to accept connections", 2), entorno_esperar_puerto(5432)])}, opciones) }
+
+/// MySQL 8 (root/prueba, base "prueba").
+funcion entorno_mysql(opciones) { retornar _en_receta("mysql:8", {"puertos": [3306], "env": {"MYSQL_ROOT_PASSWORD": "prueba", "MYSQL_DATABASE": "prueba"}, "esperar": entorno_esperar_todas([entorno_esperar_log("ready for connections", 2), entorno_esperar_puerto(3306)]), "tiempo_ms": 120000}, opciones) }
+
+/// NATS en 4222 (y monitoreo en 8222).
+funcion entorno_nats(opciones) { retornar _en_receta("nats:2", {"puertos": [4222, 8222], "esperar": entorno_esperar_log("Server is ready", 1)}, opciones) }
+
+/// RabbitMQ (guest/guest) en 5672.
+funcion entorno_rabbitmq(opciones) { retornar _en_receta("rabbitmq:3-alpine", {"puertos": [5672], "esperar": entorno_esperar_log("Server startup complete", 1), "tiempo_ms": 120000}, opciones) }
+
+/// URL de conexión típica para una receta.
+funcion entorno_url(e, esquema, puerto, ruta) {
+    retornar esquema + "://" + entorno_direccion(e, puerto) + (ruta ?? "")
+}
