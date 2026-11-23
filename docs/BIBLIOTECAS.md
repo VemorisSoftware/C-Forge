@@ -39,7 +39,7 @@ Estado: ✅ ya existe en C-Forge · 🔗 se usa hoy vía `cforge bindgen`,
 | 20 | `patron` | Expresiones regulares sin ReDoS | regex (Rust) | ✅ `regex` |
 | 21 | `consulta` | Consultas perezosas sobre colecciones | LINQ | ✅ `colecciones` (parcial) |
 | 22 | `ligero` / `dapper` | Micro-ORM | Dapper | ✅ `ligero` |
-| 23 | `mapeador` | ORM con migraciones | EF Core | ✅ `db` (migraciones) · 🛠 ORM |
+| 23 | `mapeador` / `dbmapper` | ORM con migraciones | EF Core | ✅ `mapeador` |
 | 24 | `senal` / `signalr` | Tiempo real con reconexión | SignalR | ✅ `senal` |
 | 25 | `arbol_json` | JSON tipado y dinámico | System.Text.Json | ✅ `json` |
 | 26 | `regla` / `validator` | Validación encadenada | FluentValidation | ✅ `regla` |
@@ -102,7 +102,7 @@ Estado: ✅ ya existe en C-Forge · 🔗 se usa hoy vía `cforge bindgen`,
 | 71 | `nativa` | GUI reactiva nativa | Iced, egui | 🛠 |
 | 72 | `vector` / `vectorgfx` | Gráficos vectoriales a PDF/SVG/PNG | Cairo | ✅ `vector` |
 | 73 | `grafia` / `shaping` | Moldeado de tipografías | HarfBuzz | ✅ `grafia` |
-| 74 | `importa3d` | Modelos 3D (OBJ, glTF) | Assimp | ✅ `modelo` (OBJ) · 🛠 |
+| 74 | `importa3d` / `meshio` | Modelos 3D (OBJ, glTF) | Assimp | ✅ `importa3d` |
 | 75 | `gpu` | Vulkan, Metal y DirectX | bgfx, wgpu | 🛠 |
 | 76 | `pizarra` | Objetos interactivos en lienzo | Fabric.js | 🛠 |
 | 77 | `animacion` | Animaciones vectoriales | Lottie | 🛠 |
@@ -157,7 +157,7 @@ Estado: ✅ ya existe en C-Forge · 🔗 se usa hoy vía `cforge bindgen`,
 |---|---|---|---|---|
 | 112 | `grafo_api` / `graphql` | Servidor GraphQL | async-graphql | ✅ `grafo_api` |
 | 113 | `plantilla` / `template` | Plantillas HTML | Tera, Handlebars | ✅ `plantilla` |
-| 114 | `piloto` | Navegadores automatizados | Playwright | 🛠 |
+| 114 | `piloto` / `browser` | Navegadores automatizados | Playwright | ✅ `piloto` |
 | 115 | `atributo` | Interactividad por atributos HTML | htmx | 🛠 |
 | 116 | `css` | Parser y minificador CSS | LightningCSS | ✅ `css` |
 | 117 | `empaca` / `bundler` | Empaquetador web | esbuild | ✅ `empaca` |
@@ -252,12 +252,12 @@ Estado: ✅ ya existe en C-Forge · 🔗 se usa hoy vía `cforge bindgen`,
 
 | # | Nombre | Para qué | Inspiración | Estado |
 |---|---|---|---|---|
-| 182 | `nodos` | Árbol de escenas y señales | Godot | 🛠 |
+| 182 | `nodos` / `scenetree` | Árbol de escenas y señales | Godot | ✅ `nodos` |
 | 183 | `manipulador` | Gizmos 3D de editor | ImGuizmo | 🛠 |
 | 184 | `optimalla` / `meshopt` | Optimizar mallas y LOD | meshoptimizer | ✅ `optimalla` |
 | 185 | `textura` / `texcompress` | Compresión de texturas | Basis Universal | ✅ `textura` |
 | 186 | `solido` | Física 3D multinúcleo | Jolt | ✅ `fisica3d` (básica) · 🛠 |
-| 187 | `determinista` | Física reproducible | Rapier | 🛠 |
+| 187 | `determinista` / `fixedphysics` | Física reproducible | Rapier | ✅ `determinista` |
 | 188 | `inmersiva` | Realidad virtual y aumentada | OpenXR | 🔗 |
 | 189 | `sombreador` | Traducir shaders | naga | 🛠 |
 | 190 | `mosaico` / `tilemap` | Mapas de tiles | Tiled, LDtk | ✅ `mosaico` |
