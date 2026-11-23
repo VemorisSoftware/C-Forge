@@ -49,7 +49,7 @@ sh packaging/winget/generar.sh VERSION       # → dist-winget/manifests/v/Vemor
 El script toma el SHA256 del zip de `SHA256SUMS`. Los manifiestos se copian al
 fork `VemorisSoftware/winget-pkgs` y se envían como PR a `microsoft/winget-pkgs`.
 WinGet instala el zip como portable y deja un enlace simbólico en `Links`;
-`cforge.exe` sigue ese enlace para hallar su `stdlib` (desde la versión siguiente a 4.9.0; el CI de
+`cforge.exe` sigue ese enlace para hallar su `stdlib` (desde 5.0.0; el CI de
 Windows lo prueba). El primer envío (3.7.0, PR #414662) se cerró y tenía la
 licencia y las URL equivocadas.
 
