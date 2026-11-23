@@ -19,7 +19,7 @@ Estado: ✅ ya existe en C-Forge · 🔗 se usa hoy vía `cforge bindgen`,
 |---|---|---|---|---|
 | 1 | `compacta` / `compress` | Compresión rápida | zlib, zstd | ✅ zlib nativo · `compacta` (zstd, lz4, snappy, gzip) |
 | 2 | `bodega` | SQL embebido en un archivo | SQLite | ✅ `sqlite` / `db` |
-| 3 | `rayo_json` | JSON ultrarrápido | cJSON, simdjson | ✅ `json` · 🛠 SIMD |
+| 3 | `rayo_json` | JSON ultrarrápido | cJSON, simdjson | ✅ `rayo_json` / `simdjson` |
 | 4 | `ventana` | Ventanas, audio y entrada | SDL2, Raylib | ✅ `juego` / `sdl` |
 | 5 | `panel` / `imgui` | GUI de modo inmediato | Dear ImGui | ✅ `es` / `en` |
 | 6 | `latido` / `eventloop` | Bucle de eventos asíncrono | libuv | ✅ `latido` |
@@ -97,9 +97,9 @@ Estado: ✅ ya existe en C-Forge · 🔗 se usa hoy vía `cforge bindgen`,
 |---|---|---|---|---|
 | 67 | `lienzo` | Motor gráfico 2D | Skia | ✅ `graficos` |
 | 68 | `flex` / `flexbox` | Layout Flexbox | Yoga | ✅ `flex` |
-| 69 | `escritorio` | GUI de escritorio con estilos | Avalonia | 🛠 |
+| 69 | `escritorio` | GUI de escritorio con estilos | Avalonia | ✅ `escritorio` / `avalonia` |
 | 70 | `cristal` | Apps de escritorio con WebView | Tauri | 🛠 |
-| 71 | `nativa` | GUI reactiva nativa | Iced, egui | 🛠 |
+| 71 | `nativa` | GUI reactiva nativa | Iced, egui | ✅ `nativa` / `iced` |
 | 72 | `vector` / `vectorgfx` | Gráficos vectoriales a PDF/SVG/PNG | Cairo | ✅ `vector` |
 | 73 | `grafia` / `shaping` | Moldeado de tipografías | HarfBuzz | ✅ `grafia` |
 | 74 | `importa3d` / `meshio` | Modelos 3D (OBJ, glTF) | Assimp | ✅ `importa3d` |
@@ -108,7 +108,7 @@ Estado: ✅ ya existe en C-Forge · 🔗 se usa hoy vía `cforge bindgen`,
 | 77 | `animacion` / `lottie` | Animaciones vectoriales | Lottie | ✅ `animacion` |
 | 78 | `estilos` / `tailwind` | Utilidades de estilo y temas | Tailwind | ✅ `estilos` |
 | 79 | `retoque` | Procesamiento de imágenes | ImageSharp | ✅ `imagen` (básico) |
-| 80 | `trazo` | Vectores en GPU | Vello | 🛠 |
+| 80 | `trazo` | Vectores en GPU | Vello | ✅ `trazo` / `vello` (CPU) |
 | 81 | `mini_gui` / `nuklear` | GUI embebible mínima | Nuklear | ✅ `es` / `en` |
 
 ### C. Redes, seguridad y sistemas distribuidos
