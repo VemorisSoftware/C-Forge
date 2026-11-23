@@ -1,0 +1,561 @@
+// stdlib/tunel.cfv — el protocolo de WireGuard en C-Forge: claves X25519,
+// apretón de manos Noise_IKpsk2 (iniciación y respuesta con mac1/mac2),
+// cookies bajo carga (XChaCha20-Poly1305), transporte cifrado con
+// contadores y ventana contra repeticiones, keepalive, renegociación por
+// tiempo o cantidad de mensajes y BLAKE2s propio. Habla con WireGuard de
+// verdad (probado contra boringtun). Lleva paquetes IP sobre UDP; montar
+// una interfaz tun es cosa del sistema y queda fuera. Protocolo público de
+// WireGuard, escrito desde cero. En inglés: importar "wireguard".
+//
+//   importar "tunel"
+//   sea yo = tunel_claves(nulo)
+//   sea t = tunel_nuevo(yo["privada"], clave_publica_del_otro, nulo)
+//   sea hola = tunel_iniciar(t)                      // enviar por UDP
+//   sea r = tunel_recibir(t, datagrama_que_llego)    // {"enviar": [...], "paquetes": [...]}
+//   sea cifrado = tunel_cifrar(t, paquete_ip)
+
+// ---------- BLAKE2s ----------
+
+importar "base64"
+
+sea _TU_IV = [1779033703, 3144134277, 1013904242, 2773480762, 1359893119, 2600822924, 528734635, 1541459225]
+sea _TU_SIGMA = [[0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15], [14, 10, 4, 8, 9, 15, 13, 6, 1, 12, 0, 2, 11, 7, 5, 3],
+    [11, 8, 12, 0, 5, 2, 15, 13, 10, 14, 3, 6, 7, 1, 9, 4], [7, 9, 3, 1, 13, 12, 11, 14, 2, 6, 5, 10, 4, 0, 15, 8],
+    [9, 0, 5, 7, 2, 4, 10, 15, 14, 1, 11, 12, 6, 8, 3, 13], [2, 12, 6, 10, 0, 11, 8, 3, 4, 13, 7, 5, 15, 14, 1, 9],
+    [12, 5, 1, 15, 14, 13, 4, 10, 0, 7, 6, 3, 9, 2, 8, 11], [13, 11, 7, 14, 12, 1, 3, 9, 5, 0, 15, 4, 8, 6, 2, 10],
+    [6, 15, 14, 9, 11, 3, 0, 8, 12, 2, 13, 7, 1, 4, 10, 5], [10, 2, 8, 4, 7, 6, 1, 5, 15, 11, 9, 14, 3, 12, 13, 0]]
+
+funcion _tu_rot(x, n) {
+    sea p = potencia(2, n)
+    retornar piso(x / p) + (x % p) * potencia(2, 32 - n)
+}
+
+funcion _tu_g(v, a, b, c, d, x, y) {
+    v[a] = (v[a] + v[b] + x) % 4294967296
+    v[d] = _tu_rot(bits_xo(v[d], v[a]), 16)
+    v[c] = (v[c] + v[d]) % 4294967296
+    v[b] = _tu_rot(bits_xo(v[b], v[c]), 12)
+    v[a] = (v[a] + v[b] + y) % 4294967296
+    v[d] = _tu_rot(bits_xo(v[d], v[a]), 8)
+    v[c] = (v[c] + v[d]) % 4294967296
+    v[b] = _tu_rot(bits_xo(v[b], v[c]), 7)
+}
+
+funcion _tu_comprimir(h, bloque, t, final) {
+    sea m = []
+    sea i = 0
+    mientras (i < 16) {
+        m.agregar(bytes_leer_entero(bloque, i * 4, 4, 1))
+        i = i + 1
+    }
+    sea v = [h[0], h[1], h[2], h[3], h[4], h[5], h[6], h[7], _TU_IV[0], _TU_IV[1], _TU_IV[2], _TU_IV[3],
+        bits_xo(_TU_IV[4], t % 4294967296), bits_xo(_TU_IV[5], piso(t / 4294967296)), _TU_IV[6], _TU_IV[7]]
+    si (final) { v[14] = bits_xo(v[14], 4294967295) }
+    sea r = 0
+    mientras (r < 10) {
+        sea s = _TU_SIGMA[r]
+        _tu_g(v, 0, 4, 8, 12, m[s[0]], m[s[1]])
+        _tu_g(v, 1, 5, 9, 13, m[s[2]], m[s[3]])
+        _tu_g(v, 2, 6, 10, 14, m[s[4]], m[s[5]])
+        _tu_g(v, 3, 7, 11, 15, m[s[6]], m[s[7]])
+        _tu_g(v, 0, 5, 10, 15, m[s[8]], m[s[9]])
+        _tu_g(v, 1, 6, 11, 12, m[s[10]], m[s[11]])
+        _tu_g(v, 2, 7, 8, 13, m[s[12]], m[s[13]])
+        _tu_g(v, 3, 4, 9, 14, m[s[14]], m[s[15]])
+        r = r + 1
+    }
+    i = 0
+    mientras (i < 8) {
+        h[i] = bits_xo(bits_xo(h[i], v[i]), v[i + 8])
+        i = i + 1
+    }
+}
+
+/// BLAKE2s (RFC 7693) de "n" bytes (1..32), con clave opcional (≤ 32 bytes).
+funcion tunel_blake2s(datos, n, clave) {
+    sea k = clave ?? ""
+    sea h = [bits_xo(_TU_IV[0], 16842752 + longitud(k) * 256 + n), _TU_IV[1], _TU_IV[2], _TU_IV[3], _TU_IV[4], _TU_IV[5], _TU_IV[6], _TU_IV[7]]
+    sea m = datos
+    si (longitud(k) > 0) { m = k + _tu_ceros(64 - longitud(k)) + datos }
+    sea total = longitud(m)
+    sea pos = 0
+    mientras (total - pos > 64) {
+        _tu_comprimir(h, subtexto(m, pos, pos + 64), pos + 64, falso)
+        pos = pos + 64
+    }
+    sea ultimo = subtexto(m, pos, total)
+    _tu_comprimir(h, ultimo + _tu_ceros(64 - longitud(ultimo)), total, verdadero)
+    sea r = ""
+    para x en h { r = r + bytes_entero(x, 4, 1) }
+    retornar subtexto(r, 0, n)
+}
+
+funcion _tu_ceros(n) {
+    sea r = ""
+    sea i = 0
+    mientras (i < n) {
+        r = r + char_de(0)
+        i = i + 1
+    }
+    retornar r
+}
+
+funcion _tu_hash(d) { retornar tunel_blake2s(d, 32, nulo) }
+funcion _tu_mac(k, d) { retornar tunel_blake2s(d, 16, k) }
+
+funcion _tu_hmac(k, d) {
+    sea kk = k
+    si (longitud(kk) > 64) { kk = _tu_hash(kk) }
+    kk = kk + _tu_ceros(64 - longitud(kk))
+    sea ip = ""
+    sea op = ""
+    sea i = 0
+    mientras (i < 64) {
+        sea b = byte_en(kk, i)
+        ip = ip + char_de(bits_xo(b, 54))
+        op = op + char_de(bits_xo(b, 92))
+        i = i + 1
+    }
+    retornar _tu_hash(op + _tu_hash(ip + d))
+}
+
+// KDF de WireGuard: devuelve n salidas de 32 bytes.
+funcion _tu_kdf(c, entrada, n) {
+    sea t0 = _tu_hmac(c, entrada)
+    sea r = []
+    sea prev = ""
+    sea i = 1
+    mientras (i <= n) {
+        prev = _tu_hmac(t0, prev + char_de(i))
+        r.agregar(prev)
+        i = i + 1
+    }
+    retornar r
+}
+
+funcion _tu_nonce(contador) { retornar _tu_ceros(4) + bytes_entero(contador, 8, 1) }
+
+funcion _tu_aead(k, contador, texto, ad) { retornar chacha20_poly1305_cifrar(k, _tu_nonce(contador), texto, ad) }
+funcion _tu_abrir(k, contador, cifrado, ad) {
+    sea r = nulo
+    intentar { r = chacha20_poly1305_descifrar(k, _tu_nonce(contador), cifrado, ad) } capturar (e) { r = nulo }
+    retornar r
+}
+
+// HChaCha20 y XChaCha20-Poly1305 (para las cookies).
+funcion _tu_qr(x, a, b, c, d) {
+    x[a] = (x[a] + x[b]) % 4294967296
+    x[d] = _tu_rot(bits_xo(x[d], x[a]), 16)
+    x[c] = (x[c] + x[d]) % 4294967296
+    x[b] = _tu_rot(bits_xo(x[b], x[c]), 20)
+    x[a] = (x[a] + x[b]) % 4294967296
+    x[d] = _tu_rot(bits_xo(x[d], x[a]), 24)
+    x[c] = (x[c] + x[d]) % 4294967296
+    x[b] = _tu_rot(bits_xo(x[b], x[c]), 25)
+}
+
+funcion _tu_hchacha20(k, n16) {
+    sea x = [1634760805, 857760878, 2036477234, 1797285236]
+    sea i = 0
+    mientras (i < 8) {
+        x.agregar(bytes_leer_entero(k, i * 4, 4, 1))
+        i = i + 1
+    }
+    i = 0
+    mientras (i < 4) {
+        x.agregar(bytes_leer_entero(n16, i * 4, 4, 1))
+        i = i + 1
+    }
+    i = 0
+    mientras (i < 10) {
+        _tu_qr(x, 0, 4, 8, 12)
+        _tu_qr(x, 1, 5, 9, 13)
+        _tu_qr(x, 2, 6, 10, 14)
+        _tu_qr(x, 3, 7, 11, 15)
+        _tu_qr(x, 0, 5, 10, 15)
+        _tu_qr(x, 1, 6, 11, 12)
+        _tu_qr(x, 2, 7, 8, 13)
+        _tu_qr(x, 3, 4, 9, 14)
+        i = i + 1
+    }
+    sea r = ""
+    para j en [0, 1, 2, 3, 12, 13, 14, 15] { r = r + bytes_entero(x[j], 4, 1) }
+    retornar r
+}
+
+funcion tunel_xchacha_cifrar(k, n24, texto, ad) {
+    retornar chacha20_poly1305_cifrar(_tu_hchacha20(k, subtexto(n24, 0, 16)), _tu_ceros(4) + subtexto(n24, 16, 24), texto, ad)
+}
+
+funcion tunel_xchacha_descifrar(k, n24, cifrado, ad) {
+    retornar chacha20_poly1305_descifrar(_tu_hchacha20(k, subtexto(n24, 0, 16)), _tu_ceros(4) + subtexto(n24, 16, 24), cifrado, ad)
+}
+
+// TAI64N: segundos desde 1970 + 2^62 + 10 (BE) y nanosegundos (BE).
+funcion _tu_tai64n() {
+    sea ms = tiempo_ms()
+    sea s = piso(ms / 1000)
+    sea ns = (ms % 1000) * 1000000
+    retornar bytes_entero(4611686018427387914 + s, 8, 0) + bytes_entero(ns, 4, 0)
+}
+
+// ---------- claves ----------
+
+sea _TU_CONSTRUCCION = "Noise_IKpsk2_25519_ChaChaPoly_BLAKE2s"
+sea _TU_IDENTIFICADOR = "WireGuard v1 zx2c4 Jason@zx2c4.com"
+
+/// Par de claves {"privada", "publica"} (32 bytes) y en base64 como wg.
+funcion tunel_claves(privada) {
+    sea p = privada ?? bytes_aleatorios(32)
+    si (longitud(p) == 44) { p = base64_decodificar(p) }
+    // Recorte de Curve25519.
+    sea b0 = bits_y(byte_en(p, 0), 248)
+    sea b31 = bits_o(bits_y(byte_en(p, 31), 127), 64)
+    p = char_de(b0) + subtexto(p, 1, 31) + char_de(b31)
+    sea pub = x25519_base(p)
+    retornar {"privada": p, "publica": pub, "privada_b64": base64_codificar(p), "publica_b64": base64_codificar(pub)}
+}
+
+funcion _tu_clave(k) {
+    si (k == nulo) { retornar nulo }
+    si (longitud(k) == 44) { retornar base64_decodificar(k) }
+    si (longitud(k) != 32) { lanzar "tunel: las claves tienen 32 bytes (o 44 en base64)" }
+    retornar k
+}
+
+// ---------- túnel ----------
+
+/// Túnel con un par. opciones: "psk" (clave compartida opcional),
+/// "keepalive" (segundos), "indice" (fijo, para pruebas), "efimera"
+/// (privada fija, para pruebas).
+funcion tunel_nuevo(privada, publica_par, opciones) {
+    sea op = opciones ?? {}
+    sea yo = tunel_claves(_tu_clave(privada))
+    sea pp = _tu_clave(publica_par)
+    sea t = {"privada": yo["privada"], "publica": yo["publica"], "par": pp, "psk": _tu_clave(op["psk"] ?? nulo) ?? _tu_ceros(32),
+        "mac1_par": _tu_hash("mac1----" + pp), "mac1_mio": _tu_hash("mac1----" + yo["publica"]), "cookie_clave": _tu_hash("cookie--" + yo["publica"]),
+        "keepalive": op["keepalive"] ?? 0, "indice_fijo": op["indice"] ?? nulo, "efimera_fija": op["efimera"] ?? nulo,
+        "hs": nulo, "sesion": nulo, "anterior": nulo, "ultimo_ts": "", "cookie": nulo, "cookie_t": 0, "ultimo_mac1": nulo,
+        "secreto_cookie": bytes_aleatorios(32), "secreto_t": tiempo_ms(), "bajo_carga": falso, "pendientes": [], "ultimo_envio": 0, "ultimo_recibo": 0}
+    retornar t
+}
+
+funcion _tu_indice(t) {
+    si (t["indice_fijo"] != nulo) { retornar t["indice_fijo"] }
+    retornar bytes_leer_entero(bytes_aleatorios(4), 0, 4, 1)
+}
+
+funcion _tu_macs(t, msg, clave_mac1) {
+    sea m1 = _tu_mac(clave_mac1, msg)
+    sea m2 = _tu_ceros(16)
+    si (t["cookie"] != nulo y tiempo_ms() - t["cookie_t"] < 120000) { m2 = _tu_mac(t["cookie"], msg + m1) }
+    t["ultimo_mac1"] = m1
+    retornar msg + m1 + m2
+}
+
+/// Mensaje de iniciación (148 bytes) para mandar al par.
+funcion tunel_iniciar(t) {
+    sea c = _tu_hash(_TU_CONSTRUCCION)
+    sea h = _tu_hash(c + _TU_IDENTIFICADOR)
+    h = _tu_hash(h + t["par"])
+    sea e = tunel_claves(t["efimera_fija"])
+    c = _tu_kdf(c, e["publica"], 1)[0]
+    h = _tu_hash(h + e["publica"])
+    sea ck = _tu_kdf(c, x25519(e["privada"], t["par"]), 2)
+    c = ck[0]
+    sea est = _tu_aead(ck[1], 0, t["publica"], h)
+    h = _tu_hash(h + est)
+    ck = _tu_kdf(c, x25519(t["privada"], t["par"]), 2)
+    c = ck[0]
+    sea ts = _tu_aead(ck[1], 0, _tu_tai64n(), h)
+    h = _tu_hash(h + ts)
+    sea idx = _tu_indice(t)
+    t["hs"] = {"c": c, "h": h, "e": e, "indice": idx, "t": tiempo_ms()}
+    sea msg = bytes_entero(1, 4, 1) + bytes_entero(idx, 4, 1) + e["publica"] + est + ts
+    retornar _tu_macs(t, msg, t["mac1_par"])
+}
+
+funcion _tu_sesion(t, c, mio, suyo, iniciador) {
+    sea k = _tu_kdf(c, "", 2)
+    sea envio = k[0]
+    sea recibo = k[1]
+    si (iniciador == falso) {
+        envio = k[1]
+        recibo = k[0]
+    }
+    t["anterior"] = t["sesion"]
+    t["sesion"] = {"envio": envio, "recibo": recibo, "mio": mio, "suyo": suyo, "contador": 0, "ventana": {}, "max": -1, "creada": tiempo_ms(), "iniciador": iniciador}
+    t["hs"] = nulo
+}
+
+// Comprueba mac1 (y mac2 si estamos bajo carga).
+funcion _tu_ver_macs(t, d) {
+    sea n = longitud(d)
+    sea m1 = subtexto(d, n - 32, n - 16)
+    si (_tu_mac(t["mac1_mio"], subtexto(d, 0, n - 32)) != m1) { retornar "mac1" }
+    si (t["bajo_carga"]) {
+        sea m2 = subtexto(d, n - 16, n)
+        si (_tu_mac(_tu_cookie_valor(t, t["origen"] ?? ""), subtexto(d, 0, n - 16)) != m2) { retornar "cookie" }
+    }
+    retornar nulo
+}
+
+funcion _tu_cookie_valor(t, origen) {
+    si (tiempo_ms() - t["secreto_t"] > 120000) {
+        t["secreto_cookie"] = bytes_aleatorios(32)
+        t["secreto_t"] = tiempo_ms()
+    }
+    retornar _tu_mac(t["secreto_cookie"], origen)
+}
+
+// Respuesta de cookie (64 bytes) para un mensaje que no traía mac2.
+funcion _tu_cookie_respuesta(t, d) {
+    sea emisor = subtexto(d, 4, 8)
+    sea n = longitud(d)
+    sea m1 = subtexto(d, n - 32, n - 16)
+    sea nonce = bytes_aleatorios(24)
+    sea cifrado = tunel_xchacha_cifrar(t["cookie_clave"], nonce, _tu_cookie_valor(t, t["origen"] ?? ""), m1)
+    retornar bytes_entero(3, 4, 1) + emisor + nonce + cifrado
+}
+
+funcion _tu_iniciacion(t, d, r) {
+    si (longitud(d) != 148) { retornar r }
+    sea mv = _tu_ver_macs(t, d)
+    si (mv == "mac1") { retornar r }
+    si (mv == "cookie") {
+        r["enviar"].agregar(_tu_cookie_respuesta(t, d))
+        retornar r
+    }
+    sea c = _tu_hash(_TU_CONSTRUCCION)
+    sea h = _tu_hash(c + _TU_IDENTIFICADOR)
+    h = _tu_hash(h + t["publica"])
+    sea ei = subtexto(d, 8, 40)
+    c = _tu_kdf(c, ei, 1)[0]
+    h = _tu_hash(h + ei)
+    sea ck = _tu_kdf(c, x25519(t["privada"], ei), 2)
+    c = ck[0]
+    sea est_c = subtexto(d, 40, 88)
+    sea est = _tu_abrir(ck[1], 0, est_c, h)
+    si (est == nulo o est != t["par"]) {
+        r["errores"].agregar("iniciación de un par desconocido")
+        retornar r
+    }
+    h = _tu_hash(h + est_c)
+    ck = _tu_kdf(c, x25519(t["privada"], est), 2)
+    c = ck[0]
+    sea ts_c = subtexto(d, 88, 116)
+    sea ts = _tu_abrir(ck[1], 0, ts_c, h)
+    si (ts == nulo) {
+        r["errores"].agregar("iniciación que no se pudo descifrar")
+        retornar r
+    }
+    // El sello de tiempo tiene que crecer (protege contra repeticiones).
+    si (ts <= t["ultimo_ts"]) {
+        r["errores"].agregar("iniciación repetida")
+        retornar r
+    }
+    t["ultimo_ts"] = ts
+    h = _tu_hash(h + ts_c)
+    sea suyo = bytes_leer_entero(d, 4, 4, 1)
+    // Respuesta.
+    sea er = tunel_claves(t["efimera_fija"])
+    c = _tu_kdf(c, er["publica"], 1)[0]
+    h = _tu_hash(h + er["publica"])
+    c = _tu_kdf(c, x25519(er["privada"], ei), 1)[0]
+    c = _tu_kdf(c, x25519(er["privada"], t["par"]), 1)[0]
+    sea k3 = _tu_kdf(c, t["psk"], 3)
+    c = k3[0]
+    h = _tu_hash(h + k3[1])
+    sea vacio = _tu_aead(k3[2], 0, "", h)
+    h = _tu_hash(h + vacio)
+    sea mio = _tu_indice(t)
+    sea msg = bytes_entero(2, 4, 1) + bytes_entero(mio, 4, 1) + bytes_entero(suyo, 4, 1) + er["publica"] + vacio
+    r["enviar"].agregar(_tu_macs(t, msg, t["mac1_par"]))
+    _tu_sesion(t, c, mio, suyo, falso)
+    // El responder no manda datos hasta recibir el primero (o un keepalive).
+    t["sesion"]["confirmada"] = falso
+    r["evento"] = "sesion"
+    retornar r
+}
+
+funcion _tu_respuesta(t, d, r) {
+    si (longitud(d) != 92 o t["hs"] == nulo) { retornar r }
+    si (_tu_ver_macs(t, d) == "mac1") { retornar r }
+    si (bytes_leer_entero(d, 8, 4, 1) != t["hs"]["indice"]) { retornar r }
+    sea hs = t["hs"]
+    sea c = hs["c"]
+    sea h = hs["h"]
+    sea er = subtexto(d, 12, 44)
+    c = _tu_kdf(c, er, 1)[0]
+    h = _tu_hash(h + er)
+    c = _tu_kdf(c, x25519(hs["e"]["privada"], er), 1)[0]
+    c = _tu_kdf(c, x25519(t["privada"], er), 1)[0]
+    sea k3 = _tu_kdf(c, t["psk"], 3)
+    c = k3[0]
+    h = _tu_hash(h + k3[1])
+    si (_tu_abrir(k3[2], 0, subtexto(d, 44, 60), h) == nulo) {
+        r["errores"].agregar("respuesta que no se pudo descifrar")
+        retornar r
+    }
+    _tu_sesion(t, c, hs["indice"], bytes_leer_entero(d, 4, 4, 1), verdadero)
+    t["sesion"]["confirmada"] = verdadero
+    r["evento"] = "sesion"
+    // Lo que estaba esperando la sesión sale ahora; si no hay nada, un
+    // keepalive confirma la sesión al otro lado.
+    si (longitud(t["pendientes"]) == 0) { r["enviar"].agregar(_tu_transporte(t, "")) }
+    para p en t["pendientes"] { r["enviar"].agregar(_tu_transporte(t, p)) }
+    t["pendientes"] = []
+    retornar r
+}
+
+funcion _tu_cookie(t, d, r) {
+    si (longitud(d) != 64 o t["ultimo_mac1"] == nulo) { retornar r }
+    sea v = nulo
+    intentar { v = tunel_xchacha_descifrar(_tu_hash("cookie--" + t["par"]), subtexto(d, 8, 32), subtexto(d, 32, 64), t["ultimo_mac1"]) } capturar (e) { v = nulo }
+    si (v != nulo) {
+        t["cookie"] = v
+        t["cookie_t"] = tiempo_ms()
+        r["evento"] = "cookie"
+    }
+    retornar r
+}
+
+funcion _tu_transporte(t, paquete) {
+    sea s = t["sesion"]
+    // Relleno a múltiplo de 16 (como pide WireGuard).
+    sea p = paquete
+    si (longitud(p) % 16 != 0) { p = p + _tu_ceros(16 - longitud(p) % 16) }
+    sea n = s["contador"]
+    s["contador"] = n + 1
+    t["ultimo_envio"] = tiempo_ms()
+    retornar bytes_entero(4, 4, 1) + bytes_entero(s["suyo"], 4, 1) + bytes_entero(n, 8, 1) + _tu_aead(s["envio"], n, p, "")
+}
+
+// Ventana de 2048 contadores contra repeticiones.
+funcion _tu_ventana(s, n) {
+    si (n > s["max"]) {
+        // Olvida lo que quedó fuera de la ventana.
+        si (n - s["max"] > 2048) { s["ventana"] = {} } sino {
+            para k en claves(s["ventana"]) { si (a_numero(k) < n - 2048) { quitar_clave(s["ventana"], k) } }
+        }
+        s["max"] = n
+        s["ventana"]["" + n] = verdadero
+        retornar verdadero
+    }
+    si (n < s["max"] - 2048 o tiene_clave(s["ventana"], "" + n)) { retornar falso }
+    s["ventana"]["" + n] = verdadero
+    retornar verdadero
+}
+
+funcion _tu_datos(t, d, r) {
+    si (longitud(d) < 32) { retornar r }
+    sea idx = bytes_leer_entero(d, 4, 4, 1)
+    sea s = nulo
+    para x en [t["sesion"], t["anterior"]] { si (x != nulo y x["mio"] == idx) { s = x } }
+    si (s == nulo) {
+        r["errores"].agregar("índice desconocido")
+        retornar r
+    }
+    sea n = bytes_leer_entero(d, 8, 8, 1)
+    sea p = _tu_abrir(s["recibo"], n, subtexto(d, 16, longitud(d)), "")
+    si (p == nulo) {
+        r["errores"].agregar("paquete que no se pudo descifrar")
+        retornar r
+    }
+    si (_tu_ventana(s, n) == falso) {
+        r["errores"].agregar("paquete repetido")
+        retornar r
+    }
+    t["ultimo_recibo"] = tiempo_ms()
+    s["confirmada"] = verdadero
+    si (longitud(p) == 0) {
+        r["evento"] = "keepalive"
+        retornar r
+    }
+    // Quita el relleno con el largo de la cabecera IP.
+    sea ver = piso(byte_en(p, 0) / 16)
+    sea largo = longitud(p)
+    si (ver == 4 y longitud(p) >= 20) { largo = bytes_leer_entero(p, 2, 2, 0) }
+    si (ver == 6 y longitud(p) >= 40) { largo = 40 + bytes_leer_entero(p, 4, 2, 0) }
+    r["paquetes"].agregar(subtexto(p, 0, minimo(largo, longitud(p))))
+    para q en t["pendientes"] { r["enviar"].agregar(_tu_transporte(t, q)) }
+    t["pendientes"] = []
+    retornar r
+}
+
+/// Procesa un datagrama UDP que llegó. Devuelve {"enviar": [datagramas
+/// para mandar de vuelta], "paquetes": [paquetes IP descifrados], "evento"
+/// (sesion, keepalive, cookie o nulo), "errores": [...]}. "origen" (ip:puerto)
+/// se usa para las cookies bajo carga.
+funcion tunel_recibir(t, datagrama, origen) {
+    t["origen"] = origen ?? ""
+    sea r = {"enviar": [], "paquetes": [], "evento": nulo, "errores": []}
+    si (longitud(datagrama) < 4) { retornar r }
+    sea tipo_m = bytes_leer_entero(datagrama, 0, 4, 1)
+    si (tipo_m == 1) { retornar _tu_iniciacion(t, datagrama, r) }
+    si (tipo_m == 2) { retornar _tu_respuesta(t, datagrama, r) }
+    si (tipo_m == 3) { retornar _tu_cookie(t, datagrama, r) }
+    si (tipo_m == 4) { retornar _tu_datos(t, datagrama, r) }
+    retornar r
+}
+
+/// Cifra un paquete IP para el par. Si todavía no hay sesión (o hay que
+/// renovarla) lo guarda y devuelve la iniciación para mandar.
+funcion tunel_cifrar(t, paquete) {
+    sea s = t["sesion"]
+    sea vieja = s != nulo y (tiempo_ms() - s["creada"] > 120000 o s["contador"] > 1152921504606846976)
+    si (s != nulo y vieja == falso y s["confirmada"] == falso) {
+        // El respondedor espera el primer dato del iniciador.
+        t["pendientes"].agregar(paquete)
+        retornar []
+    }
+    si (s == nulo o vieja) {
+        t["pendientes"].agregar(paquete)
+        si (t["hs"] == nulo o tiempo_ms() - t["hs"]["t"] > 5000) { retornar [tunel_iniciar(t)] }
+        retornar []
+    }
+    retornar [_tu_transporte(t, paquete)]
+}
+
+/// Keepalive (datos vacíos) si hace falta según la opción "keepalive", o
+/// siempre si forzar es verdadero.
+funcion tunel_keepalive(t, forzar) {
+    si (t["sesion"] == nulo) { retornar nulo }
+    si (forzar o (t["keepalive"] > 0 y tiempo_ms() - t["ultimo_envio"] > t["keepalive"] * 1000)) { retornar _tu_transporte(t, "") }
+    retornar nulo
+}
+
+/// Estado: {"sesion" (si hay), "enviados", "recibido_hace_ms", "iniciador"}.
+funcion tunel_estado(t) {
+    sea s = t["sesion"]
+    si (s == nulo) { retornar {"sesion": falso, "enviados": 0, "recibido_hace_ms": nulo, "iniciador": nulo} }
+    sea hace = nulo
+    si (t["ultimo_recibo"] > 0) { hace = tiempo_ms() - t["ultimo_recibo"] }
+    retornar {"sesion": verdadero, "enviados": s["contador"], "recibido_hace_ms": hace, "iniciador": s["iniciador"]}
+}
+
+/// Marca el túnel como bajo carga: pide cookie (mac2) a las iniciaciones.
+funcion tunel_bajo_carga(t, si_) { t["bajo_carga"] = si_ }
+
+/// Paquete IPv4/UDP mínimo (para pruebas y túneles de juguete).
+funcion tunel_paquete_udp(origen, destino, puerto_o, puerto_d, datos) {
+    sea largo = 28 + longitud(datos)
+    sea cab = char_de(69) + char_de(0) + bytes_entero(largo, 2, 0) + _tu_ceros(4) + char_de(64) + char_de(17) + _tu_ceros(2) + _tu_ip(origen) + _tu_ip(destino)
+    // Suma de verificación de la cabecera IP.
+    sea suma = 0
+    sea i = 0
+    mientras (i < 20) {
+        suma = suma + bytes_leer_entero(cab, i, 2, 0)
+        i = i + 2
+    }
+    mientras (suma > 65535) { suma = (suma % 65536) + piso(suma / 65536) }
+    sea ck = 65535 - suma
+    cab = subtexto(cab, 0, 10) + bytes_entero(ck, 2, 0) + subtexto(cab, 12, 20)
+    retornar cab + bytes_entero(puerto_o, 2, 0) + bytes_entero(puerto_d, 2, 0) + bytes_entero(8 + longitud(datos), 2, 0) + _tu_ceros(2) + datos
+}
+
+funcion _tu_ip(t) {
+    sea r = ""
+    para p en texto_dividir(t, ".") { r = r + char_de(a_numero(p)) }
+    retornar r
+}

@@ -1,0 +1,3013 @@
+// stdlib/sombreador.cfv — traductor de shaders al estilo naga: lee WGSL,
+// comprueba tipos y lo escribe como GLSL (450 de Vulkan o 300 es), MSL
+// (Metal), HLSL (Direct3D, modelo 5/6) o WGSL ordenado. Estructuras,
+// recursos con grupo y enlace (uniform, storage, texturas, muestreadores),
+// constantes, funciones, puntos de entrada de vértice, fragmento y cómputo
+// con @location y @builtin, control de flujo completo (if, switch, for,
+// while, loop/continuing, break, continue, discard), funciones
+// incorporadas de WGSL y reflexión de los enlaces. Los errores dicen la
+// línea y la columna. Idea de naga (MIT/Apache), escrito desde cero.
+// En inglés: importar "shader".
+//
+//   importar "sombreador"
+//   sea glsl = sombreador_traducir(wgsl, "glsl", {"entrada": "vs_main"})
+//   sea msl = sombreador_traducir(wgsl, "msl", nulo)
+//   para b en sombreador_enlaces(wgsl) { mostrar([b["grupo"], b["enlace"], b["nombre"], b["clase"]]) }
+
+// ---------- léxico ----------
+
+sea _SOM_SIMBOLOS = ["<<=", ">>=", "->", "<=", ">=", "==", "!=", "&&", "||", "<<", ">>", "+=", "-=", "*=", "/=", "%=", "&=", "|=", "^=", "++", "--",
+    "+", "-", "*", "/", "%", "&", "|", "^", "~", "!", "<", ">", "=", "(", ")", "{", "}", "[", "]", ",", ";", ":", ".", "@"]
+
+funcion _som_error(t, msj) {
+    si (t == nulo) { lanzar "sombreador: " + msj }
+    lanzar "sombreador: " + t["l"] + ":" + t["c"] + ": " + msj
+}
+
+funcion _som_es_letra(b) { retornar (b >= 65 y b <= 90) o (b >= 97 y b <= 122) o b == 95 o b >= 128 }
+funcion _som_es_digito(b) { retornar b >= 48 y b <= 57 }
+
+funcion _som_lexico(src) {
+    sea r = []
+    sea n = longitud(src)
+    sea i = 0
+    sea l = 1
+    sea col0 = 0
+    mientras (i < n) {
+        sea b = byte_en(src, i)
+        si (b == 10) {
+            l = l + 1
+            i = i + 1
+            col0 = i
+        } sino si (b == 32 o b == 9 o b == 13) {
+            i = i + 1
+        } sino si (b == 47 y i + 1 < n y byte_en(src, i + 1) == 47) {
+            mientras (i < n y byte_en(src, i) != 10) { i = i + 1 }
+        } sino si (b == 47 y i + 1 < n y byte_en(src, i + 1) == 42) {
+            // Comentarios de bloque anidables.
+            sea prof = 1
+            i = i + 2
+            mientras (i < n y prof > 0) {
+                si (byte_en(src, i) == 10) {
+                    l = l + 1
+                    col0 = i + 1
+                }
+                si (byte_en(src, i) == 47 y i + 1 < n y byte_en(src, i + 1) == 42) {
+                    prof = prof + 1
+                    i = i + 1
+                } sino si (byte_en(src, i) == 42 y i + 1 < n y byte_en(src, i + 1) == 47) {
+                    prof = prof - 1
+                    i = i + 1
+                }
+                i = i + 1
+            }
+        } sino si (_som_es_letra(b)) {
+            sea j = i
+            mientras (j < n y (_som_es_letra(byte_en(src, j)) o _som_es_digito(byte_en(src, j)))) { j = j + 1 }
+            r.agregar({"k": "id", "v": subtexto(src, i, j), "l": l, "c": i - col0 + 1})
+            i = j
+        } sino si (_som_es_digito(b) o (b == 46 y i + 1 < n y _som_es_digito(byte_en(src, i + 1)))) {
+            sea j = i
+            sea flotante = falso
+            sea hex = falso
+            si (b == 48 y i + 1 < n y (byte_en(src, i + 1) == 120 o byte_en(src, i + 1) == 88)) {
+                hex = verdadero
+                j = i + 2
+                mientras (j < n y (_som_es_digito(byte_en(src, j)) o (byte_en(src, j) >= 97 y byte_en(src, j) <= 102) o (byte_en(src, j) >= 65 y byte_en(src, j) <= 70))) { j = j + 1 }
+            } sino {
+                mientras (j < n y (_som_es_digito(byte_en(src, j)) o byte_en(src, j) == 46)) {
+                    si (byte_en(src, j) == 46) { flotante = verdadero }
+                    j = j + 1
+                }
+                si (j < n y (byte_en(src, j) == 101 o byte_en(src, j) == 69)) {
+                    flotante = verdadero
+                    j = j + 1
+                    si (j < n y (byte_en(src, j) == 43 o byte_en(src, j) == 45)) { j = j + 1 }
+                    mientras (j < n y _som_es_digito(byte_en(src, j))) { j = j + 1 }
+                }
+            }
+            sea texto = subtexto(src, i, j)
+            sea suf = ""
+            si (j < n y (byte_en(src, j) == 102 o byte_en(src, j) == 104 o byte_en(src, j) == 117 o byte_en(src, j) == 105)) {
+                suf = caracter(byte_en(src, j))
+                j = j + 1
+            }
+            sea tipo_n = "abstracto_entero"
+            si (flotante o suf == "f" o suf == "h") { tipo_n = "f32" }
+            sino si (suf == "u") { tipo_n = "u32" }
+            sino si (suf == "i") { tipo_n = "i32" }
+            sea valor = 0
+            si (hex) { valor = _som_hex(texto) } sino { valor = a_numero(texto) }
+            r.agregar({"k": "num", "v": valor, "texto": texto, "tn": tipo_n, "flot": flotante, "l": l, "c": i - col0 + 1})
+            i = j
+        } sino {
+            sea hecho = falso
+            para s en _SOM_SIMBOLOS {
+                si (hecho == falso y subtexto(src, i, minimo(n, i + longitud(s))) == s) {
+                    r.agregar({"k": "sim", "v": s, "l": l, "c": i - col0 + 1})
+                    i = i + longitud(s)
+                    hecho = verdadero
+                }
+            }
+            si (hecho == falso) { _som_error({"l": l, "c": i - col0 + 1}, "carácter inesperado '" + caracter(b) + "'") }
+        }
+    }
+    r.agregar({"k": "fin", "v": "", "l": l, "c": i - col0 + 1})
+    retornar r
+}
+
+funcion _som_hex(t) {
+    sea v = 0
+    sea i = 2
+    mientras (i < longitud(t)) {
+        sea b = byte_en(t, i)
+        sea d = 0
+        si (b >= 48 y b <= 57) { d = b - 48 } sino si (b >= 97) { d = b - 87 } sino { d = b - 55 }
+        v = v * 16 + d
+        i = i + 1
+    }
+    retornar v
+}
+
+// ---------- tipos ----------
+
+funcion _som_t_esc(s) { retornar {"k": "esc", "s": s} }
+funcion _som_t_vec(n, s) { retornar {"k": "vec", "n": n, "s": s} }
+funcion _som_t_mat(c, f) { retornar {"k": "mat", "c": c, "f": f, "s": "f32"} }
+
+funcion _som_t_txt(t) {
+    si (t == nulo) { retornar "void" }
+    sea k = t["k"]
+    si (k == "esc") { retornar t["s"] }
+    si (k == "vec") { retornar "vec" + t["n"] + "<" + t["s"] + ">" }
+    si (k == "mat") { retornar "mat" + t["c"] + "x" + t["f"] + "<" + t["s"] + ">" }
+    si (k == "arr") {
+        si (t["n"] == nulo) { retornar "array<" + _som_t_txt(t["t"]) + ">" }
+        retornar "array<" + _som_t_txt(t["t"]) + ", " + t["n"] + ">"
+    }
+    si (k == "struct") { retornar t["nombre"] }
+    si (k == "tex") { retornar t["nombre"] }
+    si (k == "muestreador") {
+        si (t["comp"]) { retornar "sampler_comparison" }
+        retornar "sampler"
+    }
+    si (k == "atomico") { retornar "atomic<" + t["s"] + ">" }
+    retornar k
+}
+
+funcion _som_t_igual(a, b) {
+    si (a == nulo o b == nulo) { retornar a == b }
+    retornar _som_t_txt(a) == _som_t_txt(b)
+}
+
+// Tipo concreto de un literal abstracto.
+funcion _som_concreto(t) {
+    si (t == nulo) { retornar t }
+    si (t["k"] == "esc" y t["s"] == "abstracto_entero") { retornar _som_t_esc("i32") }
+    si (t["k"] == "esc" y t["s"] == "abstracto_flotante") { retornar _som_t_esc("f32") }
+    si (t["k"] == "vec" y t["s"] == "abstracto_entero") { retornar _som_t_vec(t["n"], "i32") }
+    retornar t
+}
+
+funcion _som_escalar_de(t) {
+    si (t["k"] == "esc" o t["k"] == "vec" o t["k"] == "mat") { retornar t["s"] }
+    retornar nulo
+}
+
+funcion _som_con_escalar(t, s) {
+    si (t["k"] == "vec") { retornar _som_t_vec(t["n"], s) }
+    retornar _som_t_esc(s)
+}
+
+sea _SOM_ATAJOS = {"vec2f": ["vec", 2, "f32"], "vec3f": ["vec", 3, "f32"], "vec4f": ["vec", 4, "f32"], "vec2i": ["vec", 2, "i32"], "vec3i": ["vec", 3, "i32"],
+    "vec4i": ["vec", 4, "i32"], "vec2u": ["vec", 2, "u32"], "vec3u": ["vec", 3, "u32"], "vec4u": ["vec", 4, "u32"], "vec2h": ["vec", 2, "f32"], "vec3h": ["vec", 3, "f32"],
+    "vec4h": ["vec", 4, "f32"], "mat2x2f": ["mat", 2, 2], "mat2x3f": ["mat", 2, 3], "mat2x4f": ["mat", 2, 4], "mat3x2f": ["mat", 3, 2], "mat3x3f": ["mat", 3, 3],
+    "mat3x4f": ["mat", 3, 4], "mat4x2f": ["mat", 4, 2], "mat4x3f": ["mat", 4, 3], "mat4x4f": ["mat", 4, 4]}
+
+sea _SOM_TEXTURAS = {"texture_1d": ["1d", falso, falso, falso], "texture_2d": ["2d", falso, falso, falso], "texture_2d_array": ["2d", verdadero, falso, falso],
+    "texture_3d": ["3d", falso, falso, falso], "texture_cube": ["cube", falso, falso, falso], "texture_cube_array": ["cube", verdadero, falso, falso],
+    "texture_multisampled_2d": ["2d", falso, falso, verdadero], "texture_depth_2d": ["2d", falso, verdadero, falso], "texture_depth_2d_array": ["2d", verdadero, verdadero, falso],
+    "texture_depth_cube": ["cube", falso, verdadero, falso], "texture_storage_2d": ["2d", falso, falso, falso], "texture_storage_3d": ["3d", falso, falso, falso]}
+
+// ---------- análisis sintáctico ----------
+
+funcion _som_p(toks) { retornar {"t": toks, "i": 0, "m": {"structs": {}, "alias": {}, "consts": {}}} }
+funcion _som_ver(p) { retornar p["t"][p["i"]] }
+funcion _som_ver2(p) {
+    si (p["i"] + 1 < longitud(p["t"])) { retornar p["t"][p["i"] + 1] }
+    retornar p["t"][p["i"]]
+}
+funcion _som_tomar(p) {
+    sea t = p["t"][p["i"]]
+    si (t["k"] != "fin") { p["i"] = p["i"] + 1 }
+    retornar t
+}
+funcion _som_es(p, v) {
+    sea t = _som_ver(p)
+    retornar (t["k"] == "sim" o t["k"] == "id") y t["v"] == v
+}
+funcion _som_si(p, v) {
+    si (_som_es(p, v)) {
+        _som_tomar(p)
+        retornar verdadero
+    }
+    retornar falso
+}
+funcion _som_esperar(p, v) {
+    // ">>" cierra dos listas de tipos (array<vec2<f32>>).
+    si (v == ">" y _som_es(p, ">>")) {
+        sea t = _som_ver(p)
+        sea t2 = {"k": "sim", "v": ">", "l": t["l"], "c": t["c"] + 1}
+        p["t"][p["i"]] = t2
+        retornar t
+    }
+    si (_som_es(p, v) == falso) { _som_error(_som_ver(p), "se esperaba '" + v + "' y llegó '" + _som_ver(p)["v"] + "'") }
+    retornar _som_tomar(p)
+}
+funcion _som_ident(p) {
+    sea t = _som_ver(p)
+    si (t["k"] != "id") { _som_error(t, "se esperaba un nombre y llegó '" + t["v"] + "'") }
+    retornar _som_tomar(p)["v"]
+}
+
+// Atributos @nombre(args).
+funcion _som_atributos(p) {
+    sea r = {}
+    mientras (_som_es(p, "@")) {
+        _som_tomar(p)
+        sea n = _som_ident(p)
+        sea args = []
+        si (_som_si(p, "(")) {
+            mientras (_som_es(p, ")") == falso) {
+                sea t = _som_ver(p)
+                si (t["k"] == "id" y n != "workgroup_size") { args.agregar(_som_tomar(p)["v"]) }
+                sino { args.agregar(_som_expr(p)) }
+                si (_som_si(p, ",") == falso) { _som_esperar(p, ")") _som_retroceder(p) }
+            }
+            _som_esperar(p, ")")
+        }
+        r[n] = args
+    }
+    retornar r
+}
+funcion _som_retroceder(p) { p["i"] = p["i"] - 1 }
+
+funcion _som_tipo(p, m) {
+    sea t = _som_ver(p)
+    sea n = _som_ident(p)
+    si (n == "f32" o n == "i32" o n == "u32" o n == "bool" o n == "f16") {
+        si (n == "f16") { n = "f32" }
+        retornar _som_t_esc(n)
+    }
+    si (tiene_clave(_SOM_ATAJOS, n)) {
+        sea a = _SOM_ATAJOS[n]
+        si (a[0] == "vec") { retornar _som_t_vec(a[1], a[2]) }
+        retornar _som_t_mat(a[1], a[2])
+    }
+    si (n == "vec2" o n == "vec3" o n == "vec4") {
+        _som_esperar(p, "<")
+        sea s = _som_tipo(p, m)
+        _som_esperar(p, ">")
+        retornar _som_t_vec(a_numero(subtexto(n, 3, 4)), s["s"])
+    }
+    si (texto_empieza_con(n, "mat") y longitud(n) == 6) {
+        _som_esperar(p, "<")
+        _som_tipo(p, m)
+        _som_esperar(p, ">")
+        retornar _som_t_mat(a_numero(subtexto(n, 3, 4)), a_numero(subtexto(n, 5, 6)))
+    }
+    si (n == "array") {
+        _som_esperar(p, "<")
+        sea el = _som_tipo(p, m)
+        sea cant = nulo
+        si (_som_si(p, ",")) { cant = _som_valor_constante(_som_expr_sin_mayor(p), m, t) }
+        _som_esperar(p, ">")
+        retornar {"k": "arr", "t": el, "n": cant}
+    }
+    si (n == "atomic") {
+        _som_esperar(p, "<")
+        sea s = _som_tipo(p, m)
+        _som_esperar(p, ">")
+        retornar {"k": "atomico", "s": s["s"]}
+    }
+    si (n == "sampler") { retornar {"k": "muestreador", "comp": falso} }
+    si (n == "sampler_comparison") { retornar {"k": "muestreador", "comp": verdadero} }
+    si (tiene_clave(_SOM_TEXTURAS, n)) {
+        sea d = _SOM_TEXTURAS[n]
+        sea tx = {"k": "tex", "nombre": n, "dim": d[0], "arreglo": d[1], "prof": d[2], "ms": d[3], "s": "f32", "almacen": texto_empieza_con(n, "texture_storage"), "formato": nulo, "acceso": nulo}
+        si (_som_si(p, "<")) {
+            si (tx["almacen"]) {
+                tx["formato"] = _som_ident(p)
+                _som_esperar(p, ",")
+                tx["acceso"] = _som_ident(p)
+                tx["nombre"] = n + "<" + tx["formato"] + ", " + tx["acceso"] + ">"
+            } sino {
+                tx["s"] = _som_tipo(p, m)["s"]
+                tx["nombre"] = n + "<" + tx["s"] + ">"
+            }
+            _som_esperar(p, ">")
+        }
+        retornar tx
+    }
+    si (tiene_clave(m["structs"], n)) { retornar {"k": "struct", "nombre": n} }
+    si (tiene_clave(m["alias"], n)) { retornar m["alias"][n] }
+    _som_error(t, "tipo desconocido '" + n + "'")
+}
+
+funcion _som_valor_constante(e, m, t) {
+    si (e["e"] == "lit") { retornar e["v"] }
+    si (e["e"] == "id" y tiene_clave(m["consts"], e["n"])) { retornar _som_valor_constante(m["consts"][e["n"]]["v"], m, t) }
+    _som_error(t, "se esperaba una constante")
+}
+
+funcion _som_modulo(src) {
+    sea p = _som_p(_som_lexico(src))
+    sea m = {"structs": {}, "orden_structs": [], "globales": [], "global_idx": {}, "consts": {}, "orden_consts": [], "funciones": [], "fn_idx": {}, "alias": {}, "decl": [], "directivas": []}
+    p["m"] = m
+    mientras (_som_ver(p)["k"] != "fin") {
+        si (_som_si(p, ";")) {
+        } sino si (_som_es(p, "enable") o _som_es(p, "requires") o _som_es(p, "diagnostic")) {
+            sea partes = []
+            mientras (_som_si(p, ";") == falso) { partes.agregar(_som_tomar(p)["v"]) }
+            m["directivas"].agregar(partes[0] + " " + unir(_som_sin_primero(partes), "") + ";")
+        } sino {
+            sea at = _som_atributos(p)
+            sea t = _som_ver(p)
+            si (_som_si(p, "struct")) {
+                sea n = _som_ident(p)
+                // Se registra antes para permitir referencias.
+                m["structs"][n] = {"nombre": n, "miembros": []}
+                _som_esperar(p, "{")
+                mientras (_som_si(p, "}") == falso) {
+                    sea am = _som_atributos(p)
+                    sea mt = _som_ver(p)
+                    sea mn = _som_ident(p)
+                    _som_esperar(p, ":")
+                    sea mty = _som_tipo(p, m)
+                    m["structs"][n]["miembros"].agregar({"nombre": mn, "tipo": mty, "attrs": am, "tok": mt})
+                    si (_som_si(p, ",") == falso) { _som_si(p, ";") }
+                }
+                m["orden_structs"].agregar(n)
+                m["decl"].agregar(["struct", n])
+            } sino si (_som_si(p, "alias")) {
+                sea n = _som_ident(p)
+                _som_esperar(p, "=")
+                m["alias"][n] = _som_tipo(p, m)
+                _som_esperar(p, ";")
+            } sino si (_som_es(p, "const") o _som_es(p, "override")) {
+                sea es_over = _som_tomar(p)["v"] == "override"
+                sea n = _som_ident(p)
+                sea ty = nulo
+                si (_som_si(p, ":")) { ty = _som_tipo(p, m) }
+                sea v = nulo
+                si (_som_si(p, "=")) { v = _som_expr(p) }
+                _som_esperar(p, ";")
+                m["consts"][n] = {"nombre": n, "tipo": ty, "v": v, "tok": t, "override": es_over, "attrs": at}
+                m["orden_consts"].agregar(n)
+                m["decl"].agregar(["const", n])
+            } sino si (_som_si(p, "var")) {
+                sea espacio = "private"
+                sea acceso = nulo
+                si (_som_si(p, "<")) {
+                    espacio = _som_ident(p)
+                    si (_som_si(p, ",")) { acceso = _som_ident(p) }
+                    _som_esperar(p, ">")
+                }
+                sea n = _som_ident(p)
+                sea ty = nulo
+                si (_som_si(p, ":")) { ty = _som_tipo(p, m) }
+                sea v = nulo
+                si (_som_si(p, "=")) { v = _som_expr(p) }
+                _som_esperar(p, ";")
+                si (ty != nulo y (ty["k"] == "tex" o ty["k"] == "muestreador")) { espacio = "handle" }
+                sea g = nulo
+                sea b = nulo
+                si (tiene_clave(at, "group")) { g = _som_valor_constante(at["group"][0], m, t) }
+                si (tiene_clave(at, "binding")) { b = _som_valor_constante(at["binding"][0], m, t) }
+                si (espacio == "storage" y acceso == nulo) { acceso = "read" }
+                m["global_idx"][n] = longitud(m["globales"])
+                m["globales"].agregar({"nombre": n, "espacio": espacio, "acceso": acceso, "tipo": ty, "v": v, "grupo": g, "enlace": b, "tok": t})
+                m["decl"].agregar(["var", n])
+            } sino si (_som_si(p, "fn")) {
+                sea n = _som_ident(p)
+                _som_esperar(p, "(")
+                sea params = []
+                mientras (_som_si(p, ")") == falso) {
+                    sea pa = _som_atributos(p)
+                    sea pn = _som_ident(p)
+                    _som_esperar(p, ":")
+                    params.agregar({"nombre": pn, "tipo": _som_tipo(p, m), "attrs": pa})
+                    si (_som_si(p, ",") == falso) { _som_esperar(p, ")") _som_retroceder(p) }
+                }
+                sea ret = nulo
+                sea ra = {}
+                si (_som_si(p, "->")) {
+                    ra = _som_atributos(p)
+                    ret = _som_tipo(p, m)
+                }
+                sea etapa = nulo
+                para e en ["vertex", "fragment", "compute"] { si (tiene_clave(at, e)) { etapa = e } }
+                sea wg = nulo
+                si (tiene_clave(at, "workgroup_size")) {
+                    wg = []
+                    para x en at["workgroup_size"] { wg.agregar(_som_valor_constante(x, m, t)) }
+                    mientras (longitud(wg) < 3) { wg.agregar(1) }
+                }
+                sea f = {"nombre": n, "params": params, "ret": ret, "ret_attrs": ra, "etapa": etapa, "wg": wg, "tok": t, "cuerpo": nulo}
+                m["fn_idx"][n] = longitud(m["funciones"])
+                m["funciones"].agregar(f)
+                f["cuerpo"] = _som_bloque(p, m)
+                m["decl"].agregar(["fn", n])
+            } sino {
+                _som_error(t, "declaración inesperada '" + t["v"] + "'")
+            }
+        }
+    }
+    retornar m
+}
+
+funcion _som_bloque(p, m) {
+    _som_esperar(p, "{")
+    sea r = []
+    mientras (_som_si(p, "}") == falso) {
+        si (_som_ver(p)["k"] == "fin") { _som_error(_som_ver(p), "falta '}'") }
+        sea s = _som_sentencia(p, m)
+        si (s != nulo) { r.agregar(s) }
+    }
+    retornar r
+}
+
+funcion _som_sentencia(p, m) {
+    sea t = _som_ver(p)
+    _som_atributos(p)
+    si (_som_si(p, ";")) { retornar nulo }
+    si (_som_es(p, "{")) { retornar {"s": "bloque", "cuerpo": _som_bloque(p, m), "tok": t} }
+    si (_som_si(p, "let") o _som_es(p, "const")) {
+        si (_som_es(p, "const")) { _som_tomar(p) }
+        sea n = _som_ident(p)
+        sea ty = nulo
+        si (_som_si(p, ":")) { ty = _som_tipo(p, m) }
+        _som_esperar(p, "=")
+        sea v = _som_expr(p)
+        _som_esperar(p, ";")
+        retornar {"s": "let", "n": n, "t": ty, "v": v, "tok": t}
+    }
+    si (_som_si(p, "var")) {
+        si (_som_si(p, "<")) {
+            _som_ident(p)
+            _som_esperar(p, ">")
+        }
+        sea n = _som_ident(p)
+        sea ty = nulo
+        si (_som_si(p, ":")) { ty = _som_tipo(p, m) }
+        sea v = nulo
+        si (_som_si(p, "=")) { v = _som_expr(p) }
+        _som_esperar(p, ";")
+        retornar {"s": "var", "n": n, "t": ty, "v": v, "tok": t}
+    }
+    si (_som_si(p, "return")) {
+        sea v = nulo
+        si (_som_es(p, ";") == falso) { v = _som_expr(p) }
+        _som_esperar(p, ";")
+        retornar {"s": "return", "v": v, "tok": t}
+    }
+    si (_som_si(p, "if")) { retornar _som_si_sent(p, m, t) }
+    si (_som_si(p, "switch")) {
+        sea sel = _som_expr(p)
+        _som_esperar(p, "{")
+        sea casos = []
+        mientras (_som_si(p, "}") == falso) {
+            sea vals = []
+            sea defecto = falso
+            si (_som_si(p, "default")) { defecto = verdadero }
+            sino {
+                _som_esperar(p, "case")
+                mientras (_som_es(p, ":") == falso y _som_es(p, "{") == falso) {
+                    si (_som_si(p, "default")) { defecto = verdadero } sino { vals.agregar(_som_expr(p)) }
+                    _som_si(p, ",")
+                }
+            }
+            _som_si(p, ":")
+            casos.agregar({"valores": vals, "defecto": defecto, "cuerpo": _som_bloque(p, m)})
+        }
+        retornar {"s": "switch", "sel": sel, "casos": casos, "tok": t}
+    }
+    si (_som_si(p, "for")) {
+        _som_esperar(p, "(")
+        sea ini = nulo
+        si (_som_es(p, ";") == falso) { ini = _som_sentencia_simple(p, m) }
+        _som_esperar(p, ";")
+        sea c = nulo
+        si (_som_es(p, ";") == falso) { c = _som_expr(p) }
+        _som_esperar(p, ";")
+        sea paso = nulo
+        si (_som_es(p, ")") == falso) { paso = _som_sentencia_simple(p, m) }
+        _som_esperar(p, ")")
+        retornar {"s": "for", "ini": ini, "c": c, "paso": paso, "cuerpo": _som_bloque(p, m), "tok": t}
+    }
+    si (_som_si(p, "while")) {
+        sea c = _som_expr(p)
+        retornar {"s": "while", "c": c, "cuerpo": _som_bloque(p, m), "tok": t}
+    }
+    si (_som_si(p, "loop")) {
+        _som_esperar(p, "{")
+        sea cuerpo = []
+        sea cont = nulo
+        sea romper_si = nulo
+        mientras (_som_si(p, "}") == falso) {
+            si (_som_si(p, "continuing")) {
+                _som_esperar(p, "{")
+                cont = []
+                mientras (_som_si(p, "}") == falso) {
+                    si (_som_es(p, "break") y _som_ver2(p)["v"] == "if") {
+                        _som_tomar(p)
+                        _som_tomar(p)
+                        romper_si = _som_expr(p)
+                        _som_esperar(p, ";")
+                    } sino {
+                        sea s = _som_sentencia(p, m)
+                        si (s != nulo) { cont.agregar(s) }
+                    }
+                }
+            } sino {
+                sea s = _som_sentencia(p, m)
+                si (s != nulo) { cuerpo.agregar(s) }
+            }
+        }
+        retornar {"s": "loop", "cuerpo": cuerpo, "cont": cont ?? [], "romper_si": romper_si, "tok": t}
+    }
+    si (_som_si(p, "break")) {
+        _som_esperar(p, ";")
+        retornar {"s": "break", "tok": t}
+    }
+    si (_som_si(p, "continue")) {
+        _som_esperar(p, ";")
+        retornar {"s": "continue", "tok": t}
+    }
+    si (_som_si(p, "discard")) {
+        _som_esperar(p, ";")
+        retornar {"s": "discard", "tok": t}
+    }
+    sea s = _som_sentencia_simple(p, m)
+    _som_esperar(p, ";")
+    retornar s
+}
+
+funcion _som_si_sent(p, m, t) {
+    sea c = _som_expr(p)
+    sea a = _som_bloque(p, m)
+    sea b = nulo
+    si (_som_si(p, "else")) {
+        si (_som_si(p, "if")) { b = [_som_si_sent(p, m, _som_ver(p))] } sino { b = _som_bloque(p, m) }
+    }
+    retornar {"s": "if", "c": c, "a": a, "b": b, "tok": t}
+}
+
+// Asignación, ++/--, llamada o declaración (para los "for").
+funcion _som_sentencia_simple(p, m) {
+    sea t = _som_ver(p)
+    si (_som_es(p, "let") o _som_es(p, "var") o _som_es(p, "const")) {
+        // Reutiliza la sentencia completa sin el ';' final.
+        sea es_var = _som_tomar(p)["v"] == "var"
+        sea n = _som_ident(p)
+        sea ty = nulo
+        si (_som_si(p, ":")) { ty = _som_tipo(p, m) }
+        sea v = nulo
+        si (_som_si(p, "=")) { v = _som_expr(p) }
+        si (es_var) { retornar {"s": "var", "n": n, "t": ty, "v": v, "tok": t} }
+        retornar {"s": "let", "n": n, "t": ty, "v": v, "tok": t}
+    }
+    si (_som_es(p, "_") y _som_ver2(p)["v"] == "=") {
+        _som_tomar(p)
+        _som_tomar(p)
+        retornar {"s": "expr", "v": _som_expr(p), "tok": t}
+    }
+    sea l = _som_expr(p)
+    para op en ["=", "+=", "-=", "*=", "/=", "%=", "&=", "|=", "^=", "<<=", ">>="] {
+        si (_som_es(p, op)) {
+            _som_tomar(p)
+            retornar {"s": "asig", "op": op, "l": l, "r": _som_expr(p), "tok": t}
+        }
+    }
+    si (_som_si(p, "++")) { retornar {"s": "asig", "op": "+=", "l": l, "r": {"e": "lit", "v": 1, "tn": "abstracto_entero", "texto": "1", "flot": falso}, "tok": t} }
+    si (_som_si(p, "--")) { retornar {"s": "asig", "op": "-=", "l": l, "r": {"e": "lit", "v": 1, "tn": "abstracto_entero", "texto": "1", "flot": falso}, "tok": t} }
+    si (l["e"] != "call") { _som_error(t, "se esperaba una sentencia") }
+    retornar {"s": "expr", "v": l, "tok": t}
+}
+
+sea _SOM_PREC = [["||"], ["&&"], ["|"], ["^"], ["&"], ["==", "!="], ["<", ">", "<=", ">="], ["<<", ">>"], ["+", "-"], ["*", "/", "%"]]
+
+funcion _som_expr(p) { retornar _som_binario(p, 0, verdadero) }
+// Sin '>' en el nivel superior (dentro de array<T, N>).
+funcion _som_expr_sin_mayor(p) { retornar _som_binario(p, 8, verdadero) }
+
+funcion _som_binario(p, nivel, con_mayor) {
+    si (nivel >= longitud(_SOM_PREC)) { retornar _som_unario(p) }
+    sea a = _som_binario(p, nivel + 1, con_mayor)
+    mientras (verdadero) {
+        sea t = _som_ver(p)
+        sea op = nulo
+        si (t["k"] == "sim") { para o en _SOM_PREC[nivel] { si (t["v"] == o) { op = o } } }
+        si (op == nulo) { retornar a }
+        _som_tomar(p)
+        sea b = _som_binario(p, nivel + 1, con_mayor)
+        a = {"e": "bin", "op": op, "a": a, "b": b, "tok": t}
+    }
+}
+
+funcion _som_unario(p) {
+    sea t = _som_ver(p)
+    si (t["k"] == "sim" y (t["v"] == "-" o t["v"] == "!" o t["v"] == "~" o t["v"] == "&" o t["v"] == "*")) {
+        _som_tomar(p)
+        sea a = _som_unario(p)
+        // -literal se pliega.
+        si (t["v"] == "-" y a["e"] == "lit" y a["tn"] != "bool") {
+            retornar {"e": "lit", "v": 0 - a["v"], "tn": a["tn"], "texto": "-" + a["texto"], "flot": a["flot"], "tok": t}
+        }
+        retornar {"e": "un", "op": t["v"], "a": a, "tok": t}
+    }
+    retornar _som_postfijo(p)
+}
+
+funcion _som_postfijo(p) {
+    sea a = _som_primario(p)
+    mientras (verdadero) {
+        sea t = _som_ver(p)
+        si (_som_si(p, ".")) { a = {"e": "miembro", "a": a, "m": _som_ident(p), "tok": t} }
+        sino si (_som_si(p, "[")) {
+            sea i = _som_expr(p)
+            _som_esperar(p, "]")
+            a = {"e": "indice", "a": a, "i": i, "tok": t}
+        } sino { retornar a }
+    }
+}
+
+funcion _som_args(p) {
+    _som_esperar(p, "(")
+    sea r = []
+    mientras (_som_si(p, ")") == falso) {
+        r.agregar(_som_expr(p))
+        si (_som_si(p, ",") == falso) { _som_esperar(p, ")") _som_retroceder(p) }
+    }
+    retornar r
+}
+
+funcion _som_primario(p) {
+    sea t = _som_ver(p)
+    si (t["k"] == "num") {
+        _som_tomar(p)
+        retornar {"e": "lit", "v": t["v"], "tn": t["tn"], "texto": t["texto"], "flot": t["flot"], "tok": t}
+    }
+    si (_som_si(p, "(")) {
+        sea e = _som_expr(p)
+        _som_esperar(p, ")")
+        retornar {"e": "par", "a": e, "tok": t}
+    }
+    si (t["k"] != "id") { _som_error(t, "expresión inesperada '" + t["v"] + "'") }
+    si (t["v"] == "true" o t["v"] == "false") {
+        _som_tomar(p)
+        retornar {"e": "lit", "v": t["v"] == "true", "tn": "bool", "texto": t["v"], "flot": falso, "tok": t}
+    }
+    // ¿Constructor de tipo?
+    sea n = t["v"]
+    si (n == "vec2" o n == "vec3" o n == "vec4" o n == "array" o (texto_empieza_con(n, "mat") y longitud(n) == 6) o n == "bitcast") {
+        si (_som_ver2(p)["v"] == "<" o n == "array" o n == "bitcast") {
+            si (n == "bitcast") {
+                _som_tomar(p)
+                _som_esperar(p, "<")
+                sea bt = _som_tipo(p, p["m"])
+                _som_esperar(p, ">")
+                retornar {"e": "bitcast", "t": bt, "args": _som_args(p), "tok": t}
+            }
+            si (n == "array" y _som_ver2(p)["v"] != "<") {
+                _som_tomar(p)
+                retornar {"e": "cons", "t": nulo, "base": "array", "args": _som_args(p), "tok": t}
+            }
+            sea ty = _som_tipo(p, p["m"])
+            retornar {"e": "cons", "t": ty, "base": nulo, "args": _som_args(p), "tok": t}
+        }
+        _som_tomar(p)
+        retornar {"e": "cons", "t": nulo, "base": n, "args": _som_args(p), "tok": t}
+    }
+    si (tiene_clave(p["m"]["structs"], n) o tiene_clave(p["m"]["alias"], n) o tiene_clave(_SOM_ATAJOS, n) o n == "f32" o n == "i32" o n == "u32" o n == "bool") {
+        si (_som_ver2(p)["v"] == "(") {
+            sea ty = _som_tipo(p, p["m"])
+            retornar {"e": "cons", "t": ty, "base": nulo, "args": _som_args(p), "tok": t}
+        }
+    }
+    _som_tomar(p)
+    si (_som_es(p, "(")) { retornar {"e": "call", "f": n, "args": _som_args(p), "tok": t} }
+    retornar {"e": "id", "n": n, "tok": t}
+}
+
+// ---------- tipos de las expresiones ----------
+
+funcion _som_ambito_buscar(ctx, n) {
+    sea k = longitud(ctx["ambitos"]) - 1
+    mientras (k >= 0) {
+        si (tiene_clave(ctx["ambitos"][k], n)) { retornar ctx["ambitos"][k][n] }
+        k = k - 1
+    }
+    sea m = ctx["m"]
+    si (tiene_clave(m["global_idx"], n)) {
+        sea g = m["globales"][m["global_idx"][n]]
+        ctx["usadas"][n] = verdadero
+        retornar {"tipo": g["tipo"], "mutable": g["espacio"] != "uniform" y g["espacio"] != "handle" y g["acceso"] != "read", "clase": "global"}
+    }
+    si (tiene_clave(m["consts"], n)) { retornar {"tipo": m["consts"][n]["tipo_r"], "mutable": falso, "clase": "const"} }
+    retornar nulo
+}
+
+funcion _som_declarar(ctx, n, tipo_v, mutable, tok) {
+    sea am = ctx["ambitos"][longitud(ctx["ambitos"]) - 1]
+    si (tiene_clave(am, n)) { _som_error(tok, "'" + n + "' ya está declarado en este bloque") }
+    am[n] = {"tipo": tipo_v, "mutable": mutable, "clase": "local"}
+}
+
+sea _SOM_COMPONENTES = {"x": 0, "y": 1, "z": 2, "w": 3, "r": 0, "g": 1, "b": 2, "a": 3}
+
+funcion _som_es_numerico(t) { retornar t != nulo y (t["k"] == "esc" o t["k"] == "vec") y t["s"] != "bool" }
+
+// Une un tipo abstracto con uno concreto (para literales).
+funcion _som_unir(a, b, tok) {
+    si (_som_t_igual(a, b)) { retornar a }
+    sea sa = _som_escalar_de(a)
+    sea sb = _som_escalar_de(b)
+    si (sa == "abstracto_entero" y sb != nulo) { retornar b }
+    si (sb == "abstracto_entero" y sa != nulo) { retornar a }
+    retornar nulo
+}
+
+funcion _som_tipo_expr(ctx, e) {
+    sea t = _som_tipo_expr0(ctx, e)
+    e["ty"] = t
+    retornar t
+}
+
+// Fija el tipo concreto en literales abstractos (se escriben como i32/f32).
+funcion _som_fijar(e, t) {
+    si (e == nulo o t == nulo) { retornar nulo }
+    si (e["e"] == "lit" y e["tn"] == "abstracto_entero") {
+        sea s = _som_escalar_de(t)
+        si (s != nulo y s != "abstracto_entero") {
+            e["tn"] = s
+            e["ty"] = _som_t_esc(s)
+        }
+    }
+    si (e["e"] == "par") { _som_fijar(e["a"], t) e["ty"] = e["a"]["ty"] }
+    si (e["e"] == "cons" y e["t"] != nulo y _som_escalar_de(e["t"]) == "abstracto_entero") {
+        sea s = _som_escalar_de(t)
+        si (s != nulo y s != "abstracto_entero") {
+            e["t"] = _som_con_escalar(e["t"], s)
+            e["ty"] = e["t"]
+            para x en e["args"] { _som_fijar(x, _som_t_esc(s)) }
+        }
+    }
+    si (e["e"] == "un") { _som_fijar(e["a"], t) e["ty"] = e["a"]["ty"] }
+    si (e["e"] == "bin" y e["op"] != "<<" y e["op"] != ">>") {
+        si (_som_escalar_de(e["ty"] ?? _som_t_esc("f32")) == "abstracto_entero") {
+            _som_fijar(e["a"], t)
+            _som_fijar(e["b"], t)
+            e["ty"] = _som_con_escalar(e["ty"], _som_escalar_de(t))
+        }
+    }
+}
+
+funcion _som_tipo_expr0(ctx, e) {
+    sea k = e["e"]
+    si (k == "lit") {
+        si (e["tn"] == "bool") { retornar _som_t_esc("bool") }
+        retornar _som_t_esc(e["tn"])
+    }
+    si (k == "par") { retornar _som_tipo_expr(ctx, e["a"]) }
+    si (k == "id") {
+        sea v = _som_ambito_buscar(ctx, e["n"])
+        si (v == nulo) { _som_error(e["tok"], "nombre desconocido '" + e["n"] + "'") }
+        e["clase"] = v["clase"]
+        retornar v["tipo"]
+    }
+    si (k == "un") {
+        sea a = _som_tipo_expr(ctx, e["a"])
+        si (e["op"] == "&" o e["op"] == "*") {
+            e["clase"] = e["a"]["clase"] ?? nulo
+            retornar a
+        }
+        si (e["op"] == "!" y _som_escalar_de(a) != "bool") { _som_error(e["tok"], "'!' necesita bool") }
+        si (e["op"] == "-" y _som_es_numerico(a) == falso y a["k"] != "mat") { _som_error(e["tok"], "'-' necesita un número") }
+        retornar a
+    }
+    si (k == "bin") { retornar _som_tipo_bin(ctx, e) }
+    si (k == "miembro") {
+        sea a = _som_tipo_expr(ctx, e["a"])
+        si (a["k"] == "struct") {
+            para mm en ctx["m"]["structs"][a["nombre"]]["miembros"] { si (mm["nombre"] == e["m"]) { retornar mm["tipo"] } }
+            _som_error(e["tok"], "la estructura " + a["nombre"] + " no tiene '" + e["m"] + "'")
+        }
+        si (a["k"] == "vec") {
+            sea n = longitud(e["m"])
+            si (n > 4) { _som_error(e["tok"], "swizzle demasiado largo") }
+            sea i = 0
+            mientras (i < n) {
+                sea c = _SOM_COMPONENTES[subtexto(e["m"], i, i + 1)] ?? -1
+                si (c < 0 o c >= a["n"]) { _som_error(e["tok"], "componente '" + subtexto(e["m"], i, i + 1) + "' fuera de " + _som_t_txt(a)) }
+                i = i + 1
+            }
+            si (n == 1) { retornar _som_t_esc(a["s"]) }
+            retornar _som_t_vec(n, a["s"])
+        }
+        _som_error(e["tok"], "no se puede usar '." + e["m"] + "' en " + _som_t_txt(a))
+    }
+    si (k == "indice") {
+        sea a = _som_tipo_expr(ctx, e["a"])
+        sea i = _som_tipo_expr(ctx, e["i"])
+        si (_som_escalar_de(i) == nulo o i["k"] != "esc" o i["s"] == "f32" o i["s"] == "bool") { _som_error(e["tok"], "el índice debe ser entero") }
+        _som_fijar(e["i"], _som_t_esc("i32"))
+        si (a["k"] == "arr") { retornar a["t"] }
+        si (a["k"] == "vec") { retornar _som_t_esc(a["s"]) }
+        si (a["k"] == "mat") { retornar _som_t_vec(a["f"], "f32") }
+        _som_error(e["tok"], "no se puede indexar " + _som_t_txt(a))
+    }
+    si (k == "cons") { retornar _som_tipo_cons(ctx, e) }
+    si (k == "bitcast") {
+        para x en e["args"] { _som_tipo_expr(ctx, x) }
+        retornar e["t"]
+    }
+    si (k == "call") { retornar _som_tipo_llamada(ctx, e) }
+    _som_error(e["tok"], "expresión desconocida")
+}
+
+funcion _som_tipo_bin(ctx, e) {
+    sea a = _som_tipo_expr(ctx, e["a"])
+    sea b = _som_tipo_expr(ctx, e["b"])
+    sea op = e["op"]
+    si (op == "&&" o op == "||") {
+        si (_som_escalar_de(a) != "bool" o _som_escalar_de(b) != "bool") { _som_error(e["tok"], "'" + op + "' necesita bool") }
+        retornar _som_t_esc("bool")
+    }
+    si (op == "<<" o op == ">>") {
+        _som_fijar(e["b"], _som_con_escalar(b, "u32"))
+        retornar a
+    }
+    // Matrices.
+    si (op == "*" y (a["k"] == "mat" o b["k"] == "mat")) {
+        si (a["k"] == "mat" y b["k"] == "vec") {
+            si (a["c"] != b["n"]) { _som_error(e["tok"], "matriz por vector de tamaños distintos") }
+            retornar _som_t_vec(a["f"], "f32")
+        }
+        si (a["k"] == "vec" y b["k"] == "mat") { retornar _som_t_vec(b["c"], "f32") }
+        si (a["k"] == "mat" y b["k"] == "mat") { retornar _som_t_mat(b["c"], a["f"]) }
+        si (a["k"] == "mat") {
+            _som_fijar(e["b"], _som_t_esc("f32"))
+            retornar a
+        }
+        _som_fijar(e["a"], _som_t_esc("f32"))
+        retornar b
+    }
+    si ((op == "+" o op == "-") y a["k"] == "mat" y b["k"] == "mat") { retornar a }
+    si (_som_es_numerico(a) == falso y op != "==" y op != "!=" y op != "&" y op != "|" y op != "^") { _som_error(e["tok"], "'" + op + "' no se aplica a " + _som_t_txt(a)) }
+    // Literales abstractos toman el tipo del otro lado.
+    sea sa = _som_escalar_de(a)
+    sea sb = _som_escalar_de(b)
+    si (sa == "abstracto_entero" y sb != "abstracto_entero") {
+        _som_fijar(e["a"], b)
+        a = _som_con_escalar(a, sb)
+        sa = sb
+    }
+    si (sb == "abstracto_entero" y sa != "abstracto_entero") {
+        _som_fijar(e["b"], a)
+        b = _som_con_escalar(b, sa)
+        sb = sa
+    }
+    si (sa != sb) { _som_error(e["tok"], "tipos distintos en '" + op + "': " + _som_t_txt(a) + " y " + _som_t_txt(b)) }
+    si (a["k"] == "vec" y b["k"] == "vec" y a["n"] != b["n"]) { _som_error(e["tok"], "vectores de tamaños distintos en '" + op + "'") }
+    sea r = a
+    si (b["k"] == "vec") { r = b }
+    e["vecesc"] = a["k"] != b["k"]
+    si (op == "==" o op == "!=" o op == "<" o op == ">" o op == "<=" o op == ">=") { retornar _som_con_escalar(r, "bool") }
+    retornar r
+}
+
+funcion _som_tipo_cons(ctx, e) {
+    sea ts = []
+    para x en e["args"] { ts.agregar(_som_tipo_expr(ctx, x)) }
+    sea t = e["t"]
+    si (t == nulo) {
+        // vec3(…) o array(…): el tipo sale de los argumentos.
+        sea b = e["base"]
+        si (b == "array") {
+            si (longitud(ts) == 0) { _som_error(e["tok"], "array() vacío") }
+            sea el = _som_concreto(ts[0])
+            para x en e["args"] { _som_fijar(x, el) }
+            t = {"k": "arr", "t": el, "n": longitud(ts)}
+        } sino si (texto_empieza_con(b, "vec")) {
+            sea s = "f32"
+            // Todo literal entero: queda abstracto hasta saber el tipo (vec3(1, 1, 1)).
+            si (longitud(ts) > 0) { s = _som_escalar_de(ts[0]) ?? "f32" }
+            para x en ts { si (_som_escalar_de(x) != "abstracto_entero" y _som_escalar_de(x) != nulo) { s = _som_escalar_de(x) } }
+            t = _som_t_vec(a_numero(subtexto(b, 3, 4)), s)
+        } sino {
+            t = _som_t_mat(a_numero(subtexto(b, 3, 4)), a_numero(subtexto(b, 5, 6)))
+        }
+        e["t"] = t
+    }
+    si (t["k"] == "esc") {
+        si (longitud(ts) > 1) { _som_error(e["tok"], "conversión con más de un argumento") }
+        para x en e["args"] { _som_fijar(x, t) }
+        retornar t
+    }
+    si (t["k"] == "vec") {
+        sea n = 0
+        para x en ts {
+            si (x["k"] == "vec") { n = n + x["n"] } sino { n = n + 1 }
+        }
+        si (longitud(ts) > 0 y n != t["n"] y n != 1) { _som_error(e["tok"], "vec" + t["n"] + " con " + n + " componentes") }
+        para x en e["args"] { _som_fijar(x, _som_t_esc(t["s"])) }
+        retornar t
+    }
+    si (t["k"] == "mat") {
+        para x en e["args"] { _som_fijar(x, _som_t_esc("f32")) }
+        retornar t
+    }
+    si (t["k"] == "struct") {
+        sea ms = ctx["m"]["structs"][t["nombre"]]["miembros"]
+        si (longitud(ts) > 0 y longitud(ts) != longitud(ms)) { _som_error(e["tok"], t["nombre"] + " tiene " + longitud(ms) + " miembros") }
+        sea i = 0
+        mientras (i < longitud(ts)) {
+            _som_fijar(e["args"][i], ms[i]["tipo"])
+            i = i + 1
+        }
+        retornar t
+    }
+    si (t["k"] == "arr") {
+        para x en e["args"] { _som_fijar(x, t["t"]) }
+        retornar t
+    }
+    _som_error(e["tok"], "no se puede construir " + _som_t_txt(t))
+}
+
+// Funciones incorporadas: devuelven el tipo del resultado.
+sea _SOM_IGUAL_ARG0 = ["abs", "sin", "cos", "tan", "asin", "acos", "atan", "sinh", "cosh", "tanh", "asinh", "acosh", "atanh", "exp", "exp2", "log", "log2",
+    "sqrt", "inverseSqrt", "floor", "ceil", "round", "fract", "trunc", "sign", "saturate", "normalize", "radians", "degrees", "dpdx", "dpdy", "fwidth",
+    "dpdxCoarse", "dpdyCoarse", "dpdxFine", "dpdyFine", "fwidthCoarse", "fwidthFine", "min", "max", "clamp", "mix", "step", "smoothstep", "pow", "atan2",
+    "fma", "reflect", "refract", "faceForward", "countOneBits", "reverseBits", "firstLeadingBit", "firstTrailingBit", "extractBits", "insertBits", "ldexp",
+    "quantizeToF16"]
+
+funcion _som_tipo_llamada(ctx, e) {
+    sea f = e["f"]
+    sea ts = []
+    para x en e["args"] { ts.agregar(_som_tipo_expr(ctx, x)) }
+    sea n = longitud(ts)
+    sea m = ctx["m"]
+    si (tiene_clave(m["fn_idx"], f)) {
+        sea fd = m["funciones"][m["fn_idx"][f]]
+        si (n != longitud(fd["params"])) { _som_error(e["tok"], f + " espera " + longitud(fd["params"]) + " argumentos") }
+        sea i = 0
+        mientras (i < n) {
+            _som_fijar(e["args"][i], fd["params"][i]["tipo"])
+            si (_som_unir(ts[i], fd["params"][i]["tipo"], e["tok"]) == nulo) { _som_error(e["tok"], "argumento " + (i + 1) + " de " + f + ": se esperaba " + _som_t_txt(fd["params"][i]["tipo"]) + " y llegó " + _som_t_txt(ts[i])) }
+            i = i + 1
+        }
+        ctx["llamadas"][f] = verdadero
+        e["usuario"] = verdadero
+        retornar fd["ret"]
+    }
+    e["usuario"] = falso
+    si (contiene(_SOM_IGUAL_ARG0, f)) {
+        si (n == 0) { _som_error(e["tok"], f + " sin argumentos") }
+        // El primer argumento concreto decide.
+        sea t = nulo
+        para x en ts { si (t == nulo y _som_escalar_de(x) != "abstracto_entero") { t = x } }
+        si (t == nulo) { t = _som_concreto(ts[0]) }
+        // Vector si alguno lo es (mix(a, b, 0.5), clamp(v, 0.0, 1.0)).
+        para x en ts { si (x["k"] == "vec" y t["k"] != "vec" y f != "ldexp") { t = _som_con_escalar(x, _som_escalar_de(t)) } }
+        si (f == "mix" o f == "smoothstep" o f == "step" o f == "clamp" o f == "min" o f == "max" o f == "pow" o f == "atan2" o f == "fma") {
+            para x en e["args"] { _som_fijar(x, t) }
+        } sino { _som_fijar(e["args"][0], t) }
+        si (f == "insertBits" o f == "extractBits") {
+            _som_fijar(e["args"][n - 1], _som_t_esc("u32"))
+            _som_fijar(e["args"][n - 2], _som_t_esc("u32"))
+        }
+        retornar t
+    }
+    si (f == "dot") {
+        si (n != 2 o ts[0]["k"] != "vec") { _som_error(e["tok"], "dot necesita dos vectores") }
+        retornar _som_t_esc(ts[0]["s"])
+    }
+    si (f == "length" o f == "distance") { retornar _som_t_esc(_som_escalar_de(_som_concreto(ts[0])) ?? "f32") }
+    si (f == "cross") { retornar _som_t_vec(3, ts[0]["s"]) }
+    si (f == "determinant") { retornar _som_t_esc("f32") }
+    si (f == "transpose") { retornar _som_t_mat(ts[0]["f"], ts[0]["c"]) }
+    si (f == "all" o f == "any") { retornar _som_t_esc("bool") }
+    si (f == "select") {
+        si (n != 3) { _som_error(e["tok"], "select(falso, verdadero, condición)") }
+        sea t = _som_concreto(ts[0])
+        si (_som_escalar_de(ts[0]) == "abstracto_entero") { t = _som_concreto(ts[1]) }
+        _som_fijar(e["args"][0], t)
+        _som_fijar(e["args"][1], t)
+        retornar t
+    }
+    si (f == "arrayLength") { retornar _som_t_esc("u32") }
+    si (f == "textureSample" o f == "textureSampleBias" o f == "textureSampleGrad" o f == "textureSampleLevel" o f == "textureLoad" o f == "textureGather") {
+        si (n < 2 o ts[0]["k"] != "tex") { _som_error(e["tok"], f + ": el primer argumento debe ser una textura") }
+        si (f == "textureLoad") { para x en e["args"] { si (x != e["args"][0]) { _som_fijar(x, _som_t_esc("i32")) } } }
+        si (ts[0]["prof"] y f != "textureGather") { retornar _som_t_esc("f32") }
+        retornar _som_t_vec(4, ts[0]["s"])
+    }
+    si (f == "textureSampleCompare" o f == "textureSampleCompareLevel") { retornar _som_t_esc("f32") }
+    si (f == "textureDimensions") {
+        sea d = ts[0]["dim"]
+        si (d == "1d") { retornar _som_t_esc("u32") }
+        si (d == "3d") { retornar _som_t_vec(3, "u32") }
+        retornar _som_t_vec(2, "u32")
+    }
+    si (f == "textureNumLayers" o f == "textureNumLevels" o f == "textureNumSamples") { retornar _som_t_esc("u32") }
+    si (f == "textureStore") {
+        para x en e["args"] { si (x != e["args"][0] y x != e["args"][n - 1]) { _som_fijar(x, _som_t_esc("i32")) } }
+        retornar nulo
+    }
+    si (f == "workgroupBarrier" o f == "storageBarrier" o f == "textureBarrier") { retornar nulo }
+    si (texto_empieza_con(f, "atomic")) {
+        si (f == "atomicStore") { retornar nulo }
+        retornar _som_t_esc(ts[0]["s"])
+    }
+    si (f == "pack4x8unorm" o f == "pack4x8snorm" o f == "pack2x16float" o f == "pack2x16unorm" o f == "pack2x16snorm") { retornar _som_t_esc("u32") }
+    si (f == "unpack4x8unorm" o f == "unpack4x8snorm") { retornar _som_t_vec(4, "f32") }
+    si (f == "unpack2x16float" o f == "unpack2x16unorm" o f == "unpack2x16snorm") { retornar _som_t_vec(2, "f32") }
+    _som_error(e["tok"], "función desconocida '" + f + "'")
+}
+
+// Revisa sentencias y anota tipos.
+funcion _som_revisar_bloque(ctx, cuerpo) {
+    ctx["ambitos"].agregar({})
+    para s en cuerpo { _som_revisar(ctx, s) }
+    sea nuevo = []
+    sea k = 0
+    mientras (k < longitud(ctx["ambitos"]) - 1) {
+        nuevo.agregar(ctx["ambitos"][k])
+        k = k + 1
+    }
+    ctx["ambitos"] = nuevo
+}
+
+funcion _som_raiz_lvalor(e) {
+    si (e["e"] == "id") { retornar e }
+    si (e["e"] == "miembro" o e["e"] == "indice") { retornar _som_raiz_lvalor(e["a"]) }
+    si (e["e"] == "par" o e["e"] == "un") { retornar _som_raiz_lvalor(e["a"]) }
+    retornar nulo
+}
+
+funcion _som_revisar(ctx, s) {
+    sea k = s["s"]
+    si (k == "let" o k == "var") {
+        sea t = s["t"]
+        si (s["v"] != nulo) {
+            sea tv = _som_tipo_expr(ctx, s["v"])
+            si (t == nulo) { t = _som_concreto(tv) }
+            _som_fijar(s["v"], t)
+            si (_som_unir(t, tv, s["tok"]) == nulo) { _som_error(s["tok"], "'" + s["n"] + "' es " + _som_t_txt(t) + " pero se le da " + _som_t_txt(tv)) }
+        }
+        si (t == nulo) { _som_error(s["tok"], "'" + s["n"] + "' necesita tipo o valor") }
+        s["t"] = t
+        _som_declarar(ctx, s["n"], t, k == "var", s["tok"])
+        retornar nulo
+    }
+    si (k == "asig") {
+        sea tl = _som_tipo_expr(ctx, s["l"])
+        sea tr = _som_tipo_expr(ctx, s["r"])
+        _som_fijar(s["r"], tl)
+        sea raiz_l = _som_raiz_lvalor(s["l"])
+        si (raiz_l == nulo) { _som_error(s["tok"], "no se puede asignar a esa expresión") }
+        sea v = _som_ambito_buscar(ctx, raiz_l["n"])
+        si (v["mutable"] == falso) { _som_error(s["tok"], "'" + raiz_l["n"] + "' no se puede cambiar") }
+        si (raiz_l["clase"] == "global") { ctx["escritas"][raiz_l["n"]] = verdadero }
+        si (s["op"] == "=" y _som_unir(tl, tr, s["tok"]) == nulo) { _som_error(s["tok"], "se asigna " + _som_t_txt(tr) + " a " + _som_t_txt(tl)) }
+        retornar nulo
+    }
+    si (k == "expr") {
+        _som_tipo_expr(ctx, s["v"])
+        retornar nulo
+    }
+    si (k == "return") {
+        si (s["v"] != nulo) {
+            sea t = _som_tipo_expr(ctx, s["v"])
+            _som_fijar(s["v"], ctx["fn"]["ret"])
+            si (ctx["fn"]["ret"] == nulo) { _som_error(s["tok"], ctx["fn"]["nombre"] + " no devuelve nada") }
+            si (_som_unir(t, ctx["fn"]["ret"], s["tok"]) == nulo) { _som_error(s["tok"], "se devuelve " + _som_t_txt(t) + " y la función da " + _som_t_txt(ctx["fn"]["ret"])) }
+        } sino si (ctx["fn"]["ret"] != nulo) { _som_error(s["tok"], "falta el valor de return") }
+        retornar nulo
+    }
+    si (k == "if") {
+        si (_som_escalar_de(_som_tipo_expr(ctx, s["c"])) != "bool" o s["c"]["ty"]["k"] != "esc") { _som_error(s["tok"], "la condición del if debe ser bool") }
+        _som_revisar_bloque(ctx, s["a"])
+        si (s["b"] != nulo) { _som_revisar_bloque(ctx, s["b"]) }
+        retornar nulo
+    }
+    si (k == "bloque") {
+        _som_revisar_bloque(ctx, s["cuerpo"])
+        retornar nulo
+    }
+    si (k == "switch") {
+        sea ts = _som_concreto(_som_tipo_expr(ctx, s["sel"]))
+        _som_fijar(s["sel"], ts)
+        para c en s["casos"] {
+            para v en c["valores"] {
+                _som_tipo_expr(ctx, v)
+                _som_fijar(v, ts)
+            }
+            ctx["dentro"] = ctx["dentro"] + 1
+            _som_revisar_bloque(ctx, c["cuerpo"])
+            ctx["dentro"] = ctx["dentro"] - 1
+        }
+        retornar nulo
+    }
+    si (k == "for") {
+        ctx["ambitos"].agregar({})
+        si (s["ini"] != nulo) { _som_revisar(ctx, s["ini"]) }
+        si (s["c"] != nulo) { _som_tipo_expr(ctx, s["c"]) }
+        si (s["paso"] != nulo) { _som_revisar(ctx, s["paso"]) }
+        ctx["dentro"] = ctx["dentro"] + 1
+        _som_revisar_bloque(ctx, s["cuerpo"])
+        ctx["dentro"] = ctx["dentro"] - 1
+        sea nuevo = []
+        sea i = 0
+        mientras (i < longitud(ctx["ambitos"]) - 1) {
+            nuevo.agregar(ctx["ambitos"][i])
+            i = i + 1
+        }
+        ctx["ambitos"] = nuevo
+        retornar nulo
+    }
+    si (k == "while") {
+        _som_tipo_expr(ctx, s["c"])
+        ctx["dentro"] = ctx["dentro"] + 1
+        _som_revisar_bloque(ctx, s["cuerpo"])
+        ctx["dentro"] = ctx["dentro"] - 1
+        retornar nulo
+    }
+    si (k == "loop") {
+        ctx["dentro"] = ctx["dentro"] + 1
+        // continuing ve las variables del cuerpo.
+        ctx["ambitos"].agregar({})
+        para x en s["cuerpo"] { _som_revisar(ctx, x) }
+        para x en s["cont"] { _som_revisar(ctx, x) }
+        si (s["romper_si"] != nulo) { _som_tipo_expr(ctx, s["romper_si"]) }
+        sea nuevo = []
+        sea i = 0
+        mientras (i < longitud(ctx["ambitos"]) - 1) {
+            nuevo.agregar(ctx["ambitos"][i])
+            i = i + 1
+        }
+        ctx["ambitos"] = nuevo
+        ctx["dentro"] = ctx["dentro"] - 1
+        retornar nulo
+    }
+    si (k == "break" o k == "continue") {
+        si (ctx["dentro"] == 0) { _som_error(s["tok"], k + " fuera de un bucle") }
+        retornar nulo
+    }
+    si (k == "discard") {
+        ctx["descarta"] = verdadero
+        retornar nulo
+    }
+}
+
+// Analiza todo el módulo: tipos de constantes, funciones y globales usadas.
+funcion _som_analizar(m) {
+    para n en m["orden_consts"] {
+        sea c = m["consts"][n]
+        sea ctx = {"m": m, "ambitos": [{}], "usadas": {}, "escritas": {}, "llamadas": {}, "dentro": 0, "fn": nulo, "descarta": falso}
+        si (c["v"] == nulo) {
+            si (c["tipo"] == nulo) { _som_error(c["tok"], "'" + n + "' necesita tipo o valor") }
+            c["tipo_r"] = c["tipo"]
+        } sino {
+            sea t = _som_tipo_expr(ctx, c["v"])
+            sea tf = c["tipo"] ?? _som_concreto(t)
+            _som_fijar(c["v"], tf)
+            c["tipo_r"] = tf
+        }
+    }
+    para g en m["globales"] {
+        si (g["tipo"] == nulo) {
+            si (g["v"] == nulo) { _som_error(g["tok"], "'" + g["nombre"] + "' necesita tipo") }
+            sea ctx = {"m": m, "ambitos": [{}], "usadas": {}, "escritas": {}, "llamadas": {}, "dentro": 0, "fn": nulo, "descarta": falso}
+            g["tipo"] = _som_concreto(_som_tipo_expr(ctx, g["v"]))
+        } sino si (g["v"] != nulo) {
+            sea ctx = {"m": m, "ambitos": [{}], "usadas": {}, "escritas": {}, "llamadas": {}, "dentro": 0, "fn": nulo, "descarta": falso}
+            _som_tipo_expr(ctx, g["v"])
+            _som_fijar(g["v"], g["tipo"])
+        }
+        si ((g["espacio"] == "uniform" o g["espacio"] == "storage" o g["espacio"] == "handle") y (g["grupo"] == nulo o g["enlace"] == nulo)) {
+            _som_error(g["tok"], "'" + g["nombre"] + "' necesita @group y @binding")
+        }
+    }
+    para f en m["funciones"] {
+        sea ctx = {"m": m, "ambitos": [{}], "usadas": {}, "escritas": {}, "llamadas": {}, "dentro": 0, "fn": f, "descarta": falso}
+        para pa en f["params"] { _som_declarar(ctx, pa["nombre"], pa["tipo"], falso, f["tok"]) }
+        _som_revisar_bloque(ctx, f["cuerpo"])
+        f["usadas"] = ctx["usadas"]
+        f["escritas"] = ctx["escritas"]
+        f["llamadas"] = ctx["llamadas"]
+        f["descarta"] = ctx["descarta"]
+        si (f["ret"] != nulo y _som_termina(f["cuerpo"]) == falso) { _som_error(f["tok"], f["nombre"] + " puede terminar sin return") }
+        si (f["etapa"] == "compute" y f["wg"] == nulo) { _som_error(f["tok"], f["nombre"] + " necesita @workgroup_size") }
+    }
+    // Globales usadas por cada función, contando las que llama.
+    sea cambio = verdadero
+    mientras (cambio) {
+        cambio = falso
+        para f en m["funciones"] {
+            para c en claves(f["llamadas"]) {
+                sea g = m["funciones"][m["fn_idx"][c]]
+                para u en claves(g["usadas"]) {
+                    si (tiene_clave(f["usadas"], u) == falso) {
+                        f["usadas"][u] = verdadero
+                        cambio = verdadero
+                    }
+                }
+                para u en claves(g["escritas"]) { si (tiene_clave(f["escritas"], u) == falso) { f["escritas"][u] = verdadero cambio = verdadero } }
+            }
+        }
+    }
+    retornar m
+}
+
+// ¿Todas las ramas terminan en return (o discard)?
+funcion _som_termina(cuerpo) {
+    si (longitud(cuerpo) == 0) { retornar falso }
+    sea u = cuerpo[longitud(cuerpo) - 1]
+    si (u["s"] == "return" o u["s"] == "discard") { retornar verdadero }
+    si (u["s"] == "if") { retornar u["b"] != nulo y _som_termina(u["a"]) y _som_termina(u["b"]) }
+    si (u["s"] == "bloque") { retornar _som_termina(u["cuerpo"]) }
+    si (u["s"] == "loop") {
+        // Un loop sin break solo sale con return.
+        retornar _som_tiene_break(u["cuerpo"]) == falso y u["romper_si"] == nulo
+    }
+    si (u["s"] == "switch") {
+        sea hay_def = falso
+        para c en u["casos"] {
+            si (c["defecto"]) { hay_def = verdadero }
+            si (_som_termina(c["cuerpo"]) == falso) { retornar falso }
+        }
+        retornar hay_def
+    }
+    retornar falso
+}
+
+funcion _som_tiene_break(cuerpo) {
+    para s en cuerpo {
+        si (s["s"] == "break") { retornar verdadero }
+        si (s["s"] == "if" y (_som_tiene_break(s["a"]) o (s["b"] != nulo y _som_tiene_break(s["b"])))) { retornar verdadero }
+        si (s["s"] == "bloque" y _som_tiene_break(s["cuerpo"])) { retornar verdadero }
+    }
+    retornar falso
+}
+
+// ---------- escritura ----------
+
+sea _SOM_T0 = {"1d": "1D", "2d": "2D", "3d": "3D", "cube": "Cube"}
+sea _SOM_T1 = {"f32": "", "i32": "i", "u32": "u"}
+sea _SOM_T2 = {"1d": "texture1d", "2d": "texture2d", "3d": "texture3d", "cube": "texturecube"}
+sea _SOM_T3 = {"2d": "depth2d", "cube": "depthcube"}
+sea _SOM_T4 = {"f32": "0.0", "i32": "0", "u32": "0u", "bool": "false"}
+sea _SOM_T5 = {"f32": "asfloat", "i32": "asint", "u32": "asuint"}
+sea _SOM_T6 = {"<": "lessThan", ">": "greaterThan", "<=": "lessThanEqual", ">=": "greaterThanEqual", "==": "equal", "!=": "notEqual"}
+sea _SOM_T7 = {"atomicAdd": "fetch_add", "atomicSub": "fetch_sub", "atomicMin": "fetch_min", "atomicMax": "fetch_max", "atomicAnd": "fetch_and",
+    "atomicOr": "fetch_or", "atomicXor": "fetch_xor", "atomicExchange": "exchange"}
+
+sea _SOM_RESERVADAS = {
+    "glsl": ["attribute", "const", "uniform", "varying", "buffer", "shared", "coherent", "volatile", "restrict", "readonly", "writeonly", "atomic_uint", "layout",
+        "centroid", "flat", "smooth", "noperspective", "patch", "sample", "break", "continue", "do", "for", "while", "switch", "case", "default", "if", "else",
+        "subroutine", "in", "out", "inout", "float", "double", "int", "void", "bool", "true", "false", "invariant", "precise", "discard", "return", "mat2",
+        "mat3", "mat4", "vec2", "vec3", "vec4", "ivec2", "ivec3", "ivec4", "bvec2", "bvec3", "bvec4", "uint", "uvec2", "uvec3", "uvec4", "lowp", "mediump",
+        "highp", "precision", "sampler", "texture", "struct", "main", "input", "output", "filter", "common", "partition", "active", "asm", "class", "union",
+        "enum", "typedef", "template", "this", "goto", "inline", "noinline", "public", "static", "extern", "external", "interface", "long", "short", "half",
+        "fixed", "unsigned", "superp", "cast", "namespace", "using", "sizeof", "texture2D", "sampler2D", "mix", "dot", "length", "image2D"],
+    "msl": ["auto", "break", "case", "char", "const", "constant", "continue", "default", "device", "do", "double", "else", "enum", "extern", "float", "for",
+        "fragment", "goto", "half", "if", "inline", "int", "kernel", "long", "main", "namespace", "private", "protected", "public", "register", "return",
+        "short", "signed", "sizeof", "static", "struct", "switch", "template", "this", "thread", "threadgroup", "typedef", "union", "unsigned", "using",
+        "vertex", "virtual", "void", "volatile", "while", "class", "delete", "new", "operator", "sampler", "texture", "uint", "bool", "true", "false", "metal",
+        "and", "or", "not", "xor", "friend", "mutable", "explicit", "export", "typename", "catch", "throw", "try", "assert", "alignas", "alignof", "decltype",
+        "nullptr", "override", "final", "noexcept"],
+    "hlsl": ["AppendStructuredBuffer", "asm", "BlendState", "bool", "break", "Buffer", "ByteAddressBuffer", "case", "cbuffer", "centroid", "class", "column_major",
+        "compile", "const", "continue", "default", "discard", "do", "double", "else", "export", "extern", "false", "float", "for", "fxgroup", "groupshared",
+        "half", "if", "in", "inline", "inout", "int", "interface", "line", "lineadj", "linear", "matrix", "min16float", "namespace", "nointerpolation",
+        "noperspective", "out", "packoffset", "pass", "point", "precise", "register", "return", "row_major", "sample", "sampler", "SamplerState", "shared",
+        "snorm", "static", "string", "struct", "switch", "tbuffer", "technique", "texture", "Texture2D", "triangle", "true", "typedef", "uniform", "unorm",
+        "unsigned", "vector", "vertexfragment", "void", "volatile", "while", "uint", "main", "input", "output", "sizeof", "template", "this", "using", "lerp", "mul", "frac"],
+    "wgsl": []}
+
+funcion _som_n(ctx, n) {
+    si (contiene(ctx["reservadas"], n) o texto_empieza_con(n, "gl_") o texto_empieza_con(n, "__")) { retornar n + "_" }
+    retornar n
+}
+
+sea _SOM_PREF_VEC = {"glsl": {"f32": "", "i32": "i", "u32": "u", "bool": "b"}}
+sea _SOM_ESC = {"glsl": {"f32": "float", "i32": "int", "u32": "uint", "bool": "bool"}, "msl": {"f32": "float", "i32": "int", "u32": "uint", "bool": "bool"},
+    "hlsl": {"f32": "float", "i32": "int", "u32": "uint", "bool": "bool"}}
+
+funcion _som_tn(ctx, t) {
+    sea d = ctx["destino"]
+    si (t == nulo) { retornar "void" }
+    si (d == "wgsl") { retornar _som_t_txt(t) }
+    sea k = t["k"]
+    si (k == "esc") { retornar _SOM_ESC[d][t["s"]] ?? "int" }
+    si (k == "vec") {
+        si (d == "glsl") { retornar _SOM_PREF_VEC["glsl"][t["s"]] + "vec" + t["n"] }
+        retornar _SOM_ESC[d][t["s"]] + t["n"]
+    }
+    si (k == "mat") {
+        si (d == "glsl") {
+            si (t["c"] == t["f"]) { retornar "mat" + t["c"] }
+            retornar "mat" + t["c"] + "x" + t["f"]
+        }
+        retornar "float" + t["c"] + "x" + t["f"]
+    }
+    si (k == "struct") { retornar _som_n(ctx, t["nombre"]) }
+    si (k == "arr") {
+        si (d == "glsl") {
+            si (t["n"] == nulo) { retornar _som_tn(ctx, t["t"]) + "[]" }
+            retornar _som_tn(ctx, t["t"]) + "[" + t["n"] + "]"
+        }
+        si (d == "msl") {
+            si (t["n"] == nulo) { retornar _som_tn(ctx, t["t"]) + "*" }
+            retornar "metal::array<" + _som_tn(ctx, t["t"]) + ", " + t["n"] + ">"
+        }
+        // HLSL: el tamaño va en el declarador (ver _sb_decl).
+        retornar _som_tn(ctx, t["t"])
+    }
+    si (k == "atomico") {
+        si (d == "glsl" o d == "hlsl") { retornar _SOM_ESC[d][t["s"]] }
+        retornar "metal::atomic_" + _SOM_ESC[d][t["s"]]
+    }
+    si (k == "tex") { retornar _som_tn_textura(ctx, t) }
+    si (k == "muestreador") {
+        si (d == "glsl") {
+            si (t["comp"]) { retornar "samplerShadow" }
+            retornar "sampler"
+        }
+        si (d == "msl") { retornar "metal::sampler" }
+        si (t["comp"]) { retornar "SamplerComparisonState" }
+        retornar "SamplerState"
+    }
+    retornar "?"
+}
+
+funcion _som_tn_textura(ctx, t) {
+    sea d = ctx["destino"]
+    sea dim = _SOM_T0[t["dim"]] ?? "2D"
+    sea arr = ""
+    si (t["arreglo"]) { arr = "Array" }
+    si (d == "glsl") {
+        si (t["almacen"]) { retornar "image" + dim + arr }
+        sea pre = _SOM_T1[t["s"]] ?? ""
+        si (t["ms"]) { retornar pre + "texture2DMS" }
+        retornar pre + "texture" + dim + arr
+    }
+    si (d == "msl") {
+        sea md = _SOM_T2[t["dim"]] ?? "texture2d"
+        si (t["prof"]) { md = _SOM_T3[t["dim"]] ?? "depth2d" }
+        si (t["arreglo"]) { md = md + "_array" }
+        si (t["ms"]) { md = "texture2d_ms" }
+        sea acc = "sample"
+        si (t["almacen"]) {
+            acc = "write"
+            si (t["acceso"] == "read") { acc = "read" }
+            si (t["acceso"] == "read_write") { acc = "read_write" }
+        }
+        retornar "metal::" + md + "<" + _SOM_ESC["msl"][t["s"]] + ", metal::access::" + acc + ">"
+    }
+    // HLSL
+    sea comp = "float4"
+    si (t["s"] == "i32") { comp = "int4" }
+    si (t["s"] == "u32") { comp = "uint4" }
+    si (t["prof"]) { comp = "float" }
+    si (t["almacen"]) { retornar "RWTexture" + dim + arr + "<" + comp + ">" }
+    si (t["ms"]) { retornar "Texture2DMS<" + comp + ">" }
+    retornar "Texture" + dim + arr + "<" + comp + ">"
+}
+
+// Declaración "tipo nombre" (en HLSL y GLSL los arreglos llevan el tamaño
+// detrás del nombre).
+funcion _som_decl(ctx, t, n) {
+    sea d = ctx["destino"]
+    si (d == "wgsl") { retornar n + ": " + _som_t_txt(t) }
+    si (t != nulo y t["k"] == "arr" y (d == "hlsl" o d == "glsl")) {
+        sea suf = ""
+        sea x = t
+        mientras (x["k"] == "arr") {
+            si (x["n"] == nulo) { suf = suf + "[]" } sino { suf = suf + "[" + x["n"] + "]" }
+            x = x["t"]
+        }
+        retornar _som_tn(ctx, x) + " " + n + suf
+    }
+    retornar _som_tn(ctx, t) + " " + n
+}
+
+funcion _som_flotante(texto) {
+    sea t = texto
+    si (texto_termina_con(t, "f") y texto_empieza_con(t, "0x") == falso) { t = subtexto(t, 0, longitud(t) - 1) }
+    si (contiene(t, ".") == falso y contiene(t, "e") == falso y contiene(t, "E") == falso) { t = t + ".0" }
+    si (texto_termina_con(t, ".")) { t = t + "0" }
+    si (texto_empieza_con(t, ".")) { t = "0" + t }
+    si (texto_empieza_con(t, "-.")) { t = "-0" + subtexto(t, 1, longitud(t)) }
+    retornar t
+}
+
+funcion _som_lit(ctx, e) {
+    sea d = ctx["destino"]
+    si (e["tn"] == "bool") {
+        si (e["v"]) { retornar "true" }
+        retornar "false"
+    }
+    sea s = e["tn"]
+    si (s == "abstracto_entero") {
+        si (texto_empieza_con("" + e["v"], "-")) { retornar "(" + e["v"] + ")" }
+        retornar "" + e["v"]
+    }
+    sea r = ""
+    si (s == "f32") {
+        si (e["flot"]) { r = _som_flotante(e["texto"]) } sino { r = _som_flotante("" + e["v"]) }
+    } sino si (s == "u32") {
+        r = "" + e["v"] + "u"
+    } sino {
+        r = "" + e["v"]
+        si (d == "wgsl") { r = r + "i" }
+    }
+    si (texto_empieza_con(r, "-")) { retornar "(" + r + ")" }
+    retornar r
+}
+
+// Valor cero de un tipo.
+funcion _som_cero(ctx, t) {
+    sea d = ctx["destino"]
+    si (d == "msl") { retornar "{}" }
+    si (d == "hlsl") { retornar "(" + _som_tn(ctx, t) + ")0" }
+    si (d == "wgsl") { retornar _som_t_txt(t) + "()" }
+    sea k = t["k"]
+    si (k == "esc") { retornar _SOM_T4[t["s"]] }
+    si (k == "vec") { retornar _som_tn(ctx, t) + "(" + _som_cero(ctx, _som_t_esc(t["s"])) + ")" }
+    si (k == "mat") { retornar _som_tn(ctx, t) + "(0.0)" }
+    si (k == "struct") {
+        sea l = []
+        para mm en ctx["m"]["structs"][t["nombre"]]["miembros"] { l.agregar(_som_cero(ctx, mm["tipo"])) }
+        retornar _som_n(ctx, t["nombre"]) + "(" + unir(l, ", ") + ")"
+    }
+    si (k == "arr") {
+        sea l = []
+        sea i = 0
+        mientras (i < t["n"]) {
+            l.agregar(_som_cero(ctx, t["t"]))
+            i = i + 1
+        }
+        retornar _som_tn(ctx, t) + "(" + unir(l, ", ") + ")"
+    }
+    retornar "0"
+}
+
+sea _SOM_FUN = {
+    "glsl": {"inverseSqrt": "inversesqrt", "dpdx": "dFdx", "dpdy": "dFdy", "dpdxCoarse": "dFdxCoarse", "dpdyCoarse": "dFdyCoarse", "dpdxFine": "dFdxFine",
+        "dpdyFine": "dFdyFine", "fwidthCoarse": "fwidthCoarse", "fwidthFine": "fwidthFine", "atan2": "atan", "countOneBits": "bitCount", "reverseBits": "bitfieldReverse",
+        "firstLeadingBit": "findMSB", "firstTrailingBit": "findLSB", "extractBits": "bitfieldExtract", "insertBits": "bitfieldInsert", "faceForward": "faceforward",
+        "round": "roundEven", "pack4x8unorm": "packUnorm4x8", "pack4x8snorm": "packSnorm4x8", "pack2x16float": "packHalf2x16", "pack2x16unorm": "packUnorm2x16",
+        "pack2x16snorm": "packSnorm2x16", "unpack4x8unorm": "unpackUnorm4x8", "unpack4x8snorm": "unpackSnorm4x8", "unpack2x16float": "unpackHalf2x16",
+        "unpack2x16unorm": "unpackUnorm2x16", "unpack2x16snorm": "unpackSnorm2x16", "workgroupBarrier": "barrier", "storageBarrier": "memoryBarrierBuffer",
+        "atomicAdd": "atomicAdd", "atomicMin": "atomicMin", "atomicMax": "atomicMax", "atomicAnd": "atomicAnd", "atomicOr": "atomicOr", "atomicXor": "atomicXor",
+        "atomicExchange": "atomicExchange"},
+    "msl": {"inverseSqrt": "metal::rsqrt", "dpdx": "metal::dfdx", "dpdy": "metal::dfdy", "dpdxCoarse": "metal::dfdx", "dpdyCoarse": "metal::dfdy", "dpdxFine": "metal::dfdx",
+        "dpdyFine": "metal::dfdy", "fwidthCoarse": "metal::fwidth", "fwidthFine": "metal::fwidth", "countOneBits": "metal::popcount", "reverseBits": "metal::reverse_bits",
+        "extractBits": "metal::extract_bits", "insertBits": "metal::insert_bits", "faceForward": "metal::faceforward", "round": "metal::rint",
+        "pack4x8unorm": "metal::pack_float_to_unorm4x8", "pack4x8snorm": "metal::pack_float_to_snorm4x8", "pack2x16unorm": "metal::pack_float_to_unorm2x16",
+        "pack2x16snorm": "metal::pack_float_to_snorm2x16", "unpack4x8unorm": "metal::unpack_unorm4x8_to_float", "unpack4x8snorm": "metal::unpack_snorm4x8_to_float",
+        "unpack2x16unorm": "metal::unpack_unorm2x16_to_float", "unpack2x16snorm": "metal::unpack_snorm2x16_to_float"},
+    "hlsl": {"inverseSqrt": "rsqrt", "fract": "frac", "mix": "lerp", "dpdx": "ddx", "dpdy": "ddy", "dpdxCoarse": "ddx_coarse", "dpdyCoarse": "ddy_coarse",
+        "dpdxFine": "ddx_fine", "dpdyFine": "ddy_fine", "fwidthCoarse": "fwidth", "fwidthFine": "fwidth", "fma": "mad", "countOneBits": "countbits",
+        "reverseBits": "reversebits", "firstLeadingBit": "firstbithigh", "firstTrailingBit": "firstbitlow", "faceForward": "faceforward",
+        "workgroupBarrier": "GroupMemoryBarrierWithGroupSync", "storageBarrier": "DeviceMemoryBarrierWithGroupSync"}}
+
+sea _SOM_METAL_GENERICAS = ["abs", "sin", "cos", "tan", "asin", "acos", "atan", "sinh", "cosh", "tanh", "asinh", "acosh", "atanh", "exp", "exp2", "log", "log2", "sqrt",
+    "floor", "ceil", "fract", "trunc", "sign", "saturate", "normalize", "min", "max", "clamp", "mix", "step", "smoothstep", "pow", "atan2", "fma", "reflect", "refract",
+    "dot", "length", "distance", "cross", "determinant", "transpose", "all", "any", "select", "fwidth"]
+
+funcion _som_args_txt(ctx, args) {
+    sea l = []
+    para a en args { l.agregar(_som_e(ctx, a)) }
+    retornar unir(l, ", ")
+}
+
+funcion _som_e(ctx, e) {
+    sea d = ctx["destino"]
+    sea k = e["e"]
+    si (k == "lit") { retornar _som_lit(ctx, e) }
+    si (k == "par") {
+        sea dentro = _som_e(ctx, e["a"])
+        si (_som_sin_par(dentro) != dentro) { retornar dentro }
+        retornar "(" + dentro + ")"
+    }
+    si (k == "id") { retornar _som_ref(ctx, e) }
+    si (k == "un") {
+        si (e["op"] == "&" o e["op"] == "*") {
+            si (d == "wgsl") { retornar e["op"] + _som_e(ctx, e["a"]) }
+            retornar _som_e(ctx, e["a"])
+        }
+        si (d == "glsl" y e["op"] == "!" y e["ty"]["k"] == "vec") { retornar "not(" + _som_e(ctx, e["a"]) + ")" }
+        retornar e["op"] + "(" + _som_e(ctx, e["a"]) + ")"
+    }
+    si (k == "bin") { retornar _som_bin(ctx, e) }
+    si (k == "miembro") {
+        sea base = _som_e(ctx, e["a"])
+        si (e["a"]["ty"]["k"] == "struct") { retornar base + "." + _som_n(ctx, e["m"]) }
+        retornar base + "." + e["m"]
+    }
+    si (k == "indice") { retornar _som_e(ctx, e["a"]) + "[" + _som_e(ctx, e["i"]) + "]" }
+    si (k == "cons") { retornar _som_cons(ctx, e) }
+    si (k == "bitcast") {
+        sea a = e["args"][0]
+        sea de = _som_escalar_de(a["ty"])
+        sea a_ = _som_escalar_de(e["t"])
+        si (d == "wgsl") { retornar "bitcast<" + _som_t_txt(e["t"]) + ">(" + _som_e(ctx, a) + ")" }
+        si (d == "msl") { retornar "as_type<" + _som_tn(ctx, e["t"]) + ">(" + _som_e(ctx, a) + ")" }
+        si (d == "hlsl") { retornar _SOM_T5[a_] + "(" + _som_e(ctx, a) + ")" }
+        si (de == a_) { retornar _som_e(ctx, a) }
+        si (a_ == "f32") {
+            si (de == "u32") { retornar "uintBitsToFloat(" + _som_e(ctx, a) + ")" }
+            retornar "intBitsToFloat(" + _som_e(ctx, a) + ")"
+        }
+        si (de == "f32") {
+            si (a_ == "u32") { retornar "floatBitsToUint(" + _som_e(ctx, a) + ")" }
+            retornar "floatBitsToInt(" + _som_e(ctx, a) + ")"
+        }
+        retornar _som_tn(ctx, e["t"]) + "(" + _som_e(ctx, a) + ")"
+    }
+    si (k == "call") { retornar _som_llamada(ctx, e) }
+    retornar "?"
+}
+
+// Referencia a un nombre (los recursos pueden llevar un prefijo).
+funcion _som_ref(ctx, e) {
+    sea n = e["n"]
+    si ((e["clase"] ?? nulo) == "global" y tiene_clave(ctx["refs"], n)) { retornar ctx["refs"][n] }
+    retornar _som_n(ctx, n)
+}
+
+funcion _som_bin(ctx, e) {
+    sea d = ctx["destino"]
+    sea op = e["op"]
+    sea a = _som_e(ctx, e["a"])
+    sea b = _som_e(ctx, e["b"])
+    sea ta = e["a"]["ty"]
+    sea tb = e["b"]["ty"]
+    si (d == "wgsl") { retornar "(" + a + " " + op + " " + b + ")" }
+    si (op == "*" y (ta["k"] == "mat" o tb["k"] == "mat") y d == "hlsl") {
+        si (ta["k"] == "mat" y tb["k"] != "esc") { retornar "mul(" + b + ", " + a + ")" }
+        si (tb["k"] == "mat" y ta["k"] != "esc") { retornar "mul(" + b + ", " + a + ")" }
+    }
+    si (op == "%" y _som_escalar_de(ta) == "f32") {
+        si (d == "glsl") { retornar "(" + a + " - " + b + " * trunc(" + a + " / " + b + "))" }
+        si (d == "msl") { retornar "metal::fmod(" + a + ", " + b + ")" }
+        retornar "fmod(" + a + ", " + b + ")"
+    }
+    si (d == "glsl" y ta["k"] == "vec" y tb["k"] == "vec") {
+        sea f = _SOM_T6[op] ?? nulo
+        si (f != nulo) { retornar f + "(" + a + ", " + b + ")" }
+    }
+    // Vector con escalar en comparaciones (GLSL no lo admite).
+    si (d == "glsl" y (e["vecesc"] ?? falso) == verdadero y contiene(["<", ">", "<=", ">=", "==", "!="], op)) {
+        sea f = _SOM_T6[op]
+        si (ta["k"] == "vec") { retornar f + "(" + a + ", " + _som_tn(ctx, ta) + "(" + b + "))" }
+        retornar f + "(" + _som_tn(ctx, tb) + "(" + a + "), " + b + ")"
+    }
+    retornar "(" + a + " " + op + " " + b + ")"
+}
+
+funcion _som_cons(ctx, e) {
+    sea d = ctx["destino"]
+    sea t = e["t"]
+    si (d == "wgsl") {
+        si (e["base"] != nulo y e["base"] != "array") { retornar e["base"] + "(" + _som_args_txt(ctx, e["args"]) + ")" }
+        retornar _som_t_txt(t) + "(" + _som_args_txt(ctx, e["args"]) + ")"
+    }
+    si (longitud(e["args"]) == 0) { retornar _som_cero(ctx, t) }
+    si (t["k"] == "struct") {
+        si (d == "msl") { retornar _som_tn(ctx, t) + "{" + _som_args_txt(ctx, e["args"]) + "}" }
+        si (d == "hlsl") {
+            ctx["crear"][t["nombre"]] = verdadero
+            retornar "_sb_crear_" + t["nombre"] + "(" + _som_args_txt(ctx, e["args"]) + ")"
+        }
+        retornar _som_tn(ctx, t) + "(" + _som_args_txt(ctx, e["args"]) + ")"
+    }
+    si (t["k"] == "arr") {
+        si (d == "msl") { retornar _som_tn(ctx, t) + "{" + _som_args_txt(ctx, e["args"]) + "}" }
+        si (d == "hlsl") { retornar "{" + _som_args_txt(ctx, e["args"]) + "}" }
+        retornar _som_tn(ctx, t) + "(" + _som_args_txt(ctx, e["args"]) + ")"
+    }
+    si (d == "hlsl" y longitud(e["args"]) == 1 y t["k"] != "esc" y e["args"][0]["ty"]["k"] == "esc") {
+        retornar "((" + _som_tn(ctx, t) + ")" + _som_e(ctx, e["args"][0]) + ")"
+    }
+    retornar _som_tn(ctx, t) + "(" + _som_args_txt(ctx, e["args"]) + ")"
+}
+
+// Texto de un argumento como el escalar o vector pedido (conversión si hace falta).
+funcion _som_como(ctx, e, t) {
+    si (_som_t_igual(e["ty"], t)) { retornar _som_e(ctx, e) }
+    retornar _som_tn(ctx, t) + "(" + _som_e(ctx, e) + ")"
+}
+
+funcion _som_sampler_glsl(ctx, t, comp) {
+    sea dim = _SOM_T0[t["dim"]] ?? "2D"
+    sea arr = ""
+    si (t["arreglo"]) { arr = "Array" }
+    sea pre = _SOM_T1[t["s"]] ?? ""
+    sea sh = ""
+    si (comp) { sh = "Shadow" }
+    retornar pre + "sampler" + dim + arr + sh
+}
+
+// GLSL ES 3.0 no separa texturas y muestreadores: se usa uno combinado por par.
+funcion _som_combinado(ctx, tx, t, s, comp) {
+    sea n = "_sb_" + t
+    si (s != nulo) { n = n + "_" + s }
+    ctx["pares"][n] = _som_sampler_glsl(ctx, tx, comp)
+    retornar n
+}
+
+funcion _som_coords_dim(t) {
+    si (t["dim"] == "1d") { retornar 1 }
+    si (t["dim"] == "3d" o t["dim"] == "cube") { retornar 3 }
+    retornar 2
+}
+
+funcion _som_llamada(ctx, e) {
+    sea d = ctx["destino"]
+    sea f = e["f"]
+    sea a = e["args"]
+    si (e["usuario"]) {
+        sea l = []
+        para x en a { l.agregar(_som_e(ctx, x)) }
+        // MSL: los recursos se pasan a mano.
+        si (d == "msl") { para g en ctx["extras"][f] ?? [] { l.agregar(_som_ref(ctx, {"n": g, "clase": "global"})) } }
+        retornar _som_n(ctx, f) + "(" + unir(l, ", ") + ")"
+    }
+    si (d == "wgsl") { retornar f + "(" + _som_args_txt(ctx, a) + ")" }
+    si (texto_empieza_con(f, "texture")) { retornar _som_textura(ctx, e) }
+    si (f == "select") {
+        sea c = a[2]
+        si (d == "msl") { retornar "metal::select(" + _som_args_txt(ctx, a) + ")" }
+        si (d == "glsl" y c["ty"]["k"] == "vec") { retornar "mix(" + _som_e(ctx, a[0]) + ", " + _som_e(ctx, a[1]) + ", " + _som_e(ctx, c) + ")" }
+        retornar "(" + _som_e(ctx, c) + " ? " + _som_e(ctx, a[1]) + " : " + _som_e(ctx, a[0]) + ")"
+    }
+    si (f == "saturate" y d == "glsl") {
+        sea t = e["ty"]
+        retornar "clamp(" + _som_e(ctx, a[0]) + ", " + _som_cero(ctx, t) + ", " + _som_tn(ctx, t) + "(1.0))"
+    }
+    si ((f == "all" o f == "any") y a[0]["ty"]["k"] == "esc") { retornar _som_e(ctx, a[0]) }
+    si (f == "arrayLength") {
+        sea raiz_a = _som_raiz_lvalor(a[0])
+        si (d == "glsl") { retornar "uint(" + _som_e(ctx, a[0]) + ".length())" }
+        si (d == "hlsl") {
+            ctx["largos"][raiz_a["n"]] = verdadero
+            retornar "_sb_largo_" + _som_n(ctx, raiz_a["n"]) + "()"
+        }
+        _som_error(e["tok"], "arrayLength todavía no se traduce a MSL")
+    }
+    si (f == "atomicLoad") {
+        si (d == "glsl") { retornar "atomicAdd(" + _som_e(ctx, a[0]) + ", 0" + _som_sufijo_u(a[0]) + ")" }
+        si (d == "msl") { retornar "metal::atomic_load_explicit(&" + _som_e(ctx, a[0]) + ", metal::memory_order_relaxed)" }
+        retornar _som_e(ctx, a[0])
+    }
+    si (f == "atomicStore") {
+        si (d == "glsl") { retornar "atomicExchange(" + _som_e(ctx, a[0]) + ", " + _som_e(ctx, a[1]) + ")" }
+        si (d == "msl") { retornar "metal::atomic_store_explicit(&" + _som_e(ctx, a[0]) + ", " + _som_e(ctx, a[1]) + ", metal::memory_order_relaxed)" }
+    }
+    si (texto_empieza_con(f, "atomic") y d == "msl") {
+        sea nom = _SOM_T7[f] ?? "fetch_add"
+        retornar "metal::atomic_" + nom + "_explicit(&" + _som_e(ctx, a[0]) + ", " + _som_e(ctx, a[1]) + ", metal::memory_order_relaxed)"
+    }
+    si (texto_empieza_con(f, "atomic") y d == "hlsl") {
+        _som_error(e["tok"], "en HLSL " + f + " solo se puede usar como sentencia (sin usar su resultado)")
+    }
+    si (f == "atomicSub" y d == "glsl") { retornar "atomicAdd(" + _som_e(ctx, a[0]) + ", -(" + _som_e(ctx, a[1]) + "))" }
+    si (f == "firstLeadingBit" y d == "msl") { retornar "(31 - metal::clz(" + _som_e(ctx, a[0]) + "))" }
+    si (f == "firstTrailingBit" y d == "msl") { retornar "metal::ctz(" + _som_e(ctx, a[0]) + ")" }
+    si ((f == "radians" o f == "degrees") y d == "msl") {
+        sea k = "0.017453292519943295"
+        si (f == "degrees") { k = "57.29577951308232" }
+        retornar "(" + _som_e(ctx, a[0]) + " * " + k + ")"
+    }
+    si (f == "workgroupBarrier" y d == "msl") { retornar "metal::threadgroup_barrier(metal::mem_flags::mem_threadgroup)" }
+    si (f == "storageBarrier" y d == "msl") { retornar "metal::threadgroup_barrier(metal::mem_flags::mem_device)" }
+    si (f == "pack2x16float" y d == "msl") { retornar "as_type<uint>(half2(" + _som_e(ctx, a[0]) + "))" }
+    si (f == "unpack2x16float" y d == "msl") { retornar "float2(as_type<half2>(" + _som_e(ctx, a[0]) + "))" }
+    si (f == "ldexp" y d == "glsl") { retornar "ldexp(" + _som_e(ctx, a[0]) + ", " + _som_como(ctx, a[1], _som_con_escalar(a[1]["ty"], "i32")) + ")" }
+    si ((f == "extractBits" o f == "insertBits") y d == "glsl") {
+        // GLSL usa int para desplazamiento y cantidad.
+        sea l = []
+        sea i = 0
+        mientras (i < longitud(a)) {
+            si (i >= longitud(a) - 2) { l.agregar("int(" + _som_e(ctx, a[i]) + ")") } sino { l.agregar(_som_e(ctx, a[i])) }
+            i = i + 1
+        }
+        retornar _SOM_FUN["glsl"][f] + "(" + unir(l, ", ") + ")"
+    }
+    si ((f == "countOneBits" o f == "firstLeadingBit" o f == "firstTrailingBit") y d == "glsl") {
+        sea t = e["ty"]
+        retornar _som_tn(ctx, t) + "(" + _SOM_FUN["glsl"][f] + "(" + _som_e(ctx, a[0]) + "))"
+    }
+    si (f == "quantizeToF16") {
+        si (d == "glsl") { retornar "unpackHalf2x16(packHalf2x16(vec2(" + _som_e(ctx, a[0]) + "))).x" }
+        si (d == "msl") { retornar "float(half(" + _som_e(ctx, a[0]) + "))" }
+        retornar "f16tof32(f32tof16(" + _som_e(ctx, a[0]) + "))"
+    }
+    sea nom = _SOM_FUN[d][f] ?? f
+    si (d == "msl" y nom == f y contiene(_SOM_METAL_GENERICAS, f)) { nom = "metal::" + f }
+    si (d == "hlsl" y contiene(["pack4x8unorm", "unpack4x8unorm", "pack4x8snorm", "unpack4x8snorm", "pack2x16float", "unpack2x16float", "pack2x16unorm", "unpack2x16unorm", "pack2x16snorm", "unpack2x16snorm"], f)) {
+        ctx["empaques"][f] = verdadero
+        nom = "_sb_" + f
+    }
+    retornar nom + "(" + _som_args_txt(ctx, a) + ")"
+}
+
+funcion _som_sufijo_u(e) {
+    si (_som_escalar_de(e["ty"]) == "u32") { retornar "u" }
+    retornar ""
+}
+
+funcion _som_textura(ctx, e) {
+    sea d = ctx["destino"]
+    sea f = e["f"]
+    sea a = e["args"]
+    sea tx = a[0]["ty"]
+    sea t = _som_e(ctx, a[0])
+    si (f == "textureDimensions") {
+        sea nivel = "0"
+        si (longitud(a) > 1) { nivel = _som_e(ctx, a[1]) }
+        sea nd = _som_coords_dim(tx)
+        si (tx["dim"] == "cube") { nd = 2 }
+        si (d == "glsl") {
+            ctx["sin_muestreador"] = verdadero
+            si (ctx["es"]) { t = _som_combinado(ctx, tx, t, nulo, falso) }
+            sea sz = "textureSize(" + t + ", int(" + nivel + "))"
+            si (tx["almacen"]) { sz = "imageSize(" + t + ")" }
+            si (tx["ms"]) { sz = "textureSize(" + t + ")" }
+            si (tx["arreglo"]) { sz = sz + ".xy" }
+            si (nd == 1) { retornar "uint(" + sz + ")" }
+            retornar "uvec" + nd + "(" + sz + ")"
+        }
+        si (d == "msl") {
+            si (nd == 1) { retornar "uint(" + t + ".get_width())" }
+            si (nd == 2) { retornar "uint2(" + t + ".get_width(" + nivel + "), " + t + ".get_height(" + nivel + "))" }
+            retornar "uint3(" + t + ".get_width(" + nivel + "), " + t + ".get_height(" + nivel + "), " + t + ".get_depth(" + nivel + "))"
+        }
+        ctx["dimensiones"][_som_tn(ctx, tx) + "|" + nd + "|" + tx["arreglo"] + "|" + tx["almacen"]] = verdadero
+        retornar "_sb_dimensiones(" + t + ")"
+    }
+    si (f == "textureNumLevels" o f == "textureNumLayers" o f == "textureNumSamples") {
+        si (d == "glsl") {
+            ctx["sin_muestreador"] = verdadero
+            si (f == "textureNumLevels") { retornar "uint(textureQueryLevels(" + t + "))" }
+            si (f == "textureNumSamples") { retornar "uint(textureSamples(" + t + "))" }
+            retornar "uint(textureSize(" + t + ", 0).z)"
+        }
+        si (d == "msl") {
+            si (f == "textureNumLevels") { retornar t + ".get_num_mip_levels()" }
+            si (f == "textureNumSamples") { retornar t + ".get_num_samples()" }
+            retornar t + ".get_array_size()"
+        }
+        retornar "0u"
+    }
+    si (f == "textureStore") {
+        sea c = a[1]
+        sea v = a[longitud(a) - 1]
+        si (d == "glsl") { retornar "imageStore(" + t + ", ivec" + _som_coords_dim(tx) + "(" + _som_e(ctx, c) + "), " + _som_e(ctx, v) + ")" }
+        si (d == "msl") { retornar t + ".write(" + _som_e(ctx, v) + ", uint" + _som_coords_dim(tx) + "(" + _som_e(ctx, c) + "))" }
+        retornar t + "[" + _som_e(ctx, c) + "] = " + _som_e(ctx, v)
+    }
+    si (f == "textureLoad") {
+        sea c = a[1]
+        sea nd = _som_coords_dim(tx)
+        sea capa = nulo
+        sea extra = nulo
+        sea j = 2
+        si (tx["arreglo"] y longitud(a) > j) {
+            capa = a[j]
+            j = j + 1
+        }
+        si (longitud(a) > j) { extra = a[j] }
+        si (tx["almacen"]) {
+            si (d == "glsl") { retornar "imageLoad(" + t + ", ivec" + nd + "(" + _som_e(ctx, c) + "))" }
+            si (d == "msl") { retornar t + ".read(uint" + nd + "(" + _som_e(ctx, c) + "))" }
+            retornar t + "[" + _som_e(ctx, c) + "]"
+        }
+        sea lv = "0"
+        si (extra != nulo) { lv = _som_e(ctx, extra) }
+        si (d == "glsl") {
+            ctx["sin_muestreador"] = verdadero
+            si (ctx["es"]) { t = _som_combinado(ctx, tx, t, nulo, falso) }
+            sea co = "ivec" + nd + "(" + _som_e(ctx, c) + ")"
+            si (nd == 1) { co = "int(" + _som_e(ctx, c) + ")" }
+            si (capa != nulo) { co = "ivec" + (nd + 1) + "(" + _som_e(ctx, c) + ", " + _som_e(ctx, capa) + ")" }
+            sea r = "texelFetch(" + t + ", " + co + ", int(" + lv + "))"
+            si (tx["prof"]) { r = r + ".x" }
+            retornar r
+        }
+        si (d == "msl") {
+            si (tx["ms"]) { retornar t + ".read(uint2(" + _som_e(ctx, c) + "), " + lv + ")" }
+            si (nd == 1) { retornar t + ".read(uint(" + _som_e(ctx, c) + "))" }
+            si (capa != nulo) { retornar t + ".read(uint" + nd + "(" + _som_e(ctx, c) + "), uint(" + _som_e(ctx, capa) + "), " + lv + ")" }
+            retornar t + ".read(uint" + nd + "(" + _som_e(ctx, c) + "), " + lv + ")"
+        }
+        si (tx["ms"]) { retornar t + ".Load(int2(" + _som_e(ctx, c) + "), " + lv + ")" }
+        si (capa != nulo) { retornar t + ".Load(int" + (nd + 2) + "(" + _som_e(ctx, c) + ", " + _som_e(ctx, capa) + ", " + lv + "))" }
+        retornar t + ".Load(int" + (nd + 1) + "(" + _som_e(ctx, c) + ", " + lv + "))"
+    }
+    // Muestreo: t, s, coords, [capa], extra.
+    sea s = _som_e(ctx, a[1])
+    sea uv = a[2]
+    sea resto = []
+    sea i = 3
+    mientras (i < longitud(a)) {
+        resto.agregar(a[i])
+        i = i + 1
+    }
+    sea capa = nulo
+    si (tx["arreglo"] y longitud(resto) > 0) {
+        capa = resto[0]
+        sea r2 = []
+        sea j = 1
+        mientras (j < longitud(resto)) {
+            r2.agregar(resto[j])
+            j = j + 1
+        }
+        resto = r2
+    }
+    sea comp = f == "textureSampleCompare" o f == "textureSampleCompareLevel"
+    si (d == "glsl") {
+        sea smp = _som_sampler_glsl(ctx, tx, comp) + "(" + t + ", " + s + ")"
+        si (ctx["es"]) { smp = _som_combinado(ctx, tx, t, s, comp) }
+        sea co = _som_e(ctx, uv)
+        sea nd = _som_coords_dim(tx)
+        si (capa != nulo) {
+            co = "vec" + (nd + 1) + "(" + co + ", float(" + _som_e(ctx, capa) + "))"
+            nd = nd + 1
+        }
+        si (comp) {
+            co = "vec" + (nd + 1) + "(" + co + ", " + _som_e(ctx, resto[0]) + ")"
+            si (f == "textureSampleCompareLevel") {
+                // textureLod de sombras necesita una extensión; el gradiente cero da el nivel 0.
+                sea gv = "vec" + _som_coords_dim(tx)
+                si (_som_coords_dim(tx) == 1) { gv = "float" }
+                retornar "textureGrad(" + smp + ", " + co + ", " + gv + "(0.0), " + gv + "(0.0))"
+            }
+            retornar "texture(" + smp + ", " + co + ")"
+        }
+        sea r = ""
+        si (f == "textureSample") { r = "texture(" + smp + ", " + co + ")" }
+        sino si (f == "textureSampleLevel") { r = "textureLod(" + smp + ", " + co + ", float(" + _som_e(ctx, resto[0]) + "))" }
+        sino si (f == "textureSampleBias") { r = "texture(" + smp + ", " + co + ", " + _som_e(ctx, resto[0]) + ")" }
+        sino si (f == "textureSampleGrad") { r = "textureGrad(" + smp + ", " + co + ", " + _som_e(ctx, resto[0]) + ", " + _som_e(ctx, resto[1]) + ")" }
+        sino si (f == "textureGather") { r = "textureGather(" + smp + ", " + co + ")" }
+        si (tx["prof"] y f != "textureGather") { r = r + ".x" }
+        retornar r
+    }
+    si (d == "msl") {
+        sea co = _som_e(ctx, uv)
+        sea cp = ""
+        si (capa != nulo) { cp = ", uint(" + _som_e(ctx, capa) + ")" }
+        si (comp) {
+            sea lv = ""
+            si (f == "textureSampleCompareLevel") { lv = ", metal::level(0.0)" }
+            retornar t + ".sample_compare(" + s + ", " + co + cp + ", " + _som_e(ctx, resto[0]) + lv + ")"
+        }
+        si (f == "textureSample") {
+            si (tx["prof"]) { retornar t + ".sample(" + s + ", " + co + cp + ")" }
+            retornar t + ".sample(" + s + ", " + co + cp + ")"
+        }
+        si (f == "textureSampleLevel") { retornar t + ".sample(" + s + ", " + co + cp + ", metal::level(" + _som_e(ctx, resto[0]) + "))" }
+        si (f == "textureSampleBias") { retornar t + ".sample(" + s + ", " + co + cp + ", metal::bias(" + _som_e(ctx, resto[0]) + "))" }
+        si (f == "textureSampleGrad") {
+            sea gn = "gradient2d"
+            si (tx["dim"] == "3d") { gn = "gradient3d" }
+            si (tx["dim"] == "cube") { gn = "gradientcube" }
+            retornar t + ".sample(" + s + ", " + co + cp + ", metal::" + gn + "(" + _som_e(ctx, resto[0]) + ", " + _som_e(ctx, resto[1]) + "))"
+        }
+        retornar t + ".gather(" + s + ", " + co + cp + ")"
+    }
+    // HLSL
+    sea co = _som_e(ctx, uv)
+    si (capa != nulo) { co = "float" + (_som_coords_dim(tx) + 1) + "(" + co + ", float(" + _som_e(ctx, capa) + "))" }
+    si (comp) {
+        si (f == "textureSampleCompareLevel") { retornar t + ".SampleCmpLevelZero(" + s + ", " + co + ", " + _som_e(ctx, resto[0]) + ")" }
+        retornar t + ".SampleCmp(" + s + ", " + co + ", " + _som_e(ctx, resto[0]) + ")"
+    }
+    si (f == "textureSample") { retornar t + ".Sample(" + s + ", " + co + ")" }
+    si (f == "textureSampleLevel") { retornar t + ".SampleLevel(" + s + ", " + co + ", " + _som_e(ctx, resto[0]) + ")" }
+    si (f == "textureSampleBias") { retornar t + ".SampleBias(" + s + ", " + co + ", " + _som_e(ctx, resto[0]) + ")" }
+    si (f == "textureSampleGrad") { retornar t + ".SampleGrad(" + s + ", " + co + ", " + _som_e(ctx, resto[0]) + ", " + _som_e(ctx, resto[1]) + ")" }
+    retornar t + ".Gather(" + s + ", " + co + ")"
+}
+
+// ---------- sentencias ----------
+
+funcion _som_sangria(ctx) {
+    sea r = ""
+    sea i = 0
+    mientras (i < ctx["nivel"]) {
+        r = r + "    "
+        i = i + 1
+    }
+    retornar r
+}
+
+funcion _som_linea(ctx, t) { ctx["salida"].agregar(_som_sangria(ctx) + t) }
+
+funcion _som_cuerpo(ctx, cuerpo) {
+    ctx["nivel"] = ctx["nivel"] + 1
+    para s en cuerpo { _som_s(ctx, s) }
+    ctx["nivel"] = ctx["nivel"] - 1
+}
+
+// Sentencia en una línea (para los for).
+funcion _som_s_simple(ctx, s) {
+    sea d = ctx["destino"]
+    si (s["s"] == "asig") { retornar _som_e(ctx, s["l"]) + " " + s["op"] + " " + _som_e(ctx, s["r"]) }
+    si (s["s"] == "expr") { retornar _som_e(ctx, s["v"]) }
+    si (s["s"] == "var" o s["s"] == "let") {
+        sea v = ""
+        si (s["v"] != nulo) { v = _som_e(ctx, s["v"]) } sino { v = _som_cero(ctx, s["t"]) }
+        si (d == "wgsl") {
+            sea kw = "var"
+            si (s["s"] == "let") { kw = "let" }
+            retornar kw + " " + s["n"] + ": " + _som_t_txt(s["t"]) + " = " + v
+        }
+        retornar _som_decl(ctx, s["t"], _som_n(ctx, s["n"])) + " = " + v
+    }
+    retornar ""
+}
+
+funcion _som_s(ctx, s) {
+    sea d = ctx["destino"]
+    sea k = s["s"]
+    si (k == "let" o k == "var") {
+        si (d != "wgsl" y s["v"] != nulo y s["v"]["e"] == "cons" y s["t"]["k"] == "arr" y d == "hlsl") {
+            _som_linea(ctx, _som_decl(ctx, s["t"], _som_n(ctx, s["n"])) + " = {" + _som_args_txt(ctx, s["v"]["args"]) + "};")
+            retornar nulo
+        }
+        si (d == "hlsl" y s["v"] == nulo y s["t"]["k"] == "arr") {
+            _som_linea(ctx, _som_decl(ctx, s["t"], _som_n(ctx, s["n"])) + " = (" + _som_tn(ctx, s["t"]) + "[" + s["t"]["n"] + "])0;")
+            retornar nulo
+        }
+        _som_linea(ctx, _som_s_simple(ctx, s) + ";")
+        retornar nulo
+    }
+    si (k == "expr" y d == "hlsl" y s["v"]["e"] == "call" y texto_empieza_con(s["v"]["f"], "atomic") y s["v"]["f"] != "atomicLoad") {
+        sea a = s["v"]["args"]
+        sea nom = _SOM_HLSL_ATOM[s["v"]["f"]] ?? "InterlockedAdd"
+        sea val = _som_e(ctx, a[1])
+        si (s["v"]["f"] == "atomicSub") { val = "-(" + val + ")" }
+        _som_linea(ctx, nom + "(" + _som_e(ctx, a[0]) + ", " + val + ");")
+        retornar nulo
+    }
+    si (k == "asig" o k == "expr") {
+        si (k == "expr" y s["v"]["e"] == "call" y s["v"]["ty"] != nulo y d == "wgsl") {
+            _som_linea(ctx, "_ = " + _som_e(ctx, s["v"]) + ";")
+            retornar nulo
+        }
+        _som_linea(ctx, _som_s_simple(ctx, s) + ";")
+        retornar nulo
+    }
+    si (k == "return") {
+        si (s["v"] == nulo) { _som_linea(ctx, "return;") } sino { _som_linea(ctx, "return " + _som_e(ctx, s["v"]) + ";") }
+        retornar nulo
+    }
+    si (k == "discard") {
+        si (d == "msl") { _som_linea(ctx, "metal::discard_fragment();") } sino { _som_linea(ctx, "discard;") }
+        retornar nulo
+    }
+    si (k == "break") {
+        _som_linea(ctx, "break;")
+        retornar nulo
+    }
+    si (k == "continue") {
+        si (ctx["cont_pila"] != nulo y longitud(ctx["cont_pila"]) > 0 y ctx["cont_pila"][longitud(ctx["cont_pila"]) - 1] != nulo) {
+            // continue dentro de un loop con continuing: se repite el bloque.
+            sea c = ctx["cont_pila"][longitud(ctx["cont_pila"]) - 1]
+            para x en c["cont"] { _som_s(ctx, x) }
+            si (c["romper_si"] != nulo) { _som_linea(ctx, "if (" + _som_e(ctx, c["romper_si"]) + ") { break; }") }
+        }
+        _som_linea(ctx, "continue;")
+        retornar nulo
+    }
+    si (k == "bloque") {
+        _som_linea(ctx, "{")
+        _som_cuerpo(ctx, s["cuerpo"])
+        _som_linea(ctx, "}")
+        retornar nulo
+    }
+    si (k == "if") {
+        _som_linea(ctx, "if (" + _som_sin_par(_som_e(ctx, s["c"])) + ") {")
+        _som_cuerpo(ctx, s["a"])
+        si (s["b"] != nulo) {
+            _som_linea(ctx, "} else {")
+            _som_cuerpo(ctx, s["b"])
+        }
+        _som_linea(ctx, "}")
+        retornar nulo
+    }
+    si (k == "while") {
+        ctx["cont_pila"].agregar(nulo)
+        _som_linea(ctx, "while (" + _som_sin_par(_som_e(ctx, s["c"])) + ") {")
+        _som_cuerpo(ctx, s["cuerpo"])
+        _som_linea(ctx, "}")
+        ctx["cont_pila"] = _som_sin_ultimo(ctx["cont_pila"])
+        retornar nulo
+    }
+    si (k == "for") {
+        ctx["cont_pila"].agregar(nulo)
+        sea ini = ""
+        si (s["ini"] != nulo) { ini = _som_s_simple(ctx, s["ini"]) }
+        sea c = ""
+        si (s["c"] != nulo) { c = _som_sin_par(_som_e(ctx, s["c"])) }
+        sea p = ""
+        si (s["paso"] != nulo) { p = _som_s_simple(ctx, s["paso"]) }
+        _som_linea(ctx, "for (" + ini + "; " + c + "; " + p + ") {")
+        _som_cuerpo(ctx, s["cuerpo"])
+        _som_linea(ctx, "}")
+        ctx["cont_pila"] = _som_sin_ultimo(ctx["cont_pila"])
+        retornar nulo
+    }
+    si (k == "loop") {
+        si (d == "wgsl") {
+            _som_linea(ctx, "loop {")
+            _som_cuerpo(ctx, s["cuerpo"])
+            si (longitud(s["cont"]) > 0 o s["romper_si"] != nulo) {
+                ctx["nivel"] = ctx["nivel"] + 1
+                _som_linea(ctx, "continuing {")
+                _som_cuerpo(ctx, s["cont"])
+                si (s["romper_si"] != nulo) {
+                    ctx["nivel"] = ctx["nivel"] + 1
+                    _som_linea(ctx, "break if " + _som_e(ctx, s["romper_si"]) + ";")
+                    ctx["nivel"] = ctx["nivel"] - 1
+                }
+                _som_linea(ctx, "}")
+                ctx["nivel"] = ctx["nivel"] - 1
+            }
+            _som_linea(ctx, "}")
+            retornar nulo
+        }
+        // while (true) con el bloque continuing al final y en cada continue.
+        sea tiene_cont = longitud(s["cont"]) > 0 o s["romper_si"] != nulo
+        si (tiene_cont) { ctx["cont_pila"].agregar(s) } sino { ctx["cont_pila"].agregar(nulo) }
+        _som_linea(ctx, "while (true) {")
+        _som_cuerpo(ctx, s["cuerpo"])
+        si (tiene_cont) {
+            ctx["nivel"] = ctx["nivel"] + 1
+            para x en s["cont"] { _som_s(ctx, x) }
+            si (s["romper_si"] != nulo) { _som_linea(ctx, "if (" + _som_sin_par(_som_e(ctx, s["romper_si"])) + ") { break; }") }
+            ctx["nivel"] = ctx["nivel"] - 1
+        }
+        _som_linea(ctx, "}")
+        ctx["cont_pila"] = _som_sin_ultimo(ctx["cont_pila"])
+        retornar nulo
+    }
+    si (k == "switch") {
+        _som_linea(ctx, "switch (" + _som_sin_par(_som_e(ctx, s["sel"])) + ") {")
+        ctx["nivel"] = ctx["nivel"] + 1
+        para c en s["casos"] {
+            si (d == "wgsl") {
+                sea l = []
+                para v en c["valores"] { l.agregar(_som_e(ctx, v)) }
+                si (c["defecto"]) { l.agregar("default") }
+                si (c["defecto"] y longitud(c["valores"]) == 0) { _som_linea(ctx, "default: {") } sino { _som_linea(ctx, "case " + unir(l, ", ") + ": {") }
+                _som_cuerpo(ctx, c["cuerpo"])
+                _som_linea(ctx, "}")
+            } sino {
+                para v en c["valores"] { _som_linea(ctx, "case " + _som_e(ctx, v) + ":") }
+                si (c["defecto"]) { _som_linea(ctx, "default:") }
+                _som_linea(ctx, "{")
+                _som_cuerpo(ctx, c["cuerpo"])
+                // En WGSL no hay caída al siguiente caso.
+                si (_som_termina(c["cuerpo"]) == falso) {
+                    ctx["nivel"] = ctx["nivel"] + 1
+                    _som_linea(ctx, "break;")
+                    ctx["nivel"] = ctx["nivel"] - 1
+                }
+                _som_linea(ctx, "}")
+            }
+        }
+        ctx["nivel"] = ctx["nivel"] - 1
+        _som_linea(ctx, "}")
+        retornar nulo
+    }
+}
+
+funcion _som_sin_primero(l) {
+    sea r = []
+    sea i = 1
+    mientras (i < longitud(l)) {
+        r.agregar(l[i])
+        i = i + 1
+    }
+    retornar r
+}
+
+funcion _som_sin_ultimo(l) {
+    sea r = []
+    sea i = 0
+    mientras (i < longitud(l) - 1) {
+        r.agregar(l[i])
+        i = i + 1
+    }
+    retornar r
+}
+
+// Quita un par de paréntesis exteriores que encierran todo.
+funcion _som_sin_par(t) {
+    si (texto_empieza_con(t, "(") == falso o texto_termina_con(t, ")") == falso) { retornar t }
+    sea prof = 0
+    sea i = 0
+    mientras (i < longitud(t)) {
+        sea b = byte_en(t, i)
+        si (b == 40) { prof = prof + 1 }
+        si (b == 41) {
+            prof = prof - 1
+            si (prof == 0 y i < longitud(t) - 1) { retornar t }
+        }
+        i = i + 1
+    }
+    retornar subtexto(t, 1, longitud(t) - 1)
+}
+
+// ---------- módulo ----------
+
+funcion _som_contexto(m, destino, opciones) {
+    retornar {"m": m, "destino": destino, "op": opciones ?? {}, "reservadas": _SOM_RESERVADAS[destino], "refs": {}, "salida": [], "nivel": 0, "cont_pila": [],
+        "crear": {}, "dimensiones": {}, "empaques": {}, "extras": {}, "largos": {}, "pares": {}, "es": falso, "sin_muestreador": falso, "necesita_largo": falso, "atomicas_hlsl": falso}
+}
+
+// Estructuras en orden de dependencia.
+funcion _som_orden_structs(m) {
+    sea est = {"hecho": {}, "r": []}
+    para n en m["orden_structs"] { _som_visitar_struct(m, est, n) }
+    retornar est["r"]
+}
+
+funcion _som_visitar_struct(m, est, n) {
+    si (tiene_clave(est["hecho"], n)) { retornar nulo }
+    est["hecho"][n] = verdadero
+    para mm en m["structs"][n]["miembros"] {
+        sea t = mm["tipo"]
+        mientras (t["k"] == "arr") { t = t["t"] }
+        si (t["k"] == "struct") { _som_visitar_struct(m, est, t["nombre"]) }
+    }
+    est["r"].agregar(n)
+}
+
+// Funciones alcanzables desde "raices", las llamadas antes que quien llama.
+funcion _som_orden_funciones(m, raices) {
+    sea est = {"hecho": {}, "r": []}
+    para n en raices { _som_visitar_fn(m, est, n) }
+    retornar est["r"]
+}
+
+funcion _som_visitar_fn(m, est, n) {
+    si (tiene_clave(est["hecho"], n)) { retornar nulo }
+    est["hecho"][n] = verdadero
+    sea f = m["funciones"][m["fn_idx"][n]]
+    para c en claves(f["llamadas"]) { _som_visitar_fn(m, est, c) }
+    est["r"].agregar(n)
+}
+
+funcion _som_entradas(m) {
+    sea r = []
+    para f en m["funciones"] { si (f["etapa"] != nulo) { r.agregar(f) } }
+    retornar r
+}
+
+funcion _som_elegir_entrada(m, opciones) {
+    sea es = _som_entradas(m)
+    si (longitud(es) == 0) { lanzar "sombreador: no hay puntos de entrada (@vertex, @fragment o @compute)" }
+    sea n = (opciones ?? {})["entrada"] ?? nulo
+    si (n == nulo) {
+        si (longitud(es) > 1) { lanzar "sombreador: hay varias entradas; elige una con la opción \"entrada\"" }
+        retornar es[0]
+    }
+    para f en es { si (f["nombre"] == n) { retornar f } }
+    lanzar "sombreador: no hay entrada '" + n + "'"
+}
+
+// Entradas aplanadas de una función: [{"param", "miembro", "tipo", "attrs"}].
+funcion _som_aplanar_params(m, f) {
+    sea r = []
+    sea i = 0
+    para p en f["params"] {
+        si (p["tipo"]["k"] == "struct") {
+            para mm en m["structs"][p["tipo"]["nombre"]]["miembros"] { r.agregar({"param": i, "miembro": mm["nombre"], "tipo": mm["tipo"], "attrs": mm["attrs"]}) }
+        } sino {
+            r.agregar({"param": i, "miembro": nulo, "tipo": p["tipo"], "attrs": p["attrs"]})
+        }
+        i = i + 1
+    }
+    retornar r
+}
+
+funcion _som_aplanar_salida(m, f) {
+    si (f["ret"] == nulo) { retornar [] }
+    si (f["ret"]["k"] == "struct") {
+        sea r = []
+        para mm en m["structs"][f["ret"]["nombre"]]["miembros"] { r.agregar({"miembro": mm["nombre"], "tipo": mm["tipo"], "attrs": mm["attrs"]}) }
+        retornar r
+    }
+    retornar [{"miembro": nulo, "tipo": f["ret"], "attrs": f["ret_attrs"]}]
+}
+
+funcion _som_attr_num(a, k) {
+    si (tiene_clave(a, k) == falso) { retornar nulo }
+    sea v = a[k][0]
+    si (tipo(v) == "mapa") { retornar v["v"] }
+    retornar v
+}
+funcion _som_attr_txt(a, k) {
+    si (tiene_clave(a, k) == falso) { retornar nulo }
+    sea v = a[k][0]
+    si (tipo(v) == "mapa") { retornar v["n"] ?? ("" + v["v"]) }
+    retornar v
+}
+
+funcion _som_plano(a, t) {
+    si (_som_attr_txt(a, "interpolate") == "flat") { retornar verdadero }
+    sea s = _som_escalar_de(t)
+    retornar s == "i32" o s == "u32"
+}
+
+// Recursos con su clase y ranura (para reflexión y MSL).
+funcion _som_recursos(m) {
+    sea r = []
+    para g en m["globales"] {
+        si (g["espacio"] == "uniform" o g["espacio"] == "storage" o g["espacio"] == "handle") {
+            sea clase = g["espacio"]
+            si (g["espacio"] == "handle") {
+                si (g["tipo"]["k"] == "muestreador") { clase = "muestreador" }
+                sino si (g["tipo"]["almacen"]) { clase = "textura_almacen" }
+                sino { clase = "textura" }
+            }
+            r.agregar({"global": g, "clase": clase})
+        }
+    }
+    r = ordenar(r, funcion(a, b) {
+        si (a["global"]["grupo"] != b["global"]["grupo"]) { retornar a["global"]["grupo"] - b["global"]["grupo"] }
+        retornar a["global"]["enlace"] - b["global"]["enlace"]
+    })
+    sea cont = {"buffer": 0, "texture": 0, "sampler": 0}
+    para x en r {
+        sea c = "buffer"
+        si (x["clase"] == "textura" o x["clase"] == "textura_almacen") { c = "texture" }
+        si (x["clase"] == "muestreador") { c = "sampler" }
+        x["ranura_msl"] = cont[c]
+        x["tipo_msl"] = c
+        cont[c] = cont[c] + 1
+    }
+    retornar r
+}
+
+funcion _som_juntar(ctx) { retornar unir(ctx["salida"], "\n") + "\n" }
+
+funcion _som_firma(ctx, f, nombre, extras) {
+    sea ps = []
+    para p en f["params"] { ps.agregar(_som_decl(ctx, p["tipo"], _som_n(ctx, p["nombre"]))) }
+    para x en extras { ps.agregar(x) }
+    retornar _som_tn(ctx, f["ret"]) + " " + nombre + "(" + unir(ps, ", ") + ")"
+}
+
+funcion _som_funcion(ctx, f, nombre, extras) {
+    _som_linea(ctx, _som_firma(ctx, f, nombre, extras) + " {")
+    _som_cuerpo(ctx, f["cuerpo"])
+    _som_linea(ctx, "}")
+    _som_linea(ctx, "")
+}
+
+funcion _som_structs(ctx) {
+    sea m = ctx["m"]
+    sea d = ctx["destino"]
+    para n en _som_orden_structs(m) {
+        _som_linea(ctx, "struct " + _som_n(ctx, n) + " {")
+        para mm en m["structs"][n]["miembros"] {
+            sea pre = ""
+            si (d == "hlsl" y mm["tipo"]["k"] == "mat") { pre = "row_major " }
+            _som_linea(ctx, "    " + pre + _som_decl(ctx, mm["tipo"], _som_n(ctx, mm["nombre"])) + ";")
+        }
+        _som_linea(ctx, "};")
+        _som_linea(ctx, "")
+    }
+}
+
+funcion _som_consts(ctx) {
+    sea m = ctx["m"]
+    sea d = ctx["destino"]
+    para n en m["orden_consts"] {
+        sea c = m["consts"][n]
+        sea v = ""
+        si (c["v"] != nulo) { v = _som_e(ctx, c["v"]) } sino { v = _som_cero(ctx, c["tipo_r"]) }
+        si (d == "glsl") { _som_linea(ctx, "const " + _som_decl(ctx, c["tipo_r"], _som_n(ctx, n)) + " = " + v + ";") }
+        si (d == "msl") { _som_linea(ctx, "constant " + _som_decl(ctx, c["tipo_r"], _som_n(ctx, n)) + " = " + v + ";") }
+        si (d == "hlsl") { _som_linea(ctx, "static const " + _som_decl(ctx, c["tipo_r"], _som_n(ctx, n)) + " = " + v + ";") }
+    }
+    si (longitud(m["orden_consts"]) > 0) { _som_linea(ctx, "") }
+}
+
+// ---------- GLSL ----------
+
+sea _SOM_FORMATOS_GLSL = {"rgba8unorm": "rgba8", "rgba8snorm": "rgba8_snorm", "rgba8uint": "rgba8ui", "rgba8sint": "rgba8i", "rgba16float": "rgba16f",
+    "rgba16uint": "rgba16ui", "rgba16sint": "rgba16i", "rgba32float": "rgba32f", "rgba32uint": "rgba32ui", "rgba32sint": "rgba32i", "r32float": "r32f",
+    "r32uint": "r32ui", "r32sint": "r32i", "rg32float": "rg32f", "rg32uint": "rg32ui", "rg32sint": "rg32i", "bgra8unorm": "rgba8"}
+
+sea _SOM_GLSL_EN = {"view_index": "uint(gl_ViewIndex)", "vertex_index": "uint(gl_VertexIndex)", "instance_index": "uint(gl_InstanceIndex)", "position": "gl_FragCoord", "front_facing": "gl_FrontFacing",
+    "sample_index": "uint(gl_SampleID)", "sample_mask": "uint(gl_SampleMaskIn[0])", "local_invocation_id": "gl_LocalInvocationID",
+    "local_invocation_index": "gl_LocalInvocationIndex", "global_invocation_id": "gl_GlobalInvocationID", "workgroup_id": "gl_WorkGroupID",
+    "num_workgroups": "gl_NumWorkGroups"}
+sea _SOM_GLSL_SAL = {"position": "gl_Position", "frag_depth": "gl_FragDepth", "sample_mask": "gl_SampleMask[0]"}
+
+funcion _som_glsl(m, opciones) {
+    sea ctx = _som_contexto(m, "glsl", opciones)
+    sea f = _som_elegir_entrada(m, opciones)
+    sea es = ("" + ((opciones ?? {})["version"] ?? "450")) == "300 es" o ("" + ((opciones ?? {})["version"] ?? "450")) == "300"
+    ctx["es"] = es
+    si (es y f["etapa"] == "compute") { lanzar "sombreador: GLSL ES 3.0 no tiene shaders de cómputo (usa la versión 450)" }
+    // Recursos.
+    para g en m["globales"] {
+        sea n = _som_n(ctx, g["nombre"])
+        sea lay = ""
+        si (es == falso y g["grupo"] != nulo) { lay = "set = " + g["grupo"] + ", binding = " + g["enlace"] }
+        si (es y g["espacio"] == "storage") { lanzar "sombreador: GLSL ES 3.0 no tiene buffers storage (" + g["nombre"] + ")" }
+        si (g["espacio"] == "uniform" o g["espacio"] == "storage") {
+            sea kw = "uniform"
+            sea pack = "std140"
+            sea ro = ""
+            si (g["espacio"] == "storage") {
+                kw = "buffer"
+                pack = "std430"
+                si (g["acceso"] == "read") { ro = "readonly " }
+            }
+            sea l = pack
+            si (lay != "") { l = pack + ", " + lay }
+            si (g["tipo"]["k"] == "struct") {
+                _som_linea(ctx, "layout(" + l + ") " + ro + kw + " " + _som_n(ctx, g["tipo"]["nombre"]) + "_" + n + " {")
+                para mm en m["structs"][g["tipo"]["nombre"]]["miembros"] { _som_linea(ctx, "    " + _som_decl(ctx, mm["tipo"], _som_n(ctx, mm["nombre"])) + ";") }
+                _som_linea(ctx, "} " + n + ";")
+            } sino {
+                _som_linea(ctx, "layout(" + l + ") " + ro + kw + " " + n + "_bloque {")
+                _som_linea(ctx, "    " + _som_decl(ctx, g["tipo"], "valor") + ";")
+                _som_linea(ctx, "} _" + n + ";")
+                ctx["refs"][g["nombre"]] = "_" + n + ".valor"
+            }
+        } sino si (g["espacio"] == "handle" y es) {
+            // Se declaran combinados al final.
+        } sino si (g["espacio"] == "handle") {
+            sea t = g["tipo"]
+            si (t["k"] == "tex" y t["almacen"]) {
+                sea l2 = _SOM_FORMATOS_GLSL[t["formato"]] ?? "rgba8"
+                si (lay != "") { l2 = lay + ", " + l2 }
+                sea acc = ""
+                si (t["acceso"] == "write") { acc = "writeonly " }
+                si (t["acceso"] == "read") { acc = "readonly " }
+                _som_linea(ctx, "layout(" + l2 + ") uniform " + acc + _som_tn(ctx, t) + " " + n + ";")
+            } sino {
+                si (lay != "") { _som_linea(ctx, "layout(" + lay + ") uniform " + _som_tn(ctx, t) + " " + n + ";") } sino { _som_linea(ctx, "uniform " + _som_tn(ctx, t) + " " + n + ";") }
+            }
+        } sino si (g["espacio"] == "workgroup") {
+            si (f["etapa"] == "compute") { _som_linea(ctx, "shared " + _som_decl(ctx, g["tipo"], n) + ";") }
+        } sino {
+            sea v = ""
+            si (g["v"] != nulo) { v = _som_e(ctx, g["v"]) } sino { v = _som_cero(ctx, g["tipo"]) }
+            _som_linea(ctx, _som_decl(ctx, g["tipo"], n) + " = " + v + ";")
+        }
+    }
+    _som_linea(ctx, "")
+    // Interfaz de la etapa.
+    sea ins = _som_aplanar_params(m, f)
+    sea k = 0
+    para x en ins {
+        si (tiene_clave(x["attrs"], "location")) {
+            sea loc = _som_attr_num(x["attrs"], "location")
+            sea pre = ""
+            si (f["etapa"] == "fragment" y _som_plano(x["attrs"], x["tipo"])) { pre = "flat " }
+            x["nombre_g"] = "_sb_in" + loc
+            si (es y f["etapa"] == "fragment") {
+                x["nombre_g"] = "_sb_vary" + loc
+                _som_linea(ctx, pre + "in " + _som_decl(ctx, x["tipo"], x["nombre_g"]) + ";")
+            } sino { _som_linea(ctx, "layout(location = " + loc + ") " + pre + "in " + _som_decl(ctx, x["tipo"], x["nombre_g"]) + ";") }
+        } sino si (tiene_clave(x["attrs"], "builtin")) {
+            sea b = _som_attr_txt(x["attrs"], "builtin")
+            x["nombre_g"] = _SOM_GLSL_EN[b] ?? b
+            si (b == "view_index") { ctx["multivista"] = verdadero }
+            si (es y b == "vertex_index") { x["nombre_g"] = "uint(gl_VertexID)" }
+            si (es y b == "instance_index") { x["nombre_g"] = "uint(gl_InstanceID)" }
+        }
+        k = k + 1
+    }
+    sea outs = _som_aplanar_salida(m, f)
+    para x en outs {
+        si (tiene_clave(x["attrs"], "location")) {
+            sea loc = _som_attr_num(x["attrs"], "location")
+            sea pre = ""
+            si (f["etapa"] == "vertex" y _som_plano(x["attrs"], x["tipo"])) { pre = "flat " }
+            x["nombre_g"] = "_sb_out" + loc
+            si (es y f["etapa"] == "vertex") {
+                x["nombre_g"] = "_sb_vary" + loc
+                _som_linea(ctx, pre + "out " + _som_decl(ctx, x["tipo"], x["nombre_g"]) + ";")
+            } sino { _som_linea(ctx, "layout(location = " + loc + ") " + pre + "out " + _som_decl(ctx, x["tipo"], x["nombre_g"]) + ";") }
+        } sino si (tiene_clave(x["attrs"], "builtin")) {
+            sea b = _som_attr_txt(x["attrs"], "builtin")
+            x["nombre_g"] = _SOM_GLSL_SAL[b] ?? b
+            x["builtin"] = b
+        }
+    }
+    si (f["etapa"] == "compute") { _som_linea(ctx, "layout(local_size_x = " + f["wg"][0] + ", local_size_y = " + f["wg"][1] + ", local_size_z = " + f["wg"][2] + ") in;") }
+    _som_linea(ctx, "")
+    // Funciones.
+    sea nombres = _som_orden_funciones(m, [f["nombre"]])
+    para n en nombres {
+        sea g = m["funciones"][m["fn_idx"][n]]
+        si (g["etapa"] == nulo) { _som_funcion(ctx, g, _som_n(ctx, n), []) }
+    }
+    sea impl = "_sb_" + f["nombre"]
+    _som_funcion(ctx, f, impl, [])
+    // main.
+    _som_linea(ctx, "void main() {")
+    sea args = []
+    sea i = 0
+    para p en f["params"] {
+        sea pn = "_sb_p" + i
+        si (p["tipo"]["k"] == "struct") {
+            sea partes = []
+            para x en ins { si (x["param"] == i) { partes.agregar(x["nombre_g"]) } }
+            _som_linea(ctx, "    " + _som_tn(ctx, p["tipo"]) + " " + pn + " = " + _som_tn(ctx, p["tipo"]) + "(" + unir(partes, ", ") + ");")
+        } sino {
+            para x en ins { si (x["param"] == i) { _som_linea(ctx, "    " + _som_decl(ctx, p["tipo"], pn) + " = " + x["nombre_g"] + ";") } }
+        }
+        args.agregar(pn)
+        i = i + 1
+    }
+    si (f["ret"] == nulo) {
+        _som_linea(ctx, "    " + impl + "(" + unir(args, ", ") + ");")
+    } sino {
+        _som_linea(ctx, "    " + _som_tn(ctx, f["ret"]) + " _sb_r = " + impl + "(" + unir(args, ", ") + ");")
+        para x en outs {
+            sea v = "_sb_r"
+            si (x["miembro"] != nulo) { v = "_sb_r." + _som_n(ctx, x["miembro"]) }
+            si ((x["builtin"] ?? nulo) == "sample_mask") { v = "int(" + v + ")" }
+            _som_linea(ctx, "    " + x["nombre_g"] + " = " + v + ";")
+        }
+    }
+    _som_linea(ctx, "}")
+    // Cabecera (al final se sabe qué extensiones hacen falta).
+    sea cab = []
+    si (es) {
+        cab.agregar("#version 300 es")
+        cab.agregar("precision highp float;")
+        cab.agregar("precision highp int;")
+    } sino {
+        cab.agregar("#version 450")
+        si (ctx["sin_muestreador"]) { cab.agregar("#extension GL_EXT_samplerless_texture_functions : require") }
+        si ((ctx["multivista"] ?? falso) == verdadero) { cab.agregar("#extension GL_EXT_multiview : require") }
+    }
+    cab.agregar("")
+    sea c2 = _som_contexto(m, "glsl", opciones)
+    c2["refs"] = ctx["refs"]
+    _som_structs(c2)
+    _som_consts(c2)
+    para pn en claves(ctx["pares"]) { _som_linea(c2, "uniform highp " + ctx["pares"][pn] + " " + pn + ";") }
+    retornar unir(cab, "\n") + "\n" + unir(c2["salida"], "\n") + "\n" + _som_juntar(ctx)
+}
+
+// ---------- API ----------
+
+/// Lee y comprueba un módulo WGSL (lanza el primer error con línea:columna).
+funcion sombreador_analizar(fuente) { retornar _som_analizar(_som_modulo(fuente)) }
+
+/// Errores del módulo: [] si está bien, o [{"linea", "columna", "mensaje"}].
+funcion sombreador_validar(fuente) {
+    sea r = []
+    intentar { sombreador_analizar(fuente) } capturar (e) {
+        sea t = "" + e
+        si (texto_empieza_con(t, "sombreador: ")) { t = subtexto(t, 12, longitud(t)) }
+        sea partes = texto_dividir(t, ":")
+        si (longitud(partes) >= 3 y _som_es_entero(partes[0]) y _som_es_entero(partes[1])) {
+            sea msj = texto_recortar(subtexto(t, longitud(partes[0]) + longitud(partes[1]) + 2, longitud(t)))
+            r.agregar({"linea": a_numero(partes[0]), "columna": a_numero(partes[1]), "mensaje": msj})
+        } sino {
+            r.agregar({"linea": 0, "columna": 0, "mensaje": t})
+        }
+    }
+    retornar r
+}
+
+funcion _som_es_entero(t) {
+    si (longitud(t) == 0) { retornar falso }
+    sea i = 0
+    mientras (i < longitud(t)) {
+        si (_som_es_digito(byte_en(t, i)) == falso) { retornar falso }
+        i = i + 1
+    }
+    retornar verdadero
+}
+
+/// Puntos de entrada: [{"nombre", "etapa", "grupo_trabajo"}].
+funcion sombreador_entradas(fuente) {
+    sea m = sombreador_analizar(fuente)
+    sea r = []
+    para f en _som_entradas(m) { r.agregar({"nombre": f["nombre"], "etapa": f["etapa"], "grupo_trabajo": f["wg"]}) }
+    retornar r
+}
+
+/// Enlaces de recursos: [{"grupo", "enlace", "nombre", "clase" (uniform,
+/// storage, textura, textura_almacen, muestreador), "tipo", "acceso",
+/// "ranura_msl", "tipo_msl"}].
+funcion sombreador_enlaces(fuente) {
+    sea m = sombreador_analizar(fuente)
+    sea r = []
+    para x en _som_recursos(m) {
+        sea g = x["global"]
+        r.agregar({"grupo": g["grupo"], "enlace": g["enlace"], "nombre": g["nombre"], "clase": x["clase"], "tipo": _som_t_txt(g["tipo"]), "acceso": g["acceso"],
+            "ranura_msl": x["ranura_msl"], "tipo_msl": x["tipo_msl"]})
+    }
+    retornar r
+}
+
+/// Traduce WGSL a "glsl", "msl", "hlsl" o "wgsl". opciones: "entrada"
+/// (obligatoria en GLSL si hay varias), "version" de GLSL ("450" o "300 es").
+funcion sombreador_traducir(fuente, destino, opciones) {
+    sea m = sombreador_analizar(fuente)
+    si (destino == "glsl") { retornar _som_glsl(m, opciones) }
+    si (destino == "msl") { retornar _som_msl(m, opciones) }
+    si (destino == "hlsl") { retornar _som_hlsl(m, opciones) }
+    si (destino == "wgsl") { retornar _som_wgsl(m, opciones) }
+    lanzar "sombreador: destino desconocido '" + destino + "' (glsl, msl, hlsl o wgsl)"
+}
+
+// ---------- MSL ----------
+
+sea _SOM_MSL_EN = {"vertex_index": ["uint", "vertex_id"], "instance_index": ["uint", "instance_id"], "position": ["float4", "position"],
+    "front_facing": ["bool", "front_facing"], "sample_index": ["uint", "sample_id"], "sample_mask": ["uint", "sample_mask"],
+    "local_invocation_id": ["uint3", "thread_position_in_threadgroup"], "local_invocation_index": ["uint", "thread_index_in_threadgroup"],
+    "global_invocation_id": ["uint3", "thread_position_in_grid"], "workgroup_id": ["uint3", "threadgroup_position_in_grid"],
+    "num_workgroups": ["uint3", "threadgroups_per_grid"]}
+sea _SOM_MSL_SAL = {"position": "position", "frag_depth": "depth(any)", "sample_mask": "sample_mask"}
+
+// Parámetro extra (recurso o variable global) en las funciones de MSL.
+funcion _som_msl_param(ctx, g) {
+    sea n = _som_n(ctx, g["nombre"])
+    sea t = g["tipo"]
+    si (g["espacio"] == "uniform") { retornar "constant " + _som_tn(ctx, t) + "& " + n }
+    si (g["espacio"] == "storage") {
+        sea c = ""
+        si (g["acceso"] == "read") { c = "const " }
+        si (t["k"] == "arr" y t["n"] == nulo) { retornar c + "device " + _som_tn(ctx, t["t"]) + "* " + n }
+        retornar c + "device " + _som_tn(ctx, t) + "& " + n
+    }
+    si (g["espacio"] == "handle") { retornar _som_tn(ctx, t) + " " + n }
+    si (g["espacio"] == "workgroup") { retornar "threadgroup " + _som_tn(ctx, t) + "& " + n }
+    retornar "thread " + _som_tn(ctx, t) + "& " + n
+}
+
+funcion _som_extras(m, f) {
+    sea r = []
+    para g en m["globales"] { si (tiene_clave(f["usadas"], g["nombre"])) { r.agregar(g) } }
+    retornar r
+}
+
+funcion _som_msl(m, opciones) {
+    sea ctx = _som_contexto(m, "msl", opciones)
+    _som_linea(ctx, "// language: metal2.0")
+    _som_linea(ctx, "#include <metal_stdlib>")
+    _som_linea(ctx, "#include <simd/simd.h>")
+    _som_linea(ctx, "")
+    _som_linea(ctx, "using metal::uint;")
+    _som_linea(ctx, "using namespace metal;")
+    _som_linea(ctx, "")
+    _som_structs(ctx)
+    _som_consts(ctx)
+    para f en m["funciones"] {
+        sea l = []
+        para g en _som_extras(m, f) { l.agregar(g["nombre"]) }
+        ctx["extras"][f["nombre"]] = l
+    }
+    sea ranuras = {}
+    para x en _som_recursos(m) { ranuras[x["global"]["nombre"]] = x }
+    sea entradas = _som_entradas(m)
+    sea raices = []
+    para f en entradas { raices.agregar(f["nombre"]) }
+    si (((opciones ?? {})["entrada"] ?? nulo) != nulo) { raices = [opciones["entrada"]] }
+    para n en _som_orden_funciones(m, raices) {
+        sea f = m["funciones"][m["fn_idx"][n]]
+        sea ex = []
+        para g en _som_extras(m, f) { ex.agregar(_som_msl_param(ctx, g)) }
+        sea nombre = _som_n(ctx, n)
+        si (f["etapa"] != nulo) { nombre = "_sb_" + n }
+        _som_funcion(ctx, f, nombre, ex)
+    }
+    para f en entradas {
+        si (contiene(raices, f["nombre"])) { _som_msl_entrada(ctx, f, ranuras) }
+    }
+    retornar _som_juntar(ctx)
+}
+
+funcion _som_msl_entrada(ctx, f, ranuras) {
+    sea m = ctx["m"]
+    sea n = _som_n(ctx, f["nombre"])
+    sea etapa = f["etapa"]
+    sea ins = _som_aplanar_params(m, f)
+    sea outs = _som_aplanar_salida(m, f)
+    sea params = []
+    // Entrada por stage_in.
+    sea campos = []
+    para x en ins {
+        si (tiene_clave(x["attrs"], "location")) {
+            sea loc = _som_attr_num(x["attrs"], "location")
+            x["nombre_g"] = "_sb_entrada._sb_l" + loc
+            si (etapa == "vertex") { campos.agregar("    " + _som_tn(ctx, x["tipo"]) + " _sb_l" + loc + " [[attribute(" + loc + ")]];") }
+            sino {
+                sea interp = ""
+                si (_som_plano(x["attrs"], x["tipo"])) { interp = ", flat" }
+                campos.agregar("    " + _som_tn(ctx, x["tipo"]) + " _sb_l" + loc + " [[user(loc" + loc + ")" + interp + "]];")
+            }
+        } sino si (tiene_clave(x["attrs"], "builtin")) {
+            sea b = _som_attr_txt(x["attrs"], "builtin")
+            sea bi = _SOM_MSL_EN[b] ?? ["uint", b]
+            si (etapa == "fragment" y (b == "position" o b == "front_facing")) {
+                campos.agregar("    " + bi[0] + " _sb_" + b + " [[" + bi[1] + "]];")
+                x["nombre_g"] = "_sb_entrada._sb_" + b
+            } sino {
+                params.agregar(bi[0] + " _sb_" + b + " [[" + bi[1] + "]]")
+                x["nombre_g"] = "_sb_" + b
+            }
+        }
+    }
+    sea pre_params = []
+    si (longitud(campos) > 0) {
+        _som_linea(ctx, "struct " + n + "_Entrada {")
+        para c en campos { _som_linea(ctx, c) }
+        _som_linea(ctx, "};")
+        pre_params.agregar(n + "_Entrada _sb_entrada [[stage_in]]")
+    }
+    sea tipo_sal = "void"
+    si (longitud(outs) > 0) {
+        tipo_sal = n + "_Salida"
+        _som_linea(ctx, "struct " + tipo_sal + " {")
+        sea k = 0
+        para x en outs {
+            sea atr = ""
+            si (tiene_clave(x["attrs"], "location")) {
+                sea loc = _som_attr_num(x["attrs"], "location")
+                si (etapa == "fragment") { atr = "color(" + loc + ")" } sino {
+                    atr = "user(loc" + loc + ")"
+                    si (_som_plano(x["attrs"], x["tipo"])) { atr = atr + ", flat" }
+                }
+            } sino {
+                sea b = _som_attr_txt(x["attrs"], "builtin")
+                atr = _SOM_MSL_SAL[b] ?? b
+            }
+            x["campo"] = "_sb_s" + k
+            _som_linea(ctx, "    " + _som_tn(ctx, x["tipo"]) + " " + x["campo"] + " [[" + atr + "]];")
+            k = k + 1
+        }
+        _som_linea(ctx, "};")
+    }
+    // Recursos usados.
+    sea locales = []
+    para g en _som_extras(m, f) {
+        sea gn = _som_n(ctx, g["nombre"])
+        si (tiene_clave(ranuras, g["nombre"])) {
+            sea r = ranuras[g["nombre"]]
+            params.agregar(_som_msl_param(ctx, g) + " [[" + r["tipo_msl"] + "(" + r["ranura_msl"] + ")]]")
+        } sino si (g["espacio"] == "workgroup") {
+            locales.agregar("threadgroup " + _som_decl(ctx, g["tipo"], gn) + ";")
+        } sino {
+            sea v = ""
+            si (g["v"] != nulo) { v = _som_e(ctx, g["v"]) } sino { v = _som_cero(ctx, g["tipo"]) }
+            locales.agregar(_som_decl(ctx, g["tipo"], gn) + " = " + v + ";")
+        }
+    }
+    sea pal = etapa
+    si (etapa == "compute") { pal = "kernel" }
+    para p en params { pre_params.agregar(p) }
+    _som_linea(ctx, pal + " " + tipo_sal + " " + n + "(")
+    sea i = 0
+    para p en pre_params {
+        sea sep = ","
+        si (i == longitud(pre_params) - 1) { sep = "" }
+        _som_linea(ctx, "    " + p + sep)
+        i = i + 1
+    }
+    _som_linea(ctx, ") {")
+    para l en locales { _som_linea(ctx, "    " + l) }
+    sea args = []
+    i = 0
+    para p en f["params"] {
+        sea pn = "_sb_p" + i
+        si (p["tipo"]["k"] == "struct") {
+            sea partes = []
+            para x en ins { si (x["param"] == i) { partes.agregar(x["nombre_g"]) } }
+            _som_linea(ctx, "    " + _som_tn(ctx, p["tipo"]) + " " + pn + " = " + _som_tn(ctx, p["tipo"]) + "{" + unir(partes, ", ") + "};")
+        } sino {
+            para x en ins { si (x["param"] == i) { _som_linea(ctx, "    " + _som_tn(ctx, p["tipo"]) + " " + pn + " = " + x["nombre_g"] + ";") } }
+        }
+        args.agregar(pn)
+        i = i + 1
+    }
+    para g en _som_extras(m, f) { args.agregar(_som_n(ctx, g["nombre"])) }
+    si (f["ret"] == nulo) {
+        _som_linea(ctx, "    _sb_" + f["nombre"] + "(" + unir(args, ", ") + ");")
+    } sino {
+        _som_linea(ctx, "    " + _som_tn(ctx, f["ret"]) + " _sb_r = _sb_" + f["nombre"] + "(" + unir(args, ", ") + ");")
+        sea vals = []
+        para x en outs {
+            si (x["miembro"] == nulo) { vals.agregar("_sb_r") } sino { vals.agregar("_sb_r." + _som_n(ctx, x["miembro"])) }
+        }
+        _som_linea(ctx, "    return " + tipo_sal + "{" + unir(vals, ", ") + "};")
+    }
+    _som_linea(ctx, "}")
+    _som_linea(ctx, "")
+}
+
+// ---------- HLSL ----------
+
+sea _SOM_HLSL_EN = {"vertex_index": ["uint", "SV_VertexID"], "instance_index": ["uint", "SV_InstanceID"], "position": ["float4", "SV_Position"],
+    "front_facing": ["bool", "SV_IsFrontFace"], "sample_index": ["uint", "SV_SampleIndex"], "sample_mask": ["uint", "SV_Coverage"],
+    "local_invocation_id": ["uint3", "SV_GroupThreadID"], "local_invocation_index": ["uint", "SV_GroupIndex"], "global_invocation_id": ["uint3", "SV_DispatchThreadID"],
+    "workgroup_id": ["uint3", "SV_GroupID"], "num_workgroups": ["uint3", "SV_NumWorkGroups"]}
+sea _SOM_HLSL_SAL = {"position": "SV_Position", "frag_depth": "SV_Depth", "sample_mask": "SV_Coverage"}
+
+funcion _som_hlsl(m, opciones) {
+    sea ctx = _som_contexto(m, "hlsl", opciones)
+    sea cuerpo = []
+    // Recursos.
+    para g en m["globales"] {
+        sea n = _som_n(ctx, g["nombre"])
+        sea t = g["tipo"]
+        sea sp = ""
+        si (g["grupo"] != nulo y g["grupo"] != 0) { sp = ", space" + g["grupo"] }
+        si (g["espacio"] == "uniform") {
+            sea pre = ""
+            si (t["k"] == "mat") { pre = "row_major " }
+            _som_linea(ctx, "cbuffer " + n + "_bloque : register(b" + g["enlace"] + sp + ") { " + pre + _som_decl(ctx, t, n) + "; }")
+        } sino si (g["espacio"] == "storage") {
+            sea rw = "RW"
+            sea reg = "u"
+            si (g["acceso"] == "read") {
+                rw = ""
+                reg = "t"
+            }
+            si (t["k"] == "arr") {
+                _som_linea(ctx, rw + "StructuredBuffer<" + _som_tn(ctx, t["t"]) + "> " + n + " : register(" + reg + g["enlace"] + sp + ");")
+            } sino {
+                _som_linea(ctx, rw + "StructuredBuffer<" + _som_tn(ctx, t) + "> _" + n + " : register(" + reg + g["enlace"] + sp + ");")
+                ctx["refs"][g["nombre"]] = "_" + n + "[0]"
+            }
+        } sino si (g["espacio"] == "handle") {
+            sea reg = "t"
+            si (t["k"] == "muestreador") { reg = "s" }
+            si (t["k"] == "tex" y t["almacen"]) { reg = "u" }
+            _som_linea(ctx, _som_tn(ctx, t) + " " + n + " : register(" + reg + g["enlace"] + sp + ");")
+        } sino si (g["espacio"] == "workgroup") {
+            _som_linea(ctx, "groupshared " + _som_decl(ctx, t, n) + ";")
+        } sino {
+            sea v = ""
+            si (g["v"] != nulo) { v = _som_e(ctx, g["v"]) } sino { v = _som_cero(ctx, t) }
+            _som_linea(ctx, "static " + _som_decl(ctx, t, n) + " = " + v + ";")
+        }
+    }
+    _som_linea(ctx, "@@LARGOS@@")
+    sea entradas = _som_entradas(m)
+    sea raices = []
+    para f en entradas { raices.agregar(f["nombre"]) }
+    si (((opciones ?? {})["entrada"] ?? nulo) != nulo) { raices = [opciones["entrada"]] }
+    para n en _som_orden_funciones(m, raices) {
+        sea f = m["funciones"][m["fn_idx"][n]]
+        sea nombre = _som_n(ctx, n)
+        si (f["etapa"] != nulo) { nombre = "_sb_" + n }
+        _som_funcion(ctx, f, nombre, [])
+    }
+    para f en entradas { si (contiene(raices, f["nombre"])) { _som_hlsl_entrada(ctx, f) } }
+    // Ayudas que hicieron falta.
+    sea c2 = _som_contexto(m, "hlsl", opciones)
+    _som_structs(c2)
+    para s en claves(ctx["crear"]) {
+        sea ms = m["structs"][s]["miembros"]
+        sea ps = []
+        sea k = 0
+        para mm en ms {
+            ps.agregar(_som_decl(c2, mm["tipo"], "a" + k))
+            k = k + 1
+        }
+        _som_linea(c2, s + " _sb_crear_" + s + "(" + unir(ps, ", ") + ") {")
+        _som_linea(c2, "    " + s + " r = (" + s + ")0;")
+        k = 0
+        para mm en ms {
+            _som_linea(c2, "    r." + _som_n(c2, mm["nombre"]) + " = a" + k + ";")
+            k = k + 1
+        }
+        _som_linea(c2, "    return r;")
+        _som_linea(c2, "}")
+        _som_linea(c2, "")
+    }
+    para clave en claves(ctx["dimensiones"]) {
+        sea p = texto_dividir(clave, "|")
+        sea nd = a_numero(p[1])
+        sea tipo_r = "uint"
+        si (nd > 1) { tipo_r = "uint" + nd }
+        si (p[3] == "verdadero") {
+            si (nd == 2) { _som_linea(c2, "uint2 _sb_dimensiones(" + p[0] + " t) { uint w, h; t.GetDimensions(w, h); return uint2(w, h); }") }
+            sino si (nd == 3) { _som_linea(c2, "uint3 _sb_dimensiones(" + p[0] + " t) { uint w, h, d; t.GetDimensions(w, h, d); return uint3(w, h, d); }") }
+            sino { _som_linea(c2, "uint _sb_dimensiones(" + p[0] + " t) { uint w; t.GetDimensions(w); return w; }") }
+        } sino si (p[2] == "verdadero") {
+            _som_linea(c2, "uint2 _sb_dimensiones(" + p[0] + " t) { uint w, h, c, l; t.GetDimensions(0, w, h, c, l); return uint2(w, h); }")
+        } sino si (nd == 2) {
+            _som_linea(c2, "uint2 _sb_dimensiones(" + p[0] + " t) { uint w, h, l; t.GetDimensions(0, w, h, l); return uint2(w, h); }")
+        } sino si (nd == 3) {
+            _som_linea(c2, "uint3 _sb_dimensiones(" + p[0] + " t) { uint w, h, d, l; t.GetDimensions(0, w, h, d, l); return uint3(w, h, d); }")
+        } sino {
+            _som_linea(c2, "uint _sb_dimensiones(" + p[0] + " t) { uint w, l; t.GetDimensions(0, w, l); return w; }")
+        }
+    }
+    para f en claves(ctx["empaques"]) { _som_linea(c2, _SOM_HLSL_EMPAQUES[f]) }
+    // Las constantes van después de los structs (pueden usarlos).
+    sea c3 = _som_contexto(m, "hlsl", opciones)
+    _som_consts(c3)
+    sea largos = []
+    para gn en claves(ctx["largos"]) {
+        sea nn = _som_n(ctx, gn)
+        largos.agregar("uint _sb_largo_" + nn + "() { uint n, s; " + nn + ".GetDimensions(n, s); return n; }")
+    }
+    largos.agregar("")
+    sea cuerpo_t = texto_reemplazar(_som_juntar(ctx), "@@LARGOS@@", unir(largos, "\n"))
+    retornar unir(c2["salida"], "\n") + "\n" + unir(c3["salida"], "\n") + "\n" + cuerpo_t
+}
+
+sea _SOM_HLSL_ATOM = {"atomicAdd": "InterlockedAdd", "atomicSub": "InterlockedAdd", "atomicMin": "InterlockedMin", "atomicMax": "InterlockedMax",
+    "atomicAnd": "InterlockedAnd", "atomicOr": "InterlockedOr", "atomicXor": "InterlockedXor", "atomicStore": "InterlockedExchange", "atomicExchange": "InterlockedExchange"}
+
+sea _SOM_HLSL_EMPAQUES = {
+    "pack4x8unorm": "uint _sb_pack4x8unorm(float4 v) { uint4 u = uint4(round(saturate(v) * 255.0)); return u.x | (u.y << 8) | (u.z << 16) | (u.w << 24); }",
+    "unpack4x8unorm": "float4 _sb_unpack4x8unorm(uint v) { return float4(v & 0xFF, (v >> 8) & 0xFF, (v >> 16) & 0xFF, v >> 24) / 255.0; }",
+    "pack4x8snorm": "uint _sb_pack4x8snorm(float4 v) { int4 i = int4(round(clamp(v, -1.0, 1.0) * 127.0)); return (uint(i.x) & 0xFF) | ((uint(i.y) & 0xFF) << 8) | ((uint(i.z) & 0xFF) << 16) | ((uint(i.w) & 0xFF) << 24); }",
+    "unpack4x8snorm": "float4 _sb_unpack4x8snorm(uint v) { int4 i = int4(v << 24, v << 16, v << 8, v) >> 24; return clamp(float4(i) / 127.0, -1.0, 1.0); }",
+    "pack2x16float": "uint _sb_pack2x16float(float2 v) { return f32tof16(v.x) | (f32tof16(v.y) << 16); }",
+    "unpack2x16float": "float2 _sb_unpack2x16float(uint v) { return float2(f16tof32(v), f16tof32(v >> 16)); }",
+    "pack2x16unorm": "uint _sb_pack2x16unorm(float2 v) { uint2 u = uint2(round(saturate(v) * 65535.0)); return u.x | (u.y << 16); }",
+    "unpack2x16unorm": "float2 _sb_unpack2x16unorm(uint v) { return float2(v & 0xFFFF, v >> 16) / 65535.0; }",
+    "pack2x16snorm": "uint _sb_pack2x16snorm(float2 v) { int2 i = int2(round(clamp(v, -1.0, 1.0) * 32767.0)); return (uint(i.x) & 0xFFFF) | ((uint(i.y) & 0xFFFF) << 16); }",
+    "unpack2x16snorm": "float2 _sb_unpack2x16snorm(uint v) { int2 i = int2(v << 16, v) >> 16; return clamp(float2(i) / 32767.0, -1.0, 1.0); }"}
+
+funcion _som_hlsl_entrada(ctx, f) {
+    sea m = ctx["m"]
+    sea n = _som_n(ctx, f["nombre"])
+    sea etapa = f["etapa"]
+    sea ins = _som_aplanar_params(m, f)
+    sea outs = _som_aplanar_salida(m, f)
+    sea campos = []
+    para x en ins {
+        si (tiene_clave(x["attrs"], "location")) {
+            sea loc = _som_attr_num(x["attrs"], "location")
+            sea pre = ""
+            si (etapa == "fragment" y _som_plano(x["attrs"], x["tipo"])) { pre = "nointerpolation " }
+            campos.agregar("    " + pre + _som_tn(ctx, x["tipo"]) + " _sb_l" + loc + " : LOC" + loc + ";")
+            x["nombre_g"] = "_sb_entrada._sb_l" + loc
+        } sino si (tiene_clave(x["attrs"], "builtin")) {
+            sea b = _som_attr_txt(x["attrs"], "builtin")
+            sea bi = _SOM_HLSL_EN[b] ?? ["uint", b]
+            campos.agregar("    " + bi[0] + " _sb_" + b + " : " + bi[1] + ";")
+            x["nombre_g"] = "_sb_entrada._sb_" + b
+        }
+    }
+    si (longitud(campos) > 0) {
+        _som_linea(ctx, "struct " + n + "_Entrada {")
+        para c en campos { _som_linea(ctx, c) }
+        _som_linea(ctx, "};")
+        _som_linea(ctx, "")
+    }
+    sea tipo_sal = "void"
+    si (longitud(outs) > 0) {
+        tipo_sal = n + "_Salida"
+        _som_linea(ctx, "struct " + tipo_sal + " {")
+        sea k = 0
+        para x en outs {
+            sea sem = ""
+            sea pre = ""
+            si (tiene_clave(x["attrs"], "location")) {
+                sea loc = _som_attr_num(x["attrs"], "location")
+                si (etapa == "fragment") { sem = "SV_Target" + loc } sino {
+                    sem = "LOC" + loc
+                    si (_som_plano(x["attrs"], x["tipo"])) { pre = "nointerpolation " }
+                }
+            } sino {
+                sea b = _som_attr_txt(x["attrs"], "builtin")
+                sem = _SOM_HLSL_SAL[b] ?? b
+            }
+            x["campo"] = "_sb_s" + k
+            _som_linea(ctx, "    " + pre + _som_tn(ctx, x["tipo"]) + " " + x["campo"] + " : " + sem + ";")
+            k = k + 1
+        }
+        _som_linea(ctx, "};")
+        _som_linea(ctx, "")
+    }
+    si (etapa == "compute") { _som_linea(ctx, "[numthreads(" + f["wg"][0] + ", " + f["wg"][1] + ", " + f["wg"][2] + ")]") }
+    sea pe = ""
+    si (longitud(campos) > 0) { pe = n + "_Entrada _sb_entrada" }
+    _som_linea(ctx, tipo_sal + " " + n + "(" + pe + ") {")
+    sea args = []
+    sea i = 0
+    para p en f["params"] {
+        sea pn = "_sb_p" + i
+        si (p["tipo"]["k"] == "struct") {
+            sea partes = []
+            para x en ins { si (x["param"] == i) { partes.agregar(x["nombre_g"]) } }
+            ctx["crear"][p["tipo"]["nombre"]] = verdadero
+            _som_linea(ctx, "    " + _som_tn(ctx, p["tipo"]) + " " + pn + " = _sb_crear_" + p["tipo"]["nombre"] + "(" + unir(partes, ", ") + ");")
+        } sino {
+            para x en ins { si (x["param"] == i) { _som_linea(ctx, "    " + _som_tn(ctx, p["tipo"]) + " " + pn + " = " + x["nombre_g"] + ";") } }
+        }
+        args.agregar(pn)
+        i = i + 1
+    }
+    si (f["ret"] == nulo) {
+        _som_linea(ctx, "    _sb_" + f["nombre"] + "(" + unir(args, ", ") + ");")
+    } sino {
+        _som_linea(ctx, "    " + _som_tn(ctx, f["ret"]) + " _sb_r = _sb_" + f["nombre"] + "(" + unir(args, ", ") + ");")
+        _som_linea(ctx, "    " + tipo_sal + " _sb_s;")
+        para x en outs {
+            sea v = "_sb_r"
+            si (x["miembro"] != nulo) { v = "_sb_r." + _som_n(ctx, x["miembro"]) }
+            _som_linea(ctx, "    _sb_s." + x["campo"] + " = " + v + ";")
+        }
+        _som_linea(ctx, "    return _sb_s;")
+    }
+    _som_linea(ctx, "}")
+    _som_linea(ctx, "")
+}
+
+// ---------- WGSL ----------
+
+funcion _som_attrs_txt(ctx, a) {
+    sea l = []
+    para k en claves(a) {
+        si (longitud(a[k]) == 0) { l.agregar("@" + k) }
+        sino {
+            sea args = []
+            para x en a[k] {
+                si (tipo(x) == "mapa") { args.agregar(_som_e(ctx, x)) } sino { args.agregar("" + x) }
+            }
+            l.agregar("@" + k + "(" + unir(args, ", ") + ")")
+        }
+    }
+    si (longitud(l) == 0) { retornar "" }
+    retornar unir(l, " ") + " "
+}
+
+funcion _som_wgsl(m, opciones) {
+    sea ctx = _som_contexto(m, "wgsl", opciones)
+    para dv en m["directivas"] { _som_linea(ctx, texto_reemplazar(dv, ",", ", ")) }
+    si (longitud(m["directivas"]) > 0) { _som_linea(ctx, "") }
+    para dcl en m["decl"] {
+        sea k = dcl[0]
+        sea n = dcl[1]
+        si (k == "struct") {
+            _som_linea(ctx, "struct " + n + " {")
+            para mm en m["structs"][n]["miembros"] { _som_linea(ctx, "    " + _som_attrs_txt(ctx, mm["attrs"]) + mm["nombre"] + ": " + _som_t_txt(mm["tipo"]) + ",") }
+            _som_linea(ctx, "}")
+            _som_linea(ctx, "")
+        } sino si (k == "const") {
+            sea c = m["consts"][n]
+            sea kw = "const"
+            si (c["override"]) { kw = _som_attrs_txt(ctx, c["attrs"]) + "override" }
+            sea v = ""
+            si (c["v"] != nulo) { v = " = " + _som_e(ctx, c["v"]) }
+            _som_linea(ctx, kw + " " + n + ": " + _som_t_txt(c["tipo_r"]) + v + ";")
+        } sino si (k == "var") {
+            sea g = m["globales"][m["global_idx"][n]]
+            sea pre = ""
+            si (g["grupo"] != nulo) { pre = "@group(" + g["grupo"] + ") @binding(" + g["enlace"] + ") " }
+            sea esp = ""
+            si (g["espacio"] != "handle") {
+                esp = "<" + g["espacio"]
+                si (g["espacio"] == "storage") { esp = esp + ", " + g["acceso"] }
+                esp = esp + ">"
+            }
+            sea v = ""
+            si (g["v"] != nulo) { v = " = " + _som_e(ctx, g["v"]) }
+            _som_linea(ctx, pre + "var" + esp + " " + n + ": " + _som_t_txt(g["tipo"]) + v + ";")
+        } sino {
+            sea f = m["funciones"][m["fn_idx"][n]]
+            sea at = ""
+            si (f["etapa"] != nulo) { at = "@" + f["etapa"] + " " }
+            si (f["wg"] != nulo) { at = at + "@workgroup_size(" + f["wg"][0] + ", " + f["wg"][1] + ", " + f["wg"][2] + ") " }
+            sea ps = []
+            para p en f["params"] { ps.agregar(_som_attrs_txt(ctx, p["attrs"]) + p["nombre"] + ": " + _som_t_txt(p["tipo"])) }
+            sea ret = ""
+            si (f["ret"] != nulo) { ret = " -> " + _som_attrs_txt(ctx, f["ret_attrs"]) + _som_t_txt(f["ret"]) }
+            _som_linea(ctx, "")
+            _som_linea(ctx, at + "fn " + n + "(" + unir(ps, ", ") + ")" + ret + " {")
+            _som_cuerpo(ctx, f["cuerpo"])
+            _som_linea(ctx, "}")
+        }
+    }
+    retornar _som_juntar(ctx)
+}
