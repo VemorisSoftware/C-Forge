@@ -69,6 +69,12 @@ Sitio oficial: [c-forge.org](https://c-forge.org)
   `llamada`/`protobuf` (.proto, binario como protoc, marcos gRPC),
   `recolecta`/`crawler` (cookies RFC 6265, formularios, robots.txt,
   rastreo) y `sensor`/`mqtt` (paquetes MQTT, QoS 2, mini broker).
+- Lote 30 de bibliotecas (con alias en inglés y pruebas en ambos idiomas):
+  `directo`/`webrtc` (WebRTC propio: ICE con STUN, DTLS 1.2 cliente y
+  servidor con cookies y retransmisión, SCTP con fragmentación y
+  retransmisión, canales de datos DCEP, SDP de oferta y respuesta, y SRTP
+  con claves del exportador DTLS. Interopera con aiortc en los dos sentidos;
+  el DTLS, con OpenSSL; el SRTP da los mismos bytes que libsrtp).
 - Lote 29 de bibliotecas (con alias en inglés y pruebas en ambos idiomas):
   `rayo_json`/`simdjson` (JSON bajo demanda con punteros RFC 6901 que salta
   lo que no se pide con búsquedas nativas, validación estricta con línea,
