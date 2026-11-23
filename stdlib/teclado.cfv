@@ -1,0 +1,544 @@
+// stdlib/teclado.cfv — simular teclado y ratón al estilo Enigo: pulsar y
+// soltar teclas por nombre, escribir texto Unicode (también letras que no
+// están en el teclado: se asignan a una tecla libre mientras dura la
+// pulsación), atajos (ctrl+c), mover el ratón (absoluto o relativo),
+// botones, rueda vertical y horizontal, posición del puntero y tamaño de la
+// pantalla. Linux con X11 (XTest, también en Xvfb), macOS con CGEvent y
+// Windows con SendInput. Idea de Enigo (MIT), escrito desde cero.
+// En inglés: importar "input_sim".
+//
+//   importar "teclado"
+//   sea t = teclado_nuevo(nulo)
+//   teclado_texto(t, "Hola, mundo ñ")
+//   teclado_atajo(t, ["ctrl", "s"])
+//   teclado_mover(t, 400, 300)
+//   teclado_clic(t, "izquierdo")
+//   teclado_cerrar(t)
+
+sea _TC_TECLAS = {"enter": "Return", "intro": "Return", "return": "Return", "tab": "Tab", "tabulador": "Tab", "escape": "Escape", "esc": "Escape",
+    "espacio": "space", "space": "space", "retroceso": "BackSpace", "backspace": "BackSpace", "suprimir": "Delete", "delete": "Delete", "insertar": "Insert",
+    "arriba": "Up", "up": "Up", "abajo": "Down", "down": "Down", "izquierda": "Left", "left": "Left", "derecha": "Right", "right": "Right",
+    "inicio": "Home", "home": "Home", "fin": "End", "end": "End", "repag": "Prior", "pageup": "Prior", "avpag": "Next", "pagedown": "Next",
+    "ctrl": "Control_L", "control": "Control_L", "ctrl_der": "Control_R", "shift": "Shift_L", "mayus": "Shift_L", "shift_der": "Shift_R",
+    "alt": "Alt_L", "alt_der": "Alt_R", "altgr": "ISO_Level3_Shift", "meta": "Super_L", "super": "Super_L", "cmd": "Super_L", "windows": "Super_L",
+    "bloq_mayus": "Caps_Lock", "capslock": "Caps_Lock", "menu": "Menu", "imprimir": "Print", "pausa": "Pause", "bloq_num": "Num_Lock",
+    "volumen_arriba": "XF86AudioRaiseVolume", "volumen_abajo": "XF86AudioLowerVolume", "silencio": "XF86AudioMute", "reproducir": "XF86AudioPlay"}
+
+// Códigos virtuales de macOS y Windows para las teclas con nombre.
+sea _TC_MAC = {"Return": 36, "Tab": 48, "space": 49, "BackSpace": 51, "Escape": 53, "Super_L": 55, "Shift_L": 56, "Caps_Lock": 57, "Alt_L": 58, "Control_L": 59,
+    "Shift_R": 60, "Alt_R": 61, "Control_R": 62, "Delete": 117, "Home": 115, "End": 119, "Prior": 116, "Next": 121, "Left": 123, "Right": 124, "Down": 125, "Up": 126,
+    "F1": 122, "F2": 120, "F3": 99, "F4": 118, "F5": 96, "F6": 97, "F7": 98, "F8": 100, "F9": 101, "F10": 109, "F11": 103, "F12": 111}
+sea _TC_WIN = {"Return": 13, "Tab": 9, "space": 32, "BackSpace": 8, "Escape": 27, "Super_L": 91, "Shift_L": 160, "Shift_R": 161, "Control_L": 162, "Control_R": 163,
+    "Alt_L": 164, "Alt_R": 165, "Caps_Lock": 20, "Delete": 46, "Insert": 45, "Home": 36, "End": 35, "Prior": 33, "Next": 34, "Left": 37, "Up": 38, "Right": 39,
+    "Down": 40, "Menu": 93, "Print": 44, "Pause": 19, "Num_Lock": 144, "XF86AudioRaiseVolume": 175, "XF86AudioLowerVolume": 174, "XF86AudioMute": 173, "XF86AudioPlay": 179}
+
+/// Nombre del sistema (keysym de X11) para una tecla: "a", "F5", "ctrl"…
+funcion teclado_nombre_tecla(n) {
+    sea k = texto_minusculas(n)
+    si (tiene_clave(_TC_TECLAS, k)) { retornar _TC_TECLAS[k] }
+    si (longitud(k) >= 2 y longitud(k) <= 3 y texto_empieza_con(k, "f") y _tc_es_numero(subtexto(k, 1, longitud(k)))) { retornar "F" + subtexto(k, 1, longitud(k)) }
+    retornar n
+}
+
+funcion _tc_es_numero(t) {
+    si (longitud(t) == 0) { retornar falso }
+    sea i = 0
+    mientras (i < longitud(t)) {
+        sea b = byte_en(t, i)
+        si (b < 48 o b > 57) { retornar falso }
+        i = i + 1
+    }
+    retornar verdadero
+}
+
+funcion _tc_sistema() {
+    si (existe_archivo("/proc/meminfo")) { retornar "x11" }
+    si (existe_archivo("/System/Library/CoreServices")) { retornar "macos" }
+    retornar "windows"
+}
+
+funcion __teclado_x11() {
+    extern "libX11.so.6" funcion XOpenDisplay(nombre: puntero): puntero
+    extern "libX11.so.6" funcion XCloseDisplay(d: puntero): entero
+    extern "libX11.so.6" funcion XFlush(d: puntero): entero
+    extern "libX11.so.6" funcion XSync(d: puntero, descartar: entero): entero
+    extern "libX11.so.6" funcion XStringToKeysym(s: texto): largo
+    extern "libX11.so.6" funcion XKeysymToKeycode(d: puntero, ks: largo): entero
+    extern "libX11.so.6" funcion XKeycodeToKeysym(d: puntero, kc: entero, i: entero): largo
+    extern "libX11.so.6" funcion XDisplayKeycodes(d: puntero, minimo: puntero, maximo: puntero): entero
+    extern "libX11.so.6" funcion XGetKeyboardMapping(d: puntero, primero: entero, cuantos: entero, por: puntero): puntero
+    extern "libX11.so.6" funcion XChangeKeyboardMapping(d: puntero, primero: entero, por: entero, syms: puntero, cuantos: entero): entero
+    extern "libX11.so.6" funcion XFree(p: puntero): entero
+    extern "libX11.so.6" funcion XDefaultRootWindow(d: puntero): largo
+    extern "libX11.so.6" funcion XDisplayWidth(d: puntero, s: entero): entero
+    extern "libX11.so.6" funcion XDisplayHeight(d: puntero, s: entero): entero
+    extern "libXtst.so.6" funcion XTestFakeKeyEvent(d: puntero, kc: entero, abajo: entero, retraso: largo): entero
+    extern "libXtst.so.6" funcion XTestFakeButtonEvent(d: puntero, b: entero, abajo: entero, retraso: largo): entero
+    extern "libXtst.so.6" funcion XTestFakeMotionEvent(d: puntero, pantalla: entero, x: entero, y: entero, retraso: largo): entero
+    extern "libXtst.so.6" funcion XTestFakeRelativeMotionEvent(d: puntero, dx: entero, dy: entero, retraso: largo): entero
+    extern "libX11-xcb.so.1" funcion XGetXCBConnection(d: puntero): puntero
+    extern "libxcb.so.1" funcion xcb_query_pointer(c: puntero, w: entero): entero
+    extern "libxcb.so.1" funcion xcb_query_pointer_reply(c: puntero, galleta: entero, e: puntero): puntero
+}
+
+funcion __teclado_mac() {
+    extern "/System/Library/Frameworks/ApplicationServices.framework/ApplicationServices" funcion CGEventCreateKeyboardEvent(fuente: puntero, tecla: entero, abajo: entero): puntero
+    extern "/System/Library/Frameworks/ApplicationServices.framework/ApplicationServices" funcion CGEventKeyboardSetUnicodeString(ev: puntero, n: largo, s: puntero): entero
+    extern "/System/Library/Frameworks/ApplicationServices.framework/ApplicationServices" funcion CGEventCreateMouseEvent(fuente: puntero, tipo_e: entero, x: numero, y: numero, boton: entero): puntero
+    extern "/System/Library/Frameworks/ApplicationServices.framework/ApplicationServices" funcion CGEventCreateScrollWheelEvent(fuente: puntero, unidades: entero, ejes: entero, dy: entero, dx: entero): puntero
+    extern "/System/Library/Frameworks/ApplicationServices.framework/ApplicationServices" funcion CGEventSetFlags(ev: puntero, f: largo): entero
+    extern "/System/Library/Frameworks/ApplicationServices.framework/ApplicationServices" funcion CGEventPost(tap: entero, ev: puntero): entero
+    extern "/System/Library/Frameworks/ApplicationServices.framework/ApplicationServices" funcion CFRelease(p: puntero): entero
+    extern "/System/Library/Frameworks/ApplicationServices.framework/ApplicationServices" funcion CGEventCreate(fuente: puntero): puntero
+    extern "/System/Library/Frameworks/ApplicationServices.framework/ApplicationServices" funcion CGEventGetLocation(ev: puntero): numero
+    extern "/System/Library/Frameworks/ApplicationServices.framework/ApplicationServices" funcion CGMainDisplayID(): entero
+    extern "/System/Library/Frameworks/ApplicationServices.framework/ApplicationServices" funcion CGDisplayPixelsWide(d: entero): largo
+    extern "/System/Library/Frameworks/ApplicationServices.framework/ApplicationServices" funcion CGDisplayPixelsHigh(d: entero): largo
+}
+
+funcion __teclado_win() {
+    extern "user32" funcion SendInput(n: entero, entradas: puntero, tam: entero): entero
+    extern "user32" funcion GetCursorPos(p: puntero): entero
+    extern "user32" funcion GetSystemMetrics(i: entero): entero
+    extern "user32" funcion VkKeyScanW(c: entero): entero
+}
+
+/// Abre el simulador. opciones: "pantalla" (X11, p. ej. ":0"), "retraso"
+/// (ms entre eventos, 0 por defecto), "restaurar_teclas" (X11: devolver las
+/// teclas libres a su estado tras escribir caracteres que no estaban en el
+/// teclado; sí por defecto).
+funcion teclado_nuevo(opciones) {
+    sea op = opciones ?? {}
+    sea s = op["sistema"] ?? _tc_sistema()
+    sea t = {"sistema": s, "retraso": op["retraso"] ?? 0, "restaurar": op["restaurar_teclas"] ?? verdadero, "abiertas": {}, "boton_mac": {}, "x": 0, "y": 0}
+    si (s == "x11") {
+        __teclado_x11()
+        sea nombre = op["pantalla"] ?? nulo
+        sea d = nulo
+        si (nombre == nulo) { d = XOpenDisplay(nulo) } sino { d = XOpenDisplay(c_desde_bytes(nombre)) }
+        si (d == nulo o ("" + d) == ("" + nulo)) { lanzar "teclado: no se pudo abrir la pantalla de X11 (¿falta DISPLAY?)" }
+        t["d"] = d
+        t["raiz"] = XDefaultRootWindow(d)
+        sea a = c_reservar(4)
+        sea b = c_reservar(4)
+        XDisplayKeycodes(d, a, b)
+        t["kc_min"] = c_leer32(a, 0)
+        t["kc_max"] = c_leer32(b, 0)
+        c_liberar(a)
+        c_liberar(b)
+    } sino si (s == "macos") {
+        __teclado_mac()
+    } sino {
+        __teclado_win()
+    }
+    retornar t
+}
+
+funcion _tc_pausa(t) { si (t["retraso"] > 0) { hilo_dormir(t["retraso"]) } }
+
+// ---------- X11 ----------
+
+funcion _tc_x_keysym(t, n) { retornar XStringToKeysym(n) }
+
+// Tecla (keycode) libre para letras que no están en el teclado.
+funcion _tc_x_libre(t) {
+    si (tiene_clave(t, "kc_libre")) { retornar t["kc_libre"] }
+    sea por = c_reservar(4)
+    sea n = t["kc_max"] - t["kc_min"] + 1
+    sea mapa = XGetKeyboardMapping(t["d"], t["kc_min"], n, por)
+    sea k = c_leer32(por, 0)
+    sea libre = 0
+    sea i = n - 1
+    mientras (i >= 0 y libre == 0) {
+        sea vacia = verdadero
+        sea j = 0
+        mientras (j < k) {
+            si (c_leer64(mapa, (i * k + j) * 8) != 0) { vacia = falso }
+            j = j + 1
+        }
+        si (vacia) { libre = t["kc_min"] + i }
+        i = i - 1
+    }
+    XFree(mapa)
+    c_liberar(por)
+    si (libre == 0) { lanzar "teclado: no hay teclas libres para escribir ese carácter" }
+    si (t["restaurar"]) { t["kc_libre"] = libre }
+    retornar libre
+}
+
+funcion _tc_x_asignar(t, kc, ks) {
+    sea syms = c_reservar(16)
+    c_escribir64(syms, 0, ks)
+    c_escribir64(syms, 8, ks)
+    XChangeKeyboardMapping(t["d"], kc, 2, syms, 1)
+    XSync(t["d"], 0)
+    c_liberar(syms)
+}
+
+funcion _tc_x_evento(t, kc, abajo) {
+    sea v = 0
+    si (abajo) { v = 1 }
+    XTestFakeKeyEvent(t["d"], kc, v, 0)
+    XFlush(t["d"])
+    _tc_pausa(t)
+}
+
+funcion _tc_x_tecla(t, nombre, abajo) {
+    sea ks = XStringToKeysym(teclado_nombre_tecla(nombre))
+    si (ks == 0) { lanzar "teclado: tecla desconocida '" + nombre + "'" }
+    sea kc = XKeysymToKeycode(t["d"], ks)
+    si (kc == 0) {
+        kc = _tc_x_libre(t)
+        _tc_x_asignar(t, kc, ks)
+    }
+    _tc_x_evento(t, kc, abajo)
+    si (abajo) { t["abiertas"][nombre] = verdadero } sino { quitar_clave(t["abiertas"], nombre) }
+}
+
+funcion _tc_x_caracter(t, cp) {
+    sea ks = cp
+    si (cp == 10) { ks = 65293 }
+    sino si (cp == 9) { ks = 65289 }
+    sino si (cp > 255) { ks = 16777216 + cp }
+    sea kc = XKeysymToKeycode(t["d"], ks)
+    sea mayus = falso
+    sea temporal = falso
+    si (kc != 0) {
+        si (XKeycodeToKeysym(t["d"], kc, 0) != ks) {
+            si (XKeycodeToKeysym(t["d"], kc, 1) == ks) { mayus = verdadero } sino { kc = 0 }
+        }
+    }
+    si (kc == 0) {
+        kc = _tc_x_libre(t)
+        _tc_x_asignar(t, kc, ks)
+        temporal = verdadero
+    }
+    sea kc_mayus = XKeysymToKeycode(t["d"], XStringToKeysym("Shift_L"))
+    si (mayus) { _tc_x_evento(t, kc_mayus, verdadero) }
+    _tc_x_evento(t, kc, verdadero)
+    _tc_x_evento(t, kc, falso)
+    si (mayus) { _tc_x_evento(t, kc_mayus, falso) }
+    si (temporal y t["restaurar"]) {
+        XSync(t["d"], 0)
+        _tc_x_asignar(t, kc, 0)
+    }
+}
+
+// ---------- macOS ----------
+
+funcion _tc_mac_tecla(t, nombre, abajo) {
+    sea n = teclado_nombre_tecla(nombre)
+    sea kc = _TC_MAC[n] ?? nulo
+    si (kc == nulo) { lanzar "teclado: en macOS usa teclado_texto para '" + nombre + "'" }
+    sea v = 0
+    si (abajo) { v = 1 }
+    sea ev = CGEventCreateKeyboardEvent(nulo, kc, v)
+    CGEventPost(0, ev)
+    CFRelease(ev)
+    _tc_pausa(t)
+}
+
+funcion _tc_mac_caracter(t, cp) {
+    sea b = c_reservar(8)
+    sea n = 1
+    si (cp >= 65536) {
+        sea x = cp - 65536
+        c_escribir32(b, 0, (55296 + piso(x / 1024)) + (56320 + x % 1024) * 65536)
+        n = 2
+    } sino { c_escribir32(b, 0, cp) }
+    para abajo en [1, 0] {
+        sea ev = CGEventCreateKeyboardEvent(nulo, 0, abajo)
+        CGEventKeyboardSetUnicodeString(ev, n, b)
+        CGEventPost(0, ev)
+        CFRelease(ev)
+    }
+    c_liberar(b)
+    _tc_pausa(t)
+}
+
+// ---------- Windows ----------
+
+funcion _tc_win_enviar(t, tipo_e, a, b, c, d) {
+    // INPUT de 40 bytes: type (4) + relleno (4) + unión.
+    sea e = c_reservar(40)
+    c_escribir32(e, 0, tipo_e)
+    si (tipo_e == 1) {
+        c_escribir32(e, 8, a + b * 65536)
+        c_escribir32(e, 12, c)
+    } sino {
+        c_escribir32(e, 8, a)
+        c_escribir32(e, 12, b)
+        c_escribir32(e, 16, c)
+        c_escribir32(e, 20, d)
+    }
+    SendInput(1, e, 40)
+    c_liberar(e)
+    _tc_pausa(t)
+}
+
+funcion _tc_win_tecla(t, nombre, abajo) {
+    sea n = teclado_nombre_tecla(nombre)
+    sea vk = _TC_WIN[n] ?? nulo
+    si (vk == nulo y longitud(n) == 1) { vk = bits_y(VkKeyScanW(_tc_codigos(n)[0]), 255) }
+    si (vk == nulo y texto_empieza_con(n, "F")) { vk = 111 + a_numero(subtexto(n, 1, longitud(n))) }
+    si (vk == nulo) { lanzar "teclado: tecla desconocida '" + nombre + "'" }
+    sea f = 2
+    si (abajo) { f = 0 }
+    _tc_win_enviar(t, 1, vk, 0, f, 0)
+}
+
+funcion _tc_win_caracter(t, cp) {
+    // KEYEVENTF_UNICODE (4), y soltar (2).
+    si (cp >= 65536) {
+        sea x = cp - 65536
+        para u en [55296 + piso(x / 1024), 56320 + x % 1024] {
+            _tc_win_enviar(t, 1, 0, u, 4, 0)
+            _tc_win_enviar(t, 1, 0, u, 6, 0)
+        }
+    } sino {
+        _tc_win_enviar(t, 1, 0, cp, 4, 0)
+        _tc_win_enviar(t, 1, 0, cp, 6, 0)
+    }
+}
+
+// ---------- API ----------
+
+/// Pulsa una tecla (y la deja abajo hasta teclado_soltar).
+funcion teclado_pulsar(t, nombre) {
+    si (t["sistema"] == "x11") { _tc_x_tecla(t, nombre, verdadero) }
+    sino si (t["sistema"] == "macos") { _tc_mac_tecla(t, nombre, verdadero) }
+    sino { _tc_win_tecla(t, nombre, verdadero) }
+    t["abiertas"][nombre] = verdadero
+}
+
+/// Suelta una tecla.
+funcion teclado_soltar(t, nombre) {
+    si (t["sistema"] == "x11") { _tc_x_tecla(t, nombre, falso) }
+    sino si (t["sistema"] == "macos") { _tc_mac_tecla(t, nombre, falso) }
+    sino { _tc_win_tecla(t, nombre, falso) }
+    si (tiene_clave(t["abiertas"], nombre)) { quitar_clave(t["abiertas"], nombre) }
+}
+
+/// Pulsa y suelta una tecla.
+funcion teclado_tecla(t, nombre) {
+    teclado_pulsar(t, nombre)
+    teclado_soltar(t, nombre)
+}
+
+/// Atajo: pulsa en orden y suelta al revés (["ctrl", "shift", "t"]).
+funcion teclado_atajo(t, teclas) {
+    para k en teclas { teclado_pulsar(t, k) }
+    sea i = longitud(teclas) - 1
+    mientras (i >= 0) {
+        teclado_soltar(t, teclas[i])
+        i = i - 1
+    }
+}
+
+/// Escribe texto (UTF-8), cualquier carácter.
+funcion teclado_texto(t, texto) {
+    para cp en _tc_codigos(texto) {
+        si (t["sistema"] == "x11") { _tc_x_caracter(t, cp) }
+        sino si (t["sistema"] == "macos") { _tc_mac_caracter(t, cp) }
+        sino { _tc_win_caracter(t, cp) }
+    }
+}
+
+// Puntos de código de un texto UTF-8.
+funcion _tc_codigos(s) {
+    sea r = []
+    sea i = 0
+    sea n = longitud(s)
+    mientras (i < n) {
+        sea b = byte_en(s, i)
+        sea cp = b
+        sea extra = 0
+        si (b >= 240) {
+            cp = bits_y(b, 7)
+            extra = 3
+        } sino si (b >= 224) {
+            cp = bits_y(b, 15)
+            extra = 2
+        } sino si (b >= 192) {
+            cp = bits_y(b, 31)
+            extra = 1
+        }
+        sea k = 1
+        mientras (k <= extra y i + k < n) {
+            cp = cp * 64 + bits_y(byte_en(s, i + k), 63)
+            k = k + 1
+        }
+        r.agregar(cp)
+        i = i + 1 + extra
+    }
+    retornar r
+}
+
+sea _TC_WIN_BOT = {"1": [2, 4], "2": [32, 64], "3": [8, 16]}
+sea _TC_BOTONES = {"izquierdo": 1, "left": 1, "medio": 2, "middle": 2, "derecho": 3, "right": 3, "atras": 8, "back": 8, "adelante": 9, "forward": 9}
+
+/// Mueve el puntero a (x, y) de la pantalla.
+funcion teclado_mover(t, x, y) {
+    si (t["sistema"] == "x11") {
+        XTestFakeMotionEvent(t["d"], -1, x, y, 0)
+        XFlush(t["d"])
+    } sino si (t["sistema"] == "macos") {
+        sea ev = CGEventCreateMouseEvent(nulo, 5, x, y, 0)
+        CGEventPost(0, ev)
+        CFRelease(ev)
+    } sino {
+        // MOUSEEVENTF_MOVE | MOUSEEVENTF_ABSOLUTE, en 0..65535.
+        sea w = GetSystemMetrics(0)
+        sea h = GetSystemMetrics(1)
+        _tc_win_enviar(t, 0, piso(x * 65535 / maximo(1, w - 1)), piso(y * 65535 / maximo(1, h - 1)), 0, 32769)
+    }
+    t["x"] = x
+    t["y"] = y
+    _tc_pausa(t)
+}
+
+/// Mueve el puntero (dx, dy) desde donde está.
+funcion teclado_mover_relativo(t, dx, dy) {
+    si (t["sistema"] == "x11") {
+        XTestFakeRelativeMotionEvent(t["d"], dx, dy, 0)
+        XFlush(t["d"])
+    } sino si (t["sistema"] == "windows") {
+        _tc_win_enviar(t, 0, dx, dy, 0, 1)
+    } sino {
+        sea p = teclado_posicion(t)
+        teclado_mover(t, p[0] + dx, p[1] + dy)
+    }
+    _tc_pausa(t)
+}
+
+funcion _tc_boton(t, boton, abajo) {
+    sea b = _TC_BOTONES[boton ?? "izquierdo"] ?? boton
+    si (t["sistema"] == "x11") {
+        sea v = 0
+        si (abajo) { v = 1 }
+        XTestFakeButtonEvent(t["d"], b, v, 0)
+        XFlush(t["d"])
+    } sino si (t["sistema"] == "macos") {
+        // kCGEventLeftMouseDown 1/2, RightMouseDown 3/4, OtherMouseDown 25/26.
+        sea tipo_e = 1
+        sea mb = 0
+        si (b == 3) {
+            tipo_e = 3
+            mb = 1
+        }
+        si (b == 2) {
+            tipo_e = 25
+            mb = 2
+        }
+        si (abajo == falso) { tipo_e = tipo_e + 1 }
+        sea ev = CGEventCreateMouseEvent(nulo, tipo_e, t["x"], t["y"], mb)
+        CGEventPost(0, ev)
+        CFRelease(ev)
+    } sino {
+        sea f = _TC_WIN_BOT["" + b] ?? [2, 4]
+        sea fl = f[1]
+        si (abajo) { fl = f[0] }
+        _tc_win_enviar(t, 0, 0, 0, 0, fl)
+    }
+    _tc_pausa(t)
+}
+
+funcion teclado_boton_abajo(t, boton) { _tc_boton(t, boton, verdadero) }
+funcion teclado_boton_arriba(t, boton) { _tc_boton(t, boton, falso) }
+
+/// Clic (o doble clic con veces = 2).
+funcion teclado_clic(t, boton, veces) {
+    sea n = veces ?? 1
+    sea i = 0
+    mientras (i < n) {
+        _tc_boton(t, boton, verdadero)
+        _tc_boton(t, boton, falso)
+        i = i + 1
+    }
+}
+
+/// Arrastra de (x0, y0) a (x1, y1) con el botón izquierdo, en "pasos".
+funcion teclado_arrastrar(t, x0, y0, x1, y1, pasos) {
+    sea n = pasos ?? 10
+    teclado_mover(t, x0, y0)
+    _tc_boton(t, "izquierdo", verdadero)
+    sea i = 1
+    mientras (i <= n) {
+        teclado_mover(t, x0 + piso((x1 - x0) * i / n), y0 + piso((y1 - y0) * i / n))
+        i = i + 1
+    }
+    _tc_boton(t, "izquierdo", falso)
+}
+
+/// Rueda: dy > 0 baja, dy < 0 sube; dx > 0 derecha.
+funcion teclado_rueda(t, dx, dy) {
+    si (t["sistema"] == "x11") {
+        sea pasos = [[dy, 5, 4], [dx, 7, 6]]
+        para p en pasos {
+            sea c = abs(p[0])
+            sea b = p[1]
+            si (p[0] < 0) { b = p[2] }
+            sea i = 0
+            mientras (i < c) {
+                XTestFakeButtonEvent(t["d"], b, 1, 0)
+                XTestFakeButtonEvent(t["d"], b, 0, 0)
+                i = i + 1
+            }
+        }
+        XFlush(t["d"])
+    } sino si (t["sistema"] == "macos") {
+        sea ev = CGEventCreateScrollWheelEvent(nulo, 1, 2, 0 - dy, 0 - dx)
+        CGEventPost(0, ev)
+        CFRelease(ev)
+    } sino {
+        si (dy != 0) { _tc_win_enviar(t, 0, 0, 0, bits_y((0 - dy) * 120, 4294967295), 2048) }
+        si (dx != 0) { _tc_win_enviar(t, 0, 0, 0, bits_y(dx * 120, 4294967295), 4096) }
+    }
+    _tc_pausa(t)
+}
+
+/// Posición del puntero [x, y].
+funcion teclado_posicion(t) {
+    si (t["sistema"] == "x11") {
+        sea c = XGetXCBConnection(t["d"])
+        sea g = xcb_query_pointer(c, t["raiz"])
+        sea r = xcb_query_pointer_reply(c, g, nulo)
+        si (("" + r) == ("" + nulo)) { lanzar "teclado: no se pudo leer el puntero" }
+        sea w = c_leer32(r, 16)
+        si (w < 0) { w = w + 4294967296 }
+        sea x = w % 65536
+        sea y = piso(w / 65536)
+        si (x >= 32768) { x = x - 65536 }
+        si (y >= 32768) { y = y - 65536 }
+        c_liberar(r)
+        retornar [x, y]
+    }
+    si (t["sistema"] == "windows") {
+        sea p = c_reservar(8)
+        GetCursorPos(p)
+        sea r = [c_leer32(p, 0), c_leer32(p, 4)]
+        c_liberar(p)
+        retornar r
+    }
+    retornar [t["x"], t["y"]]
+}
+
+/// Tamaño de la pantalla principal [ancho, alto].
+funcion teclado_pantalla(t) {
+    si (t["sistema"] == "x11") { retornar [XDisplayWidth(t["d"], 0), XDisplayHeight(t["d"], 0)] }
+    si (t["sistema"] == "macos") {
+        sea d = CGMainDisplayID()
+        retornar [CGDisplayPixelsWide(d), CGDisplayPixelsHigh(d)]
+    }
+    retornar [GetSystemMetrics(0), GetSystemMetrics(1)]
+}
+
+/// Suelta todo lo que quedó apretado y cierra.
+funcion teclado_cerrar(t) {
+    para k en claves(t["abiertas"]) { teclado_soltar(t, k) }
+    si (t["sistema"] == "x11" y tiene_clave(t, "d")) {
+        XSync(t["d"], 0)
+        XCloseDisplay(t["d"])
+        quitar_clave(t, "d")
+    }
+}

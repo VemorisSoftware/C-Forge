@@ -158,7 +158,7 @@ Estado: ✅ ya existe en C-Forge · 🔗 se usa hoy vía `cforge bindgen`,
 | 112 | `grafo_api` / `graphql` | Servidor GraphQL | async-graphql | ✅ `grafo_api` |
 | 113 | `plantilla` / `template` | Plantillas HTML | Tera, Handlebars | ✅ `plantilla` |
 | 114 | `piloto` / `browser` | Navegadores automatizados | Playwright | ✅ `piloto` |
-| 115 | `atributo` | Interactividad por atributos HTML | htmx | 🛠 |
+| 115 | `atributo` / `hypermedia` | Interactividad por atributos HTML | htmx | ✅ `atributo` |
 | 116 | `css` | Parser y minificador CSS | LightningCSS | ✅ `css` |
 | 117 | `empaca` / `bundler` | Empaquetador web | esbuild | ✅ `empaca` |
 | 118 | `ensayo` / `vitest` | Mocks y snapshots | Vitest | ✅ `ensayo` |
@@ -253,13 +253,13 @@ Estado: ✅ ya existe en C-Forge · 🔗 se usa hoy vía `cforge bindgen`,
 | # | Nombre | Para qué | Inspiración | Estado |
 |---|---|---|---|---|
 | 182 | `nodos` / `scenetree` | Árbol de escenas y señales | Godot | ✅ `nodos` |
-| 183 | `manipulador` | Gizmos 3D de editor | ImGuizmo | 🛠 |
+| 183 | `manipulador` / `gizmo3d` | Gizmos 3D de editor | ImGuizmo | ✅ `manipulador` |
 | 184 | `optimalla` / `meshopt` | Optimizar mallas y LOD | meshoptimizer | ✅ `optimalla` |
 | 185 | `textura` / `texcompress` | Compresión de texturas | Basis Universal | ✅ `textura` |
 | 186 | `solido` | Física 3D multinúcleo | Jolt | ✅ `fisica3d` (básica) · 🛠 |
 | 187 | `determinista` / `fixedphysics` | Física reproducible | Rapier | ✅ `determinista` |
 | 188 | `inmersiva` | Realidad virtual y aumentada | OpenXR | 🔗 |
-| 189 | `sombreador` | Traducir shaders | naga | 🛠 |
+| 189 | `sombreador` / `shader` | Traducir shaders | naga | ✅ `sombreador` |
 | 190 | `mosaico` / `tilemap` | Mapas de tiles | Tiled, LDtk | ✅ `mosaico` |
 | 191 | `esqueleto` / `skeleton2d` | Animación por huesos 2D | Spine | ✅ `esqueleto` |
 | 192 | `multitud` / `crowd` | Simulación de multitudes | DetourCrowd | ✅ `multitud` |
@@ -322,7 +322,7 @@ Estado: ✅ ya existe en C-Forge · 🔗 se usa hoy vía `cforge bindgen`,
 | 234 | `ventanas_api` | APIs nativas de Windows | windows (Rust) | ✅ runtime Windows · 🛠 |
 | 235 | `manzana` | APIs nativas de macOS e iOS | Cocoa | ✅ `apple` (básico) |
 | 236 | `bus` / `dbus` | D-Bus en Linux | zbus | ✅ `bus` |
-| 237 | `teclado` | Simular teclado y ratón | Enigo | 🛠 |
+| 237 | `teclado` / `input_sim` | Simular teclado y ratón | Enigo | ✅ `teclado` |
 | 238 | `recolecta` / `crawler` | Extracción web con sesiones | Fantoccini | ✅ `recolecta` |
 | 239 | `agenda` / `schedule` | Cron con zonas horarias | tokio-cron | ✅ `agenda` |
 | 240 | `ident` / `ids` | UUID, ULID y NanoID | uuid, ulid | ✅ `ident` |
