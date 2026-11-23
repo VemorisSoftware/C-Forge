@@ -69,7 +69,7 @@ Sitio oficial: [c-forge.org](https://c-forge.org)
   `llamada`/`protobuf` (.proto, binario como protoc, marcos gRPC),
   `recolecta`/`crawler` (cookies RFC 6265, formularios, robots.txt,
   rastreo) y `sensor`/`mqtt` (paquetes MQTT, QoS 2, mini broker).
-- Lote 32 de bibliotecas (tres que antes se usaban por enlaces y ahora son
+- Lote 32 de bibliotecas (cuatro que antes se usaban por enlaces y ahora son
   propias, con alias en inglés y pruebas en ambos idiomas):
   `cientifica`/`gsl` (gamma, beta, digamma, zeta, erf/erfc, gamma y beta
   incompletas, Bessel J/Y, elípticas K y E, Runge-Kutta 4 y Dormand-Prince
@@ -80,7 +80,11 @@ Sitio oficial: [c-forge.org](https://c-forge.org)
   pseudoinversa; comparadas con NumPy) y `proyeccion`/`proj` (UTM con la
   serie de Krüger de orden 6, Web Mercator, Mercator, Lambert cónica,
   ECEF, Helmert, cadenas "+proj", EPSG comunes incluidos SIRGAS-Chile y
-  PSAD56, y geodésicas de Vincenty; comparadas con PROJ 9.8).
+  PSAD56, y geodésicas de Vincenty; comparadas con PROJ 9.8) e
+  `historia`/`libgit2` (Git nativo: objetos sueltos y empaquetados con
+  deltas, referencias y revisiones con ~ y ^, commits, árboles, log,
+  diferencias, índice y estado; escribe commits, ramas y etiquetas que
+  `git fsck --strict` acepta).
 - Las fuentes de mapa de bits (`fuente_basica`) dibujan las letras con
   tilde y la eñe como su letra ASCII más cercana en vez de "?".
 - Lote 31 de bibliotecas (con alias en inglés y pruebas en ambos idiomas):

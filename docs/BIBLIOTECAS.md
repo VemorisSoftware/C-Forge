@@ -196,7 +196,7 @@ Estado: ✅ ya existe en C-Forge · 🔗 se usa hoy vía `cforge bindgen`,
 | 140 | `vigia` / `notify` | Vigilar cambios en archivos | Notify | ✅ `vigia` |
 | 141 | `rastreo` / `glob` | Búsqueda recursiva con comodines | Walkdir, Glob | ✅ `rastreo` |
 | 142 | `sistema` / `sysinfo` | CPU, RAM y procesos | sysinfo | ✅ `sistema` |
-| 143 | `historia` | Repositorios Git nativos | libgit2 | 🔗 |
+| 143 | `historia` | Repositorios Git nativos | libgit2 | ✅ `historia` / `libgit2` |
 | 144 | `contenedor` / `docker` | Controlar Docker | Bollard | ✅ `contenedor` |
 | 145 | `version` | Versionado semántico | semver | ✅ gestor de paquetes |
 | 146 | `cronometro` / `bench` | Micro-benchmarks estadísticos | Criterion | ✅ `cronometro` |

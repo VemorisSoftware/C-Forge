@@ -1,0 +1,766 @@
+// stdlib/historia.cfv — Repositorios Git nativos al estilo de libgit2, en
+// C-Forge puro (sin llamar al programa git).
+//
+// Lectura:
+//   · Objetos sueltos y empaquetados (.pack con índice v2), con deltas
+//     OFS_DELTA y REF_DELTA.
+//   · Referencias: HEAD, ramas, etiquetas, packed-refs, referencias
+//     simbólicas, prefijos de SHA y sufijos ~N y ^N.
+//   · Commits, árboles, blobs y etiquetas anotadas; historial, archivos de
+//     una revisión, diferencias entre árboles, índice (staging) y estado
+//     de la carpeta de trabajo.
+// Escritura:
+//   · Iniciar repositorios, guardar objetos, hacer commits con un conjunto
+//     de archivos, crear ramas y etiquetas (git los lee sin problemas).
+// Idea de libgit2 (GPL con excepción de enlace): solo la idea; el formato
+// de Git está documentado. Escrito desde cero. En inglés: importar "libgit2".
+//
+//   importar "historia"
+//   sea r = historia_abrir(".")
+//   para c en historia_log(r, "HEAD", 5) { mostrar(c["mensaje"]) }
+//   historia_archivo(r, "HEAD~1", "README.md")
+
+// ---------- utilidades ----------
+
+funcion _gt_u32(b, i) { retornar bytes_leer_entero(b, i, 4, 0) }
+
+funcion _gt_unir(a, b) {
+    si (texto_termina_con(a, "/")) { retornar a + b }
+    retornar a + "/" + b
+}
+
+funcion _gt_leer(ruta) {
+    si (existe_archivo(ruta) == falso) { retornar nulo }
+    intentar { retornar leer_archivo(ruta) } capturar (e) { retornar nulo }
+}
+
+funcion _gt_hex(b) { retornar hex_de_bytes(b) }
+
+funcion _gt_sha(tipo_o, datos) { retornar hex_de_bytes(sha1_bytes(tipo_o + " " + longitud(datos) + char_de(0) + datos)) }
+
+// ---------- repositorio ----------
+
+/// Abre un repositorio (la carpeta de trabajo o la carpeta .git).
+funcion historia_abrir(ruta) {
+    sea git = ruta
+    sea trabajo = nulo
+    si (existe_archivo(_gt_unir(ruta, ".git/HEAD"))) {
+        git = _gt_unir(ruta, ".git")
+        trabajo = ruta
+    } sino si (existe_archivo(_gt_unir(ruta, ".git"))) {
+        // Archivo "gitdir: …" (submódulos y worktrees).
+        sea t = texto_recortar(leer_archivo(_gt_unir(ruta, ".git")))
+        si (texto_empieza_con(t, "gitdir:")) {
+            git = texto_recortar(subtexto(t, 7, longitud(t)))
+            si (texto_empieza_con(git, "/") == falso) { git = _gt_unir(ruta, git) }
+            trabajo = ruta
+        }
+    }
+    si (existe_archivo(_gt_unir(git, "HEAD")) == falso) { lanzar "historia_abrir: no es un repositorio Git: " + ruta }
+    retornar {"git": git, "trabajo": trabajo, "packs": nulo, "cache": {}, "objetos": _gt_unir(git, "objects")}
+}
+
+funcion _gt_packs(r) {
+    si (r["packs"] != nulo) { retornar r["packs"] }
+    sea lista = []
+    sea dir = _gt_unir(r["objetos"], "pack")
+    sea nombres = listar_carpeta(dir)
+    si (nombres != nulo) {
+        para n en nombres {
+            si (texto_termina_con(n, ".idx")) {
+                sea base = subtexto(n, 0, longitud(n) - 4)
+                sea idx = leer_archivo(_gt_unir(dir, n))
+                si (_gt_u32(idx, 0) != 4285812579 o _gt_u32(idx, 4) != 2) { lanzar "historia: índice de pack no soportado (solo v2): " + n }
+                sea total = _gt_u32(idx, 8 + 255 * 4)
+                lista.agregar({"idx": idx, "pack": nulo, "ruta": _gt_unir(dir, base + ".pack"), "total": total, "ordenados": nulo})
+            }
+        }
+    }
+    r["packs"] = lista
+    retornar lista
+}
+
+funcion _gt_buscar_idx(p, sha) {
+    sea idx = p["idx"]
+    sea bin = bytes_de_hex(sha)
+    sea b0 = byte_en(bin, 0)
+    sea lo = 0
+    si (b0 > 0) { lo = _gt_u32(idx, 8 + (b0 - 1) * 4) }
+    sea hi = _gt_u32(idx, 8 + b0 * 4)
+    sea base = 8 + 1024
+    mientras (lo < hi) {
+        sea m = piso((lo + hi) / 2)
+        sea s = subtexto(idx, base + m * 20, base + m * 20 + 20)
+        si (s == bin) { retornar m }
+        si (s < bin) { lo = m + 1 } sino { hi = m }
+    }
+    retornar -1
+}
+
+funcion _gt_offset(p, i) {
+    sea idx = p["idx"]
+    sea n = p["total"]
+    sea base = 8 + 1024 + n * 20 + n * 4
+    sea ob = _gt_u32(idx, base + i * 4)
+    si (ob >= 2147483648) {
+        sea k = ob - 2147483648
+        sea base64 = base + n * 4
+        ob = bytes_leer_entero(idx, base64 + k * 8, 8, 0)
+    }
+    retornar ob
+}
+
+// Fin de los datos de un objeto: el siguiente desplazamiento del pack.
+funcion _gt_fin(p, off) {
+    si (p["ordenados"] == nulo) {
+        sea l = []
+        sea i = 0
+        mientras (i < p["total"]) {
+            l.agregar(_gt_offset(p, i))
+            i = i + 1
+        }
+        p["ordenados"] = ordenar(l)
+    }
+    sea l = p["ordenados"]
+    sea lo = 0
+    sea hi = longitud(l)
+    mientras (lo < hi) {
+        sea m = piso((lo + hi) / 2)
+        si (l[m] <= off) { lo = m + 1 } sino { hi = m }
+    }
+    si (lo < longitud(l)) { retornar l[lo] }
+    retornar longitud(p["pack"]) - 20
+}
+
+funcion _gt_delta_tam(d, i) {
+    sea v = 0
+    sea desp = 1
+    sea k = i
+    mientras (verdadero) {
+        sea c = byte_en(d, k)
+        v = v + (c % 128) * desp
+        desp = desp * 128
+        k = k + 1
+        si (c < 128) { romper }
+    }
+    retornar [v, k]
+}
+
+funcion _gt_aplicar_delta(base, d) {
+    sea a = _gt_delta_tam(d, 0)
+    sea b = _gt_delta_tam(d, a[1])
+    si (a[0] != longitud(base)) { lanzar "historia: delta con base de tamaño distinto" }
+    sea i = b[1]
+    sea partes = []
+    mientras (i < longitud(d)) {
+        sea op = byte_en(d, i)
+        i = i + 1
+        si (op >= 128) {
+            sea off = 0
+            sea tam = 0
+            sea bit = 0
+            mientras (bit < 4) {
+                si (bits_y(op, potencia(2, bit)) != 0) {
+                    off = off + byte_en(d, i) * potencia(256, bit)
+                    i = i + 1
+                }
+                bit = bit + 1
+            }
+            bit = 0
+            mientras (bit < 3) {
+                si (bits_y(op, potencia(2, 4 + bit)) != 0) {
+                    tam = tam + byte_en(d, i) * potencia(256, bit)
+                    i = i + 1
+                }
+                bit = bit + 1
+            }
+            si (tam == 0) { tam = 65536 }
+            partes.agregar(subtexto(base, off, off + tam))
+        } sino si (op > 0) {
+            partes.agregar(subtexto(d, i, i + op))
+            i = i + op
+        } sino { lanzar "historia: instrucción de delta inválida" }
+    }
+    sea r = unir(partes, "")
+    si (longitud(r) != b[0]) { lanzar "historia: el delta no da el tamaño esperado" }
+    retornar r
+}
+
+sea _GT_TIPOS = ["", "commit", "tree", "blob", "tag"]
+
+funcion _gt_pack_objeto(r, p, off) {
+    si (p["pack"] == nulo) { p["pack"] = leer_archivo(p["ruta"]) }
+    sea pk = p["pack"]
+    sea c = byte_en(pk, off)
+    sea t = bits_y(piso(c / 16), 7)
+    sea tam = c % 16
+    sea desp = 16
+    sea i = off + 1
+    mientras (c >= 128) {
+        c = byte_en(pk, i)
+        tam = tam + (c % 128) * desp
+        desp = desp * 128
+        i = i + 1
+    }
+    sea fin = _gt_fin(p, off)
+    si (t >= 1 y t <= 4) { retornar [_GT_TIPOS[t], zlib_descomprimir(subtexto(pk, i, fin), tam + 64)] }
+    si (t == 6) {
+        // OFS_DELTA: desplazamiento negativo codificado.
+        c = byte_en(pk, i)
+        sea neg = c % 128
+        i = i + 1
+        mientras (c >= 128) {
+            c = byte_en(pk, i)
+            neg = (neg + 1) * 128 + c % 128
+            i = i + 1
+        }
+        sea base = _gt_pack_objeto(r, p, off - neg)
+        retornar [base[0], _gt_aplicar_delta(base[1], zlib_descomprimir(subtexto(pk, i, fin), tam + 64))]
+    }
+    si (t == 7) {
+        sea base = historia_objeto(r, hex_de_bytes(subtexto(pk, i, i + 20)))
+        retornar [base["tipo"], _gt_aplicar_delta(base["datos"], zlib_descomprimir(subtexto(pk, i + 20, fin), tam + 64))]
+    }
+    lanzar "historia: tipo de objeto de pack desconocido " + t
+}
+
+/// Objeto por SHA (hex completo): {"tipo", "datos", "sha"} o nulo.
+funcion historia_objeto(r, sha) {
+    sea s = texto_minusculas(sha)
+    sea c = r["cache"][s] ?? nulo
+    si (c != nulo) { retornar c }
+    sea suelto = _gt_leer(_gt_unir(_gt_unir(r["objetos"], subtexto(s, 0, 2)), subtexto(s, 2, 40)))
+    sea res = nulo
+    si (suelto != nulo) {
+        sea d = zlib_descomprimir(suelto, 268435456)
+        sea esp = texto_indice(d, " ")
+        sea nul = bytes_buscar(d, char_de(0), 0)
+        res = {"tipo": subtexto(d, 0, esp), "datos": subtexto(d, nul + 1, longitud(d)), "sha": s}
+    } sino {
+        para p en _gt_packs(r) {
+            si (res == nulo) {
+                sea i = _gt_buscar_idx(p, s)
+                si (i >= 0) {
+                    sea ob = _gt_pack_objeto(r, p, _gt_offset(p, i))
+                    res = {"tipo": ob[0], "datos": ob[1], "sha": s}
+                }
+            }
+        }
+    }
+    si (res != nulo y longitud(res["datos"]) < 1048576) { r["cache"][s] = res }
+    retornar res
+}
+
+// ---------- referencias ----------
+
+funcion _gt_packed_refs(r) {
+    sea t = _gt_leer(_gt_unir(r["git"], "packed-refs"))
+    sea m = {}
+    si (t == nulo) { retornar m }
+    sea ultimo = nulo
+    para l en texto_dividir(t, "\n") {
+        si (l == "" o texto_empieza_con(l, "#")) { continuar }
+        si (texto_empieza_con(l, "^")) {
+            si (ultimo != nulo) { m[ultimo + "^\{}"] = subtexto(l, 1, 41) }
+            continuar
+        }
+        sea partes = texto_dividir(l, " ")
+        si (longitud(partes) >= 2) {
+            m[partes[1]] = partes[0]
+            ultimo = partes[1]
+        }
+    }
+    retornar m
+}
+
+funcion _gt_ref_directa(r, nombre, saltos) {
+    si (saltos > 10) { lanzar "historia: referencias simbólicas en ciclo" }
+    sea t = _gt_leer(_gt_unir(r["git"], nombre))
+    si (t != nulo) {
+        t = texto_recortar(t)
+        si (texto_empieza_con(t, "ref:")) { retornar _gt_ref_directa(r, texto_recortar(subtexto(t, 4, longitud(t))), saltos + 1) }
+        retornar t
+    }
+    retornar _gt_packed_refs(r)[nombre] ?? nulo
+}
+
+funcion _gt_es_hex(t) {
+    para c en texto_codigos(t) { si ((c < 48 o c > 57) y (c < 97 o c > 102)) { retornar falso } }
+    retornar verdadero
+}
+
+funcion _gt_prefijo(r, p) {
+    // SHA abreviado: busca en objetos sueltos y en los packs.
+    sea encontrados = {}
+    sea dir = _gt_unir(r["objetos"], subtexto(p, 0, 2))
+    sea l = listar_carpeta(dir)
+    si (l != nulo) { para n en l { si (texto_empieza_con(subtexto(p, 0, 2) + n, p)) { encontrados[subtexto(p, 0, 2) + n] = verdadero } } }
+    para pk en _gt_packs(r) {
+        sea i = 0
+        mientras (i < pk["total"]) {
+            sea s = hex_de_bytes(subtexto(pk["idx"], 1032 + i * 20, 1052 + i * 20))
+            si (texto_empieza_con(s, p)) { encontrados[s] = verdadero }
+            i = i + 1
+        }
+    }
+    sea ks = claves(encontrados)
+    si (longitud(ks) == 1) { retornar ks[0] }
+    si (longitud(ks) > 1) { lanzar "historia: SHA ambiguo " + p }
+    retornar nulo
+}
+
+/// Resuelve una revisión a un SHA: "HEAD", "main", "refs/tags/v1",
+/// "v1", un SHA (o un prefijo de 4+), con sufijos ~N, ^ y ^N.
+funcion historia_resolver(r, rev) {
+    sea base = rev
+    sea sufijos = ""
+    sea i = 0
+    mientras (i < longitud(rev)) {
+        sea c = subtexto(rev, i, i + 1)
+        si (c == "~" o c == "^") {
+            base = subtexto(rev, 0, i)
+            sufijos = subtexto(rev, i, longitud(rev))
+            romper
+        }
+        i = i + 1
+    }
+    sea sha = nulo
+    para cand en [base, "refs/" + base, "refs/tags/" + base, "refs/heads/" + base, "refs/remotes/" + base, "refs/remotes/" + base + "/HEAD"] {
+        si (sha == nulo) { sha = _gt_ref_directa(r, cand, 0) }
+    }
+    si (sha == nulo y longitud(base) >= 4 y longitud(base) <= 40 y _gt_es_hex(texto_minusculas(base))) {
+        si (longitud(base) == 40) { sha = texto_minusculas(base) } sino { sha = _gt_prefijo(r, texto_minusculas(base)) }
+    }
+    si (sha == nulo) { lanzar "historia: revisión desconocida " + rev }
+    // Etiquetas anotadas: se sigue hasta el commit.
+    sea ob = historia_objeto(r, sha)
+    mientras (ob != nulo y ob["tipo"] == "tag" y sufijos != "") {
+        sha = _gt_campo(ob["datos"], "object")
+        ob = historia_objeto(r, sha)
+    }
+    // Sufijos.
+    sea k = 0
+    mientras (k < longitud(sufijos)) {
+        sea c = subtexto(sufijos, k, k + 1)
+        k = k + 1
+        sea num = ""
+        mientras (k < longitud(sufijos) y texto_indice("0123456789", subtexto(sufijos, k, k + 1)) >= 0) {
+            num = num + subtexto(sufijos, k, k + 1)
+            k = k + 1
+        }
+        sea n = 1
+        si (num != "") { n = a_numero(num) }
+        sea cm = historia_commit(r, sha)
+        si (c == "~") {
+            sea j = 0
+            mientras (j < n) {
+                si (longitud(cm["padres"]) == 0) { lanzar "historia: " + rev + " va más atrás que el primer commit" }
+                sha = cm["padres"][0]
+                cm = historia_commit(r, sha)
+                j = j + 1
+            }
+        } sino {
+            si (n == 0) { continuar }
+            si (n > longitud(cm["padres"])) { lanzar "historia: " + rev + ": el commit no tiene ese padre" }
+            sha = cm["padres"][n - 1]
+        }
+    }
+    retornar sha
+}
+
+/// Ramas locales: {nombre: sha}.
+funcion historia_ramas(r) { retornar _gt_refs(r, "refs/heads/") }
+
+/// Etiquetas: {nombre: sha} (el SHA de la etiqueta; para anotadas, el del objeto tag).
+funcion historia_etiquetas(r) { retornar _gt_refs(r, "refs/tags/") }
+
+funcion _gt_refs(r, prefijo) {
+    sea m = {}
+    para k en claves(_gt_packed_refs(r)) {
+        si (texto_empieza_con(k, prefijo) y texto_termina_con(k, "^\{}") == falso) { m[subtexto(k, longitud(prefijo), longitud(k))] = _gt_packed_refs(r)[k] }
+    }
+    _gt_refs_carpeta(r, _gt_unir(r["git"], prefijo), "", m)
+    retornar m
+}
+
+funcion _gt_refs_carpeta(r, dir, rel, m) {
+    sea l = listar_carpeta(dir)
+    si (l == nulo) { retornar nulo }
+    para n en l {
+        sea ruta = _gt_unir(dir, n)
+        si (es_carpeta(ruta)) { _gt_refs_carpeta(r, ruta, rel + n + "/", m) } sino { m[rel + n] = texto_recortar(leer_archivo(ruta)) }
+    }
+}
+
+/// Rama actual (o nulo si HEAD está suelto).
+funcion historia_rama_actual(r) {
+    sea t = texto_recortar(leer_archivo(_gt_unir(r["git"], "HEAD")))
+    si (texto_empieza_con(t, "ref: refs/heads/")) { retornar subtexto(t, 16, longitud(t)) }
+    retornar nulo
+}
+
+// ---------- commits, árboles y blobs ----------
+
+funcion _gt_campo(datos, nombre) {
+    para l en texto_dividir(datos, "\n") {
+        si (l == "") { romper }
+        si (texto_empieza_con(l, nombre + " ")) { retornar subtexto(l, longitud(nombre) + 1, longitud(l)) }
+    }
+    retornar nulo
+}
+
+funcion _gt_persona(t) {
+    si (t == nulo) { retornar nulo }
+    sea a = texto_indice(t, "<")
+    sea b = texto_indice(t, ">")
+    sea resto = texto_dividir(texto_recortar(subtexto(t, b + 1, longitud(t))), " ")
+    retornar {"nombre": texto_recortar(subtexto(t, 0, a)), "correo": subtexto(t, a + 1, b), "fecha": a_numero(resto[0]), "zona": resto[1] ?? "+0000"}
+}
+
+/// Commit: {"sha", "arbol", "padres", "autor", "confirmador", "mensaje"}.
+funcion historia_commit(r, rev) {
+    sea sha = rev
+    si (longitud(rev) != 40 o _gt_es_hex(rev) == falso) { sha = historia_resolver(r, rev) }
+    sea ob = historia_objeto(r, sha)
+    si (ob == nulo) { lanzar "historia: no existe el objeto " + sha }
+    mientras (ob["tipo"] == "tag") {
+        sha = _gt_campo(ob["datos"], "object")
+        ob = historia_objeto(r, sha)
+    }
+    si (ob["tipo"] != "commit") { lanzar "historia: " + sha + " no es un commit sino un " + ob["tipo"] }
+    sea d = ob["datos"]
+    sea padres = []
+    sea cabecera = d
+    sea k = texto_indice(d, "\n\n")
+    sea mensaje = ""
+    si (k >= 0) {
+        cabecera = subtexto(d, 0, k)
+        mensaje = subtexto(d, k + 2, longitud(d))
+    }
+    para l en texto_dividir(cabecera, "\n") { si (texto_empieza_con(l, "parent ")) { padres.agregar(subtexto(l, 7, 47)) } }
+    retornar {"sha": sha, "arbol": _gt_campo(d, "tree"), "padres": padres, "autor": _gt_persona(_gt_campo(d, "author")),
+        "confirmador": _gt_persona(_gt_campo(d, "committer")), "mensaje": mensaje}
+}
+
+/// Entradas de un árbol: [{"modo", "nombre", "sha", "tipo"}].
+funcion historia_arbol(r, sha) {
+    sea ob = historia_objeto(r, sha)
+    si (ob == nulo o ob["tipo"] != "tree") { lanzar "historia: " + sha + " no es un árbol" }
+    sea d = ob["datos"]
+    sea l = []
+    sea i = 0
+    mientras (i < longitud(d)) {
+        sea esp = bytes_buscar(d, " ", i)
+        sea nul = bytes_buscar(d, char_de(0), esp)
+        sea modo = subtexto(d, i, esp)
+        sea t = "blob"
+        si (modo == "40000") { t = "tree" } sino si (modo == "160000") { t = "commit" }
+        l.agregar({"modo": modo, "nombre": subtexto(d, esp + 1, nul), "sha": hex_de_bytes(subtexto(d, nul + 1, nul + 21)), "tipo": t})
+        i = nul + 21
+    }
+    retornar l
+}
+
+/// Todos los archivos de una revisión: {ruta: {"sha", "modo"}}.
+funcion historia_listar(r, rev) {
+    sea m = {}
+    _gt_recorrer(r, historia_commit(r, rev)["arbol"], "", m)
+    retornar m
+}
+
+funcion _gt_recorrer(r, arbol, prefijo, m) {
+    para e en historia_arbol(r, arbol) {
+        si (e["tipo"] == "tree") { _gt_recorrer(r, e["sha"], prefijo + e["nombre"] + "/", m) } sino { m[prefijo + e["nombre"]] = {"sha": e["sha"], "modo": e["modo"]} }
+    }
+}
+
+/// Contenido de un archivo en una revisión (o nulo si no existe).
+funcion historia_archivo(r, rev, ruta) {
+    sea arbol = historia_commit(r, rev)["arbol"]
+    sea partes = texto_dividir(ruta, "/")
+    sea i = 0
+    mientras (i < longitud(partes)) {
+        sea encontrado = nulo
+        para e en historia_arbol(r, arbol) { si (e["nombre"] == partes[i]) { encontrado = e } }
+        si (encontrado == nulo) { retornar nulo }
+        si (i == longitud(partes) - 1) {
+            si (encontrado["tipo"] != "blob") { retornar nulo }
+            retornar historia_objeto(r, encontrado["sha"])["datos"]
+        }
+        arbol = encontrado["sha"]
+        i = i + 1
+    }
+    retornar nulo
+}
+
+/// Historial desde una revisión (los más nuevos primero, por fecha del
+/// confirmador), hasta maximo commits.
+funcion historia_log(r, rev, maximo) {
+    sea lim = maximo ?? 1000000
+    sea vistos = {}
+    sea pendientes = [historia_commit(r, rev)]
+    vistos[pendientes[0]["sha"]] = verdadero
+    sea salida = []
+    mientras (longitud(pendientes) > 0 y longitud(salida) < lim) {
+        // El más reciente de los pendientes.
+        sea mejor = 0
+        sea i = 1
+        mientras (i < longitud(pendientes)) {
+            si (pendientes[i]["confirmador"]["fecha"] > pendientes[mejor]["confirmador"]["fecha"]) { mejor = i }
+            i = i + 1
+        }
+        sea c = eliminar(pendientes, mejor)
+        salida.agregar(c)
+        para p en c["padres"] {
+            si (tiene_clave(vistos, p) == falso) {
+                vistos[p] = verdadero
+                pendientes.agregar(historia_commit(r, p))
+            }
+        }
+    }
+    retornar salida
+}
+
+/// Diferencias de archivos entre dos revisiones:
+/// [{"ruta", "cambio": "agregado" | "borrado" | "modificado"}].
+funcion historia_diferencias(r, rev_a, rev_b) {
+    sea a = historia_listar(r, rev_a)
+    sea b = historia_listar(r, rev_b)
+    sea l = []
+    para k en claves(a) {
+        si (tiene_clave(b, k) == falso) { l.agregar({"ruta": k, "cambio": "borrado"}) }
+        sino si (a[k]["sha"] != b[k]["sha"] o a[k]["modo"] != b[k]["modo"]) { l.agregar({"ruta": k, "cambio": "modificado"}) }
+    }
+    para k en claves(b) { si (tiene_clave(a, k) == falso) { l.agregar({"ruta": k, "cambio": "agregado"}) } }
+    retornar _gt_ordenar_ruta(l)
+}
+
+funcion _gt_ordenar_ruta(l) {
+    sea r = []
+    para x en l { r.agregar(x) }
+    sea i = 1
+    mientras (i < longitud(r)) {
+        sea v = r[i]
+        sea j = i - 1
+        mientras (j >= 0 y r[j]["ruta"] > v["ruta"]) {
+            r[j + 1] = r[j]
+            j = j - 1
+        }
+        r[j + 1] = v
+        i = i + 1
+    }
+    retornar r
+}
+
+// ---------- índice y estado ----------
+
+/// Entradas del índice (.git/index, v2 y v3): [{"ruta", "sha", "modo", "tamano"}].
+funcion historia_indice(r) {
+    sea d = _gt_leer(_gt_unir(r["git"], "index"))
+    si (d == nulo) { retornar [] }
+    si (subtexto(d, 0, 4) != "DIRC") { lanzar "historia: índice dañado" }
+    sea version = _gt_u32(d, 4)
+    si (version != 2 y version != 3) { lanzar "historia: versión de índice no soportada " + version }
+    sea n = _gt_u32(d, 8)
+    sea i = 12
+    sea l = []
+    sea k = 0
+    mientras (k < n) {
+        sea modo = _gt_u32(d, i + 24)
+        sea tam = _gt_u32(d, i + 36)
+        sea sha = hex_de_bytes(subtexto(d, i + 40, i + 60))
+        sea banderas = bytes_leer_entero(d, i + 60, 2, 0)
+        sea extendido = bits_y(banderas, 16384) != 0
+        sea inicio = i + 62
+        si (extendido) { inicio = inicio + 2 }
+        sea nul = bytes_buscar(d, char_de(0), inicio)
+        sea ruta = subtexto(d, inicio, nul)
+        l.agregar({"ruta": ruta, "sha": sha, "modo": _gt_modo_texto(modo), "tamano": tam})
+        sea largo = nul - i + 1
+        mientras (largo % 8 != 0) { largo = largo + 1 }
+        i = i + largo
+        k = k + 1
+    }
+    retornar l
+}
+
+funcion _gt_modo_texto(m) {
+    si (m == 33261) { retornar "100755" }
+    si (m == 40960) { retornar "120000" }
+    si (m == 57344) { retornar "160000" }
+    retornar "100644"
+}
+
+/// Estado de la carpeta de trabajo: {"preparados", "modificados",
+/// "borrados", "sin_seguimiento"} (rutas). Compara HEAD, índice y archivos.
+funcion historia_estado(r) {
+    si (r["trabajo"] == nulo) { lanzar "historia_estado: el repositorio no tiene carpeta de trabajo" }
+    sea cabeza = {}
+    intentar { cabeza = historia_listar(r, "HEAD") } capturar (e) { cabeza = {} }
+    sea indice = {}
+    para e en historia_indice(r) { indice[e["ruta"]] = e }
+    sea res = {"preparados": [], "modificados": [], "borrados": [], "sin_seguimiento": []}
+    para k en claves(indice) {
+        si (tiene_clave(cabeza, k) == falso o cabeza[k]["sha"] != indice[k]["sha"]) { res["preparados"].agregar(k) }
+        sea ruta = _gt_unir(r["trabajo"], k)
+        si (existe_archivo(ruta) == falso) { res["borrados"].agregar(k) } sino {
+            sea datos = leer_archivo(ruta)
+            si (longitud(datos) != indice[k]["tamano"] o _gt_sha("blob", datos) != indice[k]["sha"]) { res["modificados"].agregar(k) }
+        }
+    }
+    para k en claves(cabeza) { si (tiene_clave(indice, k) == falso) { res["preparados"].agregar(k) } }
+    para f en _gt_archivos_trabajo(r["trabajo"], "") { si (tiene_clave(indice, f) == falso) { res["sin_seguimiento"].agregar(f) } }
+    para k en claves(res) { res[k] = ordenar(res[k]) }
+    retornar res
+}
+
+funcion _gt_archivos_trabajo(base, rel) {
+    sea l = []
+    sea dir = base
+    si (rel != "") { dir = _gt_unir(base, rel) }
+    sea nombres = listar_carpeta(dir)
+    si (nombres == nulo) { retornar l }
+    para n en nombres {
+        si (n == ".git") { continuar }
+        sea r2 = n
+        si (rel != "") { r2 = rel + "/" + n }
+        si (es_carpeta(_gt_unir(base, r2))) { para x en _gt_archivos_trabajo(base, r2) { l.agregar(x) } } sino { l.agregar(r2) }
+    }
+    retornar l
+}
+
+// ---------- escritura ----------
+
+/// Crea un repositorio vacío (con carpeta de trabajo) y lo abre.
+funcion historia_iniciar(ruta, rama) {
+    sea git = _gt_unir(ruta, ".git")
+    para d en ["objects/info", "objects/pack", "refs/heads", "refs/tags", "info"] { crear_carpeta(_gt_unir(git, d)) }
+    escribir_archivo(_gt_unir(git, "HEAD"), "ref: refs/heads/" + (rama ?? "main") + "\n")
+    escribir_archivo(_gt_unir(git, "config"), "[core]\n\trepositoryformatversion = 0\n\tfilemode = true\n\tbare = false\n")
+    escribir_archivo(_gt_unir(git, "description"), "Repositorio creado con C-Forge\n")
+    retornar historia_abrir(ruta)
+}
+
+/// Guarda un objeto ("blob", "tree", "commit", "tag") y devuelve su SHA.
+funcion historia_guardar_objeto(r, tipo_o, datos) {
+    sea sha = _gt_sha(tipo_o, datos)
+    sea dir = _gt_unir(r["objetos"], subtexto(sha, 0, 2))
+    sea ruta = _gt_unir(dir, subtexto(sha, 2, 40))
+    si (existe_archivo(ruta) == falso) {
+        crear_carpeta(dir)
+        escribir_archivo(ruta, zlib_comprimir(tipo_o + " " + longitud(datos) + char_de(0) + datos, 6))
+    }
+    retornar sha
+}
+
+// Árbol desde {ruta: contenido o {"contenido", "modo"}}.
+funcion _gt_arbol_de(r, archivos) {
+    sea hijos = {}
+    sea locales = {}
+    para ruta en claves(archivos) {
+        sea i = texto_indice(ruta, "/")
+        si (i < 0) { locales[ruta] = archivos[ruta] } sino {
+            sea d = subtexto(ruta, 0, i)
+            si (tiene_clave(hijos, d) == falso) { hijos[d] = {} }
+            hijos[d][subtexto(ruta, i + 1, longitud(ruta))] = archivos[ruta]
+        }
+    }
+    sea entradas = []
+    para n en claves(locales) {
+        sea v = locales[n]
+        sea modo = "100644"
+        sea contenido = v
+        si (tipo(v) == "mapa") {
+            contenido = v["contenido"]
+            modo = v["modo"] ?? "100644"
+        }
+        entradas.agregar([n, modo, historia_guardar_objeto(r, "blob", contenido)])
+    }
+    para d en claves(hijos) { entradas.agregar([d + "/", "40000", _gt_arbol_de(r, hijos[d])]) }
+    // Git ordena los nombres con "/" al final de las carpetas.
+    sea i = 1
+    mientras (i < longitud(entradas)) {
+        sea v = entradas[i]
+        sea j = i - 1
+        mientras (j >= 0 y entradas[j][0] > v[0]) {
+            entradas[j + 1] = entradas[j]
+            j = j - 1
+        }
+        entradas[j + 1] = v
+        i = i + 1
+    }
+    sea datos = ""
+    para e en entradas {
+        sea nombre = e[0]
+        si (texto_termina_con(nombre, "/")) { nombre = subtexto(nombre, 0, longitud(nombre) - 1) }
+        datos = datos + e[1] + " " + nombre + char_de(0) + bytes_de_hex(e[2])
+    }
+    retornar historia_guardar_objeto(r, "tree", datos)
+}
+
+funcion _gt_firma(p, defecto_fecha) {
+    // Acepta las claves en español o en inglés (name, email, time, offset).
+    sea fecha = p["fecha"] ?? (p["time"] ?? defecto_fecha)
+    retornar (p["nombre"] ?? (p["name"] ?? "C-Forge")) + " <" + (p["correo"] ?? (p["email"] ?? "cforge@localhost")) + "> " + fecha + " " + (p["zona"] ?? (p["offset"] ?? "+0000"))
+}
+
+/// Hace un commit con estos archivos ({ruta: contenido}; el árbol es
+/// exactamente ese conjunto) sobre la rama actual. opciones: "autor"
+/// ({"nombre", "correo", "fecha", "zona"}), "confirmador", "padres".
+/// Devuelve el SHA del commit.
+funcion historia_confirmar(r, archivos, mensaje, opciones) {
+    sea op = opciones ?? {}
+    sea arbol = _gt_arbol_de(r, archivos)
+    sea padres = op["padres"] ?? nulo
+    si (padres == nulo) {
+        padres = []
+        intentar { padres = [historia_resolver(r, "HEAD")] } capturar (e) { padres = [] }
+    }
+    sea ahora = piso(tiempo_ms() / 1000)
+    sea autor = op["autor"] ?? {}
+    sea conf = op["confirmador"] ?? autor
+    sea d = "tree " + arbol + "\n"
+    para p en padres { d = d + "parent " + p + "\n" }
+    d = d + "author " + _gt_firma(autor, ahora) + "\n" + "committer " + _gt_firma(conf, ahora) + "\n\n" + mensaje
+    si (texto_termina_con(mensaje, "\n") == falso) { d = d + "\n" }
+    sea sha = historia_guardar_objeto(r, "commit", d)
+    // Avanza la rama de HEAD (o HEAD suelto).
+    sea head = texto_recortar(leer_archivo(_gt_unir(r["git"], "HEAD")))
+    si (texto_empieza_con(head, "ref:")) {
+        sea ref = texto_recortar(subtexto(head, 4, longitud(head)))
+        sea ruta = _gt_unir(r["git"], ref)
+        sea carpeta = subtexto(ruta, 0, longitud(ruta) - longitud(texto_dividir(ref, "/")[longitud(texto_dividir(ref, "/")) - 1]) - 1)
+        crear_carpeta(carpeta)
+        escribir_archivo(ruta, sha + "\n")
+    } sino { escribir_archivo(_gt_unir(r["git"], "HEAD"), sha + "\n") }
+    retornar sha
+}
+
+/// Crea (o mueve) una rama a una revisión.
+funcion historia_crear_rama(r, nombre, rev) {
+    sea sha = historia_resolver(r, rev ?? "HEAD")
+    escribir_archivo(_gt_unir(_gt_unir(r["git"], "refs/heads"), nombre), sha + "\n")
+    retornar sha
+}
+
+/// Cambia HEAD a otra rama (solo la referencia; no toca archivos).
+funcion historia_cambiar_rama(r, nombre) {
+    escribir_archivo(_gt_unir(r["git"], "HEAD"), "ref: refs/heads/" + nombre + "\n")
+}
+
+/// Crea una etiqueta (anotada si hay mensaje).
+funcion historia_etiquetar(r, nombre, rev, mensaje, opciones) {
+    sea sha = historia_resolver(r, rev ?? "HEAD")
+    sea destino = sha
+    si (mensaje != nulo) {
+        sea op = opciones ?? {}
+        sea d = "object " + sha + "\ntype commit\ntag " + nombre + "\ntagger " + _gt_firma(op["autor"] ?? {}, piso(tiempo_ms() / 1000)) + "\n\n" + mensaje
+        si (texto_termina_con(mensaje, "\n") == falso) { d = d + "\n" }
+        destino = historia_guardar_objeto(r, "tag", d)
+    }
+    escribir_archivo(_gt_unir(_gt_unir(r["git"], "refs/tags"), nombre), destino + "\n")
+    retornar destino
+}
+
+/// SHA que tendría un blob con ese contenido (como git hash-object).
+funcion historia_hash(datos) { retornar _gt_sha("blob", datos) }
