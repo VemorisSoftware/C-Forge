@@ -1,0 +1,1262 @@
+// stdlib/veloz.cfv — QUIC v1 (RFC 9000/9001/9002) y HTTP/3 (RFC 9114 con
+// QPACK de RFC 9204) propios en C-Forge puro, al estilo de Quinn: cliente y
+// servidor sin E/S (se le dan datagramas y devuelve datagramas, con
+// temporizador) y sobre UDP; claves iniciales, protección de paquetes y de
+// cabeceras (AES y ChaCha20), los tres espacios de números de paquete,
+// CRYPTO con TLS 1.3 de "blindaje", ACK, retransmisión por tiempo, flujos
+// bidireccionales y unidireccionales con control de flujo, HANDSHAKE_DONE,
+// cierre, parámetros de transporte, Retry y HTTP/3 (SETTINGS, HEADERS y
+// DATA con QPACK estático y Huffman). Probado contra aioquic.
+// Idea de Quinn (MIT/Apache-2.0), escrito desde cero. En inglés: importar "quinn".
+//
+//   importar "veloz"
+//   sea r = veloz_http3_get("https://localhost:4433/", {"raices": leer_archivo("ca.pem")})
+//   mostrar([r["estado"], r["cuerpo"]])
+
+importar "blindaje"
+
+// ---------- enteros de largo variable ----------
+
+funcion veloz_varint(v) {
+    si (v < 64) { retornar char_de(v) }
+    si (v < 16384) { retornar char_de(64 + piso(v / 256)) + char_de(v % 256) }
+    si (v < 1073741824) { retornar char_de(128 + piso(v / 16777216)) + char_de(piso(v / 65536) % 256) + char_de(piso(v / 256) % 256) + char_de(v % 256) }
+    retornar char_de(192 + piso(v / 72057594037927936) % 64) + bytes_entero(v % 72057594037927936, 7, 0)
+}
+
+// [valor, siguiente posición]
+funcion _vz_leer_varint(d, p) {
+    sea b = byte_en(d, p)
+    sea tipo_v = piso(b / 64)
+    sea v = b % 64
+    sea n = 1
+    si (tipo_v == 1) { n = 2 } sino si (tipo_v == 2) { n = 4 } sino si (tipo_v == 3) { n = 8 }
+    sea i = 1
+    mientras (i < n) {
+        v = v * 256 + byte_en(d, p + i)
+        i = i + 1
+    }
+    retornar [v, p + n]
+}
+
+// ---------- claves y protección ----------
+
+sea _VZ_SAL = "38762cf7f55934b34d179ae6a4c80cadccbb7f0a"
+
+funcion _vz_claves_de(secreto, suite) {
+    sea alg = suite["hash"]
+    sea r = {"clave": blindaje_expandir_etiqueta(alg, secreto, "quic key", "", suite["klen"]), "iv": blindaje_expandir_etiqueta(alg, secreto, "quic iv", "", 12),
+        "hp": blindaje_expandir_etiqueta(alg, secreto, "quic hp", "", suite["klen"]), "aead": suite["aead"], "secreto": secreto, "suite": suite}
+    retornar r
+}
+
+/// Claves iniciales a partir del DCID del cliente: {"cliente", "servidor"}.
+funcion veloz_claves_iniciales(dcid) {
+    sea inicial = hmac_sha256_bytes(bytes_de_hex(_VZ_SAL), dcid)
+    sea suite = {"hash": 256, "klen": 16, "aead": "aes"}
+    retornar {"cliente": _vz_claves_de(blindaje_expandir_etiqueta(256, inicial, "client in", "", 32), suite),
+        "servidor": _vz_claves_de(blindaje_expandir_etiqueta(256, inicial, "server in", "", 32), suite)}
+}
+
+funcion _vz_mascara(k, muestra) {
+    si (k["aead"] == "aes") { retornar aes_bloque(k["hp"], muestra) }
+    sea contador = bytes_leer_entero(muestra, 0, 4, 1)
+    retornar chacha20_xor(k["hp"], contador, subtexto(muestra, 4, 16), _vz_ceros(5))
+}
+
+funcion _vz_ceros(n) {
+    sea r = ""
+    mientras (longitud(r) < n) { r = r + char_de(0) }
+    retornar r
+}
+
+funcion _vz_nonce(k, pn) {
+    sea r = ""
+    sea pnb = bytes_entero(pn, 8, 0)
+    sea i = 0
+    mientras (i < 12) {
+        sea x = 0
+        si (i >= 4) { x = byte_en(pnb, i - 4) }
+        r = r + char_de(bits_xo(byte_en(k["iv"], i), x))
+        i = i + 1
+    }
+    retornar r
+}
+
+funcion _vz_sellar(k, pn, aad, texto) {
+    si (k["aead"] == "aes") { retornar aes_gcm_cifrar(k["clave"], _vz_nonce(k, pn), texto, aad) }
+    retornar chacha20_poly1305_cifrar(k["clave"], _vz_nonce(k, pn), texto, aad)
+}
+
+funcion _vz_abrir(k, pn, aad, cifrado) {
+    si (k["aead"] == "aes") { retornar aes_gcm_descifrar(k["clave"], _vz_nonce(k, pn), cifrado, aad) }
+    retornar chacha20_poly1305_descifrar(k["clave"], _vz_nonce(k, pn), cifrado, aad)
+}
+
+/// Protege un paquete: cabecera (con el número de paquete sin proteger,
+/// que empieza en pn_pos y mide pn_largo) y carga útil en claro.
+funcion veloz_proteger(k, cabecera, pn, pn_pos, pn_largo, carga) {
+    sea cifrado = _vz_sellar(k, pn, cabecera, carga)
+    sea pkt = cabecera + cifrado
+    sea muestra = subtexto(pkt, pn_pos + 4, pn_pos + 20)
+    sea m = _vz_mascara(k, muestra)
+    sea b0 = byte_en(pkt, 0)
+    si (b0 >= 128) { b0 = bits_xo(b0, bits_y(byte_en(m, 0), 15)) } sino { b0 = bits_xo(b0, bits_y(byte_en(m, 0), 31)) }
+    sea r = char_de(b0) + subtexto(pkt, 1, pn_pos)
+    sea i = 0
+    mientras (i < pn_largo) {
+        r = r + char_de(bits_xo(byte_en(pkt, pn_pos + i), byte_en(m, 1 + i)))
+        i = i + 1
+    }
+    retornar r + subtexto(pkt, pn_pos + pn_largo, longitud(pkt))
+}
+
+// Quita la protección: devuelve {"pn", "carga", "cabecera"} o nulo si falla.
+funcion _vz_desproteger(k, pkt, pn_pos, esperado) {
+    si (pn_pos + 20 > longitud(pkt)) { retornar nulo }
+    sea m = _vz_mascara(k, subtexto(pkt, pn_pos + 4, pn_pos + 20))
+    sea b0 = byte_en(pkt, 0)
+    si (b0 >= 128) { b0 = bits_xo(b0, bits_y(byte_en(m, 0), 15)) } sino { b0 = bits_xo(b0, bits_y(byte_en(m, 0), 31)) }
+    sea pn_largo = b0 % 4 + 1
+    sea truncado = 0
+    sea pnb = ""
+    sea i = 0
+    mientras (i < pn_largo) {
+        sea x = bits_xo(byte_en(pkt, pn_pos + i), byte_en(m, 1 + i))
+        pnb = pnb + char_de(x)
+        truncado = truncado * 256 + x
+        i = i + 1
+    }
+    sea pn = _vz_decodificar_pn(esperado, truncado, pn_largo * 8)
+    sea cab = char_de(b0) + subtexto(pkt, 1, pn_pos) + pnb
+    sea carga = ""
+    intentar { carga = _vz_abrir(k, pn, cab, subtexto(pkt, pn_pos + pn_largo, longitud(pkt))) } capturar (e) { retornar nulo }
+    retornar {"pn": pn, "carga": carga, "b0": b0}
+}
+
+funcion _vz_decodificar_pn(esperado, truncado, bits) {
+    sea win = potencia(2, bits)
+    sea hwin = win / 2
+    sea candidato = esperado - esperado % win + truncado
+    si (candidato <= esperado - hwin y candidato < potencia(2, 62) - win) { retornar candidato + win }
+    si (candidato > esperado + hwin y candidato >= win) { retornar candidato - win }
+    retornar candidato
+}
+
+// ---------- parámetros de transporte ----------
+
+funcion _vz_tp(id, valor) { retornar veloz_varint(id) + veloz_varint(longitud(valor)) + valor }
+funcion _vz_tpn(id, n) { retornar _vz_tp(id, veloz_varint(n)) }
+
+funcion _vz_mis_parametros(q) {
+    sea op = q["op"]
+    sea r = _vz_tpn(1, op["inactividad_ms"] ?? 30000) + _vz_tpn(4, 16777216) + _vz_tpn(5, 4194304) + _vz_tpn(6, 4194304) + _vz_tpn(7, 4194304)
+    r = r + _vz_tpn(8, 100) + _vz_tpn(9, 100) + _vz_tp(15, q["scid"])
+    si (q["rol"] == "servidor") {
+        r = r + _vz_tp(0, q["odcid"])
+        si (q["retry_scid"] != nulo) { r = r + _vz_tp(16, q["retry_scid"]) }
+    }
+    retornar r
+}
+
+funcion _vz_leer_parametros(d) {
+    sea r = {}
+    sea p = 0
+    mientras (p < longitud(d)) {
+        sea a = _vz_leer_varint(d, p)
+        sea b = _vz_leer_varint(d, a[1])
+        sea v = subtexto(d, b[1], b[1] + b[0])
+        p = b[1] + b[0]
+        sea id = a[0]
+        si (id == 0 o id == 15 o id == 16 o id == 2) { r["" + id] = v }
+        sino si (longitud(v) > 0) { r["" + id] = _vz_leer_varint(v, 0)[0] }
+    }
+    retornar r
+}
+
+// ---------- conexión ----------
+
+funcion _vz_espacio() { retornar {"leer": nulo, "escribir": nulo, "sig_pn": 0, "mayor": -1, "recibidos": [], "ack": falso, "crypto": "", "crypto_off": 0, "crypto_rec": {}, "crypto_rec_off": 0, "enviados": {}, "repetir": []} }
+
+funcion _vz_conexion(rol, op) {
+    sea q = {"rol": rol, "op": op, "estado": "inicial", "espacios": {"inicial": _vz_espacio(), "handshake": _vz_espacio(), "aplicacion": _vz_espacio()},
+        "flujos": {}, "par": {}, "sig_bidi": 0, "sig_uni": 2, "eventos": [], "token": "", "retry_scid": nulo, "cerrar": nulo, "confirmado": falso,
+        "hd_pendiente": falso, "datos_enviados": 0, "max_datos_par": 0, "pto": op["pto_ms"] ?? 250, "ultimo_rec": 0, "error": nulo, "nuevos": []}
+    si (rol == "servidor") {
+        q["sig_bidi"] = 1
+        q["sig_uni"] = 3
+    }
+    retornar q
+}
+
+/// Conexión cliente (sin E/S). opciones: las de blindaje_cliente
+/// ("raices", "verificar", "alpn"…) más "inactividad_ms".
+funcion veloz_cliente(nombre_servidor, opciones) {
+    sea op = opciones ?? {}
+    sea q = _vz_conexion("cliente", op)
+    q["scid"] = bytes_aleatorios(8)
+    q["dcid"] = bytes_aleatorios(8)
+    q["odcid"] = q["dcid"]
+    _vz_iniciales(q, q["dcid"])
+    sea top = {}
+    para k en claves(op) { top[k] = op[k] }
+    top["quic"] = verdadero
+    top["quic_parametros"] = _vz_mis_parametros(q)
+    si (tiene_clave(top, "alpn") == falso) { top["alpn"] = ["h3"] }
+    q["tls"] = blindaje_cliente(nombre_servidor, top)
+    _vz_tls_salida(q)
+    retornar q
+}
+
+/// Conexión servidor (sin E/S) para el primer Initial recibido.
+/// opciones: las de blindaje_servidor ("cadena", "clave", "alpn"…).
+funcion veloz_servidor(opciones) {
+    sea op = opciones ?? {}
+    sea q = _vz_conexion("servidor", op)
+    q["scid"] = bytes_aleatorios(8)
+    retornar q
+}
+
+funcion _vz_iniciales(q, dcid) {
+    sea ci = veloz_claves_iniciales(dcid)
+    sea e = q["espacios"]["inicial"]
+    si (q["rol"] == "cliente") {
+        e["escribir"] = ci["cliente"]
+        e["leer"] = ci["servidor"]
+    } sino {
+        e["escribir"] = ci["servidor"]
+        e["leer"] = ci["cliente"]
+    }
+}
+
+// Pasa lo que TLS quiere enviar a los búferes CRYPTO e instala claves nuevas.
+funcion _vz_tls_salida(q) {
+    para nivel en ["inicial", "handshake", "aplicacion"] {
+        sea s = blindaje_quic_salida(q["tls"], nivel)
+        si (longitud(s) > 0) { q["espacios"][nivel]["crypto"] = q["espacios"][nivel]["crypto"] + s }
+    }
+    sea sec = blindaje_quic_secretos(q["tls"])
+    sea yo = "cliente"
+    sea otro = "servidor"
+    si (q["rol"] == "servidor") {
+        yo = "servidor"
+        otro = "cliente"
+    }
+    para nivel en ["handshake", "aplicacion"] {
+        sea e = q["espacios"][nivel]
+        si (tiene_clave(sec, nivel) y e["escribir"] == nulo) {
+            e["escribir"] = _vz_claves_de(sec[nivel][yo], sec["suite"])
+            e["leer"] = _vz_claves_de(sec[nivel][otro], sec["suite"])
+        }
+    }
+    si (blindaje_listo(q["tls"]) y q["estado"] == "inicial") {
+        q["estado"] = "conectado"
+        q["alpn"] = q["tls"]["alpn"]
+        q["par"] = _vz_leer_parametros(q["tls"]["quic_parametros_par"] ?? "")
+        q["max_datos_par"] = q["par"]["4"] ?? 0
+        _vz_validar_parametros(q)
+        q["eventos"].agregar({"tipo": "conectado"})
+        si (q["rol"] == "servidor") { q["hd_pendiente"] = verdadero }
+    }
+}
+
+funcion _vz_validar_parametros(q) {
+    sea p = q["par"]
+    si ((p["15"] ?? "") != q["dcid_par_inicial"]) { _vz_fallar(q, 8, "initial_source_connection_id no coincide") }
+    si (q["rol"] == "cliente") {
+        si ((p["0"] ?? "") != q["odcid"]) { _vz_fallar(q, 8, "original_destination_connection_id no coincide") }
+        si (q["retry_scid"] != nulo y (p["16"] ?? "") != q["retry_scid"]) { _vz_fallar(q, 8, "retry_source_connection_id no coincide") }
+    }
+}
+
+funcion _vz_fallar(q, codigo, msj) {
+    q["error"] = msj
+    q["cerrar"] = {"codigo": codigo, "razon": msj}
+    lanzar "veloz: " + msj
+}
+
+// ---------- recepción ----------
+
+/// Procesa un datagrama UDP recibido (ahora: milisegundos).
+funcion veloz_recibir(q, datos, ahora) {
+    q["ultimo_rec"] = ahora
+    sea p = 0
+    mientras (p < longitud(datos)) {
+        sea b0 = byte_en(datos, p)
+        si (b0 >= 128) {
+            sea version = bytes_leer_entero(datos, p + 1, 4, 0)
+            sea dl = byte_en(datos, p + 5)
+            sea dcid = subtexto(datos, p + 6, p + 6 + dl)
+            sea sl = byte_en(datos, p + 6 + dl)
+            sea scid = subtexto(datos, p + 7 + dl, p + 7 + dl + sl)
+            sea pos = p + 7 + dl + sl
+            si (version != 1) { retornar nulo }
+            sea tipo_p = piso(b0 / 16) % 4
+            si (tipo_p == 3) {
+                _vz_retry(q, subtexto(datos, p, longitud(datos)), scid)
+                retornar nulo
+            }
+            sea token = ""
+            si (tipo_p == 0) {
+                sea tl = _vz_leer_varint(datos, pos)
+                token = subtexto(datos, tl[1], tl[1] + tl[0])
+                pos = tl[1] + tl[0]
+            }
+            sea ll = _vz_leer_varint(datos, pos)
+            sea fin = ll[1] + ll[0]
+            sea pkt = subtexto(datos, p, fin)
+            sea pn_pos = ll[1] - p
+            sea nivel = "inicial"
+            si (tipo_p == 2) { nivel = "handshake" }
+            si (tipo_p == 1) { nivel = "" }
+            si (q["rol"] == "servidor" y tiene_clave(q, "odcid") == falso y tipo_p == 0) {
+                q["odcid"] = dcid
+                q["dcid"] = scid
+                q["dcid_par_inicial"] = scid
+                _vz_iniciales(q, dcid)
+                sea top = {}
+                para k en claves(q["op"]) { top[k] = q["op"][k] }
+                top["quic"] = verdadero
+                top["quic_parametros"] = _vz_mis_parametros(q)
+                si (tiene_clave(top, "alpn") == falso) { top["alpn"] = ["h3"] }
+                q["tls"] = blindaje_servidor(top)
+            }
+            si (q["rol"] == "cliente" y tipo_p == 0 y tiene_clave(q, "dcid_par_inicial") == falso) {
+                q["dcid"] = scid
+                q["dcid_par_inicial"] = scid
+            }
+            si (nivel != "") { _vz_paquete(q, nivel, pkt, pn_pos, ahora) }
+            p = fin
+        } sino si (bits_y(b0, 64) == 0) {
+            // Relleno o basura al final del datagrama.
+            p = longitud(datos)
+        } sino {
+            sea pn_pos = 1 + longitud(q["scid"])
+            _vz_paquete(q, "aplicacion", subtexto(datos, p, longitud(datos)), pn_pos, ahora)
+            p = longitud(datos)
+        }
+    }
+}
+
+funcion _vz_paquete(q, nivel, pkt, pn_pos, ahora) {
+    sea e = q["espacios"][nivel]
+    si (e["leer"] == nulo) { retornar nulo }
+    sea r = _vz_desproteger(e["leer"], pkt, pn_pos, e["mayor"] + 1)
+    si (r == nulo) {
+        q["descartados"] = (q["descartados"] ?? 0) + 1
+        retornar nulo
+    }
+    si (contiene(e["recibidos"], r["pn"])) { retornar nulo }
+    e["recibidos"].agregar(r["pn"])
+    si (r["pn"] > e["mayor"]) { e["mayor"] = r["pn"] }
+    si (nivel == "handshake" y q["rol"] == "servidor") { q["espacios"]["inicial"]["enviados"] = {} }
+    si (_vz_marcos(q, nivel, r["carga"], ahora)) { e["ack"] = verdadero }
+}
+
+// Procesa los marcos; devuelve si alguno pide ACK.
+funcion _vz_marcos(q, nivel, d, ahora) {
+    sea e = q["espacios"][nivel]
+    sea pide = falso
+    sea p = 0
+    mientras (p < longitud(d)) {
+        sea t = _vz_leer_varint(d, p)
+        sea tipo_m = t[0]
+        p = t[1]
+        si (tipo_m == 0) {
+        } sino si (tipo_m == 1) {
+            pide = verdadero
+        } sino si (tipo_m == 2 o tipo_m == 3) {
+            sea mayor = _vz_leer_varint(d, p)
+            sea demora = _vz_leer_varint(d, mayor[1])
+            sea nr = _vz_leer_varint(d, demora[1])
+            sea primero = _vz_leer_varint(d, nr[1])
+            p = primero[1]
+            sea hi = mayor[0]
+            sea lo = hi - primero[0]
+            _vz_confirmar(q, e, lo, hi)
+            sea k = 0
+            mientras (k < nr[0]) {
+                sea gap = _vz_leer_varint(d, p)
+                sea largo = _vz_leer_varint(d, gap[1])
+                p = largo[1]
+                hi = lo - gap[0] - 2
+                lo = hi - largo[0]
+                _vz_confirmar(q, e, lo, hi)
+                k = k + 1
+            }
+            si (tipo_m == 3) {
+                sea z = 0
+                mientras (z < 3) {
+                    p = _vz_leer_varint(d, p)[1]
+                    z = z + 1
+                }
+            }
+        } sino si (tipo_m == 4) {
+            sea id = _vz_leer_varint(d, p)
+            sea err = _vz_leer_varint(d, id[1])
+            sea fin_t = _vz_leer_varint(d, err[1])
+            p = fin_t[1]
+            sea f = _vz_flujo(q, id[0])
+            f["reiniciado"] = err[0]
+            q["eventos"].agregar({"tipo": "reinicio", "id": id[0], "codigo": err[0]})
+            pide = verdadero
+        } sino si (tipo_m == 5) {
+            sea id = _vz_leer_varint(d, p)
+            p = _vz_leer_varint(d, id[1])[1]
+            pide = verdadero
+        } sino si (tipo_m == 6) {
+            sea off = _vz_leer_varint(d, p)
+            sea l = _vz_leer_varint(d, off[1])
+            sea datos = subtexto(d, l[1], l[1] + l[0])
+            p = l[1] + l[0]
+            _vz_crypto_recibido(q, nivel, off[0], datos)
+            pide = verdadero
+        } sino si (tipo_m == 7) {
+            sea l = _vz_leer_varint(d, p)
+            p = l[1] + l[0]
+            pide = verdadero
+        } sino si (tipo_m >= 8 y tipo_m <= 15) {
+            sea id = _vz_leer_varint(d, p)
+            p = id[1]
+            sea off = 0
+            si (bits_y(tipo_m, 4) != 0) {
+                sea o = _vz_leer_varint(d, p)
+                off = o[0]
+                p = o[1]
+            }
+            sea largo = longitud(d) - p
+            si (bits_y(tipo_m, 2) != 0) {
+                sea l = _vz_leer_varint(d, p)
+                largo = l[0]
+                p = l[1]
+            }
+            sea datos = subtexto(d, p, p + largo)
+            p = p + largo
+            _vz_flujo_recibido(q, id[0], off, datos, bits_y(tipo_m, 1) != 0)
+            pide = verdadero
+        } sino si (tipo_m == 16) {
+            sea m = _vz_leer_varint(d, p)
+            p = m[1]
+            si (m[0] > q["max_datos_par"]) { q["max_datos_par"] = m[0] }
+            pide = verdadero
+        } sino si (tipo_m == 17) {
+            sea id = _vz_leer_varint(d, p)
+            sea m = _vz_leer_varint(d, id[1])
+            p = m[1]
+            sea f = _vz_flujo(q, id[0])
+            si (m[0] > f["max_env"]) { f["max_env"] = m[0] }
+            pide = verdadero
+        } sino si (tipo_m == 18 o tipo_m == 19 o tipo_m == 20 o tipo_m == 22 o tipo_m == 23) {
+            p = _vz_leer_varint(d, p)[1]
+            pide = verdadero
+        } sino si (tipo_m == 21) {
+            sea id = _vz_leer_varint(d, p)
+            p = _vz_leer_varint(d, id[1])[1]
+            pide = verdadero
+        } sino si (tipo_m == 24) {
+            sea sec = _vz_leer_varint(d, p)
+            sea ret = _vz_leer_varint(d, sec[1])
+            sea l = byte_en(d, ret[1])
+            p = ret[1] + 1 + l + 16
+            pide = verdadero
+        } sino si (tipo_m == 25) {
+            p = _vz_leer_varint(d, p)[1]
+            pide = verdadero
+        } sino si (tipo_m == 26) {
+            e["repetir"].agregar({"t": "path_resp", "datos": subtexto(d, p, p + 8)})
+            p = p + 8
+            pide = verdadero
+        } sino si (tipo_m == 27) {
+            p = p + 8
+            pide = verdadero
+        } sino si (tipo_m == 28 o tipo_m == 29) {
+            sea codigo = _vz_leer_varint(d, p)
+            p = codigo[1]
+            si (tipo_m == 28) { p = _vz_leer_varint(d, p)[1] }
+            sea l = _vz_leer_varint(d, p)
+            sea razon = subtexto(d, l[1], l[1] + l[0])
+            p = l[1] + l[0]
+            q["estado"] = "cerrado"
+            q["cierre_par"] = {"codigo": codigo[0], "razon": razon}
+            q["eventos"].agregar({"tipo": "cerrado", "codigo": codigo[0], "razon": razon})
+        } sino si (tipo_m == 30) {
+            q["confirmado"] = verdadero
+            q["espacios"]["handshake"]["enviados"] = {}
+            pide = verdadero
+        } sino si (tipo_m == 48 o tipo_m == 49) {
+            si (tipo_m == 49) {
+                sea l = _vz_leer_varint(d, p)
+                p = l[1] + l[0]
+            } sino { p = longitud(d) }
+            pide = verdadero
+        } sino {
+            _vz_fallar(q, 7, "marco desconocido " + tipo_m)
+        }
+    }
+    retornar pide
+}
+
+funcion _vz_confirmar(q, e, lo, hi) {
+    para k en claves(e["enviados"]) {
+        sea pn = a_numero(k)
+        si (pn >= lo y pn <= hi) { quitar_clave(e["enviados"], k) }
+    }
+}
+
+funcion _vz_crypto_recibido(q, nivel, off, datos) {
+    sea e = q["espacios"][nivel]
+    si (off + longitud(datos) <= e["crypto_rec_off"]) { retornar nulo }
+    e["crypto_rec"]["" + off] = datos
+    // Entrega en orden.
+    sea seguir = verdadero
+    mientras (seguir) {
+        seguir = falso
+        para k en claves(e["crypto_rec"]) {
+            sea o = a_numero(k)
+            sea dd = e["crypto_rec"][k]
+            si (o <= e["crypto_rec_off"] y o + longitud(dd) > e["crypto_rec_off"]) {
+                sea nuevo = subtexto(dd, e["crypto_rec_off"] - o, longitud(dd))
+                e["crypto_rec_off"] = o + longitud(dd)
+                quitar_clave(e["crypto_rec"], k)
+                si (q["tls"] != nulo) {
+                    intentar { blindaje_quic_recibir(q["tls"], nivel, nuevo) } capturar (err) {
+                        q["error"] = err
+                        q["cerrar"] = {"codigo": 256 + 40, "razon": "" + err}
+                        lanzar err
+                    }
+                }
+                seguir = verdadero
+            } sino si (o + longitud(dd) <= e["crypto_rec_off"]) { quitar_clave(e["crypto_rec"], k) }
+        }
+    }
+    _vz_tls_salida(q)
+}
+
+// ---------- flujos ----------
+
+funcion _vz_flujo(q, id) {
+    si (tiene_clave(q["flujos"], "" + id) == falso) {
+        sea propio = (id % 2 == 0) == (q["rol"] == "cliente")
+        sea uni = piso(id / 2) % 2 == 1
+        sea max_env = 0
+        si (uni) { max_env = q["par"]["7"] ?? 0 }
+        sino si (propio) { max_env = q["par"]["6"] ?? 0 }
+        sino { max_env = q["par"]["5"] ?? 0 }
+        q["flujos"]["" + id] = {"id": id, "rec": {}, "rec_off": 0, "buf": "", "fin_rec": nulo, "fin_entregado": falso, "env": "", "env_off": 0, "fin_env": falso,
+            "fin_enviado": falso, "max_env": max_env, "propio": propio, "uni": uni, "reiniciado": nulo}
+        si (propio == falso) {
+            q["eventos"].agregar({"tipo": "flujo", "id": id})
+            q["nuevos"].agregar(id)
+        }
+    }
+    retornar q["flujos"]["" + id]
+}
+
+funcion _vz_flujo_recibido(q, id, off, datos, fin) {
+    sea f = _vz_flujo(q, id)
+    si (fin) { f["fin_rec"] = off + longitud(datos) }
+    si (off + longitud(datos) > f["rec_off"] o longitud(datos) == 0) {
+        f["rec"]["" + off] = datos
+        sea seguir = verdadero
+        mientras (seguir) {
+            seguir = falso
+            para k en claves(f["rec"]) {
+                sea o = a_numero(k)
+                sea dd = f["rec"][k]
+                si (o <= f["rec_off"] y o + longitud(dd) >= f["rec_off"]) {
+                    f["buf"] = f["buf"] + subtexto(dd, f["rec_off"] - o, longitud(dd))
+                    f["rec_off"] = maximo(f["rec_off"], o + longitud(dd))
+                    quitar_clave(f["rec"], k)
+                    seguir = verdadero
+                }
+            }
+        }
+    }
+    q["eventos"].agregar({"tipo": "datos", "id": id})
+}
+
+/// Abre un flujo propio (bidireccional o no). Devuelve su número.
+funcion veloz_flujo_abrir(q, bidireccional) {
+    sea id = 0
+    si (bidireccional) {
+        id = q["sig_bidi"]
+        q["sig_bidi"] = id + 4
+    } sino {
+        id = q["sig_uni"]
+        q["sig_uni"] = id + 4
+    }
+    _vz_flujo(q, id)
+    retornar id
+}
+
+/// Encola datos en un flujo (fin: es lo último).
+funcion veloz_flujo_escribir(q, id, datos, fin) {
+    sea f = _vz_flujo(q, id)
+    f["env"] = f["env"] + datos
+    si (fin) { f["fin_env"] = verdadero }
+}
+
+/// Lee lo recibido en un flujo: {"datos", "fin"}.
+funcion veloz_flujo_leer(q, id) {
+    sea f = _vz_flujo(q, id)
+    sea d = f["buf"]
+    f["buf"] = ""
+    sea fin = f["fin_rec"] != nulo y f["rec_off"] >= f["fin_rec"]
+    retornar {"datos": d, "fin": fin}
+}
+
+/// Flujos que abrió el otro lado desde la última llamada.
+funcion veloz_flujos_nuevos(q) {
+    sea r = q["nuevos"]
+    q["nuevos"] = []
+    retornar r
+}
+
+/// Eventos pendientes (conectado, flujo, datos, cerrado…), y los quita.
+funcion veloz_eventos(q) {
+    sea r = q["eventos"]
+    q["eventos"] = []
+    retornar r
+}
+
+/// Cierra la conexión con un código de aplicación.
+funcion veloz_cerrar(q, codigo, razon) {
+    q["cerrar"] = {"codigo": codigo ?? 0, "razon": razon ?? "", "app": verdadero}
+}
+
+// ---------- Retry ----------
+
+funcion _vz_retry(q, pkt, scid) {
+    si (q["rol"] != "cliente" o q["retry_scid"] != nulo o longitud(pkt) < 16) { retornar nulo }
+    // Etiqueta de integridad (RFC 9001 5.8).
+    sea sin_tag = subtexto(pkt, 0, longitud(pkt) - 16)
+    sea pseudo = char_de(longitud(q["odcid"])) + q["odcid"] + sin_tag
+    sea tag = aes_gcm_cifrar(bytes_de_hex("be0c690b9f66575a1d766b54e368c84e"), bytes_de_hex("461599d35d632bf2239825bb"), "", pseudo)
+    si (tag != subtexto(pkt, longitud(pkt) - 16, longitud(pkt))) { retornar nulo }
+    sea dl = byte_en(pkt, 5)
+    sea sl = byte_en(pkt, 6 + dl)
+    q["token"] = subtexto(pkt, 7 + dl + sl, longitud(pkt) - 16)
+    q["retry_scid"] = scid
+    q["dcid"] = scid
+    _vz_iniciales(q, scid)
+    // Se vuelve a mandar todo el CRYPTO inicial.
+    sea e = q["espacios"]["inicial"]
+    sea todo = ""
+    para k en claves(e["enviados"]) { para fr en e["enviados"][k]["frames"] { si (fr["t"] == "crypto") { e["repetir"].agregar(fr) } } }
+    e["enviados"] = {}
+}
+
+sea _VZ_HUFF_HEX = "00001ff80d007fffd8170fffffe21c0fffffe31c0fffffe41c0fffffe51c0fffffe61c0fffffe71c0fffffe81c00ffffea183ffffffc1e0fffffe91c" +
+    "0fffffea1c3ffffffd1e0fffffeb1c0fffffec1c0fffffed1c0fffffee1c0fffffef1c0ffffff01c0ffffff11c0ffffff21c3ffffffe1e0ffffff31c" +
+    "0ffffff41c0ffffff51c0ffffff61c0ffffff71c0ffffff81c0ffffff91c0ffffffa1c0ffffffb1c0000001406000003f80a000003f90a00000ffa0c" +
+    "00001ff90d0000001506000000f808000007fa0b000003fa0a000003fb0a000000f908000007fb0b000000fa08000000160600000017060000001806" +
+    "00000000050000000105000000020500000019060000001a060000001b060000001c060000001d060000001e060000001f060000005c07000000fb08" +
+    "00007ffc0f000000200600000ffb0c000003fc0a00001ffa0d00000021060000005d070000005e070000005f07000000600700000061070000006207" +
+    "00000063070000006407000000650700000066070000006707000000680700000069070000006a070000006b070000006c070000006d070000006e07" +
+    "0000006f07000000700700000071070000007207000000fc080000007307000000fd0800001ffb0d0007fff01300001ffc0d00003ffc0e0000002206" +
+    "00007ffd0f00000003050000002306000000040500000024060000000505000000250600000026060000002706000000060500000074070000007507" +
+    "000000280600000029060000002a0600000007050000002b0600000076070000002c06000000080500000009050000002d0600000077070000007807" +
+    "00000079070000007a070000007b0700007ffe0f000007fc0b00003ffd0e00001ffd0d0ffffffc1c000fffe614003fffd216000fffe714000fffe814" +
+    "003fffd316003fffd416003fffd516007fffd917003fffd616007fffda17007fffdb17007fffdc17007fffdd17007fffde1700ffffeb18007fffdf17" +
+    "00ffffec1800ffffed18003fffd716007fffe01700ffffee18007fffe117007fffe217007fffe317007fffe417001fffdc15003fffd816007fffe517" +
+    "003fffd916007fffe617007fffe71700ffffef18003fffda16001fffdd15000fffe914003fffdb16003fffdc16007fffe817007fffe917001fffde15" +
+    "007fffea17003fffdd16003fffde1600fffff018001fffdf15003fffdf16007fffeb17007fffec17001fffe015001fffe115003fffe016001fffe215" +
+    "007fffed17003fffe116007fffee17007fffef17000fffea14003fffe216003fffe316003fffe416007ffff017003fffe516003fffe616007ffff117" +
+    "03ffffe01a03ffffe11a000fffeb140007fff113003fffe716007ffff217003fffe81601ffffec1903ffffe21a03ffffe31a03ffffe41a07ffffde1b" +
+    "07ffffdf1b03ffffe51a00fffff11801ffffed190007fff213001fffe31503ffffe61a07ffffe01b07ffffe11b03ffffe71a07ffffe21b00fffff218" +
+    "001fffe415001fffe51503ffffe81a03ffffe91a0ffffffd1c07ffffe31b07ffffe41b07ffffe51b000fffec1400fffff318000fffed14001fffe615" +
+    "003fffe916001fffe715001fffe815007ffff317003fffea16003fffeb1601ffffee1901ffffef1900fffff41800fffff51803ffffea1a007ffff417" +
+    "03ffffeb1a07ffffe61b03ffffec1a03ffffed1a07ffffe71b07ffffe81b07ffffe91b07ffffea1b07ffffeb1b0ffffffe1c07ffffec1b07ffffed1b" +
+    "07ffffee1b07ffffef1b07fffff01b03ffffee1a3fffffff1e"
+
+// ---------- envío ----------
+
+funcion _vz_ack(e) {
+    sea l = []
+    para x en e["recibidos"] { l.agregar(x) }
+    l = ordenar(l)
+    // De mayor a menor en rangos.
+    sea rangos = []
+    sea i = longitud(l) - 1
+    mientras (i >= 0) {
+        sea hi = l[i]
+        sea lo = hi
+        mientras (i > 0 y l[i - 1] == lo - 1) {
+            lo = lo - 1
+            i = i - 1
+        }
+        rangos.agregar([lo, hi])
+        i = i - 1
+    }
+    sea n = minimo(longitud(rangos), 32)
+    sea r = veloz_varint(2) + veloz_varint(rangos[0][1]) + veloz_varint(0) + veloz_varint(n - 1) + veloz_varint(rangos[0][1] - rangos[0][0])
+    sea k = 1
+    mientras (k < n) {
+        r = r + veloz_varint(rangos[k - 1][0] - rangos[k][1] - 2) + veloz_varint(rangos[k][1] - rangos[k][0])
+        k = k + 1
+    }
+    retornar r
+}
+
+funcion _vz_marco_bytes(fr) {
+    si (fr["t"] == "crypto") { retornar veloz_varint(6) + veloz_varint(fr["off"]) + veloz_varint(longitud(fr["datos"])) + fr["datos"] }
+    si (fr["t"] == "flujo") {
+        sea tipo_m = 8 + 4 + 2
+        si (fr["fin"]) { tipo_m = tipo_m + 1 }
+        retornar veloz_varint(tipo_m) + veloz_varint(fr["id"]) + veloz_varint(fr["off"]) + veloz_varint(longitud(fr["datos"])) + fr["datos"]
+    }
+    si (fr["t"] == "hd") { retornar veloz_varint(30) }
+    si (fr["t"] == "ping") { retornar veloz_varint(1) }
+    si (fr["t"] == "path_resp") { retornar veloz_varint(27) + fr["datos"] }
+    retornar ""
+}
+
+// Arma la carga de un paquete de un nivel; [carga, marcos, pide_ack].
+funcion _vz_carga(q, nivel, espacio_max, ahora) {
+    sea e = q["espacios"][nivel]
+    sea carga = ""
+    sea marcos = []
+    si (e["ack"] y longitud(e["recibidos"]) > 0) {
+        carga = carga + _vz_ack(e)
+        e["ack"] = falso
+    }
+    // Retransmisiones.
+    mientras (longitud(e["repetir"]) > 0 y longitud(carga) < espacio_max - 40) {
+        sea fr = e["repetir"][0]
+        sea b = _vz_marco_bytes(fr)
+        si (longitud(carga) + longitud(b) > espacio_max y longitud(carga) > 0) { romper }
+        carga = carga + b
+        marcos.agregar(fr)
+        sea resto = []
+        sea i = 1
+        mientras (i < longitud(e["repetir"])) {
+            resto.agregar(e["repetir"][i])
+            i = i + 1
+        }
+        e["repetir"] = resto
+    }
+    // CRYPTO nuevo.
+    mientras (longitud(e["crypto"]) > 0 y longitud(carga) < espacio_max - 40) {
+        sea cabe = espacio_max - longitud(carga) - 16
+        sea trozo = subtexto(e["crypto"], 0, minimo(cabe, longitud(e["crypto"])))
+        sea fr = {"t": "crypto", "off": e["crypto_off"], "datos": trozo}
+        e["crypto"] = subtexto(e["crypto"], longitud(trozo), longitud(e["crypto"]))
+        e["crypto_off"] = e["crypto_off"] + longitud(trozo)
+        carga = carga + _vz_marco_bytes(fr)
+        marcos.agregar(fr)
+    }
+    si (nivel == "aplicacion" y q["estado"] == "conectado") {
+        si (q["hd_pendiente"]) {
+            marcos.agregar({"t": "hd"})
+            carga = carga + veloz_varint(30)
+            q["hd_pendiente"] = falso
+        }
+        // Datos de flujos.
+        para k en claves(q["flujos"]) {
+            sea f = q["flujos"][k]
+            mientras ((longitud(f["env"]) > 0 o (f["fin_env"] y f["fin_enviado"] == falso)) y longitud(carga) < espacio_max - 40) {
+                sea cabe = espacio_max - longitud(carga) - 30
+                sea limite = minimo(f["max_env"] - f["env_off"], q["max_datos_par"] - q["datos_enviados"])
+                sea n = minimo(cabe, minimo(longitud(f["env"]), limite))
+                si (n <= 0 y (longitud(f["env"]) > 0 o f["fin_env"] == falso)) { romper }
+                sea trozo = subtexto(f["env"], 0, maximo(0, n))
+                f["env"] = subtexto(f["env"], longitud(trozo), longitud(f["env"]))
+                sea fin = f["fin_env"] y longitud(f["env"]) == 0
+                sea fr = {"t": "flujo", "id": f["id"], "off": f["env_off"], "datos": trozo, "fin": fin}
+                f["env_off"] = f["env_off"] + longitud(trozo)
+                q["datos_enviados"] = q["datos_enviados"] + longitud(trozo)
+                si (fin) { f["fin_enviado"] = verdadero }
+                carga = carga + _vz_marco_bytes(fr)
+                marcos.agregar(fr)
+            }
+        }
+    }
+    retornar [carga, marcos]
+}
+
+funcion _vz_armar(q, nivel, carga, ahora, marcos) {
+    sea e = q["espacios"][nivel]
+    sea pn = e["sig_pn"]
+    e["sig_pn"] = pn + 1
+    // Relleno para que alcance la muestra de la protección de cabecera.
+    mientras (longitud(carga) < 4) { carga = carga + char_de(0) }
+    sea cab = ""
+    sea pn_pos = 0
+    si (nivel == "aplicacion") {
+        cab = char_de(67) + q["dcid"]
+        pn_pos = longitud(cab)
+    } sino {
+        sea tipo_p = 0
+        si (nivel == "handshake") { tipo_p = 2 }
+        cab = char_de(192 + tipo_p * 16 + 3) + bytes_entero(1, 4, 0) + char_de(longitud(q["dcid"])) + q["dcid"] + char_de(longitud(q["scid"])) + q["scid"]
+        si (nivel == "inicial") { cab = cab + veloz_varint(longitud(q["token"])) + q["token"] }
+        sea largo = 4 + longitud(carga) + 16
+        cab = cab + char_de(64 + piso(largo / 256)) + char_de(largo % 256)
+        pn_pos = longitud(cab)
+    }
+    cab = cab + bytes_entero(pn, 4, 0)
+    sea pide = falso
+    para fr en marcos { si (fr["t"] != "ack") { pide = verdadero } }
+    si (pide) { e["enviados"]["" + pn] = {"t": ahora, "frames": marcos} }
+    retornar veloz_proteger(e["escribir"], cab, pn, pn_pos, 4, carga)
+}
+
+funcion _vz_cierre_paquete(q, ahora) {
+    sea c = q["cerrar"]
+    sea nivel = "aplicacion"
+    si (q["espacios"]["aplicacion"]["escribir"] == nulo o q["estado"] != "conectado") {
+        nivel = "handshake"
+        si (q["espacios"]["handshake"]["escribir"] == nulo) { nivel = "inicial" }
+    }
+    sea m = ""
+    si ((c["app"] ?? falso) y nivel == "aplicacion") { m = veloz_varint(29) + veloz_varint(c["codigo"]) + veloz_varint(longitud(c["razon"])) + c["razon"] }
+    sino { m = veloz_varint(28) + veloz_varint(c["codigo"]) + veloz_varint(0) + veloz_varint(longitud(c["razon"])) + c["razon"] }
+    sea p = _vz_armar(q, nivel, m, ahora, [])
+    si (q["rol"] == "cliente" y nivel == "inicial") {
+        mientras (longitud(m) < 1100) { m = m + char_de(0) }
+        p = _vz_armar(q, nivel, m, ahora, [])
+    }
+    retornar p
+}
+
+/// Datagramas para enviar ahora (con retransmisiones si venció el plazo).
+funcion veloz_salida(q, ahora) {
+    si (q["estado"] == "cerrado") { retornar [] }
+    si (q["cerrar"] != nulo) {
+        q["estado"] = "cerrado"
+        sea r = []
+        si (q["espacios"]["inicial"]["escribir"] != nulo) { r.agregar(_vz_cierre_paquete(q, ahora)) }
+        retornar r
+    }
+    si (q["rol"] == "servidor" y tiene_clave(q, "odcid") == falso) { retornar [] }
+    // Plazos vencidos: los marcos vuelven a la cola.
+    para nivel en ["inicial", "handshake", "aplicacion"] {
+        sea e = q["espacios"][nivel]
+        para k en claves(e["enviados"]) {
+            sea env = e["enviados"][k]
+            si (ahora - env["t"] >= q["pto"]) {
+                para fr en env["frames"] { si (fr["t"] == "crypto" o fr["t"] == "flujo" o fr["t"] == "hd") { e["repetir"].agregar(fr) } }
+                quitar_clave(e["enviados"], k)
+                q["pto"] = minimo(q["pto"] * 2, 4000)
+            }
+        }
+    }
+    sea datagramas = []
+    sea seguir = verdadero
+    mientras (seguir y longitud(datagramas) < 64) {
+        seguir = falso
+        sea dg = ""
+        sea tiene_inicial = falso
+        para nivel en ["inicial", "handshake", "aplicacion"] {
+            sea e = q["espacios"][nivel]
+            si (e["escribir"] != nulo y 1200 - longitud(dg) > 80 y tiene_inicial == falso) {
+                sea espacio = 1200 - longitud(dg) - 60
+                sea cm = _vz_carga(q, nivel, espacio, ahora)
+                si (longitud(cm[0]) > 0) {
+                    sea carga = cm[0]
+                    // El cliente rellena (con marcos PADDING) los datagramas con Initial
+                    // hasta 1200 bytes y no les agrega otros paquetes.
+                    si (nivel == "inicial" y q["rol"] == "cliente") {
+                        sea hl = 1 + 4 + 1 + longitud(q["dcid"]) + 1 + longitud(q["scid"]) + longitud(veloz_varint(longitud(q["token"]))) + longitud(q["token"]) + 2 + 4
+                        mientras (longitud(carga) < 1200 - longitud(dg) - hl - 16) { carga = carga + char_de(0) }
+                        tiene_inicial = verdadero
+                    }
+                    dg = dg + _vz_armar(q, nivel, carga, ahora, cm[1])
+                    seguir = verdadero
+                }
+            }
+        }
+        si (longitud(dg) > 0) { datagramas.agregar(dg) }
+    }
+    retornar datagramas
+}
+
+/// Milisegundos hasta el próximo plazo de retransmisión (nulo si no hay).
+funcion veloz_espera(q, ahora) {
+    sea r = nulo
+    para nivel en ["inicial", "handshake", "aplicacion"] {
+        para k en claves(q["espacios"][nivel]["enviados"]) {
+            sea falta = q["pto"] - (ahora - q["espacios"][nivel]["enviados"][k]["t"])
+            si (r == nulo o falta < r) { r = maximo(0, falta) }
+        }
+    }
+    retornar r
+}
+
+/// ¿Terminó el handshake?
+funcion veloz_conectado(q) { retornar q["estado"] == "conectado" }
+
+// ---------- QPACK (tabla estática, sin tabla dinámica) ----------
+
+sea _VZ_ESTATICA = [[":authority", ""], [":path", "/"], ["age", "0"], ["content-disposition", ""], ["content-length", "0"], ["cookie", ""], ["date", ""], ["etag", ""],
+    ["if-modified-since", ""], ["if-none-match", ""], ["last-modified", ""], ["link", ""], ["location", ""], ["referer", ""], ["set-cookie", ""],
+    [":method", "CONNECT"], [":method", "DELETE"], [":method", "GET"], [":method", "HEAD"], [":method", "OPTIONS"], [":method", "POST"], [":method", "PUT"],
+    [":scheme", "http"], [":scheme", "https"], [":status", "103"], [":status", "200"], [":status", "304"], [":status", "404"], [":status", "503"],
+    ["accept", "*/*"], ["accept", "application/dns-message"], ["accept-encoding", "gzip, deflate, br"], ["accept-ranges", "bytes"],
+    ["access-control-allow-headers", "cache-control"], ["access-control-allow-headers", "content-type"], ["access-control-allow-origin", "*"],
+    ["cache-control", "max-age=0"], ["cache-control", "max-age=2592000"], ["cache-control", "max-age=604800"], ["cache-control", "no-cache"],
+    ["cache-control", "no-store"], ["cache-control", "public, max-age=31536000"], ["content-encoding", "br"], ["content-encoding", "gzip"],
+    ["content-type", "application/dns-message"], ["content-type", "application/javascript"], ["content-type", "application/json"],
+    ["content-type", "application/x-www-form-urlencoded"], ["content-type", "image/gif"], ["content-type", "image/jpeg"], ["content-type", "image/png"],
+    ["content-type", "text/css"], ["content-type", "text/html; charset=utf-8"], ["content-type", "text/plain"], ["content-type", "text/plain;charset=utf-8"],
+    ["range", "bytes=0-"], ["strict-transport-security", "max-age=31536000"], ["strict-transport-security", "max-age=31536000; includesubdomains"],
+    ["strict-transport-security", "max-age=31536000; includesubdomains; preload"], ["vary", "accept-encoding"], ["vary", "origin"],
+    ["x-content-type-options", "nosniff"], ["x-xss-protection", "1; mode=block"], [":status", "100"], [":status", "204"], [":status", "206"],
+    [":status", "302"], [":status", "400"], [":status", "403"], [":status", "421"], [":status", "425"], [":status", "500"], ["accept-language", ""],
+    ["access-control-allow-credentials", "FALSE"], ["access-control-allow-credentials", "TRUE"], ["access-control-allow-headers", "*"],
+    ["access-control-allow-methods", "get"], ["access-control-allow-methods", "get, post, options"], ["access-control-allow-methods", "options"],
+    ["access-control-expose-headers", "content-length"], ["access-control-request-headers", "content-type"], ["access-control-request-method", "get"],
+    ["access-control-request-method", "post"], ["alt-svc", "clear"], ["authorization", ""],
+    ["content-security-policy", "script-src 'none'; object-src 'none'; base-uri 'none'"], ["early-data", "1"], ["expect-ct", ""], ["forwarded", ""],
+    ["if-range", ""], ["origin", ""], ["purpose", "prefetch"], ["server", ""], ["timing-allow-origin", "*"], ["upgrade-insecure-requests", "1"],
+    ["user-agent", ""], ["x-forwarded-for", ""], ["x-frame-options", "deny"], ["x-frame-options", "sameorigin"]]
+
+funcion _vz_entero_prefijo(bits_prefijo, primer, v) {
+    sea maxp = potencia(2, bits_prefijo) - 1
+    si (v < maxp) { retornar char_de(primer + v) }
+    sea r = char_de(primer + maxp)
+    sea x = v - maxp
+    mientras (x >= 128) {
+        r = r + char_de(128 + x % 128)
+        x = piso(x / 128)
+    }
+    retornar r + char_de(x)
+}
+
+// [valor, siguiente posición]
+funcion _vz_leer_prefijo(d, p, bits_prefijo) {
+    sea maxp = potencia(2, bits_prefijo) - 1
+    sea v = byte_en(d, p) % (maxp + 1)
+    sea q = p + 1
+    si (v < maxp) { retornar [v, q] }
+    sea m = 0
+    mientras (verdadero) {
+        sea b = byte_en(d, q)
+        v = v + (b % 128) * potencia(2, m)
+        m = m + 7
+        q = q + 1
+        si (b < 128) { romper }
+    }
+    retornar [v, q]
+}
+
+/// Codifica cabeceras (lista de [nombre, valor]) en un bloque QPACK.
+funcion veloz_qpack_codificar(cabeceras) {
+    sea r = char_de(0) + char_de(0)
+    para c en cabeceras {
+        sea nombre = texto_minusculas(c[0])
+        sea valor = "" + c[1]
+        sea exacto = -1
+        sea solo_nombre = -1
+        sea i = 0
+        mientras (i < longitud(_VZ_ESTATICA)) {
+            si (_VZ_ESTATICA[i][0] == nombre) {
+                si (_VZ_ESTATICA[i][1] == valor y exacto < 0) { exacto = i }
+                si (solo_nombre < 0) { solo_nombre = i }
+            }
+            i = i + 1
+        }
+        si (exacto >= 0) { r = r + _vz_entero_prefijo(6, 192, exacto) }
+        sino si (solo_nombre >= 0) { r = r + _vz_entero_prefijo(4, 80, solo_nombre) + _vz_entero_prefijo(7, 0, longitud(valor)) + valor }
+        sino { r = r + _vz_entero_prefijo(3, 32, longitud(nombre)) + nombre + _vz_entero_prefijo(7, 0, longitud(valor)) + valor }
+    }
+    retornar r
+}
+
+/// Decodifica un bloque QPACK (sin tabla dinámica): lista de [nombre, valor].
+funcion veloz_qpack_decodificar(d) {
+    sea ric = _vz_leer_prefijo(d, 0, 8)
+    si (ric[0] != 0) { lanzar "veloz: QPACK con tabla dinámica no soportado" }
+    sea base = _vz_leer_prefijo(d, ric[1], 7)
+    sea p = base[1]
+    sea r = []
+    mientras (p < longitud(d)) {
+        sea b = byte_en(d, p)
+        si (b >= 128) {
+            si (bits_y(b, 64) == 0) { lanzar "veloz: QPACK dinámico no soportado" }
+            sea x = _vz_leer_prefijo(d, p, 6)
+            r.agregar([_VZ_ESTATICA[x[0]][0], _VZ_ESTATICA[x[0]][1]])
+            p = x[1]
+        } sino si (b >= 64) {
+            si (bits_y(b, 16) == 0) { lanzar "veloz: QPACK dinámico no soportado" }
+            sea x = _vz_leer_prefijo(d, p, 4)
+            sea v = _vz_cadena(d, x[1], 7)
+            r.agregar([_VZ_ESTATICA[x[0]][0], v[0]])
+            p = v[1]
+        } sino si (b >= 32) {
+            sea huff = bits_y(b, 8) != 0
+            sea l = _vz_leer_prefijo(d, p, 3)
+            sea nombre = subtexto(d, l[1], l[1] + l[0])
+            si (huff) { nombre = veloz_huffman_decodificar(nombre) }
+            sea v = _vz_cadena(d, l[1] + l[0], 7)
+            r.agregar([nombre, v[0]])
+            p = v[1]
+        } sino { lanzar "veloz: QPACK dinámico no soportado" }
+    }
+    retornar r
+}
+
+funcion _vz_cadena(d, p, bits_prefijo) {
+    sea huff = bits_y(byte_en(d, p), potencia(2, bits_prefijo)) != 0
+    sea l = _vz_leer_prefijo(d, p, bits_prefijo)
+    sea s = subtexto(d, l[1], l[1] + l[0])
+    si (huff) { s = veloz_huffman_decodificar(s) }
+    retornar [s, l[1] + l[0]]
+}
+
+sea _VZ_HUFF = {}
+
+funcion _vz_huff_arbol() {
+    si (tiene_clave(_VZ_HUFF, "nodos")) { retornar _VZ_HUFF["nodos"] }
+    sea b = bytes_de_hex(_VZ_HUFF_HEX)
+    sea nodos = [[0, 0]]
+    sea s = 0
+    mientras (s < 257) {
+        sea codigo = bytes_leer_entero(b, s * 5, 4, 0)
+        sea largo = byte_en(b, s * 5 + 4)
+        sea nodo = 0
+        sea k = largo - 1
+        mientras (k >= 0) {
+            sea bit = piso(codigo / potencia(2, k)) % 2
+            si (k == 0) { nodos[nodo][bit] = 0 - (s + 1) } sino {
+                si (nodos[nodo][bit] <= 0) {
+                    nodos.agregar([0, 0])
+                    nodos[nodo][bit] = longitud(nodos) - 1
+                }
+                nodo = nodos[nodo][bit]
+            }
+            k = k - 1
+        }
+        s = s + 1
+    }
+    _VZ_HUFF["nodos"] = nodos
+    retornar nodos
+}
+
+/// Decodifica una cadena con el Huffman de HPACK/QPACK.
+funcion veloz_huffman_decodificar(d) {
+    sea nodos = _vz_huff_arbol()
+    sea r = ""
+    sea nodo = 0
+    sea i = 0
+    mientras (i < longitud(d)) {
+        sea b = byte_en(d, i)
+        sea k = 7
+        mientras (k >= 0) {
+            sea sig = nodos[nodo][piso(b / potencia(2, k)) % 2]
+            si (sig < 0) {
+                sea s = 0 - sig - 1
+                si (s == 256) { lanzar "veloz: EOS en Huffman" }
+                r = r + char_de(s)
+                nodo = 0
+            } sino { nodo = sig }
+            k = k - 1
+        }
+        i = i + 1
+    }
+    retornar r
+}
+
+// ---------- HTTP/3 ----------
+
+funcion _vz_h3_marco(tipo_m, datos) { retornar veloz_varint(tipo_m) + veloz_varint(longitud(datos)) + datos }
+
+// Abre el flujo de control con SETTINGS (una vez).
+funcion _vz_h3_control(q) {
+    si (tiene_clave(q, "h3_control")) { retornar nulo }
+    sea id = veloz_flujo_abrir(q, falso)
+    q["h3_control"] = id
+    veloz_flujo_escribir(q, id, veloz_varint(0) + _vz_h3_marco(4, veloz_varint(1) + veloz_varint(0) + veloz_varint(7) + veloz_varint(0)), falso)
+}
+
+// Lee marcos HTTP/3 completos de un búfer: [marcos, resto].
+funcion _vz_h3_marcos(buf) {
+    sea r = []
+    sea p = 0
+    mientras (p < longitud(buf)) {
+        si (p + 2 > longitud(buf)) { romper }
+        sea t = _vz_leer_varint(buf, p)
+        si (t[1] >= longitud(buf)) { romper }
+        sea l = _vz_leer_varint(buf, t[1])
+        si (l[1] + l[0] > longitud(buf)) { romper }
+        r.agregar([t[0], subtexto(buf, l[1], l[1] + l[0])])
+        p = l[1] + l[0]
+    }
+    retornar [r, subtexto(buf, p, longitud(buf))]
+}
+
+/// Prepara una solicitud HTTP/3 en un flujo nuevo. Devuelve el flujo.
+funcion veloz_h3_solicitar(q, metodo, autoridad, ruta, cabeceras, cuerpo) {
+    _vz_h3_control(q)
+    sea id = veloz_flujo_abrir(q, verdadero)
+    sea cab = [[":method", metodo], [":scheme", "https"], [":authority", autoridad], [":path", ruta]]
+    para c en cabeceras ?? [] { cab.agregar(c) }
+    sea d = _vz_h3_marco(1, veloz_qpack_codificar(cab))
+    si (cuerpo != nulo y longitud(cuerpo) > 0) { d = d + _vz_h3_marco(0, cuerpo) }
+    veloz_flujo_escribir(q, id, d, verdadero)
+    q["h3_resp"] = q["h3_resp"] ?? {}
+    q["h3_resp"]["" + id] = {"buf": "", "cabeceras": nulo, "cuerpo": "", "fin": falso}
+    retornar id
+}
+
+/// Respuesta de una solicitud: {"estado", "cabeceras", "cuerpo", "fin"}.
+funcion veloz_h3_respuesta(q, id) {
+    sea r = q["h3_resp"]["" + id]
+    sea l = veloz_flujo_leer(q, id)
+    r["buf"] = r["buf"] + l["datos"]
+    sea m = _vz_h3_marcos(r["buf"])
+    r["buf"] = m[1]
+    para fr en m[0] {
+        si (fr[0] == 1) { r["cabeceras"] = veloz_qpack_decodificar(fr[1]) }
+        si (fr[0] == 0) { r["cuerpo"] = r["cuerpo"] + fr[1] }
+    }
+    si (l["fin"]) { r["fin"] = verdadero }
+    sea estado = nulo
+    sea mapa = {}
+    para c en r["cabeceras"] ?? [] {
+        si (c[0] == ":status") { estado = a_numero(c[1]) } sino { mapa[c[0]] = c[1] }
+    }
+    retornar {"estado": estado, "cabeceras": mapa, "cuerpo": r["cuerpo"], "fin": r["fin"]}
+}
+
+/// Servidor HTTP/3: atiende las solicitudes completas con manejador(req)
+/// → {"estado", "cabeceras", "cuerpo"}. req: {"metodo", "ruta",
+/// "autoridad", "cabeceras", "cuerpo"}.
+funcion veloz_h3_atender(q, manejador) {
+    si (q["estado"] != "conectado") { retornar 0 }
+    _vz_h3_control(q)
+    q["h3_req"] = q["h3_req"] ?? {}
+    sea atendidas = 0
+    para k en claves(q["flujos"]) {
+        sea f = q["flujos"][k]
+        si (f["propio"] == falso y f["uni"] == falso) {
+            si (tiene_clave(q["h3_req"], k) == falso) { q["h3_req"][k] = {"buf": "", "cabeceras": nulo, "cuerpo": "", "listo": falso} }
+            sea st = q["h3_req"][k]
+            si (st["listo"] == falso) {
+                sea l = veloz_flujo_leer(q, f["id"])
+                st["buf"] = st["buf"] + l["datos"]
+                sea m = _vz_h3_marcos(st["buf"])
+                st["buf"] = m[1]
+                para fr en m[0] {
+                    si (fr[0] == 1 y st["cabeceras"] == nulo) { st["cabeceras"] = veloz_qpack_decodificar(fr[1]) }
+                    si (fr[0] == 0) { st["cuerpo"] = st["cuerpo"] + fr[1] }
+                }
+                si (l["fin"] y st["cabeceras"] != nulo) {
+                    st["listo"] = verdadero
+                    sea req = {"metodo": "GET", "ruta": "/", "autoridad": "", "cabeceras": {}, "cuerpo": st["cuerpo"]}
+                    para c en st["cabeceras"] {
+                        si (c[0] == ":method") { req["metodo"] = c[1] }
+                        sino si (c[0] == ":path") { req["ruta"] = c[1] }
+                        sino si (c[0] == ":authority") { req["autoridad"] = c[1] }
+                        sino si (texto_empieza_con(c[0], ":") == falso) { req["cabeceras"][c[0]] = c[1] }
+                    }
+                    sea resp = manejador(req)
+                    sea cab = [[":status", "" + (resp["estado"] ?? 200)]]
+                    para nombre en claves(resp["cabeceras"] ?? {}) { cab.agregar([nombre, resp["cabeceras"][nombre]]) }
+                    sea cuerpo = resp["cuerpo"] ?? ""
+                    cab.agregar(["content-length", "" + longitud(cuerpo)])
+                    sea d = _vz_h3_marco(1, veloz_qpack_codificar(cab))
+                    si (longitud(cuerpo) > 0) { d = d + _vz_h3_marco(0, cuerpo) }
+                    veloz_flujo_escribir(q, f["id"], d, verdadero)
+                    atendidas = atendidas + 1
+                }
+            }
+        }
+    }
+    retornar atendidas
+}
+
+// ---------- sobre UDP ----------
+
+funcion _vz_url(url) {
+    sea u = url
+    si (texto_empieza_con(u, "https://")) { u = subtexto(u, 8, longitud(u)) }
+    sea barra = texto_indice(u, "/")
+    sea hostport = u
+    sea ruta = "/"
+    si (barra >= 0) {
+        hostport = subtexto(u, 0, barra)
+        ruta = subtexto(u, barra, longitud(u))
+    }
+    sea host = hostport
+    sea puerto = 443
+    sea dos = texto_indice(hostport, ":")
+    si (dos >= 0) {
+        host = subtexto(hostport, 0, dos)
+        puerto = a_numero(subtexto(hostport, dos + 1, longitud(hostport)))
+    }
+    retornar {"host": host, "puerto": puerto, "ruta": ruta, "autoridad": hostport}
+}
+
+/// GET (o el método de opciones["metodo"]) por HTTP/3 sobre UDP.
+/// opciones: las de veloz_cliente más "metodo", "cabeceras", "cuerpo",
+/// "espera_ms" (10000). Devuelve {"estado", "cabeceras", "cuerpo"}.
+funcion veloz_http3_get(url, opciones) {
+    sea op = opciones ?? {}
+    sea u = _vz_url(url)
+    sea s = udp_crear(0)
+    sea q = veloz_cliente(op["sni"] ?? u["host"], op)
+    sea inicio = tiempo_ms()
+    sea limite = op["espera_ms"] ?? 10000
+    sea id = nulo
+    sea resp = nulo
+    mientras (tiempo_ms() - inicio < limite) {
+        sea ahora = tiempo_ms()
+        para dg en veloz_salida(q, ahora) { udp_enviar(s, u["host"], u["puerto"], dg) }
+        si (q["estado"] == "cerrado") { romper }
+        sea llego = falso
+        sea r = udp_recibir(s)
+        mientras (r != nulo) {
+            veloz_recibir(q, r["datos"], tiempo_ms())
+            llego = verdadero
+            r = udp_recibir(s)
+        }
+        si (veloz_conectado(q) y id == nulo) { id = veloz_h3_solicitar(q, op["metodo"] ?? "GET", u["autoridad"], u["ruta"], op["cabeceras"] ?? [], op["cuerpo"] ?? nulo) }
+        si (id != nulo) {
+            resp = veloz_h3_respuesta(q, id)
+            si (resp["fin"]) { romper }
+        }
+        si (llego == falso) { dormir(2) }
+    }
+    veloz_cerrar(q, 256, "")
+    para dg en veloz_salida(q, tiempo_ms()) { udp_enviar(s, u["host"], u["puerto"], dg) }
+    udp_cerrar(s)
+    si (resp == nulo o resp["fin"] == falso) {
+        si (q["error"] != nulo) { lanzar "veloz: " + q["error"] }
+        lanzar "veloz: no llegó la respuesta a tiempo"
+    }
+    retornar {"estado": resp["estado"], "cabeceras": resp["cabeceras"], "cuerpo": resp["cuerpo"], "alpn": q["alpn"]}
+}
+
+/// Servidor HTTP/3 sobre UDP: atiende con manejador hasta que pasen
+/// opciones["max_ms"] (sin límite si es nulo) o se atiendan
+/// opciones["max_solicitudes"]. Devuelve cuántas atendió.
+funcion veloz_http3_servir(puerto, opciones, manejador) {
+    sea op = opciones ?? {}
+    sea s = udp_crear(puerto)
+    sea conexiones = {}
+    sea inicio = tiempo_ms()
+    sea total = 0
+    mientras ((op["max_ms"] == nulo o tiempo_ms() - inicio < op["max_ms"]) y (op["max_solicitudes"] == nulo o total < op["max_solicitudes"])) {
+        sea r = udp_recibir(s)
+        sea hubo = falso
+        mientras (r != nulo) {
+            hubo = verdadero
+            sea clave = r["origen"] + ":" + r["puerto"]
+            si (tiene_clave(conexiones, clave) == falso) { conexiones[clave] = {"q": veloz_servidor(op), "host": r["origen"], "puerto": r["puerto"]} }
+            intentar { veloz_recibir(conexiones[clave]["q"], r["datos"], tiempo_ms()) } capturar (e) { }
+            r = udp_recibir(s)
+        }
+        para clave en claves(conexiones) {
+            sea cx = conexiones[clave]
+            intentar { total = total + veloz_h3_atender(cx["q"], manejador) } capturar (e) { }
+            para dg en veloz_salida(cx["q"], tiempo_ms()) { udp_enviar(s, cx["host"], cx["puerto"], dg) }
+            si (cx["q"]["estado"] == "cerrado") { quitar_clave(conexiones, clave) }
+        }
+        si (hubo == falso) { dormir(2) }
+    }
+    // Deja salir lo último.
+    para clave en claves(conexiones) { para dg en veloz_salida(conexiones[clave]["q"], tiempo_ms()) { udp_enviar(s, conexiones[clave]["host"], conexiones[clave]["puerto"], dg) } }
+    udp_cerrar(s)
+    retornar total
+}

@@ -35,7 +35,7 @@ Estado: ✅ ya existe en C-Forge · 🔗 se usa hoy vía `cforge bindgen`,
 | 16 | `portico` | Framework web | Axum, Actix | ✅ `web` (básico) |
 | 17 | `tabla` / `dataframe` | DataFrames | Polars | ✅ `tabla` |
 | 18 | `elenco` / `ecs` | Entidad-Componente-Sistema | Bevy ECS | ✅ `elenco` |
-| 19 | `blindaje` | TLS y cripto puras | Ring, Rustls | ✅ `crypto` · 🛠 TLS propio |
+| 19 | `blindaje` / `rustls` | TLS y cripto puras | Ring, Rustls | ✅ `crypto` · `blindaje` (TLS 1.3 propio) |
 | 20 | `patron` | Expresiones regulares sin ReDoS | regex (Rust) | ✅ `regex` |
 | 21 | `consulta` | Consultas perezosas sobre colecciones | LINQ | ✅ `colecciones` (parcial) |
 | 22 | `ligero` / `dapper` | Micro-ORM | Dapper | ✅ `ligero` |
@@ -116,7 +116,7 @@ Estado: ✅ ya existe en C-Forge · 🔗 se usa hoy vía `cforge bindgen`,
 | # | Nombre | Para qué | Inspiración | Estado |
 |---|---|---|---|---|
 | 82 | `llamada` / `protobuf` | RPC binario | gRPC, Protobuf | ✅ `llamada` |
-| 83 | `veloz` | QUIC y HTTP/3 | Quinn | 🛠 |
+| 83 | `veloz` / `quinn` | QUIC y HTTP/3 | Quinn | ✅ `es` / `en` |
 | 84 | `buzon` / `zeromq` | Mensajería entre procesos | ZeroMQ | ✅ `buzon` |
 | 85 | `malla` | Redes P2P | libp2p | 🛠 |
 | 86 | `tunel` / `wireguard` | VPN criptográfica | WireGuard | ✅ `tunel` |
