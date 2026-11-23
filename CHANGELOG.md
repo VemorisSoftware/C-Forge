@@ -75,8 +75,10 @@ Sitio oficial: [c-forge.org](https://c-forge.org)
   ejemplo de wgpu pasan glslangValidator y naga), `manipulador`/`gizmo3d`
   (gizmos 3D de mover, rotar y escalar al estilo ImGuizmo, sin GUI),
   `atributo`/`hypermedia` (runtime propio al estilo htmx, probado con
-  jsdom, y ayudas de servidor) y `teclado`/`input_sim` (simular teclado y
-  ratón: X11 con XTest, macOS y Windows).
+  jsdom, y ayudas de servidor), `teclado`/`input_sim` (simular teclado y
+  ratón: X11 con XTest, macOS y Windows) y `tunel`/`wireguard` (protocolo
+  de WireGuard con BLAKE2s propio, cookies y ventana anti-repetición;
+  interopera con boringtun como iniciador y como respondedor).
 - Lote 23 de bibliotecas (con alias en inglés y pruebas en ambos idiomas):
   `enjambre`/`parallel` (paralelismo de datos al estilo Rayon: mapear,
   filtrar, reducir y ordenar en hilos), `marea`/`asyncrt` (tareas, canales,

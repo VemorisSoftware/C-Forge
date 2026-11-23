@@ -119,7 +119,7 @@ Estado: ✅ ya existe en C-Forge · 🔗 se usa hoy vía `cforge bindgen`,
 | 83 | `veloz` | QUIC y HTTP/3 | Quinn | 🛠 |
 | 84 | `buzon` / `zeromq` | Mensajería entre procesos | ZeroMQ | ✅ `buzon` |
 | 85 | `malla` | Redes P2P | libp2p | 🛠 |
-| 86 | `tunel` | VPN criptográfica | WireGuard | 🛠 |
+| 86 | `tunel` / `wireguard` | VPN criptográfica | WireGuard | ✅ `tunel` |
 | 87 | `certifica` | Certificados HTTPS automáticos | ACME | 🛠 |
 | 88 | `ficha` | Tokens JWT/JWE | jose | ✅ `auth` (JWT) |
 | 89 | `clave` / `password` | Hash de contraseñas | Argon2, bcrypt | ✅ `clave` |
