@@ -1,0 +1,1203 @@
+// stdlib/intermedio.cfv — código intermedio en SSA al estilo LLVM y sus
+// optimizaciones: texto legible (func, bloques, %valores, phi), lector y
+// escritor, verificador (SSA, dominancia, phis, terminadores), intérprete,
+// y pases: mem2reg (alloca/load/store a SSA con fronteras de dominancia),
+// plegado de constantes con saltos constantes, combinación de
+// instrucciones (x+0, x*1, x-x…), eliminación de subexpresiones comunes
+// sobre el árbol de dominadores, código muerto, simplificar el grafo
+// (bloques inalcanzables, fusión, phis triviales), sacar invariantes de
+// los bucles (LICM) y bajar a "jit" para ejecutarlo como código máquina.
+// Idea de LLVM/MLIR (Apache-2.0 con excepción LLVM), escrito desde cero.
+// En inglés: importar "ssa_ir".
+//
+//   importar "intermedio"
+//   sea m = intermedio_leer("func @f(%a: i64) -> i64 {\nentrada:\n  %x = add i64 %a, 0\n  ret i64 %x\n}")
+//   intermedio_optimizar(m, nulo)
+//   mostrar(intermedio_texto(m))
+//   mostrar(intermedio_ejecutar(m, "f", [41]))
+
+importar "jit"
+
+// ---------- lectura ----------
+
+sea _IM_BIN = ["add", "sub", "mul", "sdiv", "srem", "udiv", "urem", "and", "or", "xor", "shl", "lshr", "ashr", "fadd", "fsub", "fmul", "fdiv"]
+sea _IM_PURAS = ["add", "sub", "mul", "sdiv", "srem", "udiv", "urem", "and", "or", "xor", "shl", "lshr", "ashr", "fadd", "fsub", "fmul", "fdiv", "icmp", "fcmp", "select", "sitofp", "fptosi", "phi", "copia"]
+
+funcion _im_error(n, msj) { lanzar "intermedio: línea " + n + ": " + msj }
+
+// Operando: {"k": "v", "n": nombre} o {"k": "c", "v": número, "t": tipo}.
+funcion _im_operando(t, tipo_o, n) {
+    sea x = texto_recortar(t)
+    si (texto_empieza_con(x, "%")) { retornar {"k": "v", "n": subtexto(x, 1, longitud(x))} }
+    si (x == "true") { retornar {"k": "c", "v": 1, "t": "i1"} }
+    si (x == "false") { retornar {"k": "c", "v": 0, "t": "i1"} }
+    si (longitud(x) == 0) { _im_error(n, "falta un operando") }
+    retornar {"k": "c", "v": a_numero(x), "t": tipo_o}
+}
+
+funcion _im_partir(t) {
+    sea r = []
+    para p en texto_dividir(t, ",") { r.agregar(texto_recortar(p)) }
+    retornar r
+}
+
+/// Lee un módulo desde el texto. Devuelve {"funciones": [...], "por_nombre": {}}.
+funcion intermedio_leer(texto) {
+    sea m = {"funciones": [], "por_nombre": {}}
+    sea f = nulo
+    sea b = nulo
+    sea n = 0
+    para l0 en texto_dividir(texto, "\n") {
+        n = n + 1
+        sea l = l0
+        sea com = texto_indice(l, ";")
+        si (com >= 0) { l = subtexto(l, 0, com) }
+        l = texto_recortar(l)
+        si (l == "") {
+        } sino si (texto_empieza_con(l, "func ")) {
+            // func @nombre(%a: i64, %b: f64) -> i64 {
+            sea a = texto_indice(l, "(")
+            sea c = texto_indice(l, ")")
+            sea nombre = texto_recortar(subtexto(l, 6, a))
+            sea params = []
+            para p en _im_partir(subtexto(l, a + 1, c)) {
+                si (p != "") {
+                    sea dp = texto_indice(p, ":")
+                    params.agregar({"n": texto_recortar(subtexto(p, 1, dp)), "t": texto_recortar(subtexto(p, dp + 1, longitud(p)))})
+                }
+            }
+            sea ret = "void"
+            sea fl = texto_indice(l, "->")
+            si (fl >= 0) { ret = texto_recortar(texto_reemplazar(subtexto(l, fl + 2, longitud(l)), "{", "")) }
+            f = {"nombre": nombre, "params": params, "ret": ret, "bloques": [], "bloque_idx": {}, "sig": 0}
+            m["funciones"].agregar(f)
+            m["por_nombre"][nombre] = f
+        } sino si (l == "}") {
+            f = nulo
+            b = nulo
+        } sino si (texto_termina_con(l, ":")) {
+            si (f == nulo) { _im_error(n, "bloque fuera de una función") }
+            b = {"nombre": subtexto(l, 0, longitud(l) - 1), "ins": []}
+            f["bloque_idx"][b["nombre"]] = longitud(f["bloques"])
+            f["bloques"].agregar(b)
+        } sino {
+            si (b == nulo) { _im_error(n, "instrucción fuera de un bloque") }
+            b["ins"].agregar(_im_instruccion(l, n))
+        }
+    }
+    retornar m
+}
+
+funcion _im_instruccion(l, n) {
+    sea r = nulo
+    sea cuerpo = l
+    sea igual = texto_indice(l, "=")
+    si (texto_empieza_con(l, "%") y igual > 0) {
+        r = texto_recortar(subtexto(l, 1, igual))
+        cuerpo = texto_recortar(subtexto(l, igual + 1, longitud(l)))
+    }
+    sea esp = texto_indice(cuerpo, " ")
+    sea op = cuerpo
+    sea resto = ""
+    si (esp >= 0) {
+        op = subtexto(cuerpo, 0, esp)
+        resto = texto_recortar(subtexto(cuerpo, esp + 1, longitud(cuerpo)))
+    }
+    sea x = {"op": op, "r": r, "t": nulo, "args": [], "n": n}
+    si (contiene(_IM_BIN, op)) {
+        sea e = texto_indice(resto, " ")
+        x["t"] = subtexto(resto, 0, e)
+        para a en _im_partir(subtexto(resto, e + 1, longitud(resto))) { x["args"].agregar(_im_operando(a, x["t"], n)) }
+        si (longitud(x["args"]) != 2) { _im_error(n, op + " lleva dos operandos") }
+    } sino si (op == "icmp" o op == "fcmp") {
+        sea p = texto_dividir(resto, " ")
+        x["cond"] = p[0]
+        x["t"] = "i1"
+        x["tc"] = p[1]
+        sea args_t = subtexto(resto, longitud(p[0]) + longitud(p[1]) + 2, longitud(resto))
+        para a en _im_partir(args_t) { x["args"].agregar(_im_operando(a, x["tc"], n)) }
+    } sino si (op == "select") {
+        // select i64 %c, %a, %b
+        sea e = texto_indice(resto, " ")
+        x["t"] = subtexto(resto, 0, e)
+        sea ps = _im_partir(subtexto(resto, e + 1, longitud(resto)))
+        x["args"] = [_im_operando(ps[0], "i1", n), _im_operando(ps[1], x["t"], n), _im_operando(ps[2], x["t"], n)]
+    } sino si (op == "phi") {
+        // phi i64 [%a, bloque1], [0, bloque2]
+        sea e = texto_indice(resto, " ")
+        x["t"] = subtexto(resto, 0, e)
+        x["entradas"] = []
+        sea t = subtexto(resto, e + 1, longitud(resto))
+        mientras (texto_indice(t, "[") >= 0) {
+            sea a = texto_indice(t, "[")
+            sea c = texto_indice(t, "]")
+            sea ps = _im_partir(subtexto(t, a + 1, c))
+            x["entradas"].agregar({"v": _im_operando(ps[0], x["t"], n), "b": ps[1]})
+            t = subtexto(t, c + 1, longitud(t))
+        }
+    } sino si (op == "br") {
+        sea ps = _im_partir(resto)
+        si (longitud(ps) == 1) { x["destinos"] = [ps[0]] } sino {
+            x["args"] = [_im_operando(ps[0], "i1", n)]
+            x["destinos"] = [ps[1], ps[2]]
+        }
+    } sino si (op == "ret") {
+        si (resto != "" y resto != "void") {
+            sea e = texto_indice(resto, " ")
+            x["t"] = subtexto(resto, 0, e)
+            x["args"] = [_im_operando(subtexto(resto, e + 1, longitud(resto)), x["t"], n)]
+        }
+    } sino si (op == "alloca") {
+        x["t"] = resto
+    } sino si (op == "load") {
+        // load i64, %p
+        sea ps = _im_partir(resto)
+        x["t"] = ps[0]
+        x["args"] = [_im_operando(ps[1], "ptr", n)]
+    } sino si (op == "store") {
+        // store i64 %v, %p
+        sea e = texto_indice(resto, " ")
+        x["t"] = subtexto(resto, 0, e)
+        sea ps = _im_partir(subtexto(resto, e + 1, longitud(resto)))
+        x["args"] = [_im_operando(ps[0], x["t"], n), _im_operando(ps[1], "ptr", n)]
+    } sino si (op == "sitofp" o op == "fptosi" o op == "copia") {
+        // %y = sitofp i64 %x to f64
+        sea ps = texto_dividir(resto, " ")
+        x["args"] = [_im_operando(ps[1], ps[0], n)]
+        si (op == "copia") { x["t"] = ps[0] } sino { x["t"] = ps[3] }
+    } sino si (op == "call") {
+        // %r = call i64 @f(%a, 3)
+        sea e = texto_indice(resto, " ")
+        x["t"] = subtexto(resto, 0, e)
+        sea a = texto_indice(resto, "(")
+        x["fn"] = texto_recortar(subtexto(resto, e + 2, a))
+        para p en _im_partir(subtexto(resto, a + 1, texto_indice(resto, ")"))) { si (p != "") { x["args"].agregar(_im_operando(p, "i64", n)) } }
+    } sino {
+        _im_error(n, "instrucción desconocida '" + op + "'")
+    }
+    retornar x
+}
+
+// ---------- escritura ----------
+
+funcion _im_op_txt(o) {
+    si (o["k"] == "v") { retornar "%" + o["n"] }
+    si (o["t"] == "i1") {
+        si (o["v"] != 0) { retornar "true" }
+        retornar "false"
+    }
+    si (o["t"] == "f64") {
+        sea s = "" + o["v"]
+        si (contiene(s, ".") == falso y contiene(s, "e") == falso) { s = s + ".0" }
+        retornar s
+    }
+    retornar "" + o["v"]
+}
+
+funcion _im_ins_txt(x) {
+    sea pre = ""
+    si (x["r"] != nulo) { pre = "%" + x["r"] + " = " }
+    sea op = x["op"]
+    sea a = []
+    para o en x["args"] { a.agregar(_im_op_txt(o)) }
+    si (contiene(_IM_BIN, op)) { retornar pre + op + " " + x["t"] + " " + unir(a, ", ") }
+    si (op == "icmp" o op == "fcmp") { retornar pre + op + " " + x["cond"] + " " + x["tc"] + " " + unir(a, ", ") }
+    si (op == "select") { retornar pre + "select " + x["t"] + " " + unir(a, ", ") }
+    si (op == "phi") {
+        sea e = []
+        para en en x["entradas"] { e.agregar("[" + _im_op_txt(en["v"]) + ", " + en["b"] + "]") }
+        retornar pre + "phi " + x["t"] + " " + unir(e, ", ")
+    }
+    si (op == "br") {
+        si (longitud(x["destinos"]) == 1) { retornar "br " + x["destinos"][0] }
+        retornar "br " + a[0] + ", " + x["destinos"][0] + ", " + x["destinos"][1]
+    }
+    si (op == "ret") {
+        si (longitud(a) == 0) { retornar "ret void" }
+        retornar "ret " + x["t"] + " " + a[0]
+    }
+    si (op == "alloca") { retornar pre + "alloca " + x["t"] }
+    si (op == "load") { retornar pre + "load " + x["t"] + ", " + a[0] }
+    si (op == "store") { retornar "store " + x["t"] + " " + a[0] + ", " + a[1] }
+    si (op == "sitofp") { retornar pre + "sitofp i64 " + a[0] + " to f64" }
+    si (op == "fptosi") { retornar pre + "fptosi f64 " + a[0] + " to i64" }
+    si (op == "copia") { retornar pre + "copia " + x["t"] + " " + a[0] }
+    si (op == "call") { retornar pre + "call " + x["t"] + " @" + x["fn"] + "(" + unir(a, ", ") + ")" }
+    retornar pre + op
+}
+
+/// El módulo como texto.
+funcion intermedio_texto(m) {
+    sea l = []
+    para f en m["funciones"] {
+        sea ps = []
+        para p en f["params"] { ps.agregar("%" + p["n"] + ": " + p["t"]) }
+        l.agregar("func @" + f["nombre"] + "(" + unir(ps, ", ") + ") -> " + f["ret"] + " {")
+        para b en f["bloques"] {
+            l.agregar(b["nombre"] + ":")
+            para x en b["ins"] { l.agregar("  " + _im_ins_txt(x)) }
+        }
+        l.agregar("}")
+    }
+    retornar unir(l, "\n") + "\n"
+}
+
+// ---------- análisis ----------
+
+funcion _im_reindexar(f) {
+    f["bloque_idx"] = {}
+    sea i = 0
+    para b en f["bloques"] {
+        f["bloque_idx"][b["nombre"]] = i
+        i = i + 1
+    }
+}
+
+funcion _im_terminador(b) {
+    si (longitud(b["ins"]) == 0) { retornar nulo }
+    sea u = b["ins"][longitud(b["ins"]) - 1]
+    si (u["op"] == "br" o u["op"] == "ret") { retornar u }
+    retornar nulo
+}
+
+funcion _im_sucesores(b) {
+    sea t = _im_terminador(b)
+    si (t == nulo o t["op"] == "ret") { retornar [] }
+    retornar t["destinos"]
+}
+
+funcion _im_predecesores(f) {
+    sea p = {}
+    para b en f["bloques"] { p[b["nombre"]] = [] }
+    para b en f["bloques"] {
+        para s en _im_sucesores(b) {
+            si (tiene_clave(p, s) y contiene(p[s], b["nombre"]) == falso) { p[s].agregar(b["nombre"]) }
+        }
+    }
+    retornar p
+}
+
+// Orden posterior inverso desde la entrada.
+funcion _im_rpo(f) {
+    sea visto = {}
+    sea post = []
+    sea pila = [[f["bloques"][0]["nombre"], 0]]
+    visto[f["bloques"][0]["nombre"]] = verdadero
+    mientras (longitud(pila) > 0) {
+        sea tope = pila[longitud(pila) - 1]
+        sea b = f["bloques"][f["bloque_idx"][tope[0]]]
+        sea su = _im_sucesores(b)
+        si (tope[1] < longitud(su)) {
+            sea s = su[tope[1]]
+            tope[1] = tope[1] + 1
+            si (tiene_clave(visto, s) == falso y tiene_clave(f["bloque_idx"], s)) {
+                visto[s] = verdadero
+                pila.agregar([s, 0])
+            }
+        } sino {
+            post.agregar(tope[0])
+            sea np = []
+            sea i = 0
+            mientras (i < longitud(pila) - 1) {
+                np.agregar(pila[i])
+                i = i + 1
+            }
+            pila = np
+        }
+    }
+    sea r = []
+    sea i = longitud(post) - 1
+    mientras (i >= 0) {
+        r.agregar(post[i])
+        i = i - 1
+    }
+    retornar r
+}
+
+// Dominadores inmediatos (Cooper, Harvey y Kennedy).
+funcion _im_dominadores(f) {
+    sea rpo = _im_rpo(f)
+    sea orden = {}
+    sea i = 0
+    para b en rpo {
+        orden[b] = i
+        i = i + 1
+    }
+    sea preds = _im_predecesores(f)
+    sea idom = {}
+    sea entrada = rpo[0]
+    idom[entrada] = entrada
+    sea cambio = verdadero
+    mientras (cambio) {
+        cambio = falso
+        para b en rpo {
+            si (b != entrada) {
+                sea nuevo = nulo
+                para p en preds[b] {
+                    si (tiene_clave(idom, p)) {
+                        si (nuevo == nulo) { nuevo = p } sino { nuevo = _im_cortar(idom, orden, p, nuevo) }
+                    }
+                }
+                si (nuevo != nulo y (tiene_clave(idom, b) == falso o idom[b] != nuevo)) {
+                    idom[b] = nuevo
+                    cambio = verdadero
+                }
+            }
+        }
+    }
+    retornar {"idom": idom, "rpo": rpo, "orden": orden, "preds": preds}
+}
+
+funcion _im_cortar(idom, orden, a, b) {
+    sea x = a
+    sea y_ = b
+    mientras (x != y_) {
+        mientras (orden[x] > orden[y_]) { x = idom[x] }
+        mientras (orden[y_] > orden[x]) { y_ = idom[y_] }
+    }
+    retornar x
+}
+
+funcion _im_domina(dom, a, b) {
+    // ¿a domina a b?
+    sea x = b
+    mientras (verdadero) {
+        si (x == a) { retornar verdadero }
+        si (tiene_clave(dom["idom"], x) == falso) { retornar falso }
+        sea p = dom["idom"][x]
+        si (p == x) { retornar falso }
+        x = p
+    }
+}
+
+funcion _im_hijos(dom) {
+    sea h = {}
+    para b en dom["rpo"] { h[b] = [] }
+    para b en dom["rpo"] {
+        sea p = dom["idom"][b]
+        si (p != b) { h[p].agregar(b) }
+    }
+    retornar h
+}
+
+// ---------- verificador ----------
+
+/// Revisa el módulo: [] o una lista de errores.
+funcion intermedio_verificar(m) {
+    sea errores = []
+    para f en m["funciones"] {
+        _im_reindexar(f)
+        si (longitud(f["bloques"]) == 0) { errores.agregar("@" + f["nombre"] + ": sin bloques") } sino {
+            sea def_en = {}
+            para p en f["params"] { def_en[p["n"]] = "@param" }
+            para b en f["bloques"] {
+                sea k = 0
+                para x en b["ins"] {
+                    si (x["r"] != nulo) {
+                        si (tiene_clave(def_en, x["r"])) { errores.agregar("@" + f["nombre"] + ": %" + x["r"] + " se define dos veces") }
+                        def_en[x["r"]] = b["nombre"]
+                    }
+                    si ((x["op"] == "br" o x["op"] == "ret") y k != longitud(b["ins"]) - 1) { errores.agregar("@" + f["nombre"] + "/" + b["nombre"] + ": terminador en el medio del bloque") }
+                    k = k + 1
+                }
+                si (_im_terminador(b) == nulo) { errores.agregar("@" + f["nombre"] + "/" + b["nombre"] + ": el bloque no termina con br o ret") }
+                para s en _im_sucesores(b) { si (tiene_clave(f["bloque_idx"], s) == falso) { errores.agregar("@" + f["nombre"] + "/" + b["nombre"] + ": salto a un bloque desconocido '" + s + "'") } }
+            }
+            si (longitud(errores) == 0) {
+                sea dom = _im_dominadores(f)
+                para b en f["bloques"] {
+                    si (tiene_clave(dom["idom"], b["nombre"])) {
+                        sea pos = {}
+                        sea k = 0
+                        para x en b["ins"] {
+                            si (x["op"] == "phi") {
+                                sea pr = dom["preds"][b["nombre"]]
+                                si (longitud(x["entradas"]) != longitud(pr)) { errores.agregar("@" + f["nombre"] + "/" + b["nombre"] + ": la phi %" + x["r"] + " no tiene una entrada por predecesor") }
+                                para en en x["entradas"] {
+                                    si (contiene(pr, en["b"]) == falso) { errores.agregar("@" + f["nombre"] + "/" + b["nombre"] + ": la phi %" + x["r"] + " nombra a " + en["b"] + " que no es predecesor") }
+                                    si (en["v"]["k"] == "v") {
+                                        sea d = def_en[en["v"]["n"]] ?? nulo
+                                        si (d == nulo) { errores.agregar("@" + f["nombre"] + ": %" + en["v"]["n"] + " no está definido") }
+                                        sino si (d != "@param" y tiene_clave(dom["idom"], en["b"]) y _im_domina(dom, d, en["b"]) == falso) { errores.agregar("@" + f["nombre"] + ": %" + en["v"]["n"] + " no domina la entrada de la phi desde " + en["b"]) }
+                                    }
+                                }
+                            } sino {
+                                para o en x["args"] {
+                                    si (o["k"] == "v") {
+                                        sea d = def_en[o["n"]] ?? nulo
+                                        si (d == nulo) { errores.agregar("@" + f["nombre"] + ": %" + o["n"] + " no está definido") }
+                                        sino si (d == b["nombre"]) {
+                                            si (tiene_clave(pos, o["n"]) == falso) { errores.agregar("@" + f["nombre"] + "/" + b["nombre"] + ": %" + o["n"] + " se usa antes de definirse") }
+                                        } sino si (d != "@param" y _im_domina(dom, d, b["nombre"]) == falso) { errores.agregar("@" + f["nombre"] + "/" + b["nombre"] + ": la definición de %" + o["n"] + " no domina su uso") }
+                                    }
+                                }
+                                si (x["op"] == "call" y tiene_clave(m["por_nombre"], x["fn"]) == falso) { errores.agregar("@" + f["nombre"] + ": llamada a @" + x["fn"] + " que no existe") }
+                            }
+                            si (x["r"] != nulo) { pos[x["r"]] = k }
+                            k = k + 1
+                        }
+                    }
+                }
+            }
+        }
+    }
+    retornar errores
+}
+
+// ---------- intérprete ----------
+
+funcion _im_valor(env, o) {
+    si (o["k"] == "c") { retornar o["v"] }
+    si (tiene_clave(env, o["n"]) == falso) { lanzar "intermedio: %" + o["n"] + " sin valor" }
+    retornar env[o["n"]]
+}
+
+funcion _im_entero64(v) {
+    // Recorta a 64 bits con signo (los enteros del lenguaje llegan a 62).
+    retornar v
+}
+
+funcion _im_calc(op, t, a, b) {
+    si (op == "add" o op == "fadd") { retornar a + b }
+    si (op == "sub" o op == "fsub") { retornar a - b }
+    si (op == "mul" o op == "fmul") { retornar a * b }
+    si (op == "fdiv") { retornar a / b }
+    si (op == "sdiv" o op == "udiv") {
+        si (b == 0) { retornar 0 }
+        sea q = a / b
+        si (q < 0) { retornar 0 - piso(0 - q) }
+        retornar piso(q)
+    }
+    si (op == "srem" o op == "urem") {
+        si (b == 0) { retornar 0 }
+        retornar a % b
+    }
+    si (op == "and") { retornar bits_y(a, b) }
+    si (op == "or") { retornar bits_o(a, b) }
+    si (op == "xor") { retornar bits_xo(a, b) }
+    si (op == "shl") { retornar a * potencia(2, b % 64) }
+    si (op == "ashr") { retornar piso(a / potencia(2, b % 64)) }
+    si (op == "lshr") {
+        si (a >= 0) { retornar piso(a / potencia(2, b % 64)) }
+        lanzar "intermedio: lshr de un negativo no se puede calcular aquí"
+    }
+    lanzar "intermedio: operación " + op
+}
+
+funcion _im_comparar(cond, a, b) {
+    sea r = falso
+    si (cond == "eq" o cond == "oeq") { r = a == b }
+    sino si (cond == "ne" o cond == "one") { r = a != b }
+    sino si (cond == "slt" o cond == "olt" o cond == "ult") { r = a < b }
+    sino si (cond == "sle" o cond == "ole" o cond == "ule") { r = a <= b }
+    sino si (cond == "sgt" o cond == "ogt" o cond == "ugt") { r = a > b }
+    sino si (cond == "sge" o cond == "oge" o cond == "uge") { r = a >= b }
+    sino { lanzar "intermedio: condición " + cond }
+    si (r) { retornar 1 }
+    retornar 0
+}
+
+/// Ejecuta la función con los argumentos (intérprete de referencia).
+funcion intermedio_ejecutar(m, nombre, args) { retornar _im_correr(m, m["por_nombre"][nombre], args, 0) }
+
+funcion _im_correr(m, f, args, prof) {
+    si (prof > 200) { lanzar "intermedio: demasiadas llamadas anidadas" }
+    _im_reindexar(f)
+    sea env = {}
+    sea mem = {}
+    sea i = 0
+    para p en f["params"] {
+        env[p["n"]] = args[i]
+        i = i + 1
+    }
+    sea b = f["bloques"][0]
+    sea previo = nulo
+    sea pasos = 0
+    mientras (verdadero) {
+        // Phis: todas a la vez con los valores de la entrada.
+        sea nuevos = {}
+        para x en b["ins"] {
+            si (x["op"] == "phi") {
+                sea hecho = falso
+                para en en x["entradas"] {
+                    si (en["b"] == previo) {
+                        nuevos[x["r"]] = _im_valor(env, en["v"])
+                        hecho = verdadero
+                    }
+                }
+                si (hecho == falso) { lanzar "intermedio: la phi %" + x["r"] + " no tiene entrada desde " + previo }
+            }
+        }
+        para k en claves(nuevos) { env[k] = nuevos[k] }
+        para x en b["ins"] {
+            pasos = pasos + 1
+            si (pasos > 10000000) { lanzar "intermedio: demasiados pasos" }
+            sea op = x["op"]
+            si (op == "phi") {
+            } sino si (contiene(_IM_BIN, op)) {
+                env[x["r"]] = _im_calc(op, x["t"], _im_valor(env, x["args"][0]), _im_valor(env, x["args"][1]))
+            } sino si (op == "icmp" o op == "fcmp") {
+                env[x["r"]] = _im_comparar(x["cond"], _im_valor(env, x["args"][0]), _im_valor(env, x["args"][1]))
+            } sino si (op == "select") {
+                si (_im_valor(env, x["args"][0]) != 0) { env[x["r"]] = _im_valor(env, x["args"][1]) } sino { env[x["r"]] = _im_valor(env, x["args"][2]) }
+            } sino si (op == "copia") { env[x["r"]] = _im_valor(env, x["args"][0]) }
+            sino si (op == "sitofp") { env[x["r"]] = _im_valor(env, x["args"][0]) * 1.0 }
+            sino si (op == "fptosi") {
+                sea v = _im_valor(env, x["args"][0])
+                si (v < 0) { env[x["r"]] = 0 - piso(0 - v) } sino { env[x["r"]] = piso(v) }
+            } sino si (op == "alloca") {
+                mem[x["r"]] = 0
+                env[x["r"]] = x["r"]
+            } sino si (op == "load") { env[x["r"]] = mem[_im_valor(env, x["args"][0])] }
+            sino si (op == "store") { mem[_im_valor(env, x["args"][1])] = _im_valor(env, x["args"][0]) }
+            sino si (op == "call") {
+                sea vals = []
+                para o en x["args"] { vals.agregar(_im_valor(env, o)) }
+                sea r = _im_correr(m, m["por_nombre"][x["fn"]], vals, prof + 1)
+                si (x["r"] != nulo) { env[x["r"]] = r }
+            } sino si (op == "ret") {
+                si (longitud(x["args"]) == 0) { retornar nulo }
+                retornar _im_valor(env, x["args"][0])
+            } sino si (op == "br") {
+                sea destino = x["destinos"][0]
+                si (longitud(x["destinos"]) == 2 y _im_valor(env, x["args"][0]) == 0) { destino = x["destinos"][1] }
+                previo = b["nombre"]
+                b = f["bloques"][f["bloque_idx"][destino]]
+            }
+        }
+    }
+}
+
+// ---------- utilidades de pases ----------
+
+funcion _im_nuevo_nombre(f, base) {
+    f["sig"] = (f["sig"] ?? 0) + 1
+    retornar base + "." + f["sig"]
+}
+
+// Reemplaza los usos de %viejo por el operando nuevo en toda la función.
+funcion _im_reemplazar_usos(f, viejo, nuevo) {
+    para b en f["bloques"] {
+        para x en b["ins"] {
+            sea i = 0
+            mientras (i < longitud(x["args"])) {
+                si (x["args"][i]["k"] == "v" y x["args"][i]["n"] == viejo) { x["args"][i] = nuevo }
+                i = i + 1
+            }
+            si (x["op"] == "phi") {
+                para en en x["entradas"] { si (en["v"]["k"] == "v" y en["v"]["n"] == viejo) { en["v"] = nuevo } }
+            }
+        }
+    }
+}
+
+funcion _im_usos(f) {
+    sea u = {}
+    para b en f["bloques"] {
+        para x en b["ins"] {
+            para o en x["args"] { si (o["k"] == "v") { u[o["n"]] = (u[o["n"]] ?? 0) + 1 } }
+            si (x["op"] == "phi") { para en en x["entradas"] { si (en["v"]["k"] == "v") { u[en["v"]["n"]] = (u[en["v"]["n"]] ?? 0) + 1 } } }
+        }
+    }
+    retornar u
+}
+
+funcion _im_const(v, t) { retornar {"k": "c", "v": v, "t": t} }
+
+// ---------- pases ----------
+
+/// mem2reg: las alloca que solo se cargan y guardan pasan a SSA con phis.
+funcion intermedio_mem2reg(f) {
+    _im_reindexar(f)
+    sea dom = _im_dominadores(f)
+    sea vars = {}
+    para b en f["bloques"] { para x en b["ins"] { si (x["op"] == "alloca") { vars[x["r"]] = x["t"] } } }
+    // Solo se promueven si el puntero no escapa (se usa solo en load/store como dirección).
+    para b en f["bloques"] {
+        para x en b["ins"] {
+            sea i = 0
+            para o en x["args"] {
+                si (o["k"] == "v" y tiene_clave(vars, o["n"])) {
+                    sea ok = (x["op"] == "load" y i == 0) o (x["op"] == "store" y i == 1)
+                    si (ok == falso) { quitar_clave(vars, o["n"]) }
+                }
+                i = i + 1
+            }
+        }
+    }
+    si (longitud(claves(vars)) == 0) { retornar 0 }
+    // Fronteras de dominancia.
+    sea df = {}
+    para b en dom["rpo"] { df[b] = [] }
+    para b en dom["rpo"] {
+        sea pr = dom["preds"][b]
+        si (longitud(pr) >= 2) {
+            para p en pr {
+                si (tiene_clave(dom["idom"], p)) {
+                    sea runner = p
+                    mientras (runner != dom["idom"][b]) {
+                        si (contiene(df[runner], b) == falso) { df[runner].agregar(b) }
+                        runner = dom["idom"][runner]
+                    }
+                }
+            }
+        }
+    }
+    // Phis donde hace falta.
+    sea phis = {}
+    para v en claves(vars) {
+        sea defs = []
+        para b en f["bloques"] { para x en b["ins"] { si (x["op"] == "store" y x["args"][1]["k"] == "v" y x["args"][1]["n"] == v y contiene(defs, b["nombre"]) == falso) { defs.agregar(b["nombre"]) } } }
+        sea trabajo = defs
+        sea con_phi = {}
+        mientras (longitud(trabajo) > 0) {
+            sea b = trabajo[longitud(trabajo) - 1]
+            trabajo = _im_sin_ultimo(trabajo)
+            para y_ en df[b] ?? [] {
+                si (tiene_clave(con_phi, y_) == falso) {
+                    con_phi[y_] = verdadero
+                    sea px = {"op": "phi", "r": _im_nuevo_nombre(f, v), "t": vars[v], "args": [], "entradas": [], "var": v, "n": 0}
+                    sea bl = f["bloques"][f["bloque_idx"][y_]]
+                    bl["ins"] = [px] + bl["ins"]
+                    phis[y_ + "|" + v] = px
+                    si (contiene(defs, y_) == falso) { trabajo.agregar(y_) }
+                }
+            }
+        }
+    }
+    // Renombrado recorriendo el árbol de dominadores.
+    sea hijos = _im_hijos(dom)
+    sea pila_val = {}
+    para v en claves(vars) { pila_val[v] = [_im_const(0, vars[v])] }
+    sea reemplazos = {}
+    _im_renombrar(f, dom["rpo"][0], vars, pila_val, hijos, reemplazos)
+    // Aplica los reemplazos de los load y quita alloca/load/store.
+    para b en f["bloques"] {
+        sea nuevas = []
+        para x en b["ins"] {
+            sea fuera = (x["op"] == "alloca" y tiene_clave(vars, x["r"])) o (x["op"] == "load" y x["args"][0]["k"] == "v" y tiene_clave(vars, x["args"][0]["n"])) o (x["op"] == "store" y x["args"][1]["k"] == "v" y tiene_clave(vars, x["args"][1]["n"]))
+            si (fuera == falso) { nuevas.agregar(x) }
+        }
+        b["ins"] = nuevas
+    }
+    // Resuelve cadenas de reemplazos.
+    para k en claves(reemplazos) {
+        sea o = reemplazos[k]
+        sea vueltas = 0
+        mientras (o["k"] == "v" y tiene_clave(reemplazos, o["n"]) y vueltas < 1000) {
+            o = reemplazos[o["n"]]
+            vueltas = vueltas + 1
+        }
+        _im_reemplazar_usos(f, k, o)
+    }
+    retornar longitud(claves(vars))
+}
+
+funcion _im_sin_ultimo(l) {
+    sea r = []
+    sea i = 0
+    mientras (i < longitud(l) - 1) {
+        r.agregar(l[i])
+        i = i + 1
+    }
+    retornar r
+}
+
+funcion _im_renombrar(f, bn, vars, pila_val, hijos, reemplazos) {
+    sea b = f["bloques"][f["bloque_idx"][bn]]
+    sea empujados = {}
+    para x en b["ins"] {
+        si (x["op"] == "phi" y tiene_clave(x, "var")) {
+            pila_val[x["var"]].agregar({"k": "v", "n": x["r"]})
+            empujados[x["var"]] = (empujados[x["var"]] ?? 0) + 1
+        } sino si (x["op"] == "load" y x["args"][0]["k"] == "v" y tiene_clave(vars, x["args"][0]["n"])) {
+            sea v = x["args"][0]["n"]
+            reemplazos[x["r"]] = pila_val[v][longitud(pila_val[v]) - 1]
+        } sino si (x["op"] == "store" y x["args"][1]["k"] == "v" y tiene_clave(vars, x["args"][1]["n"])) {
+            sea v = x["args"][1]["n"]
+            sea val = x["args"][0]
+            si (val["k"] == "v" y tiene_clave(reemplazos, val["n"])) { val = reemplazos[val["n"]] }
+            pila_val[v].agregar(val)
+            empujados[v] = (empujados[v] ?? 0) + 1
+        } sino {
+            // Los usos de cargas ya resueltas se arreglan al final.
+        }
+    }
+    // Entradas de las phis en los sucesores.
+    para s en _im_sucesores(b) {
+        sea sb = f["bloques"][f["bloque_idx"][s]]
+        para x en sb["ins"] {
+            si (x["op"] == "phi" y tiene_clave(x, "var")) {
+                sea v = x["var"]
+                sea val = pila_val[v][longitud(pila_val[v]) - 1]
+                si (val["k"] == "v" y tiene_clave(reemplazos, val["n"])) { val = reemplazos[val["n"]] }
+                x["entradas"].agregar({"v": val, "b": bn})
+            }
+        }
+    }
+    para h en hijos[bn] { _im_renombrar(f, h, vars, pila_val, hijos, reemplazos) }
+    para v en claves(empujados) {
+        sea k = 0
+        mientras (k < empujados[v]) {
+            pila_val[v] = _im_sin_ultimo(pila_val[v])
+            k = k + 1
+        }
+    }
+}
+
+// Plegado de constantes, combinación de instrucciones y saltos constantes.
+funcion intermedio_plegar(f) {
+    sea cambios = 0
+    sea seguir = verdadero
+    mientras (seguir) {
+        seguir = falso
+        para b en f["bloques"] {
+            para x en b["ins"] {
+                sea op = x["op"]
+                sea r = nulo
+                sea args = x["args"]
+                si (contiene(_IM_BIN, op) y args[0]["k"] == "c" y args[1]["k"] == "c") {
+                    si ((op == "sdiv" o op == "srem" o op == "udiv" o op == "urem" o op == "fdiv") y args[1]["v"] == 0) { r = nulo }
+                    sino si (op == "lshr" y args[0]["v"] < 0) { r = nulo }
+                    sino { r = _im_const(_im_calc(op, x["t"], args[0]["v"], args[1]["v"]), x["t"]) }
+                } sino si ((op == "icmp" o op == "fcmp") y args[0]["k"] == "c" y args[1]["k"] == "c") {
+                    r = _im_const(_im_comparar(x["cond"], args[0]["v"], args[1]["v"]), "i1")
+                } sino si (op == "select" y args[0]["k"] == "c") {
+                    si (args[0]["v"] != 0) { r = args[1] } sino { r = args[2] }
+                } sino si (op == "copia") { r = args[0] }
+                sino si (op == "sitofp" y args[0]["k"] == "c") { r = _im_const(args[0]["v"] * 1.0, "f64") }
+                sino si (contiene(_IM_BIN, op)) { r = _im_combinar(op, x["t"], args) }
+                sino si (op == "phi") {
+                    // phi con todas las entradas iguales (o ella misma).
+                    sea unico = nulo
+                    sea ok = verdadero
+                    para en en x["entradas"] {
+                        sea v = en["v"]
+                        si ((v["k"] == "v" y v["n"] == x["r"]) == falso) {
+                            si (unico == nulo) { unico = v }
+                            sino si (_im_op_txt(unico) != _im_op_txt(v)) { ok = falso }
+                        }
+                    }
+                    si (ok y unico != nulo) { r = unico }
+                } sino si (op == "br" y longitud(x["destinos"]) == 2 y args[0]["k"] == "c") {
+                    sea muerto = x["destinos"][1]
+                    sea vivo = x["destinos"][0]
+                    si (args[0]["v"] == 0) {
+                        muerto = x["destinos"][0]
+                        vivo = x["destinos"][1]
+                    }
+                    x["destinos"] = [vivo]
+                    x["args"] = []
+                    si (muerto != vivo) { _im_quitar_entrada_phi(f, muerto, b["nombre"]) }
+                    cambios = cambios + 1
+                    seguir = verdadero
+                }
+                si (r != nulo y x["r"] != nulo) {
+                    _im_reemplazar_usos(f, x["r"], r)
+                    // La instrucción queda muerta; se marca como copia para limpiarla.
+                    x["op"] = "copia"
+                    x["args"] = [r]
+                    si (op != "copia") {
+                        cambios = cambios + 1
+                        seguir = verdadero
+                    }
+                }
+            }
+        }
+    }
+    retornar cambios
+}
+
+funcion _im_quitar_entrada_phi(f, bloque, desde) {
+    si (tiene_clave(f["bloque_idx"], bloque) == falso) { retornar nulo }
+    sea b = f["bloques"][f["bloque_idx"][bloque]]
+    para x en b["ins"] {
+        si (x["op"] == "phi") {
+            sea e = []
+            para en en x["entradas"] { si (en["b"] != desde) { e.agregar(en) } }
+            x["entradas"] = e
+        }
+    }
+}
+
+funcion _im_es(o, v) { retornar o["k"] == "c" y o["v"] == v }
+funcion _im_mismo(a, b) { retornar a["k"] == "v" y b["k"] == "v" y a["n"] == b["n"] }
+
+funcion _im_combinar(op, t, a) {
+    sea x = a[0]
+    sea y_ = a[1]
+    si (t == "f64") {
+        si (op == "fmul" y _im_es(y_, 1)) { retornar x }
+        si (op == "fdiv" y _im_es(y_, 1)) { retornar x }
+        retornar nulo
+    }
+    si (op == "add") {
+        si (_im_es(y_, 0)) { retornar x }
+        si (_im_es(x, 0)) { retornar y_ }
+    }
+    si (op == "sub") {
+        si (_im_es(y_, 0)) { retornar x }
+        si (_im_mismo(x, y_)) { retornar _im_const(0, t) }
+    }
+    si (op == "mul") {
+        si (_im_es(y_, 1)) { retornar x }
+        si (_im_es(x, 1)) { retornar y_ }
+        si (_im_es(y_, 0) o _im_es(x, 0)) { retornar _im_const(0, t) }
+    }
+    si ((op == "sdiv" o op == "udiv") y _im_es(y_, 1)) { retornar x }
+    si ((op == "srem" o op == "urem") y _im_es(y_, 1)) { retornar _im_const(0, t) }
+    si (op == "and") {
+        si (_im_es(y_, 0) o _im_es(x, 0)) { retornar _im_const(0, t) }
+        si (_im_es(y_, -1)) { retornar x }
+        si (_im_mismo(x, y_)) { retornar x }
+    }
+    si (op == "or") {
+        si (_im_es(y_, 0)) { retornar x }
+        si (_im_es(x, 0)) { retornar y_ }
+        si (_im_mismo(x, y_)) { retornar x }
+    }
+    si (op == "xor") {
+        si (_im_es(y_, 0)) { retornar x }
+        si (_im_mismo(x, y_)) { retornar _im_const(0, t) }
+    }
+    si ((op == "shl" o op == "lshr" o op == "ashr") y _im_es(y_, 0)) { retornar x }
+    retornar nulo
+}
+
+/// Elimina instrucciones sin efectos cuyo resultado no se usa.
+funcion intermedio_muerto(f) {
+    sea total = 0
+    sea seguir = verdadero
+    mientras (seguir) {
+        seguir = falso
+        sea usos = _im_usos(f)
+        para b en f["bloques"] {
+            sea nuevas = []
+            para x en b["ins"] {
+                si (x["r"] != nulo y contiene(_IM_PURAS, x["op"]) y (usos[x["r"]] ?? 0) == 0) {
+                    total = total + 1
+                    seguir = verdadero
+                } sino si (x["op"] == "phi" y (usos[x["r"]] ?? 0) == 1 y _im_phi_solo_si_misma(x)) {
+                    total = total + 1
+                    seguir = verdadero
+                } sino { nuevas.agregar(x) }
+            }
+            b["ins"] = nuevas
+        }
+    }
+    retornar total
+}
+
+funcion _im_phi_solo_si_misma(x) {
+    para en en x["entradas"] { si (en["v"]["k"] == "v" y en["v"]["n"] == x["r"]) { retornar verdadero } }
+    retornar falso
+}
+
+/// Simplifica el grafo: quita bloques inalcanzables, fusiona un bloque con
+/// su único sucesor si este tiene un solo predecesor, y saltos a bloques
+/// vacíos.
+funcion intermedio_simplificar(f) {
+    sea cambios = 0
+    sea seguir = verdadero
+    mientras (seguir) {
+        seguir = falso
+        _im_reindexar(f)
+        // Inalcanzables.
+        sea vivos = {}
+        para b en _im_rpo(f) { vivos[b] = verdadero }
+        sea quedan = []
+        para b en f["bloques"] {
+            si (tiene_clave(vivos, b["nombre"])) { quedan.agregar(b) } sino {
+                para s en _im_sucesores(b) { _im_quitar_entrada_phi(f, s, b["nombre"]) }
+                cambios = cambios + 1
+                seguir = verdadero
+            }
+        }
+        f["bloques"] = quedan
+        _im_reindexar(f)
+        // Fusión.
+        sea preds = _im_predecesores(f)
+        sea hecho = falso
+        para b en f["bloques"] {
+            si (hecho == falso) {
+                sea su = _im_sucesores(b)
+                si (longitud(su) == 1 y su[0] != b["nombre"] y longitud(preds[su[0]]) == 1 y su[0] != f["bloques"][0]["nombre"]) {
+                    sea s = f["bloques"][f["bloque_idx"][su[0]]]
+                    // Las phis del sucesor tienen una sola entrada: se vuelven copias.
+                    sea cuerpo = []
+                    para x en s["ins"] {
+                        si (x["op"] == "phi") {
+                            _im_reemplazar_usos(f, x["r"], x["entradas"][0]["v"])
+                        } sino { cuerpo.agregar(x) }
+                    }
+                    sea sin_term = []
+                    sea k = 0
+                    mientras (k < longitud(b["ins"]) - 1) {
+                        sin_term.agregar(b["ins"][k])
+                        k = k + 1
+                    }
+                    b["ins"] = sin_term + cuerpo
+                    // Los sucesores del bloque fusionado ahora vienen de b.
+                    para ss en _im_sucesores(s) { _im_renombrar_pred(f, ss, s["nombre"], b["nombre"]) }
+                    sea resto = []
+                    para x en f["bloques"] { si (x["nombre"] != s["nombre"]) { resto.agregar(x) } }
+                    f["bloques"] = resto
+                    hecho = verdadero
+                    cambios = cambios + 1
+                    seguir = verdadero
+                }
+            }
+        }
+    }
+    retornar cambios
+}
+
+funcion _im_renombrar_pred(f, bloque, viejo, nuevo) {
+    si (tiene_clave(f["bloque_idx"], bloque) == falso) { retornar nulo }
+    sea b = f["bloques"][f["bloque_idx"][bloque]]
+    para x en b["ins"] { si (x["op"] == "phi") { para en en x["entradas"] { si (en["b"] == viejo) { en["b"] = nuevo } } } }
+}
+
+/// Subexpresiones comunes sobre el árbol de dominadores.
+funcion intermedio_cse(f) {
+    _im_reindexar(f)
+    sea dom = _im_dominadores(f)
+    sea hijos = _im_hijos(dom)
+    sea cuenta = [0]
+    _im_cse_bloque(f, dom["rpo"][0], {}, hijos, cuenta)
+    retornar cuenta[0]
+}
+
+funcion _im_cse_bloque(f, bn, vistos, hijos, cuenta) {
+    sea b = f["bloques"][f["bloque_idx"][bn]]
+    sea locales = {}
+    para k en claves(vistos) { locales[k] = vistos[k] }
+    para x en b["ins"] {
+        si (x["r"] != nulo y contiene(_IM_PURAS, x["op"]) y x["op"] != "phi" y x["op"] != "copia") {
+            sea a = []
+            para o en x["args"] { a.agregar(_im_op_txt(o)) }
+            // Conmutativas en orden fijo.
+            si (contiene(["add", "mul", "and", "or", "xor", "fadd", "fmul"], x["op"]) y a[0] > a[1]) { a = [a[1], a[0]] }
+            sea k = x["op"] + " " + x["t"] + " " + (x["cond"] ?? "") + " " + unir(a, ",")
+            si (tiene_clave(locales, k)) {
+                _im_reemplazar_usos(f, x["r"], {"k": "v", "n": locales[k]})
+                x["op"] = "copia"
+                x["args"] = [{"k": "v", "n": locales[k]}]
+                cuenta[0] = cuenta[0] + 1
+            } sino { locales[k] = x["r"] }
+        }
+    }
+    para h en hijos[bn] { _im_cse_bloque(f, h, locales, hijos, cuenta) }
+}
+
+/// Saca de los bucles las instrucciones puras cuyos operandos se definen
+/// afuera, llevándolas al bloque previo (cabecera con un solo predecesor
+/// externo).
+funcion intermedio_licm(f) {
+    _im_reindexar(f)
+    sea dom = _im_dominadores(f)
+    sea movidas = 0
+    // Bucles naturales por aristas hacia atrás (b → h con h dominando b).
+    para b en f["bloques"] {
+        para h en _im_sucesores(b) {
+            si (tiene_clave(dom["idom"], b["nombre"]) y _im_domina(dom, h, b["nombre"])) {
+                sea cuerpo = _im_cuerpo_bucle(dom["preds"], h, b["nombre"])
+                sea externos = []
+                para p en dom["preds"][h] { si (tiene_clave(cuerpo, p) == falso) { externos.agregar(p) } }
+                si (longitud(externos) == 1) {
+                    sea pre = f["bloques"][f["bloque_idx"][externos[0]]]
+                    si (longitud(_im_sucesores(pre)) == 1) {
+                        // Definidos dentro del bucle.
+                        sea dentro = {}
+                        para cb en claves(cuerpo) { para x en f["bloques"][f["bloque_idx"][cb]]["ins"] { si (x["r"] != nulo) { dentro[x["r"]] = verdadero } } }
+                        sea cambio = verdadero
+                        mientras (cambio) {
+                            cambio = falso
+                            para cb en claves(cuerpo) {
+                                sea bl = f["bloques"][f["bloque_idx"][cb]]
+                                sea quedan = []
+                                para x en bl["ins"] {
+                                    sea invariante = x["r"] != nulo y contiene(_IM_PURAS, x["op"]) y x["op"] != "phi" y x["op"] != "sdiv" y x["op"] != "srem" y x["op"] != "udiv" y x["op"] != "urem"
+                                    si (invariante) { para o en x["args"] { si (o["k"] == "v" y tiene_clave(dentro, o["n"])) { invariante = falso } } }
+                                    si (invariante) {
+                                        sea t = pre["ins"][longitud(pre["ins"]) - 1]
+                                        sea sin_t = []
+                                        sea k = 0
+                                        mientras (k < longitud(pre["ins"]) - 1) {
+                                            sin_t.agregar(pre["ins"][k])
+                                            k = k + 1
+                                        }
+                                        sin_t.agregar(x)
+                                        sin_t.agregar(t)
+                                        pre["ins"] = sin_t
+                                        quitar_clave(dentro, x["r"])
+                                        movidas = movidas + 1
+                                        cambio = verdadero
+                                    } sino { quedan.agregar(x) }
+                                }
+                                bl["ins"] = quedan
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+    retornar movidas
+}
+
+funcion _im_cuerpo_bucle(preds, h, atras) {
+    sea c = {}
+    c[h] = verdadero
+    sea pila = [atras]
+    mientras (longitud(pila) > 0) {
+        sea x = pila[longitud(pila) - 1]
+        pila = _im_sin_ultimo(pila)
+        si (tiene_clave(c, x) == falso) {
+            c[x] = verdadero
+            para p en preds[x] { pila.agregar(p) }
+        }
+    }
+    retornar c
+}
+
+/// Corre los pases sobre todas las funciones hasta que no cambie nada.
+/// opciones: "pases" (lista entre mem2reg, plegar, cse, licm, muerto,
+/// simplificar). Devuelve cuántos cambios hizo cada pase.
+funcion intermedio_optimizar(m, opciones) {
+    sea op = opciones ?? {}
+    sea pases = op["pases"] ?? ["mem2reg", "plegar", "simplificar", "cse", "licm", "plegar", "muerto", "simplificar"]
+    sea cuenta = {}
+    para p en pases { cuenta[p] = 0 }
+    para f en m["funciones"] {
+        sea vuelta = 0
+        sea cambio = verdadero
+        mientras (cambio y vuelta < 10) {
+            cambio = falso
+            para p en pases {
+                sea n = 0
+                si (p == "mem2reg") { n = intermedio_mem2reg(f) }
+                sino si (p == "plegar") { n = intermedio_plegar(f) + intermedio_muerto(f) }
+                sino si (p == "cse") { n = intermedio_cse(f) + intermedio_muerto(f) }
+                sino si (p == "licm") { n = intermedio_licm(f) }
+                sino si (p == "muerto") { n = intermedio_muerto(f) }
+                sino si (p == "simplificar") { n = intermedio_simplificar(f) }
+                sino { lanzar "intermedio: pase desconocido '" + p + "'" }
+                cuenta[p] = cuenta[p] + n
+                si (n > 0) { cambio = verdadero }
+            }
+            vuelta = vuelta + 1
+        }
+        _im_reindexar(f)
+    }
+    retornar cuenta
+}
+
+/// Cuenta de instrucciones del módulo (para medir los pases).
+funcion intermedio_tamano(m) {
+    sea n = 0
+    para f en m["funciones"] { para b en f["bloques"] { n = n + longitud(b["ins"]) } }
+    retornar n
+}
+
+// ---------- bajar a jit ----------
+
+/// Compila una función (sin llamadas ni memoria) a código máquina con
+/// "jit". Las phis se vuelven variables. Devuelve el manejador de jit.
+funcion intermedio_a_jit(m, nombre, opciones) {
+    sea f = m["por_nombre"][nombre]
+    _im_reindexar(f)
+    sea tipos = []
+    para p en f["params"] {
+        si (p["t"] == "f64") { tipos.agregar("real") } sino { tipos.agregar("entero") }
+    }
+    sea rt = "entero"
+    si (f["ret"] == "f64") { rt = "real" }
+    sea j = jit_funcion(longitud(f["params"]), tipos, rt)
+    sea valores = {}
+    sea i = 0
+    para p en f["params"] {
+        valores[p["n"]] = jit_param(j, i)
+        i = i + 1
+    }
+    // Una variable por phi, y un bloque de jit por bloque.
+    sea vars = {}
+    sea bloques = {}
+    sea primero = verdadero
+    para b en f["bloques"] {
+        si (primero) {
+            bloques[b["nombre"]] = 0
+            primero = falso
+        } sino { bloques[b["nombre"]] = jit_bloque(j) }
+        para x en b["ins"] {
+            si (x["op"] == "phi") {
+                si (x["t"] == "f64") { vars[x["r"]] = jit_variable(j, "real") } sino { vars[x["r"]] = jit_variable(j, "entero") }
+            }
+        }
+    }
+    para b en f["bloques"] {
+        jit_ir(j, bloques[b["nombre"]])
+        para x en b["ins"] {
+            sea op = x["op"]
+            si (op == "phi") { valores[x["r"]] = jit_leer(j, vars[x["r"]]) }
+            sino si (op == "br" o op == "ret") {
+                si (op == "ret") { jit_retornar(j, _im_jv(j, valores, x["args"][0])) }
+                sino {
+                    // Copias a las phis del destino antes de saltar.
+                    para d en x["destinos"] { si (longitud(x["destinos"]) == 1) { _im_jit_phis(j, f, valores, vars, b["nombre"], d) } }
+                    si (longitud(x["destinos"]) == 1) { jit_saltar(j, bloques[x["destinos"][0]]) } sino {
+                        // Bloques intermedios para las copias de cada lado.
+                        sea bs = jit_bloque(j)
+                        sea bn = jit_bloque(j)
+                        jit_saltar_si(j, _im_jv(j, valores, x["args"][0]), bs, bn)
+                        jit_ir(j, bs)
+                        _im_jit_phis(j, f, valores, vars, b["nombre"], x["destinos"][0])
+                        jit_saltar(j, bloques[x["destinos"][0]])
+                        jit_ir(j, bn)
+                        _im_jit_phis(j, f, valores, vars, b["nombre"], x["destinos"][1])
+                        jit_saltar(j, bloques[x["destinos"][1]])
+                    }
+                }
+            } sino {
+                valores[x["r"]] = _im_jit_ins(j, valores, x)
+            }
+        }
+    }
+    retornar jit_compilar(j, opciones)
+}
+
+funcion _im_jit_phis(j, f, valores, vars, desde, hacia) {
+    sea b = f["bloques"][f["bloque_idx"][hacia]]
+    // Primero se leen todos los valores y luego se escriben (copias paralelas).
+    sea pendientes = []
+    para x en b["ins"] {
+        si (x["op"] == "phi") {
+            para en en x["entradas"] { si (en["b"] == desde) { pendientes.agregar([vars[x["r"]], _im_jv(j, valores, en["v"])]) } }
+        }
+    }
+    para p en pendientes { jit_poner(j, p[0], p[1]) }
+}
+
+funcion _im_jv(j, valores, o) {
+    si (o["k"] == "v") { retornar valores[o["n"]] }
+    si (o["t"] == "f64") { retornar jit_real(j, o["v"]) }
+    retornar jit_constante(j, o["v"])
+}
+
+sea _IM_JIT_OPS = {"add": "suma", "sub": "resta", "mul": "mul", "sdiv": "div", "srem": "resto", "and": "y", "or": "o", "xor": "xo", "shl": "izq", "lshr": "der", "ashr": "der_s",
+    "fadd": "suma", "fsub": "resta", "fmul": "mul", "fdiv": "div"}
+sea _IM_JIT_CMP = {"eq": "igual", "ne": "distinto", "slt": "menor", "sle": "menor_igual", "sgt": "mayor", "sge": "mayor_igual", "ult": "menor_u", "ugt": "mayor_u",
+    "oeq": "igual", "one": "distinto", "olt": "menor", "ole": "menor_igual", "ogt": "mayor", "oge": "mayor_igual"}
+
+funcion _im_jit_ins(j, valores, x) {
+    sea op = x["op"]
+    sea a = []
+    para o en x["args"] { a.agregar(_im_jv(j, valores, o)) }
+    si (tiene_clave(_IM_JIT_OPS, op)) { retornar jit_op(j, _IM_JIT_OPS[op], a[0], a[1]) }
+    si (op == "icmp" o op == "fcmp") { retornar jit_comparar(j, _IM_JIT_CMP[x["cond"]], a[0], a[1]) }
+    si (op == "select") { retornar jit_seleccionar(j, a[0], a[1], a[2]) }
+    si (op == "sitofp") { retornar jit_a_real(j, a[0]) }
+    si (op == "fptosi") { retornar jit_a_entero(j, a[0]) }
+    si (op == "copia") { retornar a[0] }
+    lanzar "intermedio: '" + op + "' no se baja a jit (usa mem2reg y sin llamadas)"
+}

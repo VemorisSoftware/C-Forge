@@ -1,0 +1,805 @@
+// stdlib/jit.cfv — código máquina en tiempo de ejecución, al estilo
+// Cranelift pero chico: armas una función con un IR de bloques y valores
+// (enteros de 64 bits y reales de 64 bits), variables, saltos, selección y
+// comparaciones, y el JIT la traduce a x86-64 (System V) o ARM64 (AAPCS),
+// la pone en memoria ejecutable y la llamas como cualquier función. Trae
+// además un compilador de expresiones ("a * b + 3 > c ? a : b").
+// División y resto entre cero dan 0 (en las dos arquitecturas igual).
+// Ejecuta en Linux x86-64; en otras plataformas genera el código igual
+// (jit_codigo) y ejecuta si el sistema lo permite. Idea de Cranelift
+// (Apache-2.0), escrito desde cero. En inglés: importar "jit_asm".
+//
+//   importar "jit"
+//   sea f = jit_funcion(2, "entero")
+//   sea s = jit_op(f, "mul", jit_param(f, 0), jit_param(f, 1))
+//   jit_retornar(f, jit_op(f, "suma", s, jit_constante(f, 1)))
+//   sea h = jit_compilar(f, nulo)
+//   mostrar(jit_llamar(h, [6, 7]))      // 43
+
+// ---------- IR ----------
+
+/// Función nueva con "n" parámetros. tipos: "entero" o "real", o una lista
+/// con el tipo de cada parámetro; retorno: "entero" o "real".
+funcion jit_funcion(n, tipos, retorno) {
+    sea tp = []
+    sea i = 0
+    mientras (i < n) {
+        si (tipo(tipos) == "lista") { tp.agregar(tipos[i]) } sino { tp.agregar(tipos ?? "entero") }
+        i = i + 1
+    }
+    sea ret = retorno
+    si (ret == nulo) {
+        si (tipo(tipos) == "texto") { ret = tipos } sino { ret = "entero" }
+    }
+    si (n > 6) { lanzar "jit: hasta 6 parámetros" }
+    sea f = {"params": tp, "ret": ret, "valores": [], "variables": [], "bloques": [[]], "actual": 0, "cerrados": [falso]}
+    i = 0
+    mientras (i < n) {
+        f["valores"].agregar(tp[i])
+        i = i + 1
+    }
+    retornar f
+}
+
+funcion _jt_emitir(f, ins) {
+    si (f["cerrados"][f["actual"]]) { lanzar "jit: el bloque " + f["actual"] + " ya terminó (salto o retorno)" }
+    f["bloques"][f["actual"]].agregar(ins)
+}
+
+funcion _jt_nuevo(f, tipo_v) {
+    f["valores"].agregar(tipo_v)
+    retornar longitud(f["valores"]) - 1
+}
+
+funcion _jt_tipo(f, v) {
+    si (v < 0 o v >= longitud(f["valores"])) { lanzar "jit: valor inexistente " + v }
+    retornar f["valores"][v]
+}
+
+/// El parámetro i (es un valor).
+funcion jit_param(f, i) {
+    si (i < 0 o i >= longitud(f["params"])) { lanzar "jit: no hay parámetro " + i }
+    retornar i
+}
+
+/// Constante entera.
+funcion jit_constante(f, n) {
+    sea r = _jt_nuevo(f, "entero")
+    _jt_emitir(f, {"op": "const", "r": r, "bytes": _jt_u(piso(n), 8)})
+    retornar r
+}
+
+/// Constante real.
+funcion jit_real(f, x) {
+    sea r = _jt_nuevo(f, "real")
+    _jt_emitir(f, {"op": "const", "r": r, "bytes": _jt_real_bytes(x)})
+    retornar r
+}
+
+sea _JT_OPS_E = ["suma", "resta", "mul", "div", "resto", "y", "o", "xo", "izq", "der", "der_s"]
+sea _JT_OPS_R = ["suma", "resta", "mul", "div"]
+
+/// Operación binaria: suma, resta, mul, div, resto, y, o, xo, izq (<<),
+/// der (>> sin signo), der_s (>> con signo). Con reales: suma, resta, mul, div.
+funcion jit_op(f, op, a, b) {
+    sea ta = _jt_tipo(f, a)
+    si (ta != _jt_tipo(f, b)) { lanzar "jit: " + op + " con tipos distintos" }
+    si (ta == "entero" y contiene(_JT_OPS_E, op) == falso) { lanzar "jit: operación entera desconocida " + op }
+    si (ta == "real" y contiene(_JT_OPS_R, op) == falso) { lanzar "jit: operación real desconocida " + op }
+    sea r = _jt_nuevo(f, ta)
+    _jt_emitir(f, {"op": op, "r": r, "a": a, "b": b, "t": ta})
+    retornar r
+}
+
+/// Unarias: "neg", "no" (bits), "raiz" (real), "abs".
+funcion jit_unaria(f, op, a) {
+    sea ta = _jt_tipo(f, a)
+    sea r = _jt_nuevo(f, ta)
+    _jt_emitir(f, {"op": "u_" + op, "r": r, "a": a, "t": ta})
+    retornar r
+}
+
+/// Comparación (da entero 0 o 1): igual, distinto, menor, menor_igual,
+/// mayor, mayor_igual; con enteros también menor_u y mayor_u (sin signo).
+funcion jit_comparar(f, cond, a, b) {
+    sea ta = _jt_tipo(f, a)
+    si (ta != _jt_tipo(f, b)) { lanzar "jit: comparación con tipos distintos" }
+    sea r = _jt_nuevo(f, "entero")
+    _jt_emitir(f, {"op": "cmp", "c": cond, "r": r, "a": a, "b": b, "t": ta})
+    retornar r
+}
+
+/// c != 0 ? a : b
+funcion jit_seleccionar(f, c, a, b) {
+    sea r = _jt_nuevo(f, _jt_tipo(f, a))
+    _jt_emitir(f, {"op": "sel", "r": r, "c": c, "a": a, "b": b, "t": _jt_tipo(f, a)})
+    retornar r
+}
+
+funcion jit_a_real(f, a) {
+    sea r = _jt_nuevo(f, "real")
+    _jt_emitir(f, {"op": "a_real", "r": r, "a": a})
+    retornar r
+}
+
+funcion jit_a_entero(f, a) {
+    sea r = _jt_nuevo(f, "entero")
+    _jt_emitir(f, {"op": "a_entero", "r": r, "a": a})
+    retornar r
+}
+
+/// Variable mutable (para bucles). Devuelve su número.
+funcion jit_variable(f, tipo_v) {
+    f["variables"].agregar(tipo_v ?? "entero")
+    retornar longitud(f["variables"]) - 1
+}
+
+funcion jit_poner(f, var, v) { _jt_emitir(f, {"op": "poner", "var": var, "a": v}) }
+
+funcion jit_leer(f, var) {
+    sea r = _jt_nuevo(f, f["variables"][var])
+    _jt_emitir(f, {"op": "leer", "r": r, "var": var})
+    retornar r
+}
+
+/// Bloque nuevo (vacío). Devuelve su número.
+funcion jit_bloque(f) {
+    f["bloques"].agregar([])
+    f["cerrados"].agregar(falso)
+    retornar longitud(f["bloques"]) - 1
+}
+
+/// Sigue emitiendo en el bloque b.
+funcion jit_ir(f, b) { f["actual"] = b }
+
+funcion _jt_cerrar(f) { f["cerrados"][f["actual"]] = verdadero }
+
+funcion jit_saltar(f, b) {
+    _jt_emitir(f, {"op": "salto", "b": b})
+    _jt_cerrar(f)
+}
+
+/// Si c != 0 va a b_si, si no a b_no.
+funcion jit_saltar_si(f, c, b_si, b_no) {
+    _jt_emitir(f, {"op": "salto_si", "c": c, "si": b_si, "no": b_no})
+    _jt_cerrar(f)
+}
+
+funcion jit_retornar(f, v) {
+    si (_jt_tipo(f, v) != f["ret"]) { lanzar "jit: se retorna " + _jt_tipo(f, v) + " y la función da " + f["ret"] }
+    _jt_emitir(f, {"op": "ret", "a": v})
+    _jt_cerrar(f)
+}
+
+// Real de 64 bits (IEEE 754) como 8 bytes little-endian, y al revés. Los
+// enteros del lenguaje no llegan a 64 bits, por eso se arma a mano.
+funcion _jt_real_bytes(x) {
+    sea hi = 0
+    sea lo = 0
+    si (x != x) { hi = 2146959360 }
+    sino si (x == 0) {
+        hi = 0
+        si (("" + x) == "-0") { hi = 2147483648 }
+    } sino {
+        sea signo = 0
+        sea m = x
+        si (m < 0) {
+            signo = 2147483648
+            m = 0 - m
+        }
+        si (m > 1.7976931348623157e308) { hi = signo + 2146435072 } sino {
+            sea e = piso(logaritmo(m) / 0.6931471805599453)
+            m = m / potencia(2, e)
+            mientras (m >= 2) {
+                m = m / 2
+                e = e + 1
+            }
+            mientras (m < 1) {
+                m = m * 2
+                e = e - 1
+            }
+            sea mant = 0
+            si (e < -1022) {
+                // Subnormal.
+                mant = redondear(m * potencia(2, 52 + e + 1022))
+                e = -1023
+            } sino { mant = redondear((m - 1) * 4503599627370496) }
+            si (mant >= 4503599627370496) {
+                mant = mant - 4503599627370496
+                e = e + 1
+            }
+            hi = signo + (e + 1023) * 1048576 + piso(mant / 4294967296)
+            lo = mant % 4294967296
+        }
+    }
+    retornar bytes_entero(lo, 4, 1) + bytes_entero(hi, 4, 1)
+}
+
+funcion _jt_real_de_bytes(b) {
+    sea lo = bytes_leer_entero(b, 0, 4, 1)
+    sea hi = bytes_leer_entero(b, 4, 4, 1)
+    sea signo = 1
+    si (hi >= 2147483648) {
+        signo = -1
+        hi = hi - 2147483648
+    }
+    sea e = piso(hi / 1048576)
+    sea mant = (hi % 1048576) * 4294967296 + lo
+    si (e == 2047) {
+        // NaN no se puede representar en el lenguaje: nulo.
+        si (mant != 0) { retornar nulo }
+        retornar signo * 1.7976931348623157e308 * 10
+    }
+    si (e == 0) { retornar signo * mant * potencia(2, -1074) }
+    retornar signo * (1 + mant / 4503599627370496) * potencia(2, e - 1023)
+}
+
+// Valor del lenguaje con esos 8 bytes en un registro (para c_llamar).
+funcion _jt_registro(bytes8) {
+    sea b = c_reservar(8)
+    c_escribir32(b, 0, bytes_leer_entero(bytes8, 0, 4, 1))
+    c_escribir32(b, 4, bytes_leer_entero(bytes8, 4, 4, 1))
+    sea r = c_leer64(b, 0)
+    c_liberar(b)
+    retornar r
+}
+
+funcion _jt_bytes_de_registro(v) {
+    sea b = c_reservar(8)
+    c_escribir64(b, 0, v)
+    sea lo = c_leer32(b, 0)
+    sea hi = c_leer32(b, 4)
+    c_liberar(b)
+    si (lo < 0) { lo = lo + 4294967296 }
+    si (hi < 0) { hi = hi + 4294967296 }
+    retornar bytes_entero(lo, 4, 1) + bytes_entero(hi, 4, 1)
+}
+
+// ---------- utilidades de bytes ----------
+
+funcion _jt_u(n, bytes) {
+    // Entero con signo a "bytes" bytes en little-endian.
+    sea v = n
+    si (v < 0) {
+        si (bytes == 8) {
+            // Complemento a dos de 64 bits sin pasar por 2^64.
+            sea r = ""
+            sea x = 0 - v - 1
+            sea i = 0
+            mientras (i < 8) {
+                r = r + char_de(255 - x % 256)
+                x = piso(x / 256)
+                i = i + 1
+            }
+            retornar r
+        }
+        v = v + potencia(2, bytes * 8)
+    }
+    retornar bytes_entero(v, bytes, 1)
+}
+
+// ---------- x86-64 ----------
+
+funcion _jt_x_disp(k) { retornar _jt_u(0 - 8 * (k + 1), 4) }
+
+funcion _jt_x_cargar(reg, k) {
+    // mov reg, [rbp + d]   (rax=0, rcx=1, rdx=2)
+    retornar bytes_de_hex("488b") + char_de(133 + reg * 8) + _jt_x_disp(k)
+}
+
+funcion _jt_x_guardar(k) { retornar bytes_de_hex("488985") + _jt_x_disp(k) }
+
+funcion _jt_x_cargar_sd(xmm, k) { retornar bytes_de_hex("f20f10") + char_de(133 + xmm * 8) + _jt_x_disp(k) }
+funcion _jt_x_guardar_sd(k) { retornar bytes_de_hex("f20f1185") + _jt_x_disp(k) }
+
+sea _JT_X_CC = {"igual": "94", "distinto": "95", "menor": "9c", "menor_igual": "9e", "mayor": "9f", "mayor_igual": "9d", "menor_u": "92", "mayor_u": "97"}
+
+funcion _jt_x86(f, slot_valor, slot_var, n_slots) {
+    sea codigo = ""
+    sea marco = n_slots * 8
+    si (marco % 16 != 0) { marco = marco + 8 }
+    // push rbp; mov rbp, rsp; sub rsp, marco
+    codigo = codigo + bytes_de_hex("554889e54881ec") + _jt_u(marco, 4)
+    sea i = 0
+    mientras (i < longitud(f["params"])) {
+        // mov [rbp + d], rdi/rsi/rdx/rcx/r8/r9
+        codigo = codigo + bytes_de_hex(_JT_X_PARAM[i]) + _jt_x_disp(slot_valor[i])
+        i = i + 1
+    }
+    sea inicios = []
+    sea arreglos = []
+    sea b = 0
+    mientras (b < longitud(f["bloques"])) {
+        inicios.agregar(longitud(codigo))
+        para ins en f["bloques"][b] {
+            sea op = ins["op"]
+            si (op == "const") {
+                codigo = codigo + bytes_de_hex("48b8") + ins["bytes"] + _jt_x_guardar(slot_valor[ins["r"]])
+            } sino si (op == "leer") {
+                codigo = codigo + _jt_x_cargar(0, slot_var[ins["var"]]) + _jt_x_guardar(slot_valor[ins["r"]])
+            } sino si (op == "poner") {
+                codigo = codigo + _jt_x_cargar(0, slot_valor[ins["a"]]) + _jt_x_guardar(slot_var[ins["var"]])
+            } sino si (op == "a_real") {
+                codigo = codigo + _jt_x_cargar(0, slot_valor[ins["a"]]) + bytes_de_hex("f2480f2ac0") + _jt_x_guardar_sd(slot_valor[ins["r"]])
+            } sino si (op == "a_entero") {
+                codigo = codigo + _jt_x_cargar_sd(0, slot_valor[ins["a"]]) + bytes_de_hex("f2480f2cc0") + _jt_x_guardar(slot_valor[ins["r"]])
+            } sino si (op == "sel") {
+                codigo = codigo + _jt_x_cargar(0, slot_valor[ins["a"]]) + _jt_x_cargar(1, slot_valor[ins["b"]]) + _jt_x_cargar(2, slot_valor[ins["c"]])
+                codigo = codigo + bytes_de_hex("4885d2480f44c1") + _jt_x_guardar(slot_valor[ins["r"]])
+            } sino si (op == "cmp") {
+                si (ins["t"] == "entero") {
+                    codigo = codigo + _jt_x_cargar(0, slot_valor[ins["a"]]) + _jt_x_cargar(1, slot_valor[ins["b"]]) + bytes_de_hex("4839c80f" + _JT_X_CC[ins["c"]] + "c0480fb6c0")
+                } sino {
+                    codigo = codigo + _jt_x_cargar_sd(0, slot_valor[ins["a"]]) + _jt_x_cargar_sd(1, slot_valor[ins["b"]]) + bytes_de_hex(_JT_X_CMP_R[ins["c"]]) + bytes_de_hex("480fb6c0")
+                }
+                codigo = codigo + _jt_x_guardar(slot_valor[ins["r"]])
+            } sino si (texto_empieza_con(op, "u_")) {
+                si (ins["t"] == "real") {
+                    codigo = codigo + _jt_x_cargar_sd(0, slot_valor[ins["a"]])
+                    si (op == "u_raiz") { codigo = codigo + bytes_de_hex("f20f51c0") }
+                    sino si (op == "u_neg") { codigo = codigo + bytes_de_hex("660f57c9f20f5cc8f20f10c1") }
+                    sino si (op == "u_abs") { codigo = codigo + bytes_de_hex("66480f7ec048b9ffffffffffffff7f4821c866480f6ec0") }
+                    codigo = codigo + _jt_x_guardar_sd(slot_valor[ins["r"]])
+                } sino {
+                    codigo = codigo + _jt_x_cargar(0, slot_valor[ins["a"]])
+                    si (op == "u_neg") { codigo = codigo + bytes_de_hex("48f7d8") }
+                    sino si (op == "u_no") { codigo = codigo + bytes_de_hex("48f7d0") }
+                    sino si (op == "u_abs") { codigo = codigo + bytes_de_hex("4889c148f7d94885c0480f48c1") }
+                    codigo = codigo + _jt_x_guardar(slot_valor[ins["r"]])
+                }
+            } sino si (op == "salto") {
+                codigo = codigo + bytes_de_hex("e9")
+                arreglos.agregar([longitud(codigo), ins["b"]])
+                codigo = codigo + _jt_u(0, 4)
+            } sino si (op == "salto_si") {
+                codigo = codigo + _jt_x_cargar(0, slot_valor[ins["c"]]) + bytes_de_hex("4885c00f85")
+                arreglos.agregar([longitud(codigo), ins["si"]])
+                codigo = codigo + _jt_u(0, 4) + bytes_de_hex("e9")
+                arreglos.agregar([longitud(codigo), ins["no"]])
+                codigo = codigo + _jt_u(0, 4)
+            } sino si (op == "ret") {
+                codigo = codigo + _jt_x_cargar(0, slot_valor[ins["a"]]) + bytes_de_hex("c9c3")
+            } sino si (ins["t"] == "real") {
+                codigo = codigo + _jt_x_cargar_sd(0, slot_valor[ins["a"]]) + _jt_x_cargar_sd(1, slot_valor[ins["b"]])
+                codigo = codigo + bytes_de_hex("f20f" + _JT_X_OP_R[op] + "c1") + _jt_x_guardar_sd(slot_valor[ins["r"]])
+            } sino {
+                codigo = codigo + _jt_x_cargar(0, slot_valor[ins["a"]]) + _jt_x_cargar(1, slot_valor[ins["b"]])
+                si (op == "div" o op == "resto") {
+                    // Entre cero: 0. Con -1: negar (div) o 0 (resto); evita la trampa de INT_MIN / -1.
+                    sea fin = "4831c0"
+                    sea menos = "48f7d8"
+                    si (op == "resto") { menos = "4831c0" }
+                    sea dividir = "489948f7f9"
+                    si (op == "resto") { dividir = dividir + "4889d0" }
+                    // test rcx,rcx; jz cero; cmp rcx,-1; je menos; <dividir>; jmp fin; menos: <menos>; jmp fin; cero: xor eax,eax; fin:
+                    sea d = bytes_de_hex(dividir)
+                    sea mn = bytes_de_hex(menos)
+                    codigo = codigo + bytes_de_hex("4885c974") + char_de(6 + longitud(d) + 2 + longitud(mn) + 2)
+                    codigo = codigo + bytes_de_hex("4883f9ff74") + char_de(longitud(d) + 2)
+                    codigo = codigo + d + bytes_de_hex("eb") + char_de(longitud(mn) + 2 + 3)
+                    codigo = codigo + mn + bytes_de_hex("eb03") + bytes_de_hex(fin)
+                } sino {
+                    codigo = codigo + bytes_de_hex(_JT_X_OP_E[op])
+                }
+                codigo = codigo + _jt_x_guardar(slot_valor[ins["r"]])
+            }
+        }
+        b = b + 1
+    }
+    para ar en arreglos {
+        sea destino = inicios[ar[1]]
+        sea rel = destino - (ar[0] + 4)
+        codigo = subtexto(codigo, 0, ar[0]) + _jt_u(rel, 4) + subtexto(codigo, ar[0] + 4, longitud(codigo))
+    }
+    retornar codigo
+}
+
+sea _JT_X_PARAM = ["4889bd", "4889b5", "488995", "48898d", "4c8985", "4c898d"]
+sea _JT_X_OP_E = {"suma": "4801c8", "resta": "4829c8", "mul": "480fafc1", "y": "4821c8", "o": "4809c8", "xo": "4831c8", "izq": "48d3e0", "der": "48d3e8", "der_s": "48d3f8"}
+sea _JT_X_OP_R = {"suma": "58", "resta": "5c", "mul": "59", "div": "5e"}
+// ucomisd y setcc para reales (falso con NaN salvo "distinto").
+sea _JT_X_CMP_R = {"menor": "660f2ec80f97c0", "menor_igual": "660f2ec80f93c0", "mayor": "660f2ec10f97c0", "mayor_igual": "660f2ec10f93c0",
+    "igual": "660f2ec10f94c00f9bc120c8", "distinto": "660f2ec10f95c00f9ac108c8"}
+
+// ---------- ARM64 ----------
+
+funcion _jt_a(w) { retornar bytes_entero(w, 4, 1) }
+
+funcion _jt_a_ldr(t, k) { retornar _jt_a(4181721088 + k * 1024 + 31 * 32 + t) }
+funcion _jt_a_str(t, k) { retornar _jt_a(4177526784 + k * 1024 + 31 * 32 + t) }
+funcion _jt_a_ldr_d(t, k) { retornar _jt_a(4248829952 + k * 1024 + 31 * 32 + t) }
+funcion _jt_a_str_d(t, k) { retornar _jt_a(4244635648 + k * 1024 + 31 * 32 + t) }
+
+sea _JT_A_OP_E = {"suma": 2332098560, "resta": 3405840384, "mul": 2600565760, "y": 2315321344, "o": 2852192256, "xo": 3389063168, "izq": 2596347904, "der": 2596348928, "der_s": 2596349952}
+sea _JT_A_OP_R = {"suma": 509683712, "resta": 509687808, "mul": 509675520, "div": 509679616}
+sea _JT_A_CC = {"igual": 0, "distinto": 1, "menor": 11, "menor_igual": 13, "mayor": 12, "mayor_igual": 10, "menor_u": 3, "mayor_u": 8}
+sea _JT_A_CC_R = {"igual": 0, "distinto": 1, "menor": 4, "menor_igual": 9, "mayor": 12, "mayor_igual": 10}
+
+// cset x0, cond  (csinc x0, xzr, xzr, !cond)
+funcion _jt_a_cset(cond) { retornar _jt_a(2594113504 + bits_xo(cond, 1) * 4096) }
+
+funcion _jt_a_mov_imm(b) {
+    // movz + movk de los cuatro trozos de 16 bits (b: 8 bytes).
+    sea r = ""
+    sea hw = 0
+    mientras (hw < 4) {
+        sea trozo = bytes_leer_entero(b, hw * 2, 2, 1)
+        si (hw == 0) { r = r + _jt_a(3531603968 + trozo * 32) }
+        sino si (trozo != 0) { r = r + _jt_a(4068474880 + hw * 2097152 + trozo * 32) }
+        hw = hw + 1
+    }
+    retornar r
+}
+
+funcion _jt_arm64(f, slot_valor, slot_var, n_slots) {
+    sea marco = n_slots * 8
+    si (marco % 16 != 0) { marco = marco + 8 }
+    si (marco >= 4096) { lanzar "jit: demasiados valores para ARM64 (máximo 511)" }
+    // stp x29, x30, [sp, #-16]!; mov x29, sp; sub sp, sp, #marco
+    sea codigo = _jt_a(2847898621) + _jt_a(2432697341) + _jt_a(3506439167 + marco * 1024)
+    sea i = 0
+    mientras (i < longitud(f["params"])) {
+        codigo = codigo + _jt_a_str(i, slot_valor[i])
+        i = i + 1
+    }
+    sea inicios = []
+    sea arreglos = []
+    sea b = 0
+    mientras (b < longitud(f["bloques"])) {
+        inicios.agregar(longitud(codigo))
+        para ins en f["bloques"][b] {
+            sea op = ins["op"]
+            si (op == "const") {
+                codigo = codigo + _jt_a_mov_imm(ins["bytes"]) + _jt_a_str(0, slot_valor[ins["r"]])
+            } sino si (op == "leer") {
+                codigo = codigo + _jt_a_ldr(0, slot_var[ins["var"]]) + _jt_a_str(0, slot_valor[ins["r"]])
+            } sino si (op == "poner") {
+                codigo = codigo + _jt_a_ldr(0, slot_valor[ins["a"]]) + _jt_a_str(0, slot_var[ins["var"]])
+            } sino si (op == "a_real") {
+                codigo = codigo + _jt_a_ldr(0, slot_valor[ins["a"]]) + _jt_a(2657222656) + _jt_a_str_d(0, slot_valor[ins["r"]])
+            } sino si (op == "a_entero") {
+                codigo = codigo + _jt_a_ldr_d(0, slot_valor[ins["a"]]) + _jt_a(2658664448) + _jt_a_str(0, slot_valor[ins["r"]])
+            } sino si (op == "sel") {
+                // ldr x0, a; ldr x1, b; ldr x2, c; cmp x2, #0; csel x0, x0, x1, ne
+                codigo = codigo + _jt_a_ldr(0, slot_valor[ins["a"]]) + _jt_a_ldr(1, slot_valor[ins["b"]]) + _jt_a_ldr(2, slot_valor[ins["c"]])
+                codigo = codigo + _jt_a(4043309151) + _jt_a(2592149504) + _jt_a_str(0, slot_valor[ins["r"]])
+            } sino si (op == "cmp") {
+                si (ins["t"] == "entero") {
+                    codigo = codigo + _jt_a_ldr(0, slot_valor[ins["a"]]) + _jt_a_ldr(1, slot_valor[ins["b"]]) + _jt_a(3942711327) + _jt_a_cset(_JT_A_CC[ins["c"]])
+                } sino {
+                    codigo = codigo + _jt_a_ldr_d(0, slot_valor[ins["a"]]) + _jt_a_ldr_d(1, slot_valor[ins["b"]]) + _jt_a(509681664) + _jt_a_cset(_JT_A_CC_R[ins["c"]])
+                }
+                codigo = codigo + _jt_a_str(0, slot_valor[ins["r"]])
+            } sino si (texto_empieza_con(op, "u_")) {
+                si (ins["t"] == "real") {
+                    codigo = codigo + _jt_a_ldr_d(0, slot_valor[ins["a"]])
+                    si (op == "u_raiz") { codigo = codigo + _jt_a(509722624) }
+                    sino si (op == "u_neg") { codigo = codigo + _jt_a(509689856) }
+                    sino si (op == "u_abs") { codigo = codigo + _jt_a(509657088) }
+                    codigo = codigo + _jt_a_str_d(0, slot_valor[ins["r"]])
+                } sino {
+                    codigo = codigo + _jt_a_ldr(0, slot_valor[ins["a"]])
+                    si (op == "u_neg") { codigo = codigo + _jt_a(3405775840) }
+                    sino si (op == "u_no") { codigo = codigo + _jt_a(2854224864) }
+                    // cmp x0, #0; cneg x0, x0, lt
+                    sino si (op == "u_abs") { codigo = codigo + _jt_a(4043309087) + _jt_a(3665863680) }
+                    codigo = codigo + _jt_a_str(0, slot_valor[ins["r"]])
+                }
+            } sino si (op == "salto") {
+                arreglos.agregar([longitud(codigo), ins["b"], "b"])
+                codigo = codigo + _jt_a(335544320)
+            } sino si (op == "salto_si") {
+                codigo = codigo + _jt_a_ldr(0, slot_valor[ins["c"]])
+                arreglos.agregar([longitud(codigo), ins["si"], "cbnz"])
+                codigo = codigo + _jt_a(3036676096)
+                arreglos.agregar([longitud(codigo), ins["no"], "b"])
+                codigo = codigo + _jt_a(335544320)
+            } sino si (op == "ret") {
+                // ldr x0, v; mov sp, x29; ldp x29, x30, [sp], #16; ret
+                codigo = codigo + _jt_a_ldr(0, slot_valor[ins["a"]]) + _jt_a(2432697279) + _jt_a(2831252477) + _jt_a(3596551104)
+            } sino si (ins["t"] == "real") {
+                codigo = codigo + _jt_a_ldr_d(0, slot_valor[ins["a"]]) + _jt_a_ldr_d(1, slot_valor[ins["b"]]) + _jt_a(_JT_A_OP_R[op]) + _jt_a_str_d(0, slot_valor[ins["r"]])
+            } sino {
+                codigo = codigo + _jt_a_ldr(0, slot_valor[ins["a"]]) + _jt_a_ldr(1, slot_valor[ins["b"]])
+                si (op == "div") {
+                    // sdiv ya da 0 entre cero e INT_MIN con -1.
+                    codigo = codigo + _jt_a(2596342784)
+                } sino si (op == "resto") {
+                    // cbnz x1, +12; mov x0, xzr; b +12; sdiv x2, x0, x1; msub x0, x2, x1, x0
+                    codigo = codigo + _jt_a(3036676097 + 3 * 32) + _jt_a(2854159328) + _jt_a(335544323) + _jt_a(2596342786) + _jt_a(2600566848)
+                } sino {
+                    codigo = codigo + _jt_a(_JT_A_OP_E[op])
+                }
+                codigo = codigo + _jt_a_str(0, slot_valor[ins["r"]])
+            }
+        }
+        b = b + 1
+    }
+    para ar en arreglos {
+        sea rel = piso((inicios[ar[1]] - ar[0]) / 4)
+        sea w = bytes_leer_entero(codigo, ar[0], 4, 1)
+        si (ar[2] == "b") { w = 335544320 + bits_y(rel + 67108864, 67108863) }
+        sino { w = 3036676096 + bits_y(rel + 524288, 524287) * 32 }
+        codigo = subtexto(codigo, 0, ar[0]) + _jt_a(w) + subtexto(codigo, ar[0] + 4, longitud(codigo))
+    }
+    retornar codigo
+}
+
+// ---------- compilar y llamar ----------
+
+funcion _jt_arquitectura() {
+    si (existe_archivo("/proc/cpuinfo")) {
+        sea c = leer_archivo("/proc/cpuinfo")
+        si (contiene(c, "vendor_id") o contiene(c, "GenuineIntel") o contiene(c, "AuthenticAMD")) { retornar "x86_64" }
+        retornar "arm64"
+    }
+    si (existe_archivo("/System/Library/CoreServices")) { retornar "arm64" }
+    retornar "x86_64"
+}
+
+/// Revisa que todos los bloques terminen y los saltos vayan a bloques que existen.
+funcion _jt_revisar(f) {
+    sea b = 0
+    mientras (b < longitud(f["bloques"])) {
+        si (f["cerrados"][b] == falso) { lanzar "jit: el bloque " + b + " no termina con salto ni retorno" }
+        para ins en f["bloques"][b] {
+            para k en ["b", "si", "no"] {
+                si (tiene_clave(ins, k) y (ins["op"] == "salto" o ins["op"] == "salto_si")) {
+                    si (ins[k] < 0 o ins[k] >= longitud(f["bloques"])) { lanzar "jit: salto a un bloque inexistente" }
+                }
+            }
+        }
+        b = b + 1
+    }
+}
+
+/// Código máquina (bytes) para "x86_64" o "arm64".
+funcion jit_codigo(f, arquitectura) {
+    _jt_revisar(f)
+    sea arq = arquitectura ?? _jt_arquitectura()
+    sea sv = []
+    sea k = 0
+    mientras (k < longitud(f["valores"])) {
+        sv.agregar(k)
+        k = k + 1
+    }
+    sea svar = []
+    sea j = 0
+    mientras (j < longitud(f["variables"])) {
+        svar.agregar(k + j)
+        j = j + 1
+    }
+    sea n = k + j
+    si (arq == "arm64") { retornar _jt_arm64(f, sv, svar, n) }
+    retornar _jt_x86(f, sv, svar, n)
+}
+
+funcion __jit_declaraciones() {
+    extern "libc" funcion mmap(dir: puntero, largo_m: largo, prot: entero, banderas: entero, fd: entero, desplaz: largo): puntero
+    extern "libc" funcion mprotect(dir: puntero, largo_m: largo, prot: entero): entero
+    extern "libc" funcion munmap(dir: puntero, largo_m: largo): entero
+    extern "libc" funcion memcpy(a: puntero, b: puntero, n: largo): puntero
+}
+
+/// Compila a memoria ejecutable. opciones: "arquitectura". Devuelve el
+/// manejador para jit_llamar (con "codigo" y "tam").
+funcion jit_compilar(f, opciones) {
+    sea op = opciones ?? {}
+    sea arq = op["arquitectura"] ?? _jt_arquitectura()
+    sea c = jit_codigo(f, arq)
+    sea h = {"codigo": c, "tam": longitud(c), "arquitectura": arq, "params": f["params"], "ret": f["ret"], "mem": nulo}
+    si (existe_archivo("/proc/meminfo") == falso) { retornar h }
+    __jit_declaraciones()
+    sea tam = piso((longitud(c) + 4095) / 4096) * 4096
+    // PROT_READ|PROT_WRITE, MAP_PRIVATE|MAP_ANONYMOUS; luego PROT_READ|PROT_EXEC.
+    sea m = mmap(nulo, tam, 3, 34, -1, 0)
+    sea fuente = c_desde_bytes(c)
+    memcpy(m, fuente, longitud(c))
+    c_liberar(fuente)
+    si (mprotect(m, tam, 5) != 0) { lanzar "jit: no se pudo marcar la memoria como ejecutable" }
+    h["mem"] = m
+    h["tam_mem"] = tam
+    retornar h
+}
+
+/// Llama la función compilada con la lista de argumentos.
+funcion jit_llamar(h, args) {
+    si (h["mem"] == nulo) { lanzar "jit: en este sistema solo se genera el código (sin ejecutar)" }
+    si (longitud(args) != longitud(h["params"])) { lanzar "jit: se esperaban " + longitud(h["params"]) + " argumentos" }
+    sea a = []
+    sea i = 0
+    mientras (i < 6) {
+        si (i < longitud(args)) {
+            si (h["params"][i] == "real") { a.agregar(_jt_registro(_jt_real_bytes(args[i]))) } sino { a.agregar(args[i]) }
+        } sino { a.agregar(0) }
+        i = i + 1
+    }
+    sea r = c_llamar(h["mem"], a[0], a[1], a[2], a[3], a[4], a[5], 0, 0, 0, 0)
+    si (h["ret"] == "real") { retornar _jt_real_de_bytes(_jt_bytes_de_registro(r)) }
+    // Enteros fuera del rango del lenguaje llegan como puntero: se cortan a 62 bits con signo.
+    si (tipo(r) != "numero") {
+        sea b8 = _jt_bytes_de_registro(r)
+        sea hi = bytes_leer_entero(b8, 4, 4, 1)
+        sea lo = bytes_leer_entero(b8, 0, 4, 1)
+        si (hi >= 2147483648) { retornar 0 - ((4294967295 - hi) * 4294967296 + (4294967295 - lo) + 1) }
+        retornar hi * 4294967296 + lo
+    }
+    retornar r
+}
+
+/// Libera la memoria del código.
+funcion jit_liberar(h) {
+    si (h["mem"] != nulo) {
+        __jit_declaraciones()
+        munmap(h["mem"], h["tam_mem"])
+        h["mem"] = nulo
+    }
+}
+
+// ---------- expresiones ----------
+
+sea _JT_PREC = [["?"], ["||"], ["&&"], ["|"], ["^"], ["&"], ["==", "!="], ["<", ">", "<=", ">="], ["<<", ">>"], ["+", "-"], ["*", "/", "%"]]
+sea _JT_SIMB = ["<<", ">>", "<=", ">=", "==", "!=", "&&", "||", "+", "-", "*", "/", "%", "&", "|", "^", "~", "!", "<", ">", "(", ")", "?", ":", ","]
+
+funcion _jt_tokens(t) {
+    sea r = []
+    sea i = 0
+    sea n = longitud(t)
+    mientras (i < n) {
+        sea b = byte_en(t, i)
+        si (b == 32 o b == 9 o b == 10) { i = i + 1 }
+        sino si ((b >= 48 y b <= 57) o b == 46) {
+            sea j = i
+            mientras (j < n y ((byte_en(t, j) >= 48 y byte_en(t, j) <= 57) o byte_en(t, j) == 46 o byte_en(t, j) == 101)) { j = j + 1 }
+            r.agregar(["num", subtexto(t, i, j)])
+            i = j
+        } sino si ((b >= 97 y b <= 122) o (b >= 65 y b <= 90) o b == 95) {
+            sea j = i
+            mientras (j < n y ((byte_en(t, j) >= 97 y byte_en(t, j) <= 122) o (byte_en(t, j) >= 65 y byte_en(t, j) <= 90) o byte_en(t, j) == 95 o (byte_en(t, j) >= 48 y byte_en(t, j) <= 57))) { j = j + 1 }
+            r.agregar(["id", subtexto(t, i, j)])
+            i = j
+        } sino {
+            sea hecho = falso
+            para s en _JT_SIMB {
+                si (hecho == falso y subtexto(t, i, minimo(n, i + longitud(s))) == s) {
+                    r.agregar(["sim", s])
+                    i = i + longitud(s)
+                    hecho = verdadero
+                }
+            }
+            si (hecho == falso) { lanzar "jit: carácter inesperado en la expresión: " + caracter(b) }
+        }
+    }
+    r.agregar(["fin", ""])
+    retornar r
+}
+
+sea _JT_BIN = {"+": "suma", "-": "resta", "*": "mul", "/": "div", "%": "resto", "&": "y", "|": "o", "^": "xo", "<<": "izq", ">>": "der_s"}
+sea _JT_CMP = {"==": "igual", "!=": "distinto", "<": "menor", ">": "mayor", "<=": "menor_igual", ">=": "mayor_igual"}
+
+funcion _jt_e(p, nivel) {
+    si (nivel == 0) {
+        sea c = _jt_e(p, 1)
+        si (p["t"][p["i"]][1] == "?") {
+            p["i"] = p["i"] + 1
+            sea a = _jt_e(p, 0)
+            si (p["t"][p["i"]][1] != ":") { lanzar "jit: falta ':' en la expresión" }
+            p["i"] = p["i"] + 1
+            sea b = _jt_e(p, 0)
+            retornar jit_seleccionar(p["f"], _jt_bool(p, c), a, b)
+        }
+        retornar c
+    }
+    si (nivel >= longitud(_JT_PREC)) { retornar _jt_unario(p) }
+    sea a = _jt_e(p, nivel + 1)
+    mientras (contiene(_JT_PREC[nivel], p["t"][p["i"]][1]) y p["t"][p["i"]][0] == "sim") {
+        sea op = p["t"][p["i"]][1]
+        p["i"] = p["i"] + 1
+        sea b = _jt_e(p, nivel + 1)
+        a = _jt_binaria(p, op, a, b)
+    }
+    retornar a
+}
+
+funcion _jt_bool(p, v) {
+    sea f = p["f"]
+    si (_jt_tipo(f, v) == "real") { retornar jit_comparar(f, "distinto", v, jit_real(f, 0)) }
+    retornar v
+}
+
+funcion _jt_igualar(p, a, b) {
+    sea f = p["f"]
+    si (_jt_tipo(f, a) == _jt_tipo(f, b)) { retornar [a, b] }
+    si (_jt_tipo(f, a) == "entero") { retornar [jit_a_real(f, a), b] }
+    retornar [a, jit_a_real(f, b)]
+}
+
+funcion _jt_binaria(p, op, a, b) {
+    sea f = p["f"]
+    si (op == "&&" o op == "||") {
+        sea x = jit_comparar(f, "distinto", _jt_bool(p, a), jit_constante(f, 0))
+        sea y_ = jit_comparar(f, "distinto", _jt_bool(p, b), jit_constante(f, 0))
+        si (op == "&&") { retornar jit_op(f, "y", x, y_) }
+        retornar jit_op(f, "o", x, y_)
+    }
+    sea ab = _jt_igualar(p, a, b)
+    si (tiene_clave(_JT_CMP, op)) { retornar jit_comparar(f, _JT_CMP[op], ab[0], ab[1]) }
+    retornar jit_op(f, _JT_BIN[op], ab[0], ab[1])
+}
+
+funcion _jt_unario(p) {
+    sea t = p["t"][p["i"]]
+    sea f = p["f"]
+    si (t[0] == "sim" y (t[1] == "-" o t[1] == "~" o t[1] == "!")) {
+        p["i"] = p["i"] + 1
+        sea a = _jt_unario(p)
+        si (t[1] == "-") { retornar jit_unaria(f, "neg", a) }
+        si (t[1] == "~") { retornar jit_unaria(f, "no", a) }
+        retornar jit_comparar(f, "igual", _jt_bool(p, a), jit_constante(f, 0))
+    }
+    si (t[1] == "(") {
+        p["i"] = p["i"] + 1
+        sea v = _jt_e(p, 0)
+        si (p["t"][p["i"]][1] != ")") { lanzar "jit: falta ')' en la expresión" }
+        p["i"] = p["i"] + 1
+        retornar v
+    }
+    si (t[0] == "num") {
+        p["i"] = p["i"] + 1
+        si (contiene(t[1], ".") o contiene(t[1], "e")) { retornar jit_real(f, a_numero(t[1])) }
+        retornar jit_constante(f, a_numero(t[1]))
+    }
+    si (t[0] == "id") {
+        p["i"] = p["i"] + 1
+        si (p["t"][p["i"]][1] == "(") {
+            p["i"] = p["i"] + 1
+            sea args = []
+            mientras (p["t"][p["i"]][1] != ")") {
+                args.agregar(_jt_e(p, 0))
+                si (p["t"][p["i"]][1] == ",") { p["i"] = p["i"] + 1 }
+            }
+            p["i"] = p["i"] + 1
+            retornar _jt_llamada(p, t[1], args)
+        }
+        si (tiene_clave(p["nombres"], t[1])) { retornar p["nombres"][t[1]] }
+        lanzar "jit: nombre desconocido '" + t[1] + "'"
+    }
+    lanzar "jit: expresión inesperada '" + t[1] + "'"
+}
+
+funcion _jt_llamada(p, n, args) {
+    sea f = p["f"]
+    si (n == "raiz" o n == "sqrt") {
+        sea a = args[0]
+        si (_jt_tipo(f, a) == "entero") { a = jit_a_real(f, a) }
+        retornar jit_unaria(f, "raiz", a)
+    }
+    si (n == "abs") { retornar jit_unaria(f, "abs", args[0]) }
+    si (n == "real") { retornar jit_a_real(f, args[0]) }
+    si (n == "entero") { retornar jit_a_entero(f, args[0]) }
+    si (n == "min" o n == "max") {
+        sea ab = _jt_igualar(p, args[0], args[1])
+        sea c = "menor"
+        si (n == "max") { c = "mayor" }
+        retornar jit_seleccionar(f, jit_comparar(f, c, ab[0], ab[1]), ab[0], ab[1])
+    }
+    lanzar "jit: función desconocida '" + n + "'"
+}
+
+/// Compila una expresión con parámetros con nombre. tipos: "entero"
+/// (por defecto) o "real", o una lista por parámetro. Devuelve el
+/// manejador (si un resultado entero sale de reales, se trunca).
+funcion jit_expresion(texto, nombres, tipos) {
+    sea f = jit_funcion(longitud(nombres), tipos ?? "entero", nulo)
+    sea p = {"t": _jt_tokens(texto), "i": 0, "f": f, "nombres": {}}
+    sea i = 0
+    para n en nombres {
+        p["nombres"][n] = i
+        i = i + 1
+    }
+    sea v = _jt_e(p, 0)
+    si (p["t"][p["i"]][0] != "fin") { lanzar "jit: sobra '" + p["t"][p["i"]][1] + "' en la expresión" }
+    f["ret"] = _jt_tipo(f, v)
+    jit_retornar(f, v)
+    retornar jit_compilar(f, nulo)
+}

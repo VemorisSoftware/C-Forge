@@ -1,0 +1,1205 @@
+// stdlib/nucleo.cfv — máquina virtual de eBPF en C-Forge: ensamblador y
+// desensamblador del formato del kernel, verificador (instrucciones
+// válidas, saltos dentro del programa, registros sin inicializar, r10 de
+// solo lectura, bucles opcionales, límite de pasos), intérprete exacto de
+// 64 bits (ALU y ALU32, saltos con y sin signo, JMP32, cargas y guardados
+// de 1/2/4/8 bytes, lddw, cambios de orden de bytes, atómicos básicos,
+// división y resto con signo de la v4), punteros con límites a la pila de
+// 512 bytes, al contexto y a valores de mapas, mapas array y hash, ayudas
+// del kernel (map_lookup/update/delete, ktime, trace_printk, prandom…) y
+// carga de objetos ELF que genera "clang -target bpf" con sus mapas.
+// Idea de uBPF y rbpf (Apache-2.0/MIT), escrito desde cero.
+// En inglés: importar "ebpf".
+//
+//   importar "nucleo"
+//   sea p = nucleo_ensamblar("mov r0, 0\nldxw r1, [r1+0]\nadd r0, r1\nexit")
+//   mostrar(nucleo_ejecutar(p, bytes_entero(41, 4, 1), nulo)["r0"])
+
+// ---------- 64 bits como [alto, bajo] (32 bits sin signo cada uno) ----------
+
+sea _NU_2_32 = 4294967296
+
+funcion _nu_de(n) {
+    si (n >= 0) { retornar [piso(n / _NU_2_32) % _NU_2_32, n % _NU_2_32] }
+    // Complemento a dos.
+    sea p = 0 - n
+    sea h = piso(p / _NU_2_32) % _NU_2_32
+    sea l = p % _NU_2_32
+    retornar _nu_neg([h, l])
+}
+
+funcion _nu_neg(a) {
+    sea l = (_NU_2_32 - a[1]) % _NU_2_32
+    sea h = (_NU_2_32 - a[0] - 1) % _NU_2_32
+    si (a[1] == 0) { h = (_NU_2_32 - a[0]) % _NU_2_32 }
+    retornar [h, l]
+}
+
+funcion _nu_add(a, b) {
+    sea l = a[1] + b[1]
+    sea c = 0
+    si (l >= _NU_2_32) {
+        l = l - _NU_2_32
+        c = 1
+    }
+    retornar [(a[0] + b[0] + c) % _NU_2_32, l]
+}
+
+funcion _nu_sub(a, b) { retornar _nu_add(a, _nu_neg(b)) }
+
+funcion _nu_limbs(a) { retornar [a[1] % 65536, piso(a[1] / 65536), a[0] % 65536, piso(a[0] / 65536)] }
+
+funcion _nu_mul(a, b) {
+    sea x = _nu_limbs(a)
+    sea y = _nu_limbs(b)
+    sea r = [0, 0, 0, 0]
+    sea i = 0
+    mientras (i < 4) {
+        sea j = 0
+        mientras (i + j < 4) {
+            r[i + j] = r[i + j] + x[i] * y[j]
+            j = j + 1
+        }
+        i = i + 1
+    }
+    // Acarreos.
+    sea k = 0
+    mientras (k < 3) {
+        r[k + 1] = r[k + 1] + piso(r[k] / 65536)
+        r[k] = r[k] % 65536
+        k = k + 1
+    }
+    r[3] = r[3] % 65536
+    retornar [r[3] * 65536 + r[2], r[1] * 65536 + r[0]]
+}
+
+funcion _nu_cmp_u(a, b) {
+    si (a[0] != b[0]) { si (a[0] < b[0]) { retornar -1 } retornar 1 }
+    si (a[1] != b[1]) { si (a[1] < b[1]) { retornar -1 } retornar 1 }
+    retornar 0
+}
+
+funcion _nu_negativo(a) { retornar a[0] >= 2147483648 }
+
+funcion _nu_cmp_s(a, b) {
+    sea na = _nu_negativo(a)
+    sea nb = _nu_negativo(b)
+    si (na != nb) { si (na) { retornar -1 } retornar 1 }
+    retornar _nu_cmp_u(a, b)
+}
+
+funcion _nu_shl(a, n) {
+    sea k = n % 64
+    si (k == 0) { retornar a }
+    // Se recortan los bits que se pierden antes de multiplicar (los enteros
+    // del lenguaje no llegan a 64 bits).
+    si (k >= 32) { retornar [(a[1] % potencia(2, 64 - k)) * potencia(2, k - 32), 0] }
+    sea p = potencia(2, k)
+    sea q = potencia(2, 32 - k)
+    retornar [(a[0] % q) * p + piso(a[1] / q), (a[1] % q) * p]
+}
+
+funcion _nu_shr(a, n) {
+    sea k = n % 64
+    si (k == 0) { retornar a }
+    si (k >= 32) { retornar [0, piso(a[0] / potencia(2, k - 32))] }
+    sea p = potencia(2, k)
+    retornar [piso(a[0] / p), piso(a[1] / p) + (a[0] % p) * potencia(2, 32 - k)]
+}
+
+funcion _nu_sar(a, n) {
+    sea k = n % 64
+    si (_nu_negativo(a) == falso o k == 0) { retornar _nu_shr(a, k) }
+    // Desplazar la negación y negar de nuevo (redondea hacia -inf).
+    sea r = _nu_shr(a, k)
+    sea relleno = _nu_shl([4294967295, 4294967295], 64 - k)
+    si (k == 64) { relleno = [0, 0] }
+    retornar [bits_o(r[0], relleno[0]), bits_o(r[1], relleno[1])]
+}
+
+funcion _nu_bits(op, a, b) {
+    si (op == "y") { retornar [bits_y(a[0], b[0]), bits_y(a[1], b[1])] }
+    si (op == "o") { retornar [bits_o(a[0], b[0]), bits_o(a[1], b[1])] }
+    retornar [bits_xo(a[0], b[0]), bits_xo(a[1], b[1])]
+}
+
+// División sin signo de 64 bits (larga, bit a bit). Devuelve [cociente, resto].
+funcion _nu_divmod(a, b) {
+    si (b[0] == 0 y a[0] == 0) { retornar [[0, piso(a[1] / b[1])], [0, a[1] % b[1]]] }
+    sea q = [0, 0]
+    sea r = [0, 0]
+    sea i = 63
+    mientras (i >= 0) {
+        r = _nu_shl(r, 1)
+        sea bit = 0
+        si (i >= 32) { bit = piso(a[0] / potencia(2, i - 32)) % 2 } sino { bit = piso(a[1] / potencia(2, i)) % 2 }
+        r[1] = r[1] + bit
+        si (_nu_cmp_u(r, b) >= 0) {
+            r = _nu_sub(r, b)
+            si (i >= 32) { q[0] = q[0] + potencia(2, i - 32) } sino { q[1] = q[1] + potencia(2, i) }
+        }
+        i = i - 1
+    }
+    retornar [q, r]
+}
+
+funcion _nu_a_numero(a) {
+    // Con signo; nulo si no entra en los enteros del lenguaje.
+    si (_nu_negativo(a)) {
+        sea p = _nu_neg(a)
+        si (p[0] >= 1073741824) { retornar nulo }
+        retornar 0 - (p[0] * _NU_2_32 + p[1])
+    }
+    si (a[0] >= 1073741824) { retornar nulo }
+    retornar a[0] * _NU_2_32 + a[1]
+}
+
+funcion _nu_hex(a) {
+    sea h = hex_de_bytes(bytes_entero(a[0], 4, 0) + bytes_entero(a[1], 4, 0))
+    retornar "0x" + h
+}
+
+funcion _nu_32(a) { retornar [0, a[1]] }
+
+// Extiende con signo los n bits bajos.
+funcion _nu_sext(a, n) {
+    si (n == 64) { retornar a }
+    sea v = [0, 0]
+    si (n == 32) { v = [0, a[1]] }
+    sino { v = [0, a[1] % potencia(2, n)] }
+    si (piso(v[1] / potencia(2, n - 1)) % 2 == 1) {
+        si (n == 32) { retornar [4294967295, v[1]] }
+        retornar [4294967295, v[1] + _NU_2_32 - potencia(2, n)]
+    }
+    retornar v
+}
+
+// ---------- instrucciones ----------
+
+funcion _nu_s16(v) {
+    si (v >= 32768) { retornar v - 65536 }
+    retornar v
+}
+funcion _nu_s32(v) {
+    si (v >= 2147483648) { retornar v - _NU_2_32 }
+    retornar v
+}
+
+/// Decodifica bytes de programa en instrucciones {"op", "dst", "src", "off", "imm"}.
+funcion nucleo_decodificar(prog) {
+    si (longitud(prog) % 8 != 0) { lanzar "nucleo: el programa no tiene un largo múltiplo de 8" }
+    sea r = []
+    sea i = 0
+    mientras (i < longitud(prog)) {
+        sea rg = byte_en(prog, i + 1)
+        r.agregar({"op": byte_en(prog, i), "dst": rg % 16, "src": piso(rg / 16), "off": _nu_s16(bytes_leer_entero(prog, i + 2, 2, 1)),
+            "imm": _nu_s32(bytes_leer_entero(prog, i + 4, 4, 1))})
+        i = i + 8
+    }
+    retornar r
+}
+
+funcion _nu_codificar(op, dst, src, off, imm) {
+    sea o = off
+    si (o < 0) { o = o + 65536 }
+    sea m = imm
+    si (m < 0) { m = m + _NU_2_32 }
+    retornar char_de(op) + char_de(src * 16 + dst) + bytes_entero(o, 2, 1) + bytes_entero(m % _NU_2_32, 4, 1)
+}
+
+sea _NU_ALU = {"add": 0, "sub": 16, "mul": 32, "div": 48, "or": 64, "and": 80, "lsh": 96, "rsh": 112, "neg": 128, "mod": 144, "xor": 160, "mov": 176, "arsh": 192}
+sea _NU_ALU_N = {"0": "add", "16": "sub", "32": "mul", "48": "div", "64": "or", "80": "and", "96": "lsh", "112": "rsh", "128": "neg", "144": "mod", "160": "xor", "176": "mov", "192": "arsh", "208": "end"}
+sea _NU_JMP = {"ja": 0, "jeq": 16, "jgt": 32, "jge": 48, "jset": 64, "jne": 80, "jsgt": 96, "jsge": 112, "jlt": 160, "jle": 176, "jslt": 192, "jsle": 208}
+sea _NU_JMP_N = {"0": "ja", "16": "jeq", "32": "jgt", "48": "jge", "64": "jset", "80": "jne", "96": "jsgt", "112": "jsge", "128": "call", "144": "exit", "160": "jlt", "176": "jle", "192": "jslt", "208": "jsle"}
+sea _NU_TAM = {"w": 0, "h": 8, "b": 16, "dw": 24}
+sea _NU_TAM_N = {"0": "w", "8": "h", "16": "b", "24": "dw"}
+sea _NU_BYTES = {"0": 4, "8": 2, "16": 1, "24": 8}
+
+funcion _nu_reg(t) {
+    sea x = texto_recortar(t)
+    si (texto_empieza_con(x, "r") == falso) { retornar nulo }
+    sea n = subtexto(x, 1, longitud(x))
+    si (longitud(n) == 0 o longitud(n) > 2) { retornar nulo }
+    sea i = 0
+    mientras (i < longitud(n)) {
+        si (byte_en(n, i) < 48 o byte_en(n, i) > 57) { retornar nulo }
+        i = i + 1
+    }
+    sea v = a_numero(n)
+    si (v > 10) { retornar nulo }
+    retornar v
+}
+
+funcion _nu_num(t) {
+    sea x = texto_recortar(t)
+    sea neg = falso
+    si (texto_empieza_con(x, "-")) {
+        neg = verdadero
+        x = subtexto(x, 1, longitud(x))
+    }
+    si (texto_empieza_con(x, "+")) { x = subtexto(x, 1, longitud(x)) }
+    sea v = 0
+    si (texto_empieza_con(x, "0x")) {
+        sea i = 2
+        mientras (i < longitud(x)) {
+            sea b = byte_en(x, i)
+            sea d = 0
+            si (b >= 48 y b <= 57) { d = b - 48 } sino si (b >= 97 y b <= 102) { d = b - 87 } sino si (b >= 65 y b <= 70) { d = b - 55 } sino { lanzar "nucleo: número inválido '" + t + "'" }
+            v = v * 16 + d
+            i = i + 1
+        }
+    } sino { v = a_numero(x) }
+    si (neg) { retornar 0 - v }
+    retornar v
+}
+
+// [base, desplazamiento] de "[r1+8]".
+funcion _nu_mem(t) {
+    sea x = texto_recortar(t)
+    si (texto_empieza_con(x, "[") == falso o texto_termina_con(x, "]") == falso) { lanzar "nucleo: se esperaba [rN+desplazamiento] y llegó '" + t + "'" }
+    x = subtexto(x, 1, longitud(x) - 1)
+    sea signo = 1
+    sea p = texto_indice(x, "+")
+    si (p < 0) {
+        p = texto_indice(x, "-")
+        signo = -1
+    }
+    si (p < 0) { retornar [_nu_reg(x), 0] }
+    retornar [_nu_reg(subtexto(x, 0, p)), signo * _nu_num(subtexto(x, p + 1, longitud(x)))]
+}
+
+/// Ensambla texto (sintaxis de uBPF/kernel) a bytes. Admite etiquetas
+/// ("bucle:") como destino de los saltos y comentarios con ";" o "#".
+funcion nucleo_ensamblar(texto) {
+    sea lineas = []
+    para l0 en texto_dividir(texto, "\n") {
+        sea l = l0
+        para c en [";", "#", "//"] {
+            sea k = texto_indice(l, c)
+            si (k >= 0) { l = subtexto(l, 0, k) }
+        }
+        l = texto_recortar(l)
+        si (l != "") { lineas.agregar(l) }
+    }
+    // Primera pasada: posiciones de las etiquetas.
+    sea etiquetas = {}
+    sea pos = 0
+    para l en lineas {
+        si (texto_termina_con(l, ":")) { etiquetas[subtexto(l, 0, longitud(l) - 1)] = pos }
+        sino si (texto_empieza_con(l, "lddw")) { pos = pos + 2 }
+        sino { pos = pos + 1 }
+    }
+    sea r = ""
+    pos = 0
+    sea n_linea = 0
+    para l en lineas {
+        n_linea = n_linea + 1
+        si (texto_termina_con(l, ":") == falso) {
+            sea esp = texto_indice(l, " ")
+            sea mn = l
+            sea resto = ""
+            si (esp >= 0) {
+                mn = subtexto(l, 0, esp)
+                resto = subtexto(l, esp + 1, longitud(l))
+            }
+            sea a = []
+            si (texto_recortar(resto) != "") {
+                // Separa por comas fuera de corchetes.
+                sea prof = 0
+                sea ini = 0
+                sea i = 0
+                mientras (i < longitud(resto)) {
+                    sea b = byte_en(resto, i)
+                    si (b == 91) { prof = prof + 1 }
+                    si (b == 93) { prof = prof - 1 }
+                    si (b == 44 y prof == 0) {
+                        a.agregar(texto_recortar(subtexto(resto, ini, i)))
+                        ini = i + 1
+                    }
+                    i = i + 1
+                }
+                a.agregar(texto_recortar(subtexto(resto, ini, longitud(resto))))
+            }
+            sea ins = _nu_ensamblar_una(mn, a, pos, etiquetas, n_linea)
+            r = r + ins
+            pos = pos + longitud(ins) / 8
+        }
+    }
+    retornar r
+}
+
+funcion _nu_destino(t, pos, etiquetas, n) {
+    si (tiene_clave(etiquetas, t)) { retornar etiquetas[t] - pos - 1 }
+    si (texto_empieza_con(t, "+") o texto_empieza_con(t, "-") o (byte_en(t, 0) >= 48 y byte_en(t, 0) <= 57)) { retornar _nu_num(t) }
+    lanzar "nucleo: línea " + n + ": etiqueta desconocida '" + t + "'"
+}
+
+funcion _nu_ensamblar_una(mn0, a, pos, etiquetas, n) {
+    sea mn = texto_minusculas(mn0)
+    sea es32 = texto_termina_con(mn, "32") y mn != "be32" y mn != "le32"
+    sea base = mn
+    si (es32) { base = subtexto(mn, 0, longitud(mn) - 2) }
+    si (mn == "exit") { retornar _nu_codificar(149, 0, 0, 0, 0) }
+    si (mn == "call") { retornar _nu_codificar(133, 0, 0, 0, _nu_num(a[0])) }
+    si (mn == "ja") { retornar _nu_codificar(5, 0, 0, _nu_destino(a[0], pos, etiquetas, n), 0) }
+    si (mn == "lddw") {
+        sea v = _nu_de(_nu_num(a[1]))
+        retornar _nu_codificar(24, _nu_reg(a[0]), 0, 0, v[1]) + _nu_codificar(0, 0, 0, 0, v[0])
+    }
+    si (mn == "ldmap") {
+        // ldmap r1, fd: lddw con src = 1 (el mapa con ese número).
+        retornar _nu_codificar(24, _nu_reg(a[0]), 1, 0, _nu_num(a[1])) + _nu_codificar(0, 0, 0, 0, 0)
+    }
+    si (mn == "be16" o mn == "be32" o mn == "be64" o mn == "le16" o mn == "le32" o mn == "le64") {
+        sea src = 0
+        si (texto_empieza_con(mn, "be")) { src = 1 }
+        retornar _nu_codificar(212 + src * 8, _nu_reg(a[0]), 0, 0, a_numero(subtexto(mn, 2, 4)))
+    }
+    si (base == "neg") {
+        sea cl = 7
+        si (es32) { cl = 4 }
+        retornar _nu_codificar(128 + cl, _nu_reg(a[0]), 0, 0, 0)
+    }
+    si (base == "sdiv" o base == "smod") {
+        sea cl = 7
+        si (es32) { cl = 4 }
+        sea o2 = 48
+        si (base == "smod") { o2 = 144 }
+        sea rs = _nu_reg(a[1])
+        si (rs != nulo) { retornar _nu_codificar(o2 + 8 + cl, _nu_reg(a[0]), rs, 1, 0) }
+        retornar _nu_codificar(o2 + cl, _nu_reg(a[0]), 0, 1, _nu_num(a[1]))
+    }
+    si (tiene_clave(_NU_ALU, base)) {
+        sea cl = 7
+        si (es32) { cl = 4 }
+        sea d = _nu_reg(a[0])
+        si (d == nulo) { lanzar "nucleo: línea " + n + ": registro inválido '" + a[0] + "'" }
+        sea rs = _nu_reg(a[1])
+        si (rs != nulo) { retornar _nu_codificar(_NU_ALU[base] + 8 + cl, d, rs, 0, 0) }
+        retornar _nu_codificar(_NU_ALU[base] + cl, d, 0, 0, _nu_num(a[1]))
+    }
+    si (tiene_clave(_NU_JMP, base)) {
+        sea cl = 5
+        si (es32) { cl = 6 }
+        sea d = _nu_reg(a[0])
+        sea rs = _nu_reg(a[1])
+        sea off = _nu_destino(a[2], pos, etiquetas, n)
+        si (rs != nulo) { retornar _nu_codificar(_NU_JMP[base] + 8 + cl, d, rs, off, 0) }
+        retornar _nu_codificar(_NU_JMP[base] + cl, d, 0, off, _nu_num(a[1]))
+    }
+    para t en ["dw", "w", "h", "b"] {
+        si (mn == "ldx" + t) {
+            sea m = _nu_mem(a[1])
+            retornar _nu_codificar(97 + _NU_TAM[t], _nu_reg(a[0]), m[0], m[1], 0)
+        }
+        si (mn == "stx" + t) {
+            sea m = _nu_mem(a[0])
+            retornar _nu_codificar(99 + _NU_TAM[t], m[0], _nu_reg(a[1]), m[1], 0)
+        }
+        si (mn == "st" + t) {
+            sea m = _nu_mem(a[0])
+            retornar _nu_codificar(98 + _NU_TAM[t], m[0], 0, m[1], _nu_num(a[1]))
+        }
+        si (mn == "xadd" + t o mn == "lock_add" + t) {
+            sea m = _nu_mem(a[0])
+            retornar _nu_codificar(195 + _NU_TAM[t], m[0], _nu_reg(a[1]), m[1], 0)
+        }
+    }
+    lanzar "nucleo: línea " + n + ": instrucción desconocida '" + mn0 + "'"
+}
+
+/// Texto legible de un programa (una línea por instrucción).
+funcion nucleo_desensamblar(prog) {
+    sea ins = nucleo_decodificar(prog)
+    sea r = []
+    sea i = 0
+    mientras (i < longitud(ins)) {
+        sea x = ins[i]
+        sea op = x["op"]
+        sea cl = op % 8
+        sea t = "?"
+        si (op == 24) {
+            sea alto = 0
+            si (i + 1 < longitud(ins)) { alto = ins[i + 1]["imm"] }
+            si (x["src"] == 1) { t = "ldmap r" + x["dst"] + ", " + x["imm"] }
+            sino { t = "lddw r" + x["dst"] + ", " + _nu_hex([(alto + _NU_2_32) % _NU_2_32, (x["imm"] + _NU_2_32) % _NU_2_32]) }
+            r.agregar(t)
+            i = i + 2
+        } sino {
+            si (cl == 4 o cl == 7) {
+                sea nombre = _NU_ALU_N["" + bits_y(op, 240)] ?? "?"
+                sea suf = ""
+                si (cl == 4) { suf = "32" }
+                si (nombre == "end") {
+                    sea pre = "le"
+                    si (bits_y(op, 8) != 0) { pre = "be" }
+                    t = pre + x["imm"] + " r" + x["dst"]
+                } sino si (nombre == "neg") { t = "neg" + suf + " r" + x["dst"] }
+                sino {
+                    si (x["off"] == 1 y (nombre == "div" o nombre == "mod")) { nombre = "s" + nombre }
+                    si (bits_y(op, 8) != 0) { t = nombre + suf + " r" + x["dst"] + ", r" + x["src"] } sino { t = nombre + suf + " r" + x["dst"] + ", " + x["imm"] }
+                }
+            } sino si (cl == 5 o cl == 6) {
+                sea nombre = _NU_JMP_N["" + bits_y(op, 240)] ?? "?"
+                sea suf = ""
+                si (cl == 6) { suf = "32" }
+                sea o = "" + x["off"]
+                si (x["off"] >= 0) { o = "+" + o }
+                si (nombre == "exit") { t = "exit" }
+                sino si (nombre == "call") { t = "call " + x["imm"] }
+                sino si (nombre == "ja") { t = "ja " + o }
+                sino si (bits_y(op, 8) != 0) { t = nombre + suf + " r" + x["dst"] + ", r" + x["src"] + ", " + o }
+                sino { t = nombre + suf + " r" + x["dst"] + ", " + x["imm"] + ", " + o }
+            } sino {
+                sea tm = _NU_TAM_N["" + bits_y(op, 24)] ?? "?"
+                sea d = "" + x["off"]
+                si (x["off"] >= 0) { d = "+" + d }
+                si (cl == 1) { t = "ldx" + tm + " r" + x["dst"] + ", [r" + x["src"] + d + "]" }
+                sino si (cl == 2) { t = "st" + tm + " [r" + x["dst"] + d + "], " + x["imm"] }
+                sino si (cl == 3 y bits_y(op, 224) == 192) { t = "xadd" + tm + " [r" + x["dst"] + d + "], r" + x["src"] }
+                sino si (cl == 3) { t = "stx" + tm + " [r" + x["dst"] + d + "], r" + x["src"] }
+            }
+            r.agregar(t)
+            i = i + 1
+        }
+    }
+    retornar unir(r, "\n")
+}
+
+// ---------- verificador ----------
+
+funcion _nu_valida(x) {
+    sea op = x["op"]
+    sea cl = op % 8
+    si (cl == 4 o cl == 7) {
+        sea a = bits_y(op, 240)
+        si (a > 208) { retornar falso }
+        si (a == 208) { retornar cl == 4 y (x["imm"] == 16 o x["imm"] == 32 o x["imm"] == 64) }
+        // neg no lleva registro fuente; con registro fuente el inmediato es 0.
+        si (a == 128) { retornar bits_y(op, 8) == 0 y x["src"] == 0 }
+        si (bits_y(op, 8) != 0 y x["imm"] != 0) { retornar falso }
+        retornar verdadero
+    }
+    si (cl == 5 o cl == 6) {
+        sea j = bits_y(op, 240)
+        si (j == 224 o j == 240) { retornar falso }
+        si (cl == 6 y (j == 128 o j == 144 o j == 0)) { retornar falso }
+        retornar verdadero
+    }
+    si (cl == 1) { retornar bits_y(op, 224) == 96 }
+    si (cl == 2) { retornar bits_y(op, 224) == 96 }
+    si (cl == 3) { retornar bits_y(op, 224) == 96 o bits_y(op, 224) == 192 }
+    si (cl == 0) { retornar op == 24 }
+    retornar falso
+}
+
+/// Revisa el programa. Devuelve [] si está bien o una lista de errores
+/// "instrucción N: …". opciones: "bucles" (permitir saltos hacia atrás),
+/// "max_instrucciones" (4096).
+funcion nucleo_verificar(prog, opciones) {
+    sea op = opciones ?? {}
+    sea errores = []
+    sea ins = []
+    intentar { ins = nucleo_decodificar(prog) } capturar (e) { retornar ["" + e] }
+    sea n = longitud(ins)
+    si (n == 0) { retornar ["programa vacío"] }
+    si (n > (op["max_instrucciones"] ?? 4096)) { errores.agregar("demasiadas instrucciones (" + n + ")") }
+    // Segunda mitad de cada lddw.
+    sea mitad = {}
+    sea i = 0
+    mientras (i < n) {
+        si (ins[i]["op"] == 24) {
+            si (i + 1 >= n) { errores.agregar("instrucción " + i + ": lddw incompleto") } sino { mitad["" + (i + 1)] = verdadero }
+            i = i + 2
+        } sino { i = i + 1 }
+    }
+    i = 0
+    mientras (i < n) {
+        si (tiene_clave(mitad, "" + i) == falso) {
+            sea x = ins[i]
+            si (_nu_valida(x) == falso) { errores.agregar("instrucción " + i + ": código desconocido " + x["op"]) }
+            si (x["dst"] > 10 o x["src"] > 10) { errores.agregar("instrucción " + i + ": registro inválido") }
+            sea cl = x["op"] % 8
+            // r10 solo se lee (salvo como base de guardados).
+            si ((cl == 4 o cl == 7 o cl == 1 o x["op"] == 24) y x["dst"] == 10) { errores.agregar("instrucción " + i + ": r10 es de solo lectura") }
+            si ((cl == 5 o cl == 6) y bits_y(x["op"], 240) != 128 y bits_y(x["op"], 240) != 144) {
+                sea d = i + 1 + x["off"]
+                si (d < 0 o d >= n) { errores.agregar("instrucción " + i + ": salto fuera del programa") }
+                sino si (tiene_clave(mitad, "" + d)) { errores.agregar("instrucción " + i + ": salto al medio de un lddw") }
+                sino si (x["off"] < 0 y (op["bucles"] ?? falso) == falso) { errores.agregar("instrucción " + i + ": salto hacia atrás (bucle)") }
+            }
+        }
+        i = i + 1
+    }
+    si (longitud(errores) > 0) { retornar errores }
+    // Recorrido de caminos: registros inicializados y que todo termine en exit.
+    sea visto = {}
+    sea pila = [[0, "01000000001"]]
+    mientras (longitud(pila) > 0) {
+        sea e = pila[longitud(pila) - 1]
+        pila = _nu_sin_ultimo(pila)
+        sea pc = e[0]
+        sea ini = e[1]
+        sea clave = pc + ":" + ini
+        si (tiene_clave(visto, clave) == falso y longitud(errores) < 20) {
+            visto[clave] = verdadero
+            si (pc >= n) { errores.agregar("el programa puede terminar sin exit") } sino {
+                sea x = ins[pc]
+                sea cl = x["op"] % 8
+                sea usa = []
+                sea define = nulo
+                si (cl == 4 o cl == 7) {
+                    sea a = bits_y(x["op"], 240)
+                    si (a != 176) { usa.agregar(x["dst"]) }
+                    si (bits_y(x["op"], 8) != 0 y a != 128 y a != 208) { usa.agregar(x["src"]) }
+                    define = x["dst"]
+                } sino si (cl == 1) {
+                    usa.agregar(x["src"])
+                    define = x["dst"]
+                } sino si (cl == 2) { usa.agregar(x["dst"]) }
+                sino si (cl == 3) {
+                    usa.agregar(x["dst"])
+                    usa.agregar(x["src"])
+                } sino si (x["op"] == 24) { define = x["dst"] }
+                sino si (cl == 5 o cl == 6) {
+                    sea j = bits_y(x["op"], 240)
+                    si (j == 144) { usa.agregar(0) }
+                    sino si (j == 128) {
+                        // Las ayudas leen r1..r5 según su firma; aquí solo se exige r1.
+                        define = 0
+                    } sino si (j != 0) {
+                        usa.agregar(x["dst"])
+                        si (bits_y(x["op"], 8) != 0) { usa.agregar(x["src"]) }
+                    }
+                }
+                para u en usa {
+                    si (subtexto(ini, u, u + 1) != "1") { errores.agregar("instrucción " + pc + ": se lee r" + u + " sin inicializar") }
+                }
+                sea nuevo = ini
+                si (define != nulo) { nuevo = subtexto(ini, 0, define) + "1" + subtexto(ini, define + 1, 11) }
+                si (cl == 5 o cl == 6) {
+                    sea j = bits_y(x["op"], 240)
+                    si (j == 128) {
+                        // Tras una llamada r1..r5 quedan sin valor.
+                        nuevo = "1" + "00000" + subtexto(ini, 6, 11)
+                        pila.agregar([pc + 1, nuevo])
+                    } sino si (j == 144) {
+                    } sino si (j == 0) { pila.agregar([pc + 1 + x["off"], nuevo]) }
+                    sino {
+                        pila.agregar([pc + 1, nuevo])
+                        pila.agregar([pc + 1 + x["off"], nuevo])
+                    }
+                } sino si (x["op"] == 24) { pila.agregar([pc + 2, nuevo]) }
+                sino { pila.agregar([pc + 1, nuevo]) }
+            }
+        }
+    }
+    retornar errores
+}
+
+funcion _nu_sin_ultimo(l) {
+    sea r = []
+    sea i = 0
+    mientras (i < longitud(l) - 1) {
+        r.agregar(l[i])
+        i = i + 1
+    }
+    retornar r
+}
+
+// ---------- mapas ----------
+
+/// Mapa nuevo: tipo "array" o "hash".
+funcion nucleo_mapa(tipo_m, tam_clave, tam_valor, maximo_n) {
+    sea m = {"tipo": tipo_m, "clave": tam_clave, "valor": tam_valor, "max": maximo_n, "datos": {}}
+    si (tipo_m == "array") {
+        sea i = 0
+        mientras (i < maximo_n) {
+            m["datos"]["" + i] = _nu_region(tam_valor)
+            i = i + 1
+        }
+    }
+    retornar m
+}
+
+funcion _nu_region(n) {
+    sea b = []
+    sea i = 0
+    mientras (i < n) {
+        b.agregar(0)
+        i = i + 1
+    }
+    retornar {"b": b, "ptr": {}}
+}
+
+funcion _nu_clave(m, bytes_c) {
+    si (m["tipo"] == "array") { retornar "" + bytes_leer_entero(bytes_c, 0, 4, 1) }
+    retornar hex_de_bytes(bytes_c)
+}
+
+/// Valor guardado (bytes) o nulo.
+funcion nucleo_mapa_leer(m, clave) {
+    sea k = _nu_clave(m, clave)
+    si (tiene_clave(m["datos"], k) == falso) { retornar nulo }
+    sea r = ""
+    para b en m["datos"][k]["b"] { r = r + char_de(b) }
+    retornar r
+}
+
+/// Guarda un valor (bytes). Devuelve 0 o un código de error negativo.
+funcion nucleo_mapa_poner(m, clave, valor) {
+    si (longitud(clave) != m["clave"] o longitud(valor) != m["valor"]) { retornar -22 }
+    sea k = _nu_clave(m, clave)
+    si (m["tipo"] == "array") {
+        si (tiene_clave(m["datos"], k) == falso) { retornar -7 }
+    } sino si (tiene_clave(m["datos"], k) == falso y longitud(claves(m["datos"])) >= m["max"]) { retornar -7 }
+    sea reg = _nu_region(m["valor"])
+    sea i = 0
+    mientras (i < longitud(valor)) {
+        reg["b"][i] = byte_en(valor, i)
+        i = i + 1
+    }
+    si (tiene_clave(m["datos"], k)) {
+        // Mantiene la misma región (los punteros siguen siendo válidos).
+        sea j = 0
+        mientras (j < longitud(valor)) {
+            m["datos"][k]["b"][j] = reg["b"][j]
+            j = j + 1
+        }
+    } sino { m["datos"][k] = reg }
+    retornar 0
+}
+
+funcion nucleo_mapa_borrar(m, clave) {
+    si (m["tipo"] == "array") { retornar -22 }
+    sea k = _nu_clave(m, clave)
+    si (tiene_clave(m["datos"], k) == falso) { retornar -2 }
+    quitar_clave(m["datos"], k)
+    retornar 0
+}
+
+/// Claves guardadas (bytes).
+funcion nucleo_mapa_claves(m) {
+    sea r = []
+    para k en claves(m["datos"]) {
+        si (m["tipo"] == "array") { r.agregar(bytes_entero(a_numero(k), 4, 1)) } sino { r.agregar(bytes_de_hex(k)) }
+    }
+    retornar r
+}
+
+// ---------- intérprete ----------
+
+funcion _nu_es_ptr(v) { retornar tipo(v) == "mapa" }
+
+funcion _nu_leer_mem(reg, off, n, pc) {
+    si (off < 0 o off + n > longitud(reg["b"])) { lanzar "nucleo: instrucción " + pc + ": lectura fuera de rango (" + off + "+" + n + " de " + longitud(reg["b"]) + ")" }
+    si (n == 8 y tiene_clave(reg["ptr"], "" + off)) { retornar reg["ptr"]["" + off] }
+    sea lo = 0
+    sea hi = 0
+    sea i = 0
+    mientras (i < minimo(n, 4)) {
+        lo = lo + reg["b"][off + i] * potencia(256, i)
+        i = i + 1
+    }
+    mientras (i < n) {
+        hi = hi + reg["b"][off + i] * potencia(256, i - 4)
+        i = i + 1
+    }
+    retornar [hi, lo]
+}
+
+funcion _nu_guardar_mem(reg, off, n, v, pc) {
+    si (off < 0 o off + n > longitud(reg["b"])) { lanzar "nucleo: instrucción " + pc + ": escritura fuera de rango (" + off + "+" + n + " de " + longitud(reg["b"]) + ")" }
+    si (reg["solo_lectura"] ?? falso) { lanzar "nucleo: instrucción " + pc + ": la memoria es de solo lectura" }
+    // Un puntero guardado (8 bytes) se recuerda aparte.
+    sea k = 0
+    mientras (k < n) {
+        si (tiene_clave(reg["ptr"], "" + (off + k))) { quitar_clave(reg["ptr"], "" + (off + k)) }
+        k = k + 1
+    }
+    si (_nu_es_ptr(v)) {
+        si (n != 8) { lanzar "nucleo: instrucción " + pc + ": un puntero solo se guarda en 8 bytes" }
+        reg["ptr"]["" + off] = v
+        retornar nulo
+    }
+    sea i = 0
+    mientras (i < n) {
+        sea b = 0
+        si (i < 4) { b = piso(v[1] / potencia(256, i)) % 256 } sino { b = piso(v[0] / potencia(256, i - 4)) % 256 }
+        reg["b"][off + i] = b
+        i = i + 1
+    }
+}
+
+funcion _nu_bytes_de(ptr, n, pc) {
+    sea r = ""
+    sea i = 0
+    mientras (i < n) {
+        r = r + char_de(bits_y(_nu_leer_mem(ptr["r"], ptr["o"] + i, 1, pc)[1], 255))
+        i = i + 1
+    }
+    retornar r
+}
+
+funcion _nu_escalar(v, pc) {
+    si (_nu_es_ptr(v)) { lanzar "nucleo: instrucción " + pc + ": se esperaba un número y es un puntero" }
+    retornar v
+}
+
+funcion _nu_cambio_orden(v, bits, a_be) {
+    // Toma los bits bajos y, si a_be, invierte el orden de los bytes.
+    sea n = bits / 8
+    sea b8 = bytes_entero(v[1], 4, 1) + bytes_entero(v[0], 4, 1)
+    sea b = subtexto(b8, 0, n)
+    si (a_be) {
+        sea r = ""
+        sea i = n - 1
+        mientras (i >= 0) {
+            r = r + subtexto(b, i, i + 1)
+            i = i - 1
+        }
+        b = r
+    }
+    b = b + _nu_ceros(8 - n)
+    retornar [bytes_leer_entero(b, 4, 4, 1), bytes_leer_entero(b, 0, 4, 1)]
+}
+
+funcion _nu_ceros(n) {
+    sea r = ""
+    sea i = 0
+    mientras (i < n) {
+        r = r + char_de(0)
+        i = i + 1
+    }
+    retornar r
+}
+
+funcion _nu_alu(a, b, op, pc, con_signo) {
+    si (op == 0) { retornar _nu_add(a, b) }
+    si (op == 16) { retornar _nu_sub(a, b) }
+    si (op == 32) { retornar _nu_mul(a, b) }
+    si (op == 48 o op == 144) {
+        si (b[0] == 0 y b[1] == 0) {
+            si (op == 48) { retornar [0, 0] }
+            retornar a
+        }
+        si (con_signo) {
+            sea na = _nu_negativo(a)
+            sea nb = _nu_negativo(b)
+            sea ua = a
+            sea ub = b
+            si (na) { ua = _nu_neg(a) }
+            si (nb) { ub = _nu_neg(b) }
+            sea qr = _nu_divmod(ua, ub)
+            si (op == 48) {
+                si (na != nb) { retornar _nu_neg(qr[0]) }
+                retornar qr[0]
+            }
+            si (na) { retornar _nu_neg(qr[1]) }
+            retornar qr[1]
+        }
+        sea qr = _nu_divmod(a, b)
+        si (op == 48) { retornar qr[0] }
+        retornar qr[1]
+    }
+    si (op == 64) { retornar _nu_bits("o", a, b) }
+    si (op == 80) { retornar _nu_bits("y", a, b) }
+    si (op == 160) { retornar _nu_bits("xo", a, b) }
+    si (op == 96) { retornar _nu_shl(a, b[1] % 64) }
+    si (op == 112) { retornar _nu_shr(a, b[1] % 64) }
+    si (op == 192) { retornar _nu_sar(a, b[1] % 64) }
+    si (op == 176) { retornar b }
+    lanzar "nucleo: instrucción " + pc + ": operación desconocida"
+}
+
+/// Ejecuta un programa. ctx: bytes del contexto (r1 apunta a él; nulo =
+/// sin contexto). opciones: "mapas" (lista; el número de mapa es el
+/// índice), "ayudas" ({"número": funcion(vm, r1..r5) → entero}),
+/// "max_pasos" (1000000), "contexto_escribible". Devuelve {"r0" (entero
+/// con signo, o nulo si no entra), "r0_hex", "pasos", "salida" (textos de
+/// trace_printk), "contexto" (bytes, por si se modificó)}.
+funcion nucleo_ejecutar(prog, ctx, opciones) {
+    sea op = opciones ?? {}
+    sea ins = nucleo_decodificar(prog)
+    sea regs = []
+    sea i = 0
+    mientras (i < 11) {
+        regs.agregar([0, 0])
+        i = i + 1
+    }
+    sea pila = _nu_region(512)
+    regs[10] = {"r": pila, "o": 512, "nombre": "pila"}
+    sea creg = nulo
+    si (ctx != nulo) {
+        creg = _nu_region(longitud(ctx))
+        i = 0
+        mientras (i < longitud(ctx)) {
+            creg["b"][i] = byte_en(ctx, i)
+            i = i + 1
+        }
+        creg["solo_lectura"] = (op["contexto_escribible"] ?? falso) == falso
+        regs[1] = {"r": creg, "o": 0, "nombre": "contexto"}
+    }
+    sea vm = {"mapas": op["mapas"] ?? [], "salida": [], "ayudas": op["ayudas"] ?? {}, "azar": 12345}
+    sea max_p = op["max_pasos"] ?? 1000000
+    sea pasos = 0
+    sea pc = 0
+    sea n = longitud(ins)
+    mientras (verdadero) {
+        si (pc < 0 o pc >= n) { lanzar "nucleo: el programa salió de su código en " + pc }
+        pasos = pasos + 1
+        si (pasos > max_p) { lanzar "nucleo: se pasó del máximo de " + max_p + " pasos" }
+        sea x = ins[pc]
+        sea o = x["op"]
+        sea cl = o % 8
+        sea d = x["dst"]
+        si (cl == 7 o cl == 4) {
+            sea a = bits_y(o, 240)
+            sea fuente = nulo
+            si (bits_y(o, 8) != 0 y a != 208) { fuente = regs[x["src"]] } sino { fuente = _nu_de(x["imm"]) }
+            si (a == 208) {
+                regs[d] = _nu_cambio_orden(_nu_escalar(regs[d], pc), x["imm"], bits_y(o, 8) != 0)
+            } sino si (a == 128) {
+                si (cl == 7) { regs[d] = _nu_neg(_nu_escalar(regs[d], pc)) } sino { regs[d] = _nu_32(_nu_neg(_nu_32(_nu_escalar(regs[d], pc)))) }
+            } sino si (a == 176) {
+                si (cl == 7) {
+                    si (x["off"] == 8 o x["off"] == 16 o x["off"] == 32) { regs[d] = _nu_sext(_nu_escalar(fuente, pc), x["off"]) }
+                    sino { regs[d] = fuente }
+                } sino {
+                    sea v = _nu_32(_nu_escalar(fuente, pc))
+                    si (x["off"] == 8 o x["off"] == 16) { v = _nu_32(_nu_sext(v, x["off"])) }
+                    regs[d] = v
+                }
+            } sino si (_nu_es_ptr(regs[d]) y cl == 7 y (a == 0 o a == 16)) {
+                // Aritmética de punteros.
+                sea k = _nu_a_numero(_nu_escalar(fuente, pc))
+                si (a == 16) { k = 0 - k }
+                sea p = regs[d]
+                regs[d] = {"r": p["r"], "o": p["o"] + k, "nombre": p["nombre"]}
+            } sino si (a == 16 y _nu_es_ptr(regs[d]) y _nu_es_ptr(fuente) y cl == 7) {
+                regs[d] = _nu_de(regs[d]["o"] - fuente["o"])
+            } sino {
+                sea con_signo = x["off"] == 1
+                si (cl == 7) { regs[d] = _nu_alu(_nu_escalar(regs[d], pc), _nu_escalar(fuente, pc), a, pc, con_signo) }
+                sino {
+                    sea a32 = _nu_32(_nu_escalar(regs[d], pc))
+                    sea b32 = _nu_32(_nu_escalar(fuente, pc))
+                    si (con_signo) {
+                        a32 = _nu_sext(a32, 32)
+                        b32 = _nu_sext(b32, 32)
+                    }
+                    si (a == 96 o a == 112 o a == 192) { b32 = [0, b32[1] % 32] }
+                    si (a == 192) { regs[d] = _nu_32(_nu_sar(_nu_sext(a32, 32), b32[1])) }
+                    sino { regs[d] = _nu_32(_nu_alu(a32, b32, a, pc, con_signo)) }
+                }
+            }
+            pc = pc + 1
+        } sino si (o == 24) {
+            si (x["src"] == 1 o x["src"] == 2) {
+                sea fd = x["imm"]
+                si (fd < 0 o fd >= longitud(vm["mapas"])) { lanzar "nucleo: instrucción " + pc + ": mapa " + fd + " desconocido" }
+                si (x["src"] == 1) { regs[d] = {"mapa": fd, "r": nulo, "o": 0, "nombre": "mapa"} }
+                sino {
+                    // Puntero al valor 0 del mapa (secciones de datos del ELF).
+                    sea m = vm["mapas"][fd]
+                    regs[d] = {"r": m["datos"]["0"], "o": ins[pc + 1]["imm"], "nombre": "datos"}
+                }
+            } sino {
+                sea alto = (ins[pc + 1]["imm"] + _NU_2_32) % _NU_2_32
+                regs[d] = [alto, (x["imm"] + _NU_2_32) % _NU_2_32]
+            }
+            pc = pc + 2
+        } sino si (cl == 1 o cl == 2 o cl == 3) {
+            sea tam = _NU_BYTES["" + bits_y(o, 24)]
+            sea base = nulo
+            si (cl == 1) { base = regs[x["src"]] } sino { base = regs[d] }
+            si (_nu_es_ptr(base) == falso o base["r"] == nulo) { lanzar "nucleo: instrucción " + pc + ": acceso a memoria con un número (no es puntero)" }
+            sea off = base["o"] + x["off"]
+            si (cl == 1) {
+                sea v = _nu_leer_mem(base["r"], off, tam, pc)
+                regs[d] = v
+            } sino si (cl == 2) {
+                _nu_guardar_mem(base["r"], off, tam, _nu_de(x["imm"]), pc)
+            } sino si (bits_y(o, 224) == 192) {
+                // Atómicos: solo suma (imm 0) y fetch_add (imm 1).
+                sea viejo = _nu_leer_mem(base["r"], off, tam, pc)
+                sea s = _nu_add(viejo, _nu_escalar(regs[x["src"]], pc))
+                si (tam == 4) { s = _nu_32(s) }
+                _nu_guardar_mem(base["r"], off, tam, s, pc)
+                si (bits_y(x["imm"], 1) == 1) { regs[x["src"]] = viejo }
+            } sino {
+                _nu_guardar_mem(base["r"], off, tam, regs[x["src"]], pc)
+            }
+            pc = pc + 1
+        } sino si (cl == 5 o cl == 6) {
+            sea j = bits_y(o, 240)
+            si (j == 144) {
+                sea r0 = regs[0]
+                si (_nu_es_ptr(r0)) { lanzar "nucleo: el programa devolvió un puntero" }
+                sea cr = nulo
+                si (creg != nulo) {
+                    cr = ""
+                    para b en creg["b"] { cr = cr + char_de(b) }
+                }
+                retornar {"r0": _nu_a_numero(r0), "r0_hex": _nu_hex(r0), "r0_u32": r0[1], "pasos": pasos, "salida": vm["salida"], "contexto": cr}
+            }
+            si (j == 128) {
+                regs[0] = _nu_ayuda(vm, x["imm"], regs, pc)
+                i = 1
+                mientras (i <= 5) {
+                    regs[i] = [0, 0]
+                    i = i + 1
+                }
+                pc = pc + 1
+            } sino si (j == 0) {
+                pc = pc + 1 + x["off"]
+            } sino {
+                sea a = regs[d]
+                sea b = nulo
+                si (bits_y(o, 8) != 0) { b = regs[x["src"]] } sino { b = _nu_de(x["imm"]) }
+                sea salta = falso
+                si (_nu_es_ptr(a) o _nu_es_ptr(b)) {
+                    // Solo se comparan punteros con 0 (nulo) o entre sí por igualdad.
+                    sea pa = _nu_es_ptr(a)
+                    sea pb = _nu_es_ptr(b)
+                    sea igual = falso
+                    si (pa y pb) { igual = a["r"] == b["r"] y a["o"] == b["o"] }
+                    sino si (pa) { igual = falso } sino { igual = falso }
+                    si (j == 16) { salta = igual } sino si (j == 80) { salta = igual == falso } sino { lanzar "nucleo: instrucción " + pc + ": comparación no permitida con punteros" }
+                } sino {
+                    si (cl == 6) {
+                        a = _nu_32(a)
+                        b = _nu_32(b)
+                        si (j == 96 o j == 112 o j == 192 o j == 208) {
+                            a = _nu_sext(a, 32)
+                            b = _nu_sext(b, 32)
+                        }
+                    }
+                    sea cu = _nu_cmp_u(a, b)
+                    sea cs = _nu_cmp_s(a, b)
+                    si (j == 16) { salta = cu == 0 }
+                    sino si (j == 80) { salta = cu != 0 }
+                    sino si (j == 32) { salta = cu > 0 }
+                    sino si (j == 48) { salta = cu >= 0 }
+                    sino si (j == 160) { salta = cu < 0 }
+                    sino si (j == 176) { salta = cu <= 0 }
+                    sino si (j == 96) { salta = cs > 0 }
+                    sino si (j == 112) { salta = cs >= 0 }
+                    sino si (j == 192) { salta = cs < 0 }
+                    sino si (j == 208) { salta = cs <= 0 }
+                    sino si (j == 64) { salta = bits_y(a[0], b[0]) != 0 o bits_y(a[1], b[1]) != 0 }
+                }
+                si (salta) { pc = pc + 1 + x["off"] } sino { pc = pc + 1 }
+            }
+        } sino {
+            lanzar "nucleo: instrucción " + pc + ": código desconocido " + o
+        }
+    }
+}
+
+funcion _nu_mapa_de(vm, v, pc) {
+    si (_nu_es_ptr(v) == falso o tiene_clave(v, "mapa") == falso) { lanzar "nucleo: instrucción " + pc + ": se esperaba un mapa en r1" }
+    retornar vm["mapas"][v["mapa"]]
+}
+
+funcion _nu_ayuda(vm, id, regs, pc) {
+    si (tiene_clave(vm["ayudas"], "" + id)) {
+        sea args = []
+        sea i = 1
+        mientras (i <= 5) {
+            si (_nu_es_ptr(regs[i])) { args.agregar(regs[i]) } sino { args.agregar(_nu_a_numero(regs[i])) }
+            i = i + 1
+        }
+        sea r = vm["ayudas"]["" + id](vm, args)
+        si (tipo(r) == "mapa") { retornar r }
+        retornar _nu_de(r ?? 0)
+    }
+    si (id == 1) {
+        sea m = _nu_mapa_de(vm, regs[1], pc)
+        sea k = _nu_clave(m, _nu_bytes_de(regs[2], m["clave"], pc))
+        si (tiene_clave(m["datos"], k) == falso) { retornar [0, 0] }
+        retornar {"r": m["datos"][k], "o": 0, "nombre": "valor"}
+    }
+    si (id == 2) {
+        sea m = _nu_mapa_de(vm, regs[1], pc)
+        retornar _nu_de(nucleo_mapa_poner(m, _nu_bytes_de(regs[2], m["clave"], pc), _nu_bytes_de(regs[3], m["valor"], pc)))
+    }
+    si (id == 3) {
+        sea m = _nu_mapa_de(vm, regs[1], pc)
+        retornar _nu_de(nucleo_mapa_borrar(m, _nu_bytes_de(regs[2], m["clave"], pc)))
+    }
+    si (id == 5) { retornar _nu_de(tiempo_ms() * 1000000) }
+    si (id == 6) {
+        // trace_printk(fmt, tam, a, b, c): %d %u %x %llu %lld.
+        sea fmt = _nu_bytes_de(regs[1], _nu_a_numero(regs[2]), pc)
+        si (texto_termina_con(fmt, char_de(0))) { fmt = subtexto(fmt, 0, longitud(fmt) - 1) }
+        sea vals = [regs[3], regs[4], regs[5]]
+        sea k = 0
+        sea out = ""
+        sea i = 0
+        mientras (i < longitud(fmt)) {
+            sea c = subtexto(fmt, i, i + 1)
+            si (c == "%" y i + 1 < longitud(fmt)) {
+                sea j = i + 1
+                mientras (j < longitud(fmt) y subtexto(fmt, j, j + 1) == "l") { j = j + 1 }
+                sea t = subtexto(fmt, j, j + 1)
+                sea v = vals[minimo(k, 2)]
+                k = k + 1
+                si (t == "d" o t == "i") {
+                    si (j == i + 1) { out = out + _nu_a_numero(_nu_sext(_nu_32(v), 32)) } sino { out = out + _nu_a_numero(v) }
+                } sino si (t == "u") {
+                    si (j == i + 1) { out = out + v[1] } sino { out = out + _nu_a_numero(v) }
+                } sino si (t == "x") { out = out + texto_minusculas(subtexto(_nu_hex(v), 2, 18)) }
+                sino si (t == "%") { out = out + "%" }
+                sino { out = out + "%" + t }
+                i = j + 1
+            } sino {
+                out = out + c
+                i = i + 1
+            }
+        }
+        vm["salida"].agregar(out)
+        retornar _nu_de(longitud(out))
+    }
+    si (id == 7) {
+        vm["azar"] = (vm["azar"] * 1103515245 + 12345) % 2147483648
+        retornar [0, vm["azar"]]
+    }
+    si (id == 8) { retornar [0, 0] }
+    si (id == 14) { retornar _nu_de(1) }
+    lanzar "nucleo: instrucción " + pc + ": ayuda " + id + " desconocida"
+}
+
+// ---------- ELF ----------
+
+funcion _nu_cadena(d, pos) {
+    sea fin = pos
+    mientras (fin < longitud(d) y byte_en(d, fin) != 0) { fin = fin + 1 }
+    retornar subtexto(d, pos, fin)
+}
+
+/// Lee un objeto ELF de "clang -target bpf -c". Devuelve {"programas":
+/// {sección: bytes con los mapas ya enlazados (ldmap N)}, "mapas": lista,
+/// "nombres_mapas": {nombre: N}, "licencia"}. Mapas en la sección "maps"
+/// (struct bpf_map_def: tipo, tam_clave, tam_valor, max).
+funcion nucleo_cargar_elf(d) {
+    si (subtexto(d, 0, 4) != char_de(127) + "ELF") { lanzar "nucleo: no es un ELF" }
+    si (byte_en(d, 4) != 2 o byte_en(d, 5) != 1) { lanzar "nucleo: solo ELF de 64 bits little-endian" }
+    si (bytes_leer_entero(d, 18, 2, 1) != 247) { lanzar "nucleo: el ELF no es para BPF" }
+    sea shoff = bytes_leer_entero(d, 40, 8, 1)
+    sea shentsize = bytes_leer_entero(d, 58, 2, 1)
+    sea shnum = bytes_leer_entero(d, 60, 2, 1)
+    sea shstrndx = bytes_leer_entero(d, 62, 2, 1)
+    sea secs = []
+    sea i = 0
+    mientras (i < shnum) {
+        sea b = shoff + i * shentsize
+        secs.agregar({"nombre_i": bytes_leer_entero(d, b, 4, 1), "tipo": bytes_leer_entero(d, b + 4, 4, 1), "off": bytes_leer_entero(d, b + 24, 8, 1),
+            "tam": bytes_leer_entero(d, b + 32, 8, 1), "link": bytes_leer_entero(d, b + 40, 4, 1), "info": bytes_leer_entero(d, b + 44, 4, 1)})
+        i = i + 1
+    }
+    sea strtab = secs[shstrndx]
+    para s en secs { s["nombre"] = _nu_cadena(d, strtab["off"] + s["nombre_i"]) }
+    // Símbolos.
+    sea simbolos = []
+    para s en secs {
+        si (s["tipo"] == 2) {
+            sea st = secs[s["link"]]
+            sea k = 0
+            mientras (k < s["tam"] / 24) {
+                sea b = s["off"] + k * 24
+                simbolos.agregar({"nombre": _nu_cadena(d, st["off"] + bytes_leer_entero(d, b, 4, 1)), "sec": bytes_leer_entero(d, b + 6, 2, 1), "valor": bytes_leer_entero(d, b + 8, 8, 1)})
+                k = k + 1
+            }
+        }
+    }
+    // Mapas de la sección "maps" (bpf_map_def de 20 bytes o más).
+    sea mapas = []
+    sea nombres = {}
+    sea indice_por_off = {}
+    sea si_mapas = -1
+    i = 0
+    mientras (i < longitud(secs)) {
+        si (secs[i]["nombre"] == "maps") { si_mapas = i }
+        i = i + 1
+    }
+    si (si_mapas >= 0) {
+        sea ms = secs[si_mapas]
+        sea en_mapas = []
+        para sy en simbolos { si (sy["sec"] == si_mapas) { en_mapas.agregar(sy) } }
+        en_mapas = ordenar(en_mapas, funcion(a, b) { retornar a["valor"] - b["valor"] })
+        para sy en en_mapas {
+            sea b = ms["off"] + sy["valor"]
+            sea tm = bytes_leer_entero(d, b, 4, 1)
+            sea tipo_m = "hash"
+            si (tm == 2) { tipo_m = "array" }
+            indice_por_off["" + sy["valor"]] = longitud(mapas)
+            nombres[sy["nombre"]] = longitud(mapas)
+            mapas.agregar(nucleo_mapa(tipo_m, bytes_leer_entero(d, b + 4, 4, 1), bytes_leer_entero(d, b + 8, 4, 1), bytes_leer_entero(d, b + 12, 4, 1)))
+        }
+    }
+    // Secciones de datos (.rodata, .data, .bss) como mapas array de un valor,
+    // igual que libbpf.
+    sea datos_sec = {}
+    i = 0
+    mientras (i < longitud(secs)) {
+        sea s = secs[i]
+        sea nom = s["nombre"]
+        si ((s["tipo"] == 1 o s["tipo"] == 8) y s["tam"] > 0 y (texto_empieza_con(nom, ".rodata") o texto_empieza_con(nom, ".data") o texto_empieza_con(nom, ".bss"))) {
+            sea m = nucleo_mapa("array", 4, s["tam"], 1)
+            si (s["tipo"] == 1) {
+                sea k = 0
+                mientras (k < s["tam"]) {
+                    m["datos"]["0"]["b"][k] = byte_en(d, s["off"] + k)
+                    k = k + 1
+                }
+            }
+            si (texto_empieza_con(nom, ".rodata")) { m["datos"]["0"]["solo_lectura"] = verdadero }
+            datos_sec["" + i] = longitud(mapas)
+            nombres[nom] = longitud(mapas)
+            mapas.agregar(m)
+        }
+        i = i + 1
+    }
+    // Programas con sus reubicaciones.
+    sea progs = {}
+    i = 0
+    mientras (i < longitud(secs)) {
+        sea s = secs[i]
+        si (s["tipo"] == 1 y s["tam"] > 0 y s["tam"] % 8 == 0 y s["nombre"] != "maps" y s["nombre"] != "license" y texto_empieza_con(s["nombre"], ".") == falso o (s["tipo"] == 1 y s["nombre"] == ".text" y s["tam"] > 0)) {
+            progs[s["nombre"]] = subtexto(d, s["off"], s["off"] + s["tam"])
+            progs[s["nombre"] + "#i"] = i
+        }
+        i = i + 1
+    }
+    para s en secs {
+        si (s["tipo"] == 9 y tiene_clave(progs, (secs[s["info"]]["nombre"]) + "#i")) {
+            sea nom = secs[s["info"]]["nombre"]
+            sea p = progs[nom]
+            sea k = 0
+            mientras (k < s["tam"] / 16) {
+                sea b = s["off"] + k * 16
+                sea off = bytes_leer_entero(d, b, 8, 1)
+                sea info = bytes_leer_entero(d, b + 8, 8, 1)
+                sea simi = piso(info / _NU_2_32)
+                sea sy = simbolos[simi]
+                sea rg = byte_en(p, off + 1)
+                si (sy["sec"] == si_mapas y tiene_clave(indice_por_off, "" + sy["valor"])) {
+                    sea fd = indice_por_off["" + sy["valor"]]
+                    p = subtexto(p, 0, off + 1) + char_de(16 + rg % 16) + subtexto(p, off + 2, off + 4) + bytes_entero(fd, 4, 1) + subtexto(p, off + 8, longitud(p))
+                } sino si (tiene_clave(datos_sec, "" + sy["sec"])) {
+                    sea fd = datos_sec["" + sy["sec"]]
+                    sea desp = sy["valor"] + bytes_leer_entero(p, off + 4, 4, 1)
+                    p = subtexto(p, 0, off + 1) + char_de(32 + rg % 16) + subtexto(p, off + 2, off + 4) + bytes_entero(fd, 4, 1) + subtexto(p, off + 8, off + 12) + bytes_entero(desp, 4, 1) + subtexto(p, off + 16, longitud(p))
+                }
+                k = k + 1
+            }
+            progs[nom] = p
+        }
+    }
+    sea limpio = {}
+    para k en claves(progs) { si (texto_termina_con(k, "#i") == falso) { limpio[k] = progs[k] } }
+    sea lic = nulo
+    para s en secs { si (s["nombre"] == "license") { lic = _nu_cadena(d, s["off"]) } }
+    retornar {"programas": limpio, "mapas": mapas, "nombres_mapas": nombres, "licencia": lic}
+}
