@@ -1,0 +1,100 @@
+// Pruebas de anillo (io_uring). En sistemas sin io_uring solo se salta.
+importar "anillo"
+funcion eq(a, b, q) { afirmar(("" + a) == ("" + b), q + ": [" + a + "] != [" + b + "]") }
+si (anillo_disponible() == falso) {
+    mostrar("[OK] anillo (sin io_uring, se salta)")
+} sino {
+    sea r = anillo_nuevo(16)
+    anillo_nop(r, "a")
+    anillo_nop(r, "b")
+    sea c = anillo_completar(r, 2)
+    eq([c[0]["dato"], c[1]["dato"], c[0]["res"]], ["a", "b", 0], "nop")
+    // Archivos.
+    sea ruta = "/tmp/cforge_anillo_" + tiempo_ms() + ".txt"
+    sea texto = ""
+    sea i = 0
+    mientras (i < 3000) {
+        texto = texto + "linea " + i + "\n"
+        i = i + 1
+    }
+    eq(anillo_escribir_archivo(ruta, texto), longitud(texto), "escribir_archivo")
+    eq(leer_archivo(ruta) == texto, verdadero, "contenido")
+    eq(anillo_leer_archivo(ruta, 1000) == texto, verdadero, "leer_archivo en bloques")
+    eq(anillo_leer_archivo(ruta, nulo) == texto, verdadero, "leer_archivo")
+    // Lectura con desplazamiento y escritura en medio.
+    anillo_abrir(r, ruta, 2, 0, "abrir")
+    sea fd = anillo_completar(r, 1)[0]["res"]
+    afirmar(fd >= 0, "abrir")
+    anillo_escribir(r, fd, "LINEA", 0, "w")
+    anillo_completar(r, 1)
+    anillo_leer(r, fd, 7, 0, "r0")
+    anillo_leer(r, fd, 7, 8, "r1")
+    sea l = anillo_completar(r, 2)
+    sea m = {}
+    para x en l { m[x["dato"]] = x["datos"] }
+    eq([m["r0"], m["r1"]], ["LINEA 0", "linea 1"], "leer con desplazamiento")
+    // Cadena: si falla una, las siguientes se cancelan (-125).
+    anillo_cadena(r)
+    anillo_leer(r, 9999, 4, 0, "malo")
+    anillo_nop(r, "despues")
+    anillo_fin_cadena(r)
+    sea cad = {}
+    para x en anillo_completar(r, 2) { cad[x["dato"]] = x["res"] }
+    eq([cad["malo"], cad["despues"]], [-9, -125], "cadena")
+    anillo_cerrar_fd(r, fd, "cerrar")
+    eq(anillo_completar(r, 1)[0]["res"], 0, "cerrar")
+    eliminar_archivo(ruta)
+    // Abrir algo que no existe.
+    anillo_abrir(r, "/no/existe/x", 0, 0, "nx")
+    eq(anillo_completar(r, 1)[0]["res"], -2, "ENOENT")
+    // Sockets.
+    sea srv = anillo_escuchar("127.0.0.1", 0)
+    afirmar(srv["puerto"] > 0, "puerto")
+    sea s = anillo_socket()
+    anillo_aceptar(r, srv["fd"], "acepta")
+    anillo_conectar(r, s, "127.0.0.1", srv["puerto"], "conecta")
+    sea cli = -1
+    para h en anillo_completar(r, 2) {
+        afirmar(h["res"] >= 0, h["dato"])
+        si (h["dato"] == "acepta") { cli = h["res"] }
+    }
+    anillo_enviar_datos(r, s, "ping", "env")
+    anillo_recibir(r, cli, 100, "rec")
+    sea red = {}
+    para h en anillo_completar(r, 2) { red[h["dato"]] = h }
+    eq([red["env"]["res"], red["rec"]["datos"]], [4, "ping"], "enviar/recibir")
+    // Poll: listo para escribir.
+    anillo_poll(r, s, 4, "poll")
+    afirmar(bits_y(anillo_completar(r, 1)[0]["res"], 4) != 0, "poll")
+    // Temporizador.
+    sea t0 = tiempo_ms()
+    anillo_temporizador(r, 60, "t")
+    eq(anillo_completar(r, 1)[0]["res"], -62, "temporizador")
+    afirmar(tiempo_ms() - t0 >= 50, "esperó")
+    // Cancelar una recepción que nunca llega.
+    anillo_recibir(r, cli, 100, "espera")
+    anillo_enviar(r)
+    eq(anillo_en_vuelo(r), 1, "en vuelo")
+    anillo_cancelar(r, "espera", "cancela")
+    sea cc = {}
+    para h en anillo_completar(r, 2) { cc[h["dato"]] = h["res"] }
+    eq([cc["cancela"], cc["espera"]], [0, -125], "cancelar")
+    eq(anillo_en_vuelo(r), 0, "nada en vuelo")
+    // Muchas operaciones: la cola se llena y hay que enviar.
+    sea lleno = falso
+    intentar {
+        i = 0
+        mientras (i < 40) {
+            anillo_nop(r, i)
+            i = i + 1
+        }
+    } capturar (e) { lleno = verdadero }
+    eq(lleno, verdadero, "cola llena")
+    eq(longitud(anillo_completar(r, 16)), 16, "vaciar")
+    anillo_cerrar_ya(s)
+    anillo_cerrar_ya(cli)
+    anillo_cerrar_ya(srv["fd"])
+    anillo_cerrar(r)
+    anillo_cerrar(r)
+    mostrar("[OK] anillo")
+}

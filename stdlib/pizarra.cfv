@@ -1,0 +1,618 @@
+// stdlib/pizarra.cfv — lienzo de objetos interactivos al estilo Fabric.js:
+// rectángulos, círculos, elipses, líneas, polígonos, caminos SVG, textos y
+// grupos con posición, ángulo, escala, origen y estilos (relleno, trazo,
+// opacidad); orden en capas; detección de qué objeto hay bajo un punto
+// (en sus coordenadas propias, con trazo); cajas envolventes; selección y
+// manijas (esquinas, lados y giro); arrastrar, escalar y girar con eventos
+// de ratón; eventos (agregado, seleccionado, moviendo, escalando, girando,
+// modificado); deshacer y rehacer; y exportar a JSON (y volver a cargar),
+// SVG, PDF o PNG con "vector". Idea de Fabric.js (MIT). En inglés:
+// importar "canvasobjects".
+//
+//   importar "pizarra"
+//   sea pz = pizarra_nueva(800, 600)
+//   sea r = pizarra_agregar(pz, pizarra_rect({"izq": 100, "arriba": 100, "ancho": 80, "alto": 50, "relleno": "#36c"}))
+//   pizarra_raton(pz, "bajar", 120, 120)
+//   pizarra_raton(pz, "mover", 220, 150)
+//   pizarra_raton(pz, "subir", 220, 150)
+//   escribir_archivo("pizarra.svg", pizarra_exportar(pz, "svg"))
+
+importar "vector"
+importar "json"
+
+sea _PZ_PI = 3.141592653589793
+sea _PZ_SIG = [0]
+
+// ---------- objetos ----------
+
+funcion _pz_obj(tipo_o, o) {
+    _PZ_SIG[0] = _PZ_SIG[0] + 1
+    sea r = {"id": _PZ_SIG[0], "tipo": tipo_o, "izq": 0, "arriba": 0, "ancho": 0, "alto": 0, "angulo": 0, "escala_x": 1, "escala_y": 1, "origen_x": "izquierda", "origen_y": "arriba",
+        "relleno": "#000000", "trazo": nulo, "grosor": 1, "opacidad": 1, "visible": verdadero, "seleccionable": verdadero, "bloqueado": falso, "nombre": nulo, "datos": nulo}
+    para k en claves(o ?? {}) { r[k] = o[k] }
+    retornar r
+}
+
+funcion pizarra_rect(o) {
+    sea r = _pz_obj("rect", o)
+    si (tiene_clave(r, "radio") == falso) { r["radio"] = 0 }
+    retornar r
+}
+
+funcion pizarra_circulo(o) {
+    sea r = _pz_obj("circulo", o)
+    sea rad = r["radio"] ?? 10
+    r["radio"] = rad
+    r["ancho"] = 2 * rad
+    r["alto"] = 2 * rad
+    retornar r
+}
+
+funcion pizarra_elipse(o) {
+    sea r = _pz_obj("elipse", o)
+    r["rx"] = r["rx"] ?? 10
+    r["ry"] = r["ry"] ?? 10
+    r["ancho"] = 2 * r["rx"]
+    r["alto"] = 2 * r["ry"]
+    retornar r
+}
+
+/// Línea de (x1, y1) a (x2, y2) en coordenadas de la pizarra.
+funcion pizarra_linea(x1, y1, x2, y2, o) {
+    sea r = _pz_obj("linea", o)
+    r["izq"] = minimo(x1, x2)
+    r["arriba"] = minimo(y1, y2)
+    r["ancho"] = abs(x2 - x1)
+    r["alto"] = abs(y2 - y1)
+    r["puntos"] = [[x1 - r["izq"], y1 - r["arriba"]], [x2 - r["izq"], y2 - r["arriba"]]]
+    si (r["trazo"] == nulo) { r["trazo"] = "#000000" }
+    retornar r
+}
+
+/// Polígono con puntos [[x, y]…] en coordenadas de la pizarra.
+funcion pizarra_poligono(puntos, o) {
+    sea r = _pz_obj("poligono", o)
+    sea mn = [puntos[0][0], puntos[0][1]]
+    sea mx = [puntos[0][0], puntos[0][1]]
+    para p en puntos {
+        mn = [minimo(mn[0], p[0]), minimo(mn[1], p[1])]
+        mx = [maximo(mx[0], p[0]), maximo(mx[1], p[1])]
+    }
+    r["izq"] = mn[0]
+    r["arriba"] = mn[1]
+    r["ancho"] = mx[0] - mn[0]
+    r["alto"] = mx[1] - mn[1]
+    sea pl = []
+    para p en puntos { pl.agregar([p[0] - mn[0], p[1] - mn[1]]) }
+    r["puntos"] = pl
+    retornar r
+}
+
+/// Camino SVG ("M… L… C… Z") con su caja dada (ancho, alto) en o.
+funcion pizarra_camino(d, o) {
+    sea r = _pz_obj("camino", o)
+    r["d"] = d
+    retornar r
+}
+
+/// Texto (una línea). o: "texto", "tam", "negrita".
+funcion pizarra_texto(texto, o) {
+    sea r = _pz_obj("texto", o)
+    r["texto"] = texto
+    r["tam"] = r["tam"] ?? 20
+    r["negrita"] = r["negrita"] ?? falso
+    r["ancho"] = documento_ancho(texto, "Helvetica", r["tam"])
+    r["alto"] = r["tam"] * 1.16
+    retornar r
+}
+
+/// Grupo: los objetos pasan a coordenadas relativas al grupo.
+funcion pizarra_grupo(objetos, o) {
+    sea mn = nulo
+    sea mx = nulo
+    para ob en objetos {
+        sea c = pizarra_caja(ob)
+        si (mn == nulo) {
+            mn = [c[0], c[1]]
+            mx = [c[2], c[3]]
+        } sino {
+            mn = [minimo(mn[0], c[0]), minimo(mn[1], c[1])]
+            mx = [maximo(mx[0], c[2]), maximo(mx[1], c[3])]
+        }
+    }
+    sea r = _pz_obj("grupo", o)
+    r["izq"] = mn[0]
+    r["arriba"] = mn[1]
+    r["ancho"] = mx[0] - mn[0]
+    r["alto"] = mx[1] - mn[1]
+    sea hs = []
+    para ob en objetos {
+        ob["izq"] = ob["izq"] - mn[0]
+        ob["arriba"] = ob["arriba"] - mn[1]
+        hs.agregar(ob)
+    }
+    r["objetos"] = hs
+    r["relleno"] = nulo
+    retornar r
+}
+
+// ---------- geometría ----------
+
+funcion _pz_origen(ob) {
+    sea ox = 0
+    si (ob["origen_x"] == "centro") { ox = ob["ancho"] / 2 }
+    si (ob["origen_x"] == "derecha") { ox = ob["ancho"] }
+    sea oy = 0
+    si (ob["origen_y"] == "centro") { oy = ob["alto"] / 2 }
+    si (ob["origen_y"] == "abajo") { oy = ob["alto"] }
+    retornar [ox, oy]
+}
+
+/// Matriz [a, b, c, d, e, f] del objeto: de sus coordenadas propias (0..ancho,
+/// 0..alto) a las de la pizarra (o de su grupo).
+funcion pizarra_matriz(ob) {
+    sea o = _pz_origen(ob)
+    sea a = ob["angulo"] * _PZ_PI / 180
+    sea c = coseno(a)
+    sea s = seno(a)
+    sea sx = ob["escala_x"]
+    sea sy = ob["escala_y"]
+    // T(izq, arriba) · R · S · T(-origen)
+    retornar [c * sx, s * sx, 0 - s * sy, c * sy, ob["izq"] - (c * sx * o[0] - s * sy * o[1]), ob["arriba"] - (s * sx * o[0] + c * sy * o[1])]
+}
+
+funcion _pz_atan2(dy, dx) {
+    si (dx == 0) {
+        si (dy > 0) { retornar _PZ_PI / 2 }
+        si (dy < 0) { retornar 0 - _PZ_PI / 2 }
+        retornar 0
+    }
+    sea a = arcotangente(dy / dx)
+    si (dx < 0) {
+        si (dy >= 0) { a = a + _PZ_PI } sino { a = a - _PZ_PI }
+    }
+    retornar a
+}
+
+funcion _pz_ap(m, x, y) { retornar [m[0] * x + m[2] * y + m[4], m[1] * x + m[3] * y + m[5]] }
+
+funcion _pz_inv(m) {
+    sea det = m[0] * m[3] - m[1] * m[2]
+    retornar [m[3] / det, 0 - m[1] / det, 0 - m[2] / det, m[0] / det, (m[2] * m[5] - m[3] * m[4]) / det, (m[1] * m[4] - m[0] * m[5]) / det]
+}
+
+/// Esquinas del objeto en la pizarra: [[x, y]×4] (arriba-izq en sentido horario).
+funcion pizarra_esquinas(ob) {
+    sea m = pizarra_matriz(ob)
+    retornar [_pz_ap(m, 0, 0), _pz_ap(m, ob["ancho"], 0), _pz_ap(m, ob["ancho"], ob["alto"]), _pz_ap(m, 0, ob["alto"])]
+}
+
+/// Caja envolvente alineada: [x0, y0, x1, y1].
+funcion pizarra_caja(ob) {
+    sea e = pizarra_esquinas(ob)
+    sea r = [e[0][0], e[0][1], e[0][0], e[0][1]]
+    para p en e {
+        r = [minimo(r[0], p[0]), minimo(r[1], p[1]), maximo(r[2], p[0]), maximo(r[3], p[1])]
+    }
+    retornar r
+}
+
+funcion _pz_dentro_poligono(pts, x, y) {
+    sea dentro = falso
+    sea j = longitud(pts) - 1
+    sea i = 0
+    mientras (i < longitud(pts)) {
+        sea a = pts[i]
+        sea b = pts[j]
+        si (((a[1] > y) != (b[1] > y)) y (x < (b[0] - a[0]) * (y - a[1]) / (b[1] - a[1]) + a[0])) { dentro = dentro == falso }
+        j = i
+        i = i + 1
+    }
+    retornar dentro
+}
+
+funcion _pz_dist_segmento(p, a, b) {
+    sea dx = b[0] - a[0]
+    sea dy = b[1] - a[1]
+    sea l2 = dx * dx + dy * dy
+    sea t = 0
+    si (l2 > 0) { t = ((p[0] - a[0]) * dx + (p[1] - a[1]) * dy) / l2 }
+    si (t < 0) { t = 0 }
+    si (t > 1) { t = 1 }
+    sea qx = a[0] + t * dx - p[0]
+    sea qy = a[1] + t * dy - p[1]
+    retornar raiz(qx * qx + qy * qy)
+}
+
+/// ¿El punto (de la pizarra o del grupo padre) cae sobre el objeto?
+funcion pizarra_contiene(ob, x, y) {
+    si (ob["visible"] == falso) { retornar falso }
+    sea p = _pz_ap(_pz_inv(pizarra_matriz(ob)), x, y)
+    sea px = p[0]
+    sea py = p[1]
+    sea tol = 0
+    si (ob["trazo"] != nulo) { tol = ob["grosor"] / 2 }
+    sea t = ob["tipo"]
+    si (t == "rect" o t == "texto" o t == "camino" o t == "imagen") { retornar px >= 0 - tol y py >= 0 - tol y px <= ob["ancho"] + tol y py <= ob["alto"] + tol }
+    si (t == "circulo" o t == "elipse") {
+        sea rx = ob["ancho"] / 2 + tol
+        sea ry = ob["alto"] / 2 + tol
+        si (rx <= 0 o ry <= 0) { retornar falso }
+        sea dx = (px - ob["ancho"] / 2) / rx
+        sea dy = (py - ob["alto"] / 2) / ry
+        retornar dx * dx + dy * dy <= 1
+    }
+    si (t == "linea") { retornar _pz_dist_segmento([px, py], ob["puntos"][0], ob["puntos"][1]) <= maximo(ob["grosor"] / 2, 3) }
+    si (t == "poligono") { retornar _pz_dentro_poligono(ob["puntos"], px, py) }
+    si (t == "grupo") {
+        para h en ob["objetos"] { si (pizarra_contiene(h, px, py)) { retornar verdadero } }
+        retornar falso
+    }
+    retornar falso
+}
+
+// ---------- pizarra ----------
+
+/// Nueva pizarra.
+funcion pizarra_nueva(ancho, alto) {
+    retornar {"ancho": ancho, "alto": alto, "objetos": [], "activo": nulo, "eventos": {}, "fondo": "#ffffff", "historial": [], "futuro": [], "arrastre": nulo, "tam_manija": 8}
+}
+
+/// Escucha un evento: "agregado", "quitado", "seleccionado", "deseleccionado",
+/// "moviendo", "escalando", "girando", "modificado". fn(objeto).
+funcion pizarra_al(pz, evento, f) {
+    si (tiene_clave(pz["eventos"], evento) == falso) { pz["eventos"][evento] = [] }
+    pz["eventos"][evento].agregar(f)
+}
+
+funcion _pz_emitir(pz, evento, ob) { para f en pz["eventos"][evento] ?? [] { f(ob) } }
+
+funcion _pz_guardar_historial(pz) {
+    pz["historial"].agregar(pizarra_a_json(pz))
+    si (longitud(pz["historial"]) > 100) {
+        sea r = []
+        sea i = 1
+        mientras (i < longitud(pz["historial"])) {
+            r.agregar(pz["historial"][i])
+            i = i + 1
+        }
+        pz["historial"] = r
+    }
+    pz["futuro"] = []
+}
+
+funcion pizarra_agregar(pz, ob) {
+    _pz_guardar_historial(pz)
+    pz["objetos"].agregar(ob)
+    _pz_emitir(pz, "agregado", ob)
+    retornar ob
+}
+
+funcion pizarra_quitar(pz, ob) {
+    _pz_guardar_historial(pz)
+    sea r = []
+    para x en pz["objetos"] { si (x["id"] != ob["id"]) { r.agregar(x) } }
+    pz["objetos"] = r
+    si (pz["activo"] != nulo y pz["activo"]["id"] == ob["id"]) { pz["activo"] = nulo }
+    _pz_emitir(pz, "quitado", ob)
+}
+
+/// Busca por id o por nombre.
+funcion pizarra_obtener(pz, clave) {
+    para x en pz["objetos"] { si (x["id"] == clave o x["nombre"] == clave) { retornar x } }
+    retornar nulo
+}
+
+/// Cambia propiedades (con historial y evento "modificado").
+funcion pizarra_cambiar(pz, ob, props) {
+    _pz_guardar_historial(pz)
+    para k en claves(props) { ob[k] = props[k] }
+    _pz_emitir(pz, "modificado", ob)
+}
+
+// ---------- capas ----------
+
+funcion _pz_indice(pz, ob) {
+    sea i = 0
+    mientras (i < longitud(pz["objetos"])) {
+        si (pz["objetos"][i]["id"] == ob["id"]) { retornar i }
+        i = i + 1
+    }
+    retornar -1
+}
+
+funcion _pz_mover_a(pz, ob, nuevo) {
+    sea i = _pz_indice(pz, ob)
+    si (i < 0) { retornar nulo }
+    _pz_guardar_historial(pz)
+    sea r = []
+    para x en pz["objetos"] { si (x["id"] != ob["id"]) { r.agregar(x) } }
+    sea n = nuevo
+    si (n < 0) { n = 0 }
+    si (n > longitud(r)) { n = longitud(r) }
+    sea fin = []
+    sea k = 0
+    mientras (k <= longitud(r)) {
+        si (k == n) { fin.agregar(ob) }
+        si (k < longitud(r)) { fin.agregar(r[k]) }
+        k = k + 1
+    }
+    pz["objetos"] = fin
+}
+
+funcion pizarra_al_frente(pz, ob) { _pz_mover_a(pz, ob, longitud(pz["objetos"])) }
+funcion pizarra_al_fondo(pz, ob) { _pz_mover_a(pz, ob, 0) }
+funcion pizarra_subir(pz, ob) { _pz_mover_a(pz, ob, _pz_indice(pz, ob) + 1) }
+funcion pizarra_bajar(pz, ob) { _pz_mover_a(pz, ob, _pz_indice(pz, ob) - 1) }
+
+// ---------- selección y manijas ----------
+
+/// Objeto de más arriba bajo el punto (o nulo).
+funcion pizarra_objeto_en(pz, x, y) {
+    sea i = longitud(pz["objetos"]) - 1
+    mientras (i >= 0) {
+        sea ob = pz["objetos"][i]
+        si (ob["seleccionable"] y pizarra_contiene(ob, x, y)) { retornar ob }
+        i = i - 1
+    }
+    retornar nulo
+}
+
+funcion pizarra_seleccionar(pz, ob) {
+    si (pz["activo"] != nulo y (ob == nulo o pz["activo"]["id"] != ob["id"])) { _pz_emitir(pz, "deseleccionado", pz["activo"]) }
+    pz["activo"] = ob
+    si (ob != nulo) { _pz_emitir(pz, "seleccionado", ob) }
+}
+
+/// Manijas del objeto: {"ai", "ad", "bd", "bi" (esquinas), "ar", "ab", "iz",
+/// "de" (lados), "giro"} con su posición en la pizarra.
+funcion pizarra_manijas(ob) {
+    sea m = pizarra_matriz(ob)
+    sea w = ob["ancho"]
+    sea h = ob["alto"]
+    // La manija de giro queda 30 px por encima (en pantalla) del lado superior.
+    sea sy = ob["escala_y"]
+    si (sy == 0) { sy = 1 }
+    retornar {"ai": _pz_ap(m, 0, 0), "ad": _pz_ap(m, w, 0), "bd": _pz_ap(m, w, h), "bi": _pz_ap(m, 0, h), "ar": _pz_ap(m, w / 2, 0), "ab": _pz_ap(m, w / 2, h), "iz": _pz_ap(m, 0, h / 2), "de": _pz_ap(m, w, h / 2), "giro": _pz_ap(m, w / 2, 0 - 30 / abs(sy))}
+}
+
+funcion _pz_manija_en(pz, ob, x, y) {
+    sea ms = pizarra_manijas(ob)
+    para k en ["giro", "ai", "ad", "bd", "bi", "ar", "ab", "iz", "de"] {
+        sea p = ms[k]
+        si (abs(p[0] - x) <= pz["tam_manija"] y abs(p[1] - y) <= pz["tam_manija"]) { retornar k }
+    }
+    retornar nulo
+}
+
+// ---------- ratón ----------
+
+/// Evento de ratón: tipo "bajar", "mover" o "subir". Selecciona, mueve,
+/// escala desde manijas o gira. opciones: "proporcional" (escala uniforme).
+funcion pizarra_raton(pz, tipo_e, x, y, opciones) {
+    sea op = opciones ?? {}
+    si (tipo_e == "bajar") {
+        sea act = pz["activo"]
+        si (act != nulo y act["bloqueado"] == falso) {
+            sea mj = _pz_manija_en(pz, act, x, y)
+            si (mj != nulo) {
+                _pz_guardar_historial(pz)
+                pz["arrastre"] = {"modo": mj, "ob": act, "x0": x, "y0": y, "inicial": json_parsear(json_texto(act))}
+                retornar act
+            }
+        }
+        sea ob = pizarra_objeto_en(pz, x, y)
+        pizarra_seleccionar(pz, ob)
+        si (ob != nulo y ob["bloqueado"] == falso) {
+            _pz_guardar_historial(pz)
+            pz["arrastre"] = {"modo": "mover", "ob": ob, "x0": x, "y0": y, "inicial": json_parsear(json_texto(ob))}
+        }
+        retornar ob
+    }
+    sea a = pz["arrastre"]
+    si (a == nulo) { retornar nulo }
+    sea ob = a["ob"]
+    sea ini = a["inicial"]
+    si (tipo_e == "mover") {
+        si (a["modo"] == "mover") {
+            ob["izq"] = ini["izq"] + x - a["x0"]
+            ob["arriba"] = ini["arriba"] + y - a["y0"]
+            _pz_emitir(pz, "moviendo", ob)
+        } sino si (a["modo"] == "giro") {
+            // Ángulo respecto del centro del objeto.
+            sea m = pizarra_matriz(ini)
+            sea cen = _pz_ap(m, ini["ancho"] / 2, ini["alto"] / 2)
+            sea a0 = _pz_atan2(a["y0"] - cen[1], a["x0"] - cen[0])
+            sea a1 = _pz_atan2(y - cen[1], x - cen[0])
+            sea nuevo = ini["angulo"] + (a1 - a0) * 180 / _PZ_PI
+            si ((op["ajuste"] ?? nulo) != nulo) { nuevo = redondear(nuevo / op["ajuste"]) * op["ajuste"] }
+            // Girar alrededor del centro: se recalcula la posición del origen.
+            ob["angulo"] = nuevo
+            sea m2 = pizarra_matriz(ob)
+            sea cen2 = _pz_ap(m2, ob["ancho"] / 2, ob["alto"] / 2)
+            ob["izq"] = ob["izq"] + cen[0] - cen2[0]
+            ob["arriba"] = ob["arriba"] + cen[1] - cen2[1]
+            _pz_emitir(pz, "girando", ob)
+        } sino {
+            _pz_escalar_desde(ob, ini, a["modo"], x, y, op["proporcional"] ?? falso)
+            _pz_emitir(pz, "escalando", ob)
+        }
+        retornar ob
+    }
+    si (tipo_e == "subir") {
+        pz["arrastre"] = nulo
+        si (json_texto(ob) != json_texto(ini)) { _pz_emitir(pz, "modificado", ob) } sino { quitar_ultimo(pz["historial"]) }
+        retornar ob
+    }
+}
+
+// Escala con la esquina o lado opuesto fijo.
+funcion _pz_escalar_desde(ob, ini, manija, x, y, proporcional) {
+    sea w = ini["ancho"]
+    sea h = ini["alto"]
+    sea opuestos = {"ai": [w, h], "ad": [0, h], "bd": [0, 0], "bi": [w, 0], "ar": [w / 2, h], "ab": [w / 2, 0], "iz": [w, h / 2], "de": [0, h / 2]}
+    sea fijo_local = opuestos[manija]
+    sea m0 = pizarra_matriz(ini)
+    sea fijo = _pz_ap(m0, fijo_local[0], fijo_local[1])
+    // Punto del ratón en el marco girado pero sin escalar del objeto.
+    sea ang = ini["angulo"] * _PZ_PI / 180
+    sea c = coseno(ang)
+    sea s = seno(ang)
+    sea dx = x - fijo[0]
+    sea dy = y - fijo[1]
+    sea lx = c * dx + s * dy
+    sea ly = 0 - s * dx + c * dy
+    sea nsx = ini["escala_x"]
+    sea nsy = ini["escala_y"]
+    si (manija != "ar" y manija != "ab" y w > 0) { nsx = abs(lx) / w }
+    si (manija != "iz" y manija != "de" y h > 0) { nsy = abs(ly) / h }
+    si (proporcional y (manija == "ai" o manija == "ad" o manija == "bd" o manija == "bi")) {
+        sea k = maximo(nsx / ini["escala_x"], nsy / ini["escala_y"])
+        nsx = ini["escala_x"] * k
+        nsy = ini["escala_y"] * k
+    }
+    si (nsx < 0.01) { nsx = 0.01 }
+    si (nsy < 0.01) { nsy = 0.01 }
+    ob["escala_x"] = nsx
+    ob["escala_y"] = nsy
+    // Reubica para que el punto fijo quede en su sitio.
+    sea m1 = pizarra_matriz(ob)
+    sea ahora = _pz_ap(m1, fijo_local[0], fijo_local[1])
+    ob["izq"] = ob["izq"] + fijo[0] - ahora[0]
+    ob["arriba"] = ob["arriba"] + fijo[1] - ahora[1]
+}
+
+// ---------- deshacer ----------
+
+funcion pizarra_deshacer(pz) {
+    si (longitud(pz["historial"]) == 0) { retornar falso }
+    pz["futuro"].agregar(pizarra_a_json(pz))
+    sea j = pz["historial"][longitud(pz["historial"]) - 1]
+    quitar_ultimo(pz["historial"])
+    _pz_cargar(pz, j)
+    retornar verdadero
+}
+
+funcion pizarra_rehacer(pz) {
+    si (longitud(pz["futuro"]) == 0) { retornar falso }
+    pz["historial"].agregar(pizarra_a_json(pz))
+    sea j = pz["futuro"][longitud(pz["futuro"]) - 1]
+    quitar_ultimo(pz["futuro"])
+    _pz_cargar(pz, j)
+    retornar verdadero
+}
+
+// ---------- JSON ----------
+
+/// Estado como texto JSON.
+funcion pizarra_a_json(pz) { retornar json_texto({"version": 1, "ancho": pz["ancho"], "alto": pz["alto"], "fondo": pz["fondo"], "objetos": pz["objetos"]}) }
+
+funcion _pz_cargar(pz, j) {
+    sea d = json_parsear(j)
+    pz["objetos"] = d["objetos"]
+    pz["fondo"] = d["fondo"] ?? "#ffffff"
+    si (pz["activo"] != nulo) { pz["activo"] = pizarra_obtener(pz, pz["activo"]["id"]) }
+}
+
+/// Carga un JSON hecho con pizarra_a_json.
+funcion pizarra_desde_json(j) {
+    sea d = json_parsear(j)
+    sea pz = pizarra_nueva(d["ancho"], d["alto"])
+    _pz_cargar(pz, j)
+    para ob en pz["objetos"] { si (ob["id"] > _PZ_SIG[0]) { _PZ_SIG[0] = ob["id"] } }
+    retornar pz
+}
+
+// ---------- dibujo ----------
+
+funcion _pz_dibujar(c, ob) {
+    si (ob["visible"] == falso) { retornar nulo }
+    vector_guardar(c)
+    vector_transformar(c, pizarra_matriz(ob))
+    sea t = ob["tipo"]
+    sea alfa = ob["opacidad"]
+    sea pintar = funcion() {
+        si (ob["relleno"] != nulo y t != "linea") {
+            sea k = vector_rgba(ob["relleno"])
+            vector_color(c, [k[0], k[1], k[2], k[3] * alfa])
+            vector_rellenar_mantener(c)
+        }
+        si (ob["trazo"] != nulo) {
+            sea k = vector_rgba(ob["trazo"])
+            vector_color(c, [k[0], k[1], k[2], k[3] * alfa])
+            vector_grosor(c, ob["grosor"])
+            vector_trazar_mantener(c)
+        }
+        vector_nuevo_camino(c)
+    }
+    si (t == "rect") {
+        si (ob["radio"] > 0) { vector_rectangulo_redondeado(c, 0, 0, ob["ancho"], ob["alto"], ob["radio"]) } sino { vector_rectangulo(c, 0, 0, ob["ancho"], ob["alto"]) }
+        pintar()
+    } sino si (t == "circulo" o t == "elipse") {
+        vector_elipse(c, ob["ancho"] / 2, ob["alto"] / 2, ob["ancho"] / 2, ob["alto"] / 2)
+        pintar()
+    } sino si (t == "linea") {
+        vector_mover(c, ob["puntos"][0][0], ob["puntos"][0][1])
+        vector_linea(c, ob["puntos"][1][0], ob["puntos"][1][1])
+        pintar()
+    } sino si (t == "poligono") {
+        sea p = ob["puntos"]
+        vector_mover(c, p[0][0], p[0][1])
+        sea i = 1
+        mientras (i < longitud(p)) {
+            vector_linea(c, p[i][0], p[i][1])
+            i = i + 1
+        }
+        vector_cerrar(c)
+        pintar()
+    } sino si (t == "camino") {
+        vector_camino_svg(c, ob["d"])
+        pintar()
+    } sino si (t == "texto") {
+        sea k = vector_rgba(ob["relleno"] ?? "#000000")
+        vector_color(c, [k[0], k[1], k[2], k[3] * alfa])
+        vector_fuente(c, ob["tam"], nulo, ob["negrita"])
+        vector_texto(c, 0, ob["tam"] * 0.86, ob["texto"], nulo)
+    } sino si (t == "grupo") {
+        para h en ob["objetos"] { _pz_dibujar(c, h) }
+    }
+    vector_restaurar(c)
+}
+
+/// Dibuja en un contexto de "vector" (con o sin selección).
+funcion pizarra_dibujar(pz, c, con_seleccion) {
+    si (pz["fondo"] != nulo) {
+        vector_rectangulo(c, 0, 0, pz["ancho"], pz["alto"])
+        vector_color(c, pz["fondo"])
+        vector_rellenar(c)
+    }
+    para ob en pz["objetos"] { _pz_dibujar(c, ob) }
+    sea act = pz["activo"]
+    si ((con_seleccion ?? falso) == verdadero y act != nulo) {
+        sea e = pizarra_esquinas(act)
+        vector_mover(c, e[0][0], e[0][1])
+        vector_linea(c, e[1][0], e[1][1])
+        vector_linea(c, e[2][0], e[2][1])
+        vector_linea(c, e[3][0], e[3][1])
+        vector_cerrar(c)
+        vector_color(c, "#2f80ed")
+        vector_grosor(c, 1)
+        vector_trazar(c)
+        sea t = pz["tam_manija"]
+        para k en claves(pizarra_manijas(act)) {
+            sea p = pizarra_manijas(act)[k]
+            vector_rectangulo(c, p[0] - t / 2, p[1] - t / 2, t, t)
+            vector_color(c, "#ffffff")
+            vector_rellenar_mantener(c)
+            vector_color(c, "#2f80ed")
+            vector_trazar(c)
+        }
+    }
+}
+
+/// Exporta a "svg" (texto), "pdf" o "png" (bytes).
+funcion pizarra_exportar(pz, formato, con_seleccion) {
+    sea c = vector_nuevo(formato, pz["ancho"], pz["alto"], nulo)
+    pizarra_dibujar(pz, c, con_seleccion)
+    retornar vector_terminar(c)
+}

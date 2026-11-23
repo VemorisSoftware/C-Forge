@@ -1,0 +1,318 @@
+// stdlib/enjambre.cfv — paralelismo de datos al estilo Rayon sobre los
+// hilos reales de C-Forge (tarea/esperar): mapear, filtrar, reducir, sumar,
+// recorrer, buscar, todos/alguno, contar, ordenar (por trozos en paralelo y
+// mezcla), rangos de enteros y unir dos cálculos a la vez. Parte el trabajo
+// en trozos (uno o más por núcleo), conserva el orden de los resultados y
+// relanza el primer error de cualquier hilo. Idea de Rayon (MIT/Apache).
+// En inglés: importar "parallel".
+//
+//   importar "enjambre"
+//   sea cuadrados = enjambre_mapear(numeros, funcion(x) { retornar x * x }, nulo)
+//   sea total = enjambre_suma(cuadrados)
+//   sea r = enjambre_unir(funcion() { retornar calcular_a() }, funcion() { retornar calcular_b() })
+
+sea _EJ_HILOS = [0]
+
+/// Núcleos disponibles (cacheado). Se puede fijar con enjambre_fijar_hilos.
+funcion enjambre_hilos() {
+    si (_EJ_HILOS[0] > 0) { retornar _EJ_HILOS[0] }
+    sea n = 0
+    si (existe_archivo("/proc/cpuinfo")) {
+        para l en texto_dividir(leer_archivo("/proc/cpuinfo"), "\n") { si (texto_empieza_con(l, "processor")) { n = n + 1 } }
+    }
+    si (n == 0) {
+        sea e = variable_entorno("CFORGE_HILOS")
+        si (e != nulo y e != "") { n = a_numero(e) }
+    }
+    si (n <= 0) { n = 4 }
+    _EJ_HILOS[0] = n
+    retornar n
+}
+
+/// Fija cuántos hilos usar (0 = automático).
+funcion enjambre_fijar_hilos(n) { _EJ_HILOS[0] = n }
+
+// Trozos [inicio, fin) para n elementos. opciones: "hilos", "trozo".
+funcion _ej_trozos(n, opciones) {
+    sea op = opciones ?? {}
+    sea h = op["hilos"] ?? enjambre_hilos()
+    sea t = op["trozo"] ?? nulo
+    si (t == nulo) {
+        // Algunos trozos por hilo para repartir mejor la carga.
+        t = techo(n / (h * 4))
+        si (t < 1) { t = 1 }
+    }
+    sea r = []
+    sea i = 0
+    mientras (i < n) {
+        sea f = i + t
+        si (f > n) { f = n }
+        r.agregar([i, f])
+        i = f
+    }
+    retornar r
+}
+
+// Ejecuta f(inicio, fin) en paralelo sobre los trozos, con a lo sumo
+// "hilos" tareas vivas a la vez. Devuelve los resultados por trozo, en orden.
+funcion _ej_correr(n, opciones, f) {
+    sea trozos = _ej_trozos(n, opciones)
+    sea h = (opciones ?? {})["hilos"] ?? enjambre_hilos()
+    si (h <= 1 o longitud(trozos) <= 1) {
+        sea r = []
+        para t en trozos { r.agregar(f(t[0], t[1])) }
+        retornar r
+    }
+    sea res = []
+    sea i = 0
+    mientras (i < longitud(trozos)) {
+        sea lote = []
+        sea k = 0
+        mientras (k < h y i + k < longitud(trozos)) {
+            sea t = trozos[i + k]
+            lote.agregar(tarea(funcion() { retornar f(t[0], t[1]) }))
+            k = k + 1
+        }
+        // Se espera a todas antes de relanzar, para no dejar hilos sueltos.
+        sea err = nulo
+        para x en lote {
+            sea v = nulo
+            intentar { v = esperar(x) } capturar (e) { si (err == nulo) { err = e } }
+            res.agregar(v)
+        }
+        si (err != nulo) { lanzar err }
+        i = i + k
+    }
+    retornar res
+}
+
+funcion _ej_concat(partes) {
+    sea r = []
+    para p en partes { para x en p { r.agregar(x) } }
+    retornar r
+}
+
+/// f(x) para cada elemento, en paralelo; resultados en el mismo orden.
+funcion enjambre_mapear(lista, f, opciones) {
+    retornar _ej_concat(_ej_correr(longitud(lista), opciones, funcion(a, b) {
+        sea r = []
+        sea i = a
+        mientras (i < b) {
+            r.agregar(f(lista[i]))
+            i = i + 1
+        }
+        retornar r
+    }))
+}
+
+/// Como mapear pero f recibe (x, índice).
+funcion enjambre_mapear_indice(lista, f, opciones) {
+    retornar _ej_concat(_ej_correr(longitud(lista), opciones, funcion(a, b) {
+        sea r = []
+        sea i = a
+        mientras (i < b) {
+            r.agregar(f(lista[i], i))
+            i = i + 1
+        }
+        retornar r
+    }))
+}
+
+/// Elementos que cumplen pred, en el orden original.
+funcion enjambre_filtrar(lista, pred, opciones) {
+    retornar _ej_concat(_ej_correr(longitud(lista), opciones, funcion(a, b) {
+        sea r = []
+        sea i = a
+        mientras (i < b) {
+            si (pred(lista[i])) { r.agregar(lista[i]) }
+            i = i + 1
+        }
+        retornar r
+    }))
+}
+
+/// f(x) por sus efectos (el orden entre hilos no está garantizado).
+funcion enjambre_cada(lista, f, opciones) {
+    _ej_correr(longitud(lista), opciones, funcion(a, b) {
+        sea i = a
+        mientras (i < b) {
+            f(lista[i])
+            i = i + 1
+        }
+        retornar nulo
+    })
+}
+
+/// Reduce en paralelo: cada trozo parte de identidad y acumula con
+/// f(acum, x); los parciales se combinan con combinar(a, b) (por defecto
+/// f). f debe ser asociativa para que el resultado no dependa del reparto.
+funcion enjambre_reducir(lista, identidad, f, combinar, opciones) {
+    sea parciales = _ej_correr(longitud(lista), opciones, funcion(a, b) {
+        sea acc = identidad
+        sea i = a
+        mientras (i < b) {
+            acc = f(acc, lista[i])
+            i = i + 1
+        }
+        retornar acc
+    })
+    sea c = combinar ?? f
+    sea r = identidad
+    para p en parciales { r = c(r, p) }
+    retornar r
+}
+
+funcion enjambre_suma(lista) { retornar enjambre_reducir(lista, 0, funcion(a, x) { retornar a + x }, nulo, nulo) }
+
+/// Mínimo y máximo: [min, max] (nulo si la lista está vacía).
+funcion enjambre_extremos(lista) {
+    si (longitud(lista) == 0) { retornar nulo }
+    sea partes = _ej_correr(longitud(lista), nulo, funcion(a, b) {
+        sea mn = lista[a]
+        sea mx = lista[a]
+        sea i = a + 1
+        mientras (i < b) {
+            si (lista[i] < mn) { mn = lista[i] }
+            si (lista[i] > mx) { mx = lista[i] }
+            i = i + 1
+        }
+        retornar [mn, mx]
+    })
+    sea r = partes[0]
+    para p en partes {
+        si (p[0] < r[0]) { r = [p[0], r[1]] }
+        si (p[1] > r[1]) { r = [r[0], p[1]] }
+    }
+    retornar r
+}
+
+/// Cuántos cumplen pred.
+funcion enjambre_contar(lista, pred, opciones) {
+    sea partes = _ej_correr(longitud(lista), opciones, funcion(a, b) {
+        sea n = 0
+        sea i = a
+        mientras (i < b) {
+            si (pred(lista[i])) { n = n + 1 }
+            i = i + 1
+        }
+        retornar n
+    })
+    sea t = 0
+    para p en partes { t = t + p }
+    retornar t
+}
+
+/// Índice del primer elemento que cumple pred (o -1).
+funcion enjambre_buscar_indice(lista, pred, opciones) {
+    sea partes = _ej_correr(longitud(lista), opciones, funcion(a, b) {
+        sea i = a
+        mientras (i < b) {
+            si (pred(lista[i])) { retornar i }
+            i = i + 1
+        }
+        retornar -1
+    })
+    para p en partes { si (p >= 0) { retornar p } }
+    retornar -1
+}
+
+/// Primer elemento que cumple pred (o nulo).
+funcion enjambre_buscar(lista, pred, opciones) {
+    sea i = enjambre_buscar_indice(lista, pred, opciones)
+    si (i < 0) { retornar nulo }
+    retornar lista[i]
+}
+
+funcion enjambre_alguno(lista, pred, opciones) { retornar enjambre_buscar_indice(lista, pred, opciones) >= 0 }
+funcion enjambre_todos(lista, pred, opciones) { retornar enjambre_buscar_indice(lista, funcion(x) { retornar pred(x) == falso }, opciones) < 0 }
+
+/// f(i) para i en [desde, hasta), en paralelo; resultados en orden.
+funcion enjambre_rango(desde, hasta, f, opciones) {
+    sea n = hasta - desde
+    si (n <= 0) { retornar [] }
+    retornar _ej_concat(_ej_correr(n, opciones, funcion(a, b) {
+        sea r = []
+        sea i = a
+        mientras (i < b) {
+            r.agregar(f(desde + i))
+            i = i + 1
+        }
+        retornar r
+    }))
+}
+
+/// Ordena en paralelo (trozos ordenados a la vez y mezcla estable).
+/// cmp(a, b) negativo/0/positivo; nulo = orden natural.
+funcion enjambre_ordenar(lista, cmp, opciones) {
+    sea c = cmp
+    si (c == nulo) {
+        c = funcion(a, b) {
+            si (a < b) { retornar -1 }
+            si (a > b) { retornar 1 }
+            retornar 0
+        }
+    }
+    sea op = opciones ?? {}
+    sea h = op["hilos"] ?? enjambre_hilos()
+    sea partes = _ej_correr(longitud(lista), {"hilos": h, "trozo": techo(longitud(lista) / maximo(h, 1))}, funcion(a, b) {
+        sea t = []
+        sea i = a
+        mientras (i < b) {
+            t.agregar(lista[i])
+            i = i + 1
+        }
+        retornar ordenar(t, c)
+    })
+    // Mezcla por pares (estable: ante empate gana el trozo de la izquierda).
+    mientras (longitud(partes) > 1) {
+        sea sig = []
+        sea i = 0
+        mientras (i < longitud(partes)) {
+            si (i + 1 < longitud(partes)) { sig.agregar(_ej_mezclar(partes[i], partes[i + 1], c)) } sino { sig.agregar(partes[i]) }
+            i = i + 2
+        }
+        partes = sig
+    }
+    si (longitud(partes) == 0) { retornar [] }
+    retornar partes[0]
+}
+
+funcion _ej_mezclar(a, b, c) {
+    sea r = []
+    sea i = 0
+    sea j = 0
+    mientras (i < longitud(a) y j < longitud(b)) {
+        si (c(b[j], a[i]) < 0) {
+            r.agregar(b[j])
+            j = j + 1
+        } sino {
+            r.agregar(a[i])
+            i = i + 1
+        }
+    }
+    mientras (i < longitud(a)) {
+        r.agregar(a[i])
+        i = i + 1
+    }
+    mientras (j < longitud(b)) {
+        r.agregar(b[j])
+        j = j + 1
+    }
+    retornar r
+}
+
+/// Corre dos funciones a la vez y devuelve [resultado_a, resultado_b].
+funcion enjambre_unir(fa, fb) {
+    sea t = tarea(fb)
+    sea ra = nulo
+    sea err = nulo
+    intentar { ra = fa() } capturar (e) { err = e }
+    sea rb = esperar(t)
+    si (err != nulo) { lanzar err }
+    retornar [ra, rb]
+}
+
+/// Corre una lista de funciones a la vez; resultados en orden.
+funcion enjambre_todas(funciones) {
+    retornar enjambre_mapear(funciones, funcion(f) { retornar f() }, {"trozo": 1})
+}
