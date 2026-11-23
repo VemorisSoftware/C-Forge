@@ -117,7 +117,7 @@ Estado: ✅ ya existe en C-Forge · 🔗 se usa hoy vía `cforge bindgen`,
 |---|---|---|---|---|
 | 82 | `llamada` / `protobuf` | RPC binario | gRPC, Protobuf | ✅ `llamada` |
 | 83 | `veloz` | QUIC y HTTP/3 | Quinn | 🛠 |
-| 84 | `buzon` | Mensajería entre procesos | ZeroMQ | 🛠 |
+| 84 | `buzon` / `zeromq` | Mensajería entre procesos | ZeroMQ | ✅ `buzon` |
 | 85 | `malla` | Redes P2P | libp2p | 🛠 |
 | 86 | `tunel` | VPN criptográfica | WireGuard | 🛠 |
 | 87 | `certifica` | Certificados HTTPS automáticos | ACME | 🛠 |
@@ -137,7 +137,7 @@ Estado: ✅ ya existe en C-Forge · 🔗 se usa hoy vía `cforge bindgen`,
 |---|---|---|---|---|
 | 97 | `archivo_kv` / `kvstore` | Clave-valor en disco | RocksDB | ✅ `archivo_kv` |
 | 98 | `analitica` | SQL analítico embebido | DuckDB | 🔗 |
-| 99 | `cofre` | Base embebida ACID | sled, redb | 🛠 |
+| 99 | `cofre` / `embeddb` | Base embebida ACID | sled, redb | ✅ `cofre` |
 | 100 | `paquete_bin` / `msgpack` | Serialización binaria compacta | MessagePack | ✅ `paquete_bin` |
 | 101 | `sin_copia` / `flatbuffers` | Serialización zero-copy | FlatBuffers | ✅ `sin_copia` |
 | 102 | `columnas` / `columnar` | Formato columnar | Arrow, Parquet | ✅ `columnas` |
@@ -200,7 +200,7 @@ Estado: ✅ ya existe en C-Forge · 🔗 se usa hoy vía `cforge bindgen`,
 | 144 | `contenedor` | Controlar Docker | Bollard | 🛠 |
 | 145 | `version` | Versionado semántico | semver | ✅ gestor de paquetes |
 | 146 | `cronometro` / `bench` | Micro-benchmarks estadísticos | Criterion | ✅ `cronometro` |
-| 147 | `huesped` | Ejecutar WebAssembly embebido | Wasmtime | 🛠 |
+| 147 | `huesped` / `wasm` | Ejecutar WebAssembly embebido | Wasmtime | ✅ `huesped` |
 | 148 | `jit` | Código máquina en tiempo de ejecución | Cranelift | 🛠 |
 | 149 | `diagnostico` / `diagnostics` | Errores con flechas y colores | Miette | ✅ `diagnostico` |
 | 150 | `canal` | Canales sin bloqueo | Crossbeam | ✅ canales en `concurrencia` |
@@ -224,7 +224,7 @@ Estado: ✅ ya existe en C-Forge · 🔗 se usa hoy vía `cforge bindgen`,
 | 161 | `federa` / `oidc` | OAuth2 y OpenID Connect | OAuth2 | ✅ `federa` |
 | 162 | `segundo_factor` / `totp` | TOTP y Passkeys | TOTP, WebAuthn | ✅ `segundo_factor` |
 | 163 | `antivirus` | Escaneo por firmas | ClamAV | 🔗 |
-| 164 | `centinela` | Detección de intrusos | Suricata | 🛠 |
+| 164 | `centinela` / `suricata` | Detección de intrusos | Suricata | ✅ `centinela` |
 | 165 | `secretos` / `secrets` | Secretos cifrados en repos | sops | ✅ `secretos` |
 | 166 | `apreton` / `noise_protocol` | Protocolo Noise | snow | ✅ `apreton` |
 
@@ -295,7 +295,7 @@ Estado: ✅ ya existe en C-Forge · 🔗 se usa hoy vía `cforge bindgen`,
 | 212 | `traza` / `tracing` | Trazas y métricas distribuidas | OpenTelemetry | ✅ `traza` |
 | 213 | `metricas` / `metrics` | Métricas en tiempo real | Prometheus | ✅ `metricas` |
 | 214 | `flujo` | Streaming de eventos | Kafka | 🔗 |
-| 215 | `correo_rapido` | Mensajería entre microservicios | NATS | 🛠 |
+| 215 | `correo_rapido` / `nats` | Mensajería entre microservicios | NATS | ✅ `correo_rapido` |
 | 216 | `colas` / `amqp` | Colas AMQP | RabbitMQ | ✅ `colas` |
 | 217 | `descubre` / `discovery` | Descubrimiento de servicios | etcd, Consul | ✅ `descubre` |
 | 218 | `objetos` / `s3` | Almacenamiento compatible con S3 | MinIO | ✅ `objetos` |

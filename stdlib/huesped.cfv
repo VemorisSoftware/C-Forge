@@ -1,0 +1,1644 @@
+// stdlib/huesped.cfv — ejecutar WebAssembly embebido al estilo Wasmtime y
+// wasm3: lee módulos .wasm (tipos, importaciones, funciones, tablas,
+// memoria, globales, exportaciones, inicio, elementos, datos), los valida
+// lo justo para ejecutarlos, y los interpreta con todo el conjunto MVP
+// (control estructurado con bloques multivalor, llamadas directas e
+// indirectas, i32 e i64 completos con aritmética modular exacta, f32 y
+// f64, conversiones y reinterpretaciones, cargas y guardados con todos los
+// anchos, memory.grow) más extensiones comunes (extensión de signo,
+// truncado saturado, memory.copy y memory.fill). Las importaciones son
+// funciones de C-Forge; las trampas (división por cero, acceso fuera de
+// la memoria, unreachable) se lanzan como errores. Los i64 se representan
+// como pares [alto, bajo] de 32 bits. Idea de Wasmtime y wasm3 (Apache/MIT).
+// En inglés: importar "wasm".
+//
+//   importar "huesped"
+//   sea inst = huesped_instanciar(leer_archivo("suma.wasm"), {"env": {"log": funcion(x) { mostrar(x) }}})
+//   mostrar(huesped_llamar(inst, "sumar", [2, 3]))
+
+sea _HU_2_32 = 4294967296
+sea _HU_2_31 = 2147483648
+sea _HU_INF = 1e308 * 10
+sea _HU_NAN = _HU_INF - _HU_INF
+
+// En C-Forge NaN == NaN da verdadero, así que se reconoce por su texto.
+funcion _hu_nan(v) {
+    si (tipo(v) == "texto" o tipo(v) == "lista" o v == nulo) { retornar falso }
+    sea t = "" + v
+    retornar t == "nan" o t == "-nan"
+}
+
+// ---------- lectura binaria ----------
+
+funcion _hu_u8(st) {
+    sea b = byte_en(st["t"], st["p"])
+    st["p"] = st["p"] + 1
+    retornar b
+}
+
+funcion _hu_uleb(st) {
+    sea v = 0
+    sea f = 1
+    mientras (verdadero) {
+        sea b = _hu_u8(st)
+        v = v + (b % 128) * f
+        si (b < 128) { retornar v }
+        f = f * 128
+    }
+}
+
+funcion _hu_sleb32(st) {
+    sea v = 0
+    sea f = 1
+    sea b = 0
+    mientras (verdadero) {
+        b = _hu_u8(st)
+        v = v + (b % 128) * f
+        f = f * 128
+        si (b < 128) { romper }
+    }
+    si (piso(b / 64) % 2 == 1) { v = v - f }
+    // A u32.
+    retornar ((v % _HU_2_32) + _HU_2_32) % _HU_2_32
+}
+
+// LEB128 con signo de 64 bits como par [alto, bajo].
+funcion _hu_sleb64(st) {
+    sea grupos = []
+    sea b = 0
+    mientras (verdadero) {
+        b = _hu_u8(st)
+        grupos.agregar(b % 128)
+        si (b < 128) { romper }
+    }
+    sea v = [0, 0]
+    sea i = longitud(grupos) - 1
+    mientras (i >= 0) {
+        v = _hu_shl64(v, 7)
+        v = [v[0], v[1] + grupos[i]]
+        i = i - 1
+    }
+    sea bits_t = longitud(grupos) * 7
+    si (piso(b / 64) % 2 == 1 y bits_t < 64) {
+        sea unos = _hu_shl64([_HU_2_32 - 1, _HU_2_32 - 1], bits_t)
+        v = [bits_o(v[0], unos[0]), bits_o(v[1], unos[1])]
+    }
+    retornar v
+}
+
+funcion _hu_nombre(st) {
+    sea n = _hu_uleb(st)
+    sea r = subcadena(st["t"], st["p"], st["p"] + n)
+    st["p"] = st["p"] + n
+    retornar r
+}
+
+sea _HU_TIPOS = {"127": "i32", "126": "i64", "125": "f32", "124": "f64", "112": "funcref", "111": "externref", "123": "v128"}
+
+funcion _hu_tipo_valor(st) {
+    sea b = _hu_u8(st)
+    sea t = _HU_TIPOS["" + b] ?? nulo
+    si (t == nulo) { lanzar "wasm: tipo de valor desconocido " + b }
+    retornar t
+}
+
+funcion _hu_limites(st) {
+    sea fl = _hu_u8(st)
+    sea mn = _hu_uleb(st)
+    sea mx = nulo
+    si (fl % 2 == 1) { mx = _hu_uleb(st) }
+    retornar {"min": mn, "max": mx}
+}
+
+// Expresión constante (init de globales, desplazamientos).
+funcion _hu_const(st, globales) {
+    sea op = _hu_u8(st)
+    sea v = nulo
+    si (op == 65) { v = _hu_sleb32(st) }
+    sino si (op == 66) { v = _hu_sleb64(st) }
+    sino si (op == 67) {
+        v = _sc_de_ieee_hu(st["t"], st["p"], 4)
+        st["p"] = st["p"] + 4
+    } sino si (op == 68) {
+        v = _sc_de_ieee_hu(st["t"], st["p"], 8)
+        st["p"] = st["p"] + 8
+    } sino si (op == 35) { v = globales[_hu_uleb(st)]["valor"] }
+    sino si (op == 208) {
+        _hu_u8(st)
+        v = nulo
+    } sino si (op == 210) { v = _hu_uleb(st) }
+    sino { lanzar "wasm: expresión constante no soportada " + op }
+    si (_hu_u8(st) != 11) { lanzar "wasm: falta end en expresión constante" }
+    retornar v
+}
+
+// ---------- flotantes (IEEE 754 a mano) ----------
+
+funcion _sc_de_ieee_hu(b, p, ancho) {
+    sea alto = byte_en(b, p + ancho - 1)
+    sea s = 1
+    si (alto >= 128) { s = -1 }
+    sea ex = 0
+    sea mant = 0
+    sea bits = 52
+    sea sesgo = 1023
+    sea emax = 2047
+    si (ancho == 8) {
+        ex = (alto % 128) * 16 + piso(byte_en(b, p + 6) / 16)
+        mant = (byte_en(b, p + 6) % 16) * 281474976710656
+        sea k = 5
+        sea m2 = 0
+        mientras (k >= 0) {
+            m2 = m2 * 256 + byte_en(b, p + k)
+            k = k - 1
+        }
+        mant = mant + m2
+    } sino {
+        bits = 23
+        sesgo = 127
+        emax = 255
+        ex = (alto % 128) * 2 + piso(byte_en(b, p + 2) / 128)
+        mant = (byte_en(b, p + 2) % 128) * 65536 + byte_en(b, p + 1) * 256 + byte_en(b, p)
+    }
+    si (ex == emax) {
+        si (mant == 0) { retornar s * 1e308 * 10 }
+        retornar _HU_NAN
+    }
+    si (ex == 0) {
+        retornar s * mant * potencia(2, 1 - sesgo - bits)
+    }
+    retornar s * (1 + mant / potencia(2, bits)) * potencia(2, ex - sesgo)
+}
+
+// Bits de un f32 como u32 (redondeo al par más cercano).
+funcion _hu_f32_bits(v) {
+    si (_hu_nan(v)) { retornar 2143289344 }
+    sea s = 0
+    sea m = v
+    si (v < 0) {
+        s = 1
+        m = 0 - v
+    }
+    si (m == 0) { retornar s * _HU_2_31 }
+    si (m > 3.4028235677973366e38) { retornar s * _HU_2_31 + 2139095040 }
+    sea e = 0
+    mientras (m >= 2) {
+        m = m / 2
+        e = e + 1
+    }
+    mientras (m < 1 y e > -126) {
+        m = m * 2
+        e = e - 1
+    }
+    sea ex = 0
+    sea mant = 0
+    si (m < 1) {
+        // Subnormal.
+        mant = _hu_redondear_par(m * 8388608)
+        si (mant >= 8388608) {
+            ex = 1
+            mant = mant - 8388608
+        }
+    } sino {
+        ex = e + 127
+        mant = _hu_redondear_par((m - 1) * 8388608)
+        si (mant >= 8388608) {
+            mant = 0
+            ex = ex + 1
+        }
+        si (ex >= 255) { retornar s * _HU_2_31 + 2139095040 }
+    }
+    retornar s * _HU_2_31 + ex * 8388608 + mant
+}
+
+funcion _hu_redondear_par(x) {
+    sea f = piso(x)
+    sea d = x - f
+    si (d > 0.5) { retornar f + 1 }
+    si (d < 0.5) { retornar f }
+    si (f % 2 == 0) { retornar f }
+    retornar f + 1
+}
+
+funcion _hu_f32_de_bits(u) { retornar _sc_de_ieee_hu(bytes_entero(u, 4, 1), 0, 4) }
+
+// Redondea un número a precisión f32.
+funcion _hu_f32(v) {
+    si (_hu_nan(v)) { retornar v }
+    si (v == 0) { retornar v }
+    retornar _hu_f32_de_bits(_hu_f32_bits(v))
+}
+
+// Bits de un f64 como par [alto, bajo].
+funcion _hu_f64_bits(v) {
+    si (_hu_nan(v)) { retornar [2146959360, 0] }
+    sea s = 0
+    sea m = v
+    si (v < 0) {
+        s = 1
+        m = 0 - v
+    }
+    si (m == 0) { retornar [s * _HU_2_31, 0] }
+    si (m > 1.7976931348623157e308) { retornar [s * _HU_2_31 + 2146435072, 0] }
+    sea e = 0
+    mientras (m >= 2) {
+        m = m / 2
+        e = e + 1
+    }
+    mientras (m < 1 y e > -1022) {
+        m = m * 2
+        e = e - 1
+    }
+    sea ex = 0
+    sea mant = 0
+    si (m < 1) { mant = _hu_redondear_par(m * 4503599627370496) } sino {
+        ex = e + 1023
+        mant = _hu_redondear_par((m - 1) * 4503599627370496)
+        si (mant >= 4503599627370496) {
+            mant = 0
+            ex = ex + 1
+        }
+    }
+    sea hi = s * _HU_2_31 + ex * 1048576 + piso(mant / _HU_2_32)
+    retornar [hi, mant % _HU_2_32]
+}
+
+funcion _hu_f64_de_bits(par) { retornar _sc_de_ieee_hu(bytes_entero(par[1], 4, 1) + bytes_entero(par[0], 4, 1), 0, 8) }
+
+// ---------- enteros de 32 bits (u32 canónicos) ----------
+
+funcion _hu_s32(a) {
+    si (a >= _HU_2_31) { retornar a - _HU_2_32 }
+    retornar a
+}
+
+funcion _hu_u32(a) { retornar ((a % _HU_2_32) + _HU_2_32) % _HU_2_32 }
+
+funcion _hu_mul32(a, b) {
+    sea al = a % 65536
+    sea ah = piso(a / 65536)
+    retornar (al * b + ((ah * b) % 65536) * 65536) % _HU_2_32
+}
+
+funcion _hu_shl32(a, n) { retornar (a * potencia(2, n % 32)) % _HU_2_32 }
+funcion _hu_shr_u32(a, n) { retornar piso(a / potencia(2, n % 32)) }
+funcion _hu_shr_s32(a, n) { retornar _hu_u32(piso(_hu_s32(a) / potencia(2, n % 32))) }
+
+funcion _hu_rotl32(a, n) {
+    sea k = n % 32
+    si (k == 0) { retornar a }
+    retornar _hu_shl32(a, k) + _hu_shr_u32(a, 32 - k)
+}
+
+funcion _hu_clz32(a) {
+    si (a == 0) { retornar 32 }
+    sea n = 0
+    sea x = a
+    mientras (x < _HU_2_31) {
+        x = x * 2
+        n = n + 1
+    }
+    retornar n
+}
+
+funcion _hu_ctz32(a) {
+    si (a == 0) { retornar 32 }
+    sea n = 0
+    sea x = a
+    mientras (x % 2 == 0) {
+        x = x / 2
+        n = n + 1
+    }
+    retornar n
+}
+
+funcion _hu_popcnt32(a) {
+    sea n = 0
+    sea x = a
+    mientras (x > 0) {
+        n = n + x % 2
+        x = piso(x / 2)
+    }
+    retornar n
+}
+
+funcion _hu_bit32(op, a, b) {
+    si (op == "y") { retornar bits_y(a, b) }
+    si (op == "o") { retornar bits_o(a, b) }
+    retornar bits_xo(a, b)
+}
+
+// División truncada hacia cero.
+funcion _hu_div_trunc(a, b) {
+    sea q = a / b
+    si (q < 0) { retornar 0 - piso(0 - q) }
+    retornar piso(q)
+}
+
+// ---------- enteros de 64 bits como [alto, bajo] ----------
+
+funcion _hu_i64(n) {
+    // Desde un entero de C-Forge (|n| < 2^61).
+    si (n >= 0) { retornar [piso(n / _HU_2_32) % _HU_2_32, n % _HU_2_32] }
+    sea p = _hu_i64(0 - n)
+    retornar _hu_neg64(p)
+}
+
+funcion _hu_a_numero64(p, con_signo) {
+    si (con_signo y p[0] >= _HU_2_31) { retornar 0 - _hu_a_numero64(_hu_neg64(p), falso) }
+    retornar p[0] * _HU_2_32 + p[1]
+}
+
+funcion _hu_add64(a, b) {
+    sea lo = a[1] + b[1]
+    sea c = 0
+    si (lo >= _HU_2_32) {
+        lo = lo - _HU_2_32
+        c = 1
+    }
+    retornar [(a[0] + b[0] + c) % _HU_2_32, lo]
+}
+
+funcion _hu_neg64(a) {
+    sea lo = (_HU_2_32 - a[1]) % _HU_2_32
+    sea hi = (_HU_2_32 - a[0] - 1) % _HU_2_32
+    si (a[1] == 0) { hi = (_HU_2_32 - a[0]) % _HU_2_32 }
+    retornar [hi, lo]
+}
+
+funcion _hu_sub64(a, b) { retornar _hu_add64(a, _hu_neg64(b)) }
+
+funcion _hu_mul64(a, b) {
+    // (ah·2^32 + al)(bh·2^32 + bl) mod 2^64 = al·bl + (ah·bl + al·bh)·2^32
+    sea al = a[1]
+    sea bl = b[1]
+    // al·bl completo con mitades de 16 bits.
+    sea a0 = al % 65536
+    sea a1 = piso(al / 65536)
+    sea b0 = bl % 65536
+    sea b1 = piso(bl / 65536)
+    sea p00 = a0 * b0
+    sea p01 = a0 * b1
+    sea p10 = a1 * b0
+    sea p11 = a1 * b1
+    sea medio = p01 + p10 + piso(p00 / 65536)
+    sea lo = (p00 % 65536) + (medio % 65536) * 65536
+    sea hi = p11 + piso(medio / 65536) + piso(lo / _HU_2_32)
+    lo = lo % _HU_2_32
+    hi = (hi + _hu_mul32(a[0], bl) + _hu_mul32(al, b[0])) % _HU_2_32
+    retornar [hi, lo]
+}
+
+funcion _hu_cmp64u(a, b) {
+    si (a[0] != b[0]) {
+        si (a[0] < b[0]) { retornar -1 }
+        retornar 1
+    }
+    si (a[1] < b[1]) { retornar -1 }
+    si (a[1] > b[1]) { retornar 1 }
+    retornar 0
+}
+
+funcion _hu_cmp64s(a, b) {
+    sea na = a[0] >= _HU_2_31
+    sea nb = b[0] >= _HU_2_31
+    si (na != nb) {
+        si (na) { retornar -1 }
+        retornar 1
+    }
+    retornar _hu_cmp64u(a, b)
+}
+
+funcion _hu_shl64(a, n) {
+    sea k = n % 64
+    si (k == 0) { retornar a }
+    si (k >= 32) { retornar [_hu_shl32(a[1], k - 32), 0] }
+    retornar [(_hu_shl32(a[0], k) + _hu_shr_u32(a[1], 32 - k)) % _HU_2_32, _hu_shl32(a[1], k)]
+}
+
+funcion _hu_shr64u(a, n) {
+    sea k = n % 64
+    si (k == 0) { retornar a }
+    si (k >= 32) { retornar [0, _hu_shr_u32(a[0], k - 32)] }
+    retornar [_hu_shr_u32(a[0], k), (_hu_shr_u32(a[1], k) + _hu_shl32(a[0], 32 - k)) % _HU_2_32]
+}
+
+funcion _hu_shr64s(a, n) {
+    sea k = n % 64
+    si (k == 0) { retornar a }
+    sea neg = a[0] >= _HU_2_31
+    sea r = _hu_shr64u(a, k)
+    si (neg) {
+        // Rellena con unos los k bits altos.
+        sea unos = _hu_shl64([_HU_2_32 - 1, _HU_2_32 - 1], 64 - k)
+        r = [bits_o(r[0], unos[0]), bits_o(r[1], unos[1])]
+    }
+    retornar r
+}
+
+funcion _hu_rotl64(a, n) {
+    sea k = n % 64
+    si (k == 0) { retornar a }
+    sea x = _hu_shl64(a, k)
+    sea y = _hu_shr64u(a, 64 - k)
+    retornar [bits_o(x[0], y[0]), bits_o(x[1], y[1])]
+}
+
+// División sin signo: [cociente, resto].
+funcion _hu_divmod64u(a, b) {
+    si (b[0] == 0 y a[0] == 0) { retornar [[0, piso(a[1] / b[1])], [0, a[1] % b[1]]] }
+    si (b[0] == 0 y b[1] < 2097152) {
+        // Divisor chico: por partes de 21 bits sin desbordar.
+        sea d = b[1]
+        sea qh = piso(a[0] / d)
+        sea r = a[0] % d
+        sea x = r * _HU_2_32 + a[1]
+        // r < 2^21, así que x < 2^53: exacto.
+        sea ql = piso(x / d)
+        retornar [[qh, ql % _HU_2_32 + 0], [0, x % d]]
+    }
+    sea q = [0, 0]
+    sea r = [0, 0]
+    sea i = 63
+    mientras (i >= 0) {
+        r = _hu_shl64(r, 1)
+        sea bit = 0
+        si (i >= 32) { bit = piso(a[0] / potencia(2, i - 32)) % 2 } sino { bit = piso(a[1] / potencia(2, i)) % 2 }
+        r = [r[0], r[1] + bit]
+        si (_hu_cmp64u(r, b) >= 0) {
+            r = _hu_sub64(r, b)
+            si (i >= 32) { q = [q[0] + potencia(2, i - 32), q[1]] } sino { q = [q[0], q[1] + potencia(2, i)] }
+        }
+        i = i - 1
+    }
+    retornar [q, r]
+}
+
+funcion _hu_divmod64s(a, b) {
+    sea na = a[0] >= _HU_2_31
+    sea nb = b[0] >= _HU_2_31
+    sea ua = a
+    sea ub = b
+    si (na) { ua = _hu_neg64(a) }
+    si (nb) { ub = _hu_neg64(b) }
+    sea r = _hu_divmod64u(ua, ub)
+    sea q = r[0]
+    sea m = r[1]
+    si (na != nb) { q = _hu_neg64(q) }
+    si (na) { m = _hu_neg64(m) }
+    retornar [q, m]
+}
+
+funcion _hu_clz64(a) {
+    si (a[0] != 0) { retornar _hu_clz32(a[0]) }
+    retornar 32 + _hu_clz32(a[1])
+}
+
+funcion _hu_ctz64(a) {
+    si (a[1] != 0) { retornar _hu_ctz32(a[1]) }
+    retornar 32 + _hu_ctz32(a[0])
+}
+
+// Número (flotante) a i64 truncando; nulo si no cabe.
+funcion _hu_trunc_a64(v, con_signo) {
+    si (_hu_nan(v)) { retornar nulo }
+    sea t = v
+    si (t < 0) { t = 0 - piso(0 - t) } sino { t = piso(t) }
+    si (con_signo) {
+        si (t < -9.223372036854775808e18 o t >= 9.223372036854775808e18) { retornar nulo }
+        si (t < 0) { retornar _hu_neg64(_hu_desde_float_u(0 - t)) }
+        retornar _hu_desde_float_u(t)
+    }
+    si (t < 0 o t >= 1.8446744073709551616e19) { retornar nulo }
+    retornar _hu_desde_float_u(t)
+}
+
+funcion _hu_desde_float_u(t) {
+    sea hi = piso(t / _HU_2_32)
+    retornar [hi % _HU_2_32, t - hi * _HU_2_32]
+}
+
+funcion _hu_64_a_float(p, con_signo) {
+    si (con_signo y p[0] >= _HU_2_31) {
+        sea q = _hu_neg64(p)
+        retornar 0 - (q[0] * _HU_2_32 + q[1])
+    }
+    retornar p[0] * _HU_2_32 + p[1]
+}
+
+// ---------- módulo ----------
+
+/// Lee un módulo .wasm: {"tipos", "importaciones", "funciones", "tablas",
+/// "memorias", "globales", "exportaciones", "inicio", "elementos", "datos"}.
+funcion huesped_modulo(datos) {
+    si (subcadena(datos, 0, 4) != bytes_entero(0, 1, 0) + "asm") { lanzar "wasm: falta la marca \\0asm" }
+    sea st = {"t": datos, "p": 8}
+    sea m = {"tipos": [], "importaciones": [], "funciones": [], "tablas": [], "memorias": [], "globales": [], "exportaciones": {}, "inicio": nulo, "elementos": [], "datos": [], "cuerpos": [], "personalizadas": {}}
+    sea tipos_func = []
+    mientras (st["p"] < longitud(datos)) {
+        sea id = _hu_u8(st)
+        sea tam = _hu_uleb(st)
+        sea fin = st["p"] + tam
+        si (id == 0) {
+            sea nombre = _hu_nombre(st)
+            m["personalizadas"][nombre] = subcadena(datos, st["p"], fin)
+        } sino si (id == 1) {
+            sea n = _hu_uleb(st)
+            sea i = 0
+            mientras (i < n) {
+                si (_hu_u8(st) != 96) { lanzar "wasm: tipo de función mal formado" }
+                sea np = _hu_uleb(st)
+                sea ps = []
+                sea k = 0
+                mientras (k < np) {
+                    ps.agregar(_hu_tipo_valor(st))
+                    k = k + 1
+                }
+                sea nr = _hu_uleb(st)
+                sea rs = []
+                k = 0
+                mientras (k < nr) {
+                    rs.agregar(_hu_tipo_valor(st))
+                    k = k + 1
+                }
+                m["tipos"].agregar({"params": ps, "resultados": rs})
+                i = i + 1
+            }
+        } sino si (id == 2) {
+            sea n = _hu_uleb(st)
+            sea i = 0
+            mientras (i < n) {
+                sea mod = _hu_nombre(st)
+                sea nom = _hu_nombre(st)
+                sea k = _hu_u8(st)
+                sea imp = {"modulo": mod, "nombre": nom, "clase": k}
+                si (k == 0) { imp["tipo"] = _hu_uleb(st) }
+                sino si (k == 1) {
+                    imp["ref"] = _hu_u8(st)
+                    imp["limites"] = _hu_limites(st)
+                } sino si (k == 2) { imp["limites"] = _hu_limites(st) }
+                sino si (k == 3) {
+                    imp["tipo_valor"] = _hu_tipo_valor(st)
+                    imp["mutable"] = _hu_u8(st) == 1
+                }
+                m["importaciones"].agregar(imp)
+                i = i + 1
+            }
+        } sino si (id == 3) {
+            sea n = _hu_uleb(st)
+            sea i = 0
+            mientras (i < n) {
+                tipos_func.agregar(_hu_uleb(st))
+                i = i + 1
+            }
+        } sino si (id == 4) {
+            sea n = _hu_uleb(st)
+            sea i = 0
+            mientras (i < n) {
+                sea r = _hu_u8(st)
+                m["tablas"].agregar({"ref": r, "limites": _hu_limites(st)})
+                i = i + 1
+            }
+        } sino si (id == 5) {
+            sea n = _hu_uleb(st)
+            sea i = 0
+            mientras (i < n) {
+                m["memorias"].agregar(_hu_limites(st))
+                i = i + 1
+            }
+        } sino si (id == 6) {
+            sea n = _hu_uleb(st)
+            sea i = 0
+            mientras (i < n) {
+                sea tv = _hu_tipo_valor(st)
+                sea mut = _hu_u8(st) == 1
+                // La expresión se guarda para evaluarla al instanciar.
+                sea ini = st["p"]
+                _hu_saltar_const(st)
+                m["globales"].agregar({"tipo": tv, "mutable": mut, "init": subcadena(datos, ini, st["p"])})
+                i = i + 1
+            }
+        } sino si (id == 7) {
+            sea n = _hu_uleb(st)
+            sea i = 0
+            mientras (i < n) {
+                sea nom = _hu_nombre(st)
+                sea k = _hu_u8(st)
+                m["exportaciones"][nom] = {"clase": k, "indice": _hu_uleb(st)}
+                i = i + 1
+            }
+        } sino si (id == 8) { m["inicio"] = _hu_uleb(st) }
+        sino si (id == 9) {
+            sea n = _hu_uleb(st)
+            sea i = 0
+            mientras (i < n) {
+                sea fl = _hu_uleb(st)
+                sea el = {"tabla": 0, "offset": nulo, "funciones": [], "pasivo": falso}
+                si (fl == 0) {
+                    sea ini = st["p"]
+                    _hu_saltar_const(st)
+                    el["offset"] = subcadena(datos, ini, st["p"])
+                    sea c = _hu_uleb(st)
+                    sea k = 0
+                    mientras (k < c) {
+                        el["funciones"].agregar(_hu_uleb(st))
+                        k = k + 1
+                    }
+                } sino si (fl == 2) {
+                    el["tabla"] = _hu_uleb(st)
+                    sea ini = st["p"]
+                    _hu_saltar_const(st)
+                    el["offset"] = subcadena(datos, ini, st["p"])
+                    _hu_u8(st)
+                    sea c = _hu_uleb(st)
+                    sea k = 0
+                    mientras (k < c) {
+                        el["funciones"].agregar(_hu_uleb(st))
+                        k = k + 1
+                    }
+                } sino si (fl == 1 o fl == 3) {
+                    _hu_u8(st)
+                    el["pasivo"] = verdadero
+                    sea c = _hu_uleb(st)
+                    sea k = 0
+                    mientras (k < c) {
+                        el["funciones"].agregar(_hu_uleb(st))
+                        k = k + 1
+                    }
+                } sino { lanzar "wasm: segmento de elementos no soportado " + fl }
+                m["elementos"].agregar(el)
+                i = i + 1
+            }
+        } sino si (id == 10) {
+            sea n = _hu_uleb(st)
+            sea i = 0
+            mientras (i < n) {
+                sea tam_c = _hu_uleb(st)
+                sea fin_c = st["p"] + tam_c
+                sea grupos = _hu_uleb(st)
+                sea locales = []
+                sea g = 0
+                mientras (g < grupos) {
+                    sea c = _hu_uleb(st)
+                    sea tv = _hu_tipo_valor(st)
+                    sea k = 0
+                    mientras (k < c) {
+                        locales.agregar(tv)
+                        k = k + 1
+                    }
+                    g = g + 1
+                }
+                m["cuerpos"].agregar({"locales": locales, "codigo": subcadena(datos, st["p"], fin_c)})
+                st["p"] = fin_c
+                i = i + 1
+            }
+        } sino si (id == 11) {
+            sea n = _hu_uleb(st)
+            sea i = 0
+            mientras (i < n) {
+                sea fl = _hu_uleb(st)
+                sea d = {"memoria": 0, "offset": nulo, "pasivo": falso}
+                si (fl == 1) { d["pasivo"] = verdadero } sino {
+                    si (fl == 2) { d["memoria"] = _hu_uleb(st) }
+                    sea ini = st["p"]
+                    _hu_saltar_const(st)
+                    d["offset"] = subcadena(datos, ini, st["p"])
+                }
+                sea c = _hu_uleb(st)
+                d["bytes"] = subcadena(datos, st["p"], st["p"] + c)
+                st["p"] = st["p"] + c
+                m["datos"].agregar(d)
+                i = i + 1
+            }
+        } sino si (id == 12) { _hu_uleb(st) }
+        st["p"] = fin
+    }
+    sea i = 0
+    mientras (i < longitud(tipos_func)) {
+        m["funciones"].agregar({"tipo": tipos_func[i], "locales": m["cuerpos"][i]["locales"], "codigo": m["cuerpos"][i]["codigo"], "decod": nulo})
+        i = i + 1
+    }
+    retornar m
+}
+
+funcion _hu_saltar_const(st) {
+    mientras (verdadero) {
+        sea op = _hu_u8(st)
+        si (op == 11) { retornar nulo }
+        si (op == 65) { _hu_sleb32(st) }
+        sino si (op == 66) { _hu_sleb64(st) }
+        sino si (op == 67) { st["p"] = st["p"] + 4 }
+        sino si (op == 68) { st["p"] = st["p"] + 8 }
+        sino si (op == 35 o op == 210) { _hu_uleb(st) }
+        sino si (op == 208) { _hu_u8(st) }
+    }
+}
+
+// ---------- decodificación de cuerpos ----------
+// Instrucción: [opcode, inmediato1, inmediato2]. Los bloques llevan el
+// índice del end (y del else) para saltar sin buscar.
+
+funcion _hu_tipo_bloque(st, m) {
+    sea b = byte_en(st["t"], st["p"])
+    si (b == 64) {
+        st["p"] = st["p"] + 1
+        retornar [0, 0]
+    }
+    si (tiene_clave(_HU_TIPOS, "" + b)) {
+        st["p"] = st["p"] + 1
+        retornar [0, 1]
+    }
+    sea idx = _hu_sleb32(st)
+    sea t = m["tipos"][idx]
+    retornar [longitud(t["params"]), longitud(t["resultados"])]
+}
+
+funcion _hu_decodificar(m, codigo) {
+    sea st = {"t": codigo, "p": 0}
+    sea ins = []
+    sea pila = []
+    mientras (st["p"] < longitud(codigo)) {
+        sea op = _hu_u8(st)
+        sea a = nulo
+        sea b = nulo
+        si (op == 2 o op == 3 o op == 4) {
+            a = _hu_tipo_bloque(st, m)
+            pila.agregar(longitud(ins))
+        } sino si (op == 5) {
+            // else: marca el if.
+            ins[pila[longitud(pila) - 1]][2] = longitud(ins)
+        } sino si (op == 11) {
+            si (longitud(pila) > 0) {
+                sea ini = pila[longitud(pila) - 1]
+                pila = _hu_sacar(pila)
+                ins[ini].agregar(longitud(ins))
+                // Si hubo else, el else también apunta al end.
+                si (ins[ini][2] != nulo) { ins[ins[ini][2]][1] = longitud(ins) }
+            }
+        } sino si (op == 12 o op == 13 o op == 16 o op == 32 o op == 33 o op == 34 o op == 35 o op == 36 o op == 210) { a = _hu_uleb(st) }
+        sino si (op == 14) {
+            sea n = _hu_uleb(st)
+            sea l = []
+            sea k = 0
+            mientras (k < n) {
+                l.agregar(_hu_uleb(st))
+                k = k + 1
+            }
+            a = l
+            b = _hu_uleb(st)
+        } sino si (op == 17) {
+            a = _hu_uleb(st)
+            b = _hu_uleb(st)
+        } sino si (op == 28) {
+            sea n = _hu_uleb(st)
+            sea k = 0
+            mientras (k < n) {
+                _hu_u8(st)
+                k = k + 1
+            }
+        } sino si (op >= 40 y op <= 62) {
+            a = _hu_uleb(st)
+            b = _hu_uleb(st)
+        } sino si (op == 63 o op == 64) { _hu_u8(st) }
+        sino si (op == 65) { a = _hu_sleb32(st) }
+        sino si (op == 66) { a = _hu_sleb64(st) }
+        sino si (op == 67) {
+            a = _hu_u32(bytes_leer_entero(codigo, st["p"], 4, 1))
+            st["p"] = st["p"] + 4
+        } sino si (op == 68) {
+            a = _sc_de_ieee_hu(codigo, st["p"], 8)
+            st["p"] = st["p"] + 8
+        } sino si (op == 208) { _hu_u8(st) }
+        sino si (op == 252) {
+            a = _hu_uleb(st)
+            si (a == 10) {
+                _hu_u8(st)
+                _hu_u8(st)
+            } sino si (a == 11) { _hu_u8(st) }
+            sino si (a == 8) {
+                b = _hu_uleb(st)
+                _hu_u8(st)
+            } sino si (a == 9) { b = _hu_uleb(st) }
+        }
+        ins.agregar([op, a, b])
+    }
+    retornar ins
+}
+
+funcion _hu_sacar(l) {
+    quitar_ultimo(l)
+    retornar l
+}
+
+// ---------- instanciar ----------
+
+funcion _hu_valor_inicial(t) {
+    si (t == "i64") { retornar [0, 0] }
+    si (t == "i32") { retornar 0 }
+    si (t == "funcref" o t == "externref") { retornar nulo }
+    retornar 0.0
+}
+
+/// Instancia un módulo (bytes o ya leído). importaciones: {"modulo":
+/// {"nombre": función | {"memoria": inst} | valor global}}. Las funciones
+/// importadas reciben y devuelven números de C-Forge (los i64 como
+/// enteros).
+funcion huesped_instanciar(datos, importaciones) {
+    sea m = datos
+    si (tipo(datos) == "texto") { m = huesped_modulo(datos) }
+    sea imp = importaciones ?? {}
+    sea inst = {"m": m, "funcs": [], "tablas": [], "memoria": nulo, "max_paginas": 65536, "globales": [], "profundidad": 0, "combustible": nulo}
+    // Importaciones.
+    para i en m["importaciones"] {
+        sea mod = imp[i["modulo"]] ?? nulo
+        si (mod == nulo o tiene_clave(mod, i["nombre"]) == falso) { lanzar "wasm: falta la importación " + i["modulo"] + "." + i["nombre"] }
+        sea v = mod[i["nombre"]]
+        si (i["clase"] == 0) { inst["funcs"].agregar({"host": v, "tipo": m["tipos"][i["tipo"]]}) }
+        sino si (i["clase"] == 2) {
+            si (tipo(v) == "mapa" y tiene_clave(v, "bytes")) { inst["memoria"] = v } sino {
+                inst["memoria"] = _hu_memoria_nueva(i["limites"]["min"])
+            }
+            si (i["limites"]["max"] != nulo) { inst["max_paginas"] = i["limites"]["max"] }
+        } sino si (i["clase"] == 3) {
+            sea val = v
+            si (tipo(v) == "mapa" y tiene_clave(v, "valor")) { val = v["valor"] }
+            si (i["tipo_valor"] == "i64" y tipo(val) != "lista") { val = _hu_i64(val) }
+            inst["globales"].agregar({"tipo": i["tipo_valor"], "mutable": i["mutable"], "valor": val})
+        } sino si (i["clase"] == 1) { inst["tablas"].agregar({"elems": v ?? []}) }
+    }
+    para f en m["funciones"] { inst["funcs"].agregar({"f": f, "tipo": m["tipos"][f["tipo"]]}) }
+    para t en m["tablas"] {
+        sea el = []
+        sea k = 0
+        mientras (k < t["limites"]["min"]) {
+            el.agregar(nulo)
+            k = k + 1
+        }
+        inst["tablas"].agregar({"elems": el, "max": t["limites"]["max"]})
+    }
+    si (longitud(m["memorias"]) > 0) {
+        inst["memoria"] = _hu_memoria_nueva(m["memorias"][0]["min"])
+        si (m["memorias"][0]["max"] != nulo) { inst["max_paginas"] = m["memorias"][0]["max"] }
+    }
+    para g en m["globales"] { inst["globales"].agregar({"tipo": g["tipo"], "mutable": g["mutable"], "valor": _hu_const({"t": g["init"], "p": 0}, inst["globales"])}) }
+    // Elementos activos.
+    para el en m["elementos"] {
+        si (el["pasivo"] == falso) {
+            sea off = _hu_const({"t": el["offset"], "p": 0}, inst["globales"])
+            sea tab = inst["tablas"][el["tabla"]]["elems"]
+            sea k = 0
+            para fi en el["funciones"] {
+                si (off + k >= longitud(tab)) { lanzar "wasm: elementos fuera de la tabla" }
+                tab[off + k] = fi
+                k = k + 1
+            }
+        }
+    }
+    // Datos activos.
+    para d en m["datos"] {
+        si (d["pasivo"] == falso) {
+            sea off = _hu_const({"t": d["offset"], "p": 0}, inst["globales"])
+            sea mem = inst["memoria"]["bytes"]
+            si (off + longitud(d["bytes"]) > longitud(mem)) { lanzar "wasm: datos fuera de la memoria" }
+            sea k = 0
+            mientras (k < longitud(d["bytes"])) {
+                mem[off + k] = byte_en(d["bytes"], k)
+                k = k + 1
+            }
+        }
+    }
+    si (m["inicio"] != nulo) { _hu_invocar(inst, m["inicio"], []) }
+    retornar inst
+}
+
+funcion _hu_memoria_nueva(paginas) {
+    sea b = []
+    sea k = 0
+    mientras (k < paginas * 65536) {
+        b.agregar(0)
+        k = k + 1
+    }
+    retornar {"bytes": b, "paginas": paginas}
+}
+
+// ---------- intérprete ----------
+
+funcion _hu_trampa(msj) { lanzar "wasm: trampa: " + msj }
+
+funcion _hu_dir(mem, base, off, n) {
+    sea d = base + off
+    si (d + n > longitud(mem)) { _hu_trampa("acceso fuera de la memoria (" + d + ")") }
+    retornar d
+}
+
+funcion _hu_leer_mem(mem, d, n) {
+    sea v = 0
+    sea k = n - 1
+    mientras (k >= 0) {
+        v = v * 256 + mem[d + k]
+        k = k - 1
+    }
+    retornar v
+}
+
+funcion _hu_escribir_mem(mem, d, v, n) {
+    sea x = v
+    sea k = 0
+    mientras (k < n) {
+        mem[d + k] = x % 256
+        x = piso(x / 256)
+        k = k + 1
+    }
+}
+
+funcion _hu_invocar(inst, idx, args) {
+    sea fn = inst["funcs"][idx]
+    si (tiene_clave(fn, "host")) {
+        // Convierte i64 a número para el anfitrión.
+        sea ps = fn["tipo"]["params"]
+        sea a = []
+        sea k = 0
+        mientras (k < longitud(args)) {
+            si (ps[k] == "i64") { a.agregar(_hu_a_numero64(args[k], verdadero)) }
+            sino si (ps[k] == "i32") { a.agregar(_hu_s32(args[k])) }
+            sino { a.agregar(args[k]) }
+            k = k + 1
+        }
+        sea r = _hu_llamar_host(fn["host"], a, inst)
+        sea rs = fn["tipo"]["resultados"]
+        si (longitud(rs) == 0) { retornar [] }
+        sea vals = r
+        si (longitud(rs) == 1) { vals = [r] }
+        sea out = []
+        k = 0
+        mientras (k < longitud(rs)) {
+            sea v = vals[k]
+            si (rs[k] == "i32") { out.agregar(_hu_u32(piso(v))) }
+            sino si (rs[k] == "i64") { out.agregar(_hu_i64(piso(v))) }
+            sino si (rs[k] == "f32") { out.agregar(_hu_f32(v)) }
+            sino { out.agregar(v) }
+            k = k + 1
+        }
+        retornar out
+    }
+    inst["profundidad"] = inst["profundidad"] + 1
+    si (inst["profundidad"] > 2000) { _hu_trampa("desborde de la pila de llamadas") }
+    sea f = fn["f"]
+    si (f["decod"] == nulo) { f["decod"] = _hu_decodificar(inst["m"], f["codigo"]) }
+    sea locales = []
+    para a en args { locales.agregar(a) }
+    para t en f["locales"] { locales.agregar(_hu_valor_inicial(t)) }
+    sea r = _hu_ejecutar(inst, f["decod"], locales, longitud(fn["tipo"]["resultados"]))
+    inst["profundidad"] = inst["profundidad"] - 1
+    retornar r
+}
+
+funcion _hu_llamar_host(h, a, inst) {
+    sea n = longitud(a)
+    si (n == 0) { retornar h() }
+    si (n == 1) { retornar h(a[0]) }
+    si (n == 2) { retornar h(a[0], a[1]) }
+    si (n == 3) { retornar h(a[0], a[1], a[2]) }
+    si (n == 4) { retornar h(a[0], a[1], a[2], a[3]) }
+    si (n == 5) { retornar h(a[0], a[1], a[2], a[3], a[4]) }
+    retornar h(a[0], a[1], a[2], a[3], a[4], a[5])
+}
+
+// Ejecuta un cuerpo decodificado. Devuelve la lista de resultados.
+funcion _hu_ejecutar(inst, ins, locales, n_res) {
+    sea pila = []
+    // Etiquetas: [destino pc, aridad al saltar, altura de pila, es_bucle].
+    sea etq = [[longitud(ins), n_res, 0, falso]]
+    sea pc = 0
+    sea n = longitud(ins)
+    sea mem = nulo
+    si (inst["memoria"] != nulo) { mem = inst["memoria"]["bytes"] }
+    mientras (pc < n) {
+        sea x = ins[pc]
+        sea op = x[0]
+        pc = pc + 1
+        si (op == 32) { pila.agregar(locales[x[1]]) }
+        sino si (op == 33) {
+            locales[x[1]] = pila[longitud(pila) - 1]
+            pila = _hu_quitar(pila, 1)
+        } sino si (op == 34) { locales[x[1]] = pila[longitud(pila) - 1] }
+        sino si (op == 65 o op == 66 o op == 68) { pila.agregar(x[1]) }
+        sino si (op == 67) { pila.agregar(_hu_f32_de_bits(x[1])) }
+        sino si (op == 2) {
+            // block: [op, [params, resultados], nulo, fin]
+            etq.agregar([x[3], x[1][1], longitud(pila) - x[1][0], falso])
+        } sino si (op == 3) { etq.agregar([pc - 1, x[1][0], longitud(pila) - x[1][0], verdadero]) }
+        sino si (op == 4) {
+            sea c = pila[longitud(pila) - 1]
+            pila = _hu_quitar(pila, 1)
+            etq.agregar([x[3], x[1][1], longitud(pila) - x[1][0], falso])
+            si (c == 0) {
+                si (x[2] != nulo) { pc = x[2] + 1 } sino {
+                    pc = x[3] + 1
+                    etq = _hu_sacar(etq)
+                }
+            }
+        } sino si (op == 5) {
+            // Fin de la rama verdadera: salta al end del if.
+            pc = x[1]
+        } sino si (op == 11) {
+            si (longitud(etq) > 1) { etq = _hu_sacar(etq) }
+        } sino si (op == 12 o op == 13 o op == 14 o op == 15) {
+            sea prof = 0
+            sea saltar = verdadero
+            si (op == 12) { prof = x[1] }
+            sino si (op == 13) {
+                sea c = pila[longitud(pila) - 1]
+                pila = _hu_quitar(pila, 1)
+                saltar = c != 0
+                prof = x[1]
+            } sino si (op == 14) {
+                sea c = pila[longitud(pila) - 1]
+                pila = _hu_quitar(pila, 1)
+                si (c < longitud(x[1])) { prof = x[1][c] } sino { prof = x[2] }
+            } sino { prof = longitud(etq) - 1 }
+            si (saltar) {
+                sea e = etq[longitud(etq) - 1 - prof]
+                // Conserva la aridad del destino encima de la altura.
+                sea ar = e[1]
+                sea vals = []
+                sea k = longitud(pila) - ar
+                mientras (k < longitud(pila)) {
+                    vals.agregar(pila[k])
+                    k = k + 1
+                }
+                sea nueva = []
+                k = 0
+                mientras (k < e[2]) {
+                    nueva.agregar(pila[k])
+                    k = k + 1
+                }
+                para v en vals { nueva.agregar(v) }
+                pila = nueva
+                si (op == 15 o prof == longitud(etq) - 1) { retornar vals }
+                sea quitar = prof + 1
+                si (e[3]) {
+                    // Bucle: vuelve al inicio y conserva su etiqueta.
+                    quitar = prof
+                    pc = e[0] + 1
+                } sino { pc = e[0] + 1 }
+                sea j = 0
+                mientras (j < quitar) {
+                    etq = _hu_sacar(etq)
+                    j = j + 1
+                }
+            }
+        } sino si (op == 16 o op == 17) {
+            sea idx = 0
+            si (op == 16) { idx = x[1] } sino {
+                sea c = pila[longitud(pila) - 1]
+                pila = _hu_quitar(pila, 1)
+                sea tab = inst["tablas"][x[2]]["elems"]
+                si (c >= longitud(tab)) { _hu_trampa("índice fuera de la tabla") }
+                idx = tab[c]
+                si (idx == nulo) { _hu_trampa("elemento de tabla sin inicializar") }
+                sea esperado = inst["m"]["tipos"][x[1]]
+                sea real = inst["funcs"][idx]["tipo"]
+                si (unir(esperado["params"], ",") != unir(real["params"], ",") o unir(esperado["resultados"], ",") != unir(real["resultados"], ",")) { _hu_trampa("firma indirecta distinta") }
+            }
+            sea t = inst["funcs"][idx]["tipo"]
+            sea np = longitud(t["params"])
+            sea args = []
+            sea k = longitud(pila) - np
+            mientras (k < longitud(pila)) {
+                args.agregar(pila[k])
+                k = k + 1
+            }
+            pila = _hu_quitar(pila, np)
+            para v en _hu_invocar(inst, idx, args) { pila.agregar(v) }
+            si (inst["memoria"] != nulo) { mem = inst["memoria"]["bytes"] }
+        } sino si (op == 26) { pila = _hu_quitar(pila, 1) }
+        sino si (op == 27 o op == 28) {
+            sea c = pila[longitud(pila) - 1]
+            sea b = pila[longitud(pila) - 2]
+            sea a = pila[longitud(pila) - 3]
+            pila = _hu_quitar(pila, 3)
+            si (c != 0) { pila.agregar(a) } sino { pila.agregar(b) }
+        } sino si (op == 35) { pila.agregar(inst["globales"][x[1]]["valor"]) }
+        sino si (op == 36) {
+            inst["globales"][x[1]]["valor"] = pila[longitud(pila) - 1]
+            pila = _hu_quitar(pila, 1)
+        } sino si (op >= 40 y op <= 53) {
+            // Cargas.
+            sea base = pila[longitud(pila) - 1]
+            pila = _hu_quitar(pila, 1)
+            sea off = x[2]
+            sea v = nulo
+            si (op == 40) { v = _hu_leer_mem(mem, _hu_dir(mem, base, off, 4), 4) }
+            sino si (op == 41) {
+                sea d = _hu_dir(mem, base, off, 8)
+                v = [_hu_leer_mem(mem, d + 4, 4), _hu_leer_mem(mem, d, 4)]
+            } sino si (op == 42) { v = _hu_f32_de_bits(_hu_leer_mem(mem, _hu_dir(mem, base, off, 4), 4)) }
+            sino si (op == 43) {
+                sea d = _hu_dir(mem, base, off, 8)
+                v = _hu_f64_de_bits([_hu_leer_mem(mem, d + 4, 4), _hu_leer_mem(mem, d, 4)])
+            } sino {
+                // i32/i64 load8/16/32 con y sin signo.
+                sea ancho = 1
+                si (op == 46 o op == 47 o op == 50 o op == 51) { ancho = 2 }
+                si (op == 52 o op == 53) { ancho = 4 }
+                sea con_signo = op == 44 o op == 46 o op == 48 o op == 50 o op == 52
+                sea raw = _hu_leer_mem(mem, _hu_dir(mem, base, off, ancho), ancho)
+                sea es64 = op >= 48
+                si (con_signo y raw >= potencia(2, ancho * 8 - 1)) {
+                    si (es64) { v = _hu_i64(raw - potencia(2, ancho * 8)) } sino { v = _hu_u32(raw - potencia(2, ancho * 8)) }
+                } sino si (es64) { v = [0, raw] } sino { v = raw }
+            }
+            pila.agregar(v)
+        } sino si (op >= 54 y op <= 62) {
+            sea v = pila[longitud(pila) - 1]
+            sea base = pila[longitud(pila) - 2]
+            pila = _hu_quitar(pila, 2)
+            sea off = x[2]
+            si (op == 54) { _hu_escribir_mem(mem, _hu_dir(mem, base, off, 4), v, 4) }
+            sino si (op == 55) {
+                sea d = _hu_dir(mem, base, off, 8)
+                _hu_escribir_mem(mem, d, v[1], 4)
+                _hu_escribir_mem(mem, d + 4, v[0], 4)
+            } sino si (op == 56) { _hu_escribir_mem(mem, _hu_dir(mem, base, off, 4), _hu_f32_bits(v), 4) }
+            sino si (op == 57) {
+                sea d = _hu_dir(mem, base, off, 8)
+                sea bb = _hu_f64_bits(v)
+                _hu_escribir_mem(mem, d, bb[1], 4)
+                _hu_escribir_mem(mem, d + 4, bb[0], 4)
+            } sino si (op == 58) { _hu_escribir_mem(mem, _hu_dir(mem, base, off, 1), v % 256, 1) }
+            sino si (op == 59) { _hu_escribir_mem(mem, _hu_dir(mem, base, off, 2), v % 65536, 2) }
+            sino si (op == 60) { _hu_escribir_mem(mem, _hu_dir(mem, base, off, 1), v[1] % 256, 1) }
+            sino si (op == 61) { _hu_escribir_mem(mem, _hu_dir(mem, base, off, 2), v[1] % 65536, 2) }
+            sino si (op == 62) { _hu_escribir_mem(mem, _hu_dir(mem, base, off, 4), v[1], 4) }
+        } sino si (op == 63) { pila.agregar(inst["memoria"]["paginas"]) }
+        sino si (op == 64) {
+            sea d = pila[longitud(pila) - 1]
+            pila = _hu_quitar(pila, 1)
+            sea viejo = inst["memoria"]["paginas"]
+            si (viejo + d > inst["max_paginas"] o viejo + d > 1024) { pila.agregar(_HU_2_32 - 1) } sino {
+                sea k = 0
+                mientras (k < d * 65536) {
+                    mem.agregar(0)
+                    k = k + 1
+                }
+                inst["memoria"]["paginas"] = viejo + d
+                pila.agregar(viejo)
+            }
+        } sino si (op == 0) { _hu_trampa("unreachable") }
+        sino si (op == 1) { }
+        sino si (op == 252) { pila = _hu_ext(inst, x, pila) }
+        sino { pila = _hu_numerica(op, pila) }
+    }
+    sea r = []
+    sea k = longitud(pila) - n_res
+    mientras (k < longitud(pila)) {
+        r.agregar(pila[k])
+        k = k + 1
+    }
+    retornar r
+}
+
+funcion _hu_quitar(p, n) {
+    sea i = 0
+    mientras (i < n) {
+        quitar_ultimo(p)
+        i = i + 1
+    }
+    retornar p
+}
+
+funcion _hu_b(v) {
+    si (v) { retornar 1 }
+    retornar 0
+}
+
+// Instrucciones numéricas (0x45..0xC4).
+funcion _hu_numerica(op, pila) {
+    sea n = longitud(pila)
+    // Unarias.
+    si (op == 69 o op == 80 o (op >= 103 y op <= 105) o (op >= 121 y op <= 123) o (op >= 139 y op <= 145) o (op >= 153 y op <= 159) o op >= 167) {
+        sea a = pila[n - 1]
+        sea r = _hu_unaria(op, a)
+        pila[n - 1] = r
+        retornar pila
+    }
+    sea b = pila[n - 1]
+    sea a = pila[n - 2]
+    sea r = _hu_binaria(op, a, b)
+    sea q = _hu_quitar(pila, 1)
+    q[n - 2] = r
+    retornar q
+}
+
+funcion _hu_unaria(op, a) {
+    si (op == 69) { retornar _hu_b(a == 0) }
+    si (op == 80) { retornar _hu_b(a[0] == 0 y a[1] == 0) }
+    si (op == 103) { retornar _hu_clz32(a) }
+    si (op == 104) { retornar _hu_ctz32(a) }
+    si (op == 105) { retornar _hu_popcnt32(a) }
+    si (op == 121) { retornar [0, _hu_clz64(a)] }
+    si (op == 122) { retornar [0, _hu_ctz64(a)] }
+    si (op == 123) { retornar [0, _hu_popcnt32(a[0]) + _hu_popcnt32(a[1])] }
+    // f32 unarias (139 abs, 140 neg, 141 ceil, 142 floor, 143 trunc, 144 nearest, 145 sqrt).
+    si (op >= 139 y op <= 145) { retornar _hu_f32(_hu_float_unaria(op - 139, a)) }
+    si (op >= 153 y op <= 159) { retornar _hu_float_unaria(op - 153, a) }
+    // Conversiones.
+    si (op == 167) { retornar a[1] }
+    si (op == 168 o op == 170) {
+        sea t = _hu_trunc(a)
+        si (_hu_nan(t) o t < -2147483648 o t > 2147483647) { _hu_trampa("conversión a entero fuera de rango") }
+        retornar _hu_u32(t)
+    }
+    si (op == 169 o op == 171) {
+        sea t = _hu_trunc(a)
+        si (_hu_nan(t) o t < 0 o t > 4294967295) { _hu_trampa("conversión a entero fuera de rango") }
+        retornar t
+    }
+    si (op == 172) { retornar _hu_i64(_hu_s32(a)) }
+    si (op == 173) { retornar [0, a] }
+    si (op == 174 o op == 176 o op == 175 o op == 177) {
+        sea r = _hu_trunc_a64(a, op == 174 o op == 176)
+        si (r == nulo) { _hu_trampa("conversión a entero fuera de rango") }
+        retornar r
+    }
+    si (op == 178) { retornar _hu_f32(_hu_s32(a)) }
+    si (op == 179) { retornar _hu_f32(a) }
+    si (op == 180) { retornar _hu_f32(_hu_64_a_float(a, verdadero)) }
+    si (op == 181) { retornar _hu_f32(_hu_64_a_float(a, falso)) }
+    si (op == 182) { retornar a }
+    si (op == 183) { retornar _hu_s32(a) * 1.0 }
+    si (op == 184) { retornar a * 1.0 }
+    si (op == 185) { retornar _hu_64_a_float(a, verdadero) }
+    si (op == 186) { retornar _hu_64_a_float(a, falso) }
+    si (op == 187) { retornar a }
+    si (op == 188) { retornar _hu_f32_bits(a) }
+    si (op == 189) { retornar _hu_f64_bits(a) }
+    si (op == 190) { retornar _hu_f32_de_bits(a) }
+    si (op == 191) { retornar _hu_f64_de_bits(a) }
+    // Extensión de signo.
+    si (op == 192) { retornar _hu_u32(_hu_ext_signo(a % 256, 8)) }
+    si (op == 193) { retornar _hu_u32(_hu_ext_signo(a % 65536, 16)) }
+    si (op == 194) { retornar _hu_i64(_hu_ext_signo(a[1] % 256, 8)) }
+    si (op == 195) { retornar _hu_i64(_hu_ext_signo(a[1] % 65536, 16)) }
+    si (op == 196) { retornar _hu_i64(_hu_s32(a[1])) }
+    _hu_trampa("instrucción desconocida " + op)
+}
+
+funcion _hu_ext_signo(v, bits) {
+    si (v >= potencia(2, bits - 1)) { retornar v - potencia(2, bits) }
+    retornar v
+}
+
+funcion _hu_trunc(v) {
+    si (_hu_nan(v)) { retornar v }
+    // Los flotantes grandes ya son enteros (y piso desbordaría).
+    si (absoluto(v) >= 4503599627370496) { retornar v }
+    si (v < 0) { retornar 0 - piso(0 - v) }
+    retornar piso(v)
+}
+
+funcion _hu_float_unaria(k, a) {
+    si (k == 0) { retornar absoluto(a) }
+    si (k == 1) { retornar 0 - a }
+    si (_hu_nan(a) o a == 0) { retornar a }
+    si (k <= 5 y absoluto(a) >= 4503599627370496) { retornar a }
+    si (k == 2) { retornar techo(a) }
+    si (k == 3) { retornar piso(a) }
+    si (k == 4) { retornar _hu_trunc(a) }
+    si (k == 5) {
+        sea f = piso(a)
+        sea d = a - f
+        si (d > 0.5 o (d == 0.5 y f % 2 != 0)) { retornar f + 1 }
+        retornar f
+    }
+    si (a < 0) { retornar _HU_NAN }
+    retornar raiz(a)
+}
+
+funcion _hu_binaria(op, a, b) {
+    // i32 comparaciones (70..79).
+    si (op == 70) { retornar _hu_b(a == b) }
+    si (op == 71) { retornar _hu_b(a != b) }
+    si (op == 72) { retornar _hu_b(_hu_s32(a) < _hu_s32(b)) }
+    si (op == 73) { retornar _hu_b(a < b) }
+    si (op == 74) { retornar _hu_b(_hu_s32(a) > _hu_s32(b)) }
+    si (op == 75) { retornar _hu_b(a > b) }
+    si (op == 76) { retornar _hu_b(_hu_s32(a) <= _hu_s32(b)) }
+    si (op == 77) { retornar _hu_b(a <= b) }
+    si (op == 78) { retornar _hu_b(_hu_s32(a) >= _hu_s32(b)) }
+    si (op == 79) { retornar _hu_b(a >= b) }
+    // i64 comparaciones (81..90).
+    si (op >= 81 y op <= 90) {
+        si (op == 81) { retornar _hu_b(a[0] == b[0] y a[1] == b[1]) }
+        si (op == 82) { retornar _hu_b(a[0] != b[0] o a[1] != b[1]) }
+        sea cs = _hu_cmp64s(a, b)
+        sea cu = _hu_cmp64u(a, b)
+        si (op == 83) { retornar _hu_b(cs < 0) }
+        si (op == 84) { retornar _hu_b(cu < 0) }
+        si (op == 85) { retornar _hu_b(cs > 0) }
+        si (op == 86) { retornar _hu_b(cu > 0) }
+        si (op == 87) { retornar _hu_b(cs <= 0) }
+        si (op == 88) { retornar _hu_b(cu <= 0) }
+        si (op == 89) { retornar _hu_b(cs >= 0) }
+        retornar _hu_b(cu >= 0)
+    }
+    // Flotantes comparaciones (91..102).
+    si (op >= 91 y op <= 102) {
+        sea k = (op - 91) % 6
+        si (_hu_nan(a) o _hu_nan(b)) { retornar _hu_b(k == 1) }
+        si (k == 0) { retornar _hu_b(a == b) }
+        si (k == 1) { retornar _hu_b(a != b) }
+        si (k == 2) { retornar _hu_b(a < b) }
+        si (k == 3) { retornar _hu_b(a > b) }
+        si (k == 4) { retornar _hu_b(a <= b) }
+        retornar _hu_b(a >= b)
+    }
+    // i32 aritmética (106..120).
+    si (op == 106) { retornar (a + b) % _HU_2_32 }
+    si (op == 107) { retornar _hu_u32(a - b) }
+    si (op == 108) { retornar _hu_mul32(a, b) }
+    si (op == 109) {
+        si (b == 0) { _hu_trampa("división entera por cero") }
+        si (a == _HU_2_31 y b == _HU_2_32 - 1) { _hu_trampa("desborde entero") }
+        retornar _hu_u32(_hu_div_trunc(_hu_s32(a), _hu_s32(b)))
+    }
+    si (op == 110) {
+        si (b == 0) { _hu_trampa("división entera por cero") }
+        retornar piso(a / b)
+    }
+    si (op == 111) {
+        si (b == 0) { _hu_trampa("resto entero por cero") }
+        sea x = _hu_s32(a)
+        sea y = _hu_s32(b)
+        retornar _hu_u32(x - _hu_div_trunc(x, y) * y)
+    }
+    si (op == 112) {
+        si (b == 0) { _hu_trampa("resto entero por cero") }
+        retornar a % b
+    }
+    si (op == 113) { retornar bits_y(a, b) }
+    si (op == 114) { retornar bits_o(a, b) }
+    si (op == 115) { retornar bits_xo(a, b) }
+    si (op == 116) { retornar _hu_shl32(a, b) }
+    si (op == 117) { retornar _hu_shr_s32(a, b) }
+    si (op == 118) { retornar _hu_shr_u32(a, b) }
+    si (op == 119) { retornar _hu_rotl32(a, b) }
+    si (op == 120) { retornar _hu_rotl32(a, 32 - b % 32) }
+    // i64 aritmética (124..138).
+    si (op == 124) { retornar _hu_add64(a, b) }
+    si (op == 125) { retornar _hu_sub64(a, b) }
+    si (op == 126) { retornar _hu_mul64(a, b) }
+    si (op == 127 o op == 129) {
+        si (b[0] == 0 y b[1] == 0) { _hu_trampa("división entera por cero") }
+        si (op == 127 y a[0] == _HU_2_31 y a[1] == 0 y b[0] == _HU_2_32 - 1 y b[1] == _HU_2_32 - 1) { _hu_trampa("desborde entero") }
+        sea r = _hu_divmod64s(a, b)
+        si (op == 127) { retornar r[0] }
+        retornar r[1]
+    }
+    si (op == 128 o op == 130) {
+        si (b[0] == 0 y b[1] == 0) { _hu_trampa("división entera por cero") }
+        sea r = _hu_divmod64u(a, b)
+        si (op == 128) { retornar r[0] }
+        retornar r[1]
+    }
+    si (op == 131) { retornar [bits_y(a[0], b[0]), bits_y(a[1], b[1])] }
+    si (op == 132) { retornar [bits_o(a[0], b[0]), bits_o(a[1], b[1])] }
+    si (op == 133) { retornar [bits_xo(a[0], b[0]), bits_xo(a[1], b[1])] }
+    si (op == 134) { retornar _hu_shl64(a, b[1] % 64) }
+    si (op == 135) { retornar _hu_shr64s(a, b[1] % 64) }
+    si (op == 136) { retornar _hu_shr64u(a, b[1] % 64) }
+    si (op == 137) { retornar _hu_rotl64(a, b[1] % 64) }
+    si (op == 138) { retornar _hu_rotl64(a, 64 - b[1] % 64) }
+    // f32 (146..152) y f64 (160..166): add sub mul div min max copysign.
+    si (op >= 146 y op <= 152) { retornar _hu_f32(_hu_float_binaria(op - 146, a, b)) }
+    si (op >= 160 y op <= 166) { retornar _hu_float_binaria(op - 160, a, b) }
+    _hu_trampa("instrucción desconocida " + op)
+}
+
+funcion _hu_negativo(v) { retornar v < 0 }
+
+funcion _hu_float_binaria(k, a, b) {
+    si (k == 0) { retornar a + b }
+    si (k == 1) { retornar a - b }
+    si (k == 2) { retornar a * b }
+    si (k == 3) {
+        si (b == 0) {
+            si (_hu_nan(a) o a == 0) { retornar _HU_NAN }
+            si (_hu_negativo(a) != _hu_negativo(b)) { retornar 0 - 1e308 * 10 }
+            retornar 1e308 * 10
+        }
+        retornar a / b
+    }
+    si (k == 4 o k == 5) {
+        si (_hu_nan(a) o _hu_nan(b)) { retornar _HU_NAN }
+        si (a == b y a == 0) {
+            si (k == 4) { si (_hu_negativo(a)) { retornar a } retornar b }
+            si (_hu_negativo(a)) { retornar b }
+            retornar a
+        }
+        si (k == 4) { retornar minimo(a, b) }
+        retornar maximo(a, b)
+    }
+    // copysign
+    sea m = absoluto(a)
+    si (_hu_negativo(b)) { retornar 0 - m }
+    retornar m
+}
+
+// Prefijo 0xFC: truncado saturado y memoria masiva.
+funcion _hu_ext(inst, x, pila) {
+    sea sub = x[1]
+    sea n = longitud(pila)
+    si (sub <= 7) {
+        sea a = pila[n - 1]
+        sea r = nulo
+        sea t = _hu_trunc(a)
+        si (sub <= 3) {
+            si (_hu_nan(t)) { r = 0 } sino si (sub == 0 o sub == 2) { r = _hu_u32(maximo(-2147483648, minimo(2147483647, t))) } sino { r = maximo(0, minimo(4294967295, t)) }
+        } sino {
+            si (_hu_nan(t)) { r = [0, 0] } sino si (sub == 4 o sub == 6) {
+                si (t >= 9.223372036854775807e18) { r = [_HU_2_31 - 1, _HU_2_32 - 1] } sino si (t <= -9.223372036854775808e18) { r = [_HU_2_31, 0] } sino { r = _hu_trunc_a64(t, verdadero) }
+            } sino {
+                si (t <= 0) { r = [0, 0] } sino si (t >= 1.8446744073709551615e19) { r = [_HU_2_32 - 1, _HU_2_32 - 1] } sino { r = _hu_trunc_a64(t, falso) }
+            }
+        }
+        pila[n - 1] = r
+        retornar pila
+    }
+    sea mem = inst["memoria"]["bytes"]
+    si (sub == 10) {
+        sea c = pila[n - 1]
+        sea s = pila[n - 2]
+        sea d = pila[n - 3]
+        si (s + c > longitud(mem) o d + c > longitud(mem)) { _hu_trampa("memory.copy fuera de la memoria") }
+        sea tmp = []
+        sea k = 0
+        mientras (k < c) {
+            tmp.agregar(mem[s + k])
+            k = k + 1
+        }
+        k = 0
+        mientras (k < c) {
+            mem[d + k] = tmp[k]
+            k = k + 1
+        }
+        retornar _hu_quitar(pila, 3)
+    }
+    si (sub == 11) {
+        sea c = pila[n - 1]
+        sea v = pila[n - 2] % 256
+        sea d = pila[n - 3]
+        si (d + c > longitud(mem)) { _hu_trampa("memory.fill fuera de la memoria") }
+        sea k = 0
+        mientras (k < c) {
+            mem[d + k] = v
+            k = k + 1
+        }
+        retornar _hu_quitar(pila, 3)
+    }
+    _hu_trampa("instrucción 0xFC " + sub + " no soportada")
+}
+
+// ---------- api ----------
+
+/// i64 [alto, bajo] como texto decimal.
+funcion huesped_i64_texto(p, con_signo) {
+    sea neg = (con_signo ?? verdadero) y p[0] >= _HU_2_31
+    sea x = p
+    si (neg) { x = _hu_neg64(p) }
+    si (x[0] == 0 y x[1] == 0) { retornar "0" }
+    sea partes = []
+    mientras (x[0] != 0 o x[1] != 0) {
+        sea r = _hu_divmod64u(x, [0, 1000000000])
+        sea d = "" + r[1][1]
+        si (r[0][0] != 0 o r[0][1] != 0) { mientras (longitud(d) < 9) { d = "0" + d } }
+        partes.agregar(d)
+        x = r[0]
+    }
+    sea t = []
+    sea i = longitud(partes) - 1
+    mientras (i >= 0) {
+        t.agregar(partes[i])
+        i = i - 1
+    }
+    si (neg) { retornar "-" + unir(t, "") }
+    retornar unir(t, "")
+}
+
+/// Texto decimal (con signo) a i64 [alto, bajo].
+funcion huesped_i64(t) {
+    sea s = texto_recortar("" + t)
+    sea neg = texto_empieza_con(s, "-")
+    si (neg) { s = subcadena(s, 1, longitud(s)) }
+    sea v = [0, 0]
+    sea i = 0
+    mientras (i < longitud(s)) {
+        v = _hu_add64(_hu_mul64(v, [0, 10]), [0, a_numero(subcadena(s, i, i + 1))])
+        i = i + 1
+    }
+    si (neg) { retornar _hu_neg64(v) }
+    retornar v
+}
+
+funcion _hu_arg(t, v) {
+    si (t == "i32") { retornar _hu_u32(piso(v)) }
+    si (t == "i64") {
+        si (tipo(v) == "lista") { retornar v }
+        si (tipo(v) == "texto") { retornar huesped_i64(v) }
+        retornar _hu_i64(piso(v))
+    }
+    si (t == "f32") { retornar _hu_f32(v) }
+    retornar v * 1.0
+}
+
+// Los i64 que no caben en un entero de C-Forge (más de 2^61) salen como texto.
+funcion _hu_res(t, v) {
+    si (t == "i32") { retornar _hu_s32(v) }
+    si (t == "i64") {
+        sea grande = (v[0] >= 536870912 y v[0] < 3758096384)
+        si (grande) { retornar huesped_i64_texto(v, verdadero) }
+        retornar _hu_a_numero64(v, verdadero)
+    }
+    retornar v
+}
+
+/// Llama una función exportada con números de C-Forge. Devuelve el
+/// resultado (o lista si hay varios, nulo si ninguno). i32 e i64 con signo.
+funcion huesped_llamar(inst, nombre, args) {
+    sea e = inst["m"]["exportaciones"][nombre] ?? nulo
+    si (e == nulo o e["clase"] != 0) { lanzar "wasm: no se exporta la función " + nombre }
+    sea t = inst["funcs"][e["indice"]]["tipo"]
+    si (longitud(args ?? []) != longitud(t["params"])) { lanzar "wasm: " + nombre + " espera " + longitud(t["params"]) + " argumentos" }
+    sea a = []
+    sea k = 0
+    para v en args ?? [] {
+        a.agregar(_hu_arg(t["params"][k], v))
+        k = k + 1
+    }
+    inst["profundidad"] = 0
+    sea r = _hu_invocar(inst, e["indice"], a)
+    si (longitud(r) == 0) { retornar nulo }
+    si (longitud(r) == 1) { retornar _hu_res(t["resultados"][0], r[0]) }
+    sea out = []
+    k = 0
+    para v en r {
+        out.agregar(_hu_res(t["resultados"][k], v))
+        k = k + 1
+    }
+    retornar out
+}
+
+/// Exportaciones: {nombre: "funcion"|"tabla"|"memoria"|"global"}.
+funcion huesped_exportaciones(inst) {
+    sea nombres = ["funcion", "tabla", "memoria", "global"]
+    sea r = {}
+    para k en claves(inst["m"]["exportaciones"]) { r[k] = nombres[inst["m"]["exportaciones"][k]["clase"]] }
+    retornar r
+}
+
+/// Lee bytes de la memoria como texto.
+funcion huesped_leer(inst, dir, n) {
+    sea mem = inst["memoria"]["bytes"]
+    si (dir + n > longitud(mem)) { lanzar "wasm: lectura fuera de la memoria" }
+    sea partes = []
+    sea k = 0
+    mientras (k < n) {
+        partes.agregar(bytes_entero(mem[dir + k], 1, 0))
+        k = k + 1
+    }
+    retornar unir(partes, "")
+}
+
+/// Escribe bytes en la memoria.
+funcion huesped_escribir(inst, dir, datos) {
+    sea mem = inst["memoria"]["bytes"]
+    si (dir + longitud(datos) > longitud(mem)) { lanzar "wasm: escritura fuera de la memoria" }
+    sea k = 0
+    mientras (k < longitud(datos)) {
+        mem[dir + k] = byte_en(datos, k)
+        k = k + 1
+    }
+}
+
+/// Texto terminado en cero desde la memoria.
+funcion huesped_texto_c(inst, dir) {
+    sea mem = inst["memoria"]["bytes"]
+    sea k = dir
+    mientras (k < longitud(mem) y mem[k] != 0) { k = k + 1 }
+    retornar huesped_leer(inst, dir, k - dir)
+}
+
+/// Valor de un global exportado.
+funcion huesped_global(inst, nombre) {
+    sea e = inst["m"]["exportaciones"][nombre] ?? nulo
+    si (e == nulo o e["clase"] != 3) { lanzar "wasm: no se exporta el global " + nombre }
+    sea g = inst["globales"][e["indice"]]
+    retornar _hu_res(g["tipo"], g["valor"])
+}
+
+/// Tamaño de la memoria en páginas de 64 KiB.
+funcion huesped_paginas(inst) {
+    si (inst["memoria"] == nulo) { retornar 0 }
+    retornar inst["memoria"]["paginas"]
+}

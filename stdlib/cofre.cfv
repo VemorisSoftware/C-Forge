@@ -1,0 +1,782 @@
+// stdlib/cofre.cfv — base de datos embebida ACID en un solo archivo al
+// estilo redb, bbolt y LMDB: árboles B+ con copia en escritura (nunca se
+// sobrescribe una página viva), dos páginas meta alternadas con CRC32 y
+// número de transacción (una caída a medio commit deja el estado
+// anterior), fsync antes y después de la meta, tablas con nombre, valores
+// grandes en páginas de desborde, lista de páginas libres que se reutiliza,
+// transacciones de escritura con rollback ante errores, lecturas con
+// instantánea y rangos ordenados por clave (desde, hasta, prefijo,
+// inverso, límite). Idea de redb y bbolt (MIT/Apache). En inglés:
+// importar "embeddb".
+//
+//   importar "cofre"
+//   sea db = cofre_abrir("datos.cofre", nulo)
+//   cofre_escribir(db, funcion(tx) { cofre_poner(tx, "usuarios", "1", "Ana") })
+//   cofre_leer(db, funcion(tx) { mostrar(cofre_obtener(tx, "usuarios", "1")) })
+
+funcion __cofre_declaraciones() {
+    extern "libc" funcion open(ruta: texto, banderas: entero, modo: entero): entero
+    extern "libc" funcion close(fd: entero): entero
+    extern "libc" funcion pread(fd: entero, buf: puntero, n: entero, desde: largo): largo
+    extern "libc" funcion pwrite(fd: entero, datos: texto, n: entero, desde: largo): largo
+    extern "libc" funcion fsync(fd: entero): entero
+}
+
+sea _CF_PAG = 4096
+sea _CF_MAGIA = "CFCOFRE1"
+
+funcion _cf_b(n) { retornar bytes_entero(n, 1, 0) }
+funcion _cf_u16(n) { retornar bytes_entero(n, 2, 1) }
+funcion _cf_u32(n) { retornar bytes_entero(n, 4, 1) }
+funcion _cf_l16(t, p) { retornar bytes_leer_entero(t, p, 2, 1) }
+funcion _cf_l32(t, p) { retornar bytes_leer_entero(t, p, 4, 1) }
+
+funcion _cf_varint(n) {
+    sea r = []
+    sea v = n
+    mientras (v >= 128) {
+        r.agregar(_cf_b(v % 128 + 128))
+        v = piso(v / 128)
+    }
+    r.agregar(_cf_b(v))
+    retornar unir(r, "")
+}
+
+funcion _cf_leer_varint(t, p) {
+    sea v = 0
+    sea f = 1
+    sea i = p
+    mientras (verdadero) {
+        sea b = byte_en(t, i)
+        v = v + (b % 128) * f
+        i = i + 1
+        si (b < 128) { retornar [v, i] }
+        f = f * 128
+    }
+}
+
+sea _CF_CRC = nulo
+funcion _cf_crc(t) {
+    si (_CF_CRC == nulo) {
+        sea tab = []
+        sea i = 0
+        mientras (i < 256) {
+            sea c = i
+            sea k = 0
+            mientras (k < 8) {
+                si (c % 2 == 1) { c = bits_xo(piso(c / 2), 3988292384) } sino { c = piso(c / 2) }
+                k = k + 1
+            }
+            tab.agregar(c)
+            i = i + 1
+        }
+        _CF_CRC = tab
+    }
+    sea c = 4294967295
+    sea i = 0
+    mientras (i < longitud(t)) {
+        c = bits_xo(_CF_CRC[bits_xo(c, byte_en(t, i)) % 256], piso(c / 256))
+        i = i + 1
+    }
+    retornar bits_xo(c, 4294967295)
+}
+
+funcion _cf_linux() { retornar existe_archivo("/proc/meminfo") }
+
+// ---------- páginas ----------
+
+funcion _cf_leer_pagina(db, id) {
+    sea buf = c_reservar(_CF_PAG)
+    sea n = pread(db["fd"], buf, _CF_PAG, id * _CF_PAG)
+    sea r = ""
+    si (n > 0) { r = c_bytes(buf, n) }
+    c_liberar(buf)
+    mientras (longitud(r) < _CF_PAG) { r = r + _cf_b(0) }
+    retornar r
+}
+
+funcion _cf_escribir_pagina(db, id, datos) {
+    sea d = datos
+    si (longitud(d) > _CF_PAG) { lanzar "cofre: página demasiado grande (" + longitud(d) + ")" }
+    mientras (longitud(d) < _CF_PAG) { d = d + _cf_b(0) }
+    pwrite(db["fd"], d, _CF_PAG, id * _CF_PAG)
+}
+
+// Meta: magia, versión, tamaño de página, txid, raíz de tablas, lista libre, marca de agua, CRC.
+funcion _cf_meta_codificar(m) {
+    sea t = _CF_MAGIA + _cf_u32(1) + _cf_u32(_CF_PAG) + _cf_u32(piso(m["txid"] / 4294967296)) + _cf_u32(m["txid"] % 4294967296) + _cf_u32(m["raiz"]) + _cf_u32(m["libre"]) + _cf_u32(m["marca"])
+    retornar t + _cf_u32(_cf_crc(t))
+}
+
+funcion _cf_meta_leer(p) {
+    si (subcadena(p, 0, 8) != _CF_MAGIA) { retornar nulo }
+    sea cuerpo = subcadena(p, 0, 36)
+    si (_cf_l32(p, 36) != _cf_crc(cuerpo)) { retornar nulo }
+    retornar {"txid": _cf_l32(p, 16) * 4294967296 + _cf_l32(p, 20), "raiz": _cf_l32(p, 24), "libre": _cf_l32(p, 28), "marca": _cf_l32(p, 32)}
+}
+
+// Nodo: {"hoja", "claves", "valores" (hoja) | "hijos" (rama, uno más que claves)}.
+funcion _cf_decodificar(db, p) {
+    sea tp = byte_en(p, 0)
+    sea n = _cf_l16(p, 1)
+    sea q = 3
+    si (tp == 1) {
+        sea ks = []
+        sea vs = []
+        sea i = 0
+        mientras (i < n) {
+            sea kl = _cf_leer_varint(p, q)
+            ks.agregar(subcadena(p, kl[1], kl[1] + kl[0]))
+            q = kl[1] + kl[0]
+            sea fl = byte_en(p, q)
+            q = q + 1
+            si (fl == 0) {
+                sea vl = _cf_leer_varint(p, q)
+                vs.agregar(subcadena(p, vl[1], vl[1] + vl[0]))
+                q = vl[1] + vl[0]
+            } sino {
+                vs.agregar({"desborde": _cf_l32(p, q), "largo": _cf_l32(p, q + 4)})
+                q = q + 8
+            }
+            i = i + 1
+        }
+        retornar {"hoja": verdadero, "claves": ks, "valores": vs}
+    }
+    si (tp == 2) {
+        sea hijos = [_cf_l32(p, q)]
+        q = q + 4
+        sea ks = []
+        sea i = 0
+        mientras (i < n) {
+            sea kl = _cf_leer_varint(p, q)
+            ks.agregar(subcadena(p, kl[1], kl[1] + kl[0]))
+            q = kl[1] + kl[0]
+            hijos.agregar(_cf_l32(p, q))
+            q = q + 4
+            i = i + 1
+        }
+        retornar {"hoja": falso, "claves": ks, "hijos": hijos}
+    }
+    lanzar "cofre: página dañada (tipo " + tp + ")"
+}
+
+funcion _cf_tam_nodo(nd) {
+    sea t = 7
+    sea i = 0
+    mientras (i < longitud(nd["claves"])) {
+        t = t + longitud(nd["claves"][i]) + 3
+        si (nd["hoja"]) {
+            sea v = nd["valores"][i]
+            si (tipo(v) == "texto" y longitud(v) <= _CF_PAG / 4) { t = t + longitud(v) + 4 } sino { t = t + 9 }
+        } sino { t = t + 4 }
+        i = i + 1
+    }
+    retornar t
+}
+
+// Valor completo (siguiendo el desborde).
+funcion _cf_valor(db, v) {
+    si (tipo(v) == "texto") { retornar v }
+    si (tiene_clave(v, "texto")) { retornar v["texto"] }
+    sea partes = []
+    sea pid = v["desborde"]
+    sea falta = v["largo"]
+    mientras (falta > 0 y pid != 0) {
+        sea p = _cf_leer_pagina(db, pid)
+        sea n = _cf_l16(p, 5)
+        partes.agregar(subcadena(p, 7, 7 + n))
+        falta = falta - n
+        pid = _cf_l32(p, 1)
+    }
+    retornar unir(partes, "")
+}
+
+// ---------- abrir ----------
+
+/// Abre o crea la base. opciones: "sincronizar" (verdadero: fsync al
+/// confirmar).
+funcion cofre_abrir(ruta, opciones) {
+    sea op = opciones ?? {}
+    sea creat = 64
+    si (_cf_linux() == falso) { creat = 512 }
+    sea nueva = existe_archivo(ruta) == falso
+    si (nueva == falso) { nueva = longitud(leer_archivo(ruta)) == 0 }
+    sea fd = open(ruta, 2 + creat, 420)
+    si (fd < 0) { lanzar "cofre: no se pudo abrir " + ruta }
+    sea db = {"fd": fd, "ruta": ruta, "op": op, "meta": nulo, "lista_libre": [], "cadena_libre": [], "cache": {}, "abierta": verdadero, "leyendo": 0}
+    si (nueva) {
+        sea m = {"txid": 0, "raiz": 0, "libre": 0, "marca": 2}
+        _cf_escribir_pagina(db, 0, _cf_meta_codificar(m))
+        m["txid"] = 1
+        _cf_escribir_pagina(db, 1, _cf_meta_codificar(m))
+        fsync(fd)
+    }
+    sea m0 = _cf_meta_leer(_cf_leer_pagina(db, 0))
+    sea m1 = _cf_meta_leer(_cf_leer_pagina(db, 1))
+    sea m = m0
+    si (m == nulo o (m1 != nulo y m1["txid"] > m["txid"])) { m = m1 }
+    si (m == nulo) { lanzar "cofre: las dos páginas meta están dañadas" }
+    db["meta"] = m
+    // Lista de páginas libres.
+    sea pid = m["libre"]
+    mientras (pid != 0) {
+        sea p = _cf_leer_pagina(db, pid)
+        sea n = _cf_l16(p, 5)
+        sea i = 0
+        mientras (i < n) {
+            db["lista_libre"].agregar(_cf_l32(p, 7 + i * 4))
+            i = i + 1
+        }
+        // Las páginas de la propia lista siguen en uso (la meta actual las
+        // nombra); quedan libres recién en el próximo commit.
+        db["cadena_libre"].agregar(pid)
+        pid = _cf_l32(p, 1)
+    }
+    retornar db
+}
+
+funcion cofre_cerrar(db) {
+    si (db["abierta"]) {
+        close(db["fd"])
+        db["abierta"] = falso
+    }
+}
+
+// ---------- transacciones ----------
+
+funcion _cf_tx(db, escritura) {
+    sea libres = []
+    para x en db["lista_libre"] { libres.agregar(x) }
+    retornar {"db": db, "escritura": escritura, "raiz": db["meta"]["raiz"], "marca": db["meta"]["marca"], "sucios": {}, "liberadas": [], "libres": libres, "raices": {}, "tablas_cambiadas": {}}
+}
+
+funcion _cf_nodo(tx, pid) {
+    si (tiene_clave(tx["sucios"], "" + pid)) { retornar tx["sucios"]["" + pid] }
+    sea c = tx["db"]["cache"]
+    si (tiene_clave(c, "" + pid)) { retornar c["" + pid] }
+    sea nd = _cf_decodificar(tx["db"], _cf_leer_pagina(tx["db"], pid))
+    si (longitud(claves(c)) > 512) { tx["db"]["cache"] = {} }
+    tx["db"]["cache"]["" + pid] = nd
+    retornar nd
+}
+
+funcion _cf_asignar(tx) {
+    si (longitud(tx["libres"]) > 0) {
+        sea l = tx["libres"]
+        sea id = l[longitud(l) - 1]
+        sea r = []
+        sea i = 0
+        mientras (i < longitud(l) - 1) {
+            r.agregar(l[i])
+            i = i + 1
+        }
+        tx["libres"] = r
+        retornar id
+    }
+    sea id = tx["marca"]
+    tx["marca"] = id + 1
+    retornar id
+}
+
+// Copia en escritura: devuelve un id sucio con una copia del nodo.
+funcion _cf_copiar(tx, pid) {
+    si (tiene_clave(tx["sucios"], "" + pid)) { retornar pid }
+    sea nd = _cf_nodo(tx, pid)
+    sea nuevo = {"hoja": nd["hoja"], "claves": [], "valores": [], "hijos": []}
+    para k en nd["claves"] { nuevo["claves"].agregar(k) }
+    si (nd["hoja"]) { para v en nd["valores"] { nuevo["valores"].agregar(v) } } sino { para h en nd["hijos"] { nuevo["hijos"].agregar(h) } }
+    sea id = _cf_asignar(tx)
+    tx["sucios"]["" + id] = nuevo
+    tx["liberadas"].agregar(pid)
+    // Las páginas de desborde se copian al confirmar (las viejas siguen vivas).
+    retornar id
+}
+
+funcion _cf_nuevo(tx, nd) {
+    sea id = _cf_asignar(tx)
+    tx["sucios"]["" + id] = nd
+    retornar id
+}
+
+// Posición de la primera clave >= k (búsqueda binaria).
+funcion _cf_buscar(ks, k) {
+    sea a = 0
+    sea b = longitud(ks)
+    mientras (a < b) {
+        sea m = piso((a + b) / 2)
+        si (ks[m] < k) { a = m + 1 } sino { b = m }
+    }
+    retornar a
+}
+
+// Hijo de una rama para la clave.
+funcion _cf_hijo(nd, k) {
+    sea i = _cf_buscar(nd["claves"], k)
+    si (i < longitud(nd["claves"]) y nd["claves"][i] == k) { i = i + 1 }
+    retornar i
+}
+
+funcion _cf_cortar(l, a, b) {
+    sea r = []
+    sea i = a
+    mientras (i < b) {
+        r.agregar(l[i])
+        i = i + 1
+    }
+    retornar r
+}
+
+// Divide un nodo demasiado grande: [[separador o nulo, id], ...].
+funcion _cf_dividir(tx, id) {
+    sea nd = tx["sucios"]["" + id]
+    si (_cf_tam_nodo(nd) <= _CF_PAG o longitud(nd["claves"]) < 2) { retornar [[nulo, id]] }
+    sea n = longitud(nd["claves"])
+    sea m = piso(n / 2)
+    si (nd["hoja"]) {
+        sea a = {"hoja": verdadero, "claves": _cf_cortar(nd["claves"], 0, m), "valores": _cf_cortar(nd["valores"], 0, m), "hijos": []}
+        sea b = {"hoja": verdadero, "claves": _cf_cortar(nd["claves"], m, n), "valores": _cf_cortar(nd["valores"], m, n), "hijos": []}
+        tx["sucios"]["" + id] = a
+        sea idb = _cf_nuevo(tx, b)
+        sea r = _cf_dividir(tx, id)
+        para x en _cf_dividir_con(tx, idb, b["claves"][0]) { r.agregar(x) }
+        retornar r
+    }
+    sea sep = nd["claves"][m]
+    sea a = {"hoja": falso, "claves": _cf_cortar(nd["claves"], 0, m), "hijos": _cf_cortar(nd["hijos"], 0, m + 1), "valores": []}
+    sea b = {"hoja": falso, "claves": _cf_cortar(nd["claves"], m + 1, n), "hijos": _cf_cortar(nd["hijos"], m + 1, n + 1), "valores": []}
+    tx["sucios"]["" + id] = a
+    sea idb = _cf_nuevo(tx, b)
+    sea r = _cf_dividir(tx, id)
+    para x en _cf_dividir_con(tx, idb, sep) { r.agregar(x) }
+    retornar r
+}
+
+funcion _cf_dividir_con(tx, id, sep) {
+    sea partes = _cf_dividir(tx, id)
+    partes[0][0] = sep
+    retornar partes
+}
+
+// Inserta en el subárbol pid. Devuelve [[sep, id], ...] que lo reemplazan.
+funcion _cf_insertar(tx, pid, k, v) {
+    sea id = _cf_copiar(tx, pid)
+    sea nd = tx["sucios"]["" + id]
+    si (nd["hoja"]) {
+        sea i = _cf_buscar(nd["claves"], k)
+        si (i < longitud(nd["claves"]) y nd["claves"][i] == k) { nd["valores"][i] = v } sino {
+            sea ks = _cf_cortar(nd["claves"], 0, i)
+            ks.agregar(k)
+            para x en _cf_cortar(nd["claves"], i, longitud(nd["claves"])) { ks.agregar(x) }
+            sea vs = _cf_cortar(nd["valores"], 0, i)
+            vs.agregar(v)
+            para x en _cf_cortar(nd["valores"], i, longitud(nd["valores"])) { vs.agregar(x) }
+            nd["claves"] = ks
+            nd["valores"] = vs
+        }
+        retornar _cf_dividir(tx, id)
+    }
+    sea i = _cf_hijo(nd, k)
+    sea partes = _cf_insertar(tx, nd["hijos"][i], k, v)
+    nd["hijos"][i] = partes[0][1]
+    si (longitud(partes) > 1) {
+        sea ks = _cf_cortar(nd["claves"], 0, i)
+        sea hs = _cf_cortar(nd["hijos"], 0, i + 1)
+        sea j = 1
+        mientras (j < longitud(partes)) {
+            ks.agregar(partes[j][0])
+            hs.agregar(partes[j][1])
+            j = j + 1
+        }
+        para x en _cf_cortar(nd["claves"], i, longitud(nd["claves"])) { ks.agregar(x) }
+        para x en _cf_cortar(nd["hijos"], i + 1, longitud(nd["hijos"])) { hs.agregar(x) }
+        nd["claves"] = ks
+        nd["hijos"] = hs
+    }
+    retornar _cf_dividir(tx, id)
+}
+
+// Inserta en el árbol con raíz `raiz` (0 = vacío). Devuelve la raíz nueva.
+funcion _cf_arbol_poner(tx, raiz, k, v) {
+    si (raiz == 0) { retornar _cf_nuevo(tx, {"hoja": verdadero, "claves": [k], "valores": [v], "hijos": []}) }
+    sea partes = _cf_insertar(tx, raiz, k, v)
+    mientras (longitud(partes) > 1) {
+        sea ks = []
+        sea hs = [partes[0][1]]
+        sea j = 1
+        mientras (j < longitud(partes)) {
+            ks.agregar(partes[j][0])
+            hs.agregar(partes[j][1])
+            j = j + 1
+        }
+        sea id = _cf_nuevo(tx, {"hoja": falso, "claves": ks, "hijos": hs, "valores": []})
+        partes = _cf_dividir(tx, id)
+    }
+    retornar partes[0][1]
+}
+
+// Borra; devuelve [id nuevo o 0 si quedó vacío, borró].
+funcion _cf_quitar(tx, pid, k) {
+    sea nd = _cf_nodo(tx, pid)
+    si (nd["hoja"]) {
+        sea i = _cf_buscar(nd["claves"], k)
+        si (i >= longitud(nd["claves"]) o nd["claves"][i] != k) { retornar [pid, falso] }
+        sea id = _cf_copiar(tx, pid)
+        sea c = tx["sucios"]["" + id]
+        sea viejo = c["valores"][i]
+        si (tipo(viejo) == "mapa" y tiene_clave(viejo, "desborde")) { _cf_liberar_desborde(tx, viejo) }
+        c["claves"] = _cf_unir_sin(c["claves"], i)
+        c["valores"] = _cf_unir_sin(c["valores"], i)
+        si (longitud(c["claves"]) == 0) {
+            quitar_clave(tx["sucios"], "" + id)
+            tx["libres"].agregar(id)
+            retornar [0, verdadero]
+        }
+        retornar [id, verdadero]
+    }
+    sea i = _cf_hijo(nd, k)
+    sea r = _cf_quitar(tx, nd["hijos"][i], k)
+    si (r[1] == falso) { retornar [pid, falso] }
+    sea id = _cf_copiar(tx, pid)
+    sea c = tx["sucios"]["" + id]
+    si (r[0] == 0) {
+        // Quita el hijo vacío y su separador.
+        si (i == 0) {
+            c["hijos"] = _cf_unir_sin(c["hijos"], 0)
+            si (longitud(c["claves"]) > 0) { c["claves"] = _cf_unir_sin(c["claves"], 0) }
+        } sino {
+            c["hijos"] = _cf_unir_sin(c["hijos"], i)
+            c["claves"] = _cf_unir_sin(c["claves"], i - 1)
+        }
+        si (longitud(c["hijos"]) == 0) {
+            quitar_clave(tx["sucios"], "" + id)
+            tx["libres"].agregar(id)
+            retornar [0, verdadero]
+        }
+        si (longitud(c["hijos"]) == 1) {
+            // Una rama con un solo hijo se reemplaza por el hijo.
+            sea h = c["hijos"][0]
+            quitar_clave(tx["sucios"], "" + id)
+            tx["libres"].agregar(id)
+            retornar [h, verdadero]
+        }
+    } sino { c["hijos"][i] = r[0] }
+    retornar [id, verdadero]
+}
+
+funcion _cf_unir_sin(l, i) {
+    sea r = []
+    sea j = 0
+    mientras (j < longitud(l)) {
+        si (j != i) { r.agregar(l[j]) }
+        j = j + 1
+    }
+    retornar r
+}
+
+funcion _cf_liberar_desborde(tx, v) {
+    sea pid = v["desborde"]
+    mientras (pid != 0) {
+        tx["liberadas"].agregar(pid)
+        pid = _cf_l32(_cf_leer_pagina(tx["db"], pid), 1)
+    }
+}
+
+funcion _cf_arbol_obtener(tx, raiz, k) {
+    si (raiz == 0) { retornar nulo }
+    sea nd = _cf_nodo(tx, raiz)
+    mientras (nd["hoja"] == falso) { nd = _cf_nodo(tx, nd["hijos"][_cf_hijo(nd, k)]) }
+    sea i = _cf_buscar(nd["claves"], k)
+    si (i < longitud(nd["claves"]) y nd["claves"][i] == k) { retornar nd["valores"][i] }
+    retornar nulo
+}
+
+// Recorre en orden; fn(k, v) devuelve falso para cortar.
+funcion _cf_recorrer(tx, pid, desde, hasta, inverso, fn) {
+    si (pid == 0) { retornar verdadero }
+    sea nd = _cf_nodo(tx, pid)
+    si (nd["hoja"]) {
+        sea n = longitud(nd["claves"])
+        sea i = 0
+        sea paso = 1
+        si (inverso) {
+            i = n - 1
+            paso = -1
+        }
+        mientras (i >= 0 y i < n) {
+            sea k = nd["claves"][i]
+            sea dentro = (desde == nulo o k >= desde) y (hasta == nulo o k < hasta)
+            si (dentro) { si (fn(k, nd["valores"][i]) == falso) { retornar falso } }
+            i = i + paso
+        }
+        retornar verdadero
+    }
+    sea n = longitud(nd["hijos"])
+    sea i = 0
+    sea paso = 1
+    si (inverso) {
+        i = n - 1
+        paso = -1
+    }
+    mientras (i >= 0 y i < n) {
+        // Poda por rango usando los separadores.
+        sea min_h = nulo
+        sea max_h = nulo
+        si (i > 0) { min_h = nd["claves"][i - 1] }
+        si (i < longitud(nd["claves"])) { max_h = nd["claves"][i] }
+        sea fuera = (hasta != nulo y min_h != nulo y min_h >= hasta) o (desde != nulo y max_h != nulo y max_h <= desde)
+        si (fuera == falso) { si (_cf_recorrer(tx, nd["hijos"][i], desde, hasta, inverso, fn) == falso) { retornar falso } }
+        i = i + paso
+    }
+    retornar verdadero
+}
+
+// Raíz de una tabla (en la tabla de tablas).
+funcion _cf_raiz_tabla(tx, nombre) {
+    si (tiene_clave(tx["raices"], nombre)) { retornar tx["raices"][nombre] }
+    sea v = _cf_arbol_obtener(tx, tx["raiz"], nombre)
+    si (v == nulo) { retornar nulo }
+    retornar _cf_l32(_cf_valor(tx["db"], v), 0)
+}
+
+funcion _cf_poner_raiz(tx, nombre, raiz) {
+    tx["raices"][nombre] = raiz
+    tx["tablas_cambiadas"][nombre] = verdadero
+}
+
+// ---------- confirmar ----------
+
+funcion _cf_confirmar(tx) {
+    sea db = tx["db"]
+    // Raíces de tablas cambiadas → tabla de tablas.
+    para nombre en claves(tx["tablas_cambiadas"]) {
+        sea r = tx["raices"][nombre]
+        si (r == -1) {
+            sea q = _cf_quitar(tx, tx["raiz"], nombre)
+            tx["raiz"] = q[0]
+        } sino { tx["raiz"] = _cf_arbol_poner(tx, tx["raiz"], nombre, _cf_u32(r)) }
+    }
+    // Escribe los nodos sucios (valores grandes a páginas de desborde nuevas).
+    para sid en claves(tx["sucios"]) {
+        sea nd = tx["sucios"][sid]
+        sea partes = []
+        si (nd["hoja"]) {
+            partes.agregar(_cf_b(1) + _cf_u16(longitud(nd["claves"])))
+            sea i = 0
+            mientras (i < longitud(nd["claves"])) {
+                sea k = nd["claves"][i]
+                sea v = nd["valores"][i]
+                partes.agregar(_cf_varint(longitud(k)) + k)
+                si (tipo(v) == "texto" y longitud(v) <= _CF_PAG / 4) { partes.agregar(_cf_b(0) + _cf_varint(longitud(v)) + v) } sino {
+                    si (tipo(v) == "texto") {
+                        sea primero = _cf_escribir_desborde(tx, v)
+                        v = {"desborde": primero, "largo": longitud(v)}
+                        nd["valores"][i] = v
+                    }
+                    partes.agregar(_cf_b(1) + _cf_u32(v["desborde"]) + _cf_u32(v["largo"]))
+                }
+                i = i + 1
+            }
+        } sino {
+            partes.agregar(_cf_b(2) + _cf_u16(longitud(nd["claves"])) + _cf_u32(nd["hijos"][0]))
+            sea i = 0
+            mientras (i < longitud(nd["claves"])) {
+                partes.agregar(_cf_varint(longitud(nd["claves"][i])) + nd["claves"][i] + _cf_u32(nd["hijos"][i + 1]))
+                i = i + 1
+            }
+        }
+        _cf_escribir_pagina(db, a_numero(sid), unir(partes, ""))
+    }
+    // Lista libre nueva: lo que quedó libre + lo liberado en esta transacción.
+    sea libres = []
+    para x en tx["libres"] { libres.agregar(x) }
+    para x en tx["liberadas"] { libres.agregar(x) }
+    // La cadena de la lista anterior deja de usarse con esta meta.
+    para x en db["cadena_libre"] { libres.agregar(x) }
+    sea por_pag = piso((_CF_PAG - 7) / 4)
+    sea n_pags = piso((longitud(libres) + por_pag - 1) / por_pag)
+    sea ids = []
+    sea k = 0
+    mientras (k < n_pags) {
+        ids.agregar(tx["marca"])
+        tx["marca"] = tx["marca"] + 1
+        k = k + 1
+    }
+    k = 0
+    mientras (k < n_pags) {
+        sea sig = 0
+        si (k + 1 < n_pags) { sig = ids[k + 1] }
+        sea trozo = _cf_cortar(libres, k * por_pag, minimo(longitud(libres), (k + 1) * por_pag))
+        sea partes = [_cf_b(4) + _cf_u32(sig) + _cf_u16(longitud(trozo))]
+        para x en trozo { partes.agregar(_cf_u32(x)) }
+        _cf_escribir_pagina(db, ids[k], unir(partes, ""))
+        k = k + 1
+    }
+    sea primera_libre = 0
+    si (n_pags > 0) { primera_libre = ids[0] }
+    si (db["op"]["sincronizar"] ?? verdadero) { fsync(db["fd"]) }
+    si ((db["op"]["fallar_antes_de_meta"] ?? falso)) { lanzar "cofre: caída simulada antes de escribir la meta" }
+    sea m = {"txid": db["meta"]["txid"] + 1, "raiz": tx["raiz"], "libre": primera_libre, "marca": tx["marca"]}
+    _cf_escribir_pagina(db, m["txid"] % 2, _cf_meta_codificar(m))
+    si (db["op"]["sincronizar"] ?? verdadero) { fsync(db["fd"]) }
+    db["meta"] = m
+    // Para la próxima transacción: libres = todo (incluidas las páginas de la lista).
+    sea nl = []
+    para x en libres { nl.agregar(x) }
+    db["lista_libre"] = nl
+    db["cadena_libre"] = ids
+    // Las páginas reutilizadas pueden tener otro contenido en la caché.
+    db["cache"] = {}
+}
+
+funcion _cf_escribir_desborde(tx, v) {
+    sea cap = _CF_PAG - 7
+    sea n = piso((longitud(v) + cap - 1) / cap)
+    sea ids = []
+    sea k = 0
+    mientras (k < n) {
+        ids.agregar(_cf_asignar(tx))
+        k = k + 1
+    }
+    k = 0
+    mientras (k < n) {
+        sea sig = 0
+        si (k + 1 < n) { sig = ids[k + 1] }
+        sea trozo = subcadena(v, k * cap, minimo(longitud(v), (k + 1) * cap))
+        _cf_escribir_pagina(tx["db"], ids[k], _cf_b(3) + _cf_u32(sig) + _cf_u16(longitud(trozo)) + trozo)
+        k = k + 1
+    }
+    retornar ids[0]
+}
+
+// ---------- api ----------
+
+/// Transacción de escritura: fn(tx). Si fn lanza un error, nada se
+/// guarda y el error se relanza. Devuelve lo que devuelva fn.
+funcion cofre_escribir(db, fn) {
+    sea tx = _cf_tx(db, verdadero)
+    sea r = nulo
+    intentar { r = fn(tx) } capturar (e) {
+        db["cache"] = {}
+        lanzar e
+    }
+    _cf_confirmar(tx)
+    retornar r
+}
+
+/// Transacción de lectura (instantánea): fn(tx).
+funcion cofre_leer(db, fn) {
+    sea tx = _cf_tx(db, falso)
+    retornar fn(tx)
+}
+
+funcion _cf_exigir_escritura(tx) { si (tx["escritura"] == falso) { lanzar "cofre: transacción de solo lectura" } }
+
+/// Guarda clave = valor en la tabla (la crea si no existe).
+funcion cofre_poner(tx, tabla, clave, valor) {
+    _cf_exigir_escritura(tx)
+    sea raiz = _cf_raiz_tabla(tx, tabla) ?? 0
+    si (raiz == -1) { raiz = 0 }
+    _cf_poner_raiz(tx, tabla, _cf_arbol_poner(tx, raiz, "" + clave, "" + valor))
+}
+
+/// Valor o nulo.
+funcion cofre_obtener(tx, tabla, clave) {
+    sea raiz = _cf_raiz_tabla(tx, tabla)
+    si (raiz == nulo o raiz == -1) { retornar nulo }
+    sea v = _cf_arbol_obtener(tx, raiz, "" + clave)
+    si (v == nulo) { retornar nulo }
+    retornar _cf_valor(tx["db"], v)
+}
+
+/// Borra una clave. Devuelve verdadero si existía.
+funcion cofre_borrar(tx, tabla, clave) {
+    _cf_exigir_escritura(tx)
+    sea raiz = _cf_raiz_tabla(tx, tabla)
+    si (raiz == nulo o raiz == -1 o raiz == 0) { retornar falso }
+    sea r = _cf_quitar(tx, raiz, "" + clave)
+    si (r[1]) { _cf_poner_raiz(tx, tabla, r[0]) }
+    retornar r[1]
+}
+
+/// Pares [clave, valor] en orden. opciones: "desde", "hasta" (excluida),
+/// "prefijo", "inverso", "limite".
+funcion cofre_rango(tx, tabla, opciones) {
+    sea op = opciones ?? {}
+    sea raiz = _cf_raiz_tabla(tx, tabla)
+    si (raiz == nulo o raiz == -1) { retornar [] }
+    sea desde = op["desde"] ?? nulo
+    sea hasta = op["hasta"] ?? nulo
+    sea pre = op["prefijo"] ?? nulo
+    si (pre != nulo) {
+        si (desde == nulo o desde < pre) { desde = pre }
+        // Fin del prefijo: incrementa el último byte.
+        sea i = longitud(pre) - 1
+        sea fin = nulo
+        mientras (i >= 0 y fin == nulo) {
+            si (byte_en(pre, i) < 255) { fin = subcadena(pre, 0, i) + _cf_b(byte_en(pre, i) + 1) }
+            i = i - 1
+        }
+        si (fin != nulo y (hasta == nulo o fin < hasta)) { hasta = fin }
+    }
+    sea lim = op["limite"] ?? nulo
+    sea r = []
+    _cf_recorrer(tx, raiz, desde, hasta, op["inverso"] ?? falso, funcion(k, v) {
+        r.agregar([k, _cf_valor(tx["db"], v)])
+        retornar lim == nulo o longitud(r) < lim
+    })
+    retornar r
+}
+
+/// Cantidad de claves de la tabla.
+funcion cofre_contar(tx, tabla) {
+    sea raiz = _cf_raiz_tabla(tx, tabla)
+    si (raiz == nulo o raiz == -1) { retornar 0 }
+    sea n = [0]
+    _cf_recorrer(tx, raiz, nulo, nulo, falso, funcion(k, v) {
+        n[0] = n[0] + 1
+        retornar verdadero
+    })
+    retornar n[0]
+}
+
+/// Nombres de las tablas.
+funcion cofre_tablas(tx) {
+    sea r = []
+    _cf_recorrer(tx, tx["raiz"], nulo, nulo, falso, funcion(k, v) {
+        si ((tx["raices"][k] ?? 0) != -1) { r.agregar(k) }
+        retornar verdadero
+    })
+    para k en claves(tx["raices"]) { si (tx["raices"][k] != -1 y lista_contiene(r, k) == falso) { r.agregar(k) } }
+    retornar ordenar(r, funcion(a, b) {
+        si (a < b) { retornar -1 }
+        si (a > b) { retornar 1 }
+        retornar 0
+    })
+}
+
+/// Borra una tabla entera.
+funcion cofre_borrar_tabla(tx, tabla) {
+    _cf_exigir_escritura(tx)
+    sea raiz = _cf_raiz_tabla(tx, tabla)
+    si (raiz == nulo o raiz == -1) { retornar falso }
+    // Libera sus páginas.
+    sea pendientes = []
+    si (raiz != 0) { pendientes.agregar(raiz) }
+    mientras (longitud(pendientes) > 0) {
+        sea p = pendientes[longitud(pendientes) - 1]
+        pendientes = _cf_cortar(pendientes, 0, longitud(pendientes) - 1)
+        sea nd = _cf_nodo(tx, p)
+        si (nd["hoja"] == falso) { para h en nd["hijos"] { pendientes.agregar(h) } } sino {
+            para v en nd["valores"] { si (tipo(v) == "mapa" y tiene_clave(v, "desborde")) { _cf_liberar_desborde(tx, v) } }
+        }
+        si (tiene_clave(tx["sucios"], "" + p)) {
+            quitar_clave(tx["sucios"], "" + p)
+            tx["libres"].agregar(p)
+        } sino { tx["liberadas"].agregar(p) }
+    }
+    _cf_poner_raiz(tx, tabla, -1)
+    retornar verdadero
+}
+
+/// Estado: {"txid", "paginas", "libres", "bytes"}.
+funcion cofre_estado(db) { retornar {"txid": db["meta"]["txid"], "paginas": db["meta"]["marca"], "libres": longitud(db["lista_libre"]), "bytes": db["meta"]["marca"] * _CF_PAG} }
