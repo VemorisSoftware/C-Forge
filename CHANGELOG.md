@@ -69,6 +69,19 @@ Sitio oficial: [c-forge.org](https://c-forge.org)
   `llamada`/`protobuf` (.proto, binario como protoc, marcos gRPC),
   `recolecta`/`crawler` (cookies RFC 6265, formularios, robots.txt,
   rastreo) y `sensor`/`mqtt` (paquetes MQTT, QoS 2, mini broker).
+- `aes_gcm_cifrar` y `aes_gcm_descifrar` aceptan claves de 16 bytes
+  (AES-128-GCM) además de las de 32.
+- Lote 27 de bibliotecas (con alias en inglés y pruebas en ambos idiomas):
+  `blindaje`/`rustls` (TLS 1.3 propio, cliente y servidor sin E/S o sobre
+  TCP: X25519 y P-256/P-384, AES-GCM y ChaCha20-Poly1305, firmas Ed25519,
+  ECDSA y RSA PSS/PKCS#1, X.509 con cadena hasta las raíces del sistema,
+  SNI, ALPN, HelloRetryRequest, KeyUpdate, exportador, modo QUIC y
+  certificados propios; probado contra OpenSSL en los dos sentidos) y
+  `veloz`/`quinn` (QUIC v1 y HTTP/3 propios sobre `blindaje`: protección de
+  paquetes y cabeceras, ACK, retransmisión, flujos con control de flujo,
+  Retry, QPACK estático con Huffman, cliente y servidor sobre UDP; probado
+  contra aioquic en los dos sentidos).
+- `aes_bloque(clave, bloque)`: un bloque AES-128 o AES-256 (ECB).
 - Lote 26 de bibliotecas (con alias en inglés y pruebas en ambos idiomas):
   `panel`/`imgui` (GUI de modo inmediato al estilo de Dear ImGui: ventanas
   que se mueven, pliegan, apilan y desplazan, y los elementos de siempre,

@@ -1,0 +1,113 @@
+// Pruebas de veloz (QUIC v1 y HTTP/3). Cliente y servidor hablan en memoria.
+importar "veloz"
+funcion eq(a, b, q) { afirmar(("" + a) == ("" + b), q + ": [" + a + "] != [" + b + "]") }
+
+// Enteros de largo variable (RFC 9000 A.1) y número de paquete (A.3).
+eq([hex_de_bytes(veloz_varint(37)), hex_de_bytes(veloz_varint(15293)), hex_de_bytes(veloz_varint(494878333)), hex_de_bytes(veloz_varint(151288809941952652))], ["25", "7bbd", "9d7f3e7d", "c2197c5eff14e88c"], "varint")
+eq(_vz_leer_varint(bytes_de_hex("c2197c5eff14e88c"), 0)[0], 151288809941952652, "varint al revés")
+eq(_vz_decodificar_pn(2821666027, 39730, 16), 2821692210, "número de paquete")
+// Claves iniciales (RFC 9001 A.1).
+sea ci = veloz_claves_iniciales(bytes_de_hex("8394c8f03e515708"))
+eq([hex_de_bytes(ci["cliente"]["clave"]), hex_de_bytes(ci["cliente"]["iv"]), hex_de_bytes(ci["cliente"]["hp"])], ["1f369613dd76d5467730efcbe3b1a22d", "fa044b2f42a3fd3b46fb255c", "9f50449e04a0e810283a1e9933adedd2"], "claves del cliente")
+eq([hex_de_bytes(ci["servidor"]["clave"]), hex_de_bytes(ci["servidor"]["iv"]), hex_de_bytes(ci["servidor"]["hp"])], ["cf3a5331653c364c88f0f379b6067e37", "0ac1493ca1905853b0bba03e", "c206b8d9b9f0f37644430b490eeaa314"], "claves del servidor")
+// Protección de un paquete Initial, comparada con aioquic.
+sea carga = ""
+sea i = 0
+mientras (i < 200) {
+    carga = carga + char_de(i)
+    i = i + 1
+}
+sea cab = bytes_de_hex("c300000001088394c8f03e5157080000449e00000002")
+sea pkt = veloz_proteger(ci["cliente"], cab, 2, 18, 4, carga)
+eq(hex_de_bytes(pkt), "c600000001088394c8f03e5157080000449e7852cbc8d7b08b7fd26d9952e71b33b1477823bdf112f36f98fec3d5e97ea9d3ae3b611a03125cfbb77f0dd793fc360d26fae93125832db7dd204d84722bb69d7f9e89610d81557f2dc69dcf123ac5fc1ed38a91c006bf4eba579eeaa3e0263e5276249465e60e4c8a99d4b80f7a5aa35b7cddcf33ad70db9e1709e214802270865b48651827c2424a784587313d358084064233322fc904ea650b378aa7dc1a77519bb03d80145314b6787269a7e4678a5a31a1785c81636095166da24ac47980a4d2ae5d345608f572bab20233572f09f0791ec39b5aac8f27ef26", "paquete protegido como aioquic")
+sea des = _vz_desproteger(ci["cliente"], pkt, 18, 0)
+eq([des["pn"], des["carga"] == carga], [2, verdadero], "desproteger")
+afirmar(_vz_desproteger(ci["servidor"], pkt, 18, 0) == nulo, "con otra clave no abre")
+
+// QPACK y Huffman (RFC 7541 C.4.1).
+eq(veloz_huffman_decodificar(bytes_de_hex("f1e3c2e5f23a6ba0ab90f4ff")), "www.example.com", "Huffman")
+sea cab_h = [[":method", "GET"], [":path", "/a?b=c"], [":authority", "ejemplo.cl"], ["x-propia", "valor"], ["content-type", "text/plain"]]
+eq(veloz_qpack_decodificar(veloz_qpack_codificar(cab_h)), cab_h, "QPACK de ida y vuelta")
+eq(hex_de_bytes(veloz_qpack_codificar([[":method", "GET"]])), "0000d1", "índice estático 17")
+
+// Conexión completa en memoria.
+sea ca = blindaje_emitir(["CA"], {"ca": verdadero})
+sea srv = blindaje_emitir(["localhost"], {"emisor": {"certificado": ca["der"], "clave": ca["clave"]}})
+funcion manejador(req) { retornar {"estado": 201, "cabeceras": {"x-ruta": req["ruta"]}, "cuerpo": req["metodo"] + ":" + longitud(req["cuerpo"])} }
+// Lleva datagramas de un lado al otro; "perder": función que decide si se pierde uno.
+funcion correr(c, s, ids, perder, rondas) {
+    sea t = 0
+    sea n = 0
+    mientras (n < rondas) {
+        sea k = 0
+        para dg en veloz_salida(c, t) {
+            si (perder(k) == falso) { veloz_recibir(s, dg, t) }
+            k = k + 1
+        }
+        veloz_h3_atender(s, manejador)
+        para dg en veloz_salida(s, t) {
+            si (perder(k) == falso) { veloz_recibir(c, dg, t) }
+            k = k + 1
+        }
+        si (veloz_conectado(c) y longitud(ids) == 0) {
+            ids.agregar(veloz_h3_solicitar(c, "GET", "localhost", "/hola", [["user-agent", "prueba"]], nulo))
+            sea grande = ""
+            mientras (longitud(grande) < 100000) { grande = grande + "0123456789" }
+            ids.agregar(veloz_h3_solicitar(c, "POST", "localhost", "/subir", [], grande))
+        }
+        si (longitud(ids) == 2 y veloz_h3_respuesta(c, ids[0])["fin"] y veloz_h3_respuesta(c, ids[1])["fin"]) { retornar n }
+        t = t + 100
+        n = n + 1
+    }
+    retornar n
+}
+sea c = veloz_cliente("localhost", {"raices": ca["pem"]})
+sea s = veloz_servidor({"cadena": [srv["der"]], "clave": srv["clave"]})
+sea ids = []
+sea rondas = correr(c, s, ids, funcion(k) { retornar falso }, 60)
+afirmar(rondas < 10, "sin pérdidas en pocas rondas: " + rondas)
+eq([c["alpn"], c["confirmado"], s["estado"]], ["h3", verdadero, "conectado"], "conectados")
+sea r1 = veloz_h3_respuesta(c, ids[0])
+sea r2 = veloz_h3_respuesta(c, ids[1])
+eq([r1["estado"], r1["cabeceras"]["x-ruta"], r1["cuerpo"]], [201, "/hola", "GET:0"], "GET")
+eq(r2["cuerpo"], "POST:100000", "POST de 100 KB")
+// Con pérdidas: se pierde uno de cada tres datagramas y se recupera.
+sea c2 = veloz_cliente("localhost", {"raices": ca["pem"]})
+sea s2 = veloz_servidor({"cadena": [srv["der"]], "clave": srv["clave"]})
+sea ids2 = []
+sea contador = [0]
+correr(c2, s2, ids2, funcion(k) {
+    contador[0] = contador[0] + 1
+    retornar contador[0] % 3 == 0
+}, 400)
+eq([veloz_h3_respuesta(c2, ids2[0])["cuerpo"], veloz_h3_respuesta(c2, ids2[1])["cuerpo"]], ["GET:0", "POST:100000"], "con pérdidas")
+// Cierre.
+veloz_cerrar(c, 7, "chao")
+para dg en veloz_salida(c, 0) { veloz_recibir(s, dg, 0) }
+sea ev = veloz_eventos(s)
+sea cierre = nulo
+para e en ev { si (e["tipo"] == "cerrado") { cierre = e } }
+eq([cierre["codigo"], cierre["razon"]], [7, "chao"], "CONNECTION_CLOSE")
+// Certificado que no corresponde: el handshake falla.
+sea c3 = veloz_cliente("otro.com", {"raices": ca["pem"]})
+sea s3 = veloz_servidor({"cadena": [srv["der"]], "clave": srv["clave"]})
+sea fallo = ""
+intentar { correr(c3, s3, [], funcion(k) { retornar falso }, 5) } capturar (e) { fallo = e }
+afirmar(contiene(fallo, "no es para otro.com"), "verificación del nombre")
+
+// Retry (paquete de aioquic): token, nuevo DCID y claves iniciales nuevas.
+sea c4 = veloz_cliente("localhost", {"raices": ca["pem"]})
+c4["odcid"] = bytes_de_hex("8394c8f03e515708")
+c4["scid"] = bytes_de_hex("0011223344556677")
+veloz_salida(c4, 0)
+veloz_recibir(c4, bytes_de_hex("f00000000108001122334455667708f067a5502a4262b566696368612d64652d7072756562617ac47f69ab2c023e5510265777f7418d"), 0)
+eq([c4["token"], hex_de_bytes(c4["dcid"]), hex_de_bytes(c4["retry_scid"])], ["ficha-de-prueba", "f067a5502a4262b5", "f067a5502a4262b5"], "Retry")
+eq(hex_de_bytes(c4["espacios"]["inicial"]["escribir"]["clave"]), hex_de_bytes(veloz_claves_iniciales(bytes_de_hex("f067a5502a4262b5"))["cliente"]["clave"]), "claves tras Retry")
+sea tras = veloz_salida(c4, 1000)
+afirmar(longitud(tras) > 0 y longitud(tras[0]) >= 1200, "vuelve a mandar el Initial")
+// Un Retry con la etiqueta mala se ignora.
+sea c5 = veloz_cliente("localhost", {"raices": ca["pem"]})
+c5["odcid"] = bytes_de_hex("8394c8f03e515708")
+veloz_recibir(c5, bytes_de_hex("f00000000108001122334455667708f067a5502a4262b566696368612d64652d7072756562617ac47f69ab2c023e5510265777f7418e"), 0)
+eq(c5["retry_scid"], nulo, "Retry falso")
+mostrar("[OK] veloz")
