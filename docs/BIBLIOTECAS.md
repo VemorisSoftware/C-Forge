@@ -40,7 +40,7 @@ Estado: ✅ ya existe en C-Forge · 🔗 se usa hoy vía `cforge bindgen`,
 | 21 | `consulta` | Consultas perezosas sobre colecciones | LINQ | ✅ `colecciones` (parcial) |
 | 22 | `ligero` / `dapper` | Micro-ORM | Dapper | ✅ `ligero` |
 | 23 | `mapeador` | ORM con migraciones | EF Core | ✅ `db` (migraciones) · 🛠 ORM |
-| 24 | `senal` | Tiempo real con reconexión | SignalR | 🛠 |
+| 24 | `senal` / `signalr` | Tiempo real con reconexión | SignalR | ✅ `senal` |
 | 25 | `arbol_json` | JSON tipado y dinámico | System.Text.Json | ✅ `json` |
 | 26 | `regla` / `validator` | Validación encadenada | FluentValidation | ✅ `regla` |
 | 27 | `calco` / `mapper` | Mapeo entre estructuras | AutoMapper | ✅ `calco` |
@@ -57,7 +57,7 @@ Estado: ✅ ya existe en C-Forge · 🔗 se usa hoy vía `cforge bindgen`,
 | 38 | `ruta` | Framework web con middlewares | Express, Hono | ✅ `web` (básico) |
 | 39 | `navaja` | Utilidades funcionales | Lodash | ✅ `lista` / `algoritmos` · 🔗 npm |
 | 40 | `calendario` | Fechas y zonas horarias | Day.js, Luxon | ✅ `fecha` |
-| 41 | `cartero` | Cliente HTTP con interceptores | Axios | ✅ `red` · 🛠 interceptores |
+| 41 | `cartero` / `httpclient` | Cliente HTTP con interceptores | Axios | ✅ `cartero` |
 | 42 | `eco` | Eventos en tiempo real | Socket.io | ✅ WebSocket en `red` |
 | 43 | `modelo_db` / `orm` | Esquemas y consultas limpias | Prisma, Drizzle | ✅ `modelo_db` |
 | 44 | `escena` | 3D sobre WebGL | Three.js | ✅ `gl` / `modelo` (básico) |
@@ -149,7 +149,7 @@ Estado: ✅ ya existe en C-Forge · 🔗 se usa hoy vía `cforge bindgen`,
 | 108 | `sintaxis` | Parser incremental | tree-sitter | 🔗 |
 | 109 | `xml` | XML rápido | quick-xml | ✅ `xml` |
 | 110 | `csv` | CSV gigantes (RFC 4180) | csv-rs | ✅ `csv` |
-| 111 | `memoria_rapida` | Cliente Redis con clústeres | fred | ✅ `redis` · 🛠 clústeres |
+| 111 | `memoria_rapida` / `redisx` | Cliente Redis con clústeres | fred | ✅ `memoria_rapida` |
 
 ### E. Web, frontend, APIs y pruebas
 
@@ -197,7 +197,7 @@ Estado: ✅ ya existe en C-Forge · 🔗 se usa hoy vía `cforge bindgen`,
 | 141 | `rastreo` / `glob` | Búsqueda recursiva con comodines | Walkdir, Glob | ✅ `rastreo` |
 | 142 | `sistema` / `sysinfo` | CPU, RAM y procesos | sysinfo | ✅ `sistema` |
 | 143 | `historia` | Repositorios Git nativos | libgit2 | 🔗 |
-| 144 | `contenedor` | Controlar Docker | Bollard | 🛠 |
+| 144 | `contenedor` / `docker` | Controlar Docker | Bollard | ✅ `contenedor` |
 | 145 | `version` | Versionado semántico | semver | ✅ gestor de paquetes |
 | 146 | `cronometro` / `bench` | Micro-benchmarks estadísticos | Criterion | ✅ `cronometro` |
 | 147 | `huesped` / `wasm` | Ejecutar WebAssembly embebido | Wasmtime | ✅ `huesped` |
@@ -306,7 +306,7 @@ Estado: ✅ ya existe en C-Forge · 🔗 se usa hoy vía `cforge bindgen`,
 | 223 | `proceso` / `workflow` | Flujos de trabajo de larga duración | Temporal | ✅ `proceso` |
 | 224 | `permisos` / `rbac` | ACL, RBAC y ABAC | Casbin | ✅ `permisos` |
 | 225 | `interruptor` / `flags` | Feature flags y pruebas A/B | OpenFeature | ✅ `interruptor` |
-| 226 | `entorno` | Servicios reales en pruebas | Testcontainers | 🛠 |
+| 226 | `entorno` / `testcontainers` | Servicios reales en pruebas | Testcontainers | ✅ `entorno` |
 
 ### M. Automatización, compiladores y sistema
 
@@ -321,7 +321,7 @@ Estado: ✅ ya existe en C-Forge · 🔗 se usa hoy vía `cforge bindgen`,
 | 233 | `anillo` | E/S asíncrona en Linux | io_uring | 🛠 |
 | 234 | `ventanas_api` | APIs nativas de Windows | windows (Rust) | ✅ runtime Windows · 🛠 |
 | 235 | `manzana` | APIs nativas de macOS e iOS | Cocoa | ✅ `apple` (básico) |
-| 236 | `bus` | D-Bus en Linux | zbus | 🛠 |
+| 236 | `bus` / `dbus` | D-Bus en Linux | zbus | ✅ `bus` |
 | 237 | `teclado` | Simular teclado y ratón | Enigo | 🛠 |
 | 238 | `recolecta` / `crawler` | Extracción web con sesiones | Fantoccini | ✅ `recolecta` |
 | 239 | `agenda` / `schedule` | Cron con zonas horarias | tokio-cron | ✅ `agenda` |

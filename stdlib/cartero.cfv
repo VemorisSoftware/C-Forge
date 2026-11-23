@@ -1,0 +1,400 @@
+// stdlib/cartero.cfv — cliente HTTP con instancias e interceptores: URL
+// base, cabeceras y parámetros por defecto, interceptores de petición y de
+// respuesta (con manejo de errores encadenado), JSON automático, formularios
+// urlencoded, transformaciones, validar_estado, reintentos con espera
+// exponencial y Retry-After, cancelación con fichas, autenticación básica y
+// bearer, y adaptadores cambiables (uno de prueba incluido). Idea de Axios
+// (MIT). En inglés: importar "httpclient".
+//
+//   importar "cartero"
+//   sea api = cartero_crear({"base": "https://api.ejemplo.com/v1", "cabeceras": {"X-App": "demo"}})
+//   cartero_interceptor_peticion(api, funcion(p) { p["cabeceras"]["Authorization"] = "Bearer x"; retornar p }, nulo)
+//   sea r = cartero_get(api, "/usuarios", {"parametros": {"pagina": 2}})
+//   mostrar(r["datos"])
+
+importar "json"
+importar "base64"
+
+// ---------- utilidades ----------
+
+funcion _ca_codificar(t) {
+    sea s = "" + t
+    sea seguros = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-_.~"
+    sea hexa = "0123456789ABCDEF"
+    sea r = []
+    sea i = 0
+    mientras (i < longitud(s)) {
+        sea b = byte_en(s, i)
+        sea ch = subcadena(s, i, i + 1)
+        si (contiene(seguros, ch) y b < 128) { r.agregar(ch) } sino {
+            r.agregar("%" + subcadena(hexa, piso(b / 16), piso(b / 16) + 1) + subcadena(hexa, b % 16, b % 16 + 1))
+        }
+        i = i + 1
+    }
+    retornar unir(r, "")
+}
+
+/// Serializa parámetros: listas como a=1&a=2 (o a[]=1 con estilo
+/// "corchetes"), mapas anidados como a[b]=1; se omiten los nulos.
+funcion cartero_parametros(p, estilo) {
+    sea partes = []
+    _ca_param(partes, nulo, p, estilo ?? "repetir")
+    retornar unir(partes, "&")
+}
+
+funcion _ca_param(partes, prefijo, v, estilo) {
+    si (v == nulo) { retornar nulo }
+    si (tipo(v) == "mapa") {
+        para k en claves(v) {
+            sea nombre = k
+            si (prefijo != nulo) { nombre = prefijo + "[" + k + "]" }
+            _ca_param(partes, nombre, v[k], estilo)
+        }
+        retornar nulo
+    }
+    si (tipo(v) == "lista") {
+        si (estilo == "coma") {
+            sea t = []
+            para x en v { t.agregar("" + x) }
+            partes.agregar(_ca_codificar(prefijo) + "=" + _ca_codificar(unir(t, ",")))
+            retornar nulo
+        }
+        sea i = 0
+        para x en v {
+            sea nombre = prefijo
+            si (estilo == "corchetes") { nombre = prefijo + "[]" }
+            si (estilo == "indices") { nombre = prefijo + "[" + i + "]" }
+            _ca_param(partes, nombre, x, estilo)
+            i = i + 1
+        }
+        retornar nulo
+    }
+    sea s = "" + v
+    si (v == verdadero) { s = "true" }
+    si (v == falso) { s = "false" }
+    partes.agregar(_ca_codificar(prefijo) + "=" + _ca_codificar(s))
+}
+
+/// Une la URL base con una ruta (salvo que la ruta ya sea absoluta).
+funcion cartero_unir_url(base, ruta) {
+    si (base == nulo o base == "") { retornar ruta }
+    si (ruta == nulo o ruta == "") { retornar base }
+    si (texto_empieza_con(ruta, "http://") o texto_empieza_con(ruta, "https://")) { retornar ruta }
+    sea b = base
+    mientras (texto_termina_con(b, "/")) { b = subcadena(b, 0, longitud(b) - 1) }
+    sea r = ruta
+    mientras (texto_empieza_con(r, "/")) { r = subcadena(r, 1, longitud(r)) }
+    retornar b + "/" + r
+}
+
+funcion _ca_copiar(m) {
+    si (tipo(m) == "mapa") {
+        sea r = {}
+        para k en claves(m) { r[k] = _ca_copiar(m[k]) }
+        retornar r
+    }
+    si (tipo(m) == "lista") {
+        sea r = []
+        para x en m { r.agregar(_ca_copiar(x)) }
+        retornar r
+    }
+    retornar m
+}
+
+// Mezcla de configuraciones: los mapas de cabeceras y parámetros se unen;
+// lo demás lo pisa la configuración más específica.
+funcion _ca_mezclar(a, b) {
+    sea r = _ca_copiar(a)
+    si (b == nulo) { retornar r }
+    para k en claves(b) {
+        si ((k == "cabeceras" o k == "parametros") y tipo(b[k]) == "mapa" y tipo(r[k] ?? nulo) == "mapa") {
+            para h en claves(b[k]) { r[k][h] = b[k][h] }
+        } sino { r[k] = b[k] }
+    }
+    retornar r
+}
+
+funcion _ca_cabecera(cab, nombre) {
+    para k en claves(cab ?? {}) { si (texto_minusculas(k) == texto_minusculas(nombre)) { retornar cab[k] } }
+    retornar nulo
+}
+
+funcion _ca_poner_si_falta(cab, nombre, valor) {
+    si (_ca_cabecera(cab, nombre) == nulo) { cab[nombre] = valor }
+}
+
+// ---------- instancias ----------
+
+/// Crea una instancia. opciones: "base", "cabeceras", "parametros",
+/// "estilo_parametros", "tiempo" (ms), "reintentos", "espera" (ms base),
+/// "reintentar_en" (lista de estados), "validar_estado" (función(estado)),
+/// "tipo_respuesta" ("json" | "texto"), "adaptador" (función(peticion)
+/// → {"estado", "cabeceras", "cuerpo"}), "auth" ({"usuario", "clave"}),
+/// "token", "transformar_peticion" / "transformar_respuesta" (listas de
+/// funciones), "dormir" (función(ms), para pruebas).
+funcion cartero_crear(opciones) {
+    sea c = _ca_mezclar({"base": "", "cabeceras": {}, "parametros": {}, "reintentos": 0, "espera": 200, "reintentar_en": [408, 429, 500, 502, 503, 504], "tipo_respuesta": "json"}, opciones)
+    retornar {"config": c, "ida": [], "vuelta": [], "sig": 0}
+}
+
+/// Instancia hija que hereda configuración e interceptores.
+funcion cartero_extender(inst, opciones) {
+    sea h = cartero_crear(_ca_mezclar(inst["config"], opciones))
+    para x en inst["ida"] { h["ida"].agregar(x) }
+    para x en inst["vuelta"] { h["vuelta"].agregar(x) }
+    retornar h
+}
+
+/// Agrega un interceptor de petición: ok(peticion) → peticion (puede
+/// lanzar); error(e) → peticion o lanza. Devuelve un id para quitarlo.
+funcion cartero_interceptor_peticion(inst, ok, error) {
+    inst["sig"] = inst["sig"] + 1
+    inst["ida"].agregar({"id": inst["sig"], "ok": ok, "error": error})
+    retornar inst["sig"]
+}
+
+/// Interceptor de respuesta: ok(respuesta) → respuesta; error(e) → respuesta
+/// (para recuperarse, por ejemplo renovando un token) o lanza.
+funcion cartero_interceptor_respuesta(inst, ok, error) {
+    inst["sig"] = inst["sig"] + 1
+    inst["vuelta"].agregar({"id": inst["sig"], "ok": ok, "error": error})
+    retornar inst["sig"]
+}
+
+funcion cartero_quitar_interceptor(inst, id) {
+    sea f = funcion(l) {
+        sea r = []
+        para x en l { si (x["id"] != id) { r.agregar(x) } }
+        retornar r
+    }
+    inst["ida"] = f(inst["ida"])
+    inst["vuelta"] = f(inst["vuelta"])
+}
+
+// ---------- cancelación ----------
+
+/// Ficha de cancelación: pasarla como "cancelar" en la configuración.
+funcion cartero_ficha() { retornar {"cancelada": falso, "motivo": nulo} }
+
+funcion cartero_cancelar(ficha, motivo) {
+    ficha["cancelada"] = verdadero
+    ficha["motivo"] = motivo ?? "cancelada"
+}
+
+/// ¿El error es una cancelación?
+funcion cartero_es_cancelacion(e) { retornar tipo(e) == "mapa" y (e["codigo"] ?? nulo) == "CANCELADA" }
+
+// ---------- errores ----------
+
+funcion _ca_error(mensaje, codigo, peticion, respuesta) {
+    retornar {"error": verdadero, "mensaje": mensaje, "codigo": codigo, "peticion": peticion, "respuesta": respuesta}
+}
+
+/// Texto legible de un error de cartero (o de cualquier otro).
+funcion cartero_mensaje(e) {
+    si (tipo(e) == "mapa" y (e["error"] ?? falso)) { retornar e["mensaje"] }
+    retornar "" + e
+}
+
+// ---------- envío ----------
+
+funcion _ca_adaptador_red(p) {
+    sea op = {"cabeceras": p["cabeceras"]}
+    si ((p["cuerpo"] ?? nulo) != nulo) { op["cuerpo"] = p["cuerpo"] }
+    sea ct = _ca_cabecera(p["cabeceras"], "Content-Type")
+    si (ct != nulo) { op["tipo"] = ct }
+    si ((p["tiempo"] ?? nulo) != nulo) { op["tiempo"] = p["tiempo"] }
+    sea r = http_solicitud(p["metodo"], p["url"], op)
+    retornar {"estado": r["estado"], "cabeceras": r["cabeceras"], "cuerpo": r["cuerpo"]}
+}
+
+funcion _ca_preparar(cfg) {
+    sea p = _ca_copiar(cfg)
+    p["metodo"] = texto_mayusculas(cfg["metodo"] ?? "GET")
+    sea url = cartero_unir_url(cfg["base"], cfg["url"] ?? "")
+    sea q = cartero_parametros(cfg["parametros"] ?? {}, cfg["estilo_parametros"] ?? nulo)
+    si (q != "") {
+        si (contiene(url, "?")) { url = url + "&" + q } sino { url = url + "?" + q }
+    }
+    p["url"] = url
+    sea cab = p["cabeceras"] ?? {}
+    p["cabeceras"] = cab
+    _ca_poner_si_falta(cab, "Accept", "application/json, text/plain, */*")
+    si ((cfg["auth"] ?? nulo) != nulo) { cab["Authorization"] = "Basic " + base64_codificar(cfg["auth"]["usuario"] + ":" + cfg["auth"]["clave"]) }
+    si ((cfg["token"] ?? nulo) != nulo) { cab["Authorization"] = "Bearer " + cfg["token"] }
+    // Cuerpo: mapas y listas como JSON, salvo formulario.
+    sea d = cfg["datos"] ?? nulo
+    para f en cfg["transformar_peticion"] ?? [] { d = f(d, cab) }
+    si (d != nulo) {
+        sea ct = _ca_cabecera(cab, "Content-Type")
+        si (tipo(d) == "mapa" o tipo(d) == "lista") {
+            si (ct != nulo y contiene(ct, "x-www-form-urlencoded")) { d = cartero_parametros(d, cfg["estilo_parametros"] ?? nulo) } sino {
+                d = json_texto(d)
+                _ca_poner_si_falta(cab, "Content-Type", "application/json")
+            }
+        } sino { _ca_poner_si_falta(cab, "Content-Type", "text/plain;charset=utf-8") }
+    }
+    p["cuerpo"] = d
+    retornar p
+}
+
+funcion _ca_respuesta(p, cruda) {
+    sea cab = {}
+    para k en claves(cruda["cabeceras"] ?? {}) { cab[texto_minusculas(k)] = cruda["cabeceras"][k] }
+    sea datos = cruda["cuerpo"]
+    sea ct = cab["content-type"] ?? ""
+    si ((p["tipo_respuesta"] ?? "json") == "json" y tipo(datos) == "texto" y longitud(datos) > 0) {
+        si (contiene(ct, "json") o ct == "") {
+            intentar { datos = json_parsear(datos) } capturar (e) {
+                si (contiene(ct, "json")) { lanzar _ca_error("JSON inválido en la respuesta", "JSON_INVALIDO", p, {"estado": cruda["estado"], "cabeceras": cab, "datos": datos}) }
+            }
+        }
+    }
+    para f en p["transformar_respuesta"] ?? [] { datos = f(datos, cab) }
+    retornar {"estado": cruda["estado"], "cabeceras": cab, "datos": datos, "peticion": p}
+}
+
+funcion _ca_valido(p, estado) {
+    sea v = p["validar_estado"] ?? nulo
+    si (v != nulo) { retornar v(estado) }
+    retornar estado >= 200 y estado < 300
+}
+
+funcion _ca_dormir(p, ms) {
+    sea d = p["dormir"] ?? nulo
+    si (d != nulo) { d(ms) } sino { dormir(ms) }
+}
+
+// Un intento de envío (sin interceptores), con reintentos.
+funcion _ca_enviar(p) {
+    sea adaptador = p["adaptador"] ?? _ca_adaptador_red
+    sea intento = 0
+    mientras (verdadero) {
+        sea ficha = p["cancelar"] ?? nulo
+        si (ficha != nulo y ficha["cancelada"]) { lanzar _ca_error(ficha["motivo"], "CANCELADA", p, nulo) }
+        sea cruda = nulo
+        sea fallo_red = nulo
+        intentar { cruda = adaptador(p) } capturar (e) { fallo_red = e }
+        sea reintentable = falso
+        sea espera = (p["espera"] ?? 200) * potencia(2, intento)
+        sea err = nulo
+        si (fallo_red != nulo) {
+            si (tipo(fallo_red) == "mapa" y (fallo_red["error"] ?? falso)) { err = fallo_red } sino { err = _ca_error("error de red: " + fallo_red, "RED", p, nulo) }
+            reintentable = (err["codigo"] == "RED" o err["codigo"] == "TIEMPO")
+        } sino {
+            sea r = _ca_respuesta(p, cruda)
+            si (_ca_valido(p, r["estado"])) { retornar r }
+            err = _ca_error("la petición falló con estado " + r["estado"], "ESTADO", p, r)
+            para s en p["reintentar_en"] ?? [] { si (s == r["estado"]) { reintentable = verdadero } }
+            sea ra = r["cabeceras"]["retry-after"] ?? nulo
+            si (ra != nulo) {
+                intentar { espera = a_numero("" + ra) * 1000 } capturar (e) { nulo }
+            }
+        }
+        // Solo se reintentan métodos idempotentes (o si se pide).
+        sea idem = contiene(" GET HEAD OPTIONS PUT DELETE ", " " + p["metodo"] + " ") o (p["reintentar_todo"] ?? falso)
+        si (reintentable y idem y intento < (p["reintentos"] ?? 0)) {
+            intento = intento + 1
+            _ca_dormir(p, espera)
+        } sino {
+            err["intentos"] = intento + 1
+            lanzar err
+        }
+    }
+}
+
+/// Petición completa: opciones tiene "metodo", "url", "datos" y cualquier
+/// opción de cartero_crear. Devuelve {"estado", "cabeceras", "datos",
+/// "peticion"} o lanza {"error", "mensaje", "codigo", "respuesta"…}.
+funcion cartero_pedir(inst, opciones) {
+    sea cfg = _ca_mezclar(inst["config"], opciones)
+    sea p = nulo
+    sea err = nulo
+    intentar { p = _ca_preparar(cfg) } capturar (e) { err = e }
+    // Interceptores de petición: el último agregado corre primero (como Axios).
+    sea i = longitud(inst["ida"]) - 1
+    mientras (i >= 0) {
+        sea it = inst["ida"][i]
+        si (err == nulo) {
+            intentar { p = it["ok"](p) } capturar (e) { err = e }
+        } sino si ((it["error"] ?? nulo) != nulo) {
+            sea e0 = err
+            err = nulo
+            intentar { p = it["error"](e0) } capturar (e) { err = e }
+        }
+        i = i - 1
+    }
+    sea r = nulo
+    si (err == nulo) {
+        intentar { r = _ca_enviar(p) } capturar (e) { err = e }
+    }
+    // Interceptores de respuesta, en orden.
+    para it en inst["vuelta"] {
+        si (err == nulo) {
+            si ((it["ok"] ?? nulo) != nulo) {
+                intentar { r = it["ok"](r) } capturar (e) { err = e }
+            }
+        } sino si ((it["error"] ?? nulo) != nulo) {
+            sea e0 = err
+            err = nulo
+            intentar { r = it["error"](e0) } capturar (e) { err = e }
+        }
+    }
+    si (err != nulo) { lanzar err }
+    retornar r
+}
+
+/// Reenvía una petición ya hecha (útil desde un interceptor de error).
+funcion cartero_repetir(inst, peticion) {
+    sea c = _ca_copiar(peticion)
+    // La URL ya trae base y parámetros.
+    c["base"] = ""
+    c["parametros"] = {}
+    c["datos"] = peticion["cuerpo"]
+    retornar cartero_pedir(inst, c)
+}
+
+funcion cartero_get(inst, url, opciones) { retornar cartero_pedir(inst, _ca_mezclar(opciones ?? {}, {"metodo": "GET", "url": url})) }
+funcion cartero_borrar(inst, url, opciones) { retornar cartero_pedir(inst, _ca_mezclar(opciones ?? {}, {"metodo": "DELETE", "url": url})) }
+funcion cartero_head(inst, url, opciones) { retornar cartero_pedir(inst, _ca_mezclar(opciones ?? {}, {"metodo": "HEAD", "url": url})) }
+funcion cartero_post(inst, url, datos, opciones) { retornar cartero_pedir(inst, _ca_mezclar(opciones ?? {}, {"metodo": "POST", "url": url, "datos": datos})) }
+funcion cartero_put(inst, url, datos, opciones) { retornar cartero_pedir(inst, _ca_mezclar(opciones ?? {}, {"metodo": "PUT", "url": url, "datos": datos})) }
+funcion cartero_patch(inst, url, datos, opciones) { retornar cartero_pedir(inst, _ca_mezclar(opciones ?? {}, {"metodo": "PATCH", "url": url, "datos": datos})) }
+
+/// Ejecuta varias peticiones y devuelve todas las respuestas (o lanza el
+/// primer error). Con "permitir_errores", los errores quedan en su lugar.
+funcion cartero_todas(inst, configs, permitir_errores) {
+    sea r = []
+    para c en configs {
+        si ((permitir_errores ?? falso) == verdadero) {
+            sea v = nulo
+            intentar { v = cartero_pedir(inst, c) } capturar (e) { v = e }
+            r.agregar(v)
+        } sino { r.agregar(cartero_pedir(inst, c)) }
+    }
+    retornar r
+}
+
+// ---------- adaptador de prueba ----------
+
+/// Adaptador simulado: rutas {"GET /ruta": función(peticion) → {"estado",
+/// "cabeceras", "cuerpo"} | mapa fijo}. Guarda cada petición en "historial".
+funcion cartero_simulado(rutas) {
+    sea s = {"rutas": rutas, "historial": []}
+    s["adaptador"] = funcion(p) {
+        s["historial"].agregar(p)
+        sea ruta = p["url"]
+        sea q = texto_indice(ruta, "?")
+        si (q >= 0) { ruta = subcadena(ruta, 0, q) }
+        // Sin esquema ni host.
+        si (texto_empieza_con(ruta, "http")) {
+            sea d = texto_indice(subcadena(ruta, 8, longitud(ruta)), "/")
+            si (d >= 0) { ruta = subcadena(ruta, 8 + d, longitud(ruta)) } sino { ruta = "/" }
+        }
+        sea h = s["rutas"][p["metodo"] + " " + ruta] ?? nulo
+        si (h == nulo) { retornar {"estado": 404, "cabeceras": {"Content-Type": "application/json"}, "cuerpo": "{" + caracter(34) + "error" + caracter(34) + ":" + caracter(34) + "no existe" + caracter(34) + "}"} }
+        si (tipo(h) == "funcion") { retornar h(p) }
+        retornar h
+    }
+    retornar s
+}

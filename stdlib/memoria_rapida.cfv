@@ -1,0 +1,878 @@
+// stdlib/memoria_rapida.cfv — cliente Redis completo con clústeres: RESP2
+// y RESP3 (HELLO 3, mapas, conjuntos, dobles, nulos, push), tuberías,
+// transacciones MULTI/EXEC, scripts EVAL/EVALSHA, pub/sub, y Redis Cluster
+// con las 16384 ranuras (CRC16 y etiquetas {…}), mapa por CLUSTER SLOTS,
+// redirecciones MOVED y ASK, tuberías repartidas por nodo y MGET/MSET/DEL
+// que cruzan ranuras. Probado contra redis-server en modo clúster. Idea de
+// fred (MIT) y redis-py (MIT). En inglés: importar "redisc".
+//
+//   importar "memoria_rapida"
+//   sea cl = memoria_cluster(["127.0.0.1:7001"], nulo)
+//   memoria_cmd(cl, ["SET", "usuario:1", "Ana"])
+//   mostrar(memoria_cmd(cl, ["GET", "usuario:1"]))
+
+// ---------- CRC16 y ranuras ----------
+
+sea _MR_CRC = nulo
+
+funcion _mr_tabla() {
+    si (_MR_CRC != nulo) { retornar _MR_CRC }
+    sea t = []
+    sea i = 0
+    mientras (i < 256) {
+        sea c = i * 256
+        sea j = 0
+        mientras (j < 8) {
+            si (c >= 32768) { c = bits_xo((c * 2) % 65536, 4129) } sino { c = (c * 2) % 65536 }
+            j = j + 1
+        }
+        t.agregar(c)
+        i = i + 1
+    }
+    _MR_CRC = t
+    retornar t
+}
+
+/// CRC16-XMODEM (el de Redis Cluster).
+funcion memoria_crc16(t) {
+    sea tb = _mr_tabla()
+    sea c = 0
+    sea i = 0
+    mientras (i < longitud(t)) {
+        c = bits_xo((c * 256) % 65536, tb[bits_xo(piso(c / 256), byte_en(t, i))])
+        i = i + 1
+    }
+    retornar c
+}
+
+/// Ranura de una clave (0..16383), respetando la etiqueta {…}.
+funcion memoria_ranura(clave) {
+    sea k = "" + clave
+    sea a = texto_indice(k, caracter(123))
+    si (a >= 0) {
+        sea resto = subcadena(k, a + 1, longitud(k))
+        sea b = texto_indice(resto, caracter(125))
+        si (b > 0) { k = subcadena(resto, 0, b) }
+    }
+    retornar memoria_crc16(k) % 16384
+}
+
+// ---------- RESP ----------
+
+/// Codifica un comando como arreglo RESP de textos.
+funcion memoria_resp(args) {
+    sea p = ["*" + longitud(args) + "\r\n"]
+    para a en args {
+        sea s = "" + a
+        p.agregar("$" + longitud(s) + "\r\n" + s + "\r\n")
+    }
+    retornar unir(p, "")
+}
+
+/// ¿El valor es un error de Redis?
+funcion memoria_es_error(v) { retornar tipo(v) == "mapa" y tiene_clave(v, "__error__") }
+
+funcion _mr_linea(c) {
+    sea partes = []
+    mientras (verdadero) {
+        sea ch = c["t"]["recibir"](1)
+        si (ch == "\r") {
+            c["t"]["recibir"](1)
+            retornar unir(partes, "")
+        }
+        partes.agregar(ch)
+    }
+}
+
+funcion _mr_num(t) {
+    si (t == "inf") { retornar 1e308 * 10 }
+    si (t == "-inf") { retornar -1e308 * 10 }
+    retornar a_numero(t)
+}
+
+// Lee una respuesta. Los errores vuelven como {"__error__": texto}; los
+// push de RESP3 como {"__push__": [...]}.
+funcion _mr_leer(c) {
+    sea l = _mr_linea(c)
+    sea k = subcadena(l, 0, 1)
+    sea r = subcadena(l, 1, longitud(l))
+    si (k == "+") { retornar r }
+    si (k == "-" o k == "!") {
+        si (k == "!") { r = c["t"]["recibir"](a_numero(r)); c["t"]["recibir"](2) }
+        retornar {"__error__": r}
+    }
+    si (k == ":") { retornar a_numero(r) }
+    si (k == ",") { retornar _mr_num(r) }
+    si (k == "(") { retornar r }
+    si (k == "#") { retornar r == "t" }
+    si (k == "_") { retornar nulo }
+    si (k == "$" o k == "=") {
+        sea n = a_numero(r)
+        si (n < 0) { retornar nulo }
+        sea d = ""
+        si (n > 0) { d = c["t"]["recibir"](n) }
+        c["t"]["recibir"](2)
+        si (k == "=") { d = subcadena(d, 4, longitud(d)) }
+        retornar d
+    }
+    si (k == "*" o k == "~" o k == ">") {
+        sea n = a_numero(r)
+        si (n < 0) { retornar nulo }
+        sea l2 = []
+        sea i = 0
+        mientras (i < n) {
+            l2.agregar(_mr_leer(c))
+            i = i + 1
+        }
+        si (k == ">") { retornar {"__push__": l2} }
+        retornar l2
+    }
+    si (k == "%" o k == "|") {
+        sea n = a_numero(r)
+        sea m = {}
+        sea i = 0
+        mientras (i < n) {
+            sea clave = _mr_leer(c)
+            m["" + clave] = _mr_leer(c)
+            i = i + 1
+        }
+        si (k == "|") { retornar _mr_leer(c) }
+        retornar m
+    }
+    lanzar "redis: respuesta desconocida '" + l + "'"
+}
+
+// ---------- conexión a un nodo ----------
+
+funcion _mr_tcp(host, puerto) {
+    sea s = net_conectar(host, puerto)
+    retornar {"enviar": funcion(d) { net_enviar(s, d) }, "recibir": funcion(n) { retornar net_recibir_exacto(s, n) }, "cerrar": funcion() { net_cerrar(s) }}
+}
+
+funcion _mr_dir(t) {
+    sea r = t
+    si (texto_empieza_con(r, "redis://")) { r = subcadena(r, 8, longitud(r)) }
+    sea u = {"host": "127.0.0.1", "puerto": 6379, "usuario": nulo, "clave": nulo, "base": nulo}
+    sea arroba = texto_indice(r, "@")
+    si (arroba >= 0) {
+        sea cred = subcadena(r, 0, arroba)
+        r = subcadena(r, arroba + 1, longitud(r))
+        sea dos = texto_indice(cred, ":")
+        si (dos >= 0) {
+            si (dos > 0) { u["usuario"] = subcadena(cred, 0, dos) }
+            u["clave"] = subcadena(cred, dos + 1, longitud(cred))
+        } sino { u["clave"] = cred }
+    }
+    sea barra = texto_indice(r, "/")
+    si (barra >= 0) {
+        si (barra + 1 < longitud(r)) { u["base"] = a_numero(subcadena(r, barra + 1, longitud(r))) }
+        r = subcadena(r, 0, barra)
+    }
+    sea p = texto_dividir(r, ":")
+    si (p[0] != "") { u["host"] = p[0] }
+    si (longitud(p) > 1) { u["puerto"] = a_numero(p[1]) }
+    retornar u
+}
+
+/// Conecta a un nodo. direccion: "host:puerto" o "redis://usuario:clave@host:puerto/base".
+/// opciones: "usuario", "clave", "base", "resp3", "nombre", "transporte"
+/// (función(host, puerto) → {"enviar", "recibir", "cerrar"}).
+funcion memoria_conectar(direccion, opciones) {
+    sea op = opciones ?? {}
+    sea u = _mr_dir(direccion ?? "127.0.0.1:6379")
+    sea fab = op["transporte"] ?? nulo
+    sea t = nulo
+    si (fab != nulo) { t = fab(u["host"], u["puerto"]) } sino { t = _mr_tcp(u["host"], u["puerto"]) }
+    sea c = {"t": t, "host": u["host"], "puerto": u["puerto"], "resp3": falso, "push": [], "abierta": verdadero}
+    sea usuario = op["usuario"] ?? u["usuario"]
+    sea clave = op["clave"] ?? u["clave"]
+    si (op["resp3"] ?? falso) {
+        sea h = ["HELLO", "3"]
+        si (clave != nulo) { h = h + ["AUTH", usuario ?? "default", clave] }
+        si ((op["nombre"] ?? nulo) != nulo) { h = h + ["SETNAME", op["nombre"]] }
+        sea r = memoria_cmd(c, h)
+        c["resp3"] = verdadero
+        c["servidor"] = r
+    } sino {
+        si (clave != nulo) {
+            si (usuario != nulo) { memoria_cmd(c, ["AUTH", usuario, clave]) } sino { memoria_cmd(c, ["AUTH", clave]) }
+        }
+        si ((op["nombre"] ?? nulo) != nulo) { memoria_cmd(c, ["CLIENT", "SETNAME", op["nombre"]]) }
+    }
+    sea base = op["base"] ?? u["base"]
+    si (base != nulo y base != 0) { memoria_cmd(c, ["SELECT", base]) }
+    retornar c
+}
+
+// Lee una respuesta saltando los push (que quedan en c["push"]).
+funcion _mr_respuesta(c) {
+    mientras (verdadero) {
+        sea v = _mr_leer(c)
+        si (tipo(v) == "mapa" y tiene_clave(v, "__push__")) { c["push"].agregar(v["__push__"]) } sino { retornar v }
+    }
+}
+
+funcion _mr_falla(v) {
+    si (memoria_es_error(v)) { lanzar "redis: " + v["__error__"] }
+    retornar v
+}
+
+/// Ejecuta un comando (en un nodo o en un clúster). Lanza los errores.
+funcion memoria_cmd(c, args) {
+    si ((c["cluster"] ?? falso) == verdadero) { retornar _mr_falla(_mr_ccmd(c, args, 0)) }
+    c["t"]["enviar"](memoria_resp(args))
+    retornar _mr_falla(_mr_respuesta(c))
+}
+
+/// Tubería: envía todos los comandos de una vez y devuelve las respuestas
+/// en orden (los errores quedan como {"__error__"} en su lugar).
+funcion memoria_tuberia(c, comandos) {
+    si ((c["cluster"] ?? falso) == verdadero) { retornar _mr_ctuberia(c, comandos) }
+    sea p = []
+    para a en comandos { p.agregar(memoria_resp(a)) }
+    c["t"]["enviar"](unir(p, ""))
+    sea r = []
+    para a en comandos { r.agregar(_mr_respuesta(c)) }
+    retornar r
+}
+
+/// Transacción MULTI/EXEC; vigilar: claves para WATCH. Devuelve la lista de
+/// resultados o nulo si una clave vigilada cambió.
+funcion memoria_transaccion(c, comandos, vigilar) {
+    sea n = c
+    si ((c["cluster"] ?? falso) == verdadero) {
+        // Todas las claves deben ir a la misma ranura.
+        sea claves_tx = vigilar ?? []
+        para a en comandos { si (longitud(a) > 1) { claves_tx = claves_tx + [a[1]] } }
+        si (longitud(claves_tx) == 0) { lanzar "redis: la transacción necesita al menos una clave" }
+        sea s = memoria_ranura(claves_tx[0])
+        para k en claves_tx { si (memoria_ranura(k) != s) { lanzar "redis: CROSSSLOT las claves de la transacción están en ranuras distintas" } }
+        n = _mr_nodo(c, _mr_dueno(c, s))
+    }
+    sea todo = []
+    si (vigilar != nulo y longitud(vigilar) > 0) { todo.agregar(["WATCH"] + vigilar) }
+    todo.agregar(["MULTI"])
+    para a en comandos { todo.agregar(a) }
+    todo.agregar(["EXEC"])
+    sea r = memoria_tuberia(n, todo)
+    sea ex = r[longitud(r) - 1]
+    si (memoria_es_error(ex)) {
+        // EXECABORT: devuelve el primer error de encolado.
+        para x en r { si (memoria_es_error(x) y texto_empieza_con(x["__error__"], "EXECABORT") == falso) { lanzar "redis: " + x["__error__"] } }
+        _mr_falla(ex)
+    }
+    retornar ex
+}
+
+/// Script Lua: usa EVALSHA y, si el servidor no lo tiene, EVAL.
+funcion memoria_script(c, codigo, claves_s, args) {
+    sea sha = hex_de_bytes(sha1_bytes(codigo))
+    sea ks = claves_s ?? []
+    sea a = ["EVALSHA", sha, longitud(ks)] + ks + (args ?? [])
+    intentar { retornar memoria_cmd(c, a) } capturar (e) {
+        si (contiene("" + e, "NOSCRIPT") == falso) { lanzar e }
+    }
+    retornar memoria_cmd(c, ["EVAL", codigo, longitud(ks)] + ks + (args ?? []))
+}
+
+// ---------- pub/sub ----------
+
+/// Se suscribe a canales (o patrones si patron es verdadero). La conexión
+/// queda en modo suscripción (en RESP2).
+funcion memoria_suscribir(c, canales, patron) {
+    sea cmd = "SUBSCRIBE"
+    si ((patron ?? falso) == verdadero) { cmd = "PSUBSCRIBE" }
+    c["t"]["enviar"](memoria_resp([cmd] + canales))
+    para x en canales {
+        sea r = _mr_leer(c)
+        si (tipo(r) == "mapa" y tiene_clave(r, "__push__")) { r = r["__push__"] }
+        _mr_falla(r)
+    }
+}
+
+/// Siguiente mensaje: {"canal", "datos", "patron"} (bloquea).
+funcion memoria_mensaje(c) {
+    mientras (verdadero) {
+        sea r = nulo
+        si (longitud(c["push"]) > 0) {
+            r = c["push"][0]
+            sea resto = []
+            sea q = 1
+            mientras (q < longitud(c["push"])) {
+                resto.agregar(c["push"][q])
+                q = q + 1
+            }
+            c["push"] = resto
+        } sino { r = _mr_leer(c) }
+        si (tipo(r) == "mapa" y tiene_clave(r, "__push__")) { r = r["__push__"] }
+        si (tipo(r) == "lista" y longitud(r) >= 3) {
+            si (r[0] == "message" o r[0] == "smessage") { retornar {"canal": r[1], "datos": r[2], "patron": nulo} }
+            si (r[0] == "pmessage") { retornar {"canal": r[2], "datos": r[3], "patron": r[1]} }
+        }
+    }
+}
+
+funcion memoria_cerrar(c) {
+    si ((c["cluster"] ?? falso) == verdadero) {
+        para k en claves(c["nodos"]) { memoria_cerrar(c["nodos"][k]) }
+        retornar nulo
+    }
+    si (c["abierta"]) {
+        c["abierta"] = falso
+        sea f = c["t"]["cerrar"] ?? nulo
+        si (f != nulo) { f() }
+    }
+}
+
+// ---------- utilidades de respuesta ----------
+
+/// Convierte una lista [k1, v1, k2, v2…] (HGETALL en RESP2) en mapa.
+funcion memoria_mapa(v) {
+    si (tipo(v) == "mapa") { retornar v }
+    sea m = {}
+    sea i = 0
+    mientras (i + 1 < longitud(v)) {
+        m["" + v[i]] = v[i + 1]
+        i = i + 2
+    }
+    retornar m
+}
+
+// ---------- clúster ----------
+
+/// Conecta a un clúster desde una o más semillas "host:puerto".
+/// Mismas opciones que memoria_conectar (sin "base").
+funcion memoria_cluster(semillas, opciones) {
+    sea op = opciones ?? {}
+    sea cl = {"cluster": verdadero, "semillas": semillas, "op": op, "nodos": {}, "ranuras": [], "redirecciones": 0, "actualizaciones": 0}
+    _mr_mapear(cl)
+    retornar cl
+}
+
+funcion _mr_nodo(cl, dir) {
+    sea n = cl["nodos"][dir] ?? nulo
+    si (n == nulo) {
+        n = memoria_conectar(dir, cl["op"])
+        cl["nodos"][dir] = n
+    }
+    retornar n
+}
+
+// Lee CLUSTER SLOTS y arma la tabla de rangos [inicio, fin, "host:puerto"].
+funcion _mr_mapear(cl) {
+    sea err = "sin semillas"
+    sea fuentes = cl["semillas"] + claves(cl["nodos"])
+    para s en fuentes {
+        sea ok = falso
+        intentar {
+            sea n = _mr_nodo(cl, s)
+            n["t"]["enviar"](memoria_resp(["CLUSTER", "SLOTS"]))
+            sea r = _mr_falla(_mr_respuesta(n))
+            sea t = []
+            para x en r {
+                sea host = x[2][0]
+                si (host == "" o host == nulo) { host = n["host"] }
+                t.agregar([x[0], x[1], host + ":" + x[2][1]])
+            }
+            cl["ranuras"] = ordenar(t, funcion(a, b) { retornar a[0] - b[0] })
+            cl["actualizaciones"] = cl["actualizaciones"] + 1
+            ok = verdadero
+        } capturar (e) { err = "" + e }
+        si (ok) { retornar nulo }
+    }
+    lanzar "redis: no se pudo leer el mapa del clúster (" + err + ")"
+}
+
+funcion _mr_dueno(cl, ranura) {
+    // Búsqueda binaria sobre los rangos.
+    sea t = cl["ranuras"]
+    sea a = 0
+    sea b = longitud(t) - 1
+    mientras (a <= b) {
+        sea m = piso((a + b) / 2)
+        si (ranura < t[m][0]) { b = m - 1 } sino si (ranura > t[m][1]) { a = m + 1 } sino { retornar t[m][2] }
+    }
+    lanzar "redis: CLUSTERDOWN ranura " + ranura + " sin dueño"
+}
+
+/// Nodo dueño de una clave: "host:puerto".
+funcion memoria_nodo_de(cl, clave) { retornar _mr_dueno(cl, memoria_ranura(clave)) }
+
+/// Maestros del clúster.
+funcion memoria_maestros(cl) {
+    sea vistos = {}
+    sea l = []
+    para r en cl["ranuras"] {
+        si (tiene_clave(vistos, r[2]) == falso) {
+            vistos[r[2]] = verdadero
+            l.agregar(r[2])
+        }
+    }
+    retornar l
+}
+
+// Comandos sin clave o que van a todos los maestros.
+sea _MR_SIN_CLAVE = {"PING": 1, "INFO": 1, "TIME": 1, "ECHO": 1, "CLUSTER": 1, "CONFIG": 1, "CLIENT": 1, "COMMAND": 1, "DBSIZE": 1, "SCRIPT": 1, "FLUSHALL": 1, "FLUSHDB": 1, "KEYS": 1, "RANDOMKEY": 1, "PUBLISH": 1, "LASTSAVE": 1, "HELLO": 1, "SCAN": 1}
+
+/// Clave de un comando (o nulo si no tiene).
+funcion memoria_clave_de(args) {
+    sea c = texto_mayusculas("" + args[0])
+    si (tiene_clave(_MR_SIN_CLAVE, c)) { retornar nulo }
+    si (c == "EVAL" o c == "EVALSHA" o c == "EVAL_RO" o c == "EVALSHA_RO" o c == "FCALL" o c == "FCALL_RO") {
+        si (longitud(args) > 3 y a_numero("" + args[2]) > 0) { retornar args[3] }
+        retornar nulo
+    }
+    si (c == "XREAD" o c == "XREADGROUP") {
+        sea i = 1
+        mientras (i < longitud(args)) {
+            si (texto_mayusculas("" + args[i]) == "STREAMS") { retornar args[i + 1] }
+            i = i + 1
+        }
+    }
+    si (c == "BITOP") { retornar args[2] }
+    si (longitud(args) > 1) { retornar args[1] }
+    retornar nulo
+}
+
+funcion _mr_redir(v) {
+    si (memoria_es_error(v) == falso) { retornar nulo }
+    sea p = texto_dividir(v["__error__"], " ")
+    si ((p[0] == "MOVED" o p[0] == "ASK") y longitud(p) >= 3) {
+        sea dir = p[2]
+        si (texto_empieza_con(dir, ":")) { dir = "127.0.0.1" + dir }
+        retornar {"tipo": p[0], "ranura": a_numero(p[1]), "dir": dir}
+    }
+    retornar nulo
+}
+
+// Comando en clúster siguiendo MOVED/ASK (hasta 5 saltos).
+funcion _mr_ccmd(cl, args, profundidad) {
+    sea c = texto_mayusculas("" + args[0])
+    sea k = memoria_clave_de(args)
+    si (k == nulo y (c == "FLUSHALL" o c == "FLUSHDB" o c == "SCRIPT" o c == "KEYS" o c == "DBSIZE")) {
+        // A todos los maestros.
+        sea r = []
+        para m en memoria_maestros(cl) {
+            sea n = _mr_nodo(cl, m)
+            n["t"]["enviar"](memoria_resp(args))
+            r.agregar(_mr_respuesta(n))
+        }
+        si (c == "KEYS") {
+            sea todo = []
+            para x en r { todo = todo + _mr_falla(x) }
+            retornar todo
+        }
+        si (c == "DBSIZE") {
+            sea t = 0
+            para x en r { t = t + _mr_falla(x) }
+            retornar t
+        }
+        retornar _mr_falla(r[0])
+    }
+    sea dir = nulo
+    si (k == nulo) { dir = memoria_maestros(cl)[0] } sino { dir = _mr_dueno(cl, memoria_ranura(k)) }
+    sea n = _mr_nodo(cl, dir)
+    n["t"]["enviar"](memoria_resp(args))
+    sea v = _mr_respuesta(n)
+    sea rd = _mr_redir(v)
+    si (rd == nulo) { retornar v }
+    si (profundidad >= 5) { lanzar "redis: demasiadas redirecciones" }
+    cl["redirecciones"] = cl["redirecciones"] + 1
+    si (rd["tipo"] == "MOVED") {
+        _mr_mapear(cl)
+        retornar _mr_ccmd(cl, args, profundidad + 1)
+    }
+    // ASK: una sola vez al nodo indicado, precedido de ASKING.
+    sea otro = _mr_nodo(cl, rd["dir"])
+    otro["t"]["enviar"](memoria_resp(["ASKING"]) + memoria_resp(args))
+    _mr_respuesta(otro)
+    retornar _mr_respuesta(otro)
+}
+
+// Tubería en clúster: agrupa por nodo, envía en paralelo y reintenta los
+// que vuelvan con MOVED/ASK.
+funcion _mr_ctuberia(cl, comandos) {
+    sea grupos = {}
+    sea orden = []
+    sea i = 0
+    mientras (i < longitud(comandos)) {
+        sea k = memoria_clave_de(comandos[i])
+        sea dir = nulo
+        si (k == nulo) { dir = memoria_maestros(cl)[0] } sino { dir = _mr_dueno(cl, memoria_ranura(k)) }
+        si (tiene_clave(grupos, dir) == falso) {
+            grupos[dir] = []
+            orden.agregar(dir)
+        }
+        grupos[dir].agregar(i)
+        i = i + 1
+    }
+    sea r = []
+    para x en comandos { r.agregar(nulo) }
+    // Primero se envía a todos los nodos y luego se lee: así los nodos
+    // trabajan a la vez.
+    para dir en orden {
+        sea p = []
+        para j en grupos[dir] { p.agregar(memoria_resp(comandos[j])) }
+        _mr_nodo(cl, dir)["t"]["enviar"](unir(p, ""))
+    }
+    sea reintentar = []
+    para dir en orden {
+        sea n = _mr_nodo(cl, dir)
+        para j en grupos[dir] {
+            sea v = _mr_respuesta(n)
+            si (_mr_redir(v) != nulo) { reintentar.agregar(j) } sino { r[j] = v }
+        }
+    }
+    para j en reintentar {
+        cl["redirecciones"] = cl["redirecciones"] + 1
+        r[j] = _mr_ccmd(cl, comandos[j], 1)
+    }
+    retornar r
+}
+
+/// MGET que cruza ranuras (agrupa por ranura y reordena).
+funcion memoria_mget(c, ks) {
+    si ((c["cluster"] ?? falso) == falso) { retornar memoria_cmd(c, ["MGET"] + ks) }
+    sea porr = {}
+    sea orden = []
+    sea i = 0
+    mientras (i < longitud(ks)) {
+        sea s = "" + memoria_ranura(ks[i])
+        si (tiene_clave(porr, s) == falso) {
+            porr[s] = []
+            orden.agregar(s)
+        }
+        porr[s].agregar(i)
+        i = i + 1
+    }
+    sea cmds = []
+    para s en orden {
+        sea a = ["MGET"]
+        para j en porr[s] { a.agregar(ks[j]) }
+        cmds.agregar(a)
+    }
+    sea rs = _mr_ctuberia(c, cmds)
+    sea r = []
+    para x en ks { r.agregar(nulo) }
+    sea g = 0
+    mientras (g < longitud(orden)) {
+        sea v = _mr_falla(rs[g])
+        sea j = 0
+        mientras (j < longitud(porr[orden[g]])) {
+            r[porr[orden[g]][j]] = v[j]
+            j = j + 1
+        }
+        g = g + 1
+    }
+    retornar r
+}
+
+/// MSET que cruza ranuras: mapa {clave: valor}.
+funcion memoria_mset(c, m) {
+    si ((c["cluster"] ?? falso) == falso) {
+        sea a = ["MSET"]
+        para k en claves(m) { a = a + [k, m[k]] }
+        retornar memoria_cmd(c, a)
+    }
+    sea porr = {}
+    para k en claves(m) {
+        sea s = "" + memoria_ranura(k)
+        si (tiene_clave(porr, s) == falso) { porr[s] = ["MSET"] }
+        porr[s] = porr[s] + [k, m[k]]
+    }
+    sea cmds = []
+    para s en claves(porr) { cmds.agregar(porr[s]) }
+    para v en _mr_ctuberia(c, cmds) { _mr_falla(v) }
+    retornar "OK"
+}
+
+/// DEL que cruza ranuras; devuelve cuántas borró.
+funcion memoria_borrar(c, ks) {
+    si ((c["cluster"] ?? falso) == falso) { retornar memoria_cmd(c, ["DEL"] + ks) }
+    sea cmds = []
+    para k en ks { cmds.agregar(["DEL", k]) }
+    sea t = 0
+    para v en _mr_ctuberia(c, cmds) { t = t + _mr_falla(v) }
+    retornar t
+}
+
+/// Recorre todas las claves (SCAN en cada maestro) con un patrón opcional.
+funcion memoria_escanear(c, patron) {
+    sea nodos = [c]
+    si ((c["cluster"] ?? falso) == verdadero) {
+        nodos = []
+        para m en memoria_maestros(c) { nodos.agregar(_mr_nodo(c, m)) }
+    }
+    sea r = []
+    para n en nodos {
+        sea cursor = "0"
+        sea primero = verdadero
+        mientras (primero o cursor != "0") {
+            primero = falso
+            sea a = ["SCAN", cursor, "COUNT", 100]
+            si (patron != nulo) { a = a + ["MATCH", patron] }
+            n["t"]["enviar"](memoria_resp(a))
+            sea v = _mr_falla(_mr_respuesta(n))
+            cursor = "" + v[0]
+            r = r + v[1]
+        }
+    }
+    retornar ordenar(r, funcion(a, b) { si (a < b) { retornar -1 } si (a > b) { retornar 1 } retornar 0 })
+}
+
+// ---------- clúster en memoria (para pruebas) ----------
+
+/// Imita un clúster de varios nodos con un almacén simple (GET, SET, DEL,
+/// MGET, MSET, INCR, HSET, HGETALL, EXPIRE, TTL, KEYS, SCAN, MULTI/EXEC,
+/// CLUSTER SLOTS, PING) y redirecciones MOVED/ASK reales. Devuelve
+/// {"nodos": {dir: nodo}, "transporte": función(host, puerto),
+/// "mover": función(ranura, dir), "migrando": función(ranura, dir)}.
+funcion memoria_simulado(direcciones) {
+    sea sim = {"nodos": {}, "dirs": direcciones}
+    sea n = longitud(direcciones)
+    sea por = piso(16384 / n)
+    sea i = 0
+    mientras (i < n) {
+        sea fin = (i + 1) * por - 1
+        si (i == n - 1) { fin = 16383 }
+        sim["nodos"][direcciones[i]] = {"dir": direcciones[i], "inicio": i * por, "fin": fin, "datos": {}, "extra": {}, "fuera": {}, "migrando": {}}
+        i = i + 1
+    }
+    sim["transporte"] = funcion(host, puerto) {
+        sea nodo = sim["nodos"][host + ":" + puerto]
+        sea cn = {"entrada": "", "salida": "", "tx": nulo, "asking": falso}
+        retornar {
+            "enviar": funcion(d) {
+                cn["entrada"] = cn["entrada"] + d
+                _mr_sim_procesar(sim, nodo, cn)
+            },
+            "recibir": funcion(k) {
+                si (longitud(cn["salida"]) < k) { lanzar "redis: el simulado no tiene datos" }
+                sea r = subcadena(cn["salida"], 0, k)
+                cn["salida"] = subcadena(cn["salida"], k, longitud(cn["salida"]))
+                retornar r
+            },
+            "cerrar": funcion() { nulo }
+        }
+    }
+    // Pasa una ranura (y sus claves) a otro nodo: los clientes reciben MOVED.
+    sim["mover"] = funcion(ranura, destino) {
+        para d en claves(sim["nodos"]) {
+            sea nd = sim["nodos"][d]
+            si (d != destino) { nd["fuera"]["" + ranura] = destino }
+            para k en claves(nd["datos"]) {
+                si (memoria_ranura(k) == ranura y d != destino) {
+                    sim["nodos"][destino]["datos"][k] = nd["datos"][k]
+                    quitar_clave(nd["datos"], k)
+                }
+            }
+        }
+        quitar_clave(sim["nodos"][destino]["fuera"], "" + ranura)
+        sim["nodos"][destino]["extra"]["" + ranura] = verdadero
+    }
+    // Ranura en migración: el dueño contesta ASK para claves que no tiene.
+    sim["migrando"] = funcion(ranura, destino) {
+        para d en claves(sim["nodos"]) {
+            sea nd = sim["nodos"][d]
+            si (ranura >= nd["inicio"] y ranura <= nd["fin"]) { nd["migrando"]["" + ranura] = destino }
+        }
+    }
+    retornar sim
+}
+
+funcion _mr_sim_es_mia(nodo, ranura) {
+    si (tiene_clave(nodo["fuera"], "" + ranura)) { retornar falso }
+    retornar (ranura >= nodo["inicio"] y ranura <= nodo["fin"]) o tiene_clave(nodo["extra"], "" + ranura)
+}
+
+funcion _mr_sim_dueno(sim, ranura) {
+    para d en sim["dirs"] { si (_mr_sim_es_mia(sim["nodos"][d], ranura)) { retornar d } }
+    retornar nulo
+}
+
+funcion _mr_bulk(v) {
+    si (v == nulo) { retornar "$-1\r\n" }
+    sea s = "" + v
+    retornar "$" + longitud(s) + "\r\n" + s + "\r\n"
+}
+
+funcion _mr_arr(l) {
+    sea p = ["*" + longitud(l) + "\r\n"]
+    para x en l {
+        si (tipo(x) == "lista") { p.agregar(_mr_arr(x)) } sino si (tipo(x) == "numero") { p.agregar(":" + x + "\r\n") } sino { p.agregar(_mr_bulk(x)) }
+    }
+    retornar unir(p, "")
+}
+
+// Lee un comando RESP completo de la entrada (o nulo si falta).
+funcion _mr_sim_comando(cn) {
+    sea e = cn["entrada"]
+    si (longitud(e) == 0) { retornar nulo }
+    sea f = texto_indice(e, "\r\n")
+    si (f < 0) { retornar nulo }
+    sea n = a_numero(subcadena(e, 1, f))
+    sea pos = f + 2
+    sea args = []
+    sea i = 0
+    mientras (i < n) {
+        sea rest = subcadena(e, pos, longitud(e))
+        sea g = texto_indice(rest, "\r\n")
+        si (g < 0) { retornar nulo }
+        sea largo = a_numero(subcadena(rest, 1, g))
+        si (longitud(rest) < g + 2 + largo + 2) { retornar nulo }
+        args.agregar(subcadena(rest, g + 2, g + 2 + largo))
+        pos = pos + g + 2 + largo + 2
+        i = i + 1
+    }
+    cn["entrada"] = subcadena(e, pos, longitud(e))
+    retornar args
+}
+
+funcion _mr_sim_procesar(sim, nodo, cn) {
+    mientras (verdadero) {
+        sea a = _mr_sim_comando(cn)
+        si (a == nulo) { retornar nulo }
+        cn["salida"] = cn["salida"] + _mr_sim_ejecutar(sim, nodo, cn, a)
+    }
+}
+
+funcion _mr_sim_ejecutar(sim, nodo, cn, a) {
+    sea c = texto_mayusculas(a[0])
+    si (c == "ASKING") {
+        cn["asking"] = verdadero
+        retornar "+OK\r\n"
+    }
+    si (c == "PING") { retornar "+PONG\r\n" }
+    si (c == "CLUSTER" y texto_mayusculas(a[1]) == "SLOTS") {
+        // Rangos contiguos por dueño.
+        sea l = []
+        sea ini = 0
+        sea actual = _mr_sim_dueno(sim, 0)
+        sea s = 1
+        mientras (s <= 16384) {
+            sea d = nulo
+            si (s < 16384) { d = _mr_sim_dueno(sim, s) }
+            si (d != actual) {
+                sea hp = texto_dividir(actual, ":")
+                l.agregar([ini, s - 1, [hp[0], a_numero(hp[1]), "id-" + hp[1]]])
+                ini = s
+                actual = d
+            }
+            s = s + 1
+        }
+        retornar _mr_arr(l)
+    }
+    si (c == "MULTI") {
+        cn["tx"] = []
+        retornar "+OK\r\n"
+    }
+    si (c == "EXEC") {
+        si (cn["tx"] == nulo) { retornar "-ERR EXEC without MULTI\r\n" }
+        sea cola = cn["tx"]
+        cn["tx"] = nulo
+        sea p = ["*" + longitud(cola) + "\r\n"]
+        para x en cola { p.agregar(_mr_sim_ejecutar(sim, nodo, cn, x)) }
+        retornar unir(p, "")
+    }
+    si (c == "WATCH") { retornar "+OK\r\n" }
+    sea k = memoria_clave_de(a)
+    si (k != nulo) {
+        sea s = memoria_ranura(k)
+        sea asking = cn["asking"]
+        cn["asking"] = falso
+        sea mig = nodo["migrando"]["" + s] ?? nulo
+        si (mig != nulo y tiene_clave(nodo["datos"], "" + k) == falso) { retornar "-ASK " + s + " " + mig + "\r\n" }
+        si (_mr_sim_es_mia(nodo, s) == falso y asking == falso) { retornar "-MOVED " + s + " " + _mr_sim_dueno(sim, s) + "\r\n" }
+        // Claves múltiples: deben compartir ranura.
+        si (c == "MGET" o c == "MSET" o c == "DEL") {
+            sea paso = 1
+            si (c == "MSET") { paso = 2 }
+            sea i = 1
+            mientras (i < longitud(a)) {
+                si (memoria_ranura(a[i]) != s) { retornar "-CROSSSLOT Keys in request don't hash to the same slot\r\n" }
+                i = i + paso
+            }
+        }
+    }
+    si (cn["tx"] != nulo) {
+        cn["tx"].agregar(a)
+        retornar "+QUEUED\r\n"
+    }
+    sea d = nodo["datos"]
+    si (c == "SET") {
+        d[a[1]] = a[2]
+        retornar "+OK\r\n"
+    }
+    si (c == "GET") {
+        sea v = d[a[1]] ?? nulo
+        si (tipo(v) == "mapa") { retornar "-WRONGTYPE Operation against a key holding the wrong kind of value\r\n" }
+        retornar _mr_bulk(v)
+    }
+    si (c == "DEL") {
+        sea t = 0
+        sea i = 1
+        mientras (i < longitud(a)) {
+            si (tiene_clave(d, a[i])) {
+                quitar_clave(d, a[i])
+                t = t + 1
+            }
+            i = i + 1
+        }
+        retornar ":" + t + "\r\n"
+    }
+    si (c == "MGET") {
+        sea l = []
+        sea i = 1
+        mientras (i < longitud(a)) {
+            l.agregar(d[a[i]] ?? nulo)
+            i = i + 1
+        }
+        sea p = ["*" + longitud(l) + "\r\n"]
+        para x en l { p.agregar(_mr_bulk(x)) }
+        retornar unir(p, "")
+    }
+    si (c == "MSET") {
+        sea i = 1
+        mientras (i + 1 < longitud(a)) {
+            d[a[i]] = a[i + 1]
+            i = i + 2
+        }
+        retornar "+OK\r\n"
+    }
+    si (c == "INCR" o c == "INCRBY") {
+        sea paso = 1
+        si (c == "INCRBY") { paso = a_numero(a[2]) }
+        sea v = a_numero(d[a[1]] ?? "0") + paso
+        d[a[1]] = "" + v
+        retornar ":" + v + "\r\n"
+    }
+    si (c == "HSET") {
+        si (tiene_clave(d, a[1]) == falso) { d[a[1]] = {} }
+        sea nuevos = 0
+        sea i = 2
+        mientras (i + 1 < longitud(a)) {
+            si (tiene_clave(d[a[1]], a[i]) == falso) { nuevos = nuevos + 1 }
+            d[a[1]][a[i]] = a[i + 1]
+            i = i + 2
+        }
+        retornar ":" + nuevos + "\r\n"
+    }
+    si (c == "HGETALL") {
+        sea m = d[a[1]] ?? {}
+        sea l = []
+        para kk en ordenar(claves(m)) { l = l + [kk, m[kk]] }
+        retornar _mr_arr(l)
+    }
+    si (c == "KEYS" o c == "SCAN") {
+        sea l = []
+        para kk en ordenar(claves(d)) { l.agregar(kk) }
+        si (c == "KEYS") { retornar _mr_arr(l) }
+        retornar _mr_arr(["0", l])
+    }
+    si (c == "DBSIZE") { retornar ":" + longitud(claves(d)) + "\r\n" }
+    si (c == "FLUSHALL" o c == "FLUSHDB") {
+        nodo["datos"] = {}
+        retornar "+OK\r\n"
+    }
+    retornar "-ERR unknown command '" + a[0] + "'\r\n"
+}
