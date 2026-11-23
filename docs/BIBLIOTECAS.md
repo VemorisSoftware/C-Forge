@@ -201,7 +201,7 @@ Estado: ✅ ya existe en C-Forge · 🔗 se usa hoy vía `cforge bindgen`,
 | 145 | `version` | Versionado semántico | semver | ✅ gestor de paquetes |
 | 146 | `cronometro` / `bench` | Micro-benchmarks estadísticos | Criterion | ✅ `cronometro` |
 | 147 | `huesped` / `wasm` | Ejecutar WebAssembly embebido | Wasmtime | ✅ `huesped` |
-| 148 | `jit` | Código máquina en tiempo de ejecución | Cranelift | 🛠 |
+| 148 | `jit` / `jit_asm` | Código máquina en tiempo de ejecución | Cranelift | ✅ `jit` |
 | 149 | `diagnostico` / `diagnostics` | Errores con flechas y colores | Miette | ✅ `diagnostico` |
 | 150 | `canal` | Canales sin bloqueo | Crossbeam | ✅ canales en `concurrencia` |
 | 151 | `asignador` | Asignador de memoria rápido | mimalloc | ✅ asignador propio |
@@ -314,10 +314,10 @@ Estado: ✅ ya existe en C-Forge · 🔗 se usa hoy vía `cforge bindgen`,
 |---|---|---|---|---|
 | 227 | `asistente` | Servidor de lenguaje | LSP | ✅ `cforge lsp` |
 | 228 | `depura` / `dap` | Depuración paso a paso | DAP | ✅ `depura` |
-| 229 | `intermedio` | Optimización de código intermedio | LLVM, MLIR | 🛠 (v5) |
+| 229 | `intermedio` / `ssa_ir` | Optimización de código intermedio | LLVM, MLIR | ✅ `es` / `en` |
 | 230 | `gramatica` / `parser` | Combinadores de parsers | Pest, Nom | ✅ `gramatica` |
 | 231 | `analiza` | Compilador como servicio | Roslyn | 🛠 |
-| 232 | `nucleo` | Programas en el kernel | eBPF | 🛠 |
+| 232 | `nucleo` / `ebpf` | Programas en el kernel | eBPF | ✅ `nucleo` |
 | 233 | `anillo` / `iouring` | E/S asíncrona en Linux | io_uring | ✅ `anillo` |
 | 234 | `ventanas_api` | APIs nativas de Windows | windows (Rust) | ✅ runtime Windows · 🛠 |
 | 235 | `manzana` | APIs nativas de macOS e iOS | Cocoa | ✅ `apple` (básico) |

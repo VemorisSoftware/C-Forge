@@ -1,0 +1,82 @@
+// Pruebas de nucleo (eBPF). datos/nucleo-kernel.txt trae programas al azar
+// con el r0 que dio el kernel de Linux (BPF_PROG_TEST_RUN); en total se
+// compararon aparte 1800 programas (ALU, saltos, pila y atómicos) sin una
+// diferencia. datos/nucleo-contar.o sale de "clang -O2 -target bpf" con el
+// .c que está al lado.
+importar "nucleo"
+funcion eq(a, b, q) { afirmar(("" + a) == ("" + b), q + ": [" + a + "] != [" + b + "]") }
+funcion correr(t, ctx) { retornar nucleo_ejecutar(nucleo_ensamblar(t), ctx, nulo) }
+// Contra el kernel.
+sea k = 0
+para l en texto_dividir(leer_archivo("tests/bibliotecas/datos/nucleo-kernel.txt"), "\n") {
+    si (l != "") {
+        sea p = texto_dividir(l, " ")
+        eq(subtexto(nucleo_ejecutar(bytes_de_hex(p[0]), nulo, nulo)["r0_hex"], 2, 18), p[1], "programa del kernel " + k)
+        k = k + 1
+    }
+}
+eq(k, 9, "programas del kernel")
+// Ensamblador y desensamblador.
+sea src = "mov r0, 0\nldxw r1, [r1+0]\nadd r0, r1\nlsh32 r0, 2\njeq r0, 164, +1\nmov r0, -1\nexit"
+sea p = nucleo_ensamblar(src)
+eq(nucleo_desensamblar(p), src, "ida y vuelta")
+eq(nucleo_ejecutar(p, bytes_entero(41, 4, 1), nulo)["r0"], 164, "contexto")
+// 64 bits exactos.
+eq(correr("lddw r0, 0x123456789abcdef0\nlddw r1, 0x0fedcba987654321\nmul r0, r1\nexit", nulo)["r0_hex"], "0x2236d88fe5618cf0", "mul64")
+eq(correr("lddw r0, 0xffffffffffffffff\nlddw r1, 0x10\ndiv r0, r1\nexit", nulo)["r0_hex"], "0x0fffffffffffffff", "div64 sin signo")
+eq(correr("mov r0, -7\nmod r0, 3\nexit", nulo)["r0_hex"], "0x0000000000000000", "mod sin signo")
+eq(correr("mov r0, -7\nsmod r0, 3\nexit", nulo)["r0"], -1, "smod")
+eq(correr("mov r0, -7\nsdiv r0, 2\nexit", nulo)["r0"], -3, "sdiv")
+eq(correr("mov r0, 5\nmov r1, 0\ndiv r0, r1\nexit", nulo)["r0"], 0, "división entre cero")
+eq(correr("mov r0, 5\nmov r1, 0\nmod r0, r1\nexit", nulo)["r0"], 5, "resto entre cero")
+eq(correr("mov r0, -1\nadd32 r0, 1\nexit", nulo)["r0"], 0, "alu32")
+eq(correr("mov32 r0, -1\nexit", nulo)["r0_hex"], "0x00000000ffffffff", "mov32 sin signo")
+eq(correr("mov r0, -16\narsh r0, 2\nexit", nulo)["r0"], -4, "arsh")
+eq(correr("mov r0, -16\nrsh r0, 60\nexit", nulo)["r0"], 15, "rsh")
+eq(correr("lddw r0, 0x1122334455667788\nbe32 r0\nexit", nulo)["r0_hex"], "0x0000000088776655", "be32")
+eq(correr("lddw r0, 0x1122334455667788\nbe64 r0\nexit", nulo)["r0_hex"], "0x8877665544332211", "be64")
+eq(correr("lddw r0, 0x1122334455667788\nle16 r0\nexit", nulo)["r0_hex"], "0x0000000000007788", "le16")
+eq(correr("mov r1, -1\nmov r0, 1\njsgt r1, 0, +1\nmov r0, 2\nexit", nulo)["r0"], 2, "con signo")
+eq(correr("mov r1, -1\nmov r0, 1\njgt r1, 0, +1\nmov r0, 2\nexit", nulo)["r0"], 1, "sin signo")
+eq(correr("lddw r1, 0x100000000\nmov r0, 1\njeq32 r1, 0, +1\nmov r0, 2\nexit", nulo)["r0"], 1, "jmp32")
+// Pila y atómicos.
+eq(correr("mov r1, 7\nstxdw [r10-8], r1\nstw [r10-12], 5\nmov r2, 3\nxadddw [r10-8], r2\nldxdw r0, [r10-8]\nldxw r3, [r10-12]\nadd r0, r3\nexit", nulo)["r0"], 15, "pila")
+sea fuera = ""
+intentar { correr("ldxdw r0, [r10+0]\nexit", nulo) } capturar (e) { fuera = "" + e }
+afirmar(contiene(fuera, "fuera de rango"), "límite de la pila")
+intentar { correr("mov r1, 1\nldxw r0, [r1+0]\nexit", nulo) } capturar (e) { fuera = "" + e }
+afirmar(contiene(fuera, "no es puntero"), "número como puntero")
+intentar { nucleo_ejecutar(nucleo_ensamblar("stw [r1+0], 1\nmov r0, 0\nexit"), "abcd", nulo) } capturar (e) { fuera = "" + e }
+afirmar(contiene(fuera, "solo lectura"), "contexto de solo lectura")
+// Bucle (solo si se permite) y límite de pasos.
+sea b = nucleo_ensamblar("mov r0, 0\nmov r1, 10\nbucle:\nadd r0, r1\nsub r1, 1\njne r1, 0, bucle\nexit")
+eq(nucleo_verificar(b, nulo), ["instrucción 4: salto hacia atrás (bucle)"], "bucle prohibido")
+eq(nucleo_verificar(b, {"bucles": verdadero}), [], "bucle permitido")
+eq(nucleo_ejecutar(b, nulo, nulo)["r0"], 55, "bucle")
+intentar { nucleo_ejecutar(nucleo_ensamblar("a:\nja a\nexit"), nulo, {"max_pasos": 100}) } capturar (e) { fuera = "" + e }
+afirmar(contiene(fuera, "máximo de 100 pasos"), "límite de pasos")
+// Verificador.
+eq(nucleo_verificar(nucleo_ensamblar("add r0, 1\nexit"), nulo), ["instrucción 0: se lee r0 sin inicializar"], "sin inicializar")
+eq(nucleo_verificar(nucleo_ensamblar("mov r10, 1\nmov r0, 0\nexit"), nulo), ["instrucción 0: r10 es de solo lectura"], "r10")
+eq(nucleo_verificar(nucleo_ensamblar("mov r0, 0"), nulo), ["el programa puede terminar sin exit"], "sin exit")
+eq(nucleo_verificar(nucleo_ensamblar("mov r0, 0\nja +5\nexit"), nulo), ["instrucción 1: salto fuera del programa"], "salto fuera")
+eq(nucleo_verificar(bytes_de_hex("8f00000000000000"), nulo), ["instrucción 0: código desconocido 143"], "neg con registro")
+eq(nucleo_verificar(nucleo_ensamblar("mov r0, 0\ncall 1\nadd r0, r1\nexit"), nulo), ["instrucción 2: se lee r1 sin inicializar"], "r1 tras call")
+// Mapas y ayudas.
+sea m = nucleo_mapa("hash", 4, 8, 16)
+sea pm = nucleo_ensamblar("stw [r10-4], 7\nstdw [r10-16], 99\nldmap r1, 0\nmov r2, r10\nadd r2, -4\nmov r3, r10\nadd r3, -16\nmov r4, 0\ncall 2\nldmap r1, 0\nmov r2, r10\nadd r2, -4\ncall 1\njeq r0, 0, +2\nldxdw r0, [r0+0]\nexit\nmov r0, -1\nexit")
+eq(nucleo_verificar(pm, nulo), [], "programa con mapa")
+eq(nucleo_ejecutar(pm, nulo, {"mapas": [m]})["r0"], 99, "update y lookup")
+eq(bytes_leer_entero(nucleo_mapa_leer(m, bytes_entero(7, 4, 1)), 0, 8, 1), 99, "leer el mapa desde afuera")
+sea pa = nucleo_ensamblar("mov r1, 5\nmov r2, 6\ncall 100\nexit")
+eq(nucleo_ejecutar(pa, nulo, {"ayudas": {"100": funcion(vm, a) { retornar a[0] * a[1] }}})["r0"], 30, "ayuda propia")
+// ELF de clang.
+sea elf = nucleo_cargar_elf(leer_archivo("tests/bibliotecas/datos/nucleo-contar.o"))
+eq([claves(elf["programas"]), elf["licencia"], elf["nombres_mapas"]["cuentas"], elf["nombres_mapas"]["total"]], [["socket"], "GPL", 0, 1], "ELF")
+eq(nucleo_verificar(elf["programas"]["socket"], nulo), [], "ELF verificado")
+sea ctx = bytes_entero(5, 4, 1) + bytes_de_hex("030203090700000000000000000000000")
+sea r = nucleo_ejecutar(elf["programas"]["socket"], subtexto(ctx, 0, 20), {"mapas": elf["mapas"]})
+eq([r["r0"], r["salida"]], [87, ["suma 87 de 5\n"]], "programa de clang")
+eq(bytes_leer_entero(nucleo_mapa_leer(elf["mapas"][0], bytes_entero(3, 4, 1)), 0, 8, 1), 2, "cuenta del 3")
+eq(bytes_leer_entero(nucleo_mapa_leer(elf["mapas"][1], bytes_entero(0, 4, 1)), 0, 8, 1), 87, "total")
+mostrar("[OK] nucleo")
