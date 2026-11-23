@@ -1,0 +1,754 @@
+// stdlib/voz_activa.cfv — detección de voz (VAD): dice, cuadro por cuadro,
+// si hay habla en audio PCM de 16 bits a 8, 16, 32 o 48 kHz, con cuatro
+// niveles de agresividad. Es un port bit a bit del VAD de WebRTC: banco de
+// filtros de 6 bandas con filtros pasa-todo, energías logarítmicas en punto
+// fijo, modelos de mezcla de gaussianas que se adaptan al ruido y la
+// histéresis de salida; da exactamente las mismas decisiones que la
+// biblioteca original. Además agrupa los cuadros en segmentos de voz con
+// relleno, como el ejemplo de py-webrtcvad. En inglés: importar "vad".
+//
+// Basado en el código de WebRTC (common_audio/vad y signal_processing).
+// Copyright (c) 2011-2012 The WebRTC project authors. Licencia BSD de 3
+// cláusulas: se permite redistribuir con o sin cambios manteniendo este
+// aviso; el nombre de Google ni de los autores puede usarse para promover
+// productos derivados sin permiso; se entrega "tal cual", sin garantías.
+//
+//   importar "voz_activa"
+//   sea v = voz_nuevo(2)
+//   para cuadro en voz_cuadros(pcm, 16000, 30) { mostrar(voz_hay(v, cuadro, 16000)) }
+
+// ---------- aritmética de enteros de C ----------
+
+sea _VA_P2 = [1, 2, 4, 8, 16, 32, 64, 128, 256, 512, 1024, 2048, 4096, 8192, 16384, 32768, 65536, 131072, 262144, 524288, 1048576, 2097152, 4194304, 8388608, 16777216, 33554432, 67108864, 134217728, 268435456, 536870912, 1073741824, 2147483648, 4294967296]
+
+funcion _va_s16(x) {
+    sea m = x - piso(x / 65536) * 65536
+    si (m >= 32768) { retornar m - 65536 }
+    retornar m
+}
+
+funcion _va_s32(x) {
+    sea m = x - piso(x / 4294967296) * 4294967296
+    si (m >= 2147483648) { retornar m - 4294967296 }
+    retornar m
+}
+
+funcion _va_u32(x) { retornar x - piso(x / 4294967296) * 4294967296 }
+
+// Desplazamiento aritmético a la derecha.
+funcion _va_shr(x, k) { retornar piso(x / _VA_P2[k]) }
+
+// División entera de C (trunca hacia cero).
+funcion _va_div(a, b) {
+    si (b == 0) { retornar 2147483647 }
+    sea q = piso(abs(a) / abs(b))
+    si ((a < 0) != (b < 0)) { retornar 0 - q }
+    retornar q
+}
+
+funcion _va_norm_w32(a0) {
+    sea a = a0
+    si (a == 0) { retornar 0 }
+    si (a < 0) { a = -1 - a }
+    // Bits significativos de a (positivo, < 2^31).
+    sea z = 0
+    mientras (a < 1073741824) {
+        a = a * 2
+        z = z + 1
+    }
+    retornar z
+}
+
+funcion _va_norm_u32(a0) {
+    sea a = a0
+    si (a == 0) { retornar 0 }
+    sea z = 0
+    mientras (a < 2147483648) {
+        a = a * 2
+        z = z + 1
+    }
+    retornar z
+}
+
+funcion _va_bits(n) {
+    sea b = 0
+    mientras (n >= _VA_P2[b]) { b = b + 1 }
+    retornar b
+}
+
+// ---------- tablas ----------
+
+sea _VA_PESO_ESPECTRO = [6, 8, 10, 12, 14, 16]
+sea _VA_DIF_MINIMA = [544, 544, 576, 576, 576, 576]
+sea _VA_MAX_VOZ = [11392, 11392, 11520, 11520, 11520, 11520]
+sea _VA_MEDIA_MINIMA = [640, 768]
+sea _VA_MAX_RUIDO = [9216, 9088, 8960, 8832, 8704, 8576]
+sea _VA_PESOS_RUIDO = [34, 62, 72, 66, 53, 25, 94, 66, 56, 62, 75, 103]
+sea _VA_PESOS_VOZ = [48, 82, 45, 87, 50, 47, 80, 46, 83, 41, 78, 81]
+sea _VA_MEDIAS_RUIDO = [6738, 4892, 7065, 6715, 6771, 3369, 7646, 3863, 7820, 7266, 5020, 4362]
+sea _VA_MEDIAS_VOZ = [8306, 10085, 10078, 11823, 11843, 6309, 9473, 9571, 10879, 7581, 8180, 7483]
+sea _VA_DESV_RUIDO = [378, 1064, 493, 582, 688, 593, 474, 697, 475, 688, 421, 455]
+sea _VA_DESV_VOZ = [555, 505, 567, 524, 585, 1231, 509, 828, 492, 1540, 1079, 850]
+sea _VA_MODOS = [
+    [[8, 4, 3], [14, 7, 5], [24, 21, 24], [57, 48, 57]],
+    [[8, 4, 3], [14, 7, 5], [37, 32, 37], [100, 80, 100]],
+    [[6, 3, 2], [9, 5, 3], [82, 78, 82], [285, 260, 285]],
+    [[6, 3, 2], [9, 5, 3], [94, 94, 94], [1100, 1050, 1100]]
+]
+sea _VA_DESPLAZ = [368, 368, 272, 176, 176, 176]
+sea _VA_PASATODO = [[821, 6110, 12382], [3050, 9368, 15063]]
+sea _VA_48_32 = [[778, -2050, 1087, 23285, 12903, -3783, 441, 222], [222, 441, -3783, 12903, 23285, 1087, -2050, 778]]
+
+funcion _va_copia(l) {
+    sea r = []
+    para x en l { r.agregar(x) }
+    retornar r
+}
+
+funcion _va_ceros(n) {
+    sea r = []
+    sea i = 0
+    mientras (i < n) {
+        r.agregar(0)
+        i = i + 1
+    }
+    retornar r
+}
+
+/// Nuevo detector. modo: 0 (calidad) a 3 (muy agresivo).
+funcion voz_nuevo(modo) {
+    sea v = {"vad": 1, "contador": 0, "colgado": 0, "num_voz": 0, "estados_bajada": _va_ceros(4),
+        "s48_24": _va_ceros(8), "s24_24": _va_ceros(16), "s24_16": _va_ceros(8), "s16_8": _va_ceros(8),
+        "medias_ruido": _va_copia(_VA_MEDIAS_RUIDO), "medias_voz": _va_copia(_VA_MEDIAS_VOZ), "desv_ruido": _va_copia(_VA_DESV_RUIDO), "desv_voz": _va_copia(_VA_DESV_VOZ),
+        "edad": _va_ceros(96), "minimos": [], "media": [1600, 1600, 1600, 1600, 1600, 1600],
+        "sup": _va_ceros(5), "inf": _va_ceros(5), "pa": _va_ceros(4), "compat_48k": verdadero}
+    sea i = 0
+    mientras (i < 96) {
+        v["minimos"].agregar(10000)
+        i = i + 1
+    }
+    voz_modo(v, modo ?? 0)
+    retornar v
+}
+
+/// A 48 kHz con cuadros de 20 o 30 ms, WebRTC (y py-webrtcvad) analiza los
+/// primeros 10 ms repetidos. Por defecto se imita para dar sus mismas
+/// decisiones; con falso se analiza el cuadro entero.
+funcion voz_compat_48k(v, activo) { v["compat_48k"] = activo }
+
+funcion voz_modo(v, modo) {
+    si (modo < 0 o modo > 3) { lanzar "vad: el modo va de 0 a 3" }
+    sea m = _VA_MODOS[modo]
+    v["colgado1"] = m[0]
+    v["colgado2"] = m[1]
+    v["individual"] = m[2]
+    v["total"] = m[3]
+    v["modo"] = modo
+}
+
+// ---------- banco de filtros ----------
+
+funcion _va_pasa_altos(datos, estado) {
+    sea r = []
+    para x en datos {
+        sea t = 6631 * x + -13262 * estado[0] + 6631 * estado[1]
+        estado[1] = estado[0]
+        estado[0] = x
+        t = _va_s32(t - -7756 * estado[2] - 5620 * estado[3])
+        estado[3] = estado[2]
+        estado[2] = _va_s16(_va_shr(t, 14))
+        r.agregar(estado[2])
+    }
+    retornar r
+}
+
+// Filtro pasa-todo sobre las muestras inicio, inicio+2, …
+funcion _va_pasa_todo(datos, inicio, n, coef, estados, k) {
+    sea r = []
+    sea s32 = estados[k] * 65536
+    sea i = 0
+    mientras (i < n) {
+        sea x = datos[inicio + 2 * i]
+        sea t = _va_s32(s32 + coef * x)
+        sea t16 = _va_s16(_va_shr(t, 16))
+        r.agregar(t16)
+        s32 = _va_s32((_va_s32(x * 16384 - coef * t16)) * 2)
+        i = i + 1
+    }
+    estados[k] = _va_s16(_va_shr(s32, 16))
+    retornar r
+}
+
+funcion _va_dividir(v, datos, n, banda) {
+    sea mitad = _va_shr(n, 1)
+    sea hp = _va_pasa_todo(datos, 0, mitad, 20972, v["sup"], banda)
+    sea lp = _va_pasa_todo(datos, 1, mitad, 5571, v["inf"], banda)
+    sea i = 0
+    mientras (i < mitad) {
+        sea t = hp[i]
+        hp[i] = _va_s16(hp[i] - lp[i])
+        lp[i] = _va_s16(lp[i] + t)
+        i = i + 1
+    }
+    retornar [hp, lp]
+}
+
+// Devuelve [log_energia, total_energia].
+funcion _va_log_energia(datos, n, desplaz, total) {
+    // WebRtcSpl_Energy con WebRtcSpl_GetScalingSquare.
+    sea nbits = _va_bits(n)
+    sea smax = -1
+    sea i = 0
+    mientras (i < n) {
+        sea a = _va_s16(abs(datos[i]))
+        si (a > smax) { smax = a }
+        i = i + 1
+    }
+    sea escala = 0
+    si (smax != 0) {
+        sea t = _va_norm_w32(_va_s32(smax * smax))
+        si (t <= nbits) { escala = nbits - t }
+    }
+    sea en = 0
+    i = 0
+    mientras (i < n) {
+        en = _va_s32(en + _va_shr(datos[i] * datos[i], escala))
+        i = i + 1
+    }
+    sea energia = _va_u32(en)
+    sea despl = escala
+    si (energia == 0) { retornar [desplaz, total] }
+    sea norm = 17 - _va_norm_u32(energia)
+    despl = despl + norm
+    si (norm < 0) { energia = _va_u32(energia * _VA_P2[0 - norm]) } sino { energia = _va_shr(energia, norm) }
+    sea log2 = _va_s16(14336 + _va_shr(bits_y(energia, 16383), 4))
+    sea le = _va_s16(_va_shr(24660 * log2, 19) + _va_shr(_va_s16(despl) * 24660, 9))
+    si (le < 0) { le = 0 }
+    le = _va_s16(le + desplaz)
+    si (total <= 10) {
+        si (despl >= 0) { total = _va_s16(total + 11) } sino { total = _va_s16(total + _va_s16(_va_shr(energia, 0 - despl))) }
+    }
+    retornar [le, total]
+}
+
+funcion _va_rasgos(v, datos, n) {
+    sea rasgos = [0, 0, 0, 0, 0, 0]
+    sea total = 0
+    sea mitad = _va_shr(n, 1)
+    sea p = _va_dividir(v, datos, n, 0)
+    sea hp120 = p[0]
+    sea lp120 = p[1]
+    sea q = _va_dividir(v, hp120, mitad, 1)
+    sea largo = _va_shr(mitad, 1)
+    sea r = _va_log_energia(q[0], largo, _VA_DESPLAZ[5], total)
+    rasgos[5] = r[0]
+    total = r[1]
+    r = _va_log_energia(q[1], largo, _VA_DESPLAZ[4], total)
+    rasgos[4] = r[0]
+    total = r[1]
+    q = _va_dividir(v, lp120, mitad, 2)
+    largo = _va_shr(mitad, 1)
+    r = _va_log_energia(q[0], largo, _VA_DESPLAZ[3], total)
+    rasgos[3] = r[0]
+    total = r[1]
+    sea b = _va_dividir(v, q[1], largo, 3)
+    largo = _va_shr(largo, 1)
+    r = _va_log_energia(b[0], largo, _VA_DESPLAZ[2], total)
+    rasgos[2] = r[0]
+    total = r[1]
+    sea d = _va_dividir(v, b[1], largo, 4)
+    largo = _va_shr(largo, 1)
+    r = _va_log_energia(d[0], largo, _VA_DESPLAZ[1], total)
+    rasgos[1] = r[0]
+    total = r[1]
+    sea pa = _va_pasa_altos(d[1], v["pa"])
+    r = _va_log_energia(pa, largo, _VA_DESPLAZ[0], total)
+    rasgos[0] = r[0]
+    total = r[1]
+    retornar [rasgos, total]
+}
+
+// ---------- GMM ----------
+
+// Devuelve [probabilidad, delta].
+funcion _va_gauss(entrada, media, desv) {
+    sea inv = _va_s16(_va_div(131072 + _va_shr(desv, 1), desv))
+    sea t16 = _va_shr(inv, 2)
+    sea inv2 = _va_s16(_va_shr(t16 * t16, 2))
+    t16 = _va_s16(_va_s16(entrada * 8) - media)
+    sea delta = _va_s16(_va_shr(inv2 * t16, 10))
+    sea t32 = _va_shr(delta * t16, 9)
+    sea ex = 0
+    si (t32 < 22005) {
+        t16 = _va_s16(_va_shr(5909 * _va_s16(t32), 12))
+        t16 = _va_s16(0 - t16)
+        ex = bits_o(1024, bits_y(t16, 1023))
+        t16 = _va_s16(bits_xo(t16, 65535))
+        t16 = _va_shr(t16, 10)
+        t16 = t16 + 1
+        ex = _va_shr(ex, t16)
+    }
+    retornar [_va_s32(inv * ex), delta]
+}
+
+funcion _va_promedio(datos, canal, desplaz, pesos) {
+    sea r = 0
+    sea k = 0
+    mientras (k < 2) {
+        sea i = canal + k * 6
+        datos[i] = _va_s16(datos[i] + desplaz)
+        r = r + datos[i] * pesos[i]
+        k = k + 1
+    }
+    retornar _va_s32(r)
+}
+
+funcion _va_minimo(v, valor, canal) {
+    sea o = canal * 16
+    sea edad = v["edad"]
+    sea mins = v["minimos"]
+    sea i = 0
+    mientras (i < 16) {
+        si (edad[o + i] != 100) { edad[o + i] = edad[o + i] + 1 } sino {
+            sea j = i
+            mientras (j < 15) {
+                mins[o + j] = mins[o + j + 1]
+                edad[o + j] = edad[o + j + 1]
+                j = j + 1
+            }
+            edad[o + 15] = 101
+            mins[o + 15] = 10000
+        }
+        i = i + 1
+    }
+    sea pos = -1
+    si (valor < mins[o + 15]) {
+        pos = 0
+        mientras (valor >= mins[o + pos]) { pos = pos + 1 }
+    }
+    si (pos > -1) {
+        i = 15
+        mientras (i > pos) {
+            mins[o + i] = mins[o + i - 1]
+            edad[o + i] = edad[o + i - 1]
+            i = i - 1
+        }
+        mins[o + pos] = valor
+        edad[o + pos] = 1
+    }
+    sea mediana = 1600
+    si (v["contador"] > 2) { mediana = mins[o + 2] } sino si (v["contador"] > 0) { mediana = mins[o] }
+    sea alfa = 0
+    si (v["contador"] > 0) {
+        si (mediana < v["media"][canal]) { alfa = 6553 } sino { alfa = 32439 }
+    }
+    sea t = (alfa + 1) * v["media"][canal] + (32767 - alfa) * mediana + 16384
+    v["media"][canal] = _va_s16(_va_shr(_va_s32(t), 15))
+    retornar v["media"][canal]
+}
+
+funcion _va_gmm(v, rasgos, potencia_total, n) {
+    sea col = 2
+    si (n == 80) { col = 0 }
+    si (n == 160) { col = 1 }
+    sea oh1 = v["colgado1"][col]
+    sea oh2 = v["colgado2"][col]
+    sea indiv = v["individual"][col]
+    sea total_t = v["total"][col]
+    sea flag = 0
+    si (potencia_total > 10) {
+        sea dN = _va_ceros(12)
+        sea dS = _va_ceros(12)
+        sea ngp = _va_ceros(12)
+        sea sgp = _va_ceros(12)
+        sea suma = 0
+        sea canal = 0
+        mientras (canal < 6) {
+            sea h0t = 0
+            sea h1t = 0
+            sea pn = [0, 0]
+            sea ps = [0, 0]
+            sea k = 0
+            mientras (k < 2) {
+                sea g = canal + k * 6
+                sea a = _va_gauss(rasgos[canal], v["medias_ruido"][g], v["desv_ruido"][g])
+                dN[g] = a[1]
+                pn[k] = _va_s32(_VA_PESOS_RUIDO[g] * a[0])
+                h0t = _va_s32(h0t + pn[k])
+                sea b = _va_gauss(rasgos[canal], v["medias_voz"][g], v["desv_voz"][g])
+                dS[g] = b[1]
+                ps[k] = _va_s32(_VA_PESOS_VOZ[g] * b[0])
+                h1t = _va_s32(h1t + ps[k])
+                k = k + 1
+            }
+            sea sh0 = _va_norm_w32(h0t)
+            sea sh1 = _va_norm_w32(h1t)
+            si (h0t == 0) { sh0 = 31 }
+            si (h1t == 0) { sh1 = 31 }
+            sea llr = _va_s16(sh0 - sh1)
+            suma = _va_s32(suma + llr * _VA_PESO_ESPECTRO[canal])
+            si (llr * 4 > indiv) { flag = 1 }
+            sea h0 = _va_s16(_va_shr(h0t, 12))
+            si (h0 > 0) {
+                sea t1 = _va_s32(_va_u32(bits_y(_va_u32(pn[0]), 4294963200) * 4))
+                ngp[canal] = _va_s16(_va_div(t1, h0))
+                ngp[canal + 6] = _va_s16(16384 - ngp[canal])
+            } sino { ngp[canal] = 16384 }
+            sea h1 = _va_s16(_va_shr(h1t, 12))
+            si (h1 > 0) {
+                sea t1 = _va_s32(_va_u32(bits_y(_va_u32(ps[0]), 4294963200) * 4))
+                sgp[canal] = _va_s16(_va_div(t1, h1))
+                sgp[canal + 6] = _va_s16(16384 - sgp[canal])
+            }
+            canal = canal + 1
+        }
+        si (suma >= total_t) { flag = 1 }
+        sea maxspe = 12800
+        canal = 0
+        mientras (canal < 6) {
+            sea fmin = _va_minimo(v, rasgos[canal], canal)
+            sea ngm = _va_promedio(v["medias_ruido"], canal, 0, _VA_PESOS_RUIDO)
+            sea t1s = _va_s16(_va_shr(ngm, 6))
+            sea k = 0
+            mientras (k < 2) {
+                sea g = canal + k * 6
+                sea nmk = v["medias_ruido"][g]
+                sea smk = v["medias_voz"][g]
+                sea nsk = v["desv_ruido"][g]
+                sea ssk = v["desv_voz"][g]
+                sea nmk2 = nmk
+                si (flag == 0) {
+                    sea delt = _va_s16(_va_shr(ngp[g] * dN[g], 11))
+                    nmk2 = _va_s16(nmk + _va_s16(_va_shr(delt * 655, 22)))
+                }
+                sea ndelt = _va_s16(fmin * 16 - t1s)
+                sea nmk3 = _va_s16(nmk2 + _va_s16(_va_shr(ndelt * 154, 9)))
+                sea lim = (k + 5) * 128
+                si (nmk3 < lim) { nmk3 = lim }
+                lim = (72 + k - canal) * 128
+                si (nmk3 > lim) { nmk3 = lim }
+                v["medias_ruido"][g] = nmk3
+                si (flag != 0) {
+                    sea delt = _va_s16(_va_shr(sgp[g] * dS[g], 11))
+                    sea ts = _va_s16(_va_shr(delt * 6554, 21))
+                    sea smk2 = _va_s16(smk + _va_shr(ts + 1, 1))
+                    sea maxmu = maxspe + 640
+                    si (smk2 < _VA_MEDIA_MINIMA[k]) { smk2 = _VA_MEDIA_MINIMA[k] }
+                    si (smk2 > maxmu) { smk2 = maxmu }
+                    v["medias_voz"][g] = smk2
+                    ts = _va_shr(smk + 4, 3)
+                    ts = _va_s16(rasgos[canal] - ts)
+                    sea t1 = _va_shr(dS[g] * ts, 3)
+                    sea t2 = t1 - 4096
+                    ts = _va_shr(sgp[g], 2)
+                    t1 = _va_s32(ts * t2)
+                    t2 = _va_shr(t1, 4)
+                    sea den = _va_s16(ssk * 10)
+                    si (t2 > 0) { ts = _va_s16(_va_div(t2, den)) } sino { ts = _va_s16(0 - _va_s16(_va_div(0 - t2, den))) }
+                    ts = _va_s16(ts + 128)
+                    ssk = _va_s16(ssk + _va_shr(ts, 8))
+                    si (ssk < 384) { ssk = 384 }
+                    v["desv_voz"][g] = ssk
+                } sino {
+                    sea ts = _va_s16(rasgos[canal] - _va_shr(nmk, 3))
+                    sea t1 = _va_shr(dN[g] * ts, 3) - 4096
+                    ts = _va_shr(ngp[g] + 2, 2)
+                    sea t2 = _va_s32(ts * t1)
+                    t1 = _va_shr(t2, 14)
+                    si (t1 > 0) { ts = _va_s16(_va_div(t1, nsk)) } sino { ts = _va_s16(0 - _va_s16(_va_div(0 - t1, nsk))) }
+                    ts = _va_s16(ts + 32)
+                    nsk = _va_s16(nsk + _va_shr(ts, 6))
+                    si (nsk < 384) { nsk = 384 }
+                    v["desv_ruido"][g] = nsk
+                }
+                k = k + 1
+            }
+            ngm = _va_promedio(v["medias_ruido"], canal, 0, _VA_PESOS_RUIDO)
+            sea sgm = _va_promedio(v["medias_voz"], canal, 0, _VA_PESOS_VOZ)
+            sea dif = _va_s16(_va_s16(_va_shr(sgm, 9)) - _va_s16(_va_shr(ngm, 9)))
+            si (dif < _VA_DIF_MINIMA[canal]) {
+                sea ts = _va_s16(_VA_DIF_MINIMA[canal] - dif)
+                sea a1 = _va_s16(_va_shr(13 * ts, 2))
+                sea a2 = _va_s16(_va_shr(3 * ts, 2))
+                sgm = _va_promedio(v["medias_voz"], canal, a1, _VA_PESOS_VOZ)
+                ngm = _va_promedio(v["medias_ruido"], canal, 0 - a2, _VA_PESOS_RUIDO)
+            }
+            maxspe = _VA_MAX_VOZ[canal]
+            sea t2s = _va_s16(_va_shr(sgm, 7))
+            si (t2s > maxspe) {
+                t2s = t2s - maxspe
+                v["medias_voz"][canal] = _va_s16(v["medias_voz"][canal] - t2s)
+                v["medias_voz"][canal + 6] = _va_s16(v["medias_voz"][canal + 6] - t2s)
+            }
+            t2s = _va_s16(_va_shr(ngm, 7))
+            si (t2s > _VA_MAX_RUIDO[canal]) {
+                t2s = t2s - _VA_MAX_RUIDO[canal]
+                v["medias_ruido"][canal] = _va_s16(v["medias_ruido"][canal] - t2s)
+                v["medias_ruido"][canal + 6] = _va_s16(v["medias_ruido"][canal + 6] - t2s)
+            }
+            canal = canal + 1
+        }
+        v["contador"] = v["contador"] + 1
+    }
+    si (flag == 0) {
+        si (v["colgado"] > 0) {
+            flag = 2 + v["colgado"]
+            v["colgado"] = v["colgado"] - 1
+        }
+        v["num_voz"] = 0
+    } sino {
+        v["num_voz"] = v["num_voz"] + 1
+        si (v["num_voz"] > 6) {
+            v["num_voz"] = 6
+            v["colgado"] = oh2
+        } sino { v["colgado"] = oh1 }
+    }
+    retornar flag
+}
+
+// ---------- remuestreo ----------
+
+funcion _va_bajar2(entrada, estado, k) {
+    sea r = []
+    sea t1 = estado[k]
+    sea t2 = estado[k + 1]
+    sea i = 0
+    mientras (i + 1 < longitud(entrada)) {
+        sea a = entrada[i]
+        sea s1 = _va_s16(_va_shr(t1, 1) + _va_shr(5243 * a, 14))
+        t1 = _va_s32(a - _va_shr(5243 * s1, 12))
+        sea b = entrada[i + 1]
+        sea s2 = _va_s16(_va_shr(t2, 1) + _va_shr(1392 * b, 14))
+        r.agregar(_va_s16(s1 + s2))
+        t2 = _va_s32(b - _va_shr(1392 * s2, 12))
+        i = i + 2
+    }
+    estado[k] = t1
+    estado[k + 1] = t2
+    retornar r
+}
+
+// Una etapa pasa-todo de tres secciones (las de resample_by_2_internal).
+funcion _va_etapa(x, st, b, c) {
+    sea d = _va_s32(x - st[b + 1])
+    d = _va_shr(d + 8192, 14)
+    sea t1 = _va_s32(st[b] + d * c[0])
+    st[b] = x
+    d = _va_s32(t1 - st[b + 2])
+    d = _va_shr(d, 14)
+    si (d < 0) { d = d + 1 }
+    sea t0 = _va_s32(st[b + 1] + d * c[1])
+    st[b + 1] = t1
+    d = _va_s32(t0 - st[b + 3])
+    d = _va_shr(d, 14)
+    si (d < 0) { d = d + 1 }
+    st[b + 3] = _va_s32(st[b + 2] + d * c[2])
+    st[b + 2] = t0
+    retornar _va_shr(st[b + 3], 1)
+}
+
+// 48 kHz → 8 kHz para 10 ms (480 → 80 muestras).
+funcion _va_48a8(v, ent) {
+    // DownBy2ShortToInt: 480 → 240.
+    sea a = []
+    sea st = v["s48_24"]
+    sea i = 0
+    mientras (i < 240) {
+        a.agregar(_va_etapa(_va_s32(ent[2 * i] * 32768 + 16384), st, 0, _VA_PASATODO[1]))
+        i = i + 1
+    }
+    i = 0
+    mientras (i < 240) {
+        a[i] = _va_s32(a[i] + _va_etapa(_va_s32(ent[2 * i + 1] * 32768 + 16384), st, 4, _VA_PASATODO[0]))
+        i = i + 1
+    }
+    // LPBy2IntToInt: 240 → 240.
+    sea s = v["s24_24"]
+    sea o = _va_ceros(240)
+    sea t0 = s[12]
+    i = 0
+    mientras (i < 120) {
+        o[2 * i] = _va_etapa(t0, s, 0, _VA_PASATODO[1])
+        t0 = a[2 * i + 1]
+        i = i + 1
+    }
+    i = 0
+    mientras (i < 120) {
+        o[2 * i] = _va_shr(_va_s32(o[2 * i] + _va_etapa(a[2 * i], s, 4, _VA_PASATODO[0])), 15)
+        i = i + 1
+    }
+    i = 0
+    mientras (i < 120) {
+        o[2 * i + 1] = _va_etapa(a[2 * i], s, 8, _VA_PASATODO[1])
+        i = i + 1
+    }
+    i = 0
+    mientras (i < 120) {
+        o[2 * i + 1] = _va_shr(_va_s32(o[2 * i + 1] + _va_etapa(a[2 * i + 1], s, 12, _VA_PASATODO[0])), 15)
+        i = i + 1
+    }
+    // 24 → 16 kHz (fraccional 3:2) con 8 muestras de historia.
+    sea e = v["s24_16"] + o
+    v["s24_16"] = [o[232], o[233], o[234], o[235], o[236], o[237], o[238], o[239]]
+    sea m32 = []
+    sea m = 0
+    mientras (m < 80) {
+        sea b = 3 * m
+        sea t = 16384
+        sea j = 0
+        mientras (j < 8) {
+            t = t + _VA_48_32[0][j] * e[b + j]
+            j = j + 1
+        }
+        m32.agregar(_va_s32(t))
+        t = 16384
+        j = 0
+        mientras (j < 8) {
+            t = t + _VA_48_32[1][j] * e[b + 1 + j]
+            j = j + 1
+        }
+        m32.agregar(_va_s32(t))
+        m = m + 1
+    }
+    // DownBy2IntToShort: 160 → 80.
+    sea s8 = v["s16_8"]
+    i = 0
+    mientras (i < 80) {
+        m32[2 * i] = _va_etapa(m32[2 * i], s8, 0, _VA_PASATODO[1])
+        i = i + 1
+    }
+    i = 0
+    mientras (i < 80) {
+        m32[2 * i + 1] = _va_etapa(m32[2 * i + 1], s8, 4, _VA_PASATODO[0])
+        i = i + 1
+    }
+    sea r = []
+    i = 0
+    mientras (i < 80) {
+        sea t = _va_shr(_va_s32(m32[2 * i] + m32[2 * i + 1]), 15)
+        si (t > 32767) { t = 32767 }
+        si (t < -32768) { t = -32768 }
+        r.agregar(t)
+        i = i + 1
+    }
+    retornar r
+}
+
+// ---------- API ----------
+
+/// Convierte PCM de 16 bits little endian en lista de muestras.
+funcion voz_muestras(pcm) {
+    sea r = []
+    sea i = 0
+    mientras (i + 1 < longitud(pcm)) {
+        sea x = byte_en(pcm, i) + byte_en(pcm, i + 1) * 256
+        si (x >= 32768) { x = x - 65536 }
+        r.agregar(x)
+        i = i + 2
+    }
+    retornar r
+}
+
+/// ¿Es válida la combinación de frecuencia y largo del cuadro (muestras)?
+funcion voz_cuadro_valido(frecuencia, n) {
+    si (frecuencia != 8000 y frecuencia != 16000 y frecuencia != 32000 y frecuencia != 48000) { retornar falso }
+    sea k = frecuencia / 1000
+    retornar n == 10 * k o n == 20 * k o n == 30 * k
+}
+
+/// ¿Hay voz en el cuadro? cuadro: PCM de 16 bits (texto de bytes) o lista
+/// de muestras; debe durar 10, 20 o 30 ms.
+funcion voz_hay(v, cuadro, frecuencia) {
+    sea x = cuadro
+    si (tipo(cuadro) == "texto") { x = voz_muestras(cuadro) }
+    si (voz_cuadro_valido(frecuencia, longitud(x)) == falso) { lanzar "vad: el cuadro debe durar 10, 20 o 30 ms a 8, 16, 32 o 48 kHz" }
+    sea nb = x
+    si (frecuencia == 16000) { nb = _va_bajar2(x, v["estados_bajada"], 0) }
+    si (frecuencia == 32000) { nb = _va_bajar2(_va_bajar2(x, v["estados_bajada"], 2), v["estados_bajada"], 0) }
+    si (frecuencia == 48000) {
+        nb = []
+        sea i = 0
+        mientras (i < longitud(x)) {
+            sea trozo = []
+            sea j = 0
+            mientras (j < 480) {
+                // La versión de WebRTC que se imita remuestrea los primeros
+                // 10 ms en cada vuelta; con compat_48k = falso se usa cada
+                // tramo de 10 ms como corresponde.
+                si (v["compat_48k"]) { trozo.agregar(x[j]) } sino { trozo.agregar(x[i + j]) }
+                j = j + 1
+            }
+            nb = nb + _va_48a8(v, trozo)
+            i = i + 480
+        }
+    }
+    sea r = _va_rasgos(v, nb, longitud(nb))
+    v["vad"] = _va_gmm(v, r[0], r[1], longitud(nb))
+    retornar v["vad"] > 0
+}
+
+/// Corta PCM de 16 bits en cuadros de ms milisegundos (descarta el resto).
+funcion voz_cuadros(pcm, frecuencia, ms) {
+    sea n = frecuencia * ms / 1000 * 2
+    sea r = []
+    sea i = 0
+    mientras (i + n <= longitud(pcm)) {
+        r.agregar(subcadena(pcm, i, i + n))
+        i = i + n
+    }
+    retornar r
+}
+
+/// Decisión de cada cuadro de un audio completo.
+funcion voz_decisiones(v, pcm, frecuencia, ms) {
+    sea r = []
+    para c en voz_cuadros(pcm, frecuencia, ms) { r.agregar(voz_hay(v, c, frecuencia)) }
+    retornar r
+}
+
+/// Segmentos de voz al estilo del ejemplo de py-webrtcvad: una ventana de
+/// relleno_ms; empieza cuando más del 90 % de la ventana es voz y termina
+/// cuando más del 90 % no lo es. Devuelve [{"inicio_ms", "fin_ms", "pcm"}].
+funcion voz_segmentos(v, pcm, frecuencia, ms, relleno_ms) {
+    sea n_vent = piso(relleno_ms / ms)
+    sea ventana = []
+    sea dentro = falso
+    sea segs = []
+    sea actual = nulo
+    sea t = 0
+    para c en voz_cuadros(pcm, frecuencia, ms) {
+        sea voz = voz_hay(v, c, frecuencia)
+        ventana.agregar([c, voz, t])
+        si (longitud(ventana) > n_vent) {
+            sea w = []
+            sea i = 1
+            mientras (i < longitud(ventana)) {
+                w.agregar(ventana[i])
+                i = i + 1
+            }
+            ventana = w
+        }
+        si (dentro == falso) {
+            sea n = 0
+            para f en ventana { si (f[1]) { n = n + 1 } }
+            si (n > 0.9 * n_vent) {
+                dentro = verdadero
+                actual = {"inicio_ms": ventana[0][2], "partes": []}
+                para f en ventana { actual["partes"].agregar(f[0]) }
+                ventana = []
+            }
+        } sino {
+            actual["partes"].agregar(c)
+            sea n = 0
+            para f en ventana { si (f[1] == falso) { n = n + 1 } }
+            si (n > 0.9 * n_vent) {
+                dentro = falso
+                segs.agregar({"inicio_ms": actual["inicio_ms"], "fin_ms": t + ms, "pcm": unir(actual["partes"], "")})
+                ventana = []
+            }
+        }
+        t = t + ms
+    }
+    si (dentro) { segs.agregar({"inicio_ms": actual["inicio_ms"], "fin_ms": t, "pcm": unir(actual["partes"], "")}) }
+    retornar segs
+}

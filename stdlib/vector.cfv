@@ -1,0 +1,1126 @@
+// stdlib/vector.cfv — gráficos vectoriales al estilo Cairo con tres
+// salidas desde el mismo dibujo: SVG, PDF (varias páginas, degradados como
+// sombreados, transparencia con ExtGState) y PNG (rasterizado propio con
+// antialiasing). Caminos con líneas, curvas cúbicas y cuadráticas, arcos,
+// rectángulos (también redondeados) y elipses; transformaciones con pila
+// guardar/restaurar; relleno no-cero o par-impar; trazos con grosor,
+// extremos, uniones, límite de inglete y guiones; degradados lineales y
+// radiales con varias paradas; recortes; y texto. Las salidas se cruzaron
+// con rsvg-convert y pdftoppm. Idea de Cairo (MPL/LGPL: solo la idea). En
+// inglés: importar "vectorgfx".
+//
+//   importar "vector"
+//   sea c = vector_nuevo("svg", 200, 100, nulo)
+//   vector_rectangulo(c, 10, 10, 180, 80)
+//   vector_color(c, "#3366cc")
+//   vector_rellenar(c)
+//   escribir_archivo("dibujo.svg", vector_terminar(c))
+
+importar "graficos"
+importar "fuente"
+importar "documento"
+importar "base64"
+
+sea _VE_PI = 3.141592653589793
+
+// ---------- colores ----------
+
+/// Color normalizado [r, g, b, a] (0..1) desde "#rgb", "#rrggbb",
+/// "#rrggbbaa", [r, g, b] o [r, g, b, a] en 0..1.
+funcion vector_rgba(c) {
+    si (tipo(c) == "texto") {
+        sea h = c
+        si (texto_empieza_con(h, "#")) { h = subcadena(h, 1, longitud(h)) }
+        si (longitud(h) == 3) { h = subcadena(h, 0, 1) + subcadena(h, 0, 1) + subcadena(h, 1, 2) + subcadena(h, 1, 2) + subcadena(h, 2, 3) + subcadena(h, 2, 3) }
+        sea b = bytes_de_hex(h)
+        sea a = 1
+        si (longitud(b) == 4) { a = byte_en(b, 3) / 255 }
+        retornar [byte_en(b, 0) / 255, byte_en(b, 1) / 255, byte_en(b, 2) / 255, a]
+    }
+    si (longitud(c) == 3) { retornar [c[0], c[1], c[2], 1] }
+    retornar [c[0], c[1], c[2], c[3]]
+}
+
+funcion _ve_hex2(v) {
+    sea n = redondear(v * 255)
+    si (n < 0) { n = 0 }
+    si (n > 255) { n = 255 }
+    retornar hex_de_bytes(bytes_entero(n, 1, 0))
+}
+
+funcion _ve_css(c) { retornar "#" + _ve_hex2(c[0]) + _ve_hex2(c[1]) + _ve_hex2(c[2]) }
+
+// ---------- matrices [a, b, c, d, e, f] ----------
+
+funcion _ve_mul(m, n) {
+    // Primero n, después m (m · n).
+    retornar [m[0] * n[0] + m[2] * n[1], m[1] * n[0] + m[3] * n[1], m[0] * n[2] + m[2] * n[3], m[1] * n[2] + m[3] * n[3], m[0] * n[4] + m[2] * n[5] + m[4], m[1] * n[4] + m[3] * n[5] + m[5]]
+}
+
+funcion _ve_ap(m, x, y) { retornar [m[0] * x + m[2] * y + m[4], m[1] * x + m[3] * y + m[5]] }
+
+funcion _ve_inv(m) {
+    sea det = m[0] * m[3] - m[1] * m[2]
+    si (det == 0) { lanzar "vector: la transformación no se puede invertir" }
+    retornar [m[3] / det, 0 - m[1] / det, 0 - m[2] / det, m[0] / det, (m[2] * m[5] - m[3] * m[4]) / det, (m[1] * m[4] - m[0] * m[5]) / det]
+}
+
+funcion _ve_escala(m) { retornar raiz(abs(m[0] * m[3] - m[1] * m[2])) }
+
+// ---------- contexto ----------
+
+/// Nuevo dibujo. tipo: "svg", "pdf" o "png". opciones: "fondo" (color),
+/// "fuente_ttf" (datos de una .ttf para PNG), "titulo" (PDF).
+funcion vector_nuevo(tipo_s, ancho, alto, opciones) {
+    sea op = opciones ?? {}
+    si (tipo_s != "svg" y tipo_s != "pdf" y tipo_s != "png") { lanzar "vector: tipo desconocido " + tipo_s }
+    sea c = {"tipo": tipo_s, "ancho": ancho, "alto": alto, "camino": [], "actual": nulo, "inicio": nulo, "pila": [], "op": op,
+        "est": {"m": [1, 0, 0, 1, 0, 0], "fuente": {"color": [0, 0, 0, 1]}, "grosor": 1, "extremo": "plano", "union": "inglete", "inglete": 10, "guiones": [], "desfase": 0, "regla": "no_cero", "tam": 12, "familia": "sans-serif", "negrita": falso, "recortes": 0, "mascara": nulo},
+        "svg": [], "defs": [], "sig": 0, "paginas": [], "flujo": [], "alfas": {}, "patrones": [], "lienzo": nulo}
+    si (tipo_s == "png") {
+        c["lienzo"] = lienzo_crear(ancho, alto)
+        si ((op["fondo"] ?? nulo) != nulo) {
+            sea f = vector_rgba(op["fondo"])
+            lienzo_limpiar(c["lienzo"], [redondear(f[0] * 255), redondear(f[1] * 255), redondear(f[2] * 255), redondear(f[3] * 255)])
+        }
+    }
+    si (tipo_s != "png" y (op["fondo"] ?? nulo) != nulo) {
+        vector_rectangulo(c, 0, 0, ancho, alto)
+        vector_color(c, op["fondo"])
+        vector_rellenar(c)
+    }
+    retornar c
+}
+
+funcion _ve_copiar_est(e) {
+    sea r = {}
+    para k en claves(e) { r[k] = e[k] }
+    r["recortes"] = 0
+    retornar r
+}
+
+/// Guarda el estado (transformación, estilo, recorte).
+funcion vector_guardar(c) {
+    c["pila"].agregar(c["est"])
+    c["est"] = _ve_copiar_est(c["est"])
+    si (c["tipo"] == "pdf") { c["flujo"].agregar("q") }
+}
+
+/// Vuelve al último estado guardado.
+funcion vector_restaurar(c) {
+    si (longitud(c["pila"]) == 0) { lanzar "vector: restaurar sin guardar" }
+    si (c["tipo"] == "svg") {
+        sea i = 0
+        mientras (i < c["est"]["recortes"]) {
+            c["svg"].agregar("</g>")
+            i = i + 1
+        }
+    }
+    si (c["tipo"] == "pdf") { c["flujo"].agregar("Q") }
+    c["est"] = c["pila"][longitud(c["pila"]) - 1]
+    quitar_ultimo(c["pila"])
+}
+
+funcion vector_transformar(c, m) { c["est"]["m"] = _ve_mul(c["est"]["m"], m) }
+funcion vector_trasladar(c, x, y) { vector_transformar(c, [1, 0, 0, 1, x, y]) }
+funcion vector_escalar(c, sx, sy) { vector_transformar(c, [sx, 0, 0, sy ?? sx, 0, 0]) }
+funcion vector_rotar(c, radianes) { vector_transformar(c, [coseno(radianes), seno(radianes), 0 - seno(radianes), coseno(radianes), 0, 0]) }
+funcion vector_matriz(c) { retornar c["est"]["m"] }
+funcion vector_fijar_matriz(c, m) { c["est"]["m"] = m }
+
+// ---------- estilo ----------
+
+/// Color sólido de relleno y trazo.
+funcion vector_color(c, color) { c["est"]["fuente"] = {"color": vector_rgba(color)} }
+
+funcion _ve_paradas(paradas) {
+    sea r = []
+    para p en paradas { r.agregar([p[0], vector_rgba(p[1])]) }
+    retornar ordenar(r, funcion(a, b) { retornar a[0] - b[0] })
+}
+
+/// Degradado lineal de (x0, y0) a (x1, y1); paradas: [[t, color]…].
+funcion vector_degradado_lineal(c, x0, y0, x1, y1, paradas) {
+    c["est"]["fuente"] = {"lineal": [x0, y0, x1, y1], "paradas": _ve_paradas(paradas), "m": c["est"]["m"]}
+}
+
+/// Degradado radial concéntrico en (cx, cy) desde r0 hasta r1.
+funcion vector_degradado_radial(c, cx, cy, r0, r1, paradas) {
+    c["est"]["fuente"] = {"radial": [cx, cy, r0, r1], "paradas": _ve_paradas(paradas), "m": c["est"]["m"]}
+}
+
+funcion vector_grosor(c, g) { c["est"]["grosor"] = g }
+/// "plano", "redondo" o "cuadrado".
+funcion vector_extremo(c, e) { c["est"]["extremo"] = e }
+/// "inglete", "redonda" o "bisel".
+funcion vector_union(c, u) { c["est"]["union"] = u }
+funcion vector_limite_inglete(c, l) { c["est"]["inglete"] = l }
+funcion vector_guiones(c, lista, desfase) {
+    c["est"]["guiones"] = lista ?? []
+    c["est"]["desfase"] = desfase ?? 0
+}
+/// "no_cero" o "par_impar".
+funcion vector_regla(c, r) { c["est"]["regla"] = r }
+funcion vector_fuente(c, tam, familia, negrita) {
+    c["est"]["tam"] = tam
+    si (familia != nulo) { c["est"]["familia"] = familia }
+    c["est"]["negrita"] = negrita ?? falso
+}
+
+// ---------- caminos (en coordenadas del dispositivo) ----------
+
+funcion vector_nuevo_camino(c) {
+    c["camino"] = []
+    c["actual"] = nulo
+}
+
+funcion _ve_sub(c) { retornar c["camino"][longitud(c["camino"]) - 1] }
+
+funcion vector_mover(c, x, y) {
+    sea p = _ve_ap(c["est"]["m"], x, y)
+    c["camino"].agregar({"pts": [["M", p[0], p[1]]], "cerrado": falso})
+    c["actual"] = [x, y]
+    c["inicio"] = [x, y]
+}
+
+funcion vector_linea(c, x, y) {
+    si (c["actual"] == nulo) { retornar vector_mover(c, x, y) }
+    sea p = _ve_ap(c["est"]["m"], x, y)
+    _ve_sub(c)["pts"].agregar(["L", p[0], p[1]])
+    c["actual"] = [x, y]
+}
+
+/// Curva cúbica.
+funcion vector_curva(c, x1, y1, x2, y2, x3, y3) {
+    si (c["actual"] == nulo) { vector_mover(c, x1, y1) }
+    sea m = c["est"]["m"]
+    sea a = _ve_ap(m, x1, y1)
+    sea b = _ve_ap(m, x2, y2)
+    sea d = _ve_ap(m, x3, y3)
+    _ve_sub(c)["pts"].agregar(["C", a[0], a[1], b[0], b[1], d[0], d[1]])
+    c["actual"] = [x3, y3]
+}
+
+/// Curva cuadrática (se convierte a cúbica).
+funcion vector_cuadratica(c, x1, y1, x2, y2) {
+    sea p = c["actual"] ?? [x1, y1]
+    vector_curva(c, p[0] + 2 / 3 * (x1 - p[0]), p[1] + 2 / 3 * (y1 - p[1]), x2 + 2 / 3 * (x1 - x2), y2 + 2 / 3 * (y1 - y2), x2, y2)
+}
+
+funcion vector_cerrar(c) {
+    si (longitud(c["camino"]) == 0) { retornar nulo }
+    sea sub = _ve_sub(c)
+    sub["cerrado"] = verdadero
+    c["actual"] = c["inicio"]
+}
+
+/// Arco de circunferencia (ángulos en radianes, en sentido horario en
+/// pantalla). negativo: en sentido contrario.
+funcion vector_arco(c, cx, cy, r, a0, a1, negativo) {
+    sea neg = (negativo ?? falso) == verdadero
+    sea fin = a1
+    si (neg == falso) { mientras (fin < a0) { fin = fin + 2 * _VE_PI } } sino { mientras (fin > a0) { fin = fin - 2 * _VE_PI } }
+    sea total = fin - a0
+    sea n = techo(abs(total) / (_VE_PI / 2) - 0.000001)
+    si (n < 1) { n = 1 }
+    sea paso = total / n
+    sea x0 = cx + r * coseno(a0)
+    sea y0 = cy + r * seno(a0)
+    si (c["actual"] == nulo) { vector_mover(c, x0, y0) } sino { vector_linea(c, x0, y0) }
+    sea k = 4 / 3 * tangente(paso / 4)
+    sea i = 0
+    mientras (i < n) {
+        sea t0 = a0 + paso * i
+        sea t1 = t0 + paso
+        sea c0 = coseno(t0)
+        sea s0 = seno(t0)
+        sea c1 = coseno(t1)
+        sea s1 = seno(t1)
+        vector_curva(c, cx + r * (c0 - k * s0), cy + r * (s0 + k * c0), cx + r * (c1 + k * s1), cy + r * (s1 - k * c1), cx + r * c1, cy + r * s1)
+        i = i + 1
+    }
+}
+
+funcion vector_rectangulo(c, x, y, w, h) {
+    vector_mover(c, x, y)
+    vector_linea(c, x + w, y)
+    vector_linea(c, x + w, y + h)
+    vector_linea(c, x, y + h)
+    vector_cerrar(c)
+}
+
+funcion vector_rectangulo_redondeado(c, x, y, w, h, r) {
+    sea rr = minimo(r, minimo(w, h) / 2)
+    c["actual"] = nulo
+    vector_arco(c, x + w - rr, y + rr, rr, 0 - _VE_PI / 2, 0, falso)
+    vector_arco(c, x + w - rr, y + h - rr, rr, 0, _VE_PI / 2, falso)
+    vector_arco(c, x + rr, y + h - rr, rr, _VE_PI / 2, _VE_PI, falso)
+    vector_arco(c, x + rr, y + rr, rr, _VE_PI, 3 * _VE_PI / 2, falso)
+    vector_cerrar(c)
+}
+
+funcion vector_elipse(c, cx, cy, rx, ry) {
+    vector_guardar_m(c)
+    vector_trasladar(c, cx, cy)
+    vector_escalar(c, rx, ry)
+    c["actual"] = nulo
+    vector_arco(c, 0, 0, 1, 0, 2 * _VE_PI - 0.0000001, falso)
+    vector_cerrar(c)
+    vector_restaurar_m(c)
+}
+
+funcion vector_circulo(c, cx, cy, r) { vector_elipse(c, cx, cy, r, r) }
+
+// Guardar/restaurar solo la matriz (sin efectos en la salida).
+funcion vector_guardar_m(c) { c["pila_m"] = c["est"]["m"] }
+funcion vector_restaurar_m(c) { c["est"]["m"] = c["pila_m"] }
+
+/// Agrega un camino en sintaxis de SVG (M L H V C S Q T Z, absolutos y
+/// relativos; sin A).
+funcion vector_camino_svg(c, d) {
+    sea toks = _ve_tokens(d)
+    sea i = 0
+    sea cmd = ""
+    sea p = c["actual"] ?? [0, 0]
+    sea ini = p
+    sea ctrl = nulo
+    mientras (i < longitud(toks)) {
+        si (tipo(toks[i]) == "texto") {
+            cmd = toks[i]
+            i = i + 1
+        }
+        sea rel = cmd == texto_minusculas(cmd)
+        sea C = texto_mayusculas(cmd)
+        sea ox = 0
+        sea oy = 0
+        si (rel) {
+            ox = p[0]
+            oy = p[1]
+        }
+        si (C == "Z") {
+            vector_cerrar(c)
+            p = ini
+            ctrl = nulo
+        } sino si (C == "M") {
+            p = [ox + toks[i], oy + toks[i + 1]]
+            vector_mover(c, p[0], p[1])
+            ini = p
+            i = i + 2
+            cmd = "L"
+            si (rel) { cmd = "l" }
+            ctrl = nulo
+        } sino si (C == "L") {
+            p = [ox + toks[i], oy + toks[i + 1]]
+            vector_linea(c, p[0], p[1])
+            i = i + 2
+            ctrl = nulo
+        } sino si (C == "H") {
+            p = [ox + toks[i], p[1]]
+            vector_linea(c, p[0], p[1])
+            i = i + 1
+            ctrl = nulo
+        } sino si (C == "V") {
+            p = [p[0], oy + toks[i]]
+            vector_linea(c, p[0], p[1])
+            i = i + 1
+            ctrl = nulo
+        } sino si (C == "C" o C == "S") {
+            sea a = nulo
+            si (C == "C") {
+                a = [ox + toks[i], oy + toks[i + 1]]
+                i = i + 2
+            } sino {
+                a = p
+                si (ctrl != nulo) { a = [2 * p[0] - ctrl[0], 2 * p[1] - ctrl[1]] }
+            }
+            sea b = [ox + toks[i], oy + toks[i + 1]]
+            sea e = [ox + toks[i + 2], oy + toks[i + 3]]
+            i = i + 4
+            vector_curva(c, a[0], a[1], b[0], b[1], e[0], e[1])
+            ctrl = b
+            p = e
+        } sino si (C == "Q" o C == "T") {
+            sea a = nulo
+            si (C == "Q") {
+                a = [ox + toks[i], oy + toks[i + 1]]
+                i = i + 2
+            } sino {
+                a = p
+                si (ctrl != nulo) { a = [2 * p[0] - ctrl[0], 2 * p[1] - ctrl[1]] }
+            }
+            sea e = [ox + toks[i], oy + toks[i + 1]]
+            i = i + 2
+            vector_cuadratica(c, a[0], a[1], e[0], e[1])
+            ctrl = a
+            p = e
+        } sino { lanzar "vector: comando de camino no soportado '" + cmd + "'" }
+    }
+}
+
+funcion _ve_tokens(d) {
+    sea r = []
+    sea caja = [[]]
+    sea i = 0
+    sea letras = "MmLlHhVvCcSsQqTtZz"
+    sea cierra = funcion() {
+        si (longitud(caja[0]) > 0) {
+            r.agregar(a_numero(unir(caja[0], "")))
+            caja[0] = []
+        }
+    }
+    mientras (i < longitud(d)) {
+        sea ch = subcadena(d, i, i + 1)
+        si (contiene(letras, ch)) {
+            cierra()
+            r.agregar(ch)
+        } sino si (ch == " " o ch == "," o ch == "\n" o ch == "\t") { cierra() }
+        sino si (ch == "-" y longitud(caja[0]) > 0 y caja[0][longitud(caja[0]) - 1] != "e") {
+            cierra()
+            caja[0].agregar(ch)
+        } sino si (ch == "." y contiene(unir(caja[0], ""), ".")) {
+            cierra()
+            caja[0].agregar(ch)
+        } sino { caja[0].agregar(ch) }
+        i = i + 1
+    }
+    cierra()
+    retornar r
+}
+
+// ---------- salida común ----------
+
+funcion _ve_num(v) {
+    sea r = redondear(v * 1000) / 1000
+    si (r == piso(r)) { retornar "" + piso(r) }
+    retornar "" + r
+}
+
+funcion _ve_d_svg(camino) {
+    sea p = []
+    para s en camino {
+        para q en s["pts"] {
+            si (q[0] == "M") { p.agregar("M" + _ve_num(q[1]) + " " + _ve_num(q[2])) }
+            si (q[0] == "L") { p.agregar("L" + _ve_num(q[1]) + " " + _ve_num(q[2])) }
+            si (q[0] == "C") { p.agregar("C" + _ve_num(q[1]) + " " + _ve_num(q[2]) + " " + _ve_num(q[3]) + " " + _ve_num(q[4]) + " " + _ve_num(q[5]) + " " + _ve_num(q[6])) }
+        }
+        si (s["cerrado"]) { p.agregar("Z") }
+    }
+    retornar unir(p, "")
+}
+
+funcion _ve_d_pdf(camino) {
+    sea p = []
+    para s en camino {
+        para q en s["pts"] {
+            si (q[0] == "M") { p.agregar(_ve_num(q[1]) + " " + _ve_num(q[2]) + " m") }
+            si (q[0] == "L") { p.agregar(_ve_num(q[1]) + " " + _ve_num(q[2]) + " l") }
+            si (q[0] == "C") { p.agregar(_ve_num(q[1]) + " " + _ve_num(q[2]) + " " + _ve_num(q[3]) + " " + _ve_num(q[4]) + " " + _ve_num(q[5]) + " " + _ve_num(q[6]) + " c") }
+        }
+        si (s["cerrado"]) { p.agregar("h") }
+    }
+    retornar unir(p, " ")
+}
+
+/// El camino actual como atributo "d" de SVG (coordenadas del dispositivo).
+funcion vector_camino_d(c) { retornar _ve_d_svg(c["camino"]) }
+
+funcion _ve_id(c, pref) {
+    c["sig"] = c["sig"] + 1
+    retornar pref + c["sig"]
+}
+
+// ---------- SVG ----------
+
+funcion _ve_svg_pintura(c, f) {
+    si (tiene_clave(f, "color")) {
+        sea r = {"pintura": _ve_css(f["color"]), "alfa": f["color"][3]}
+        retornar r
+    }
+    sea id = _ve_id(c, "g")
+    sea Q = caracter(34)
+    sea m = f["m"]
+    sea mt = "matrix(" + _ve_num(m[0]) + " " + _ve_num(m[1]) + " " + _ve_num(m[2]) + " " + _ve_num(m[3]) + " " + _ve_num(m[4]) + " " + _ve_num(m[5]) + ")"
+    sea paradas = f["paradas"]
+    sea cab = ""
+    si (tiene_clave(f, "lineal")) {
+        sea g = f["lineal"]
+        cab = "<linearGradient id=" + Q + id + Q + " gradientUnits=" + Q + "userSpaceOnUse" + Q + " x1=" + Q + _ve_num(g[0]) + Q + " y1=" + Q + _ve_num(g[1]) + Q + " x2=" + Q + _ve_num(g[2]) + Q + " y2=" + Q + _ve_num(g[3]) + Q + " gradientTransform=" + Q + mt + Q + ">"
+    } sino {
+        sea g = f["radial"]
+        cab = "<radialGradient id=" + Q + id + Q + " gradientUnits=" + Q + "userSpaceOnUse" + Q + " cx=" + Q + _ve_num(g[0]) + Q + " cy=" + Q + _ve_num(g[1]) + Q + " r=" + Q + _ve_num(g[3]) + Q + " gradientTransform=" + Q + mt + Q + ">"
+        // Radio interior: se reescalan las paradas.
+        sea base = g[2] / g[3]
+        sea np = []
+        para p en paradas { np.agregar([base + p[0] * (1 - base), p[1]]) }
+        paradas = np
+    }
+    sea l = [cab]
+    para p en paradas { l.agregar("<stop offset=" + Q + _ve_num(p[0]) + Q + " stop-color=" + Q + _ve_css(p[1]) + Q + " stop-opacity=" + Q + _ve_num(p[1][3]) + Q + "/>") }
+    si (tiene_clave(f, "lineal")) { l.agregar("</linearGradient>") } sino { l.agregar("</radialGradient>") }
+    c["defs"].agregar(unir(l, ""))
+    retornar {"pintura": "url(#" + id + ")", "alfa": 1}
+}
+
+funcion _ve_svg_trazo(c, e) {
+    sea Q = caracter(34)
+    sea s = _ve_escala(e["m"])
+    sea caps = {"plano": "butt", "redondo": "round", "cuadrado": "square"}
+    sea joins = {"inglete": "miter", "redonda": "round", "bisel": "bevel"}
+    sea t = " stroke-width=" + Q + _ve_num(e["grosor"] * s) + Q + " stroke-linecap=" + Q + caps[e["extremo"]] + Q + " stroke-linejoin=" + Q + joins[e["union"]] + Q
+    si (e["union"] == "inglete" y e["inglete"] != 4) { t = t + " stroke-miterlimit=" + Q + _ve_num(e["inglete"]) + Q }
+    si (longitud(e["guiones"]) > 0) {
+        sea g = []
+        para x en e["guiones"] { g.agregar(_ve_num(x * s)) }
+        t = t + " stroke-dasharray=" + Q + unir(g, " ") + Q
+        si (e["desfase"] != 0) { t = t + " stroke-dashoffset=" + Q + _ve_num(e["desfase"] * s) + Q }
+    }
+    retornar t
+}
+
+funcion _ve_svg_dibujar(c, rellenar, trazar) {
+    sea Q = caracter(34)
+    sea e = c["est"]
+    sea a = "<path d=" + Q + _ve_d_svg(c["camino"]) + Q
+    si (rellenar) {
+        sea p = _ve_svg_pintura(c, e["fuente"])
+        a = a + " fill=" + Q + p["pintura"] + Q
+        si (p["alfa"] < 1) { a = a + " fill-opacity=" + Q + _ve_num(p["alfa"]) + Q }
+        si (e["regla"] == "par_impar") { a = a + " fill-rule=" + Q + "evenodd" + Q }
+    } sino { a = a + " fill=" + Q + "none" + Q }
+    si (trazar) {
+        sea p = _ve_svg_pintura(c, e["fuente"])
+        a = a + " stroke=" + Q + p["pintura"] + Q
+        si (p["alfa"] < 1) { a = a + " stroke-opacity=" + Q + _ve_num(p["alfa"]) + Q }
+        a = a + _ve_svg_trazo(c, e)
+    }
+    c["svg"].agregar(a + "/>")
+}
+
+funcion _ve_xml(t) { retornar texto_reemplazar(texto_reemplazar(texto_reemplazar(t, "&", "&amp;"), "<", "&lt;"), ">", "&gt;") }
+
+// ---------- PDF ----------
+
+funcion _ve_pdf_alfa(c, a, trazo) {
+    sea k = "" + _ve_num(a)
+    si (tiene_clave(c["alfas"], k) == falso) { c["alfas"][k] = "GS" + (longitud(claves(c["alfas"])) + 1) }
+    c["flujo"].agregar("/" + c["alfas"][k] + " gs")
+}
+
+funcion _ve_pdf_funcion(paradas) {
+    sea f = funcion(a, b) { retornar "<< /FunctionType 2 /Domain [0 1] /C0 [" + _ve_num(a[0]) + " " + _ve_num(a[1]) + " " + _ve_num(a[2]) + "] /C1 [" + _ve_num(b[0]) + " " + _ve_num(b[1]) + " " + _ve_num(b[2]) + "] /N 1 >>" }
+    sea ps = paradas
+    si (longitud(ps) == 1) { ps = [ps[0], [1, ps[0][1]]] }
+    // Paradas en 0 y 1.
+    si (ps[0][0] > 0) { ps = [[0, ps[0][1]]] + ps }
+    si (ps[longitud(ps) - 1][0] < 1) { ps = ps + [[1, ps[longitud(ps) - 1][1]]] }
+    si (longitud(ps) == 2) { retornar f(ps[0][1], ps[1][1]) }
+    sea fs = []
+    sea bounds = []
+    sea enc = []
+    sea i = 0
+    mientras (i + 1 < longitud(ps)) {
+        fs.agregar(f(ps[i][1], ps[i + 1][1]))
+        si (i > 0) { bounds.agregar(_ve_num(ps[i][0])) }
+        enc.agregar("0 1")
+        i = i + 1
+    }
+    retornar "<< /FunctionType 3 /Domain [0 1] /Functions [" + unir(fs, " ") + "] /Bounds [" + unir(bounds, " ") + "] /Encode [" + unir(enc, " ") + "] >>"
+}
+
+funcion _ve_pdf_pintura(c, f, trazo) {
+    si (tiene_clave(f, "color")) {
+        sea k = f["color"]
+        sea op = "rg"
+        si (trazo) { op = "RG" }
+        c["flujo"].agregar(_ve_num(k[0]) + " " + _ve_num(k[1]) + " " + _ve_num(k[2]) + " " + op)
+        si (k[3] < 1) { _ve_pdf_alfa(c, k[3], trazo) }
+        retornar nulo
+    }
+    // Patrón de sombreado: coordenadas en espacio de usuario y matriz al
+    // espacio de la página (con el eje y invertido).
+    sea m = f["m"]
+    sea H = c["alto"]
+    sea pm = [m[0], 0 - m[1], m[2], 0 - m[3], m[4], H - m[5]]
+    sea sh = ""
+    si (tiene_clave(f, "lineal")) {
+        sea g = f["lineal"]
+        sh = "<< /ShadingType 2 /ColorSpace /DeviceRGB /Coords [" + _ve_num(g[0]) + " " + _ve_num(g[1]) + " " + _ve_num(g[2]) + " " + _ve_num(g[3]) + "] /Function " + _ve_pdf_funcion(f["paradas"]) + " /Extend [true true] >>"
+    } sino {
+        sea g = f["radial"]
+        sh = "<< /ShadingType 3 /ColorSpace /DeviceRGB /Coords [" + _ve_num(g[0]) + " " + _ve_num(g[1]) + " " + _ve_num(g[2]) + " " + _ve_num(g[0]) + " " + _ve_num(g[1]) + " " + _ve_num(g[3]) + "] /Function " + _ve_pdf_funcion(f["paradas"]) + " /Extend [true true] >>"
+    }
+    sea nombre = "P" + (longitud(c["patrones"]) + 1)
+    c["patrones"].agregar([nombre, "<< /Type /Pattern /PatternType 2 /Shading " + sh + " /Matrix [" + _ve_num(pm[0]) + " " + _ve_num(pm[1]) + " " + _ve_num(pm[2]) + " " + _ve_num(pm[3]) + " " + _ve_num(pm[4]) + " " + _ve_num(pm[5]) + "] >>"])
+    si (trazo) { c["flujo"].agregar("/Pattern CS /" + nombre + " SCN") } sino { c["flujo"].agregar("/Pattern cs /" + nombre + " scn") }
+}
+
+funcion _ve_pdf_dibujar(c, rellenar, trazar) {
+    sea e = c["est"]
+    c["flujo"].agregar("q")
+    si (rellenar) { _ve_pdf_pintura(c, e["fuente"], falso) }
+    si (trazar) {
+        _ve_pdf_pintura(c, e["fuente"], verdadero)
+        sea s = _ve_escala(e["m"])
+        sea caps = {"plano": 0, "redondo": 1, "cuadrado": 2}
+        sea joins = {"inglete": 0, "redonda": 1, "bisel": 2}
+        c["flujo"].agregar(_ve_num(e["grosor"] * s) + " w " + caps[e["extremo"]] + " J " + joins[e["union"]] + " j " + _ve_num(e["inglete"]) + " M")
+        si (longitud(e["guiones"]) > 0) {
+            sea g = []
+            para x en e["guiones"] { g.agregar(_ve_num(x * s)) }
+            c["flujo"].agregar("[" + unir(g, " ") + "] " + _ve_num(e["desfase"] * s) + " d")
+        }
+    }
+    sea op = "S"
+    si (rellenar y trazar) { op = "B" }
+    sino si (rellenar) { op = "f" }
+    si (rellenar y e["regla"] == "par_impar") { op = op + "*" }
+    c["flujo"].agregar(_ve_d_pdf(c["camino"]) + " " + op)
+    c["flujo"].agregar("Q")
+}
+
+funcion _ve_pdf_texto(t) {
+    sea w = documento_winansi(t)
+    retornar "(" + texto_reemplazar(texto_reemplazar(texto_reemplazar(w, "\\", "\\\\"), "(", "\\("), ")", "\\)") + ")"
+}
+
+/// Nueva página (solo PDF).
+funcion vector_pagina(c) {
+    si (c["tipo"] != "pdf") { lanzar "vector: las páginas son solo para PDF" }
+    c["paginas"].agregar(unir(c["flujo"], "\n"))
+    c["flujo"] = []
+    c["pila"] = []
+    c["est"]["m"] = [1, 0, 0, 1, 0, 0]
+    vector_nuevo_camino(c)
+}
+
+funcion _ve_pdf_armar(c) {
+    sea pags = c["paginas"] + [unir(c["flujo"], "\n")]
+    sea objs = []
+    // 1 catálogo, 2 páginas, 3 fuente normal, 4 fuente negrita, 5 recursos.
+    sea n_pag = longitud(pags)
+    sea kids = []
+    sea i = 0
+    mientras (i < n_pag) {
+        kids.agregar((6 + i * 2) + " 0 R")
+        i = i + 1
+    }
+    objs.agregar("<< /Type /Catalog /Pages 2 0 R >>")
+    objs.agregar("<< /Type /Pages /Kids [" + unir(kids, " ") + "] /Count " + n_pag + " >>")
+    objs.agregar("<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica /Encoding /WinAnsiEncoding >>")
+    objs.agregar("<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica-Bold /Encoding /WinAnsiEncoding >>")
+    sea gs = []
+    para k en claves(c["alfas"]) { gs.agregar("/" + c["alfas"][k] + " << /Type /ExtGState /ca " + k + " /CA " + k + " >>") }
+    sea pt = []
+    para p en c["patrones"] { pt.agregar("/" + p[0] + " " + p[1]) }
+    objs.agregar("<< /Font << /F1 3 0 R /F2 4 0 R >> /ExtGState << " + unir(gs, " ") + " >> /Pattern << " + unir(pt, " ") + " >> >>")
+    para contenido en pags {
+        // Todo se dibuja con el origen arriba a la izquierda.
+        sea flujo = "1 0 0 -1 0 " + _ve_num(c["alto"]) + " cm\n" + contenido
+        sea yo = longitud(objs) + 1
+        objs.agregar("<< /Type /Page /Parent 2 0 R /MediaBox [0 0 " + _ve_num(c["ancho"]) + " " + _ve_num(c["alto"]) + "] /Resources 5 0 R /Contents " + (yo + 1) + " 0 R >>")
+        objs.agregar("<< /Length " + longitud(flujo) + " >>\nstream\n" + flujo + "\nendstream")
+    }
+    sea partes = ["%PDF-1.4\n%" + caracter(226) + caracter(227) + caracter(207) + caracter(211) + "\n"]
+    sea pos = longitud(partes[0])
+    sea xref = []
+    i = 0
+    mientras (i < longitud(objs)) {
+        sea o = (i + 1) + " 0 obj\n" + objs[i] + "\nendobj\n"
+        xref.agregar(pos)
+        partes.agregar(o)
+        pos = pos + longitud(o)
+        i = i + 1
+    }
+    sea x = ["xref\n0 " + (longitud(objs) + 1) + "\n0000000000 65535 f \n"]
+    para p en xref {
+        sea t = "" + p
+        mientras (longitud(t) < 10) { t = "0" + t }
+        x.agregar(t + " 00000 n \n")
+    }
+    x.agregar("trailer\n<< /Size " + (longitud(objs) + 1) + " /Root 1 0 R >>\nstartxref\n" + pos + "\n%%EOF\n")
+    retornar unir(partes, "") + unir(x, "")
+}
+
+// ---------- PNG ----------
+
+funcion _ve_aplanar(camino, tol) {
+    sea r = []
+    para s en camino {
+        sea pts = []
+        para q en s["pts"] {
+            si (q[0] == "M" o q[0] == "L") { pts.agregar([q[1], q[2]]) }
+            si (q[0] == "C") {
+                sea p0 = pts[longitud(pts) - 1]
+                sea d = abs(q[1] - p0[0]) + abs(q[2] - p0[1]) + abs(q[3] - q[1]) + abs(q[4] - q[2]) + abs(q[5] - q[3]) + abs(q[6] - q[4])
+                sea n = techo(raiz(d / tol))
+                si (n < 2) { n = 2 }
+                si (n > 200) { n = 200 }
+                sea i = 1
+                mientras (i <= n) {
+                    sea t = i / n
+                    sea u = 1 - t
+                    sea a = u * u * u
+                    sea b = 3 * u * u * t
+                    sea cc = 3 * u * t * t
+                    sea dd = t * t * t
+                    pts.agregar([a * p0[0] + b * q[1] + cc * q[3] + dd * q[5], a * p0[1] + b * q[2] + cc * q[4] + dd * q[6]])
+                    i = i + 1
+                }
+            }
+        }
+        r.agregar({"pts": pts, "cerrado": s["cerrado"]})
+    }
+    retornar r
+}
+
+funcion _ve_area(p) {
+    sea a = 0
+    sea i = 0
+    mientras (i < longitud(p)) {
+        sea q = p[(i + 1) % longitud(p)]
+        a = a + p[i][0] * q[1] - q[0] * p[i][1]
+        i = i + 1
+    }
+    retornar a / 2
+}
+
+funcion _ve_positivo(p) {
+    si (_ve_area(p) >= 0) { retornar p }
+    sea r = []
+    sea i = longitud(p) - 1
+    mientras (i >= 0) {
+        r.agregar(p[i])
+        i = i - 1
+    }
+    retornar r
+}
+
+funcion _ve_disco(x, y, r) {
+    sea n = piso(r * 1.5) + 12
+    sea p = []
+    sea i = 0
+    mientras (i < n) {
+        sea a = 2 * _VE_PI * i / n
+        p.agregar([x + r * coseno(a), y + r * seno(a)])
+        i = i + 1
+    }
+    retornar p
+}
+
+// Corta una polilínea en tramos según el patrón de guiones.
+funcion _ve_guionar(pts, cerrado, patron, desfase) {
+    sea p = pts
+    si (cerrado) { p = pts + [pts[0]] }
+    sea total = 0
+    para x en patron { total = total + x }
+    si (total <= 0) { retornar [p] }
+    sea idx = 0
+    sea resto = patron[0]
+    sea dentro = verdadero
+    // Avanza el desfase.
+    sea d = desfase % total
+    mientras (d > 0) {
+        si (d >= resto) {
+            d = d - resto
+            idx = (idx + 1) % longitud(patron)
+            resto = patron[idx]
+            dentro = dentro == falso
+        } sino {
+            resto = resto - d
+            d = 0
+        }
+    }
+    sea tramos = []
+    sea actual = []
+    si (dentro) { actual = [p[0]] }
+    sea i = 0
+    mientras (i + 1 < longitud(p)) {
+        sea a = p[i]
+        sea b = p[i + 1]
+        sea largo = raiz((b[0] - a[0]) * (b[0] - a[0]) + (b[1] - a[1]) * (b[1] - a[1]))
+        sea hecho = 0
+        mientras (largo - hecho > resto) {
+            hecho = hecho + resto
+            sea t = hecho / largo
+            sea q = [a[0] + (b[0] - a[0]) * t, a[1] + (b[1] - a[1]) * t]
+            si (dentro) {
+                actual.agregar(q)
+                tramos.agregar(actual)
+                actual = []
+            } sino { actual = [q] }
+            dentro = dentro == falso
+            idx = (idx + 1) % longitud(patron)
+            resto = patron[idx]
+        }
+        resto = resto - (largo - hecho)
+        si (dentro) { actual.agregar(b) }
+        i = i + 1
+    }
+    si (dentro y longitud(actual) > 1) { tramos.agregar(actual) }
+    retornar tramos
+}
+
+// Polígonos que cubren el trazo de una polilínea (unión con no-cero).
+funcion _ve_trazo_poligonos(pts0, cerrado, w, extremo, union, limite) {
+    // Quita puntos repetidos.
+    sea pts = []
+    para p en pts0 {
+        si (longitud(pts) == 0) { pts.agregar(p) } sino {
+            sea q = pts[longitud(pts) - 1]
+            si (abs(p[0] - q[0]) + abs(p[1] - q[1]) > 0.0001) { pts.agregar(p) }
+        }
+    }
+    si (cerrado y longitud(pts) > 2) {
+        sea f = pts[0]
+        sea l = pts[longitud(pts) - 1]
+        si (abs(f[0] - l[0]) + abs(f[1] - l[1]) < 0.0001) { quitar_ultimo(pts) }
+    }
+    sea h = w / 2
+    sea r = []
+    si (longitud(pts) == 1) {
+        si (extremo == "redondo") { r.agregar(_ve_disco(pts[0][0], pts[0][1], h)) }
+        si (extremo == "cuadrado") { r.agregar([[pts[0][0] - h, pts[0][1] - h], [pts[0][0] + h, pts[0][1] - h], [pts[0][0] + h, pts[0][1] + h], [pts[0][0] - h, pts[0][1] + h]]) }
+        retornar r
+    }
+    sea n = longitud(pts)
+    sea segs = n - 1
+    si (cerrado) { segs = n }
+    sea i = 0
+    mientras (i < segs) {
+        sea a = pts[i]
+        sea b = pts[(i + 1) % n]
+        sea dx = b[0] - a[0]
+        sea dy = b[1] - a[1]
+        sea L = raiz(dx * dx + dy * dy)
+        sea ux = dx / L
+        sea uy = dy / L
+        sea nx = 0 - uy * h
+        sea ny = ux * h
+        sea a2 = a
+        sea b2 = b
+        si (cerrado == falso y extremo == "cuadrado") {
+            si (i == 0) { a2 = [a[0] - ux * h, a[1] - uy * h] }
+            si (i == segs - 1) { b2 = [b[0] + ux * h, b[1] + uy * h] }
+        }
+        r.agregar(_ve_positivo([[a2[0] + nx, a2[1] + ny], [b2[0] + nx, b2[1] + ny], [b2[0] - nx, b2[1] - ny], [a2[0] - nx, a2[1] - ny]]))
+        i = i + 1
+    }
+    // Uniones.
+    sea j = 1
+    sea fin_j = n - 1
+    si (cerrado) {
+        j = 0
+        fin_j = n
+    }
+    mientras (j < fin_j) {
+        sea p = pts[j]
+        sea a = pts[(j - 1 + n) % n]
+        sea b = pts[(j + 1) % n]
+        sea d1x = p[0] - a[0]
+        sea d1y = p[1] - a[1]
+        sea l1 = raiz(d1x * d1x + d1y * d1y)
+        sea d2x = b[0] - p[0]
+        sea d2y = b[1] - p[1]
+        sea l2 = raiz(d2x * d2x + d2y * d2y)
+        d1x = d1x / l1
+        d1y = d1y / l1
+        d2x = d2x / l2
+        d2y = d2y / l2
+        sea cruz = d1x * d2y - d1y * d2x
+        si (union == "redonda") { r.agregar(_ve_disco(p[0], p[1], h)) } sino si (abs(cruz) > 0.000001) {
+            // Lado exterior del giro.
+            sea s = 1
+            si (cruz > 0) { s = -1 }
+            sea o1 = [p[0] - d1y * h * s, p[1] + d1x * h * s]
+            sea o2 = [p[0] - d2y * h * s, p[1] + d2x * h * s]
+            sea punto = d1x * d2x + d1y * d2y
+            sea cos_mitad = raiz((1 + punto) / 2)
+            sea miter = 0
+            si (cos_mitad > 0.000001) { miter = 1 / cos_mitad }
+            si (union == "inglete" y miter > 0 y miter <= limite) {
+                sea bx = (0 - d1y - d2y) * s
+                sea by = (d1x + d2x) * s
+                sea bl = raiz(bx * bx + by * by)
+                sea tip = [p[0] + bx / bl * h * miter, p[1] + by / bl * h * miter]
+                r.agregar(_ve_positivo([p, o1, tip, o2]))
+            } sino { r.agregar(_ve_positivo([p, o1, o2])) }
+        }
+        j = j + 1
+    }
+    si (cerrado == falso y extremo == "redondo") {
+        r.agregar(_ve_disco(pts[0][0], pts[0][1], h))
+        r.agregar(_ve_disco(pts[n - 1][0], pts[n - 1][1], h))
+    }
+    retornar r
+}
+
+funcion _ve_u8(v) {
+    sea n = redondear(v * 255)
+    si (n < 0) { retornar 0 }
+    si (n > 255) { retornar 255 }
+    retornar n
+}
+
+// Color de la fuente en un punto del dispositivo.
+funcion _ve_color_en(f, x, y) {
+    si (tiene_clave(f, "color")) { retornar f["color"] }
+    sea inv = f["inv"]
+    sea u = _ve_ap(inv, x, y)
+    sea t = 0
+    si (tiene_clave(f, "lineal")) {
+        sea g = f["lineal"]
+        sea dx = g[2] - g[0]
+        sea dy = g[3] - g[1]
+        sea dd = dx * dx + dy * dy
+        si (dd > 0) { t = ((u[0] - g[0]) * dx + (u[1] - g[1]) * dy) / dd }
+    } sino {
+        sea g = f["radial"]
+        sea d = raiz((u[0] - g[0]) * (u[0] - g[0]) + (u[1] - g[1]) * (u[1] - g[1]))
+        si (g[3] != g[2]) { t = (d - g[2]) / (g[3] - g[2]) }
+    }
+    si (t < 0) { t = 0 }
+    si (t > 1) { t = 1 }
+    sea ps = f["paradas"]
+    si (t <= ps[0][0]) { retornar ps[0][1] }
+    sea i = 0
+    mientras (i + 1 < longitud(ps)) {
+        si (t <= ps[i + 1][0]) {
+            sea span = ps[i + 1][0] - ps[i][0]
+            sea k = 0
+            si (span > 0) { k = (t - ps[i][0]) / span }
+            sea a = ps[i][1]
+            sea b = ps[i + 1][1]
+            retornar [a[0] + (b[0] - a[0]) * k, a[1] + (b[1] - a[1]) * k, a[2] + (b[2] - a[2]) * k, a[3] + (b[3] - a[3]) * k]
+        }
+        i = i + 1
+    }
+    retornar ps[longitud(ps) - 1][1]
+}
+
+// Cobertura de unos contornos como lienzo (alfa = cobertura).
+funcion _ve_mascara(c, contornos, par_impar) {
+    sea m = lienzo_crear(c["ancho"], c["alto"])
+    si (longitud(contornos) > 0) { lienzo_contornos(m, contornos, [255, 255, 255, 255], par_impar) }
+    retornar m
+}
+
+funcion _ve_png_pintar(c, contornos, par_impar) {
+    sea e = c["est"]
+    sea f = e["fuente"]
+    si (tiene_clave(f, "color") y e["mascara"] == nulo) {
+        sea k = f["color"]
+        si (longitud(contornos) > 0) { lienzo_contornos(c["lienzo"], contornos, [_ve_u8(k[0]), _ve_u8(k[1]), _ve_u8(k[2]), _ve_u8(k[3])], par_impar) }
+        retornar nulo
+    }
+    si (tiene_clave(f, "color") == falso) { f["inv"] = _ve_inv(f["m"]) }
+    sea m = _ve_mascara(c, contornos, par_impar)
+    sea clip = e["mascara"]
+    sea W = c["ancho"]
+    sea dst = c["lienzo"]
+    sea mp = m["pixeles"]
+    sea dp = dst["pixeles"]
+    sea y = 0
+    mientras (y < c["alto"]) {
+        sea x = 0
+        mientras (x < W) {
+            sea i = (y * W + x) * 4
+            sea cov = byte_en(mp, i + 3)
+            si (cov > 0 y clip != nulo) { cov = cov * byte_en(clip["pixeles"], i + 3) / 255 }
+            si (cov > 0) {
+                sea col = _ve_color_en(f, x + 0.5, y + 0.5)
+                sea sa = col[3] * cov / 255
+                sea da = byte_en(dp, i + 3) / 255
+                sea oa = sa + da * (1 - sa)
+                si (oa > 0) {
+                    sea rr = (col[0] * sa + byte_en(dp, i) / 255 * da * (1 - sa)) / oa
+                    sea gg = (col[1] * sa + byte_en(dp, i + 1) / 255 * da * (1 - sa)) / oa
+                    sea bb = (col[2] * sa + byte_en(dp, i + 2) / 255 * da * (1 - sa)) / oa
+                    imagen_fijar_pixel(dst, x, y, [_ve_u8(rr), _ve_u8(gg), _ve_u8(bb), _ve_u8(oa)])
+                }
+            }
+            x = x + 1
+        }
+        y = y + 1
+    }
+}
+
+funcion _ve_png_contornos_relleno(c) {
+    sea r = []
+    para s en _ve_aplanar(c["camino"], 0.2) { si (longitud(s["pts"]) > 2) { r.agregar(s["pts"]) } }
+    retornar r
+}
+
+funcion _ve_png_contornos_trazo(c) {
+    sea e = c["est"]
+    sea s = _ve_escala(e["m"])
+    sea w = e["grosor"] * s
+    sea r = []
+    para sub en _ve_aplanar(c["camino"], 0.2) {
+        si (longitud(e["guiones"]) > 0) {
+            sea g = []
+            para x en e["guiones"] { g.agregar(x * s) }
+            para tramo en _ve_guionar(sub["pts"], sub["cerrado"], g, e["desfase"] * s) { r = r + _ve_trazo_poligonos(tramo, falso, w, e["extremo"], e["union"], e["inglete"]) }
+        } sino { r = r + _ve_trazo_poligonos(sub["pts"], sub["cerrado"], w, e["extremo"], e["union"], e["inglete"]) }
+    }
+    retornar r
+}
+
+// ---------- operaciones ----------
+
+funcion _ve_dibujar(c, rellenar, trazar) {
+    si (c["tipo"] == "svg") { _ve_svg_dibujar(c, rellenar, trazar) }
+    sino si (c["tipo"] == "pdf") { _ve_pdf_dibujar(c, rellenar, trazar) }
+    sino {
+        si (rellenar) { _ve_png_pintar(c, _ve_png_contornos_relleno(c), c["est"]["regla"] == "par_impar") }
+        si (trazar) { _ve_png_pintar(c, _ve_png_contornos_trazo(c), falso) }
+    }
+}
+
+funcion vector_rellenar(c) {
+    _ve_dibujar(c, verdadero, falso)
+    vector_nuevo_camino(c)
+}
+funcion vector_rellenar_mantener(c) { _ve_dibujar(c, verdadero, falso) }
+funcion vector_trazar(c) {
+    _ve_dibujar(c, falso, verdadero)
+    vector_nuevo_camino(c)
+}
+funcion vector_trazar_mantener(c) { _ve_dibujar(c, falso, verdadero) }
+/// Rellena y traza con la misma fuente.
+funcion vector_rellenar_y_trazar(c) {
+    _ve_dibujar(c, verdadero, verdadero)
+    vector_nuevo_camino(c)
+}
+
+/// Recorta lo que se dibuje después al camino actual (hasta restaurar).
+funcion vector_recortar(c) {
+    sea e = c["est"]
+    sea par = e["regla"] == "par_impar"
+    si (c["tipo"] == "svg") {
+        sea Q = caracter(34)
+        sea id = _ve_id(c, "c")
+        sea regla = ""
+        si (par) { regla = " clip-rule=" + Q + "evenodd" + Q }
+        c["defs"].agregar("<clipPath id=" + Q + id + Q + "><path d=" + Q + _ve_d_svg(c["camino"]) + Q + regla + "/></clipPath>")
+        c["svg"].agregar("<g clip-path=" + Q + "url(#" + id + ")" + Q + ">")
+        e["recortes"] = e["recortes"] + 1
+    } sino si (c["tipo"] == "pdf") {
+        sea op = "W"
+        si (par) { op = "W*" }
+        c["flujo"].agregar(_ve_d_pdf(c["camino"]) + " " + op + " n")
+    } sino {
+        sea m = _ve_mascara(c, _ve_png_contornos_relleno(c), par)
+        si (e["mascara"] != nulo) {
+            // Intersección con el recorte anterior.
+            sea a = e["mascara"]["pixeles"]
+            sea W = c["ancho"]
+            sea y = 0
+            mientras (y < c["alto"]) {
+                sea x = 0
+                mientras (x < W) {
+                    sea i = (y * W + x) * 4
+                    sea v = byte_en(m["pixeles"], i + 3) * byte_en(a, i + 3) / 255
+                    imagen_fijar_pixel(m, x, y, [255, 255, 255, redondear(v)])
+                    x = x + 1
+                }
+                y = y + 1
+            }
+        }
+        e["mascara"] = m
+    }
+    vector_nuevo_camino(c)
+}
+
+funcion _ve_fuente_png(c) {
+    sea k = "fuente_png"
+    si (c["est"]["negrita"]) { k = "fuente_png_negrita" }
+    sea f = c[k] ?? nulo
+    si (f == nulo) {
+        sea datos = c["op"]["fuente_ttf"] ?? nulo
+        si (datos != nulo) { f = fuente_desde_bytes(datos) } sino { f = fuente_sistema(c["est"]["negrita"]) }
+        c[k] = f
+    }
+    retornar f
+}
+
+/// Ancho de un texto con la fuente actual (en PDF y SVG, métricas de
+/// Helvetica; en PNG, las de la fuente TrueType usada).
+funcion vector_ancho_texto(c, texto) {
+    si (c["tipo"] == "png") { retornar texto_medir(_ve_fuente_png(c), texto, c["est"]["tam"])["ancho"] }
+    sea f = "Helvetica"
+    si (c["est"]["negrita"]) { f = "Helvetica-Bold" }
+    retornar documento_ancho(texto, f, c["est"]["tam"])
+}
+
+/// Texto con la línea base en (x, y). alinear: "izquierda", "centro" o "derecha".
+funcion vector_texto(c, x, y, texto, alinear) {
+    sea e = c["est"]
+    sea x0 = x
+    si (alinear == "centro") { x0 = x - vector_ancho_texto(c, texto) / 2 }
+    si (alinear == "derecha") { x0 = x - vector_ancho_texto(c, texto) }
+    sea m = e["m"]
+    si (c["tipo"] == "svg") {
+        sea Q = caracter(34)
+        sea f = e["fuente"]
+        sea col = [0, 0, 0, 1]
+        si (tiene_clave(f, "color")) { col = f["color"] }
+        sea a = "<text x=" + Q + _ve_num(x0) + Q + " y=" + Q + _ve_num(y) + Q + " font-family=" + Q + "Helvetica, Arial, sans-serif" + Q + " font-size=" + Q + _ve_num(e["tam"]) + Q
+        si (e["negrita"]) { a = a + " font-weight=" + Q + "bold" + Q }
+        a = a + " fill=" + Q + _ve_css(col) + Q
+        si (col[3] < 1) { a = a + " fill-opacity=" + Q + _ve_num(col[3]) + Q }
+        si (m[0] != 1 o m[1] != 0 o m[2] != 0 o m[3] != 1 o m[4] != 0 o m[5] != 0) { a = a + " transform=" + Q + "matrix(" + _ve_num(m[0]) + " " + _ve_num(m[1]) + " " + _ve_num(m[2]) + " " + _ve_num(m[3]) + " " + _ve_num(m[4]) + " " + _ve_num(m[5]) + ")" + Q }
+        c["svg"].agregar(a + ">" + _ve_xml(texto) + "</text>")
+    } sino si (c["tipo"] == "pdf") {
+        c["flujo"].agregar("q")
+        _ve_pdf_pintura(c, e["fuente"], falso)
+        sea p = _ve_ap(m, x0, y)
+        sea fuente = "/F1"
+        si (e["negrita"]) { fuente = "/F2" }
+        c["flujo"].agregar("BT " + fuente + " " + _ve_num(e["tam"]) + " Tf " + _ve_num(m[0]) + " " + _ve_num(m[1]) + " " + _ve_num(0 - m[2]) + " " + _ve_num(0 - m[3]) + " " + _ve_num(p[0]) + " " + _ve_num(p[1]) + " Tm " + _ve_pdf_texto(texto) + " Tj ET")
+        c["flujo"].agregar("Q")
+    } sino {
+        sea f = _ve_fuente_png(c)
+        sea col = [0, 0, 0, 1]
+        si (tiene_clave(e["fuente"], "color")) { col = e["fuente"]["color"] }
+        sea p = _ve_ap(m, x0, y)
+        sea tam = e["tam"] * _ve_escala(m)
+        sea asc = 0
+        si (f["tipo"] != "bits") { asc = f["ascenso"] * tam / f["unidades"] }
+        lienzo_texto(c["lienzo"], f, texto, p[0], p[1] - asc, tam, [_ve_u8(col[0]), _ve_u8(col[1]), _ve_u8(col[2]), _ve_u8(col[3])])
+    }
+}
+
+/// Imagen PNG/RGBA en (x, y) con tamaño w × h (solo salida PNG y SVG).
+funcion vector_imagen(c, img, x, y, w, h) {
+    si (c["tipo"] == "svg") {
+        sea Q = caracter(34)
+        c["svg"].agregar("<image x=" + Q + _ve_num(x) + Q + " y=" + Q + _ve_num(y) + Q + " width=" + Q + _ve_num(w) + Q + " height=" + Q + _ve_num(h) + Q + " href=" + Q + "data:image/png;base64," + base64_codificar(imagen_codificar_png(img)) + Q + "/>")
+    } sino si (c["tipo"] == "png") {
+        lienzo_imagen(c["lienzo"], img, x, y, {"ancho": w, "alto": h, "suave": verdadero})
+    } sino { lanzar "vector: imágenes en PDF todavía no" }
+}
+
+/// Resultado: texto SVG, bytes PDF o bytes PNG.
+funcion vector_terminar(c) {
+    si (c["tipo"] == "svg") {
+        sea Q = caracter(34)
+        mientras (longitud(c["pila"]) > 0) { vector_restaurar(c) }
+        sea i = 0
+        mientras (i < c["est"]["recortes"]) {
+            c["svg"].agregar("</g>")
+            i = i + 1
+        }
+        c["est"]["recortes"] = 0
+        sea cab = "<svg xmlns=" + Q + "http://www.w3.org/2000/svg" + Q + " width=" + Q + _ve_num(c["ancho"]) + Q + " height=" + Q + _ve_num(c["alto"]) + Q + " viewBox=" + Q + "0 0 " + _ve_num(c["ancho"]) + " " + _ve_num(c["alto"]) + Q + ">"
+        sea defs = ""
+        si (longitud(c["defs"]) > 0) { defs = "<defs>" + unir(c["defs"], "") + "</defs>" }
+        retornar cab + "\n" + defs + unir(c["svg"], "\n") + "\n</svg>\n"
+    }
+    si (c["tipo"] == "pdf") { retornar _ve_pdf_armar(c) }
+    retornar imagen_codificar_png(c["lienzo"])
+}
+
+/// Lienzo RGBA de la salida PNG (para seguir dibujando con "graficos").
+funcion vector_lienzo(c) { retornar c["lienzo"] }
+
+funcion vector_guardar_archivo(c, ruta) { escribir_archivo(ruta, vector_terminar(c)) }

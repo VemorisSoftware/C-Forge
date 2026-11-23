@@ -65,6 +65,14 @@ Sitio oficial: [c-forge.org](https://c-forge.org)
   `llamada`/`protobuf` (.proto, binario como protoc, marcos gRPC),
   `recolecta`/`crawler` (cookies RFC 6265, formularios, robots.txt,
   rastreo) y `sensor`/`mqtt` (paquetes MQTT, QoS 2, mini broker).
+- Lote 21 de bibliotecas (con alias en inglés y pruebas en ambos idiomas):
+  `vector`/`vectorgfx` (dibujo al estilo Cairo con salida SVG, PDF y PNG;
+  las tres coinciden con rsvg-convert y pdftoppm), `voz_activa`/`vad` (port
+  bit a bit del VAD de WebRTC: mismas decisiones que py-webrtcvad),
+  `grafia`/`shaping` (moldeado OpenType con GSUB y GPOS, igual que
+  HarfBuzz en 45 casos con 5 fuentes), `latido`/`eventloop` (bucle de
+  eventos con temporizadores, tubos y TCP sin bloqueo) y `depura`/`dap`
+  (cliente del Debug Adapter Protocol, probado contra debugpy).
 - Lote 20 de bibliotecas (con alias en inglés y pruebas en ambos idiomas):
   `memoria_rapida`/`redisx` (Redis con RESP3 y clústeres: ranuras, MOVED y
   ASK, tuberías por nodo; probado contra un clúster real), `cartero`/
