@@ -1,0 +1,427 @@
+// stdlib/latido.cfv — bucle de eventos al estilo libuv sobre poll(2):
+// temporizadores (una vez o repetidos, ordenados por vencimiento),
+// vigilancia de descriptores para lectura y escritura, tareas para la
+// próxima vuelta, tareas inactivas que corren en cada vuelta, tubos, y
+// TCP sin bloqueo (servidor con aceptación, cliente con conexión
+// asíncrona, lectura y escritura con cola y cierre ordenado). Las
+// referencias deciden cuándo termina el bucle, como en libuv. Linux y
+// macOS. Idea de libuv (MIT). En inglés: importar "eventloop".
+//
+//   importar "latido"
+//   sea b = latido_bucle()
+//   latido_temporizador(b, 100, 0, funcion(t) { mostrar("¡pasaron 100 ms!") })
+//   latido_correr(b, nulo)
+
+funcion __latido_declaraciones() {
+    extern "libc" funcion socket(dominio: entero, tipo_s: entero, proto: entero): entero
+    extern "libc" funcion setsockopt(fd: entero, nivel: entero, opcion: entero, valor: puntero, largo: entero): entero
+    extern "libc" funcion getsockopt(fd: entero, nivel: entero, opcion: entero, valor: puntero, largo: puntero): entero
+    extern "libc" funcion bind(fd: entero, dir: puntero, largo: entero): entero
+    extern "libc" funcion listen(fd: entero, cola: entero): entero
+    extern "libc" funcion accept(fd: entero, dir: puntero, largo: puntero): entero
+    extern "libc" funcion connect(fd: entero, dir: puntero, largo: entero): entero
+    extern "libc" funcion getsockname(fd: entero, dir: puntero, largo: puntero): entero
+    extern "libc" funcion read(fd: entero, buf: puntero, n: entero): largo
+    extern "libc" funcion write(fd: entero, datos: texto, n: entero): largo
+    extern "libc" funcion close(fd: entero): entero
+    extern "libc" funcion poll(fds: puntero, n: entero, espera: entero): entero
+    extern "libc" funcion pipe(fds: puntero): entero
+    extern "libc" funcion fcntl(fd: entero, cmd: entero, arg: entero): entero
+}
+
+funcion _la_linux() { retornar existe_archivo("/proc/meminfo") }
+
+funcion _la_s32(v) {
+    si (v >= 2147483648) { retornar v - 4294967296 }
+    retornar v
+}
+
+funcion _la_sin_bloqueo(fd) {
+    __latido_declaraciones()
+    sea nb = 4
+    si (_la_linux()) { nb = 2048 }
+    sea fl = fcntl(fd, 3, 0)
+    fcntl(fd, 4, bits_o(fl, nb))
+}
+
+// ---------- bucle ----------
+
+/// Nuevo bucle de eventos.
+funcion latido_bucle() {
+    retornar {"ahora": tiempo_ms(), "temporizadores": [], "vigilados": [], "proximos": [], "inactivos": [], "parar": falso, "sig": 0, "vueltas": 0, "buf": nulo}
+}
+
+/// Hora del bucle (ms), actualizada al empezar cada vuelta.
+funcion latido_ahora(b) { retornar b["ahora"] }
+
+/// Pide que latido_correr termine al final de la vuelta actual.
+funcion latido_parar(b) { b["parar"] = verdadero }
+
+funcion _la_id(b) {
+    b["sig"] = b["sig"] + 1
+    retornar b["sig"]
+}
+
+/// Temporizador: cb(t) después de espera_ms; si repetir_ms > 0, se repite.
+funcion latido_temporizador(b, espera_ms, repetir_ms, cb) {
+    sea t = {"id": _la_id(b), "vence": b["ahora"] + espera_ms, "repetir": repetir_ms ?? 0, "cb": cb, "activo": verdadero, "ref": verdadero, "bucle": b}
+    b["temporizadores"].agregar(t)
+    retornar t
+}
+
+funcion latido_detener(h) {
+    h["activo"] = falso
+}
+
+/// Una referencia de menos: el bucle puede terminar aunque h siga activo.
+funcion latido_sin_ref(h) { h["ref"] = falso }
+funcion latido_con_ref(h) { h["ref"] = verdadero }
+
+/// cb() en la próxima vuelta, antes de esperar eventos.
+funcion latido_proximo(b, cb) { b["proximos"].agregar(cb) }
+
+/// cb(h) en cada vuelta mientras esté activo (como uv_idle).
+funcion latido_inactivo(b, cb) {
+    sea h = {"id": _la_id(b), "cb": cb, "activo": verdadero, "ref": verdadero}
+    b["inactivos"].agregar(h)
+    retornar h
+}
+
+/// Vigila un descriptor: eventos "r", "w" o "rw"; cb(h, listo) con
+/// listo = {"leer", "escribir", "error"}.
+funcion latido_vigilar(b, fd, eventos, cb) {
+    sea h = {"id": _la_id(b), "fd": fd, "ev": eventos, "cb": cb, "activo": verdadero, "ref": verdadero}
+    b["vigilados"].agregar(h)
+    retornar h
+}
+
+funcion latido_cambiar_eventos(h, eventos) { h["ev"] = eventos }
+
+funcion _la_vivo(b) {
+    si (longitud(b["proximos"]) > 0) { retornar verdadero }
+    para t en b["temporizadores"] { si (t["activo"] y t["ref"]) { retornar verdadero } }
+    para h en b["vigilados"] { si (h["activo"] y h["ref"]) { retornar verdadero } }
+    para h en b["inactivos"] { si (h["activo"] y h["ref"]) { retornar verdadero } }
+    retornar falso
+}
+
+funcion _la_limpiar(l) {
+    sea r = []
+    para x en l { si (x["activo"]) { r.agregar(x) } }
+    retornar r
+}
+
+funcion _la_correr_temporizadores(b) {
+    // Los vencidos, en orden de vencimiento (y de creación).
+    sea vencidos = []
+    para t en b["temporizadores"] { si (t["activo"] y t["vence"] <= b["ahora"]) { vencidos.agregar(t) } }
+    vencidos = ordenar(vencidos, funcion(x, z) {
+        si (x["vence"] != z["vence"]) { retornar x["vence"] - z["vence"] }
+        retornar x["id"] - z["id"]
+    })
+    para t en vencidos {
+        si (t["activo"]) {
+            si (t["repetir"] > 0) { t["vence"] = b["ahora"] + t["repetir"] } sino { t["activo"] = falso }
+            t["cb"](t)
+        }
+    }
+    b["temporizadores"] = _la_limpiar(b["temporizadores"])
+}
+
+funcion _la_espera(b) {
+    si (longitud(b["proximos"]) > 0) { retornar 0 }
+    para h en b["inactivos"] { si (h["activo"]) { retornar 0 } }
+    sea min = -1
+    para t en b["temporizadores"] {
+        si (t["activo"]) {
+            sea e = t["vence"] - b["ahora"]
+            si (e < 0) { e = 0 }
+            si (min < 0 o e < min) { min = e }
+        }
+    }
+    retornar min
+}
+
+funcion _la_poll(b, espera) {
+    __latido_declaraciones()
+    sea hs = []
+    para h en b["vigilados"] { si (h["activo"] y h["ev"] != "") { hs.agregar(h) } }
+    si (longitud(hs) == 0) {
+        si (espera > 0) { dormir(espera) }
+        retornar nulo
+    }
+    sea n = longitud(hs)
+    sea p = c_reservar(8 * n)
+    sea i = 0
+    mientras (i < n) {
+        sea ev = 0
+        si (contiene(hs[i]["ev"], "r")) { ev = ev + 1 }
+        si (contiene(hs[i]["ev"], "w")) { ev = ev + 4 }
+        c_escribir32(p, 8 * i, hs[i]["fd"])
+        c_escribir32(p, 8 * i + 4, ev)
+        i = i + 1
+    }
+    sea r = poll(p, n, espera)
+    si (r > 0) {
+        i = 0
+        mientras (i < n) {
+            sea w = c_leer32(p, 8 * i + 4)
+            si (w < 0) { w = w + 4294967296 }
+            sea rev = piso(w / 65536)
+            si (rev != 0 y hs[i]["activo"]) {
+                sea listo = {"leer": bits_y(rev, 1 + 16) != 0, "escribir": bits_y(rev, 4) != 0, "error": bits_y(rev, 8 + 32) != 0}
+                hs[i]["cb"](hs[i], listo)
+            }
+            i = i + 1
+        }
+    }
+    c_liberar(p)
+}
+
+/// Corre el bucle. modo: nulo/"defecto" (hasta que no quede nada activo),
+/// "una" (una vuelta esperando eventos) o "sin_esperar" (una vuelta sin
+/// esperar). Devuelve verdadero si quedan cosas activas.
+funcion latido_correr(b, modo) {
+    sea m = modo ?? "defecto"
+    b["parar"] = falso
+    mientras (verdadero) {
+        b["ahora"] = tiempo_ms()
+        b["vueltas"] = b["vueltas"] + 1
+        _la_correr_temporizadores(b)
+        sea px = b["proximos"]
+        b["proximos"] = []
+        para cb en px { cb() }
+        para h en b["inactivos"] { si (h["activo"]) { h["cb"](h) } }
+        b["inactivos"] = _la_limpiar(b["inactivos"])
+        si (_la_vivo(b) == falso o b["parar"]) { retornar _la_vivo(b) }
+        sea espera = _la_espera(b)
+        si (m == "sin_esperar") { espera = 0 }
+        _la_poll(b, espera)
+        b["vigilados"] = _la_limpiar(b["vigilados"])
+        b["ahora"] = tiempo_ms()
+        _la_correr_temporizadores(b)
+        si (m != "defecto" o b["parar"]) { retornar _la_vivo(b) }
+    }
+}
+
+// ---------- flujos (tubos y TCP) ----------
+
+funcion _la_flujo(b, fd) {
+    _la_sin_bloqueo(fd)
+    sea s = {"id": _la_id(b), "fd": fd, "bucle": b, "cola": [], "leyendo": nulo, "cerrado": falso, "fin_pedido": falso, "h": nulo, "al_conectar": nulo, "conectando": falso}
+    s["h"] = latido_vigilar(b, fd, "", funcion(h, listo) { _la_flujo_evento(s, listo) })
+    retornar s
+}
+
+funcion _la_actualizar(s) {
+    sea ev = ""
+    si (s["leyendo"] != nulo) { ev = ev + "r" }
+    si (longitud(s["cola"]) > 0 o s["conectando"]) { ev = ev + "w" }
+    s["h"]["ev"] = ev
+    // Sin interés en eventos, el flujo no mantiene vivo al bucle.
+    s["h"]["ref"] = ev != ""
+}
+
+funcion _la_flujo_evento(s, listo) {
+    si (s["cerrado"]) { retornar nulo }
+    si (s["conectando"] y (listo["escribir"] o listo["error"])) {
+        s["conectando"] = falso
+        sea err = c_reservar(4)
+        sea largo = c_reservar(4)
+        c_escribir32(err, 0, 0)
+        c_escribir32(largo, 0, 4)
+        si (_la_linux()) { getsockopt(s["fd"], 1, 4, err, largo) } sino { getsockopt(s["fd"], 65535, 4103, err, largo) }
+        sea e = c_leer32(err, 0)
+        _la_actualizar(s)
+        sea cb = s["al_conectar"]
+        si (e != 0) {
+            latido_cerrar(s, nulo)
+            cb(nulo, "no se pudo conectar (errno " + e + ")")
+        } sino { cb(s, nulo) }
+        retornar nulo
+    }
+    si ((listo["leer"] o listo["error"]) y s["leyendo"] != nulo) {
+        si (s["bucle"]["buf"] == nulo) { s["bucle"]["buf"] = c_reservar(65536) }
+        sea buf = s["bucle"]["buf"]
+        sea n = read(s["fd"], buf, 65536)
+        si (n > 0) { s["leyendo"](s, c_bytes(buf, n)) }
+        sino si (n == 0 o listo["error"]) {
+            // Fin del flujo.
+            sea cb = s["leyendo"]
+            s["leyendo"] = nulo
+            _la_actualizar(s)
+            cb(s, nulo)
+        }
+    }
+    si (s["cerrado"] == falso y listo["escribir"] y longitud(s["cola"]) > 0) { _la_vaciar(s) }
+}
+
+funcion _la_vaciar(s) {
+    mientras (longitud(s["cola"]) > 0) {
+        sea e = s["cola"][0]
+        sea d = e[0]
+        sea n = write(s["fd"], d, longitud(d))
+        si (n <= 0) {
+            _la_actualizar(s)
+            retornar nulo
+        }
+        si (n < longitud(d)) {
+            e[0] = subcadena(d, n, longitud(d))
+            _la_actualizar(s)
+            retornar nulo
+        }
+        sea r = []
+        sea i = 1
+        mientras (i < longitud(s["cola"])) {
+            r.agregar(s["cola"][i])
+            i = i + 1
+        }
+        s["cola"] = r
+        si (e[1] != nulo) { e[1](s) }
+    }
+    _la_actualizar(s)
+    si (s["fin_pedido"] y longitud(s["cola"]) == 0) { latido_cerrar(s, s["al_cerrar"] ?? nulo) }
+}
+
+/// Empieza a leer: cb(s, datos) con cada bloque y cb(s, nulo) al final.
+funcion latido_leer(s, cb) {
+    s["leyendo"] = cb
+    _la_actualizar(s)
+}
+
+funcion latido_dejar_de_leer(s) {
+    s["leyendo"] = nulo
+    _la_actualizar(s)
+}
+
+/// Encola datos para escribir; cb(s) cuando se escribieron (opcional).
+funcion latido_escribir(s, datos, cb) {
+    si (s["cerrado"]) { lanzar "latido: el flujo está cerrado" }
+    s["cola"].agregar([datos, cb])
+    _la_actualizar(s)
+}
+
+/// Cierra cuando termine de escribir lo encolado.
+funcion latido_terminar(s, cb) {
+    s["fin_pedido"] = verdadero
+    s["al_cerrar"] = cb
+    si (longitud(s["cola"]) == 0) { latido_cerrar(s, cb) }
+}
+
+/// Cierra ya; cb(s) en la próxima vuelta.
+funcion latido_cerrar(s, cb) {
+    si (s["cerrado"]) { retornar nulo }
+    __latido_declaraciones()
+    s["cerrado"] = verdadero
+    s["h"]["activo"] = falso
+    close(s["fd"])
+    si (cb != nulo) { latido_proximo(s["bucle"], funcion() { cb(s) }) }
+}
+
+/// Tubo: [lectura, escritura] como flujos.
+funcion latido_tubo(b) {
+    __latido_declaraciones()
+    sea p = c_reservar(8)
+    si (pipe(p) != 0) { lanzar "latido: pipe falló" }
+    retornar [_la_flujo(b, c_leer32(p, 0)), _la_flujo(b, c_leer32(p, 4))]
+}
+
+// ---------- TCP ----------
+
+funcion _la_dir(host, puerto) {
+    sea a = c_reservar(16)
+    sea ip = [127, 0, 0, 1]
+    si (host == "*" o host == "0.0.0.0") { ip = [0, 0, 0, 0] } sino si (host != "localhost") {
+        sea p = texto_dividir(host, ".")
+        si (longitud(p) != 4) { lanzar "latido: solo direcciones IPv4 (" + host + ")" }
+        ip = [a_numero(p[0]), a_numero(p[1]), a_numero(p[2]), a_numero(p[3])]
+    }
+    sea w0 = 0
+    si (_la_linux()) { w0 = 2 + piso(puerto / 256) * 65536 + (puerto % 256) * 16777216 } sino { w0 = 16 + 2 * 256 + piso(puerto / 256) * 65536 + (puerto % 256) * 16777216 }
+    c_escribir32(a, 0, _la_s32(w0))
+    c_escribir32(a, 4, _la_s32(ip[0] + ip[1] * 256 + ip[2] * 65536 + ip[3] * 16777216))
+    c_escribir32(a, 8, 0)
+    c_escribir32(a, 12, 0)
+    retornar a
+}
+
+/// Servidor TCP: al_conectar(cliente) por cada conexión. puerto 0 = uno
+/// libre (ver latido_puerto). Devuelve el servidor.
+funcion latido_tcp_servidor(b, host, puerto, al_conectar) {
+    __latido_declaraciones()
+    sea fd = socket(2, 1, 0)
+    si (fd < 0) { lanzar "latido: no se pudo crear el socket" }
+    sea uno = c_reservar(4)
+    c_escribir32(uno, 0, 1)
+    si (_la_linux()) { setsockopt(fd, 1, 2, uno, 4) } sino { setsockopt(fd, 65535, 4, uno, 4) }
+    si (bind(fd, _la_dir(host, puerto), 16) != 0) {
+        close(fd)
+        lanzar "latido: no se pudo escuchar en " + host + ":" + puerto
+    }
+    listen(fd, 128)
+    _la_sin_bloqueo(fd)
+    sea srv = {"fd": fd, "bucle": b, "cerrado": falso}
+    srv["h"] = latido_vigilar(b, fd, "r", funcion(h, listo) {
+        si (listo["leer"]) {
+            sea c = accept(fd, c_reservar(16), c_reservar(4))
+            si (c >= 0) { al_conectar(_la_flujo(b, c)) }
+        }
+    })
+    retornar srv
+}
+
+/// Puerto en el que escucha un servidor.
+funcion latido_puerto(srv) {
+    __latido_declaraciones()
+    sea a = c_reservar(16)
+    sea l = c_reservar(4)
+    c_escribir32(l, 0, 16)
+    getsockname(srv["fd"], a, l)
+    sea w = c_leer32(a, 0)
+    si (w < 0) { w = w + 4294967296 }
+    sea hi = piso(w / 65536) % 256
+    sea lo = piso(w / 16777216)
+    retornar hi * 256 + lo
+}
+
+funcion latido_cerrar_servidor(srv) {
+    si (srv["cerrado"]) { retornar nulo }
+    __latido_declaraciones()
+    srv["cerrado"] = verdadero
+    srv["h"]["activo"] = falso
+    close(srv["fd"])
+}
+
+/// Conecta sin bloquear: cb(cliente, error).
+funcion latido_tcp_conectar(b, host, puerto, cb) {
+    __latido_declaraciones()
+    sea fd = socket(2, 1, 0)
+    si (fd < 0) { lanzar "latido: no se pudo crear el socket" }
+    sea s = _la_flujo(b, fd)
+    s["al_conectar"] = cb
+    sea r = connect(fd, _la_dir(host, puerto), 16)
+    si (r == 0) {
+        latido_proximo(b, funcion() { cb(s, nulo) })
+    } sino {
+        s["conectando"] = verdadero
+        _la_actualizar(s)
+    }
+    retornar s
+}
+
+// ---------- utilidades ----------
+
+/// Corre fn() en una vuelta próxima y entrega el resultado a cb(error,
+/// valor) (no hay hilos: es para encadenar trabajo sin bloquear la vuelta
+/// actual).
+funcion latido_trabajo(b, fn, cb) {
+    latido_proximo(b, funcion() {
+        sea v = nulo
+        sea e = nulo
+        intentar { v = fn() } capturar (x) { e = x }
+        cb(e, v)
+    })
+}
+
+/// Espera ms en el bucle y luego llama cb() (atajo de un temporizador).
+funcion latido_despues(b, ms, cb) { retornar latido_temporizador(b, ms, 0, funcion(t) { cb() }) }

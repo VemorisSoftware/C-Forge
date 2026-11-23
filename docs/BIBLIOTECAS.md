@@ -22,7 +22,7 @@ Estado: ✅ ya existe en C-Forge · 🔗 se usa hoy vía `cforge bindgen`,
 | 3 | `rayo_json` | JSON ultrarrápido | cJSON, simdjson | ✅ `json` · 🛠 SIMD |
 | 4 | `ventana` | Ventanas, audio y entrada | SDL2, Raylib | ✅ `juego` / `sdl` |
 | 5 | `panel` | GUI de modo inmediato | Dear ImGui | 🛠 |
-| 6 | `latido` | Bucle de eventos asíncrono | libuv | 🛠 |
+| 6 | `latido` / `eventloop` | Bucle de eventos asíncrono | libuv | ✅ `latido` |
 | 7 | `boveda` | Criptografía moderna | OpenSSL, libsodium | ✅ `crypto` / `tls` |
 | 8 | `pixel` | Imágenes y tipografías | stb_image, stb_truetype | ✅ `imagen` / `fuente` |
 | 9 | `inercia` | Física 2D y 3D | Box2D, Bullet | ✅ `fisica2d` / `fisica3d` (básica) |
@@ -100,8 +100,8 @@ Estado: ✅ ya existe en C-Forge · 🔗 se usa hoy vía `cforge bindgen`,
 | 69 | `escritorio` | GUI de escritorio con estilos | Avalonia | 🛠 |
 | 70 | `cristal` | Apps de escritorio con WebView | Tauri | 🛠 |
 | 71 | `nativa` | GUI reactiva nativa | Iced, egui | 🛠 |
-| 72 | `vector` | Gráficos vectoriales a PDF/SVG/PNG | Cairo | ✅ PNG · 🛠 PDF/SVG |
-| 73 | `grafia` | Moldeado de tipografías | HarfBuzz | 🛠 |
+| 72 | `vector` / `vectorgfx` | Gráficos vectoriales a PDF/SVG/PNG | Cairo | ✅ `vector` |
+| 73 | `grafia` / `shaping` | Moldeado de tipografías | HarfBuzz | ✅ `grafia` |
 | 74 | `importa3d` | Modelos 3D (OBJ, glTF) | Assimp | ✅ `modelo` (OBJ) · 🛠 |
 | 75 | `gpu` | Vulkan, Metal y DirectX | bgfx, wgpu | 🛠 |
 | 76 | `pizarra` | Objetos interactivos en lienzo | Fabric.js | 🛠 |
@@ -286,7 +286,7 @@ Estado: ✅ ya existe en C-Forge · 🔗 se usa hoy vía `cforge bindgen`,
 | 208 | `cobro` / `payments` | Cobros idempotentes y webhooks | Stripe | ✅ `cobro` |
 | 209 | `postura` | Rostro, manos y pose | MediaPipe | 🔗 |
 | 210 | `tuberia` | Pipelines multimedia | GStreamer | 🔗 |
-| 211 | `voz_activa` | Detección de voz | Silero VAD | 🛠 |
+| 211 | `voz_activa` / `vad` | Detección de voz | Silero VAD | ✅ `voz_activa` |
 
 ### L. Nube, microservicios y DevOps
 
@@ -313,7 +313,7 @@ Estado: ✅ ya existe en C-Forge · 🔗 se usa hoy vía `cforge bindgen`,
 | # | Nombre | Para qué | Inspiración | Estado |
 |---|---|---|---|---|
 | 227 | `asistente` | Servidor de lenguaje | LSP | ✅ `cforge lsp` |
-| 228 | `depura` | Depuración paso a paso | DAP | 🛠 |
+| 228 | `depura` / `dap` | Depuración paso a paso | DAP | ✅ `depura` |
 | 229 | `intermedio` | Optimización de código intermedio | LLVM, MLIR | 🛠 (v5) |
 | 230 | `gramatica` / `parser` | Combinadores de parsers | Pest, Nom | ✅ `gramatica` |
 | 231 | `analiza` | Compilador como servicio | Roslyn | 🛠 |
