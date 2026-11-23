@@ -1,0 +1,564 @@
+// stdlib/proyeccion.cfv — Sistemas de coordenadas y proyecciones al estilo
+// de PROJ: geográficas ↔ proyectadas ↔ geocéntricas, con elipsoides,
+// códigos EPSG comunes, cadenas "+proj=…" y geodésicas.
+//
+//   · Mercator transversa con la serie de Krüger de orden 6 (la de PROJ
+//     "etmerc"; precisión de milímetros a miles de km del meridiano), UTM
+//     norte y sur (EPSG:326xx y 327xx).
+//   · Web Mercator (EPSG:3857), Mercator elipsoidal (EPSG:3395), Lambert
+//     cónica conforme de 1 y 2 paralelos, equirrectangular.
+//   · Geocéntricas ECEF (EPSG:4978) y transformación de Helmert de 7
+//     parámetros (+towgs84) para cambiar de datum.
+//   · Geodésicas sobre el elipsoide (Vincenty): distancia, rumbos y punto
+//     de destino.
+// Los puntos van en orden x, y (longitud, latitud) en grados y metros.
+// Idea de PROJ (MIT), escrito desde cero. En inglés: importar "proj".
+//
+//   importar "proyeccion"
+//   proyeccion_transformar("EPSG:4326", "EPSG:32719", [-70.6483, -33.4569])   // [346812.85, 6296844.22]
+//   proyeccion_geodesica_inversa([-70.6483, -33.4569], [-58.3816, -34.6037], nulo)["distancia"]
+
+sea _PY_PI = 3.141592653589793
+sea _PY_RAD = 0.017453292519943295
+
+sea _PY_ELIPSOIDES = {"WGS84": [6378137, 298.257223563], "GRS80": [6378137, 298.257222101], "clrk66": [6378206.4, 294.9786982],
+    "intl": [6378388, 297], "bessel": [6377397.155, 299.1528128], "airy": [6377563.396, 299.3249646], "krass": [6378245, 298.3],
+    "WGS72": [6378135, 298.26], "esfera": [6370997, 0]}
+
+/// Elipsoide por nombre ("WGS84", "GRS80", "intl", "clrk66", "bessel",
+/// "airy", "krass", "WGS72", "esfera") o [a, 1/f]: {"a", "f", "e2", "e", "b"}.
+funcion proyeccion_elipsoide(nombre) {
+    sea p = nulo
+    si (tipo(nombre) == "lista") { p = nombre } sino { p = _PY_ELIPSOIDES[nombre ?? "WGS84"] ?? nulo }
+    si (p == nulo) { lanzar "proyeccion: elipsoide desconocido " + nombre }
+    sea f = 0
+    si (p[1] != 0) { f = 1 / p[1] }
+    sea e2 = f * (2 - f)
+    retornar {"a": p[0], "f": f, "e2": e2, "e": raiz(e2), "b": p[0] * (1 - f)}
+}
+
+funcion _py_atanh(x) { retornar 0.5 * logaritmo((1 + x) / (1 - x)) }
+funcion _py_asinh(x) { retornar logaritmo(x + raiz(x * x + 1)) }
+funcion _py_sinh(x) { retornar (exponencial(x) - exponencial(0 - x)) / 2 }
+funcion _py_cosh(x) { retornar (exponencial(x) + exponencial(0 - x)) / 2 }
+funcion _py_tanh(x) { retornar _py_sinh(x) / _py_cosh(x) }
+funcion _py_atan2(yv, xv) {
+    si (xv > 0) { retornar arcotangente(yv / xv) }
+    si (xv < 0 y yv >= 0) { retornar arcotangente(yv / xv) + _PY_PI }
+    si (xv < 0) { retornar arcotangente(yv / xv) - _PY_PI }
+    si (yv > 0) { retornar _PY_PI / 2 }
+    si (yv < 0) { retornar 0 - _PY_PI / 2 }
+    retornar 0
+}
+funcion _py_asin(x) { retornar arcoseno(maximo(-1, minimo(1, x))) }
+
+// ---------- geocéntricas ----------
+
+/// Geográficas [lon, lat, h] → ECEF [X, Y, Z].
+funcion proyeccion_a_ecef(p, elipsoide) {
+    sea el = proyeccion_elipsoide(elipsoide)
+    sea lon = p[0] * _PY_RAD
+    sea lat = p[1] * _PY_RAD
+    sea h = 0
+    si (longitud(p) > 2) { h = p[2] }
+    sea s = seno(lat)
+    sea n = el["a"] / raiz(1 - el["e2"] * s * s)
+    retornar [(n + h) * coseno(lat) * coseno(lon), (n + h) * coseno(lat) * seno(lon), (n * (1 - el["e2"]) + h) * s]
+}
+
+/// ECEF [X, Y, Z] → geográficas [lon, lat, h].
+funcion proyeccion_desde_ecef(p, elipsoide) {
+    sea el = proyeccion_elipsoide(elipsoide)
+    sea a = el["a"]
+    sea e2 = el["e2"]
+    sea x = p[0]
+    sea yv = p[1]
+    sea z = p[2]
+    sea lon = _py_atan2(yv, x)
+    sea r = raiz(x * x + yv * yv)
+    sea lat = _py_atan2(z, r * (1 - e2))
+    sea h = 0
+    sea i = 0
+    mientras (i < 12) {
+        sea s = seno(lat)
+        sea n = a / raiz(1 - e2 * s * s)
+        si (absoluto(lat) < 0.8) { h = r / coseno(lat) - n } sino { h = z / s - n * (1 - e2) }
+        sea nueva = _py_atan2(z, r * (1 - e2 * n / (n + h)))
+        si (absoluto(nueva - lat) < 1e-15) {
+            lat = nueva
+            romper
+        }
+        lat = nueva
+        i = i + 1
+    }
+    sea s = seno(lat)
+    sea n = a / raiz(1 - e2 * s * s)
+    si (absoluto(lat) < 0.8) { h = r / coseno(lat) - n } sino { h = z / s - n * (1 - e2) }
+    retornar [lon / _PY_RAD, lat / _PY_RAD, h]
+}
+
+/// Helmert de 7 parámetros (convención +towgs84 / vector de posición):
+/// [dx, dy, dz (m), rx, ry, rz (segundos de arco), ds (ppm)] sobre ECEF.
+funcion proyeccion_helmert(xyz, par) {
+    sea seg = _PY_RAD / 3600
+    sea rx = par[3] * seg
+    sea ry = par[4] * seg
+    sea rz = par[5] * seg
+    sea m = 1 + par[6] * 0.000001
+    sea x = xyz[0]
+    sea yv = xyz[1]
+    sea z = xyz[2]
+    retornar [par[0] + m * (x - rz * yv + ry * z), par[1] + m * (rz * x + yv - rx * z), par[2] + m * (0 - ry * x + rx * yv + z)]
+}
+
+// ---------- Mercator transversa (Krüger) ----------
+
+funcion _py_tm_coef(el) {
+    sea n = el["f"] / (2 - el["f"])
+    sea n2 = n * n
+    sea n3 = n2 * n
+    sea n4 = n3 * n
+    sea n5 = n4 * n
+    sea n6 = n5 * n
+    sea A = el["a"] / (1 + n) * (1 + n2 / 4 + n4 / 64 + n6 / 256)
+    sea alfa = [n / 2 - 2 * n2 / 3 + 5 * n3 / 16 + 41 * n4 / 180 - 127 * n5 / 288 + 7891 * n6 / 37800,
+        13 * n2 / 48 - 3 * n3 / 5 + 557 * n4 / 1440 + 281 * n5 / 630 - 1983433 * n6 / 1935360,
+        61 * n3 / 240 - 103 * n4 / 140 + 15061 * n5 / 26880 + 167603 * n6 / 181440,
+        49561 * n4 / 161280 - 179 * n5 / 168 + 6601661 * n6 / 7257600,
+        34729 * n5 / 80640 - 3418889 * n6 / 1995840,
+        212378941 * n6 / 319334400]
+    sea beta = [n / 2 - 2 * n2 / 3 + 37 * n3 / 96 - n4 / 360 - 81 * n5 / 512 + 96199 * n6 / 604800,
+        n2 / 48 + n3 / 15 - 437 * n4 / 1440 + 46 * n5 / 105 - 1118711 * n6 / 3870720,
+        17 * n3 / 480 - 37 * n4 / 840 - 209 * n5 / 4480 + 5569 * n6 / 90720,
+        4397 * n4 / 161280 - 11 * n5 / 504 - 830251 * n6 / 7257600,
+        4583 * n5 / 161280 - 108847 * n6 / 3991680,
+        20648693 * n6 / 638668800]
+    retornar {"A": A, "alfa": alfa, "beta": beta}
+}
+
+funcion _py_conforme(lat, e) {
+    // Latitud conforme χ.
+    sea s = seno(lat)
+    retornar arcotangente(_py_sinh(_py_atanh(s) - e * _py_atanh(e * s)))
+}
+
+funcion _py_geodetica(chi, e) {
+    // Inversa de la latitud conforme (iteración clásica).
+    sea lat = chi
+    sea i = 0
+    mientras (i < 20) {
+        sea s = seno(lat)
+        sea nueva = 2 * arcotangente(tangente(_PY_PI / 4 + chi / 2) * potencia((1 + e * s) / (1 - e * s), e / 2)) - _PY_PI / 2
+        si (absoluto(nueva - lat) < 1e-15) { retornar nueva }
+        lat = nueva
+        i = i + 1
+    }
+    retornar lat
+}
+
+funcion _py_tm_meridiano0(c, el, lat0) {
+    // Distancia sobre el meridiano central desde el ecuador hasta lat0 (ξ con η = 0).
+    si (lat0 == 0) { retornar 0 }
+    sea xi = _py_conforme(lat0, el["e"])
+    sea s = xi
+    sea j = 1
+    mientras (j <= 6) {
+        s = s + c["alfa"][j - 1] * seno(2 * j * xi)
+        j = j + 1
+    }
+    retornar c["A"] * s
+}
+
+funcion _py_tm_adelante(d, lon, lat) {
+    sea el = d["el"]
+    sea c = d["coef"]
+    sea dl = (lon - d["lon_0"]) * _PY_RAD
+    sea chi = _py_conforme(lat * _PY_RAD, el["e"])
+    sea t = tangente(chi)
+    sea xi_p = _py_atan2(t, coseno(dl))
+    sea eta_p = _py_atanh(seno(dl) / raiz(1 + t * t))
+    sea xi = xi_p
+    sea eta = eta_p
+    sea j = 1
+    mientras (j <= 6) {
+        xi = xi + c["alfa"][j - 1] * seno(2 * j * xi_p) * _py_cosh(2 * j * eta_p)
+        eta = eta + c["alfa"][j - 1] * coseno(2 * j * xi_p) * _py_sinh(2 * j * eta_p)
+        j = j + 1
+    }
+    retornar [d["x_0"] + d["k_0"] * c["A"] * eta, d["y_0"] + d["k_0"] * (c["A"] * xi - d["m0"])]
+}
+
+funcion _py_tm_atras(d, x, yv) {
+    sea el = d["el"]
+    sea c = d["coef"]
+    sea xi = ((yv - d["y_0"]) / d["k_0"] + d["m0"]) / c["A"]
+    sea eta = (x - d["x_0"]) / (d["k_0"] * c["A"])
+    sea xi_p = xi
+    sea eta_p = eta
+    sea j = 1
+    mientras (j <= 6) {
+        xi_p = xi_p - c["beta"][j - 1] * seno(2 * j * xi) * _py_cosh(2 * j * eta)
+        eta_p = eta_p - c["beta"][j - 1] * coseno(2 * j * xi) * _py_sinh(2 * j * eta)
+        j = j + 1
+    }
+    sea chi = _py_asin(seno(xi_p) / _py_cosh(eta_p))
+    sea lon = d["lon_0"] * _PY_RAD + _py_atan2(_py_sinh(eta_p), coseno(xi_p))
+    retornar [lon / _PY_RAD, _py_geodetica(chi, el["e"]) / _PY_RAD]
+}
+
+// ---------- otras proyecciones ----------
+
+funcion _py_z(p) {
+    si (longitud(p) > 2) { retornar p[2] }
+    retornar 0
+}
+
+funcion _py_m(lat, e2) { retornar coseno(lat) / raiz(1 - e2 * seno(lat) * seno(lat)) }
+funcion _py_t(lat, e) {
+    sea s = seno(lat)
+    retornar tangente(_PY_PI / 4 - lat / 2) / potencia((1 - e * s) / (1 + e * s), e / 2)
+}
+
+funcion _py_lcc_preparar(d) {
+    sea el = d["el"]
+    sea e = el["e"]
+    sea l1 = d["lat_1"] * _PY_RAD
+    sea l2 = (d["lat_2"] ?? d["lat_1"]) * _PY_RAD
+    sea m1 = _py_m(l1, el["e2"])
+    sea t1 = _py_t(l1, e)
+    sea n = seno(l1)
+    si (absoluto(l1 - l2) > 1e-12) { n = (logaritmo(m1) - logaritmo(_py_m(l2, el["e2"]))) / (logaritmo(t1) - logaritmo(_py_t(l2, e))) }
+    sea F = m1 / (n * potencia(t1, n))
+    d["n"] = n
+    d["F"] = F
+    d["rho0"] = el["a"] * F * potencia(_py_t(d["lat_0"] * _PY_RAD, e), n) * d["k_0"]
+}
+
+funcion _py_lcc_adelante(d, lon, lat) {
+    sea el = d["el"]
+    sea rho = el["a"] * d["F"] * potencia(_py_t(lat * _PY_RAD, el["e"]), d["n"]) * d["k_0"]
+    sea theta = d["n"] * (lon - d["lon_0"]) * _PY_RAD
+    retornar [d["x_0"] + rho * seno(theta), d["y_0"] + d["rho0"] - rho * coseno(theta)]
+}
+
+funcion _py_lcc_atras(d, x, yv) {
+    sea el = d["el"]
+    sea e = el["e"]
+    sea dx = x - d["x_0"]
+    sea dy = d["rho0"] - (yv - d["y_0"])
+    sea rho = raiz(dx * dx + dy * dy)
+    si (d["n"] < 0) {
+        rho = 0 - rho
+        dx = 0 - dx
+        dy = 0 - dy
+    }
+    sea theta = _py_atan2(dx, dy)
+    sea t = potencia(rho / (el["a"] * d["F"] * d["k_0"]), 1 / d["n"])
+    sea lat = _PY_PI / 2 - 2 * arcotangente(t)
+    sea i = 0
+    mientras (i < 20) {
+        sea s = seno(lat)
+        sea nueva = _PY_PI / 2 - 2 * arcotangente(t * potencia((1 - e * s) / (1 + e * s), e / 2))
+        si (absoluto(nueva - lat) < 1e-15) {
+            lat = nueva
+            romper
+        }
+        lat = nueva
+        i = i + 1
+    }
+    retornar [d["lon_0"] + theta / d["n"] / _PY_RAD, lat / _PY_RAD]
+}
+
+funcion _py_merc_adelante(d, lon, lat) {
+    sea el = d["el"]
+    sea a = el["a"] * d["k_0"]
+    sea phi = lat * _PY_RAD
+    sea yv = 0
+    si (d["esferica"]) { yv = a * logaritmo(tangente(_PY_PI / 4 + phi / 2)) } sino { yv = 0 - a * logaritmo(_py_t(phi, el["e"])) }
+    retornar [d["x_0"] + a * (lon - d["lon_0"]) * _PY_RAD, d["y_0"] + yv]
+}
+
+funcion _py_merc_atras(d, x, yv) {
+    sea el = d["el"]
+    sea a = el["a"] * d["k_0"]
+    sea lon = d["lon_0"] + (x - d["x_0"]) / a / _PY_RAD
+    sea t = exponencial(0 - (yv - d["y_0"]) / a)
+    si (d["esferica"]) { retornar [lon, (_PY_PI / 2 - 2 * arcotangente(t)) / _PY_RAD] }
+    sea e = el["e"]
+    sea lat = _PY_PI / 2 - 2 * arcotangente(t)
+    sea i = 0
+    mientras (i < 20) {
+        sea s = seno(lat)
+        sea nueva = _PY_PI / 2 - 2 * arcotangente(t * potencia((1 - e * s) / (1 + e * s), e / 2))
+        si (absoluto(nueva - lat) < 1e-15) {
+            lat = nueva
+            romper
+        }
+        lat = nueva
+        i = i + 1
+    }
+    retornar [lon, lat / _PY_RAD]
+}
+
+// ---------- definiciones ----------
+
+/// Lee una cadena de PROJ ("+proj=utm +zone=19 +south +ellps=WGS84 …").
+funcion proyeccion_desde_proj(texto) {
+    sea d = {}
+    para parte en texto_dividir(texto_recortar(texto), " ") {
+        si (parte == "") { continuar }
+        sea p = parte
+        si (texto_empieza_con(p, "+")) { p = subtexto(p, 1, longitud(p)) }
+        sea i = texto_indice(p, "=")
+        si (i < 0) { d[p] = verdadero } sino {
+            sea v = subtexto(p, i + 1, longitud(p))
+            sea num = nulo
+            intentar { num = a_numero(v) } capturar (e) { num = nulo }
+            si (num != nulo y texto_indice(v, ",") < 0) { d[subtexto(p, 0, i)] = num } sino { d[subtexto(p, 0, i)] = v }
+        }
+    }
+    retornar proyeccion_crs(d)
+}
+
+/// Sistema de referencia desde un código "EPSG:nnnn", una cadena "+proj=…"
+/// o un mapa con "proj" y sus parámetros (lat_0, lon_0, k_0, x_0, y_0,
+/// lat_1, lat_2, zone, south, ellps, towgs84).
+funcion proyeccion_crs(def) {
+    si (tipo(def) == "texto") {
+        sea t = texto_recortar(def)
+        si (texto_empieza_con(t, "+proj") o texto_empieza_con(t, "proj=")) { retornar proyeccion_desde_proj(t) }
+        sea codigo = texto_mayusculas(t)
+        si (texto_empieza_con(codigo, "EPSG:")) { codigo = subtexto(codigo, 5, longitud(codigo)) }
+        retornar _py_epsg(a_numero(codigo))
+    }
+    si (tipo(def) == "numero") { retornar _py_epsg(def) }
+    si (tiene_clave(def, "tipo") y tiene_clave(def, "el")) { retornar def }
+    sea el = proyeccion_elipsoide(def["ellps"] ?? (def["datum"] ?? "WGS84"))
+    sea proj = def["proj"]
+    sea d = {"tipo": proj, "el": el, "lat_0": def["lat_0"] ?? 0, "lon_0": def["lon_0"] ?? 0, "k_0": def["k_0"] ?? (def["k"] ?? 1),
+        "x_0": def["x_0"] ?? 0, "y_0": def["y_0"] ?? 0, "lat_1": def["lat_1"] ?? nulo, "lat_2": def["lat_2"] ?? nulo, "towgs84": nulo, "esferica": falso}
+    si (tiene_clave(def, "towgs84")) {
+        sea tw = []
+        para v en texto_dividir("" + def["towgs84"], ",") { tw.agregar(a_numero(v)) }
+        mientras (longitud(tw) < 7) { tw.agregar(0) }
+        d["towgs84"] = tw
+    }
+    si (proj == "utm") {
+        sea zona = def["zone"] ?? 0
+        d["tipo"] = "tmerc"
+        d["lon_0"] = zona * 6 - 183
+        d["k_0"] = 0.9996
+        d["x_0"] = 500000
+        si (def["south"] ?? falso) { d["y_0"] = 10000000 }
+    }
+    si (proj == "merc" y (def["a"] ?? nulo) != nulo y (def["b"] ?? nulo) == def["a"]) {
+        d["esferica"] = verdadero
+        d["el"] = proyeccion_elipsoide([def["a"], 0])
+    }
+    si (proj == "webmerc") {
+        d["tipo"] = "merc"
+        d["esferica"] = verdadero
+        d["el"] = proyeccion_elipsoide([6378137, 0])
+    }
+    si (d["tipo"] == "tmerc") {
+        d["coef"] = _py_tm_coef(d["el"])
+        d["m0"] = _py_tm_meridiano0(d["coef"], d["el"], d["lat_0"] * _PY_RAD)
+    }
+    si (d["tipo"] == "lcc") {
+        si (d["lat_1"] == nulo) { d["lat_1"] = d["lat_0"] }
+        _py_lcc_preparar(d)
+    }
+    si (contiene(["longlat", "latlong", "lonlat", "geocent", "tmerc", "lcc", "merc", "eqc"], d["tipo"]) == falso) { lanzar "proyeccion: proyección no soportada " + proj }
+    retornar d
+}
+
+funcion _py_epsg(c) {
+    si (c == 4326 o c == 4979) { retornar proyeccion_crs({"proj": "longlat", "ellps": "WGS84"}) }
+    si (c == 4258 o c == 4674 o c == 5360) { retornar proyeccion_crs({"proj": "longlat", "ellps": "GRS80"}) }
+    si (c == 4978) { retornar proyeccion_crs({"proj": "geocent", "ellps": "WGS84"}) }
+    si (c == 3857 o c == 900913) { retornar proyeccion_crs({"proj": "webmerc"}) }
+    si (c == 3395) { retornar proyeccion_crs({"proj": "merc", "ellps": "WGS84"}) }
+    si (c == 4087) { retornar proyeccion_crs({"proj": "eqc", "ellps": "WGS84"}) }
+    si (c > 32600 y c <= 32660) { retornar proyeccion_crs({"proj": "utm", "zone": c - 32600, "ellps": "WGS84"}) }
+    si (c > 32700 y c <= 32760) { retornar proyeccion_crs({"proj": "utm", "zone": c - 32700, "south": verdadero, "ellps": "WGS84"}) }
+    // SIRGAS-Chile 2016 / UTM 18S y 19S.
+    si (c == 5361) { retornar proyeccion_crs({"proj": "utm", "zone": 19, "south": verdadero, "ellps": "GRS80"}) }
+    si (c == 5362) { retornar proyeccion_crs({"proj": "utm", "zone": 18, "south": verdadero, "ellps": "GRS80"}) }
+    // PSAD56 / UTM 19S (con el desplazamiento de datum típico para Chile).
+    si (c == 24879) { retornar proyeccion_crs({"proj": "utm", "zone": 19, "south": verdadero, "ellps": "intl", "towgs84": "-288,175,-376"}) }
+    lanzar "proyeccion: código EPSG no incluido: " + c
+}
+
+// Proyectadas → geográficas del mismo datum, en grados.
+funcion _py_a_geo(d, p) {
+    sea t = d["tipo"]
+    si (t == "longlat" o t == "latlong" o t == "lonlat") { retornar [p[0], p[1], _py_z(p)] }
+    si (t == "geocent") { retornar proyeccion_desde_ecef(p, [d["el"]["a"], _py_inv_f(d["el"])]) }
+    sea r = nulo
+    si (t == "tmerc") { r = _py_tm_atras(d, p[0], p[1]) }
+    sino si (t == "lcc") { r = _py_lcc_atras(d, p[0], p[1]) }
+    sino si (t == "merc") { r = _py_merc_atras(d, p[0], p[1]) }
+    sino si (t == "eqc") { r = [d["lon_0"] + (p[0] - d["x_0"]) / d["el"]["a"] / _PY_RAD, (p[1] - d["y_0"]) / d["el"]["a"] / _PY_RAD] }
+    retornar [r[0], r[1], _py_z(p)]
+}
+
+funcion _py_desde_geo(d, g) {
+    sea t = d["tipo"]
+    si (t == "longlat" o t == "latlong" o t == "lonlat") { retornar g }
+    si (t == "geocent") { retornar proyeccion_a_ecef(g, [d["el"]["a"], _py_inv_f(d["el"])]) }
+    sea r = nulo
+    si (t == "tmerc") { r = _py_tm_adelante(d, g[0], g[1]) }
+    sino si (t == "lcc") { r = _py_lcc_adelante(d, g[0], g[1]) }
+    sino si (t == "merc") { r = _py_merc_adelante(d, g[0], g[1]) }
+    sino si (t == "eqc") { r = [d["x_0"] + d["el"]["a"] * (g[0] - d["lon_0"]) * _PY_RAD, d["y_0"] + d["el"]["a"] * g[1] * _PY_RAD] }
+    retornar [r[0], r[1], g[2]]
+}
+
+funcion _py_inv_f(el) {
+    si (el["f"] == 0) { retornar 0 }
+    retornar 1 / el["f"]
+}
+
+/// Transforma un punto [x, y] o [x, y, z] (lon, lat en grados para las
+/// geográficas) de un sistema a otro (códigos EPSG, cadenas PROJ o mapas).
+/// Si alguno tiene towgs84, pasa por WGS84 con Helmert.
+funcion proyeccion_transformar(desde, hacia, p) {
+    sea a = proyeccion_crs(desde)
+    sea b = proyeccion_crs(hacia)
+    sea g = _py_a_geo(a, [p[0], p[1], _py_z(p)])
+    // Cambio de datum (solo si los elipsoides o los parámetros cambian).
+    sea mismo = a["el"]["a"] == b["el"]["a"] y a["el"]["f"] == b["el"]["f"] y a["towgs84"] == nulo y b["towgs84"] == nulo
+    si (mismo == falso y a["tipo"] != "merc" y b["tipo"] != "merc") {
+        sea xyz = proyeccion_a_ecef(g, [a["el"]["a"], _py_inv_f(a["el"])])
+        si (a["towgs84"] != nulo) { xyz = proyeccion_helmert(xyz, a["towgs84"]) }
+        si (b["towgs84"] != nulo) {
+            sea t = b["towgs84"]
+            // Inversa aproximada (signos opuestos; exacta para traslaciones).
+            xyz = proyeccion_helmert(xyz, [0 - t[0], 0 - t[1], 0 - t[2], 0 - t[3], 0 - t[4], 0 - t[5], 0 - t[6]])
+        }
+        g = proyeccion_desde_ecef(xyz, [b["el"]["a"], _py_inv_f(b["el"])])
+    }
+    sea r = _py_desde_geo(b, g)
+    si (longitud(p) > 2) { retornar r }
+    retornar [r[0], r[1]]
+}
+
+/// Zona UTM y código EPSG para un punto [lon, lat].
+funcion proyeccion_zona_utm(p) {
+    sea zona = piso((p[0] + 180) / 6) + 1
+    si (zona > 60) { zona = 60 }
+    // Excepciones de Noruega y Svalbard.
+    si (p[1] >= 56 y p[1] < 64 y p[0] >= 3 y p[0] < 12) { zona = 32 }
+    si (p[1] >= 72 y p[1] < 84) {
+        si (p[0] >= 0 y p[0] < 9) { zona = 31 } sino si (p[0] >= 9 y p[0] < 21) { zona = 33 } sino si (p[0] >= 21 y p[0] < 33) { zona = 35 } sino si (p[0] >= 33 y p[0] < 42) { zona = 37 }
+    }
+    sea epsg = 32600 + zona
+    si (p[1] < 0) { epsg = 32700 + zona }
+    retornar {"zona": zona, "sur": p[1] < 0, "epsg": epsg}
+}
+
+// ---------- geodésicas (Vincenty) ----------
+
+/// Distancia y rumbos entre dos puntos [lon, lat]: {"distancia" (m),
+/// "rumbo_1", "rumbo_2"} (grados desde el norte).
+funcion proyeccion_geodesica_inversa(p1, p2, elipsoide) {
+    sea el = proyeccion_elipsoide(elipsoide)
+    sea a = el["a"]
+    sea b = el["b"]
+    sea f = el["f"]
+    sea L = (p2[0] - p1[0]) * _PY_RAD
+    sea U1 = arcotangente((1 - f) * tangente(p1[1] * _PY_RAD))
+    sea U2 = arcotangente((1 - f) * tangente(p2[1] * _PY_RAD))
+    sea sU1 = seno(U1)
+    sea cU1 = coseno(U1)
+    sea sU2 = seno(U2)
+    sea cU2 = coseno(U2)
+    sea lam = L
+    sea sSig = 0
+    sea cSig = 0
+    sea sig = 0
+    sea cos2a = 0
+    sea c2sm = 0
+    sea it = 0
+    sea convergio = falso
+    mientras (it < 200) {
+        sea sl = seno(lam)
+        sea cl = coseno(lam)
+        sSig = raiz((cU2 * sl) * (cU2 * sl) + (cU1 * sU2 - sU1 * cU2 * cl) * (cU1 * sU2 - sU1 * cU2 * cl))
+        si (sSig == 0) { retornar {"distancia": 0, "rumbo_1": 0, "rumbo_2": 0} }
+        cSig = sU1 * sU2 + cU1 * cU2 * cl
+        sig = _py_atan2(sSig, cSig)
+        sea sa = cU1 * cU2 * sl / sSig
+        cos2a = 1 - sa * sa
+        c2sm = 0
+        si (cos2a != 0) { c2sm = cSig - 2 * sU1 * sU2 / cos2a }
+        sea C = f / 16 * cos2a * (4 + f * (4 - 3 * cos2a))
+        sea previo = lam
+        lam = L + (1 - C) * f * sa * (sig + C * sSig * (c2sm + C * cSig * (-1 + 2 * c2sm * c2sm)))
+        si (absoluto(lam - previo) < 1e-13) {
+            convergio = verdadero
+            romper
+        }
+        it = it + 1
+    }
+    si (convergio == falso) { lanzar "proyeccion_geodesica_inversa: no converge (puntos casi antípodas)" }
+    sea u2 = cos2a * (a * a - b * b) / (b * b)
+    sea A = 1 + u2 / 16384 * (4096 + u2 * (-768 + u2 * (320 - 175 * u2)))
+    sea B = u2 / 1024 * (256 + u2 * (-128 + u2 * (74 - 47 * u2)))
+    sea dSig = B * sSig * (c2sm + B / 4 * (cSig * (-1 + 2 * c2sm * c2sm) - B / 6 * c2sm * (-3 + 4 * sSig * sSig) * (-3 + 4 * c2sm * c2sm)))
+    sea s = b * A * (sig - dSig)
+    sea sl = seno(lam)
+    sea cl = coseno(lam)
+    sea az1 = _py_atan2(cU2 * sl, cU1 * sU2 - sU1 * cU2 * cl) / _PY_RAD
+    sea az2 = _py_atan2(cU1 * sl, 0 - sU1 * cU2 + cU1 * sU2 * cl) / _PY_RAD
+    retornar {"distancia": s, "rumbo_1": az1, "rumbo_2": az2}
+}
+
+/// Punto de destino desde [lon, lat] con un rumbo (grados) y una distancia
+/// (m): {"punto": [lon, lat], "rumbo": rumbo final}.
+funcion proyeccion_geodesica_directa(p, rumbo, distancia, elipsoide) {
+    sea el = proyeccion_elipsoide(elipsoide)
+    sea a = el["a"]
+    sea b = el["b"]
+    sea f = el["f"]
+    sea a1 = rumbo * _PY_RAD
+    sea sa1 = seno(a1)
+    sea ca1 = coseno(a1)
+    sea tU1 = (1 - f) * tangente(p[1] * _PY_RAD)
+    sea cU1 = 1 / raiz(1 + tU1 * tU1)
+    sea sU1 = tU1 * cU1
+    sea sig1 = _py_atan2(tU1, ca1)
+    sea sa = cU1 * sa1
+    sea cos2a = 1 - sa * sa
+    sea u2 = cos2a * (a * a - b * b) / (b * b)
+    sea A = 1 + u2 / 16384 * (4096 + u2 * (-768 + u2 * (320 - 175 * u2)))
+    sea B = u2 / 1024 * (256 + u2 * (-128 + u2 * (74 - 47 * u2)))
+    sea sig = distancia / (b * A)
+    sea c2sm = 0
+    sea sSig = 0
+    sea cSig = 0
+    sea it = 0
+    mientras (it < 200) {
+        c2sm = coseno(2 * sig1 + sig)
+        sSig = seno(sig)
+        cSig = coseno(sig)
+        sea dSig = B * sSig * (c2sm + B / 4 * (cSig * (-1 + 2 * c2sm * c2sm) - B / 6 * c2sm * (-3 + 4 * sSig * sSig) * (-3 + 4 * c2sm * c2sm)))
+        sea nuevo = distancia / (b * A) + dSig
+        si (absoluto(nuevo - sig) < 1e-14) {
+            sig = nuevo
+            romper
+        }
+        sig = nuevo
+        it = it + 1
+    }
+    c2sm = coseno(2 * sig1 + sig)
+    sSig = seno(sig)
+    cSig = coseno(sig)
+    sea tmp = sU1 * sSig - cU1 * cSig * ca1
+    sea lat = _py_atan2(sU1 * cSig + cU1 * sSig * ca1, (1 - f) * raiz(sa * sa + tmp * tmp))
+    sea lam = _py_atan2(sSig * sa1, cU1 * cSig - sU1 * sSig * ca1)
+    sea C = f / 16 * cos2a * (4 + f * (4 - 3 * cos2a))
+    sea L = lam - (1 - C) * f * sa * (sig + C * sSig * (c2sm + C * cSig * (-1 + 2 * c2sm * c2sm)))
+    sea az2 = _py_atan2(sa, 0 - tmp) / _PY_RAD
+    retornar {"punto": [p[0] + L / _PY_RAD, lat / _PY_RAD], "rumbo": az2}
+}

@@ -1,0 +1,81 @@
+// Pruebas de historia (Git nativo). La parte con el programa git solo
+// corre si git está instalado.
+importar "historia"
+importar "sistema"
+funcion eq(a, b, q) { afirmar(("" + a) == ("" + b), q + ": [" + a + "] != [" + b + "]") }
+
+sea base = (variable_entorno("TMPDIR") ?? "/tmp")
+si (base == "") { base = "/tmp" }
+sea dir = base + "/cforge-historia-" + hex_de_bytes(bytes_aleatorios(6))
+
+// Escribir y leer sin git.
+sea r = historia_iniciar(dir, "main")
+eq(historia_rama_actual(r), "main", "rama inicial")
+sea autor = {"nombre": "Ana", "correo": "ana@ejemplo.cl", "fecha": 1700000000, "zona": "-0300"}
+sea c1 = historia_confirmar(r, {"README.md": "hola\n", "src/a.py": "print(1)\n", "src/sub/z.txt": "z", "src-x": "guion"}, "primero", {"autor": autor})
+// SHA conocidos (los mismos que calcula git).
+eq(historia_hash("hola\n"), "5c1b14949828006ed75a3e8858957f86a2f7e2eb", "hash de blob como git")
+eq(c1, "908908a4e5b9328e44f292b9ef224db4bbe5ad85", "SHA del commit igual al de git")
+autor["fecha"] = 1700000100
+autor["zona"] = "+0000"
+sea c2 = historia_confirmar(r, {"README.md": "hola\nmundo\n", "src/a.py": {"contenido": "#!/bin/sh\n", "modo": "100755"}}, "segundo\n\ncon cuerpo", {"autor": autor})
+eq(c2, "f197fb0aa30e2a98585a23b2a44cd46c8e80a4b5", "segundo commit")
+historia_crear_rama(r, "otra", c1)
+historia_etiquetar(r, "v1", c1, nulo, nulo)
+sea tag = historia_etiquetar(r, "v2", c2, "versión 2", {"autor": {"nombre": "Ana", "correo": "a@b.c", "fecha": 1700000200}})
+eq([historia_resolver(r, "HEAD"), historia_resolver(r, "main"), historia_resolver(r, "otra"), historia_resolver(r, "v1"), historia_resolver(r, "HEAD~1"), historia_resolver(r, "HEAD^")], [c2, c2, c1, c1, c1, c1], "revisiones")
+eq(historia_resolver(r, subtexto(c2, 0, 8)), c2, "prefijo de SHA")
+eq(historia_resolver(r, "v2"), tag, "etiqueta anotada")
+eq(historia_commit(r, "v2")["sha"], c2, "commit de la etiqueta anotada")
+sea cm = historia_commit(r, "HEAD")
+eq([cm["arbol"] != nulo, cm["padres"], cm["autor"]["nombre"], cm["autor"]["correo"], cm["autor"]["fecha"], cm["mensaje"]], [verdadero, [c1], "Ana", "ana@ejemplo.cl", 1700000100, "segundo\n\ncon cuerpo\n"], "commit")
+eq(historia_commit(r, "otra")["autor"]["zona"], "-0300", "zona horaria")
+eq(historia_listar(r, "HEAD"), {"README.md": {"modo": "100644", "sha": "70e300cdc0a6474be66e31790145902efd3dcd77"}, "src/a.py": {"modo": "100755", "sha": "1a2485251c33a70432394c93fb89330ef214bfc9"}}, "listar")
+eq([historia_archivo(r, "HEAD", "README.md"), historia_archivo(r, "v1", "src/sub/z.txt"), historia_archivo(r, "HEAD", "no/existe")], ["hola\nmundo\n", "z", nulo], "archivos")
+sea nombres = []
+para e en historia_arbol(r, historia_commit(r, "v1")["arbol"]) { nombres.agregar(e["nombre"] + ":" + e["tipo"]) }
+eq(nombres, ["README.md:blob", "src-x:blob", "src:tree"], "orden de Git en los árboles")
+eq(historia_diferencias(r, "v1", "HEAD"), [{"cambio": "modificado", "ruta": "README.md"}, {"cambio": "borrado", "ruta": "src-x"}, {"cambio": "modificado", "ruta": "src/a.py"}, {"cambio": "borrado", "ruta": "src/sub/z.txt"}], "diferencias")
+sea log = historia_log(r, "HEAD", nulo)
+eq([longitud(log), log[0]["sha"], log[1]["sha"]], [2, c2, c1], "log")
+eq(historia_ramas(r), {"main": c2, "otra": c1}, "ramas")
+eq(historia_etiquetas(r), {"v1": c1, "v2": tag}, "etiquetas")
+sea error = ""
+intentar { historia_resolver(r, "nada") } capturar (e) { error = "" + e }
+afirmar(texto_contiene(error, "revisión desconocida"), "revisión desconocida")
+error = ""
+intentar { historia_resolver(r, "HEAD~5") } capturar (e) { error = "" + e }
+afirmar(texto_contiene(error, "primer commit"), "más atrás del primero")
+historia_cambiar_rama(r, "otra")
+eq(historia_rama_actual(r), "otra", "cambiar de rama")
+historia_cambiar_rama(r, "main")
+
+// Con el programa git: lo que escribimos lo lee git, y leemos lo que
+// escribe git (incluidos packs con deltas, fusiones e índice).
+si (sistema_comando("git --version") != nulo y texto_contiene(sistema_comando("git --version") ?? "", "git version")) {
+    eq(texto_recortar(sistema_comando("git -C '" + dir + "' fsck --strict 2>&1; echo fin")), "fin", "git fsck --strict sin quejas")
+    eq(texto_recortar(sistema_comando("git -C '" + dir + "' log --format=%s")), "segundo\nprimero", "git log de nuestros commits")
+    sea g = dir + "-git"
+    sea comandos = "set -e; mkdir -p '" + g + "'; cd '" + g + "'; git init -q -b main .; git config user.email a@b.c; git config user.name Ana; " +
+        "seq 1 4000 > grande.txt; mkdir src; echo hola > README.md; echo 'print(1)' > src/a.py; git add -A; git commit -q -m primero; " +
+        "echo mundo >> README.md; sed -i.bak 's/^2000$/CAMBIO/' grande.txt; rm -f grande.txt.bak; git add -A; git commit -q -m segundo; " +
+        "git checkout -q -b rama; echo x > src/b.py; git add -A; git commit -q -m 'en rama'; git checkout -q main; " +
+        "git merge -q --no-ff rama -m fusion; git tag v1; git tag -a v2 -m anotada HEAD~1; git gc -q --aggressive; " +
+        "echo suelto > nuevo.txt; git add nuevo.txt; git commit -q -m 'despues del gc'; echo mas >> src/a.py; echo sin > sin.txt; git rm -q --cached README.md; echo listo"
+    eq(texto_recortar(sistema_comando(comandos) ?? ""), "listo", "repositorio de git armado")
+    sea rg = historia_abrir(g)
+    sea mensajes = []
+    para c en historia_log(rg, "HEAD", 10) { mensajes.agregar(texto_recortar(c["mensaje"])) }
+    eq(unir(mensajes, "\n"), texto_recortar(sistema_comando("git -C '" + g + "' log --format=%s")), "log de un repo de git (con pack), en el mismo orden")
+    eq(historia_resolver(rg, "HEAD"), texto_recortar(sistema_comando("git -C '" + g + "' rev-parse HEAD")), "HEAD igual que git")
+    eq(historia_resolver(rg, "HEAD~1^2"), texto_recortar(sistema_comando("git -C '" + g + "' rev-parse HEAD~1^2")), "padre de la fusión")
+    eq(historia_resolver(rg, "v2"), texto_recortar(sistema_comando("git -C '" + g + "' rev-parse v2")), "etiqueta anotada de git")
+    sea grande = historia_archivo(rg, "HEAD", "grande.txt")
+    afirmar(texto_contiene(grande, "\n1999\nCAMBIO\n2001\n"), "archivo reconstruido desde un delta")
+    eq(historia_hash(grande), texto_recortar(sistema_comando("git -C '" + g + "' rev-parse HEAD:grande.txt")), "blob del pack")
+    eq(historia_archivo(rg, "HEAD~2", "README.md"), "hola\nmundo\n", "archivo en una revisión vieja")
+    eq(historia_estado(rg), {"borrados": [], "modificados": ["src/a.py"], "preparados": ["README.md"], "sin_seguimiento": ["README.md", "sin.txt"]}, "estado como git status")
+    sistema_comando("rm -rf '" + g + "'")
+} sino { mostrar("  (git no está: se salta la parte con git)") }
+sistema_comando("rm -rf '" + dir + "'")
+mostrar("[OK] historia")
