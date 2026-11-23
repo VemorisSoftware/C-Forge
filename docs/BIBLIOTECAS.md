@@ -98,12 +98,12 @@ Estado: ✅ ya existe en C-Forge · 🔗 se usa hoy vía `cforge bindgen`,
 | 67 | `lienzo` | Motor gráfico 2D | Skia | ✅ `graficos` |
 | 68 | `flex` / `flexbox` | Layout Flexbox | Yoga | ✅ `flex` |
 | 69 | `escritorio` | GUI de escritorio con estilos | Avalonia | ✅ `escritorio` / `avalonia` |
-| 70 | `cristal` | Apps de escritorio con WebView | Tauri | 🛠 |
+| 70 | `cristal` | Apps de escritorio con WebView | Tauri | ✅ `cristal` / `tauri` |
 | 71 | `nativa` | GUI reactiva nativa | Iced, egui | ✅ `nativa` / `iced` |
 | 72 | `vector` / `vectorgfx` | Gráficos vectoriales a PDF/SVG/PNG | Cairo | ✅ `vector` |
 | 73 | `grafia` / `shaping` | Moldeado de tipografías | HarfBuzz | ✅ `grafia` |
 | 74 | `importa3d` / `meshio` | Modelos 3D (OBJ, glTF) | Assimp | ✅ `importa3d` |
-| 75 | `gpu` | Vulkan, Metal y DirectX | bgfx, wgpu | 🛠 |
+| 75 | `gpu` | Vulkan, Metal y DirectX | bgfx, wgpu | ✅ `gpu` / `wgpu` (backend de software) |
 | 76 | `pizarra` / `canvasobjects` | Objetos interactivos en lienzo | Fabric.js | ✅ `pizarra` |
 | 77 | `animacion` / `lottie` | Animaciones vectoriales | Lottie | ✅ `animacion` |
 | 78 | `estilos` / `tailwind` | Utilidades de estilo y temas | Tailwind | ✅ `estilos` |
@@ -319,7 +319,7 @@ Estado: ✅ ya existe en C-Forge · 🔗 se usa hoy vía `cforge bindgen`,
 | 231 | `analiza` / `code_analysis` | Compilador como servicio | Roslyn | ✅ `es` / `en` |
 | 232 | `nucleo` / `ebpf` | Programas en el kernel | eBPF | ✅ `nucleo` |
 | 233 | `anillo` / `iouring` | E/S asíncrona en Linux | io_uring | ✅ `anillo` |
-| 234 | `ventanas_api` | APIs nativas de Windows | windows (Rust) | ✅ runtime Windows · 🛠 |
+| 234 | `ventanas_api` | APIs nativas de Windows | windows (Rust) | ✅ `ventanas_api` / `windows` |
 | 235 | `manzana` | APIs nativas de macOS e iOS | Cocoa | ✅ `apple` (básico) |
 | 236 | `bus` / `dbus` | D-Bus en Linux | zbus | ✅ `bus` |
 | 237 | `teclado` / `input_sim` | Simular teclado y ratón | Enigo | ✅ `teclado` |

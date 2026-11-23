@@ -1,0 +1,869 @@
+// stdlib/ventanas_api.cfv — APIs nativas de Windows al estilo del crate
+// windows de Rust: llamadas Win32 con tipos de C-Forge y utilidades para los
+// formatos de Windows que sirven en cualquier sistema.
+//
+// En cualquier sistema:
+//   · UTF-16 (con pares sustitutos), GUID (texto ↔ bytes, v4 nuevo),
+//     HRESULT y errores Win32 (con textos de los más comunes), FILETIME.
+//   · Archivos .reg del registro (leer y escribir: REG_SZ, DWORD, QWORD,
+//     binario, EXPAND_SZ y MULTI_SZ).
+//   · Lector de ejecutables PE/COFF (.exe y .dll): máquina, subsistema,
+//     secciones, importaciones (por nombre y por ordinal) y exportaciones.
+// Solo en Windows (kernel32, advapi32, user32, shell32, ole32):
+//   · Registro (leer, escribir, borrar y listar claves), portapapeles,
+//     variables de entorno, nombre del equipo y del usuario, carpetas
+//     conocidas, versión del sistema, memoria, MessageBox, ShellExecute,
+//     mutex de instancia única, GetLastError con su texto.
+// Idea del crate windows (MIT/Apache), escrito desde cero. En inglés:
+// importar "windows".
+//
+//   importar "ventanas_api"
+//   ventanas_guid_texto(ventanas_guid_bytes("\{6B29FC40-CA47-1067-B31D-00DD010662DA}"))
+//   ventanas_pe_leer(leer_archivo("programa.exe"))["importaciones"]
+//   si (ventanas_es_windows()) { ventanas_registro_leer("HKCU", "Software\\Mi App", "Tema") }
+
+funcion __ventanas_win() {
+    extern "kernel32" funcion GetLastError(): entero
+    extern "kernel32" funcion LoadLibraryA(nombre: puntero): puntero
+    extern "kernel32" funcion GetProcAddress(modulo: puntero, nombre: puntero): puntero
+    extern "kernel32" funcion SetLastError(e: entero): entero
+    extern "kernel32" funcion GetComputerNameW(buf: puntero, n: puntero): entero
+    extern "kernel32" funcion GetEnvironmentVariableW(nombre: puntero, buf: puntero, n: entero): entero
+    extern "kernel32" funcion SetEnvironmentVariableW(nombre: puntero, valor: puntero): entero
+    extern "kernel32" funcion GetTickCount64(): entero
+    extern "kernel32" funcion GetCurrentProcessId(): entero
+    extern "kernel32" funcion GetModuleFileNameW(modulo: puntero, buf: puntero, n: entero): entero
+    extern "kernel32" funcion CreateMutexW(atributos: puntero, dueno: entero, nombre: puntero): puntero
+    extern "kernel32" funcion CloseHandle(h: puntero): entero
+    extern "kernel32" funcion GlobalAlloc(banderas: entero, n: entero): puntero
+    extern "kernel32" funcion GlobalLock(h: puntero): puntero
+    extern "kernel32" funcion GlobalUnlock(h: puntero): entero
+    extern "kernel32" funcion GlobalFree(h: puntero): puntero
+    extern "kernel32" funcion GlobalMemoryStatusEx(p: puntero): entero
+    extern "kernel32" funcion GetNativeSystemInfo(p: puntero): entero
+    extern "kernel32" funcion OutputDebugStringW(p: puntero): entero
+    extern "kernel32" funcion GetFileAttributesW(p: puntero): entero
+    extern "advapi32" funcion GetUserNameW(buf: puntero, n: puntero): entero
+    extern "advapi32" funcion RegOpenKeyExW(clave: puntero, sub: puntero, opciones: entero, acceso: entero, salida: puntero): entero
+    extern "advapi32" funcion RegQueryValueExW(clave: puntero, nombre: puntero, r: puntero, tipo_v: puntero, datos: puntero, n: puntero): entero
+    extern "advapi32" funcion RegSetValueExW(clave: puntero, nombre: puntero, r: entero, tipo_v: entero, datos: puntero, n: entero): entero
+    extern "advapi32" funcion RegDeleteValueW(clave: puntero, nombre: puntero): entero
+    extern "advapi32" funcion RegDeleteKeyW(clave: puntero, sub: puntero): entero
+    extern "advapi32" funcion RegCloseKey(clave: puntero): entero
+    extern "user32" funcion MessageBoxW(ventana: puntero, texto: puntero, titulo: puntero, tipo_m: entero): entero
+    extern "user32" funcion OpenClipboard(ventana: puntero): entero
+    extern "user32" funcion CloseClipboard(): entero
+    extern "user32" funcion EmptyClipboard(): entero
+    extern "user32" funcion GetClipboardData(formato: entero): entero
+    extern "user32" funcion SetClipboardData(formato: entero, h: puntero): puntero
+    extern "user32" funcion GetSystemMetrics(i: entero): entero
+    extern "shell32" funcion ShellExecuteW(ventana: puntero, op: puntero, archivo: puntero, params: puntero, dir: puntero, mostrar_v: entero): entero
+    extern "shell32" funcion SHGetKnownFolderPath(id: puntero, banderas: entero, token: puntero, salida: puntero): entero
+    extern "ole32" funcion CoTaskMemFree(p: puntero): entero
+    extern "ntdll" funcion RtlGetVersion(p: puntero): entero
+}
+
+/// ¿Corre en Windows?
+funcion ventanas_es_windows() { retornar sys_info()["sistema"] == "windows" }
+
+sea _VW_LISTO = [falso]
+
+funcion _vw_win() {
+    si (ventanas_es_windows() == falso) { lanzar "ventanas_api: esta función solo existe en Windows" }
+    si (_VW_LISTO[0] == falso) {
+        __ventanas_win()
+        _VW_LISTO[0] = verdadero
+    }
+}
+
+funcion _vw_u32(v) { retornar bits_y(v, 4294967295) }
+
+// Funciones con más de 6 argumentos: se buscan con GetProcAddress y se
+// llaman con c_llamar.
+sea _VW_FUNCIONES = {}
+
+funcion _vw_fn(dll, nombre) {
+    sea clave = dll + "!" + nombre
+    sea f = _VW_FUNCIONES[clave] ?? nulo
+    si (f == nulo) {
+        sea d = c_desde_bytes(dll + char_de(0))
+        sea n = c_desde_bytes(nombre + char_de(0))
+        f = GetProcAddress(LoadLibraryA(d), n)
+        c_liberar(d)
+        c_liberar(n)
+        _VW_FUNCIONES[clave] = f
+    }
+    retornar f
+}
+
+// ---------- UTF-16 ----------
+
+/// Texto a UTF-16LE terminado en dos ceros (para pasar a las funciones W).
+funcion ventanas_utf16(t) {
+    sea r = ""
+    para cp en texto_codigos(t) {
+        si (cp < 65536) { r = r + char_de(cp % 256) + char_de(piso(cp / 256)) } sino {
+            sea v = cp - 65536
+            sea alto = 55296 + piso(v / 1024)
+            sea bajo = 56320 + v % 1024
+            r = r + char_de(alto % 256) + char_de(piso(alto / 256)) + char_de(bajo % 256) + char_de(piso(bajo / 256))
+        }
+    }
+    retornar r + char_de(0) + char_de(0)
+}
+
+/// UTF-16LE a texto (se detiene en el primer cero). Los sustitutos sueltos
+/// se cambian por U+FFFD.
+funcion ventanas_desde_utf16(b) {
+    sea r = ""
+    sea i = 0
+    sea n = longitud(b)
+    mientras (i + 1 < n) {
+        sea u = byte_en(b, i) + byte_en(b, i + 1) * 256
+        si (u == 0) { romper }
+        i = i + 2
+        si (u >= 55296 y u <= 56319 y i + 1 < n) {
+            sea u2 = byte_en(b, i) + byte_en(b, i + 1) * 256
+            si (u2 >= 56320 y u2 <= 57343) {
+                r = r + caracter(65536 + (u - 55296) * 1024 + (u2 - 56320))
+                i = i + 2
+                continuar
+            }
+        }
+        si (u >= 55296 y u <= 57343) { u = 65533 }
+        r = r + caracter(u)
+    }
+    retornar r
+}
+
+// ---------- GUID ----------
+
+funcion _vw_hex(b) { retornar texto_mayusculas(hex_de_bytes(b)) }
+funcion _vw_rev(b) {
+    sea r = ""
+    sea i = longitud(b) - 1
+    mientras (i >= 0) {
+        r = r + subtexto(b, i, i + 1)
+        i = i - 1
+    }
+    retornar r
+}
+
+/// GUID de 16 bytes (en memoria, como en Windows) a "{XXXXXXXX-XXXX-…}".
+funcion ventanas_guid_texto(b) {
+    retornar "{" + _vw_hex(_vw_rev(subtexto(b, 0, 4))) + "-" + _vw_hex(_vw_rev(subtexto(b, 4, 6))) + "-" + _vw_hex(_vw_rev(subtexto(b, 6, 8))) + "-" +
+        _vw_hex(subtexto(b, 8, 10)) + "-" + _vw_hex(subtexto(b, 10, 16)) + "}"
+}
+
+/// "{XXXXXXXX-XXXX-XXXX-XXXX-XXXXXXXXXXXX}" (con o sin llaves) a 16 bytes.
+funcion ventanas_guid_bytes(t) {
+    sea s = texto_reemplazar(texto_reemplazar(texto_reemplazar(texto_recortar(t), "{", ""), "}", ""), "-", "")
+    si (longitud(s) != 32) { lanzar "ventanas_guid_bytes: GUID inválido " + t }
+    sea b = bytes_de_hex(s)
+    retornar _vw_rev(subtexto(b, 0, 4)) + _vw_rev(subtexto(b, 4, 6)) + _vw_rev(subtexto(b, 6, 8)) + subtexto(b, 8, 16)
+}
+
+/// GUID aleatorio (versión 4) en texto.
+funcion ventanas_guid_nuevo() {
+    sea b = bytes_aleatorios(16)
+    b = subtexto(b, 0, 7) + char_de(64 + byte_en(b, 7) % 16) + char_de(128 + byte_en(b, 8) % 64) + subtexto(b, 9, 16)
+    retornar ventanas_guid_texto(b)
+}
+
+// ---------- HRESULT y errores ----------
+
+sea _VW_ERRORES = {"0": "La operación se completó correctamente.", "2": "El sistema no puede encontrar el archivo especificado.",
+    "3": "El sistema no puede encontrar la ruta especificada.", "5": "Acceso denegado.", "6": "Identificador no válido.", "8": "No hay suficiente memoria.",
+    "32": "El archivo está siendo usado por otro proceso.", "80": "El archivo ya existe.", "87": "El parámetro no es correcto.",
+    "122": "El área de datos pasada a una llamada del sistema es demasiado pequeña.", "183": "No se puede crear un archivo que ya existe.",
+    "259": "No hay más datos.", "1223": "El usuario canceló la operación.", "1460": "Se agotó el tiempo de espera."}
+
+sea _VW_HRESULT = {"0": ["S_OK", "Correcto"], "1": ["S_FALSE", "Correcto (falso)"], "2147500033": ["E_NOTIMPL", "No implementado"],
+    "2147500034": ["E_NOINTERFACE", "Interfaz no soportada"], "2147500035": ["E_POINTER", "Puntero no válido"], "2147500036": ["E_ABORT", "Operación abortada"],
+    "2147500037": ["E_FAIL", "Error no especificado"], "2147549183": ["E_UNEXPECTED", "Error inesperado"], "2147942405": ["E_ACCESSDENIED", "Acceso denegado"],
+    "2147942406": ["E_HANDLE", "Identificador no válido"], "2147942414": ["E_OUTOFMEMORY", "Memoria insuficiente"], "2147942487": ["E_INVALIDARG", "Argumento no válido"]}
+
+/// HRESULT a partir de un error Win32 (HRESULT_FROM_WIN32).
+funcion ventanas_hresult_de_win32(e) {
+    si (e <= 0) { retornar e }
+    retornar 2147942400 + e % 65536
+}
+
+/// Describe un HRESULT: {"valor", "hex", "falla", "facilidad", "codigo", "nombre", "texto"}.
+funcion ventanas_hresult(h) {
+    sea v = _vw_u32(h)
+    sea r = {"valor": v, "hex": "0x" + texto_mayusculas(hex_de_bytes(bytes_entero(v, 4, 0))), "falla": v >= 2147483648,
+        "facilidad": bits_y(piso(v / 65536), 2047), "codigo": v % 65536, "nombre": nulo, "texto": nulo}
+    sea k = _VW_HRESULT["" + v] ?? nulo
+    si (k != nulo) {
+        r["nombre"] = k[0]
+        r["texto"] = k[1]
+    } sino si (r["facilidad"] == 7) { r["texto"] = _VW_ERRORES["" + r["codigo"]] ?? nulo }
+    retornar r
+}
+
+/// Texto de un error Win32 (de la tabla; en Windows, del sistema).
+funcion ventanas_texto_error(e) {
+    si (ventanas_es_windows()) {
+        _vw_win()
+        sea buf = c_reservar(2048)
+        sea n = _vw_u32(c_llamar(_vw_fn("kernel32.dll", "FormatMessageW"), 4096 + 512, 0, e, 0, buf, 1024, 0, 0, 0, 0))
+        sea t = ventanas_desde_utf16(c_bytes(buf, n * 2 + 2))
+        c_liberar(buf)
+        si (n > 0) { retornar texto_recortar(t) }
+    }
+    retornar _VW_ERRORES["" + e] ?? ("Error " + e)
+}
+
+// ---------- FILETIME ----------
+
+/// FILETIME (intervalos de 100 ns desde 1601) a milisegundos Unix.
+funcion ventanas_filetime_a_ms(ft) { retornar piso(ft / 10000) - 11644473600000 }
+
+/// Milisegundos Unix a FILETIME.
+funcion ventanas_ms_a_filetime(ms) { retornar (ms + 11644473600000) * 10000 }
+
+// ---------- archivos .reg ----------
+
+funcion _vw_hex_lista(t) {
+    sea r = ""
+    para p en texto_dividir(texto_reemplazar(texto_reemplazar(texto_reemplazar(t, "\\", ""), "\n", ""), " ", ""), ",") {
+        sea x = texto_recortar(p)
+        si (x != "") { r = r + bytes_de_hex(x) }
+    }
+    retornar r
+}
+
+funcion _vw_cadena_reg(t) {
+    // "texto con \"comillas\" y \\barras" → valor.
+    sea r = ""
+    sea i = 1
+    sea n = longitud(t)
+    mientras (i < n - 1) {
+        sea c = subtexto(t, i, i + 1)
+        si (c == "\\" y i + 1 < n - 1) {
+            r = r + subtexto(t, i + 1, i + 2)
+            i = i + 2
+        } sino {
+            r = r + c
+            i = i + 1
+        }
+    }
+    retornar r
+}
+
+funcion _vw_multi(b) {
+    sea r = []
+    sea actual = ""
+    sea i = 0
+    mientras (i + 1 < longitud(b)) {
+        si (byte_en(b, i) == 0 y byte_en(b, i + 1) == 0) {
+            si (actual == "") { romper }
+            r.agregar(ventanas_desde_utf16(actual + char_de(0) + char_de(0)))
+            actual = ""
+        } sino { actual = actual + subtexto(b, i, i + 2) }
+        i = i + 2
+    }
+    retornar r
+}
+
+/// Lee un archivo .reg: {clave: {nombre_valor: {"tipo", "datos"}}}. El valor
+/// por defecto se llama "@". Tipos: "REG_SZ", "REG_DWORD", "REG_QWORD",
+/// "REG_BINARY", "REG_EXPAND_SZ", "REG_MULTI_SZ"; una clave "-[…]" o un
+/// valor "=-" se marcan con "borrar".
+funcion ventanas_reg_leer(texto) {
+    sea t = texto
+    // UTF-16 con BOM (como lo guarda regedit).
+    si (longitud(t) >= 2 y byte_en(t, 0) == 255 y byte_en(t, 1) == 254) { t = ventanas_desde_utf16(subtexto(t, 2, longitud(t)) + char_de(0) + char_de(0)) }
+    si (longitud(t) >= 3 y byte_en(t, 0) == 239 y byte_en(t, 1) == 187) { t = subtexto(t, 3, longitud(t)) }
+    sea lineas = []
+    sea actual = ""
+    para l0 en texto_dividir(texto_reemplazar(t, "\r", ""), "\n") {
+        sea l = texto_recortar(l0)
+        si (texto_termina_con(l, "\\")) {
+            actual = actual + subtexto(l, 0, longitud(l) - 1)
+            continuar
+        }
+        lineas.agregar(actual + l)
+        actual = ""
+    }
+    sea r = {}
+    sea clave = nulo
+    para l en lineas {
+        si (l == "" o texto_empieza_con(l, ";") o texto_empieza_con(l, "Windows Registry Editor") o texto_empieza_con(l, "REGEDIT")) { continuar }
+        si (texto_empieza_con(l, "[")) {
+            sea borrar = texto_empieza_con(l, "[-")
+            sea ini = 1
+            si (borrar) { ini = 2 }
+            clave = subtexto(l, ini, longitud(l) - 1)
+            si (tiene_clave(r, clave) == falso) { r[clave] = {} }
+            si (borrar) { r[clave]["borrar"] = verdadero }
+            continuar
+        }
+        si (clave == nulo) { continuar }
+        // Nombre del valor.
+        sea nombre = "@"
+        sea resto = ""
+        si (texto_empieza_con(l, "@=")) { resto = subtexto(l, 2, longitud(l)) } sino si (texto_empieza_con(l, "\"")) {
+            sea i = 1
+            mientras (i < longitud(l)) {
+                sea c = subtexto(l, i, i + 1)
+                si (c == "\\") { i = i + 2 } sino si (c == "\"") { romper } sino { i = i + 1 }
+            }
+            nombre = _vw_cadena_reg(subtexto(l, 0, i + 1))
+            resto = subtexto(l, i + 2, longitud(l))
+        } sino { continuar }
+        sea v = nulo
+        si (resto == "-") { v = {"tipo": nulo, "datos": nulo, "borrar": verdadero} }
+        sino si (texto_empieza_con(resto, "\"")) { v = {"tipo": "REG_SZ", "datos": _vw_cadena_reg(resto)} }
+        sino si (texto_empieza_con(resto, "dword:")) { v = {"tipo": "REG_DWORD", "datos": bytes_leer_entero(bytes_de_hex(subtexto(resto, 6, longitud(resto))), 0, 4, 0)} }
+        sino si (texto_empieza_con(resto, "hex(b):")) { v = {"tipo": "REG_QWORD", "datos": bytes_leer_entero(_vw_hex_lista(subtexto(resto, 7, longitud(resto))), 0, 8, 1)} }
+        sino si (texto_empieza_con(resto, "hex(2):")) { v = {"tipo": "REG_EXPAND_SZ", "datos": ventanas_desde_utf16(_vw_hex_lista(subtexto(resto, 7, longitud(resto))))} }
+        sino si (texto_empieza_con(resto, "hex(7):")) { v = {"tipo": "REG_MULTI_SZ", "datos": _vw_multi(_vw_hex_lista(subtexto(resto, 7, longitud(resto))))} }
+        sino si (texto_empieza_con(resto, "hex:")) { v = {"tipo": "REG_BINARY", "datos": _vw_hex_lista(subtexto(resto, 4, longitud(resto)))} }
+        si (v != nulo) { r[clave][nombre] = v }
+    }
+    retornar r
+}
+
+funcion _vw_hex_reg(b) {
+    sea p = []
+    sea i = 0
+    mientras (i < longitud(b)) {
+        p.agregar(hex_de_bytes(subtexto(b, i, i + 1)))
+        i = i + 1
+    }
+    retornar unir(p, ",")
+}
+
+funcion _vw_escapar_reg(t) { retornar "\"" + texto_reemplazar(texto_reemplazar(t, "\\", "\\\\"), "\"", "\\\"") + "\"" }
+
+/// Escribe un archivo .reg (UTF-8) desde la misma estructura que ventanas_reg_leer.
+funcion ventanas_reg_escribir(claves_reg) {
+    sea l = ["Windows Registry Editor Version 5.00", ""]
+    para clave en claves(claves_reg) {
+        sea valores = claves_reg[clave]
+        si (valores["borrar"] ?? falso) {
+            l.agregar("[-" + clave + "]")
+            l.agregar("")
+            continuar
+        }
+        l.agregar("[" + clave + "]")
+        para nombre en claves(valores) {
+            si (nombre == "borrar") { continuar }
+            sea v = valores[nombre]
+            sea n = "@"
+            si (nombre != "@") { n = _vw_escapar_reg(nombre) }
+            sea d = v["datos"]
+            sea tv = v["tipo"]
+            si (v["borrar"] ?? falso) { l.agregar(n + "=-") }
+            sino si (tv == "REG_SZ") { l.agregar(n + "=" + _vw_escapar_reg(d)) }
+            sino si (tv == "REG_DWORD") { l.agregar(n + "=dword:" + hex_de_bytes(bytes_entero(d, 4, 0))) }
+            sino si (tv == "REG_QWORD") { l.agregar(n + "=hex(b):" + _vw_hex_reg(bytes_entero(d, 8, 1))) }
+            sino si (tv == "REG_EXPAND_SZ") { l.agregar(n + "=hex(2):" + _vw_hex_reg(ventanas_utf16(d))) }
+            sino si (tv == "REG_MULTI_SZ") {
+                sea b = ""
+                para s en d { b = b + ventanas_utf16(s) }
+                l.agregar(n + "=hex(7):" + _vw_hex_reg(b + char_de(0) + char_de(0)))
+            } sino { l.agregar(n + "=hex:" + _vw_hex_reg(d)) }
+        }
+        l.agregar("")
+    }
+    retornar unir(l, "\r\n")
+}
+
+// ---------- PE/COFF ----------
+
+funcion _vw_l16(b, i) { retornar bytes_leer_entero(b, i, 2, 1) }
+funcion _vw_l32(b, i) { retornar bytes_leer_entero(b, i, 4, 1) }
+funcion _vw_l64(b, i) { retornar bytes_leer_entero(b, i, 8, 1) }
+
+funcion _vw_cstr(b, i) {
+    sea f = i
+    mientras (f < longitud(b) y byte_en(b, f) != 0) { f = f + 1 }
+    retornar subtexto(b, i, f)
+}
+
+funcion _vw_rva(pe, rva) {
+    para s en pe["secciones"] {
+        si (rva >= s["va"] y rva < s["va"] + maximo(s["tamano_virtual"], s["tamano_crudo"])) { retornar rva - s["va"] + s["puntero_crudo"] }
+    }
+    si (rva < pe["tamano_cabeceras"]) { retornar rva }
+    retornar -1
+}
+
+/// Lee un ejecutable PE (.exe o .dll): {"maquina", "64bits", "dll",
+/// "subsistema", "punto_entrada", "base", "fecha", "secciones",
+/// "importaciones": {dll: [nombres o "#ordinal"]}, "exportaciones": [{"nombre", "ordinal", "rva"}]}.
+funcion ventanas_pe_leer(b) {
+    si (longitud(b) < 64 o subtexto(b, 0, 2) != "MZ") { lanzar "ventanas_pe_leer: no es un ejecutable (falta MZ)" }
+    sea pe_off = _vw_l32(b, 60)
+    si (pe_off + 24 > longitud(b) o subtexto(b, pe_off, pe_off + 4) != "PE" + char_de(0) + char_de(0)) { lanzar "ventanas_pe_leer: falta la firma PE" }
+    sea c = pe_off + 4
+    sea maquinas = {"34404": "x64", "332": "x86", "43620": "arm64", "452": "arm"}
+    sea nsec = _vw_l16(b, c + 2)
+    sea opt = c + 20
+    sea tam_opt = _vw_l16(b, c + 16)
+    sea caract = _vw_l16(b, c + 18)
+    sea magia = _vw_l16(b, opt)
+    sea es64 = magia == 523
+    sea r = {"maquina": maquinas["" + _vw_l16(b, c)] ?? ("" + _vw_l16(b, c)), "64bits": es64, "dll": bits_y(caract, 8192) != 0,
+        "fecha": _vw_l32(b, c + 4), "punto_entrada": _vw_l32(b, opt + 16), "secciones": [], "importaciones": {}, "exportaciones": []}
+    sea dd = 0
+    si (es64) {
+        r["base"] = _vw_l64(b, opt + 24)
+        r["subsistema"] = _vw_l16(b, opt + 68)
+        r["tamano_cabeceras"] = _vw_l32(b, opt + 60)
+        dd = opt + 112
+    } sino {
+        r["base"] = _vw_l32(b, opt + 28)
+        r["subsistema"] = _vw_l16(b, opt + 68)
+        r["tamano_cabeceras"] = _vw_l32(b, opt + 60)
+        dd = opt + 96
+    }
+    r["subsistema"] = {"2": "gui", "3": "consola", "1": "nativo", "10": "efi"}["" + r["subsistema"]] ?? ("" + r["subsistema"])
+    sea s = opt + tam_opt
+    sea i = 0
+    mientras (i < nsec) {
+        sea o = s + i * 40
+        r["secciones"].agregar({"nombre": _vw_cstr(subtexto(b, o, o + 8), 0), "tamano_virtual": _vw_l32(b, o + 8), "va": _vw_l32(b, o + 12),
+            "tamano_crudo": _vw_l32(b, o + 16), "puntero_crudo": _vw_l32(b, o + 20), "caracteristicas": _vw_l32(b, o + 36)})
+        i = i + 1
+    }
+    // Exportaciones.
+    sea exp_rva = _vw_l32(b, dd)
+    si (exp_rva != 0) {
+        sea e = _vw_rva(r, exp_rva)
+        si (e >= 0) {
+            sea base_ord = _vw_l32(b, e + 16)
+            sea nfun = _vw_l32(b, e + 20)
+            sea nnom = _vw_l32(b, e + 24)
+            sea funcs = _vw_rva(r, _vw_l32(b, e + 28))
+            sea noms = _vw_rva(r, _vw_l32(b, e + 32))
+            sea ords = _vw_rva(r, _vw_l32(b, e + 36))
+            r["nombre_dll"] = _vw_cstr(b, _vw_rva(r, _vw_l32(b, e + 12)))
+            sea k = 0
+            mientras (k < nnom y k < 65536) {
+                sea ord = _vw_l16(b, ords + k * 2)
+                r["exportaciones"].agregar({"nombre": _vw_cstr(b, _vw_rva(r, _vw_l32(b, noms + k * 4))), "ordinal": ord + base_ord, "rva": _vw_l32(b, funcs + ord * 4)})
+                k = k + 1
+            }
+        }
+    }
+    // Importaciones.
+    sea imp_rva = _vw_l32(b, dd + 8)
+    si (imp_rva != 0) {
+        sea d = _vw_rva(r, imp_rva)
+        mientras (d >= 0 y d + 20 <= longitud(b)) {
+            sea ilt = _vw_l32(b, d)
+            sea nombre_rva = _vw_l32(b, d + 12)
+            sea iat = _vw_l32(b, d + 16)
+            si (nombre_rva == 0) { romper }
+            sea dll = _vw_cstr(b, _vw_rva(r, nombre_rva))
+            sea lista = []
+            sea tabla = ilt
+            si (tabla == 0) { tabla = iat }
+            sea t = _vw_rva(r, tabla)
+            sea paso = 4
+            si (es64) { paso = 8 }
+            mientras (t >= 0 y t + paso <= longitud(b)) {
+                sea bajo = _vw_l32(b, t)
+                sea alto = 0
+                si (es64) { alto = _vw_l32(b, t + 4) }
+                si (bajo == 0 y alto == 0) { romper }
+                sea por_ordinal = (es64 y alto >= 2147483648) o (es64 == falso y bajo >= 2147483648)
+                si (por_ordinal) { lista.agregar("#" + bits_y(bajo, 65535)) } sino { lista.agregar(_vw_cstr(b, _vw_rva(r, bajo) + 2)) }
+                t = t + paso
+            }
+            r["importaciones"][dll] = lista
+            d = d + 20
+        }
+    }
+    retornar r
+}
+
+// ---------- Win32: registro ----------
+
+sea _VW_RAICES = {"HKCR": -2147483648, "HKEY_CLASSES_ROOT": -2147483648, "HKCU": -2147483647, "HKEY_CURRENT_USER": -2147483647,
+    "HKLM": -2147483646, "HKEY_LOCAL_MACHINE": -2147483646, "HKU": -2147483645, "HKEY_USERS": -2147483645}
+
+funcion _vw_raiz(r) {
+    sea v = _VW_RAICES[texto_mayusculas(r)] ?? nulo
+    si (v == nulo) { lanzar "ventanas_api: raíz del registro desconocida " + r }
+    retornar v
+}
+
+funcion _vw_abrir(raiz, sub, acceso, crear) {
+    _vw_win()
+    sea salida = c_reservar(8)
+    sea nombre = c_desde_bytes(ventanas_utf16(sub))
+    sea e = 0
+    si (crear) { e = _vw_u32(c_llamar(_vw_fn("advapi32.dll", "RegCreateKeyExW"), _vw_raiz(raiz), nombre, 0, 0, 0, acceso, 0, salida, 0, 0)) } sino { e = _vw_u32(RegOpenKeyExW(_vw_raiz(raiz), nombre, 0, acceso, salida)) }
+    c_liberar(nombre)
+    sea h = c_leer64(salida, 0)
+    c_liberar(salida)
+    si (e != 0) { retornar [nulo, e] }
+    retornar [h, 0]
+}
+
+/// Lee un valor del registro: REG_SZ/EXPAND_SZ → texto, DWORD/QWORD →
+/// número, MULTI_SZ → lista, otro → bytes. nulo si no existe.
+funcion ventanas_registro_leer(raiz, sub, nombre) {
+    sea a = _vw_abrir(raiz, sub, 131097, falso)
+    si (a[0] == nulo) { retornar nulo }
+    sea h = a[0]
+    sea tipo_v = c_reservar(4)
+    sea tam = c_reservar(4)
+    sea n = c_desde_bytes(ventanas_utf16(nombre ?? ""))
+    sea e = _vw_u32(RegQueryValueExW(h, n, nulo, tipo_v, nulo, tam))
+    sea r = nulo
+    si (e == 0) {
+        sea largo = _vw_u32(c_leer32(tam, 0))
+        sea datos = c_reservar(largo + 4)
+        e = _vw_u32(RegQueryValueExW(h, n, nulo, tipo_v, datos, tam))
+        sea b = c_bytes(datos, _vw_u32(c_leer32(tam, 0)))
+        c_liberar(datos)
+        sea t = _vw_u32(c_leer32(tipo_v, 0))
+        si (e == 0) {
+            si (t == 1 o t == 2) { r = ventanas_desde_utf16(b + char_de(0) + char_de(0)) }
+            sino si (t == 4) { r = bytes_leer_entero(b, 0, 4, 1) }
+            sino si (t == 11) { r = bytes_leer_entero(b, 0, 8, 1) }
+            sino si (t == 7) { r = _vw_multi(b + char_de(0) + char_de(0)) }
+            sino { r = b }
+        }
+    }
+    c_liberar(n)
+    c_liberar(tipo_v)
+    c_liberar(tam)
+    RegCloseKey(h)
+    retornar r
+}
+
+/// Escribe un valor (crea la clave si falta). tipo_v: "REG_SZ" (por
+/// defecto para textos), "REG_DWORD" (para números), "REG_QWORD",
+/// "REG_EXPAND_SZ", "REG_MULTI_SZ" (lista) o "REG_BINARY".
+funcion ventanas_registro_escribir(raiz, sub, nombre, valor, tipo_v) {
+    sea t = tipo_v
+    si (t == nulo) {
+        si (tipo(valor) == "numero") { t = "REG_DWORD" } sino si (tipo(valor) == "lista") { t = "REG_MULTI_SZ" } sino { t = "REG_SZ" }
+    }
+    sea codigos = {"REG_SZ": 1, "REG_EXPAND_SZ": 2, "REG_BINARY": 3, "REG_DWORD": 4, "REG_MULTI_SZ": 7, "REG_QWORD": 11}
+    sea b = ""
+    si (t == "REG_SZ" o t == "REG_EXPAND_SZ") { b = ventanas_utf16("" + valor) }
+    sino si (t == "REG_DWORD") { b = bytes_entero(valor, 4, 1) }
+    sino si (t == "REG_QWORD") { b = bytes_entero(valor, 8, 1) }
+    sino si (t == "REG_MULTI_SZ") {
+        para s en valor { b = b + ventanas_utf16(s) }
+        b = b + char_de(0) + char_de(0)
+    } sino { b = valor }
+    sea a = _vw_abrir(raiz, sub, 131078, verdadero)
+    si (a[0] == nulo) { lanzar "ventanas_registro_escribir: " + ventanas_texto_error(a[1]) }
+    sea n = c_desde_bytes(ventanas_utf16(nombre ?? ""))
+    sea d = c_desde_bytes(b + char_de(0))
+    sea e = _vw_u32(RegSetValueExW(a[0], n, 0, codigos[t], d, longitud(b)))
+    c_liberar(n)
+    c_liberar(d)
+    RegCloseKey(a[0])
+    si (e != 0) { lanzar "ventanas_registro_escribir: " + ventanas_texto_error(e) }
+}
+
+/// Borra un valor (nombre) o, sin nombre, la clave (debe estar vacía).
+funcion ventanas_registro_borrar(raiz, sub, nombre) {
+    si (nombre == nulo) {
+        _vw_win()
+        sea s = c_desde_bytes(ventanas_utf16(sub))
+        sea e = _vw_u32(RegDeleteKeyW(_vw_raiz(raiz), s))
+        c_liberar(s)
+        retornar e == 0
+    }
+    sea a = _vw_abrir(raiz, sub, 131078, falso)
+    si (a[0] == nulo) { retornar falso }
+    sea n = c_desde_bytes(ventanas_utf16(nombre))
+    sea e = _vw_u32(RegDeleteValueW(a[0], n))
+    c_liberar(n)
+    RegCloseKey(a[0])
+    retornar e == 0
+}
+
+/// Subclaves y nombres de valores de una clave: {"claves", "valores"}.
+funcion ventanas_registro_listar(raiz, sub) {
+    sea a = _vw_abrir(raiz, sub, 131097, falso)
+    si (a[0] == nulo) { retornar nulo }
+    sea r = {"claves": [], "valores": []}
+    sea buf = c_reservar(1024)
+    sea n = c_reservar(4)
+    sea i = 0
+    mientras (i < 100000) {
+        c_escribir32(n, 0, 512)
+        si (_vw_u32(c_llamar(_vw_fn("advapi32.dll", "RegEnumKeyExW"), a[0], i, buf, n, 0, 0, 0, 0, 0, 0)) != 0) { romper }
+        r["claves"].agregar(ventanas_desde_utf16(c_bytes(buf, _vw_u32(c_leer32(n, 0)) * 2 + 2)))
+        i = i + 1
+    }
+    i = 0
+    mientras (i < 100000) {
+        c_escribir32(n, 0, 512)
+        si (_vw_u32(c_llamar(_vw_fn("advapi32.dll", "RegEnumValueW"), a[0], i, buf, n, 0, 0, 0, 0, 0, 0)) != 0) { romper }
+        sea nom = ventanas_desde_utf16(c_bytes(buf, _vw_u32(c_leer32(n, 0)) * 2 + 2))
+        si (nom == "") { nom = "@" }
+        r["valores"].agregar(nom)
+        i = i + 1
+    }
+    c_liberar(buf)
+    c_liberar(n)
+    RegCloseKey(a[0])
+    retornar r
+}
+
+// ---------- Win32: sistema ----------
+
+funcion _vw_texto_w(f, n) {
+    sea buf = c_reservar(n * 2 + 2)
+    sea tam = c_reservar(4)
+    c_escribir32(tam, 0, n)
+    sea ok = f(buf, tam)
+    sea r = nulo
+    si (ok) { r = ventanas_desde_utf16(c_bytes(buf, n * 2 + 2)) }
+    c_liberar(buf)
+    c_liberar(tam)
+    retornar r
+}
+
+/// Nombre del equipo.
+funcion ventanas_nombre_equipo() {
+    _vw_win()
+    retornar _vw_texto_w(funcion(b, t) { retornar _vw_u32(GetComputerNameW(b, t)) != 0 }, 256)
+}
+
+/// Nombre del usuario.
+funcion ventanas_nombre_usuario() {
+    _vw_win()
+    retornar _vw_texto_w(funcion(b, t) { retornar _vw_u32(GetUserNameW(b, t)) != 0 }, 256)
+}
+
+/// Variable de entorno (con soporte Unicode completo). nulo si no existe.
+funcion ventanas_entorno(nombre) {
+    _vw_win()
+    sea n = c_desde_bytes(ventanas_utf16(nombre))
+    sea buf = c_reservar(65536)
+    sea largo = _vw_u32(GetEnvironmentVariableW(n, buf, 32767))
+    sea r = nulo
+    si (largo > 0) { r = ventanas_desde_utf16(c_bytes(buf, largo * 2 + 2)) }
+    c_liberar(n)
+    c_liberar(buf)
+    retornar r
+}
+
+/// Cambia (o borra, con valor nulo) una variable de entorno del proceso.
+funcion ventanas_fijar_entorno(nombre, valor) {
+    _vw_win()
+    sea n = c_desde_bytes(ventanas_utf16(nombre))
+    sea v = nulo
+    si (valor != nulo) { v = c_desde_bytes(ventanas_utf16(valor)) }
+    sea ok = _vw_u32(SetEnvironmentVariableW(n, v)) != 0
+    c_liberar(n)
+    si (v != nulo) { c_liberar(v) }
+    retornar ok
+}
+
+/// Último error Win32: {"codigo", "texto"}.
+funcion ventanas_ultimo_error() {
+    _vw_win()
+    sea e = _vw_u32(GetLastError())
+    retornar {"codigo": e, "texto": ventanas_texto_error(e)}
+}
+
+/// Versión de Windows: {"mayor", "menor", "compilacion"}.
+funcion ventanas_version() {
+    _vw_win()
+    sea p = c_reservar(284)
+    c_escribir32(p, 0, 284)
+    RtlGetVersion(p)
+    sea r = {"mayor": _vw_u32(c_leer32(p, 4)), "menor": _vw_u32(c_leer32(p, 8)), "compilacion": _vw_u32(c_leer32(p, 12))}
+    c_liberar(p)
+    retornar r
+}
+
+/// Memoria: {"total", "libre", "carga"} (bytes y porcentaje).
+funcion ventanas_memoria() {
+    _vw_win()
+    sea p = c_reservar(64)
+    c_escribir32(p, 0, 64)
+    GlobalMemoryStatusEx(p)
+    sea r = {"carga": _vw_u32(c_leer32(p, 4)), "total": c_leer64(p, 8), "libre": c_leer64(p, 16)}
+    c_liberar(p)
+    retornar r
+}
+
+/// Procesadores lógicos y arquitectura.
+funcion ventanas_info_sistema() {
+    _vw_win()
+    sea p = c_reservar(64)
+    GetNativeSystemInfo(p)
+    sea arq = {"9": "x64", "0": "x86", "12": "arm64", "5": "arm"}["" + bits_y(c_leer32(p, 0), 65535)] ?? "?"
+    sea r = {"arquitectura": arq, "procesadores": _vw_u32(c_leer32(p, 32)), "pagina": _vw_u32(c_leer32(p, 4))}
+    c_liberar(p)
+    retornar r
+}
+
+/// Milisegundos desde que arrancó el sistema.
+funcion ventanas_tiempo_encendido() {
+    _vw_win()
+    retornar GetTickCount64()
+}
+
+/// Ruta del ejecutable actual.
+funcion ventanas_ruta_ejecutable() {
+    _vw_win()
+    sea buf = c_reservar(65536)
+    sea n = _vw_u32(GetModuleFileNameW(nulo, buf, 32767))
+    sea r = ventanas_desde_utf16(c_bytes(buf, n * 2 + 2))
+    c_liberar(buf)
+    retornar r
+}
+
+sea _VW_CARPETAS = {"escritorio": "\{B4BFCC3A-DB2C-424C-B029-7FE99A87C641}", "documentos": "\{FDD39AD0-238F-46AF-ADB4-6C85480369C7}",
+    "descargas": "\{374DE290-123F-4565-9164-39C4925E467B}", "datos_locales": "\{F1B32785-6FBA-4FCF-9D55-7B8E7F157091}",
+    "datos_roaming": "\{3EB685DB-65F9-4CF6-A03A-E3EF65729F3D}", "programas": "\{905E63B6-C1BF-494E-B29C-65B732D3D21A}",
+    "perfil": "\{5E6C858F-0E22-4760-9AFE-EA3317B67173}", "imagenes": "\{33E28130-4E1E-4676-835A-98395C3BC3BB}", "musica": "\{4BD8D571-6D19-48D3-BE97-422220080E43}",
+    "temporal": nulo}
+
+/// Carpeta conocida: "escritorio", "documentos", "descargas", "datos_locales",
+/// "datos_roaming", "programas", "perfil", "imagenes", "musica".
+funcion ventanas_carpeta(nombre) {
+    _vw_win()
+    sea g = _VW_CARPETAS[nombre] ?? nulo
+    si (g == nulo) { lanzar "ventanas_carpeta: carpeta desconocida " + nombre }
+    sea id = c_desde_bytes(ventanas_guid_bytes(g))
+    sea salida = c_reservar(8)
+    sea hr = _vw_u32(SHGetKnownFolderPath(id, 0, nulo, salida))
+    c_liberar(id)
+    si (hr != 0) {
+        c_liberar(salida)
+        retornar nulo
+    }
+    sea p = c_leer64(salida, 0)
+    // Lee la cadena UTF-16 hasta el cero.
+    sea b = ""
+    sea i = 0
+    mientras (i < 65536) {
+        sea u = c_leer8(p, i) + c_leer8(p, i + 1) * 256
+        si (u == 0) { romper }
+        b = b + char_de(c_leer8(p, i)) + char_de(c_leer8(p, i + 1))
+        i = i + 2
+    }
+    CoTaskMemFree(p)
+    c_liberar(salida)
+    retornar ventanas_desde_utf16(b + char_de(0) + char_de(0))
+}
+
+/// ¿Existe el archivo o carpeta? (GetFileAttributesW, rutas Unicode).
+funcion ventanas_existe(ruta) {
+    _vw_win()
+    sea p = c_desde_bytes(ventanas_utf16(ruta))
+    sea a = _vw_u32(GetFileAttributesW(p))
+    c_liberar(p)
+    retornar a != 4294967295
+}
+
+// ---------- Win32: portapapeles, ventanas y procesos ----------
+
+/// Texto del portapapeles (o nulo).
+funcion ventanas_portapapeles() {
+    _vw_win()
+    si (_vw_u32(OpenClipboard(nulo)) == 0) { retornar nulo }
+    sea h = GetClipboardData(13)
+    sea r = nulo
+    si (h != 0) {
+        sea p = GlobalLock(h)
+        sea b = ""
+        sea i = 0
+        mientras (i < 16777216) {
+            sea u = c_leer8(p, i) + c_leer8(p, i + 1) * 256
+            si (u == 0) { romper }
+            b = b + char_de(c_leer8(p, i)) + char_de(c_leer8(p, i + 1))
+            i = i + 2
+        }
+        GlobalUnlock(h)
+        r = ventanas_desde_utf16(b + char_de(0) + char_de(0))
+    }
+    CloseClipboard()
+    retornar r
+}
+
+/// Pone texto en el portapapeles.
+funcion ventanas_fijar_portapapeles(texto) {
+    _vw_win()
+    sea b = ventanas_utf16(texto)
+    si (_vw_u32(OpenClipboard(nulo)) == 0) { retornar falso }
+    EmptyClipboard()
+    mientras (longitud(b) % 4 != 0) { b = b + char_de(0) }
+    sea h = GlobalAlloc(2, longitud(b))
+    sea p = GlobalLock(h)
+    sea i = 0
+    mientras (i < longitud(b)) {
+        c_escribir32(p, i, bytes_leer_entero(b, i, 4, 1))
+        i = i + 4
+    }
+    GlobalUnlock(h)
+    sea ok = SetClipboardData(13, h) != nulo
+    CloseClipboard()
+    retornar ok
+}
+
+/// Caja de mensaje. tipo_m: "ok", "ok_cancelar", "si_no", "si_no_cancelar";
+/// icono: "info", "aviso", "error", "pregunta". Devuelve el botón elegido.
+funcion ventanas_mensaje(texto, titulo, tipo_m, icono) {
+    _vw_win()
+    sea t = {"ok": 0, "ok_cancelar": 1, "si_no_cancelar": 3, "si_no": 4}[tipo_m ?? "ok"] ?? 0
+    sea ic = {"error": 16, "pregunta": 32, "aviso": 48, "info": 64}[icono ?? "info"] ?? 64
+    sea a = c_desde_bytes(ventanas_utf16(texto))
+    sea b = c_desde_bytes(ventanas_utf16(titulo ?? ""))
+    sea r = _vw_u32(MessageBoxW(nulo, a, b, t + ic))
+    c_liberar(a)
+    c_liberar(b)
+    retornar {"1": "ok", "2": "cancelar", "6": "si", "7": "no"}["" + r] ?? ("" + r)
+}
+
+/// Abre un archivo, carpeta o URL con el programa asociado (ShellExecute).
+funcion ventanas_abrir(ruta, operacion) {
+    _vw_win()
+    sea op = c_desde_bytes(ventanas_utf16(operacion ?? "open"))
+    sea f = c_desde_bytes(ventanas_utf16(ruta))
+    sea r = ShellExecuteW(nulo, op, f, nulo, nulo, 1)
+    c_liberar(op)
+    c_liberar(f)
+    retornar r > 32
+}
+
+/// Mutex con nombre para que la app tenga una sola instancia. Devuelve
+/// {"primera": bool, "h"}; ventanas_soltar_instancia(r) lo cierra.
+funcion ventanas_instancia_unica(nombre) {
+    _vw_win()
+    sea n = c_desde_bytes(ventanas_utf16("Local\\" + nombre))
+    SetLastError(0)
+    sea h = CreateMutexW(nulo, 0, n)
+    sea e = _vw_u32(GetLastError())
+    c_liberar(n)
+    retornar {"primera": e != 183, "h": h}
+}
+
+funcion ventanas_soltar_instancia(r) {
+    _vw_win()
+    CloseHandle(r["h"])
+}
+
+/// Métrica del sistema (GetSystemMetrics): "ancho_pantalla", "alto_pantalla",
+/// "monitores" o un número.
+funcion ventanas_metrica(m) {
+    _vw_win()
+    sea i = {"ancho_pantalla": 0, "alto_pantalla": 1, "monitores": 80, "botones_raton": 43}[m] ?? m
+    retornar c_i32(GetSystemMetrics(i))
+}
+
+/// Manda texto al depurador (OutputDebugString).
+funcion ventanas_depurar(texto) {
+    _vw_win()
+    sea p = c_desde_bytes(ventanas_utf16(texto))
+    OutputDebugStringW(p)
+    c_liberar(p)
+}

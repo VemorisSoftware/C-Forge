@@ -69,6 +69,19 @@ Sitio oficial: [c-forge.org](https://c-forge.org)
   `llamada`/`protobuf` (.proto, binario como protoc, marcos gRPC),
   `recolecta`/`crawler` (cookies RFC 6265, formularios, robots.txt,
   rastreo) y `sensor`/`mqtt` (paquetes MQTT, QoS 2, mini broker).
+- Lote 31 de bibliotecas (con alias en inglés y pruebas en ambos idiomas):
+  `gpu`/`wgpu` (API al estilo WebGPU con backend de software: buffers,
+  texturas, muestreadores, tuberías de render y de cómputo, pases,
+  instancias, índices, profundidad, descarte de caras, recorte contra el
+  plano cercano, regla arriba-izquierda y corrección de perspectiva),
+  `cristal`/`tauri` (apps con interfaz web: servidor en 127.0.0.1 con token,
+  revisión de Host y Origin, comandos registrados, eventos en los dos
+  sentidos, CSP y ventana del navegador en modo app; el puente JS también
+  expone `window.__TAURI__`) y `ventanas_api`/`windows` (UTF-16, GUID,
+  HRESULT, FILETIME, archivos .reg y lector de PE en cualquier sistema;
+  registro, portapapeles, entorno, carpetas conocidas, versión, memoria,
+  MessageBox, ShellExecute e instancia única en Windows, probados en el CI
+  de Windows).
 - Lote 30 de bibliotecas (con alias en inglés y pruebas en ambos idiomas):
   `directo`/`webrtc` (WebRTC propio: ICE con STUN, DTLS 1.2 cliente y
   servidor con cookies y retransmisión, SCTP con fragmentación y

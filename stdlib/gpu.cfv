@@ -1,0 +1,769 @@
+// stdlib/gpu.cfv — API de GPU al estilo de wgpu/WebGPU con un backend de
+// software (corre en la CPU, igual en todas las plataformas).
+//
+// Mismos conceptos que wgpu: adaptador y dispositivo, buffers, texturas,
+// muestreadores, grupos de recursos (bind groups), tuberías de render y de
+// cómputo, codificadores de comandos, pases y una cola que los ejecuta. Los
+// shaders son funciones de C-Forge:
+//   · vértice(entrada, recursos, indice_instancia) → {"posicion": [x, y, z, w], …varyings}
+//   · fragmento(varyings, recursos) → [r, g, b, a] (0 a 1) o nulo para descartar
+//   · cómputo(id_global [x, y, z], recursos)
+// El rasterizador recorta contra el plano cercano, usa la regla
+// arriba-izquierda (dos triángulos que comparten un borde no pintan dos
+// veces el mismo píxel), interpola con corrección de perspectiva y tiene
+// prueba de profundidad, descarte de caras y mezcla. Idea de wgpu (MIT/Apache)
+// y bgfx (BSD), escrito desde cero. En inglés: importar "wgpu".
+//
+//   importar "gpu"
+//   sea dev = gpu_dispositivo(gpu_adaptador(nulo))
+//   sea vb = gpu_buffer(dev, {"uso": ["vertice"], "contenido": [0, 0.5, -0.5, -0.5, 0.5, -0.5]})
+//   sea p = gpu_pipeline_render(dev, {
+//       "atributos": [{"nombre": "pos", "componentes": 2, "desplazamiento": 0}], "paso": 2,
+//       "vertice": funcion(v, r, inst) { retornar {"posicion": [v["pos"][0], v["pos"][1], 0, 1]} },
+//       "fragmento": funcion(f, r) { retornar [1, 0.5, 0, 1] }})
+//   sea t = gpu_textura(dev, {"ancho": 64, "alto": 64})
+//   sea enc = gpu_codificador(dev)
+//   sea pase = gpu_pase_render(enc, {"color": t, "limpiar": [0, 0, 0, 1]})
+//   gpu_fijar_pipeline(pase, p)
+//   gpu_fijar_vertices(pase, 0, vb)
+//   gpu_dibujar(pase, 3, 1, 0, 0)
+//   gpu_fin_pase(pase)
+//   gpu_enviar(dev, [gpu_terminar(enc)])
+//   imagen_guardar(gpu_textura_imagen(dev, t), "triangulo.png")
+
+importar "imagen"
+
+// Sinónimos en inglés para los valores de las opciones.
+sea _GP_SIN = {"triangles": "triangulos", "triangle-list": "triangulos", "strip": "tira", "triangle-strip": "tira", "lines": "lineas", "line-list": "lineas",
+    "points": "puntos", "point-list": "puntos", "none": "ninguna", "back": "atras", "front": "frente", "replace": "reemplazar", "alpha": "alfa",
+    "additive": "aditiva", "premultiplied": "premultiplicada", "less": "menor", "less_equal": "menor_igual", "greater": "mayor",
+    "greater_equal": "mayor_igual", "equal": "igual", "never": "nunca", "always": "siempre", "depth32f": "profundidad32f", "depth32float": "profundidad32f",
+    "linear": "lineal", "nearest": "cercano", "repeat": "repetir", "clamp": "recortar", "clamp-to-edge": "recortar", "mirror": "espejo", "mirror-repeat": "espejo"}
+
+funcion _gp_s(v) {
+    si (tipo(v) != "texto") { retornar v }
+    retornar _GP_SIN[v] ?? v
+}
+
+// ---------- adaptador y dispositivo ----------
+
+/// Adaptador (el único es el de software). opciones: "potencia" (se ignora).
+funcion gpu_adaptador(opciones) {
+    retornar {"nombre": "C-Forge software", "backend": "software", "tipo": "cpu",
+        "limites": {"textura_2d_max": 8192, "buffer_max": 268435456, "grupos_max": 4, "atributos_max": 16, "grupo_computo_max": [256, 256, 64]},
+        "caracteristicas": ["computo", "profundidad32", "instancias", "indices32"]}
+}
+
+/// Dispositivo y cola.
+funcion gpu_dispositivo(adaptador) {
+    retornar {"adaptador": adaptador, "recursos": 0, "estadisticas": {"dibujos": 0, "triangulos": 0, "fragmentos": 0, "invocaciones": 0}}
+}
+
+funcion gpu_estadisticas(dev) { retornar dev["estadisticas"] }
+
+// ---------- buffers ----------
+
+/// Buffer de números (f32 en la GPU real). opciones: "tamano" (cantidad de
+/// elementos), "uso" (lista: "vertice", "indice", "uniforme", "almacen",
+/// "copia_origen", "copia_destino", "mapa_lectura"), "contenido".
+funcion gpu_buffer(dev, opciones) {
+    sea datos = []
+    si ((opciones["contenido"] ?? nulo) != nulo) { para x en opciones["contenido"] { datos.agregar(x) } } sino {
+        sea n = opciones["tamano"] ?? 0
+        sea i = 0
+        mientras (i < n) {
+            datos.agregar(0)
+            i = i + 1
+        }
+    }
+    dev["recursos"] = dev["recursos"] + 1
+    retornar {"tipo": "buffer", "datos": datos, "uso": opciones["uso"] ?? [], "id": dev["recursos"]}
+}
+
+/// Escribe en un buffer desde un desplazamiento (en elementos).
+funcion gpu_escribir_buffer(dev, buf, desplazamiento, datos) {
+    sea i = 0
+    para x en datos {
+        sea k = desplazamiento + i
+        mientras (k >= longitud(buf["datos"])) { buf["datos"].agregar(0) }
+        buf["datos"][k] = x
+        i = i + 1
+    }
+}
+
+/// Copia del contenido de un buffer.
+funcion gpu_leer_buffer(dev, buf) {
+    sea r = []
+    para x en buf["datos"] { r.agregar(x) }
+    retornar r
+}
+
+// ---------- texturas y muestreadores ----------
+
+/// Textura 2D. opciones: "ancho", "alto", "formato" ("rgba8" (por
+/// defecto), "rgba32f", "r32f", "profundidad32f"), "uso".
+funcion gpu_textura(dev, opciones) {
+    sea ancho = opciones["ancho"]
+    sea alto = opciones["alto"]
+    sea formato = _gp_s(opciones["formato"] ?? "rgba8")
+    sea canales = 4
+    si (formato == "r32f" o formato == "profundidad32f") { canales = 1 }
+    sea inicial = 0
+    si (formato == "profundidad32f") { inicial = 1 }
+    sea datos = []
+    sea i = 0
+    mientras (i < ancho * alto * canales) {
+        datos.agregar(inicial)
+        i = i + 1
+    }
+    dev["recursos"] = dev["recursos"] + 1
+    retornar {"tipo": "textura", "ancho": ancho, "alto": alto, "formato": formato, "canales": canales, "datos": datos, "uso": opciones["uso"] ?? [], "id": dev["recursos"]}
+}
+
+/// Carga una imagen (del módulo imagen) en una textura rgba8 nueva.
+funcion gpu_textura_de_imagen(dev, img) {
+    sea t = gpu_textura(dev, {"ancho": img["ancho"], "alto": img["alto"]})
+    sea y = 0
+    mientras (y < img["alto"]) {
+        sea x = 0
+        mientras (x < img["ancho"]) {
+            sea p = imagen_pixel(img, x, y)
+            sea k = (y * img["ancho"] + x) * 4
+            t["datos"][k] = p[0] / 255
+            t["datos"][k + 1] = p[1] / 255
+            t["datos"][k + 2] = p[2] / 255
+            t["datos"][k + 3] = p[3] / 255
+            x = x + 1
+        }
+        y = y + 1
+    }
+    retornar t
+}
+
+/// Lee una textura de color como imagen RGBA de 8 bits.
+funcion gpu_textura_imagen(dev, t) {
+    sea img = imagen_nueva(t["ancho"], t["alto"])
+    sea y = 0
+    mientras (y < t["alto"]) {
+        sea x = 0
+        mientras (x < t["ancho"]) {
+            sea c = gpu_texel(t, x, y)
+            imagen_fijar_pixel(img, x, y, [_gp_byte(c[0]), _gp_byte(c[1]), _gp_byte(c[2]), _gp_byte(c[3])])
+            x = x + 1
+        }
+        y = y + 1
+    }
+    retornar img
+}
+
+funcion _gp_byte(v) { retornar minimo(255, maximo(0, piso(v * 255 + 0.5))) }
+
+/// Valor de un texel: [r, g, b, a] (o [v, 0, 0, 1] en texturas de un canal).
+funcion gpu_texel(t, x, y) {
+    sea k = (y * t["ancho"] + x) * t["canales"]
+    si (t["canales"] == 1) { retornar [t["datos"][k], 0, 0, 1] }
+    retornar [t["datos"][k], t["datos"][k + 1], t["datos"][k + 2], t["datos"][k + 3]]
+}
+
+/// Escribe un texel (desde un shader de cómputo, por ejemplo).
+funcion gpu_escribir_texel(t, x, y, c) {
+    si (x < 0 o y < 0 o x >= t["ancho"] o y >= t["alto"]) { retornar nulo }
+    sea k = (y * t["ancho"] + x) * t["canales"]
+    si (t["canales"] == 1) { t["datos"][k] = c[0] } sino {
+        t["datos"][k] = c[0]
+        t["datos"][k + 1] = c[1]
+        t["datos"][k + 2] = c[2]
+        t["datos"][k + 3] = c[3]
+    }
+}
+
+/// Muestreador. opciones: "filtro" ("lineal" o "cercano"), "direccion"
+/// ("repetir", "recortar" o "espejo").
+funcion gpu_muestreador(dev, opciones) {
+    sea op = opciones ?? {}
+    retornar {"tipo": "muestreador", "filtro": _gp_s(op["filtro"] ?? "lineal"), "direccion": _gp_s(op["direccion"] ?? "recortar")}
+}
+
+funcion _gp_dir(i, n, modo) {
+    si (modo == "repetir") { retornar ((i % n) + n) % n }
+    si (modo == "espejo") {
+        sea p = ((i % (2 * n)) + 2 * n) % (2 * n)
+        si (p >= n) { retornar 2 * n - 1 - p }
+        retornar p
+    }
+    retornar minimo(n - 1, maximo(0, i))
+}
+
+/// Muestrea una textura en coordenadas [u, v] (0 a 1).
+funcion gpu_muestrear(t, m, uv) {
+    sea w = t["ancho"]
+    sea h = t["alto"]
+    sea x = uv[0] * w - 0.5
+    sea y = uv[1] * h - 0.5
+    si (m["filtro"] == "cercano") { retornar gpu_texel(t, _gp_dir(piso(x + 0.5), w, m["direccion"]), _gp_dir(piso(y + 0.5), h, m["direccion"])) }
+    sea x0 = piso(x)
+    sea y0 = piso(y)
+    sea fx = x - x0
+    sea fy = y - y0
+    sea a = gpu_texel(t, _gp_dir(x0, w, m["direccion"]), _gp_dir(y0, h, m["direccion"]))
+    sea b = gpu_texel(t, _gp_dir(x0 + 1, w, m["direccion"]), _gp_dir(y0, h, m["direccion"]))
+    sea c = gpu_texel(t, _gp_dir(x0, w, m["direccion"]), _gp_dir(y0 + 1, h, m["direccion"]))
+    sea d = gpu_texel(t, _gp_dir(x0 + 1, w, m["direccion"]), _gp_dir(y0 + 1, h, m["direccion"]))
+    sea r = []
+    sea k = 0
+    mientras (k < 4) {
+        r.agregar((a[k] * (1 - fx) + b[k] * fx) * (1 - fy) + (c[k] * (1 - fx) + d[k] * fx) * fy)
+        k = k + 1
+    }
+    retornar r
+}
+
+// ---------- tuberías y grupos ----------
+
+/// Tubería de render. opciones: "vertice", "fragmento" (funciones),
+/// "atributos" ([{"nombre", "componentes", "desplazamiento", "ranura"}]),
+/// "pasos" (por ranura: elementos por vértice), "paso" (para la ranura 0),
+/// "por_instancia" (lista de ranuras que avanzan por instancia),
+/// "topologia" ("triangulos", "tira", "lineas", "puntos"), "descartar"
+/// ("ninguna", "atras", "frente"), "frente" ("ccw" o "cw"),
+/// "profundidad" ({"comparar": "menor"…, "escribir": bool}), "mezcla"
+/// ("reemplazar", "alfa", "aditiva", "premultiplicada").
+funcion gpu_pipeline_render(dev, opciones) {
+    sea pasos = opciones["pasos"] ?? nulo
+    si (pasos == nulo) { pasos = [opciones["paso"] ?? 0] }
+    sea attrs = []
+    para a en opciones["atributos"] ?? [] {
+        attrs.agregar({"nombre": a["nombre"] ?? a["name"], "componentes": a["componentes"] ?? (a["components"] ?? 1),
+            "desplazamiento": a["desplazamiento"] ?? (a["offset"] ?? 0), "ranura": a["ranura"] ?? (a["slot"] ?? 0)})
+    }
+    retornar {"tipo": "render", "vertice": opciones["vertice"], "fragmento": opciones["fragmento"], "atributos": attrs, "pasos": pasos,
+        "por_instancia": opciones["por_instancia"] ?? [], "topologia": _gp_s(opciones["topologia"] ?? "triangulos"), "descartar": _gp_s(opciones["descartar"] ?? "ninguna"),
+        "frente": opciones["frente"] ?? "ccw", "profundidad": _gp_prof(opciones["profundidad"] ?? nulo), "mezcla": _gp_s(opciones["mezcla"] ?? "reemplazar")}
+}
+
+funcion _gp_prof(d) {
+    si (d == nulo) { retornar nulo }
+    retornar {"comparar": _gp_s(d["comparar"] ?? (d["compare"] ?? "menor")), "escribir": d["escribir"] ?? (d["write"] ?? verdadero)}
+}
+
+/// Tubería de cómputo. opciones: "computo" (función), "grupo" ([x, y, z]).
+funcion gpu_pipeline_computo(dev, opciones) {
+    retornar {"tipo": "computo", "computo": opciones["computo"], "grupo": opciones["grupo"] ?? [1, 1, 1]}
+}
+
+/// Grupo de recursos (bind group): mapa nombre → buffer, textura,
+/// muestreador o valor.
+funcion gpu_grupo(dev, entradas) { retornar {"tipo": "grupo", "entradas": entradas} }
+
+// ---------- comandos ----------
+
+funcion gpu_codificador(dev) { retornar {"comandos": [], "abierto": nulo} }
+
+/// Empieza un pase de render. opciones: "color" (textura), "limpiar"
+/// ([r, g, b, a] o nulo para cargar), "profundidad" (textura
+/// profundidad32f), "limpiar_profundidad" (1), "vista" ([x, y, ancho, alto]),
+/// "tijera" ([x, y, ancho, alto]).
+funcion gpu_pase_render(enc, opciones) {
+    sea p = {"tipo": "pase_render", "op": opciones, "comandos": [], "enc": enc}
+    enc["comandos"].agregar(p)
+    retornar p
+}
+
+funcion gpu_pase_computo(enc) {
+    sea p = {"tipo": "pase_computo", "comandos": [], "enc": enc}
+    enc["comandos"].agregar(p)
+    retornar p
+}
+
+funcion gpu_fijar_pipeline(pase, p) { pase["comandos"].agregar(["pipeline", p]) }
+funcion gpu_fijar_grupo(pase, indice, grupo) { pase["comandos"].agregar(["grupo", indice, grupo]) }
+funcion gpu_fijar_vertices(pase, ranura, buf) { pase["comandos"].agregar(["vertices", ranura, buf]) }
+funcion gpu_fijar_indices(pase, buf) { pase["comandos"].agregar(["indices", buf]) }
+funcion gpu_dibujar(pase, vertices, instancias, primer_vertice, primera_instancia) { pase["comandos"].agregar(["dibujar", vertices, instancias ?? 1, primer_vertice ?? 0, primera_instancia ?? 0]) }
+funcion gpu_dibujar_indexado(pase, indices, instancias, primer_indice, base_vertice, primera_instancia) { pase["comandos"].agregar(["dibujar_indexado", indices, instancias ?? 1, primer_indice ?? 0, base_vertice ?? 0, primera_instancia ?? 0]) }
+funcion gpu_despachar(pase, x, y, z) { pase["comandos"].agregar(["despachar", x, y ?? 1, z ?? 1]) }
+funcion gpu_fin_pase(pase) { }
+
+/// Copia n elementos entre buffers.
+funcion gpu_copiar_buffer(enc, origen, desde, destino, hacia, n) { enc["comandos"].agregar({"tipo": "copia", "origen": origen, "desde": desde, "destino": destino, "hacia": hacia, "n": n}) }
+
+/// Cierra el codificador y devuelve el buffer de comandos.
+funcion gpu_terminar(enc) { retornar {"comandos": enc["comandos"]} }
+
+/// Ejecuta buffers de comandos en orden (la cola del dispositivo).
+funcion gpu_enviar(dev, buffers) {
+    para b en buffers {
+        para c en b["comandos"] {
+            si (c["tipo"] == "pase_render") { _gp_pase_render(dev, c) }
+            sino si (c["tipo"] == "pase_computo") { _gp_pase_computo(dev, c) }
+            sino si (c["tipo"] == "copia") {
+                sea i = 0
+                mientras (i < c["n"]) {
+                    c["destino"]["datos"][c["hacia"] + i] = c["origen"]["datos"][c["desde"] + i]
+                    i = i + 1
+                }
+            }
+        }
+    }
+}
+
+// ---------- cómputo ----------
+
+funcion _gp_recursos(grupos) {
+    sea r = {}
+    sea i = 0
+    mientras (i < longitud(grupos)) {
+        si (grupos[i] != nulo) { para k en claves(grupos[i]["entradas"]) { r[k] = grupos[i]["entradas"][k] } }
+        i = i + 1
+    }
+    retornar r
+}
+
+funcion _gp_pase_computo(dev, pase) {
+    sea p = nulo
+    sea grupos = [nulo, nulo, nulo, nulo]
+    para c en pase["comandos"] {
+        si (c[0] == "pipeline") { p = c[1] }
+        sino si (c[0] == "grupo") { grupos[c[1]] = c[2] }
+        sino si (c[0] == "despachar") {
+            si (p == nulo o p["tipo"] != "computo") { lanzar "gpu: despachar sin tubería de cómputo" }
+            sea rec = _gp_recursos(grupos)
+            sea g = p["grupo"]
+            sea f = p["computo"]
+            sea gz = 0
+            mientras (gz < c[3] * g[2]) {
+                sea gy = 0
+                mientras (gy < c[2] * g[1]) {
+                    sea gx = 0
+                    mientras (gx < c[1] * g[0]) {
+                        f([gx, gy, gz], rec)
+                        dev["estadisticas"]["invocaciones"] = dev["estadisticas"]["invocaciones"] + 1
+                        gx = gx + 1
+                    }
+                    gy = gy + 1
+                }
+                gz = gz + 1
+            }
+        }
+    }
+}
+
+// ---------- render ----------
+
+funcion _gp_vertice_entrada(p, vbs, indice, instancia) {
+    sea e = {}
+    para a en p["atributos"] {
+        sea ranura = a["ranura"] ?? 0
+        sea buf = vbs[ranura]
+        sea paso = p["pasos"][ranura] ?? 0
+        sea i = indice
+        si (contiene(p["por_instancia"], ranura)) { i = instancia }
+        sea base = i * paso + (a["desplazamiento"] ?? 0)
+        sea n = a["componentes"] ?? 1
+        si (n == 1) { e[a["nombre"]] = buf["datos"][base] } sino {
+            sea v = []
+            sea k = 0
+            mientras (k < n) {
+                v.agregar(buf["datos"][base + k])
+                k = k + 1
+            }
+            e[a["nombre"]] = v
+        }
+    }
+    retornar e
+}
+
+funcion _gp_comparar(modo, nuevo, viejo) {
+    si (modo == "menor") { retornar nuevo < viejo }
+    si (modo == "menor_igual") { retornar nuevo <= viejo }
+    si (modo == "mayor") { retornar nuevo > viejo }
+    si (modo == "mayor_igual") { retornar nuevo >= viejo }
+    si (modo == "igual") { retornar nuevo == viejo }
+    si (modo == "nunca") { retornar falso }
+    retornar verdadero
+}
+
+funcion _gp_mezclar(modo, src, dst) {
+    si (modo == "alfa") {
+        sea a = src[3]
+        retornar [src[0] * a + dst[0] * (1 - a), src[1] * a + dst[1] * (1 - a), src[2] * a + dst[2] * (1 - a), a + dst[3] * (1 - a)]
+    }
+    si (modo == "premultiplicada") {
+        sea a = src[3]
+        retornar [src[0] + dst[0] * (1 - a), src[1] + dst[1] * (1 - a), src[2] + dst[2] * (1 - a), a + dst[3] * (1 - a)]
+    }
+    si (modo == "aditiva") { retornar [src[0] + dst[0], src[1] + dst[1], src[2] + dst[2], src[3] + dst[3]] }
+    retornar src
+}
+
+funcion _gp_pase_render(dev, pase) {
+    sea op = pase["op"]
+    sea color = op["color"] ?? nulo
+    sea prof = op["profundidad"] ?? nulo
+    si ((op["limpiar"] ?? nulo) != nulo y color != nulo) {
+        sea c = op["limpiar"]
+        sea i = 0
+        sea n = color["ancho"] * color["alto"]
+        mientras (i < n) {
+            si (color["canales"] == 1) { color["datos"][i] = c[0] } sino {
+                color["datos"][i * 4] = c[0]
+                color["datos"][i * 4 + 1] = c[1]
+                color["datos"][i * 4 + 2] = c[2]
+                color["datos"][i * 4 + 3] = c[3]
+            }
+            i = i + 1
+        }
+    }
+    si (prof != nulo) {
+        sea lp = op["limpiar_profundidad"] ?? 1
+        si (lp != nulo) {
+            sea i = 0
+            mientras (i < longitud(prof["datos"])) {
+                prof["datos"][i] = lp
+                i = i + 1
+            }
+        }
+    }
+    sea destino = color
+    si (destino == nulo) { destino = prof }
+    sea vista = op["vista"] ?? [0, 0, destino["ancho"], destino["alto"]]
+    sea tijera = op["tijera"] ?? [0, 0, destino["ancho"], destino["alto"]]
+    sea ctx = {"color": color, "prof": prof, "vista": vista, "tijera": tijera}
+    sea p = nulo
+    sea grupos = [nulo, nulo, nulo, nulo]
+    sea vbs = [nulo, nulo, nulo, nulo, nulo, nulo, nulo, nulo]
+    sea ib = nulo
+    para c en pase["comandos"] {
+        si (c[0] == "pipeline") { p = c[1] }
+        sino si (c[0] == "grupo") { grupos[c[1]] = c[2] }
+        sino si (c[0] == "vertices") { vbs[c[1]] = c[2] }
+        sino si (c[0] == "indices") { ib = c[1] }
+        sino si (c[0] == "dibujar" o c[0] == "dibujar_indexado") {
+            si (p == nulo o p["tipo"] != "render") { lanzar "gpu: dibujar sin tubería de render" }
+            sea rec = _gp_recursos(grupos)
+            dev["estadisticas"]["dibujos"] = dev["estadisticas"]["dibujos"] + 1
+            sea inst = c[4]
+            si (c[0] == "dibujar_indexado") { inst = c[5] }
+            sea fin_inst = inst + c[2]
+            mientras (inst < fin_inst) {
+                // Vértices de esta instancia (con caché por índice).
+                sea lista = []
+                si (c[0] == "dibujar") {
+                    sea k = 0
+                    mientras (k < c[1]) {
+                        lista.agregar(c[3] + k)
+                        k = k + 1
+                    }
+                } sino {
+                    si (ib == nulo) { lanzar "gpu: dibujar_indexado sin buffer de índices" }
+                    sea k = 0
+                    mientras (k < c[1]) {
+                        lista.agregar(piso(ib["datos"][c[3] + k]) + c[4])
+                        k = k + 1
+                    }
+                }
+                sea cache = {}
+                sea salidas = []
+                para idx en lista {
+                    sea clave = "" + idx
+                    sea s = cache[clave] ?? nulo
+                    si (s == nulo) {
+                        s = p["vertice"](_gp_vertice_entrada(p, vbs, idx, inst), rec, inst)
+                        si (tiene_clave(s, "posicion") == falso y tiene_clave(s, "position")) {
+                            sea s2 = {}
+                            para k en claves(s) { si (k == "position") { s2["posicion"] = s[k] } sino { s2[k] = s[k] } }
+                            s = s2
+                        }
+                        cache[clave] = s
+                    }
+                    salidas.agregar(s)
+                }
+                _gp_primitivas(dev, ctx, p, rec, salidas)
+                inst = inst + 1
+            }
+        }
+    }
+}
+
+funcion _gp_primitivas(dev, ctx, p, rec, vs) {
+    sea t = p["topologia"]
+    si (t == "triangulos") {
+        sea i = 0
+        mientras (i + 2 < longitud(vs)) {
+            _gp_triangulo(dev, ctx, p, rec, vs[i], vs[i + 1], vs[i + 2])
+            i = i + 3
+        }
+    } sino si (t == "tira") {
+        sea i = 0
+        mientras (i + 2 < longitud(vs)) {
+            si (i % 2 == 0) { _gp_triangulo(dev, ctx, p, rec, vs[i], vs[i + 1], vs[i + 2]) } sino { _gp_triangulo(dev, ctx, p, rec, vs[i + 1], vs[i], vs[i + 2]) }
+            i = i + 1
+        }
+    } sino si (t == "lineas") {
+        sea i = 0
+        mientras (i + 1 < longitud(vs)) {
+            _gp_linea(dev, ctx, p, rec, vs[i], vs[i + 1])
+            i = i + 2
+        }
+    } sino si (t == "puntos") {
+        para v en vs { _gp_punto(dev, ctx, p, rec, v) }
+    }
+}
+
+funcion _gp_a_pantalla(ctx, v) {
+    sea pos = v["posicion"]
+    sea w = pos[3]
+    sea vw = ctx["vista"]
+    // NDC: x e y de -1 a 1 (y hacia arriba), z de 0 a 1 como en WebGPU.
+    retornar [vw[0] + (pos[0] / w + 1) * 0.5 * vw[2], vw[1] + (1 - pos[1] / w) * 0.5 * vw[3], pos[2] / w, 1 / w]
+}
+
+// Recorta el triángulo contra el plano cercano (w > 0 y z >= 0).
+funcion _gp_recortar(v0, v1, v2) {
+    sea entrada = [v0, v1, v2]
+    sea salida = []
+    sea n = 3
+    sea i = 0
+    mientras (i < n) {
+        sea a = entrada[i]
+        sea b = entrada[(i + 1) % n]
+        sea da = a["posicion"][2]
+        sea db = b["posicion"][2]
+        si (da >= 0) { salida.agregar(a) }
+        si ((da >= 0) != (db >= 0)) {
+            sea t = da / (da - db)
+            salida.agregar(_gp_lerp_v(a, b, t))
+        }
+        i = i + 1
+    }
+    retornar salida
+}
+
+funcion _gp_lerp_v(a, b, t) {
+    sea r = {}
+    para k en claves(a) {
+        sea x = a[k]
+        sea y = b[k]
+        si (tipo(x) == "lista") {
+            sea l = []
+            sea i = 0
+            mientras (i < longitud(x)) {
+                l.agregar(x[i] + (y[i] - x[i]) * t)
+                i = i + 1
+            }
+            r[k] = l
+        } sino si (tipo(x) == "numero") { r[k] = x + (y - x) * t } sino { r[k] = x }
+    }
+    retornar r
+}
+
+funcion _gp_triangulo(dev, ctx, p, rec, v0, v1, v2) {
+    sea poli = [v0, v1, v2]
+    si (v0["posicion"][2] < 0 o v1["posicion"][2] < 0 o v2["posicion"][2] < 0) { poli = _gp_recortar(v0, v1, v2) }
+    sea i = 1
+    mientras (i + 1 < longitud(poli)) {
+        _gp_rasterizar(dev, ctx, p, rec, poli[0], poli[i], poli[i + 1])
+        i = i + 1
+    }
+}
+
+funcion _gp_arriba_izquierda(ax, ay, bx, by) {
+    // Borde superior (horizontal) o izquierdo, según la orientación.
+    retornar (ay == by y bx > ax) o by < ay
+}
+
+funcion _gp_rasterizar(dev, ctx, p, rec, v0, v1, v2) {
+    sea a = _gp_a_pantalla(ctx, v0)
+    sea b = _gp_a_pantalla(ctx, v1)
+    sea c = _gp_a_pantalla(ctx, v2)
+    sea area = (b[0] - a[0]) * (c[1] - a[1]) - (b[1] - a[1]) * (c[0] - a[0])
+    si (area == 0) { retornar nulo }
+    // En pantalla y crece hacia abajo: área positiva = horario visto en NDC.
+    sea ccw = area < 0
+    sea frontal = ccw
+    si (p["frente"] == "cw") { frontal = ccw == falso }
+    si (p["descartar"] == "atras" y frontal == falso) { retornar nulo }
+    si (p["descartar"] == "frente" y frontal) { retornar nulo }
+    // Orden horario en pantalla para los bordes.
+    si (area < 0) {
+        sea tmp = b
+        b = c
+        c = tmp
+        sea tv = v1
+        v1 = v2
+        v2 = tv
+        area = 0 - area
+    }
+    dev["estadisticas"]["triangulos"] = dev["estadisticas"]["triangulos"] + 1
+    sea tj = ctx["tijera"]
+    sea x0 = maximo(tj[0], piso(minimo(a[0], minimo(b[0], c[0]))))
+    sea x1 = minimo(tj[0] + tj[2] - 1, techo(maximo(a[0], maximo(b[0], c[0]))))
+    sea y0 = maximo(tj[1], piso(minimo(a[1], minimo(b[1], c[1]))))
+    sea y1 = minimo(tj[1] + tj[3] - 1, techo(maximo(a[1], maximo(b[1], c[1]))))
+    sea tl0 = _gp_arriba_izquierda(b[0], b[1], c[0], c[1])
+    sea tl1 = _gp_arriba_izquierda(c[0], c[1], a[0], a[1])
+    sea tl2 = _gp_arriba_izquierda(a[0], a[1], b[0], b[1])
+    sea claves_v = []
+    para k en claves(v0) { si (k != "posicion") { claves_v.agregar(k) } }
+    sea py = y0
+    mientras (py <= y1) {
+        sea px = x0
+        mientras (px <= x1) {
+            sea cx = px + 0.5
+            sea cy = py + 0.5
+            sea w0 = (c[0] - b[0]) * (cy - b[1]) - (c[1] - b[1]) * (cx - b[0])
+            sea w1 = (a[0] - c[0]) * (cy - c[1]) - (a[1] - c[1]) * (cx - c[0])
+            sea w2 = (b[0] - a[0]) * (cy - a[1]) - (b[1] - a[1]) * (cx - a[0])
+            sea dentro = (w0 > 0 o (w0 == 0 y tl0)) y (w1 > 0 o (w1 == 0 y tl1)) y (w2 > 0 o (w2 == 0 y tl2))
+            si (dentro) {
+                sea l0 = w0 / area
+                sea l1 = w1 / area
+                sea l2 = w2 / area
+                sea z = l0 * a[2] + l1 * b[2] + l2 * c[2]
+                _gp_fragmento(dev, ctx, p, rec, px, py, z, [l0 * a[3], l1 * b[3], l2 * c[3]], [v0, v1, v2], claves_v)
+            }
+            px = px + 1
+        }
+        py = py + 1
+    }
+}
+
+funcion _gp_fragmento(dev, ctx, p, rec, px, py, z, pesos, vs, claves_v) {
+    si (z < 0 o z > 1) { retornar nulo }
+    sea prof = ctx["prof"]
+    sea pd = p["profundidad"]
+    si (prof != nulo y pd != nulo) {
+        sea k = py * prof["ancho"] + px
+        si (_gp_comparar(pd["comparar"] ?? "menor", z, prof["datos"][k]) == falso) { retornar nulo }
+    }
+    // Interpolación con corrección de perspectiva.
+    sea suma = pesos[0] + pesos[1] + pesos[2]
+    sea f = {"posicion_fragmento": [px + 0.5, py + 0.5, z]}
+    para k en claves_v {
+        sea x0 = vs[0][k]
+        si (tipo(x0) == "lista") {
+            sea l = []
+            sea i = 0
+            mientras (i < longitud(x0)) {
+                l.agregar((x0[i] * pesos[0] + vs[1][k][i] * pesos[1] + vs[2][k][i] * pesos[2]) / suma)
+                i = i + 1
+            }
+            f[k] = l
+        } sino si (tipo(x0) == "numero") { f[k] = (x0 * pesos[0] + vs[1][k] * pesos[1] + vs[2][k] * pesos[2]) / suma } sino { f[k] = x0 }
+    }
+    _gp_escribir(dev, ctx, p, rec, px, py, z, f)
+}
+
+funcion _gp_escribir(dev, ctx, p, rec, px, py, z, f) {
+    sea c = p["fragmento"](f, rec)
+    dev["estadisticas"]["fragmentos"] = dev["estadisticas"]["fragmentos"] + 1
+    si (c == nulo) { retornar nulo }
+    sea prof = ctx["prof"]
+    sea pd = p["profundidad"]
+    si (prof != nulo y pd != nulo y (pd["escribir"] ?? verdadero)) { prof["datos"][py * prof["ancho"] + px] = z }
+    sea t = ctx["color"]
+    si (t == nulo) { retornar nulo }
+    si (t["canales"] == 1) {
+        t["datos"][py * t["ancho"] + px] = c[0]
+        retornar nulo
+    }
+    sea k = (py * t["ancho"] + px) * 4
+    sea dst = [t["datos"][k], t["datos"][k + 1], t["datos"][k + 2], t["datos"][k + 3]]
+    sea r = _gp_mezclar(p["mezcla"], [c[0], c[1], c[2], c[3] ?? 1], dst)
+    // rgba8 se guarda limitado a [0, 1].
+    sea lim = t["formato"] == "rgba8"
+    sea i = 0
+    mientras (i < 4) {
+        sea v = r[i]
+        si (lim) { v = minimo(1, maximo(0, v)) }
+        t["datos"][k + i] = v
+        i = i + 1
+    }
+}
+
+funcion _gp_linea(dev, ctx, p, rec, v0, v1) {
+    si (v0["posicion"][3] <= 0 o v1["posicion"][3] <= 0) { retornar nulo }
+    sea a = _gp_a_pantalla(ctx, v0)
+    sea b = _gp_a_pantalla(ctx, v1)
+    sea n = maximo(1, techo(maximo(absoluto(b[0] - a[0]), absoluto(b[1] - a[1]))))
+    sea claves_v = []
+    para k en claves(v0) { si (k != "posicion") { claves_v.agregar(k) } }
+    sea tj = ctx["tijera"]
+    sea i = 0
+    mientras (i < n) {
+        sea t = (i + 0.5) / n
+        sea px = piso(a[0] + (b[0] - a[0]) * t)
+        sea py = piso(a[1] + (b[1] - a[1]) * t)
+        si (px >= tj[0] y py >= tj[1] y px < tj[0] + tj[2] y py < tj[1] + tj[3]) {
+            _gp_fragmento(dev, ctx, p, rec, px, py, a[2] + (b[2] - a[2]) * t, [(1 - t) * a[3], t * b[3], 0], [v0, v1, v0], claves_v)
+        }
+        i = i + 1
+    }
+}
+
+funcion _gp_punto(dev, ctx, p, rec, v) {
+    si (v["posicion"][3] <= 0) { retornar nulo }
+    sea a = _gp_a_pantalla(ctx, v)
+    sea px = piso(a[0])
+    sea py = piso(a[1])
+    sea tj = ctx["tijera"]
+    si (px < tj[0] o py < tj[1] o px >= tj[0] + tj[2] o py >= tj[1] + tj[3]) { retornar nulo }
+    sea claves_v = []
+    para k en claves(v) { si (k != "posicion") { claves_v.agregar(k) } }
+    _gp_fragmento(dev, ctx, p, rec, px, py, a[2], [a[3], 0, 0], [v, v, v], claves_v)
+}
+
+// ---------- matemática para shaders ----------
+
+/// Matriz 4×4 (por columnas, como WGSL) de perspectiva con z de 0 a 1.
+funcion gpu_perspectiva(fov_y, aspecto, cerca, lejos) {
+    sea f = 1 / tangente(fov_y / 2)
+    sea nf = 1 / (cerca - lejos)
+    retornar [f / aspecto, 0, 0, 0, 0, f, 0, 0, 0, 0, lejos * nf, -1, 0, 0, cerca * lejos * nf, 0]
+}
+
+/// Matriz de vista que mira desde ojo hacia centro.
+funcion gpu_mirar(ojo, centro, arriba) {
+    sea f = _gp_norm([centro[0] - ojo[0], centro[1] - ojo[1], centro[2] - ojo[2]])
+    sea s = _gp_norm(_gp_cruz(f, arriba))
+    sea u = _gp_cruz(s, f)
+    retornar [s[0], u[0], 0 - f[0], 0, s[1], u[1], 0 - f[1], 0, s[2], u[2], 0 - f[2], 0,
+        0 - _gp_pe(s, ojo), 0 - _gp_pe(u, ojo), _gp_pe(f, ojo), 1]
+}
+
+funcion _gp_norm(v) {
+    sea l = raiz(v[0] * v[0] + v[1] * v[1] + v[2] * v[2])
+    retornar [v[0] / l, v[1] / l, v[2] / l]
+}
+funcion _gp_cruz(a, b) { retornar [a[1] * b[2] - a[2] * b[1], a[2] * b[0] - a[0] * b[2], a[0] * b[1] - a[1] * b[0]] }
+funcion _gp_pe(a, b) { retornar a[0] * b[0] + a[1] * b[1] + a[2] * b[2] }
+
+/// Producto de matrices 4×4 por columnas (a · b).
+funcion gpu_mat_mul(a, b) {
+    sea r = []
+    sea c = 0
+    mientras (c < 4) {
+        sea f = 0
+        mientras (f < 4) {
+            sea s = 0
+            sea k = 0
+            mientras (k < 4) {
+                s = s + a[k * 4 + f] * b[c * 4 + k]
+                k = k + 1
+            }
+            r.agregar(s)
+            f = f + 1
+        }
+        c = c + 1
+    }
+    retornar r
+}
+
+/// Matriz por vector [x, y, z, w].
+funcion gpu_mat_vec(m, v) {
+    retornar [m[0] * v[0] + m[4] * v[1] + m[8] * v[2] + m[12] * v[3], m[1] * v[0] + m[5] * v[1] + m[9] * v[2] + m[13] * v[3],
+        m[2] * v[0] + m[6] * v[1] + m[10] * v[2] + m[14] * v[3], m[3] * v[0] + m[7] * v[1] + m[11] * v[2] + m[15] * v[3]]
+}
+
+funcion gpu_traslacion(x, y, z) { retornar [1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1, 0, x, y, z, 1] }
+funcion gpu_rotacion_y(a) { retornar [coseno(a), 0, 0 - seno(a), 0, 0, 1, 0, 0, seno(a), 0, coseno(a), 0, 0, 0, 0, 1] }

@@ -1,0 +1,187 @@
+// Pruebas de gpu (API al estilo wgpu con backend de software).
+importar "gpu"
+funcion eq(a, b, q) { afirmar(("" + a) == ("" + b), q + ": [" + a + "] != [" + b + "]") }
+funcion cerca(a, b, tol, q) { afirmar(absoluto(a - b) <= tol, q + ": " + a + " vs " + b) }
+
+sea ad = gpu_adaptador(nulo)
+eq([ad["backend"], contiene(ad["caracteristicas"], "computo")], ["software", verdadero], "adaptador")
+sea dev = gpu_dispositivo(ad)
+
+// Pipeline 2D simple: posición y color por vértice.
+sea p2d = gpu_pipeline_render(dev, {
+    "atributos": [{"nombre": "pos", "componentes": 2, "desplazamiento": 0}, {"nombre": "col", "componentes": 4, "desplazamiento": 2}], "paso": 6,
+    "vertice": funcion(v, r, inst) { retornar {"posicion": [v["pos"][0], v["pos"][1], 0.5, 1], "col": v["col"]} },
+    "fragmento": funcion(f, r) { retornar f["col"] }, "mezcla": "aditiva"})
+funcion dibujar(t, pipeline, vb, n, limpiar) {
+    sea enc = gpu_codificador(dev)
+    sea pase = gpu_pase_render(enc, {"color": t, "limpiar": limpiar})
+    gpu_fijar_pipeline(pase, pipeline)
+    gpu_fijar_vertices(pase, 0, vb)
+    gpu_dibujar(pase, n, 1, 0, 0)
+    gpu_fin_pase(pase)
+    gpu_enviar(dev, [gpu_terminar(enc)])
+}
+// Dos triángulos que comparten la diagonal: con mezcla aditiva cada píxel
+// del cuadrado recibe exactamente un fragmento (regla arriba-izquierda).
+sea t = gpu_textura(dev, {"ancho": 16, "alto": 16, "formato": "rgba32f"})
+sea quad = gpu_buffer(dev, {"uso": ["vertice"], "contenido": [
+    -0.5, -0.5, 0.25, 0, 0, 1,  0.5, -0.5, 0.25, 0, 0, 1,  0.5, 0.5, 0.25, 0, 0, 1,
+    -0.5, -0.5, 0.25, 0, 0, 1,  0.5, 0.5, 0.25, 0, 0, 1,  -0.5, 0.5, 0.25, 0, 0, 1]})
+dibujar(t, p2d, quad, 6, [0, 0, 0, 0])
+sea suma = 0
+sea mal = 0
+sea fy = 0
+mientras (fy < 16) {
+    sea x = 0
+    mientras (x < 16) {
+        sea v = gpu_texel(t, x, fy)[0]
+        suma = suma + v
+        si (v != 0 y v != 0.25) { mal = mal + 1 }
+        x = x + 1
+    }
+    fy = fy + 1
+}
+eq([suma, mal], [16, 0], "regla arriba-izquierda: 64 píxeles, ninguno doble")
+eq([gpu_texel(t, 4, 4)[0], gpu_texel(t, 11, 11)[0], gpu_texel(t, 3, 4)[0], gpu_texel(t, 12, 4)[0]], [0.25, 0.25, 0, 0], "bordes del cuadrado")
+eq(gpu_estadisticas(dev)["fragmentos"], 64, "fragmentos")
+
+// Descarte de caras: el mismo triángulo en sentido horario no se dibuja.
+sea pcull = gpu_pipeline_render(dev, {"atributos": [{"nombre": "pos", "componentes": 2}], "paso": 2, "descartar": "atras",
+    "vertice": funcion(v, r, i) { retornar {"posicion": [v["pos"][0], v["pos"][1], 0, 1]} }, "fragmento": funcion(f, r) { retornar [1, 1, 1, 1] }})
+sea t2 = gpu_textura(dev, {"ancho": 8, "alto": 8})
+dibujar(t2, pcull, gpu_buffer(dev, {"contenido": [-1, -1, 1, -1, 0, 1]}), 3, [0, 0, 0, 1])
+eq(gpu_texel(t2, 4, 4), [1, 1, 1, 1], "antihorario: de frente")
+dibujar(t2, pcull, gpu_buffer(dev, {"contenido": [-1, -1, 0, 1, 1, -1]}), 3, [0, 0, 0, 1])
+eq(gpu_texel(t2, 4, 4), [0, 0, 0, 1], "horario: descartado")
+
+// Profundidad: lo más cercano gana aunque se dibuje primero.
+sea pz = gpu_pipeline_render(dev, {"atributos": [{"nombre": "p", "componentes": 3}, {"nombre": "c", "componentes": 3, "desplazamiento": 3}], "paso": 6,
+    "profundidad": {"comparar": "menor", "escribir": verdadero},
+    "vertice": funcion(v, r, i) { retornar {"posicion": [v["p"][0], v["p"][1], v["p"][2], 1], "c": v["c"]} },
+    "fragmento": funcion(f, r) { retornar [f["c"][0], f["c"][1], f["c"][2], 1] }})
+sea tc = gpu_textura(dev, {"ancho": 8, "alto": 8})
+sea tz = gpu_textura(dev, {"ancho": 8, "alto": 8, "formato": "profundidad32f"})
+sea cerca_vb = gpu_buffer(dev, {"contenido": [-1, -1, 0.2, 1, 0, 0,  3, -1, 0.2, 1, 0, 0,  -1, 3, 0.2, 1, 0, 0]})
+sea lejos_vb = gpu_buffer(dev, {"contenido": [-1, -1, 0.8, 0, 1, 0,  3, -1, 0.8, 0, 1, 0,  -1, 3, 0.8, 0, 1, 0]})
+sea enc = gpu_codificador(dev)
+sea pase = gpu_pase_render(enc, {"color": tc, "limpiar": [0, 0, 0, 1], "profundidad": tz})
+gpu_fijar_pipeline(pase, pz)
+gpu_fijar_vertices(pase, 0, cerca_vb)
+gpu_dibujar(pase, 3, 1, 0, 0)
+gpu_fijar_vertices(pase, 0, lejos_vb)
+gpu_dibujar(pase, 3, 1, 0, 0)
+gpu_fin_pase(pase)
+gpu_enviar(dev, [gpu_terminar(enc)])
+eq([gpu_texel(tc, 3, 3), gpu_texel(tz, 3, 3)[0]], [[1, 0, 0, 1], 0.2], "prueba de profundidad")
+
+// Índices e instancias: 4 cuadrados desplazados por instancia.
+sea pinst = gpu_pipeline_render(dev, {
+    "atributos": [{"nombre": "pos", "componentes": 2, "ranura": 0}, {"nombre": "off", "componentes": 2, "ranura": 1}],
+    "pasos": [2, 2], "por_instancia": [1], "mezcla": "aditiva",
+    "vertice": funcion(v, r, i) { retornar {"posicion": [v["pos"][0] + v["off"][0], v["pos"][1] + v["off"][1], 0, 1], "i": i} },
+    "fragmento": funcion(f, r) { retornar [1, f["i"], 0, 1] }})
+sea ti = gpu_textura(dev, {"ancho": 8, "alto": 8, "formato": "rgba32f"})
+sea vq = gpu_buffer(dev, {"contenido": [0, 0, 0.5, 0, 0.5, 0.5, 0, 0.5]})
+sea ix = gpu_buffer(dev, {"uso": ["indice"], "contenido": [0, 1, 2, 0, 2, 3]})
+sea offs = gpu_buffer(dev, {"contenido": [-1, -1, -0.5, -1, 0, 0, 0.5, 0.5]})
+enc = gpu_codificador(dev)
+pase = gpu_pase_render(enc, {"color": ti, "limpiar": [0, 0, 0, 0]})
+gpu_fijar_pipeline(pase, pinst)
+gpu_fijar_vertices(pase, 0, vq)
+gpu_fijar_vertices(pase, 1, offs)
+gpu_fijar_indices(pase, ix)
+gpu_dibujar_indexado(pase, 6, 4, 0, 0, 0)
+gpu_fin_pase(pase)
+gpu_enviar(dev, [gpu_terminar(enc)])
+sea total = 0
+fy = 0
+mientras (fy < 8) {
+    sea x = 0
+    mientras (x < 8) {
+        total = total + gpu_texel(ti, x, fy)[0]
+        x = x + 1
+    }
+    fy = fy + 1
+}
+eq([total, gpu_texel(ti, 0, 7), gpu_texel(ti, 2, 7), gpu_texel(ti, 4, 3), gpu_texel(ti, 6, 1)], [16, [1, 0, 0, 1], [1, 1, 0, 1], [1, 2, 0, 1], [1, 3, 0, 1]], "índices e instancias")
+
+// Perspectiva: un piso con coordenadas de textura; la interpolación corrige
+// la perspectiva (la línea u = 0,5 cae en el centro en toda la altura).
+sea proy = gpu_perspectiva(1.2, 1, 0.1, 100)
+sea vista = gpu_mirar([0, 1, 2], [0, 0, -2], [0, 1, 0])
+sea mvp = gpu_mat_mul(proy, vista)
+sea ppers = gpu_pipeline_render(dev, {"atributos": [{"nombre": "p", "componentes": 3}, {"nombre": "uv", "componentes": 2, "desplazamiento": 3}], "paso": 5,
+    "vertice": funcion(v, r, i) { retornar {"posicion": gpu_mat_vec(r["mvp"], [v["p"][0], v["p"][1], v["p"][2], 1]), "uv": v["uv"]} },
+    "fragmento": funcion(f, r) {
+        sea u = f["uv"][0]
+        si (u < 0.5) { retornar [1, 0, 0, 1] }
+        retornar [0, 0, 1, 1]
+    }})
+sea piso_vb = gpu_buffer(dev, {"contenido": [-1, 0, 4, 0, 0,  1, 0, 4, 1, 0,  1, 0, -6, 1, 1,  -1, 0, 4, 0, 0,  1, 0, -6, 1, 1,  -1, 0, -6, 0, 1]})
+sea tp = gpu_textura(dev, {"ancho": 32, "alto": 32})
+enc = gpu_codificador(dev)
+pase = gpu_pase_render(enc, {"color": tp, "limpiar": [0, 0, 0, 1]})
+gpu_fijar_pipeline(pase, ppers)
+gpu_fijar_grupo(pase, 0, gpu_grupo(dev, {"mvp": mvp}))
+gpu_fijar_vertices(pase, 0, piso_vb)
+gpu_dibujar(pase, 6, 1, 0, 0)
+gpu_fin_pase(pase)
+gpu_enviar(dev, [gpu_terminar(enc)])
+// En cada fila con piso, el cambio de rojo a azul está en x = 16.
+sea filas = 0
+fy = 0
+mientras (fy < 32) {
+    si (gpu_texel(tp, 15, fy)[0] == 1 y gpu_texel(tp, 16, fy)[2] == 1) { filas = filas + 1 }
+    fy = fy + 1
+}
+afirmar(filas > 8, "corrección de perspectiva en " + filas + " filas")
+// Recorte contra el plano cercano: vértices detrás de la cámara no rompen nada.
+eq(gpu_texel(tp, 16, 31)[2], 1, "triángulo recortado")
+
+// Textura y muestreador.
+sea tex = gpu_textura(dev, {"ancho": 2, "alto": 2})
+gpu_escribir_texel(tex, 0, 0, [1, 0, 0, 1])
+gpu_escribir_texel(tex, 1, 0, [0, 1, 0, 1])
+gpu_escribir_texel(tex, 0, 1, [0, 0, 1, 1])
+gpu_escribir_texel(tex, 1, 1, [1, 1, 1, 1])
+sea cercano = gpu_muestreador(dev, {"filtro": "cercano"})
+sea lineal = gpu_muestreador(dev, {"filtro": "lineal", "direccion": "repetir"})
+eq([gpu_muestrear(tex, cercano, [0.1, 0.1]), gpu_muestrear(tex, cercano, [0.9, 0.9])], [[1, 0, 0, 1], [1, 1, 1, 1]], "muestreo cercano")
+eq(gpu_muestrear(tex, lineal, [0.5, 0.5]), [0.5, 0.5, 0.5, 1], "muestreo lineal al centro")
+eq(gpu_muestrear(tex, lineal, [1.25, 0.25]), gpu_muestrear(tex, lineal, [0.25, 0.25]), "repetir")
+
+// Cómputo: duplica un buffer y procesa una imagen.
+sea datos = gpu_buffer(dev, {"uso": ["almacen"], "contenido": [1, 2, 3, 4, 5, 6, 7, 8, 9, 10]})
+sea resultado = gpu_buffer(dev, {"uso": ["almacen", "copia_origen"], "tamano": 10})
+sea pc = gpu_pipeline_computo(dev, {"grupo": [4, 1, 1], "computo": funcion(id, r) {
+    si (id[0] < longitud(r["entrada"]["datos"])) { r["salida"]["datos"][id[0]] = r["entrada"]["datos"][id[0]] * 2 }
+}})
+enc = gpu_codificador(dev)
+sea pcomp = gpu_pase_computo(enc)
+gpu_fijar_pipeline(pcomp, pc)
+gpu_fijar_grupo(pcomp, 0, gpu_grupo(dev, {"entrada": datos, "salida": resultado}))
+gpu_despachar(pcomp, 3, 1, 1)
+gpu_fin_pase(pcomp)
+sea copia = gpu_buffer(dev, {"tamano": 10})
+gpu_copiar_buffer(enc, resultado, 0, copia, 0, 10)
+gpu_enviar(dev, [gpu_terminar(enc)])
+eq(gpu_leer_buffer(dev, copia), [2, 4, 6, 8, 10, 12, 14, 16, 18, 20], "cómputo y copia")
+eq(gpu_estadisticas(dev)["invocaciones"], 12, "invocaciones (3 grupos de 4)")
+sea img_t = gpu_textura(dev, {"ancho": 4, "alto": 4})
+gpu_escribir_texel(img_t, 1, 2, [0.25, 0.5, 1, 1])
+sea pinv = gpu_pipeline_computo(dev, {"grupo": [2, 2, 1], "computo": funcion(id, r) {
+    sea c = gpu_texel(r["img"], id[0], id[1])
+    gpu_escribir_texel(r["img"], id[0], id[1], [1 - c[0], 1 - c[1], 1 - c[2], c[3]])
+}})
+enc = gpu_codificador(dev)
+pcomp = gpu_pase_computo(enc)
+gpu_fijar_pipeline(pcomp, pinv)
+gpu_fijar_grupo(pcomp, 0, gpu_grupo(dev, {"img": img_t}))
+gpu_despachar(pcomp, 2, 2, 1)
+gpu_enviar(dev, [gpu_terminar(enc)])
+eq([gpu_texel(img_t, 1, 2), gpu_texel(img_t, 0, 0)], [[0.75, 0.5, 0, 1], [1, 1, 1, 0]], "cómputo sobre textura")
+// Imagen de salida.
+sea img = gpu_textura_imagen(dev, tc)
+eq(imagen_pixel(img, 3, 3), [255, 0, 0, 255], "textura a imagen")
+eq(gpu_texel(gpu_textura_de_imagen(dev, img), 3, 3), [1, 0, 0, 1], "imagen a textura")
+mostrar("[OK] gpu")
