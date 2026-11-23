@@ -1,0 +1,139 @@
+// Pruebas de certifica (ACME). De punta a punta se probó aparte contra
+// Pebble (cuenta, http-01 validado de verdad, finalizar, bajar la cadena que
+// openssl verifica y revocar). Aquí: criptografía con vectores conocidos y
+// un servidor ACME de mentira que comprueba cada firma.
+importar "certifica"
+importar "json"
+funcion eq(a, b, q) { afirmar(("" + a) == ("" + b), q + ": [" + a + "] != [" + b + "]") }
+// Clave de RFC 6979 (A.2.5) y firma hecha con la biblioteca cryptography.
+sea priv = bytes_de_hex("c9afa9d845ba75166b5c215767b1d6934e50c3db36e89b127b8a622b120f6721")
+sea k = certifica_claves(priv)
+eq(hex_de_bytes(k["x"]), "60fed4ba255a9d31c961eb74c6356d68c049b8923b61fa6ce669622e60f29fb6", "pública x")
+eq(hex_de_bytes(k["y"]), "7903fe1008b8bc99a41ae9e95628bc64f2f1b20c2d7e9f5177a3c294d4462299", "pública y")
+sea ajena = bytes_de_hex("188c791d888e7d422f84bd7db1e0efa6966adcc5dacd2a1d33f4f7ee994a18663df896dd8824a99ffb0fc68ebd9c1bb8305b28f3c488f216c602f0832fc2e374")
+eq(certifica_verificar(k, "sample", ajena), verdadero, "verifica firma de cryptography")
+eq(certifica_verificar(k, "samplf", ajena), falso, "otro mensaje")
+sea f = certifica_firmar(k, "hola")
+eq([longitud(f), certifica_verificar(k, "hola", f)], [64, verdadero], "firma propia")
+// PEM: PKCS#8 de cryptography, y SEC1 de ida y vuelta.
+sea pkcs8 = "-----BEGIN PRIVATE KEY-----\nMIGHAgEAMBMGByqGSM49AgEGCCqGSM49AwEHBG0wawIBAQQgya+p2EW6dRZrXCFX\nZ7HWk05Qw9s26JsSe4piKxIPZyGhRANCAARg/tS6JVqdMclh63TGNW1owEm4kjth\n+mzmaWIuYPKftnkD/hAIuLyZpBrp6VYovGTy8bIMLX6fUXejwpTURiKZ\n-----END PRIVATE KEY-----\n"
+eq(certifica_leer_clave(pkcs8)["privada"] == priv, verdadero, "PKCS#8")
+sea pem = certifica_clave_pem(k)
+afirmar(texto_empieza_con(pem, "-----BEGIN EC PRIVATE KEY-----"), "SEC1")
+eq(certifica_leer_clave(pem)["y"] == k["y"], verdadero, "SEC1 de vuelta")
+afirmar(contiene(certifica_publica_pem(k), "BEGIN PUBLIC KEY"), "pública PEM")
+// Huella RFC 7638 (calculada con Python).
+eq(certifica_huella(k), "DOvxvJiAdIqVWIkFt5hDtCunXLF0BV4-JGv4f-ALSm0", "huella JWK")
+// CSR: estructura y firma.
+sea csr = certifica_csr(k, ["ejemplo.com", "www.ejemplo.com"])
+sea raiz = _ce_leer(csr, 0)
+sea partes = _ce_hijos(csr, raiz)
+eq(longitud(partes), 3, "CSR: info, algoritmo y firma")
+afirmar(contiene(csr, "www.ejemplo.com") y contiene(csr, "ejemplo.com"), "SAN")
+sea firma_der = _ce_contenido(csr, partes[2])
+sea fd = subtexto(firma_der, 1, longitud(firma_der))
+sea rs = _ce_hijos(fd, _ce_leer(fd, 0))
+sea r_ = _ce_contenido(fd, rs[0])
+sea s_ = _ce_contenido(fd, rs[1])
+mientras (longitud(r_) > 32) { r_ = subtexto(r_, 1, longitud(r_)) }
+mientras (longitud(s_) > 32) { s_ = subtexto(s_, 1, longitud(s_)) }
+mientras (longitud(r_) < 32) { r_ = char_de(0) + r_ }
+mientras (longitud(s_) < 32) { s_ = char_de(0) + s_ }
+sea tlv_info = subtexto(csr, raiz[1], partes[0][1] + partes[0][2])
+eq(certifica_verificar(k, tlv_info, r_ + s_), verdadero, "firma de la CSR")
+
+// Servidor ACME de mentira: verifica cada JWS y lleva el estado.
+sea S = {"nonce": 0, "cuentas": {}, "estado_authz": "pending", "estado_pedido": "pending", "llamadas": [], "malos": 0, "rechazar_nonce": 1}
+sea B = "https://acme.prueba"
+funcion resp(estado, cuerpo, extra, S) {
+    S["nonce"] = S["nonce"] + 1
+    sea c = {"Replay-Nonce": "n" + S["nonce"], "Content-Type": "application/json"}
+    para k2 en claves(extra ?? {}) { c[k2] = extra[k2] }
+    sea t = cuerpo
+    si (tipo(cuerpo) != "texto") { t = json_texto(cuerpo) }
+    retornar {"estado": estado, "cabeceras": c, "cuerpo": t}
+}
+funcion b64d(t) {
+    sea x = texto_reemplazar(texto_reemplazar(t, "-", "+"), "_", "/")
+    mientras (longitud(x) % 4 != 0) { x = x + "=" }
+    retornar base64_decodificar(x)
+}
+funcion falso_acme(S, B, m, url, cab, cuerpo) {
+    S["llamadas"].agregar(m + " " + url)
+    si (url == B + "/dir") { retornar resp(200, {"newNonce": B + "/nonce", "newAccount": B + "/cuenta", "newOrder": B + "/pedido", "revokeCert": B + "/revocar"}, nulo, S) }
+    si (url == B + "/nonce") { retornar resp(200, "", nulo, S) }
+    sea j = json_parsear(cuerpo)
+    sea prot = json_parsear(b64d(j["protected"]))
+    afirmar(prot["url"] == url, "url firmada")
+    afirmar(prot["alg"] == "ES256", "alg")
+    // Rechaza el primer nonce para probar el reintento.
+    si (S["rechazar_nonce"] > 0) {
+        S["rechazar_nonce"] = 0
+        retornar resp(400, {"type": "urn:ietf:params:acme:error:badNonce", "detail": "otra vez"}, nulo, S)
+    }
+    sea jwk = nulo
+    si (tiene_clave(prot, "jwk")) { jwk = prot["jwk"] } sino { jwk = S["cuentas"][prot["kid"]] }
+    sea pub = {"x": b64d(jwk["x"]), "y": b64d(jwk["y"])}
+    si (certifica_verificar(pub, j["protected"] + "." + j["payload"], b64d(j["signature"])) == falso) {
+        S["malos"] = S["malos"] + 1
+        retornar resp(400, {"type": "urn:ietf:params:acme:error:malformed", "detail": "firma"}, nulo, S)
+    }
+    sea carga = nulo
+    si (j["payload"] != "") { carga = json_parsear(b64d(j["payload"])) }
+    si (url == B + "/cuenta") {
+        S["cuentas"][B + "/cuenta/1"] = jwk
+        retornar resp(201, {"status": "valid"}, {"Location": B + "/cuenta/1"}, S)
+    }
+    si (url == B + "/pedido") { retornar resp(201, {"status": "pending", "authorizations": [B + "/authz/1"], "finalize": B + "/fin/1"}, {"Location": B + "/pedidos/1"}, S) }
+    si (url == B + "/authz/1") {
+        retornar resp(200, {"status": S["estado_authz"], "identifier": {"type": "dns", "value": "ejemplo.com"},
+            "challenges": [{"type": "http-01", "url": B + "/chal/1", "token": "tok", "status": "pending"}, {"type": "dns-01", "url": B + "/chal/2", "token": "tok2", "status": "pending"}]}, nulo, S)
+    }
+    si (url == B + "/chal/1") {
+        S["estado_authz"] = "valid"
+        S["estado_pedido"] = "ready"
+        retornar resp(200, {"status": "processing"}, nulo, S)
+    }
+    si (url == B + "/pedidos/1") {
+        sea o2 = {"status": S["estado_pedido"], "finalize": B + "/fin/1"}
+        si (S["estado_pedido"] == "valid") { o2["certificate"] = B + "/cert/1" }
+        retornar resp(200, o2, nulo, S)
+    }
+    si (url == B + "/fin/1") {
+        S["csr"] = carga["csr"]
+        S["estado_pedido"] = "valid"
+        retornar resp(200, {"status": "processing", "finalize": B + "/fin/1"}, nulo, S)
+    }
+    si (url == B + "/cert/1") {
+        sea r = resp(200, "-----BEGIN CERTIFICATE-----\nAAAA\n-----END CERTIFICATE-----\n", nulo, S)
+        r["cabeceras"]["Content-Type"] = "application/pem-certificate-chain"
+        retornar r
+    }
+    retornar resp(404, {"type": "x", "detail": "no"}, nulo, S)
+}
+sea c = certifica_cliente(B + "/dir", {"transporte": funcion(m, u, cb, cu) { retornar falso_acme(S, B, m, u, cb, cu) }, "espera_ms": 1})
+sea cu = certifica_cuenta(c, {"contacto": ["mailto:a@b.c"]})
+eq([cu["url"], cu["nueva"]], [B + "/cuenta/1", verdadero], "cuenta")
+sea publicado = {}
+sea res = certifica_emitir(c, ["ejemplo.com"], funcion(d) {
+    publicado["ruta"] = d["ruta"]
+    publicado["ka"] = d["clave_autorizacion"]
+    publicado["dns"] = d["valor_dns"]
+}, nulo)
+eq(publicado["ruta"], "/.well-known/acme-challenge/tok", "ruta http-01")
+eq(publicado["ka"], "tok." + certifica_huella(c["clave"]), "clave de autorización")
+eq(res["certificado"], "-----BEGIN CERTIFICATE-----\nAAAA\n-----END CERTIFICATE-----\n", "certificado")
+eq(S["malos"], 0, "todas las firmas válidas")
+afirmar(longitud(S["csr"]) > 100, "CSR enviada")
+afirmar(contiene(S["llamadas"], "HEAD " + B + "/nonce"), "nonce pedido")
+// dns-01: el valor es base64url(SHA-256(clave de autorización)).
+sea p2 = certifica_pedido(c, ["ejemplo.com"])
+S["estado_authz"] = "pending"
+sea ds = certifica_desafios(c, p2)
+eq([longitud(ds), ds[1]["tipo"], ds[1]["nombre_dns"]], [2, "dns-01", "_acme-challenge.ejemplo.com"], "desafíos")
+eq(ds[1]["valor_dns"], _ce_b64u(sha256_bytes(ds[1]["clave_autorizacion"])), "valor dns-01")
+// Errores del servidor llegan con su tipo.
+sea err = ""
+intentar { _ce_post(c, B + "/nada", {}, falso) } capturar (e) { err = "" + e }
+afirmar(contiene(err, "certifica: x: no"), "error del servidor")
+mostrar("[OK] certifica")

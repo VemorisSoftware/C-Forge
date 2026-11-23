@@ -1,0 +1,196 @@
+// Pruebas de sombreador (WGSL a GLSL, MSL, HLSL y WGSL). Las salidas se
+// comprobaron aparte con glslangValidator (GLSL y HLSL) y naga (WGSL).
+importar "sombreador"
+funcion eq(a, b, q) { afirmar(("" + a) == ("" + b), q + ": [" + a + "] != [" + b + "]") }
+funcion tiene(t, sub, q) { afirmar(contiene(t, sub), q + ": falta [" + sub + "] en\n" + t) }
+
+sea w = "struct VSOut {
+    @builtin(position) pos: vec4<f32>,
+    @location(0) color: vec3<f32>,
+    @location(1) @interpolate(flat) id: u32,
+}
+struct Uniforms { mvp: mat4x4<f32>, tint: vec4<f32>, time: f32, }
+@group(0) @binding(0) var<uniform> u: Uniforms;
+@group(0) @binding(1) var tex: texture_2d<f32>;
+@group(0) @binding(2) var samp: sampler;
+const PI: f32 = 3.14159265;
+fn ondular(x: f32) -> f32 { return sin(x * PI) * 0.5 + 0.5; }
+@vertex
+fn vs_main(@builtin(vertex_index) vi: u32, @location(0) pos: vec3<f32>, @location(1) col: vec3f) -> VSOut {
+    var o: VSOut;
+    let k = ondular(u.time + f32(vi));
+    o.pos = u.mvp * vec4<f32>(pos * k, 1.0);
+    o.color = col;
+    o.id = vi % 3u;
+    return o;
+}
+@fragment
+fn fs_main(in: VSOut) -> @location(0) vec4<f32> {
+    let uv = in.pos.xy / 512.0;
+    var c = textureSample(tex, samp, uv).rgb * in.color;
+    if (in.id == 0u) { c = c * 2.0; } else if (in.id == 1u) { c = vec3(c.r, 0.0, c.b); }
+    var acc = 0.0;
+    for (var i = 0; i < 4; i++) {
+        if (i == 2) { continue; }
+        acc += f32(i) * 0.25;
+    }
+    let m = select(0.0, 1.0, acc > 0.5);
+    return vec4<f32>(clamp(c, vec3(0.0), vec3(1.0)) * u.tint.rgb, m) + vec4(f32(in.id) % 2.0);
+}"
+
+// Reflexión.
+eq(sombreador_validar(w), [], "válido")
+sea ents = sombreador_entradas(w)
+eq([ents[0]["nombre"], ents[0]["etapa"], ents[1]["nombre"], ents[1]["etapa"]], ["vs_main", "vertex", "fs_main", "fragment"], "entradas")
+sea en = sombreador_enlaces(w)
+eq(longitud(en), 3, "tres enlaces")
+eq([en[0]["nombre"], en[0]["clase"], en[1]["clase"], en[2]["clase"], en[1]["tipo"]], ["u", "uniform", "textura", "muestreador", "texture_2d<f32>"], "clases")
+eq([en[0]["ranura_msl"], en[1]["ranura_msl"], en[2]["ranura_msl"], en[2]["tipo_msl"]], [0, 0, 0, "sampler"], "ranuras MSL")
+
+// GLSL de Vulkan.
+sea vs = sombreador_traducir(w, "glsl", {"entrada": "vs_main"})
+tiene(vs, "#version 450", "versión")
+tiene(vs, "layout(std140, set = 0, binding = 0) uniform Uniforms_u {", "bloque uniform")
+tiene(vs, "layout(location = 0) in vec3 _sb_in0;", "atributo")
+tiene(vs, "layout(location = 1) flat out uint _sb_out1;", "varying plano")
+tiene(vs, "o.pos = (u.mvp * vec4((pos * k), 1.0));", "matriz por vector")
+tiene(vs, "uint _sb_p0 = uint(gl_VertexIndex);", "vertex_index")
+tiene(vs, "gl_Position = _sb_r.pos;", "posición")
+tiene(vs, "const float PI = 3.14159265;", "constante")
+afirmar(contiene(vs, "texture(") == falso, "solo lo que usa la entrada")
+sea fs = sombreador_traducir(w, "glsl", {"entrada": "fs_main"})
+tiene(fs, "layout(set = 0, binding = 1) uniform texture2D tex;", "textura")
+tiene(fs, "texture(sampler2D(tex, samp), uv).rgb", "muestreo")
+tiene(fs, "((acc > 0.5) ? 1.0 : 0.0)", "select")
+tiene(fs, "for (int i = 0; i < 4; i += 1) {", "for")
+tiene(fs, " - 2.0 * trunc(", "módulo de flotantes")
+tiene(fs, "VSOut _sb_p0 = VSOut(gl_FragCoord, _sb_in0, _sb_in1);", "entrada en struct")
+// GLSL ES 3.0: muestreadores combinados y varyings por nombre.
+sea es = sombreador_traducir(w, "glsl", {"entrada": "fs_main", "version": "300 es"})
+tiene(es, "#version 300 es", "es")
+tiene(es, "uniform highp sampler2D _sb_tex_samp;", "combinado")
+tiene(es, "texture(_sb_tex_samp, uv)", "muestreo combinado")
+tiene(es, "flat in uint _sb_vary1;", "varying por nombre")
+sea fallo = nulo
+intentar { sombreador_traducir(w, "glsl", nulo) } capturar (e) { fallo = "" + e }
+tiene(fallo, "varias entradas", "falta la entrada")
+
+// MSL.
+sea msl = sombreador_traducir(w, "msl", nulo)
+tiene(msl, "#include <metal_stdlib>", "cabecera")
+tiene(msl, "vertex vs_main_Salida vs_main(", "entrada de vértice")
+tiene(msl, "float3 _sb_l0 [[attribute(0)]];", "atributo MSL")
+tiene(msl, "uint _sb_s2 [[user(loc1), flat]];", "varying MSL")
+tiene(msl, "constant Uniforms& u [[buffer(0)]]", "buffer")
+tiene(msl, "metal::texture2d<float, metal::access::sample> tex [[texture(0)]]", "textura MSL")
+tiene(msl, "tex.sample(samp, uv)", "muestreo MSL")
+tiene(msl, "metal::select(0.0, 1.0, (acc > 0.5))", "select MSL")
+tiene(msl, "float ondular(float x)", "función")
+tiene(msl, "VSOut _sb_vs_main(uint vi, float3 pos, float3 col, constant Uniforms& u)", "recursos como parámetros")
+tiene(msl, "metal::fmod(", "fmod")
+
+// HLSL.
+sea hl = sombreador_traducir(w, "hlsl", nulo)
+tiene(hl, "cbuffer u_bloque : register(b0) { Uniforms u; }", "cbuffer")
+tiene(hl, "row_major float4x4 mvp;", "row_major")
+tiene(hl, "mul(float4((pos * k), 1.0), u.mvp)", "mul transpuesto")
+tiene(hl, "Texture2D<float4> tex : register(t1);", "textura HLSL")
+tiene(hl, "SamplerState samp : register(s2);", "muestreador HLSL")
+tiene(hl, "tex.Sample(samp, uv)", "Sample")
+tiene(hl, "uint _sb_vertex_index : SV_VertexID;", "SV_VertexID")
+tiene(hl, "float4 _sb_s0 : SV_Position;", "SV_Position")
+tiene(hl, "nointerpolation uint _sb_s2 : LOC1;", "nointerpolation")
+tiene(hl, "float4 _sb_s0 : SV_Target0;", "SV_Target")
+tiene(hl, "_sb_crear_VSOut(", "constructor de struct")
+tiene(hl, "fmod(", "fmod HLSL")
+
+// WGSL de vuelta.
+sea w2 = sombreador_traducir(w, "wgsl", nulo)
+eq(sombreador_validar(w2), [], "WGSL de salida válido")
+tiene(w2, "@group(0) @binding(0) var<uniform> u: Uniforms;", "global WGSL")
+tiene(w2, "@vertex fn vs_main(@builtin(vertex_index) vi: u32", "entrada WGSL")
+eq(sombreador_traducir(w2, "wgsl", nulo), w2, "punto fijo")
+
+// Cómputo con storage, workgroup, loop/continuing, switch y atómicos.
+sea c = "struct P { pos: vec2<f32>, vel: vec2<f32>, }
+@group(0) @binding(0) var<storage, read_write> parts: array<P>;
+@group(0) @binding(1) var<storage, read> fuerzas: array<vec2<f32>>;
+@group(0) @binding(2) var<uniform> dt: f32;
+@group(0) @binding(3) var<storage, read_write> cuenta: atomic<u32>;
+var<workgroup> suma: array<f32, 64>;
+fn paso(p: P, f: vec2<f32>) -> P {
+    var r = p;
+    r.vel = r.vel + f * dt;
+    r.pos = r.pos + r.vel * dt;
+    return r;
+}
+@compute @workgroup_size(64)
+fn main(@builtin(global_invocation_id) gid: vec3<u32>, @builtin(local_invocation_index) li: u32) {
+    let i = gid.x;
+    if (i >= arrayLength(&parts)) { return; }
+    parts[i] = paso(parts[i], fuerzas[i % 8u]);
+    suma[li] = length(parts[i].vel);
+    workgroupBarrier();
+    var k = 32u;
+    loop {
+        if (k == 0u) { break; }
+        if (li < k) { suma[li] = suma[li] + suma[li + k]; }
+        workgroupBarrier();
+        continuing { k = k >> 1u; }
+    }
+    if (li == 0u && suma[0] > 10.0) { atomicAdd(&cuenta, 1u); }
+    switch (i % 4u) {
+        case 0u: { parts[i].pos.x = 0.0; }
+        case 1u, 2u: { parts[i].pos.y = -parts[i].pos.y; }
+        default: { }
+    }
+}"
+eq(sombreador_validar(c), [], "cómputo válido")
+eq(sombreador_entradas(c)[0]["grupo_trabajo"], [64, 1, 1], "workgroup_size")
+sea gc = sombreador_traducir(c, "glsl", nulo)
+tiene(gc, "layout(local_size_x = 64, local_size_y = 1, local_size_z = 1) in;", "local_size")
+tiene(gc, "layout(std430, set = 0, binding = 0) buffer parts_bloque {", "storage")
+tiene(gc, "readonly buffer fuerzas_bloque", "solo lectura")
+tiene(gc, "shared float suma[64];", "shared")
+tiene(gc, "uint(_parts.valor.length())", "arrayLength GLSL")
+tiene(gc, "while (true) {", "loop")
+tiene(gc, "k = (k >> 1u);", "continuing")
+tiene(gc, "barrier();", "barrera")
+tiene(gc, "atomicAdd(_cuenta.valor, 1u);", "atómico GLSL")
+tiene(gc, "case 1u:\n        case 2u:", "casos juntos")
+sea hc = sombreador_traducir(c, "hlsl", nulo)
+tiene(hc, "RWStructuredBuffer<P> parts : register(u0);", "RWStructuredBuffer")
+tiene(hc, "StructuredBuffer<float2> fuerzas : register(t1);", "StructuredBuffer")
+tiene(hc, "groupshared float suma[64];", "groupshared")
+tiene(hc, "[numthreads(64, 1, 1)]", "numthreads")
+tiene(hc, "InterlockedAdd(_cuenta[0], 1u);", "Interlocked")
+tiene(hc, "uint _sb_largo_parts() { uint n, s; parts.GetDimensions(n, s); return n; }", "largo HLSL")
+tiene(hc, "GroupMemoryBarrierWithGroupSync();", "barrera HLSL")
+sea mc = ""
+intentar { mc = sombreador_traducir(c, "msl", nulo) } capturar (e) { mc = "" + e }
+tiene(mc, "arrayLength", "MSL sin arrayLength")
+sea c2 = texto_reemplazar(c, "if (i >= arrayLength(&parts)) { return; }", "if (i >= 1024u) { return; }")
+mc = sombreador_traducir(c2, "msl", nulo)
+tiene(mc, "kernel void main_(", "kernel")
+tiene(mc, "uint3 _sb_global_invocation_id [[thread_position_in_grid]]", "posición en la grilla")
+tiene(mc, "device P* parts [[buffer(0)]]", "puntero device")
+tiene(mc, "const device float2* fuerzas [[buffer(1)]]", "const device")
+tiene(mc, "threadgroup metal::array<float, 64> suma;", "threadgroup")
+tiene(mc, "metal::atomic_fetch_add_explicit(&cuenta, 1u, metal::memory_order_relaxed)", "atómico MSL")
+tiene(mc, "metal::threadgroup_barrier(metal::mem_flags::mem_threadgroup)", "barrera MSL")
+eq(sombreador_validar(sombreador_traducir(c, "wgsl", nulo)), [], "cómputo de vuelta a WGSL")
+
+// Errores con línea y columna.
+sea e1 = sombreador_validar("fn f() -> f32 {\n    let x: f32 = 1u;\n    return x;\n}")
+eq([e1[0]["linea"], e1[0]["columna"]], [2, 5], "posición del error")
+tiene(e1[0]["mensaje"], "f32", "mensaje de tipo")
+tiene(sombreador_validar("fn f() { let a = b; }")[0]["mensaje"], "nombre desconocido 'b'", "nombre desconocido")
+tiene(sombreador_validar("fn f() -> f32 { if (true) { return 1.0; } }")[0]["mensaje"], "sin return", "sin return")
+tiene(sombreador_validar("fn f() { let a = 1; a = 2; }")[0]["mensaje"], "no se puede cambiar", "let inmutable")
+tiene(sombreador_validar("fn f() { break; }")[0]["mensaje"], "fuera de un bucle", "break suelto")
+tiene(sombreador_validar("fn f() { let v = vec3<f32>(1.0, 2.0); }")[0]["mensaje"], "componentes", "componentes")
+tiene(sombreador_validar("fn f() { let v = vec2<f32>(1.0, 2.0); let w = v.xyz; }")[0]["mensaje"], "fuera de", "swizzle")
+tiene(sombreador_validar("var<uniform> u: f32;")[0]["mensaje"], "@group", "falta el grupo")
+tiene(sombreador_validar("fn f() { let x = 1 + ; }")[0]["mensaje"], "inesperada", "sintaxis")
+eq(sombreador_validar("/* abierto /* anidado */ */ fn f() -> i32 { return 1 + 2 * 3; }"), [], "comentarios anidados")
+mostrar("[OK] sombreador")

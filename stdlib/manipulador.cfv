@@ -1,0 +1,641 @@
+// stdlib/manipulador.cfv — gizmos 3D de editor al estilo ImGuizmo, sin
+// depender de ninguna GUI: con la cámara (vista y proyección 4x4 por
+// columnas, como OpenGL) y la matriz del objeto, da las primitivas que hay
+// que dibujar en pantalla (líneas, flechas, cuadros de plano, anillos) y
+// convierte el ratón en una nueva matriz. Modos mover, rotar y escalar (o
+// todos a la vez), en espacio del mundo o local, ejes y planos, mover
+// libre en el plano de la cámara, anillo de rotación de pantalla, escala
+// uniforme, ajuste a pasos (snap), tamaño constante en píxeles y
+// descomponer/componer matrices. Idea de ImGuizmo (MIT), escrito desde
+// cero. En inglés: importar "gizmo3d".
+//
+//   importar "manipulador"
+//   sea g = manipulador_nuevo({"modo": "mover"})
+//   manipulador_camara(g, vista, proyeccion, 800, 600)
+//   para p en manipulador_dibujar(g, objeto) { ... dibujar p["puntos"] ... }
+//   sea r = manipulador_raton(g, objeto, x, y, boton_abajo)
+//   objeto = r["matriz"]
+
+importar "vector"
+
+sea _MN_PI = 3.141592653589793
+
+funcion _mn_atan2(dy, dx) {
+    si (dx == 0) {
+        si (dy > 0) { retornar _MN_PI / 2 }
+        si (dy < 0) { retornar 0 - _MN_PI / 2 }
+        retornar 0
+    }
+    sea a = arcotangente(dy / dx)
+    si (dx < 0) {
+        si (dy >= 0) { a = a + _MN_PI } sino { a = a - _MN_PI }
+    }
+    retornar a
+}
+
+// ---------- vectores y matrices (4x4 por columnas) ----------
+
+funcion _mn_sub(a, b) { retornar [a[0] - b[0], a[1] - b[1], a[2] - b[2]] }
+funcion _mn_add(a, b) { retornar [a[0] + b[0], a[1] + b[1], a[2] + b[2]] }
+funcion _mn_mul(a, k) { retornar [a[0] * k, a[1] * k, a[2] * k] }
+funcion _mn_dot(a, b) { retornar a[0] * b[0] + a[1] * b[1] + a[2] * b[2] }
+funcion _mn_cross(a, b) { retornar [a[1] * b[2] - a[2] * b[1], a[2] * b[0] - a[0] * b[2], a[0] * b[1] - a[1] * b[0]] }
+funcion _mn_len(a) { retornar raiz(_mn_dot(a, a)) }
+funcion _mn_norm(a) {
+    sea l = _mn_len(a)
+    si (l == 0) { retornar [0, 0, 0] }
+    retornar _mn_mul(a, 1 / l)
+}
+
+/// Matriz identidad 4x4.
+funcion manipulador_identidad() { retornar [1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1] }
+
+/// a · b (por columnas).
+funcion manipulador_multiplicar(a, b) {
+    sea r = []
+    sea c = 0
+    mientras (c < 4) {
+        sea f = 0
+        mientras (f < 4) {
+            r.agregar(a[f] * b[c * 4] + a[4 + f] * b[c * 4 + 1] + a[8 + f] * b[c * 4 + 2] + a[12 + f] * b[c * 4 + 3])
+            f = f + 1
+        }
+        c = c + 1
+    }
+    retornar r
+}
+
+funcion _mn_punto(m, p) {
+    sea x = m[0] * p[0] + m[4] * p[1] + m[8] * p[2] + m[12]
+    sea y = m[1] * p[0] + m[5] * p[1] + m[9] * p[2] + m[13]
+    sea z = m[2] * p[0] + m[6] * p[1] + m[10] * p[2] + m[14]
+    sea w = m[3] * p[0] + m[7] * p[1] + m[11] * p[2] + m[15]
+    retornar [x, y, z, w]
+}
+
+/// Inversa general 4x4 (nulo si no tiene).
+funcion manipulador_inversa(m) {
+    sea inv = [
+        m[5] * m[10] * m[15] - m[5] * m[11] * m[14] - m[9] * m[6] * m[15] + m[9] * m[7] * m[14] + m[13] * m[6] * m[11] - m[13] * m[7] * m[10],
+        0 - m[1] * m[10] * m[15] + m[1] * m[11] * m[14] + m[9] * m[2] * m[15] - m[9] * m[3] * m[14] - m[13] * m[2] * m[11] + m[13] * m[3] * m[10],
+        m[1] * m[6] * m[15] - m[1] * m[7] * m[14] - m[5] * m[2] * m[15] + m[5] * m[3] * m[14] + m[13] * m[2] * m[7] - m[13] * m[3] * m[6],
+        0 - m[1] * m[6] * m[11] + m[1] * m[7] * m[10] + m[5] * m[2] * m[11] - m[5] * m[3] * m[10] - m[9] * m[2] * m[7] + m[9] * m[3] * m[6],
+        0 - m[4] * m[10] * m[15] + m[4] * m[11] * m[14] + m[8] * m[6] * m[15] - m[8] * m[7] * m[14] - m[12] * m[6] * m[11] + m[12] * m[7] * m[10],
+        m[0] * m[10] * m[15] - m[0] * m[11] * m[14] - m[8] * m[2] * m[15] + m[8] * m[3] * m[14] + m[12] * m[2] * m[11] - m[12] * m[3] * m[10],
+        0 - m[0] * m[6] * m[15] + m[0] * m[7] * m[14] + m[4] * m[2] * m[15] - m[4] * m[3] * m[14] - m[12] * m[2] * m[7] + m[12] * m[3] * m[6],
+        m[0] * m[6] * m[11] - m[0] * m[7] * m[10] - m[4] * m[2] * m[11] + m[4] * m[3] * m[10] + m[8] * m[2] * m[7] - m[8] * m[3] * m[6],
+        m[4] * m[9] * m[15] - m[4] * m[11] * m[13] - m[8] * m[5] * m[15] + m[8] * m[7] * m[13] + m[12] * m[5] * m[11] - m[12] * m[7] * m[9],
+        0 - m[0] * m[9] * m[15] + m[0] * m[11] * m[13] + m[8] * m[1] * m[15] - m[8] * m[3] * m[13] - m[12] * m[1] * m[11] + m[12] * m[3] * m[9],
+        m[0] * m[5] * m[15] - m[0] * m[7] * m[13] - m[4] * m[1] * m[15] + m[4] * m[3] * m[13] + m[12] * m[1] * m[7] - m[12] * m[3] * m[5],
+        0 - m[0] * m[5] * m[11] + m[0] * m[7] * m[9] + m[4] * m[1] * m[11] - m[4] * m[3] * m[9] - m[8] * m[1] * m[7] + m[8] * m[3] * m[5],
+        0 - m[4] * m[9] * m[14] + m[4] * m[10] * m[13] + m[8] * m[5] * m[14] - m[8] * m[6] * m[13] - m[12] * m[5] * m[10] + m[12] * m[6] * m[9],
+        m[0] * m[9] * m[14] - m[0] * m[10] * m[13] - m[8] * m[1] * m[14] + m[8] * m[2] * m[13] + m[12] * m[1] * m[10] - m[12] * m[2] * m[9],
+        0 - m[0] * m[5] * m[14] + m[0] * m[6] * m[13] + m[4] * m[1] * m[14] - m[4] * m[2] * m[13] - m[12] * m[1] * m[6] + m[12] * m[2] * m[5],
+        m[0] * m[5] * m[10] - m[0] * m[6] * m[9] - m[4] * m[1] * m[10] + m[4] * m[2] * m[9] + m[8] * m[1] * m[6] - m[8] * m[2] * m[5]]
+    sea det = m[0] * inv[0] + m[1] * inv[4] + m[2] * inv[8] + m[3] * inv[12]
+    si (det == 0) { retornar nulo }
+    sea r = []
+    para v en inv { r.agregar(v / det) }
+    retornar r
+}
+
+/// Traslación.
+funcion manipulador_traslacion(x, y, z) { retornar [1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1, 0, x, y, z, 1] }
+
+/// Rotación de "grados" alrededor de un eje (normalizado dentro).
+funcion manipulador_rotacion(eje, grados) {
+    sea a = _mn_norm(eje)
+    sea t = grados * _MN_PI / 180
+    sea c = coseno(t)
+    sea s = seno(t)
+    sea k = 1 - c
+    sea x = a[0]
+    sea y = a[1]
+    sea z = a[2]
+    retornar [c + x * x * k, y * x * k + z * s, z * x * k - y * s, 0,
+        x * y * k - z * s, c + y * y * k, z * y * k + x * s, 0,
+        x * z * k + y * s, y * z * k - x * s, c + z * z * k, 0, 0, 0, 0, 1]
+}
+
+/// Escala.
+funcion manipulador_escala(x, y, z) { retornar [x, 0, 0, 0, 0, y, 0, 0, 0, 0, z, 0, 0, 0, 0, 1] }
+
+/// Matriz de vista que mira desde "ojo" hacia "centro".
+funcion manipulador_mirar(ojo, centro, arriba) {
+    sea f = _mn_norm(_mn_sub(centro, ojo))
+    sea s = _mn_norm(_mn_cross(f, arriba))
+    sea u = _mn_cross(s, f)
+    retornar [s[0], u[0], 0 - f[0], 0, s[1], u[1], 0 - f[1], 0, s[2], u[2], 0 - f[2], 0,
+        0 - _mn_dot(s, ojo), 0 - _mn_dot(u, ojo), _mn_dot(f, ojo), 1]
+}
+
+/// Proyección en perspectiva (fov vertical en grados).
+funcion manipulador_perspectiva(fov, aspecto, cerca, lejos) {
+    sea f = 1 / tangente(fov * _MN_PI / 360)
+    retornar [f / aspecto, 0, 0, 0, 0, f, 0, 0, 0, 0, (lejos + cerca) / (cerca - lejos), -1, 0, 0, 2 * lejos * cerca / (cerca - lejos), 0]
+}
+
+/// Proyección ortográfica.
+funcion manipulador_ortografica(izq, der, abajo, arriba, cerca, lejos) {
+    retornar [2 / (der - izq), 0, 0, 0, 0, 2 / (arriba - abajo), 0, 0, 0, 0, -2 / (lejos - cerca), 0,
+        0 - (der + izq) / (der - izq), 0 - (arriba + abajo) / (arriba - abajo), 0 - (lejos + cerca) / (lejos - cerca), 1]
+}
+
+/// Separa una matriz en {"traslacion", "rotacion" (grados, Euler XYZ),
+/// "escala"}.
+funcion manipulador_descomponer(m) {
+    sea sx = _mn_len([m[0], m[1], m[2]])
+    sea sy = _mn_len([m[4], m[5], m[6]])
+    sea sz = _mn_len([m[8], m[9], m[10]])
+    // Reflexión: se atribuye a x.
+    si (_mn_dot(_mn_cross([m[0], m[1], m[2]], [m[4], m[5], m[6]]), [m[8], m[9], m[10]]) < 0) { sx = 0 - sx }
+    sea r00 = m[0] / sx
+    sea r10 = m[1] / sx
+    sea r20 = m[2] / sx
+    sea r11 = m[5] / sy
+    sea r21 = m[6] / sy
+    sea r12 = m[9] / sz
+    sea r22 = m[10] / sz
+    sea r01 = m[4] / sy
+    sea r02 = m[8] / sz
+    // R = Rz · Ry · Rx.
+    sea ry = arcoseno(minimo(1, maximo(-1, 0 - r20)))
+    sea rx = 0
+    sea rz = 0
+    si (abs(r20) < 0.9999999) {
+        rx = _mn_atan2(r21, r22)
+        rz = _mn_atan2(r10, r00)
+    } sino {
+        rz = 0
+        rx = _mn_atan2(0 - r12, r11)
+    }
+    sea g = 180 / _MN_PI
+    retornar {"traslacion": [m[12], m[13], m[14]], "rotacion": [rx * g, ry * g, rz * g], "escala": [sx, sy, sz]}
+}
+
+/// Arma una matriz desde traslación, rotación (grados XYZ) y escala.
+funcion manipulador_componer(traslacion, rotacion, escala) {
+    sea r = manipulador_multiplicar(manipulador_rotacion([0, 0, 1], rotacion[2]), manipulador_multiplicar(manipulador_rotacion([0, 1, 0], rotacion[1]), manipulador_rotacion([1, 0, 0], rotacion[0])))
+    sea m = manipulador_multiplicar(r, manipulador_escala(escala[0], escala[1], escala[2]))
+    m[12] = traslacion[0]
+    m[13] = traslacion[1]
+    m[14] = traslacion[2]
+    retornar m
+}
+
+// ---------- gizmo ----------
+
+sea _MN_COLORES = {"x": [230, 60, 60, 255], "y": [80, 200, 80, 255], "z": [70, 110, 235, 255], "libre": [230, 230, 230, 255], "pantalla": [230, 230, 230, 255],
+    "xy": [70, 110, 235, 120], "yz": [230, 60, 60, 120], "zx": [80, 200, 80, 120], "uniforme": [230, 230, 230, 255], "activo": [255, 200, 40, 255]}
+
+/// Gizmo nuevo. opciones: "modo" ("mover", "rotar", "escalar", "todo"),
+/// "espacio" ("mundo" o "local"), "tam" (píxeles), "ajuste" ({"mover",
+/// "rotar", "escalar"}: pasos), "tolerancia" (píxeles).
+funcion manipulador_nuevo(opciones) {
+    sea op = opciones ?? {}
+    retornar {"modo": op["modo"] ?? "mover", "espacio": op["espacio"] ?? "mundo", "tam": op["tam"] ?? 100, "ajuste": op["ajuste"] ?? nulo,
+        "tolerancia": op["tolerancia"] ?? 8, "vista": manipulador_identidad(), "proy": manipulador_identidad(), "ancho": 800, "alto": 600, "x0": 0, "y0": 0,
+        "arrastre": nulo, "encima": nulo}
+}
+
+funcion manipulador_modo(g, modo) { g["modo"] = modo }
+funcion manipulador_espacio(g, espacio) { g["espacio"] = espacio }
+funcion manipulador_ajuste(g, ajuste) { g["ajuste"] = ajuste }
+
+/// Cámara y rectángulo de la vista en pantalla (x0, y0 opcionales).
+funcion manipulador_camara(g, vista, proyeccion, ancho, alto, x0, y0) {
+    g["vista"] = vista
+    g["proy"] = proyeccion
+    g["ancho"] = ancho
+    g["alto"] = alto
+    g["x0"] = x0 ?? 0
+    g["y0"] = y0 ?? 0
+    g["vp"] = manipulador_multiplicar(proyeccion, vista)
+    g["vp_inv"] = manipulador_inversa(g["vp"])
+}
+
+/// De un punto del mundo a la pantalla: [x, y, profundidad] (nulo si
+/// queda detrás de la cámara).
+funcion manipulador_a_pantalla(g, p) {
+    si (tiene_clave(g, "vp") == falso) { g["vp"] = manipulador_multiplicar(g["proy"], g["vista"]) }
+    sea c = _mn_punto(g["vp"], p)
+    si (c[3] <= 0.000001) { retornar nulo }
+    retornar [g["x0"] + (c[0] / c[3] * 0.5 + 0.5) * g["ancho"], g["y0"] + (0.5 - c[1] / c[3] * 0.5) * g["alto"], c[2] / c[3]]
+}
+
+/// Rayo del mundo bajo el píxel (x, y): {"origen", "dir"}.
+funcion manipulador_rayo(g, x, y) {
+    si (tiene_clave(g, "vp_inv") == falso) { manipulador_camara(g, g["vista"], g["proy"], g["ancho"], g["alto"], g["x0"], g["y0"]) }
+    sea nx = ((x - g["x0"]) / g["ancho"]) * 2 - 1
+    sea ny = 1 - ((y - g["y0"]) / g["alto"]) * 2
+    sea a = _mn_punto(g["vp_inv"], [nx, ny, -1])
+    sea b = _mn_punto(g["vp_inv"], [nx, ny, 1])
+    sea pa = [a[0] / a[3], a[1] / a[3], a[2] / a[3]]
+    sea pb = [b[0] / b[3], b[1] / b[3], b[2] / b[3]]
+    retornar {"origen": pa, "dir": _mn_norm(_mn_sub(pb, pa))}
+}
+
+// Largo en el mundo de "px" píxeles a la profundidad del punto p.
+funcion _mn_escala_mundo(g, p, px) {
+    sea c = _mn_punto(g["vp"], p)
+    sea w = c[3]
+    si (w <= 0.000001) { w = 0.000001 }
+    // Píxeles por unidad del mundo según la proyección vertical.
+    sea py = g["proy"][5]
+    si (py == 0) { py = 1 }
+    retornar px * 2 * w / (g["alto"] * abs(py))
+}
+
+// Origen y ejes (en el mundo, unitarios) del gizmo para un objeto.
+funcion _mn_marco(g, m) {
+    sea o = [m[12], m[13], m[14]]
+    sea ejes = {"x": [1, 0, 0], "y": [0, 1, 0], "z": [0, 0, 1]}
+    si (g["espacio"] == "local" o g["modo"] == "escalar") {
+        ejes = {"x": _mn_norm([m[0], m[1], m[2]]), "y": _mn_norm([m[4], m[5], m[6]]), "z": _mn_norm([m[8], m[9], m[10]])}
+    }
+    retornar {"o": o, "ejes": ejes, "largo": _mn_escala_mundo(g, o, g["tam"])}
+}
+
+funcion _mn_camara_pos(g) {
+    sea inv = manipulador_inversa(g["vista"])
+    retornar [inv[12], inv[13], inv[14]]
+}
+
+funcion _mn_dir_camara(g, o) {
+    // Hacia el ojo (perspectiva) o el eje de la vista (ortográfica).
+    si (g["proy"][15] == 1) {
+        sea inv = manipulador_inversa(g["vista"])
+        retornar _mn_norm([inv[8], inv[9], inv[10]])
+    }
+    retornar _mn_norm(_mn_sub(_mn_camara_pos(g), o))
+}
+
+funcion _mn_dist_segmento(px, py, a, b) {
+    sea dx = b[0] - a[0]
+    sea dy = b[1] - a[1]
+    sea l2 = dx * dx + dy * dy
+    sea t = 0
+    si (l2 > 0) { t = minimo(1, maximo(0, ((px - a[0]) * dx + (py - a[1]) * dy) / l2)) }
+    sea qx = a[0] + dx * t - px
+    sea qy = a[1] + dy * t - py
+    retornar raiz(qx * qx + qy * qy)
+}
+
+funcion _mn_dentro(px, py, pts) {
+    sea dentro = falso
+    sea n = longitud(pts)
+    sea j = n - 1
+    sea i = 0
+    mientras (i < n) {
+        sea a = pts[i]
+        sea b = pts[j]
+        si ((a[1] > py) != (b[1] > py) y px < (b[0] - a[0]) * (py - a[1]) / (b[1] - a[1]) + a[0]) { dentro = dentro == falso }
+        j = i
+        i = i + 1
+    }
+    retornar dentro
+}
+
+funcion _mn_anillo(g, o, eje, radio, n) {
+    sea u = _mn_norm(_mn_cross(eje, [0, 0, 1]))
+    si (_mn_len(_mn_cross(eje, [0, 0, 1])) < 0.001) { u = _mn_norm(_mn_cross(eje, [0, 1, 0])) }
+    sea v = _mn_cross(eje, u)
+    sea r = []
+    sea k = 0
+    mientras (k <= n) {
+        sea t = 2 * _MN_PI * k / n
+        sea p = _mn_add(o, _mn_add(_mn_mul(u, coseno(t) * radio), _mn_mul(v, seno(t) * radio)))
+        r.agregar(p)
+        k = k + 1
+    }
+    retornar r
+}
+
+funcion _mn_modos(g) {
+    si (g["modo"] == "todo") { retornar ["mover", "rotar", "escalar"] }
+    retornar [g["modo"]]
+}
+
+// Partes del gizmo con su forma en pantalla. Cada una: {"parte", "modo",
+// "tipo", "puntos" (pantalla), "color", "eje"}.
+funcion _mn_partes(g, m) {
+    sea fr = _mn_marco(g, m)
+    sea o = fr["o"]
+    sea L = fr["largo"]
+    sea so = manipulador_a_pantalla(g, o)
+    sea r = []
+    si (so == nulo) { retornar r }
+    sea cam = _mn_dir_camara(g, o)
+    para modo en _mn_modos(g) {
+        si (modo == "mover" o modo == "escalar") {
+            para e en ["x", "y", "z"] {
+                sea d = fr["ejes"][e]
+                // Ejes casi de frente a la cámara no se pueden agarrar.
+                si (abs(_mn_dot(d, cam)) < 0.98) {
+                    sea k = 1
+                    si (modo == "escalar" y g["modo"] == "todo") { k = 0.7 }
+                    sea fin = manipulador_a_pantalla(g, _mn_add(o, _mn_mul(d, L * k)))
+                    si (fin != nulo) {
+                        r.agregar({"parte": e, "modo": modo, "tipo": "linea", "puntos": [[so[0], so[1]], [fin[0], fin[1]]], "color": _MN_COLORES[e], "eje": d})
+                        si (modo == "mover") {
+                            r.agregar({"parte": e, "modo": modo, "tipo": "flecha", "puntos": [[fin[0], fin[1]]], "color": _MN_COLORES[e], "eje": d})
+                        } sino {
+                            r.agregar({"parte": e, "modo": modo, "tipo": "cuadro", "puntos": [[fin[0], fin[1]]], "color": _MN_COLORES[e], "eje": d})
+                        }
+                    }
+                }
+            }
+        }
+        si (modo == "mover") {
+            // Cuadritos de plano entre dos ejes.
+            para pl en [["xy", "x", "y", "z"], ["yz", "y", "z", "x"], ["zx", "z", "x", "y"]] {
+                sea a = fr["ejes"][pl[1]]
+                sea b = fr["ejes"][pl[2]]
+                sea n = fr["ejes"][pl[3]]
+                si (abs(_mn_dot(n, cam)) > 0.2) {
+                    sea q = []
+                    para c en [[0.25, 0.25], [0.45, 0.25], [0.45, 0.45], [0.25, 0.45]] {
+                        sea p = manipulador_a_pantalla(g, _mn_add(o, _mn_add(_mn_mul(a, L * c[0]), _mn_mul(b, L * c[1]))))
+                        si (p != nulo) { q.agregar([p[0], p[1]]) }
+                    }
+                    si (longitud(q) == 4) { r.agregar({"parte": pl[0], "modo": modo, "tipo": "poligono", "puntos": q, "color": _MN_COLORES[pl[0]], "eje": n}) }
+                }
+            }
+            r.agregar({"parte": "libre", "modo": modo, "tipo": "circulo", "puntos": [[so[0], so[1]]], "radio": 6, "color": _MN_COLORES["libre"], "eje": cam})
+        }
+        si (modo == "escalar") {
+            r.agregar({"parte": "uniforme", "modo": modo, "tipo": "circulo", "puntos": [[so[0], so[1]]], "radio": 7, "color": _MN_COLORES["uniforme"], "eje": nulo})
+        }
+        si (modo == "rotar") {
+            para e en ["x", "y", "z"] {
+                sea d = fr["ejes"][e]
+                sea pts = []
+                para p en _mn_anillo(g, o, d, L * 0.9, 48) {
+                    sea s = manipulador_a_pantalla(g, p)
+                    si (s != nulo) { pts.agregar([s[0], s[1]]) }
+                }
+                r.agregar({"parte": e, "modo": modo, "tipo": "anillo", "puntos": pts, "color": _MN_COLORES[e], "eje": d})
+            }
+            sea pts = []
+            para p en _mn_anillo(g, o, cam, L * 1.1, 48) {
+                sea s = manipulador_a_pantalla(g, p)
+                si (s != nulo) { pts.agregar([s[0], s[1]]) }
+            }
+            r.agregar({"parte": "pantalla", "modo": modo, "tipo": "anillo", "puntos": pts, "color": _MN_COLORES["pantalla"], "eje": cam})
+        }
+    }
+    retornar r
+}
+
+// Parte bajo el ratón (la más cercana dentro de la tolerancia).
+funcion _mn_tocar(g, partes, x, y) {
+    sea mejor = nulo
+    sea md = g["tolerancia"]
+    // Primero lo que se ve como relleno (círculos centrales y planos).
+    para p en partes {
+        si (p["tipo"] == "circulo") {
+            sea dx = x - p["puntos"][0][0]
+            sea dy = y - p["puntos"][0][1]
+            si (raiz(dx * dx + dy * dy) <= p["radio"] + 2) { retornar p }
+        }
+    }
+    para p en partes {
+        sea d = 1000000
+        si (p["tipo"] == "linea") { d = _mn_dist_segmento(x, y, p["puntos"][0], p["puntos"][1]) }
+        sino si (p["tipo"] == "flecha" o p["tipo"] == "cuadro") {
+            sea dx = x - p["puntos"][0][0]
+            sea dy = y - p["puntos"][0][1]
+            d = maximo(0, raiz(dx * dx + dy * dy) - 6)
+        } sino si (p["tipo"] == "poligono") {
+            si (_mn_dentro(x, y, p["puntos"])) { d = 0 }
+        } sino si (p["tipo"] == "anillo") {
+            sea k = 1
+            mientras (k < longitud(p["puntos"])) {
+                d = minimo(d, _mn_dist_segmento(x, y, p["puntos"][k - 1], p["puntos"][k]))
+                k = k + 1
+            }
+        }
+        si (d <= md) {
+            md = d
+            mejor = p
+        }
+    }
+    retornar mejor
+}
+
+/// Primitivas para dibujar: [{"parte", "modo", "tipo" (linea, flecha,
+/// cuadro, poligono, circulo, anillo), "puntos" (pantalla), "radio",
+/// "color" [r, g, b, a], "activa"}].
+funcion manipulador_dibujar(g, m) {
+    sea r = []
+    para p en _mn_partes(g, m) {
+        sea a = falso
+        sea act = g["arrastre"] ?? g["encima"]
+        si (act != nulo y act["parte"] == p["parte"] y act["modo"] == p["modo"]) { a = verdadero }
+        sea c = p["color"]
+        si (a) { c = _MN_COLORES["activo"] }
+        r.agregar({"parte": p["parte"], "modo": p["modo"], "tipo": p["tipo"], "puntos": p["puntos"], "radio": p["radio"] ?? 0, "color": c, "activa": a})
+    }
+    retornar r
+}
+
+/// ¿Qué parte hay bajo el ratón? {"parte", "modo"} o nulo.
+funcion manipulador_encima(g, m, x, y) {
+    sea p = _mn_tocar(g, _mn_partes(g, m), x, y)
+    si (p == nulo) { retornar nulo }
+    retornar {"parte": p["parte"], "modo": p["modo"]}
+}
+
+// Intersección rayo-plano (nulo si es paralelo).
+funcion _mn_rayo_plano(rayo, p0, n) {
+    sea den = _mn_dot(rayo["dir"], n)
+    si (abs(den) < 0.000001) { retornar nulo }
+    sea t = _mn_dot(_mn_sub(p0, rayo["origen"]), n) / den
+    retornar _mn_add(rayo["origen"], _mn_mul(rayo["dir"], t))
+}
+
+// Parámetro s sobre la recta o + s·d bajo el rayo: se corta el rayo con
+// el plano que contiene la recta y mira lo más posible a la cámara "cam" (así el
+// movimiento sigue al ratón en pantalla, también en perspectiva).
+funcion _mn_rayo_recta(rayo, o, d, cam) {
+    sea n = _mn_cross(d, _mn_cross(cam, d))
+    si (_mn_len(n) < 0.000001) { retornar nulo }
+    sea q = _mn_rayo_plano(rayo, o, _mn_norm(n))
+    si (q == nulo) { retornar nulo }
+    retornar _mn_dot(_mn_sub(q, o), d) / _mn_dot(d, d)
+}
+
+funcion _mn_ajustar(v, paso) {
+    si (paso == nulo o paso == 0) { retornar v }
+    retornar redondear(v / paso) * paso
+}
+
+funcion _mn_paso(g, modo) {
+    si (g["ajuste"] == nulo) { retornar nulo }
+    retornar g["ajuste"][modo] ?? nulo
+}
+
+// Punto de agarre para la parte (en el mundo) y lo que haga falta para
+// seguirla.
+funcion _mn_agarre(g, parte, rayo, m) {
+    sea fr = _mn_marco(g, m)
+    sea o = fr["o"]
+    sea modo = parte["modo"]
+    sea p = parte["parte"]
+    si (modo == "mover" o modo == "escalar") {
+        si (p == "x" o p == "y" o p == "z") {
+            sea s = _mn_rayo_recta(rayo, o, fr["ejes"][p], _mn_dir_camara(g, o))
+            si (s == nulo) { retornar nulo }
+            retornar {"s": s}
+        }
+        si (p == "uniforme") { retornar {"s": 0} }
+        sea n = parte["eje"]
+        si (p == "libre") { n = _mn_dir_camara(g, o) }
+        sea q = _mn_rayo_plano(rayo, o, n)
+        si (q == nulo) { retornar nulo }
+        retornar {"q": q, "n": n}
+    }
+    // Rotar: vector desde el centro sobre el plano del anillo.
+    sea n = parte["eje"]
+    sea q = _mn_rayo_plano(rayo, o, n)
+    si (q == nulo) { retornar nulo }
+    retornar {"v": _mn_norm(_mn_sub(q, o)), "n": n}
+}
+
+/// Pasa el ratón al gizmo. Devuelve {"matriz" (la nueva), "activo" (si se
+/// está arrastrando), "parte", "modo", "delta" (matriz del cambio desde el
+/// inicio del arrastre), "valor" (desplazamiento, grados o factor)}.
+funcion manipulador_raton(g, m, x, y, abajo) {
+    sea rayo = manipulador_rayo(g, x, y)
+    si (abajo == falso) {
+        g["arrastre"] = nulo
+        g["encima"] = manipulador_encima(g, m, x, y)
+        retornar {"matriz": m, "activo": falso, "parte": nulo, "modo": nulo, "delta": manipulador_identidad(), "valor": nulo}
+    }
+    si (g["arrastre"] == nulo) {
+        sea p = _mn_tocar(g, _mn_partes(g, m), x, y)
+        si (p == nulo) { retornar {"matriz": m, "activo": falso, "parte": nulo, "modo": nulo, "delta": manipulador_identidad(), "valor": nulo} }
+        sea a = _mn_agarre(g, p, rayo, m)
+        si (a == nulo) { retornar {"matriz": m, "activo": falso, "parte": nulo, "modo": nulo, "delta": manipulador_identidad(), "valor": nulo} }
+        g["arrastre"] = {"parte": p["parte"], "modo": p["modo"], "eje": p["eje"], "inicio": m, "agarre": a, "x": x, "y": y, "marco": _mn_marco(g, m)}
+    }
+    sea ar = g["arrastre"]
+    sea m0 = ar["inicio"]
+    sea fr = ar["marco"]
+    sea o = fr["o"]
+    sea p = ar["parte"]
+    sea delta = manipulador_identidad()
+    sea valor = 0
+    si (ar["modo"] == "mover") {
+        sea dv = [0, 0, 0]
+        si (p == "x" o p == "y" o p == "z") {
+            sea s = _mn_rayo_recta(rayo, o, fr["ejes"][p], _mn_dir_camara(g, o))
+            si (s != nulo) {
+                valor = _mn_ajustar(s - ar["agarre"]["s"], _mn_paso(g, "mover"))
+                dv = _mn_mul(fr["ejes"][p], valor)
+            }
+        } sino {
+            sea q = _mn_rayo_plano(rayo, o, ar["agarre"]["n"])
+            si (q != nulo) {
+                dv = _mn_sub(q, ar["agarre"]["q"])
+                sea paso = _mn_paso(g, "mover")
+                si (paso != nulo y p != "libre") {
+                    // Ajuste por eje del plano.
+                    sea planos = {"xy": ["x", "y"], "yz": ["y", "z"], "zx": ["z", "x"]}
+                    sea ejes = planos[p] ?? nulo
+                    si (ejes != nulo) {
+                        sea a = fr["ejes"][ejes[0]]
+                        sea b = fr["ejes"][ejes[1]]
+                        dv = _mn_add(_mn_mul(a, _mn_ajustar(_mn_dot(dv, a), paso)), _mn_mul(b, _mn_ajustar(_mn_dot(dv, b), paso)))
+                    }
+                }
+                valor = _mn_len(dv)
+            }
+        }
+        delta = manipulador_traslacion(dv[0], dv[1], dv[2])
+        sea nm = []
+        para v en m0 { nm.agregar(v) }
+        nm[12] = m0[12] + dv[0]
+        nm[13] = m0[13] + dv[1]
+        nm[14] = m0[14] + dv[2]
+        retornar {"matriz": nm, "activo": verdadero, "parte": p, "modo": "mover", "delta": delta, "valor": valor}
+    }
+    si (ar["modo"] == "rotar") {
+        sea n = ar["agarre"]["n"]
+        sea q = _mn_rayo_plano(rayo, o, n)
+        si (q != nulo) {
+            sea v1 = _mn_norm(_mn_sub(q, o))
+            sea v0 = ar["agarre"]["v"]
+            valor = _mn_atan2(_mn_dot(_mn_cross(v0, v1), n), _mn_dot(v0, v1)) * 180 / _MN_PI
+            valor = _mn_ajustar(valor, _mn_paso(g, "rotar"))
+        }
+        sea r = manipulador_rotacion(n, valor)
+        delta = manipulador_multiplicar(manipulador_traslacion(o[0], o[1], o[2]), manipulador_multiplicar(r, manipulador_traslacion(0 - o[0], 0 - o[1], 0 - o[2])))
+        retornar {"matriz": manipulador_multiplicar(delta, m0), "activo": verdadero, "parte": p, "modo": "rotar", "delta": delta, "valor": valor}
+    }
+    // Escalar (siempre en ejes locales del objeto).
+    sea f = 1
+    sea fs = [1, 1, 1]
+    si (p == "uniforme") {
+        f = 1 + ((x - ar["x"]) - (y - ar["y"])) / g["tam"]
+        f = maximo(0.001, _mn_ajustar(f, _mn_paso(g, "escalar")))
+        fs = [f, f, f]
+    } sino {
+        sea s = _mn_rayo_recta(rayo, o, fr["ejes"][p], _mn_dir_camara(g, o))
+        sea s0 = ar["agarre"]["s"]
+        si (s != nulo y s0 != 0) { f = s / s0 }
+        f = _mn_ajustar(f, _mn_paso(g, "escalar"))
+        si (abs(f) < 0.001) { f = 0.001 }
+        si (p == "x") { fs = [f, 1, 1] } sino si (p == "y") { fs = [1, f, 1] } sino { fs = [1, 1, f] }
+    }
+    delta = manipulador_escala(fs[0], fs[1], fs[2])
+    retornar {"matriz": manipulador_multiplicar(m0, delta), "activo": verdadero, "parte": p, "modo": "escalar", "delta": delta, "valor": f}
+}
+
+/// ¿Se está arrastrando?
+funcion manipulador_activo(g) { retornar g["arrastre"] != nulo }
+
+/// Corta el arrastre y devuelve la matriz del inicio (para cancelar con Esc).
+funcion manipulador_cancelar(g) {
+    si (g["arrastre"] == nulo) { retornar nulo }
+    sea m = g["arrastre"]["inicio"]
+    g["arrastre"] = nulo
+    retornar m
+}
+
+/// Dibuja las primitivas en un lienzo de "vector".
+funcion manipulador_dibujar_vector(g, m, lienzo) {
+    para p en manipulador_dibujar(g, m) {
+        sea c = p["color"]
+        vector_color(lienzo, [c[0], c[1], c[2], c[3] / 255])
+        vector_grosor(lienzo, 2.5)
+        vector_nuevo_camino(lienzo)
+        sea t = p["tipo"]
+        si (t == "linea" o t == "anillo") {
+            sea k = 0
+            para q en p["puntos"] {
+                si (k == 0) { vector_mover(lienzo, q[0], q[1]) } sino { vector_linea(lienzo, q[0], q[1]) }
+                k = k + 1
+            }
+            vector_trazar(lienzo)
+        } sino si (t == "poligono") {
+            sea k = 0
+            para q en p["puntos"] {
+                si (k == 0) { vector_mover(lienzo, q[0], q[1]) } sino { vector_linea(lienzo, q[0], q[1]) }
+                k = k + 1
+            }
+            vector_cerrar(lienzo)
+            vector_rellenar(lienzo)
+        } sino si (t == "flecha") {
+            vector_circulo(lienzo, p["puntos"][0][0], p["puntos"][0][1], 5)
+            vector_rellenar(lienzo)
+        } sino si (t == "cuadro") {
+            vector_rectangulo(lienzo, p["puntos"][0][0] - 4, p["puntos"][0][1] - 4, 8, 8)
+            vector_rellenar(lienzo)
+        } sino si (t == "circulo") {
+            vector_circulo(lienzo, p["puntos"][0][0], p["puntos"][0][1], p["radio"])
+            vector_trazar(lienzo)
+        }
+    }
+    retornar lienzo
+}
