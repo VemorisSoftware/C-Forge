@@ -1,0 +1,140 @@
+// Pruebas de blindaje (TLS 1.3 propio). Cliente y servidor hablan en memoria.
+importar "blindaje"
+funcion eq(a, b, q) { afirmar(("" + a) == ("" + b), q + ": [" + a + "] != [" + b + "]") }
+
+funcion conversar(c, s) {
+    sea vueltas = 0
+    mientras ((blindaje_listo(c) == falso o blindaje_listo(s) == falso) y vueltas < 10) {
+        blindaje_entrada(s, blindaje_salida(c))
+        blindaje_entrada(c, blindaje_salida(s))
+        vueltas = vueltas + 1
+    }
+    retornar vueltas
+}
+
+// CA propia y certificado del servidor (Ed25519).
+sea ca = blindaje_emitir(["CForge CA"], {"ca": verdadero})
+sea srv = blindaje_emitir(["localhost", "*.cforge.test", "127.0.0.1"], {"emisor": {"certificado": ca["der"], "clave": ca["clave"]}})
+sea info = blindaje_certificado(srv["der"])
+eq([info["sujeto"]["CN"], info["emisor"]["CN"], info["nombres"], info["alg_firma"], info["ca"], longitud(info["ips"])], ["localhost", "CForge CA", ["localhost", "*.cforge.test"], "ed25519", falso, 1], "certificado")
+afirmar(blindaje_certificado(ca["der"])["ca"], "es CA")
+afirmar(blindaje_nombre_valido(info, "api.cforge.test") y blindaje_nombre_valido(info, "127.0.0.1"), "comodín e IP")
+afirmar(blindaje_nombre_valido(info, "a.b.cforge.test") == falso y blindaje_nombre_valido(info, "otro.com") == falso, "nombres que no")
+
+// Handshake completo, datos y ALPN.
+sea s = blindaje_servidor({"cadena": [srv["der"]], "clave": srv["clave"], "alpn": ["h2", "http/1.1"]})
+sea c = blindaje_cliente("localhost", {"raices": ca["pem"], "alpn": ["http/1.1"]})
+eq(conversar(c, s), 2, "dos vueltas")
+sea ic = blindaje_info(c)
+eq([ic["suite"], ic["grupo"], ic["alpn"], ic["esquema"], blindaje_info(s)["sni"]], ["TLS_AES_128_GCM_SHA256", "x25519", "http/1.1", "ed25519", "localhost"], "info")
+blindaje_escribir(c, "hola servidor")
+blindaje_entrada(s, blindaje_salida(c))
+eq(blindaje_leer(s), "hola servidor", "cliente → servidor")
+sea grande = ""
+mientras (longitud(grande) < 40000) { grande = grande + "0123456789" }
+blindaje_escribir(s, grande)
+blindaje_entrada(c, blindaje_salida(s))
+eq(longitud(blindaje_leer(c)), 40000, "varios registros")
+// Exportador igual en los dos lados.
+eq(hex_de_bytes(blindaje_exportar(c, "prueba", "ctx", 16)), hex_de_bytes(blindaje_exportar(s, "prueba", "ctx", 16)), "exportador")
+// Renovación de claves pedida por el cliente.
+blindaje_renovar_claves(c, verdadero)
+blindaje_escribir(c, "con claves nuevas")
+blindaje_entrada(s, blindaje_salida(c))
+eq(blindaje_leer(s), "con claves nuevas", "KeyUpdate")
+blindaje_escribir(s, "respuesta")
+blindaje_entrada(c, blindaje_salida(s))
+eq(blindaje_leer(c), "respuesta", "KeyUpdate de vuelta")
+// Cierre.
+blindaje_aviso_cierre(c)
+blindaje_entrada(s, blindaje_salida(c))
+afirmar(s["cerrado_par"], "close_notify")
+
+// P-256, ChaCha20-Poly1305 y HelloRetryRequest (el servidor solo acepta P-256).
+sea k256 = blindaje_clave_nueva("P-256")
+sea srv2 = blindaje_emitir(["localhost"], {"clave": k256, "emisor": {"certificado": ca["der"], "clave": ca["clave"]}})
+eq(blindaje_certificado(srv2["der"])["clave"]["curva"], "P-256", "clave P-256")
+sea s2 = blindaje_servidor({"cadena": [srv2["der"]], "clave": k256, "grupos": ["P-256"], "suites": [4867]})
+sea c2 = blindaje_cliente("localhost", {"raices": ca["pem"]})
+conversar(c2, s2)
+sea i2 = blindaje_info(c2)
+eq([i2["suite"], i2["grupo"], i2["esquema"], i2["reintento"]], ["TLS_CHACHA20_POLY1305_SHA256", "P-256", "ecdsa_sha256", verdadero], "HRR y P-256")
+blindaje_escribir(c2, "x")
+blindaje_entrada(s2, blindaje_salida(c2))
+eq(blindaje_leer(s2), "x", "datos tras HRR")
+// AES-256-GCM.
+sea s3 = blindaje_servidor({"cadena": [srv["der"]], "clave": srv["clave"], "suites": [4866]})
+sea c3 = blindaje_cliente("localhost", {"raices": ca["pem"]})
+conversar(c3, s3)
+eq(blindaje_info(c3)["suite"], "TLS_AES_256_GCM_SHA384", "AES-256-GCM")
+
+// Rechazos.
+funcion falla(nombre, op, srv) {
+    sea s = blindaje_servidor({"cadena": [srv["der"]], "clave": srv["clave"]})
+    sea c = blindaje_cliente(nombre, op)
+    sea msj = ""
+    intentar { conversar(c, s) } capturar (e) { msj = e }
+    retornar msj
+}
+afirmar(contiene(falla("otro.com", {"raices": ca["pem"]}, srv), "no es para otro.com"), "nombre equivocado")
+afirmar(contiene(falla("localhost", {"raices": blindaje_emitir(["Otra CA"], {"ca": verdadero})["pem"]}, srv), "raíz"), "CA desconocida")
+afirmar(contiene(falla("localhost", {"raices": ca["pem"], "ahora": 4000000000}, srv), "vencido"), "vencido")
+eq(falla("otro.com", {"verificar": falso}, srv), "", "sin verificar")
+// Un registro alterado no se acepta.
+sea s4 = blindaje_servidor({"cadena": [srv["der"]], "clave": srv["clave"]})
+sea c4 = blindaje_cliente("localhost", {"raices": ca["pem"]})
+conversar(c4, s4)
+blindaje_escribir(c4, "intacto")
+sea reg = blindaje_salida(c4)
+sea malo = subtexto(reg, 0, 10) + char_de(bits_xo(byte_en(reg, 10), 1)) + subtexto(reg, 11, longitud(reg))
+sea rechazo = ""
+intentar { blindaje_entrada(s4, malo) } capturar (e) { rechazo = e }
+afirmar(contiene(rechazo, "bad_record_mac"), "registro alterado")
+
+// Modo QUIC: mensajes por nivel y los mismos secretos en los dos lados.
+sea sq = blindaje_servidor({"cadena": [srv["der"]], "clave": srv["clave"], "quic": verdadero, "quic_parametros": "SP", "alpn": ["h3"]})
+sea cq = blindaje_cliente("localhost", {"raices": ca["pem"], "quic": verdadero, "quic_parametros": "CP", "alpn": ["h3"]})
+blindaje_quic_recibir(sq, "inicial", blindaje_quic_salida(cq, "inicial"))
+blindaje_quic_recibir(cq, "inicial", blindaje_quic_salida(sq, "inicial"))
+blindaje_quic_recibir(cq, "handshake", blindaje_quic_salida(sq, "handshake"))
+blindaje_quic_recibir(sq, "handshake", blindaje_quic_salida(cq, "handshake"))
+afirmar(blindaje_listo(cq) y blindaje_listo(sq), "QUIC listo")
+eq([cq["quic_parametros_par"], sq["quic_parametros_par"], cq["alpn"]], ["SP", "CP", "h3"], "parámetros de transporte")
+sea ks = blindaje_quic_secretos(cq)
+sea ss = blindaje_quic_secretos(sq)
+eq(hex_de_bytes(ks["aplicacion"]["cliente"]), hex_de_bytes(ss["aplicacion"]["cliente"]), "secretos QUIC")
+eq(hex_de_bytes(ks["handshake"]["servidor"]), hex_de_bytes(ss["handshake"]["servidor"]), "secretos de handshake")
+eq(blindaje_salida(cq), "", "QUIC no usa registros")
+
+// Claves en PEM de ida y vuelta.
+sea kp = blindaje_leer_clave(blindaje_clave_pem(k256))
+eq(hex_de_bytes(kp["publica"]), hex_de_bytes(k256["publica"]), "PEM P-256")
+eq(hex_de_bytes(blindaje_leer_clave(srv["clave_pem"])["publica"]), hex_de_bytes(srv["clave"]["publica"]), "PEM Ed25519")
+
+// Certificados y firmas de OpenSSL: RSA 2048 (PSS y PKCS#1 con SHA-384) y P-384.
+sea pem = leer_archivo("tests/bibliotecas/datos/blindaje-certs.pem")
+sea certs = []
+para d en blindaje_pem(pem, "CERTIFICATE") { certs.agregar(blindaje_certificado(d)) }
+eq([certs[0]["clave"]["tipo"], certs[0]["clave"]["bits"], certs[1]["alg_firma"], certs[2]["clave"]["curva"]], ["rsa", 2048, "rsa_sha384", "P-384"], "certificados de OpenSSL")
+sea raiz = [certs[0]]
+sea ahora = 1800000000
+eq(blindaje_verificar_cadena([certs[1]], raiz, "prueba.cforge.test", ahora), nulo, "cadena RSA")
+eq(blindaje_verificar_cadena([certs[1]], raiz, "x.cforge.test", ahora), nulo, "comodín")
+eq(blindaje_verificar_cadena([certs[2]], raiz, "p384.cforge.test", ahora), nulo, "hoja P-384 firmada por RSA")
+afirmar(blindaje_verificar_cadena([certs[2]], [certs[2]], "p384.cforge.test", 1700000000) != nulo, "antes de la fecha")
+sea firmas = {}
+para l en texto_dividir(texto_recortar(leer_archivo("tests/bibliotecas/datos/blindaje-firmas.txt")), "\n") {
+    sea p = texto_dividir(l, " ")
+    firmas[p[0]] = bytes_de_hex(p[1])
+}
+sea msj = "mensaje firmado"
+afirmar(_bl_verificar(certs[1]["clave"], "rsa_pss_sha256", msj, firmas["pss"]), "RSA-PSS")
+afirmar(_bl_verificar(certs[1]["clave"], "rsa_sha384", msj, firmas["pkcs1"]), "RSA PKCS#1 v1.5")
+afirmar(_bl_verificar(certs[2]["clave"], "ecdsa_sha384", msj, firmas["ec384"]), "ECDSA P-384")
+afirmar(_bl_verificar(certs[1]["clave"], "rsa_pss_sha256", msj + "!", firmas["pss"]) == falso, "PSS con otro mensaje")
+afirmar(_bl_verificar(certs[2]["clave"], "ecdsa_sha384", "otro", firmas["ec384"]) == falso, "ECDSA con otro mensaje")
+// Clave P-384 de OpenSSL: firma nuestra que se verifica con su certificado.
+sea k384 = blindaje_leer_clave(leer_archivo("tests/bibliotecas/datos/blindaje-p384.key"))
+eq(hex_de_bytes(k384["publica"]), hex_de_bytes(certs[2]["clave"]["punto"]), "clave P-384 de OpenSSL")
+afirmar(_bl_verificar(certs[2]["clave"], "ecdsa_sha384", "nuestro", _bl_ecdsa_firmar(_bl_curva("P-384"), k384["privada"], _bl_hash(384, "nuestro"))), "firma P-384 propia")
+mostrar("[OK] blindaje")
