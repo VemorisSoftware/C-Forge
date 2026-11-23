@@ -1,0 +1,422 @@
+// stdlib/anillo.cfv — E/S asíncrona con io_uring en Linux, sin liburing:
+// crea el anillo con io_uring_setup, mapea las colas de envío y de
+// terminación y arma las entradas (SQE) a mano. Operaciones: nop, leer y
+// escribir (con desplazamiento), fsync, abrir y cerrar archivos, poll de
+// un descriptor, aceptar, conectar, enviar y recibir por sockets,
+// temporizadores y cancelar; enlazar operaciones en cadena; enviar todo
+// de una vez y recoger las terminaciones con su resultado y sus datos.
+// Atajos para leer y copiar archivos enteros con varias lecturas en vuelo.
+// En inglés: importar "iouring".
+//
+//   importar "anillo"
+//   sea r = anillo_nuevo(64)
+//   anillo_leer(r, fd, 4096, 0, "bloque 0")
+//   anillo_enviar(r)
+//   para c en anillo_completar(r, 1) { mostrar([c["dato"], c["res"], longitud(c["datos"])]) }
+//   anillo_cerrar(r)
+
+funcion __anillo_declaraciones() {
+    extern "libc" funcion syscall(n: largo, a: largo, b: puntero, c: largo, d: largo, e: largo): largo
+    extern "libc" funcion mmap(dir: puntero, largo_m: largo, prot: entero, banderas: entero, fd: entero, desplaz: largo): puntero
+    extern "libc" funcion munmap(dir: puntero, largo_m: largo): entero
+    extern "libc" funcion close(fd: entero): entero
+    extern "libc" funcion socket(dominio: entero, tipo_s: entero, proto: entero): entero
+    extern "libc" funcion setsockopt(fd: entero, nivel: entero, nombre: entero, valor: puntero, largo_v: entero): entero
+    extern "libc" funcion bind(fd: entero, dir: puntero, largo_d: entero): entero
+    extern "libc" funcion listen(fd: entero, cola: entero): entero
+    extern "libc" funcion getsockname(fd: entero, dir: puntero, largo_d: puntero): entero
+}
+
+funcion _an_s32(v) {
+    si (v >= 2147483648) { retornar v - 4294967296 }
+    retornar v
+}
+
+// sockaddr_in de host:puerto (IPv4).
+funcion _an_dir(host, puerto) {
+    sea a = c_reservar(16)
+    sea ip = [127, 0, 0, 1]
+    si (host != nulo y host != "localhost") {
+        sea p = texto_dividir(host, ".")
+        si (longitud(p) != 4) { lanzar "anillo: solo direcciones IPv4 (" + host + ")" }
+        ip = [a_numero(p[0]), a_numero(p[1]), a_numero(p[2]), a_numero(p[3])]
+    }
+    c_escribir32(a, 0, _an_s32(2 + piso(puerto / 256) * 65536 + (puerto % 256) * 16777216))
+    c_escribir32(a, 4, _an_s32(ip[0] + ip[1] * 256 + ip[2] * 65536 + ip[3] * 16777216))
+    retornar a
+}
+
+/// Socket TCP que escucha en host:puerto (puerto 0 = uno libre). Devuelve
+/// {"fd", "puerto"}.
+funcion anillo_escuchar(host, puerto) {
+    __anillo_declaraciones()
+    sea fd = socket(2, 1, 0)
+    si (fd < 0) { lanzar "anillo: no se pudo crear el socket" }
+    sea uno = c_reservar(4)
+    c_escribir32(uno, 0, 1)
+    setsockopt(fd, 1, 2, uno, 4)
+    c_liberar(uno)
+    sea a = _an_dir(host ?? "0.0.0.0", puerto ?? 0)
+    si (bind(fd, a, 16) != 0) {
+        close(fd)
+        lanzar "anillo: no se pudo escuchar en " + (host ?? "0.0.0.0") + ":" + puerto
+    }
+    listen(fd, 128)
+    sea l = c_reservar(4)
+    c_escribir32(l, 0, 16)
+    getsockname(fd, a, l)
+    sea w = _an_u32(c_leer32(a, 0))
+    sea pr = piso(w / 65536)
+    c_liberar(a)
+    c_liberar(l)
+    retornar {"fd": fd, "puerto": (pr % 256) * 256 + piso(pr / 256)}
+}
+
+/// Socket TCP nuevo (sin conectar), para anillo_conectar.
+funcion anillo_socket() {
+    __anillo_declaraciones()
+    retornar socket(2, 1, 0)
+}
+
+/// Cierra un descriptor sin pasar por el anillo.
+funcion anillo_cerrar_ya(fd) {
+    __anillo_declaraciones()
+    close(fd)
+}
+
+sea _AN_OP = {"nop": 0, "fsync": 3, "poll": 6, "timeout": 11, "accept": 13, "cancel": 14, "link_timeout": 15, "connect": 16, "openat": 18, "close": 19, "read": 22, "write": 23, "send": 26, "recv": 27}
+
+/// ¿Hay io_uring en este sistema?
+funcion anillo_disponible() {
+    si (existe_archivo("/proc/meminfo") == falso) { retornar falso }
+    sea ok = falso
+    intentar {
+        sea r = anillo_nuevo(2)
+        anillo_cerrar(r)
+        ok = verdadero
+    } capturar (e) { ok = falso }
+    retornar ok
+}
+
+/// Nuevo anillo con lugar para "entradas" operaciones (potencia de 2).
+funcion anillo_nuevo(entradas) {
+    si (existe_archivo("/proc/meminfo") == falso) { lanzar "anillo: io_uring solo existe en Linux" }
+    __anillo_declaraciones()
+    sea p = c_reservar(120)
+    sea fd = syscall(425, entradas, p, 0, 0, 0)
+    si (fd < 0) {
+        c_liberar(p)
+        lanzar "anillo: io_uring_setup falló (" + fd + ")"
+    }
+    sea sq_n = c_leer32(p, 0)
+    sea cq_n = c_leer32(p, 4)
+    sea feat = c_leer32(p, 20)
+    sea so = {"head": c_leer32(p, 40), "tail": c_leer32(p, 44), "mask": c_leer32(p, 48), "array": c_leer32(p, 64)}
+    sea co = {"head": c_leer32(p, 80), "tail": c_leer32(p, 84), "mask": c_leer32(p, 88), "cqes": c_leer32(p, 100)}
+    c_liberar(p)
+    sea tam_sq = so["array"] + sq_n * 4
+    sea tam_cq = co["cqes"] + cq_n * 16
+    sea unico = bits_y(feat, 1) != 0
+    si (unico) { tam_sq = maximo(tam_sq, tam_cq) }
+    // PROT_READ|PROT_WRITE, MAP_SHARED|MAP_POPULATE.
+    sea sq = mmap(nulo, tam_sq, 3, 32769, fd, 0)
+    sea cq = sq
+    si (unico == falso) { cq = mmap(nulo, tam_cq, 3, 32769, fd, 134217728) }
+    sea sqes = mmap(nulo, sq_n * 64, 3, 32769, fd, 268435456)
+    retornar {"fd": fd, "sq": sq, "cq": cq, "sqes": sqes, "sq_n": sq_n, "cq_n": cq_n, "so": so, "co": co, "tam_sq": tam_sq, "tam_cq": tam_cq, "unico": unico,
+        "pendientes": 0, "sig": 0, "vuelo": {}, "abierto": verdadero, "enlazar": falso}
+}
+
+funcion _an_u32(v) {
+    si (v < 0) { retornar v + 4294967296 }
+    retornar v
+}
+
+// Toma la siguiente SQE libre (en cero) y la deja apuntada en el arreglo.
+funcion _an_sqe(r, op, fd, op_dato) {
+    sea tail = _an_u32(c_leer32(r["sq"], r["so"]["tail"]))
+    sea head = _an_u32(c_leer32(r["sq"], r["so"]["head"]))
+    si (tail - head >= r["sq_n"]) { lanzar "anillo: la cola de envío está llena (llama a anillo_enviar)" }
+    sea idx = tail % r["sq_n"]
+    sea o = idx * 64
+    sea k = 0
+    mientras (k < 64) {
+        c_escribir32(r["sqes"], o + k, 0)
+        k = k + 4
+    }
+    sea banderas = 0
+    si (r["enlazar"]) { banderas = 4 }
+    c_escribir32(r["sqes"], o, _AN_OP[op] + banderas * 256)
+    c_escribir32(r["sqes"], o + 4, fd)
+    r["sig"] = r["sig"] + 1
+    sea id = r["sig"]
+    c_escribir64(r["sqes"], o + 32, id)
+    c_escribir32(r["sq"], r["so"]["array"] + idx * 4, idx)
+    r["vuelo"]["" + id] = {"dato": op_dato, "op": op, "buf": nulo, "n": 0, "extra": nulo}
+    retornar [o, id]
+}
+
+funcion _an_publicar(r) {
+    sea tail = _an_u32(c_leer32(r["sq"], r["so"]["tail"]))
+    c_escribir32(r["sq"], r["so"]["tail"], (tail + 1) % 4294967296)
+    r["pendientes"] = r["pendientes"] + 1
+}
+
+/// Las operaciones que se agreguen hasta anillo_fin_cadena van enlazadas
+/// (cada una empieza cuando terminó bien la anterior).
+funcion anillo_cadena(r) { r["enlazar"] = verdadero }
+
+funcion anillo_fin_cadena(r) {
+    // La última de la cadena no lleva la bandera de enlace.
+    sea tail = _an_u32(c_leer32(r["sq"], r["so"]["tail"]))
+    si (tail > 0) {
+        sea idx = (tail - 1) % r["sq_n"]
+        sea w = _an_u32(c_leer32(r["sqes"], idx * 64))
+        c_escribir32(r["sqes"], idx * 64, bits_y(w, 255) + bits_y(piso(w / 256), 251) * 256 + piso(w / 65536) * 65536)
+    }
+    r["enlazar"] = falso
+}
+
+funcion anillo_nop(r, dato) {
+    _an_sqe(r, "nop", -1, dato)
+    _an_publicar(r)
+}
+
+/// Lee n bytes de fd desde desplaz (-1: posición actual).
+funcion anillo_leer(r, fd, n, desplaz, dato) {
+    sea s = _an_sqe(r, "read", fd, dato)
+    sea buf = c_reservar(n + 1)
+    c_escribir64(r["sqes"], s[0] + 8, desplaz ?? -1)
+    c_escribir64(r["sqes"], s[0] + 16, buf)
+    c_escribir32(r["sqes"], s[0] + 24, n)
+    r["vuelo"]["" + s[1]]["buf"] = buf
+    _an_publicar(r)
+}
+
+/// Escribe datos en fd desde desplaz (-1: posición actual).
+funcion anillo_escribir(r, fd, datos, desplaz, dato) {
+    sea s = _an_sqe(r, "write", fd, dato)
+    sea buf = c_desde_bytes(datos)
+    c_escribir64(r["sqes"], s[0] + 8, desplaz ?? -1)
+    c_escribir64(r["sqes"], s[0] + 16, buf)
+    c_escribir32(r["sqes"], s[0] + 24, longitud(datos))
+    r["vuelo"]["" + s[1]]["extra"] = buf
+    _an_publicar(r)
+}
+
+funcion anillo_fsync(r, fd, dato) {
+    _an_sqe(r, "fsync", fd, dato)
+    _an_publicar(r)
+}
+
+/// Abre un archivo (banderas de open: 0 leer, 577 crear+truncar+escribir…).
+funcion anillo_abrir(r, ruta, banderas, modo, dato) {
+    sea s = _an_sqe(r, "openat", -100, dato)
+    sea buf = c_desde_bytes(ruta)
+    c_escribir64(r["sqes"], s[0] + 16, buf)
+    c_escribir32(r["sqes"], s[0] + 24, modo ?? 420)
+    c_escribir32(r["sqes"], s[0] + 28, banderas ?? 0)
+    r["vuelo"]["" + s[1]]["extra"] = buf
+    _an_publicar(r)
+}
+
+funcion anillo_cerrar_fd(r, fd, dato) {
+    _an_sqe(r, "close", fd, dato)
+    _an_publicar(r)
+}
+
+/// Espera que fd esté listo (eventos: 1 leer, 4 escribir).
+funcion anillo_poll(r, fd, eventos, dato) {
+    sea s = _an_sqe(r, "poll", fd, dato)
+    c_escribir32(r["sqes"], s[0] + 28, eventos ?? 1)
+    _an_publicar(r)
+}
+
+/// Temporizador de ms milisegundos (termina con -62, ETIME).
+funcion anillo_temporizador(r, ms, dato) {
+    sea s = _an_sqe(r, "timeout", -1, dato)
+    sea ts = c_reservar(16)
+    c_escribir64(ts, 0, piso(ms / 1000))
+    c_escribir64(ts, 8, (ms % 1000) * 1000000)
+    c_escribir64(r["sqes"], s[0] + 16, ts)
+    c_escribir32(r["sqes"], s[0] + 24, 1)
+    r["vuelo"]["" + s[1]]["extra"] = ts
+    _an_publicar(r)
+}
+
+/// Acepta una conexión en un socket que escucha.
+funcion anillo_aceptar(r, fd, dato) {
+    _an_sqe(r, "accept", fd, dato)
+    _an_publicar(r)
+}
+
+/// Conecta un socket a host:puerto.
+funcion anillo_conectar(r, fd, host, puerto, dato) {
+    sea s = _an_sqe(r, "connect", fd, dato)
+    sea a = _an_dir(host, puerto)
+    c_escribir64(r["sqes"], s[0] + 8, 16)
+    c_escribir64(r["sqes"], s[0] + 16, a)
+    r["vuelo"]["" + s[1]]["extra"] = a
+    _an_publicar(r)
+}
+
+/// Recibe hasta n bytes de un socket.
+funcion anillo_recibir(r, fd, n, dato) {
+    sea s = _an_sqe(r, "recv", fd, dato)
+    sea buf = c_reservar(n + 1)
+    c_escribir64(r["sqes"], s[0] + 16, buf)
+    c_escribir32(r["sqes"], s[0] + 24, n)
+    r["vuelo"]["" + s[1]]["buf"] = buf
+    _an_publicar(r)
+}
+
+/// Envía datos por un socket.
+funcion anillo_enviar_datos(r, fd, datos, dato) {
+    sea s = _an_sqe(r, "send", fd, dato)
+    sea buf = c_desde_bytes(datos)
+    c_escribir64(r["sqes"], s[0] + 16, buf)
+    c_escribir32(r["sqes"], s[0] + 24, longitud(datos))
+    r["vuelo"]["" + s[1]]["extra"] = buf
+    _an_publicar(r)
+}
+
+/// Pide cancelar la operación con ese dato (la primera que coincida).
+funcion anillo_cancelar(r, dato_buscado, dato) {
+    sea objetivo = nulo
+    para k en claves(r["vuelo"]) { si (objetivo == nulo y r["vuelo"][k]["dato"] == dato_buscado) { objetivo = a_numero(k) } }
+    si (objetivo == nulo) { lanzar "anillo: no hay operación con ese dato" }
+    sea s = _an_sqe(r, "cancel", -1, dato)
+    c_escribir64(r["sqes"], s[0] + 8, 0)
+    c_escribir64(r["sqes"], s[0] + 16, objetivo)
+    _an_publicar(r)
+}
+
+/// Envía al núcleo todo lo encolado; devuelve cuántas operaciones.
+funcion anillo_enviar(r) {
+    __anillo_declaraciones()
+    sea n = r["pendientes"]
+    si (n == 0) { retornar 0 }
+    sea v = syscall(426, r["fd"], n, 0, 0, 0)
+    si (v < 0) { lanzar "anillo: io_uring_enter falló (" + v + ")" }
+    r["pendientes"] = r["pendientes"] - v
+    retornar v
+}
+
+/// Espera al menos "minimo" terminaciones y devuelve todas las que haya:
+/// [{"dato", "op", "res", "datos" (para lecturas)}]. res negativo = -errno.
+funcion anillo_completar(r, minimo) {
+    __anillo_declaraciones()
+    si (r["pendientes"] > 0) { anillo_enviar(r) }
+    sea listas = []
+    sea vueltas = 0
+    mientras (verdadero) {
+        sea head = _an_u32(c_leer32(r["cq"], r["co"]["head"]))
+        sea tail = _an_u32(c_leer32(r["cq"], r["co"]["tail"]))
+        mientras (head != tail) {
+            sea o = r["co"]["cqes"] + (head % r["cq_n"]) * 16
+            sea id = c_leer64(r["cq"], o)
+            sea res = c_leer32(r["cq"], o + 8)
+            sea v = r["vuelo"]["" + id] ?? nulo
+            si (v != nulo) {
+                sea c = {"dato": v["dato"], "op": v["op"], "res": res, "datos": nulo}
+                si (v["buf"] != nulo) {
+                    si (res > 0) { c["datos"] = c_bytes(v["buf"], res) } sino { c["datos"] = "" }
+                    c_liberar(v["buf"])
+                }
+                si (v["extra"] != nulo) { c_liberar(v["extra"]) }
+                quitar_clave(r["vuelo"], "" + id)
+                listas.agregar(c)
+            }
+            head = (head + 1) % 4294967296
+        }
+        c_escribir32(r["cq"], r["co"]["head"], head)
+        si (longitud(listas) >= (minimo ?? 0)) { retornar listas }
+        // Espera en el núcleo (IORING_ENTER_GETEVENTS).
+        sea faltan = (minimo ?? 0) - longitud(listas)
+        syscall(426, r["fd"], 0, faltan, 1, 0)
+        vueltas = vueltas + 1
+        si (vueltas > 100000) { lanzar "anillo: no llegan las terminaciones" }
+    }
+}
+
+/// Operaciones en vuelo.
+funcion anillo_en_vuelo(r) { retornar longitud(claves(r["vuelo"])) }
+
+funcion anillo_cerrar(r) {
+    si (r["abierto"] == falso) { retornar nulo }
+    __anillo_declaraciones()
+    r["abierto"] = falso
+    munmap(r["sqes"], r["sq_n"] * 64)
+    munmap(r["sq"], r["tam_sq"])
+    si (r["unico"] == falso) { munmap(r["cq"], r["tam_cq"]) }
+    close(r["fd"])
+}
+
+// ---------- atajos ----------
+
+funcion _an_esperar_uno(r) {
+    sea c = anillo_completar(r, 1)
+    retornar c[0]
+}
+
+/// Lee un archivo entero con varias lecturas en vuelo (bloques de "bloque"
+/// bytes).
+funcion anillo_leer_archivo(ruta, bloque) {
+    sea b = bloque ?? 65536
+    sea r = anillo_nuevo(32)
+    anillo_abrir(r, ruta, 0, 0, "abrir")
+    sea c = _an_esperar_uno(r)
+    si (c["res"] < 0) {
+        anillo_cerrar(r)
+        lanzar "anillo: no se pudo abrir " + ruta + " (errno " + (0 - c["res"]) + ")"
+    }
+    sea fd = c["res"]
+    sea partes = {}
+    sea desplaz = 0
+    sea fin = falso
+    sea total = 0
+    mientras (fin == falso) {
+        // Ocho lecturas a la vez.
+        sea k = 0
+        mientras (k < 8) {
+            anillo_leer(r, fd, b, desplaz + k * b, desplaz + k * b)
+            k = k + 1
+        }
+        para t en anillo_completar(r, 8) {
+            si (t["res"] < 0) { lanzar "anillo: error al leer (errno " + (0 - t["res"]) + ")" }
+            si (t["res"] > 0) { partes["" + t["dato"]] = t["datos"] }
+            si (t["res"] < b) { fin = verdadero }
+        }
+        desplaz = desplaz + 8 * b
+    }
+    anillo_cerrar_fd(r, fd, "cerrar")
+    anillo_completar(r, 1)
+    anillo_cerrar(r)
+    sea ks = []
+    para k en claves(partes) { ks.agregar(a_numero(k)) }
+    sea l = []
+    para k en ordenar(ks, funcion(x, z) { retornar x - z }) { l.agregar(partes["" + k]) }
+    retornar unir(l, "")
+}
+
+/// Escribe un archivo entero (crea o reemplaza) y lo sincroniza.
+funcion anillo_escribir_archivo(ruta, datos) {
+    sea r = anillo_nuevo(8)
+    anillo_abrir(r, ruta, 577, 420, "abrir")
+    sea c = _an_esperar_uno(r)
+    si (c["res"] < 0) {
+        anillo_cerrar(r)
+        lanzar "anillo: no se pudo crear " + ruta + " (errno " + (0 - c["res"]) + ")"
+    }
+    sea fd = c["res"]
+    anillo_cadena(r)
+    anillo_escribir(r, fd, datos, 0, "escribir")
+    anillo_fsync(r, fd, "fsync")
+    anillo_fin_cadena(r)
+    sea hechos = anillo_completar(r, 2)
+    anillo_cerrar_fd(r, fd, "cerrar")
+    anillo_completar(r, 1)
+    anillo_cerrar(r)
+    para h en hechos { si (h["res"] < 0) { lanzar "anillo: falló " + h["dato"] + " (errno " + (0 - h["res"]) + ")" } }
+    retornar longitud(datos)
+}

@@ -1,0 +1,413 @@
+// stdlib/animacion.cfv — reproductor de animaciones Lottie (JSON de
+// Bodymovin) sobre "vector": capas de formas, sólidas, nulas y
+// precomposiciones; padres; puntos de entrada y salida; transformaciones
+// animadas (ancla, posición —también separada en x/y—, escala, rotación,
+// opacidad e inclinación) con fotogramas clave, retención y curvas de
+// Bézier; formas (grupos, rectángulos redondeados, elipses, caminos con
+// tangentes —también animados—, estrellas y polígonos) con rellenos,
+// trazos (extremos, uniones, guiones) y degradados lineales y radiales.
+// Cada cuadro sale como SVG, PDF o PNG. Comparado con python-lottie +
+// rsvg-convert. Idea de lottie-web (MIT). En inglés: importar "lottie".
+//
+//   importar "animacion"
+//   sea a = animacion_cargar(leer_archivo("animacion.json"))
+//   escribir_archivo("cuadro.png", animacion_cuadro(a, 30, "png", nulo))
+
+importar "vector"
+importar "json"
+
+sea _AN_PI = 3.141592653589793
+
+/// Carga una animación desde su JSON (texto o mapa).
+funcion animacion_cargar(j) {
+    sea d = j
+    si (tipo(j) == "texto") { d = json_parsear(j) }
+    sea activos = {}
+    para a en d["assets"] ?? [] { activos[a["id"]] = a }
+    retornar {"d": d, "ancho": d["w"], "alto": d["h"], "fps": d["fr"] ?? 30, "ip": d["ip"] ?? 0, "op": d["op"] ?? 0, "activos": activos}
+}
+
+/// Datos: {"ancho", "alto", "fps", "inicio", "fin", "cuadros", "segundos", "capas"}.
+funcion animacion_info(a) {
+    retornar {"ancho": a["ancho"], "alto": a["alto"], "fps": a["fps"], "inicio": a["ip"], "fin": a["op"], "cuadros": a["op"] - a["ip"], "segundos": (a["op"] - a["ip"]) / a["fps"], "capas": longitud(a["d"]["layers"] ?? [])}
+}
+
+// ---------- valores animados ----------
+
+// Bézier cúbica de easing: dado x en [0,1] devuelve y.
+funcion _an_bezier(x1, y1, x2, y2, x) {
+    si (x1 == y1 y x2 == y2) { retornar x }
+    sea lo = 0
+    sea hi = 1
+    sea t = x
+    sea k = 0
+    mientras (k < 40) {
+        sea u = 1 - t
+        sea bx = 3 * u * u * t * x1 + 3 * u * t * t * x2 + t * t * t
+        si (abs(bx - x) < 0.0000001) { k = 40 } sino {
+            si (bx < x) { lo = t } sino { hi = t }
+            t = (lo + hi) / 2
+        }
+        k = k + 1
+    }
+    sea u = 1 - t
+    retornar 3 * u * u * t * y1 + 3 * u * t * t * y2 + t * t * t
+}
+
+funcion _an_comp(v, i) {
+    si (tipo(v) == "lista") {
+        si (longitud(v) == 0) { retornar 0 }
+        si (i < longitud(v)) { retornar v[i] }
+        retornar v[longitud(v) - 1]
+    }
+    retornar v
+}
+
+funcion _an_mezclar(a, b, t) {
+    si (tipo(a) == "lista") {
+        sea r = []
+        sea i = 0
+        mientras (i < longitud(a)) {
+            r.agregar(_an_mezclar(a[i], b[i] ?? a[i], t))
+            i = i + 1
+        }
+        retornar r
+    }
+    si (tipo(a) == "mapa") {
+        // Camino: {"c", "v", "i", "o"}.
+        retornar {"c": a["c"] ?? falso, "v": _an_mezclar(a["v"], b["v"], t), "i": _an_mezclar(a["i"], b["i"], t), "o": _an_mezclar(a["o"], b["o"], t)}
+    }
+    si (tipo(a) != "numero") { retornar a }
+    retornar a + (b - a) * t
+}
+
+// Valor de una propiedad animada en el cuadro f.
+funcion _an_valor(p, f) {
+    si (p == nulo) { retornar nulo }
+    si (tipo(p) != "mapa") { retornar p }
+    si (tiene_clave(p, "x") y tiene_clave(p, "y") y (p["s"] ?? falso) == verdadero) {
+        // Posición separada en dimensiones.
+        retornar [_an_valor(p["x"], f), _an_valor(p["y"], f)]
+    }
+    sea k = p["k"]
+    sea animada = (p["a"] ?? 0) == 1
+    si (animada == falso) {
+        si (tipo(k) == "lista" y longitud(k) > 0 y tipo(k[0]) == "mapa" y tiene_clave(k[0], "t")) { animada = verdadero } sino { retornar k }
+    }
+    sea kf = k
+    si (f <= kf[0]["t"]) { retornar _an_desempacar(kf[0]["s"]) }
+    sea i = 0
+    mientras (i + 1 < longitud(kf)) {
+        sea a = kf[i]
+        sea b = kf[i + 1]
+        si (f < b["t"]) {
+            sea ini = _an_desempacar(a["s"])
+            si ((a["h"] ?? 0) == 1) { retornar ini }
+            sea fin = nulo
+            si (tiene_clave(a, "e")) { fin = _an_desempacar(a["e"]) } sino { fin = _an_desempacar(b["s"] ?? a["s"]) }
+            sea x = (f - a["t"]) / (b["t"] - a["t"])
+            sea o = a["o"] ?? {"x": [0], "y": [0]}
+            sea ii = a["i"] ?? {"x": [1], "y": [1]}
+            si (tipo(ini) == "lista") {
+                sea r = []
+                sea d = 0
+                mientras (d < longitud(ini)) {
+                    sea y = _an_bezier(_an_comp(o["x"], d), _an_comp(o["y"], d), _an_comp(ii["x"], d), _an_comp(ii["y"], d), x)
+                    r.agregar(_an_mezclar(ini[d], fin[d] ?? ini[d], y))
+                    d = d + 1
+                }
+                retornar r
+            }
+            sea y = _an_bezier(_an_comp(o["x"], 0), _an_comp(o["y"], 0), _an_comp(ii["x"], 0), _an_comp(ii["y"], 0), x)
+            retornar _an_mezclar(ini, fin, y)
+        }
+        i = i + 1
+    }
+    sea u = kf[longitud(kf) - 1]
+    si (tiene_clave(u, "s")) { retornar _an_desempacar(u["s"]) }
+    si (longitud(kf) >= 2 y tiene_clave(kf[longitud(kf) - 2], "e")) { retornar _an_desempacar(kf[longitud(kf) - 2]["e"]) }
+    retornar _an_desempacar(kf[longitud(kf) - 2]["s"])
+}
+
+// Los caminos animados vienen como [camino].
+funcion _an_desempacar(v) {
+    si (tipo(v) == "lista" y longitud(v) == 1 y tipo(v[0]) == "mapa") { retornar v[0] }
+    retornar v
+}
+
+funcion _an_num(p, f, defecto) {
+    sea v = _an_valor(p, f)
+    si (v == nulo) { retornar defecto }
+    si (tipo(v) == "lista") { retornar v[0] }
+    retornar v
+}
+
+funcion _an_vec(p, f, defecto) {
+    sea v = _an_valor(p, f)
+    si (v == nulo) { retornar defecto }
+    si (tipo(v) != "lista") { retornar [v, v] }
+    retornar v
+}
+
+// ---------- transformaciones ----------
+
+funcion _an_mul(m, n) { retornar [m[0] * n[0] + m[2] * n[1], m[1] * n[0] + m[3] * n[1], m[0] * n[2] + m[2] * n[3], m[1] * n[2] + m[3] * n[3], m[0] * n[4] + m[2] * n[5] + m[4], m[1] * n[4] + m[3] * n[5] + m[5]] }
+
+// Matriz y opacidad (0..1) de un bloque de transformación (ks o tr).
+funcion _an_transformacion(t, f) {
+    si (t == nulo) { retornar [[1, 0, 0, 1, 0, 0], 1] }
+    sea an = _an_vec(t["a"] ?? nulo, f, [0, 0])
+    sea po = _an_vec(t["p"] ?? nulo, f, [0, 0])
+    sea es = _an_vec(t["s"] ?? nulo, f, [100, 100])
+    sea r = _an_num(t["r"] ?? (t["rz"] ?? nulo), f, 0) * _AN_PI / 180
+    sea o = _an_num(t["o"] ?? nulo, f, 100) / 100
+    sea sk = _an_num(t["sk"] ?? nulo, f, 0) * _AN_PI / 180
+    sea sa = _an_num(t["sa"] ?? nulo, f, 0) * _AN_PI / 180
+    sea m = [1, 0, 0, 1, po[0], po[1]]
+    m = _an_mul(m, [coseno(r), seno(r), 0 - seno(r), coseno(r), 0, 0])
+    si (sk != 0) {
+        // Inclinación sobre el eje sa.
+        sea c = coseno(sa)
+        sea s = seno(sa)
+        m = _an_mul(m, [c, s, 0 - s, c, 0, 0])
+        m = _an_mul(m, [1, 0, 0 - tangente(sk), 1, 0, 0])
+        m = _an_mul(m, [c, 0 - s, s, c, 0, 0])
+    }
+    m = _an_mul(m, [es[0] / 100, 0, 0, es[1] / 100, 0, 0])
+    m = _an_mul(m, [1, 0, 0, 1, 0 - an[0], 0 - an[1]])
+    retornar [m, o]
+}
+
+// ---------- caminos de las formas ----------
+
+funcion _an_camino(c, p) {
+    sea v = p["v"]
+    si (longitud(v) == 0) { retornar nulo }
+    sea ii = p["i"]
+    sea oo = p["o"]
+    vector_mover(c, v[0][0], v[0][1])
+    sea n = longitud(v)
+    sea k = 1
+    sea fin = n
+    si (p["c"] ?? falso) { fin = n + 1 }
+    mientras (k < fin) {
+        sea a = v[(k - 1) % n]
+        sea b = v[k % n]
+        sea ao = oo[(k - 1) % n]
+        sea bi = ii[k % n]
+        vector_curva(c, a[0] + ao[0], a[1] + ao[1], b[0] + bi[0], b[1] + bi[1], b[0], b[1])
+        k = k + 1
+    }
+    si (p["c"] ?? falso) { vector_cerrar(c) }
+}
+
+funcion _an_geometria(c, it, f) {
+    sea t = it["ty"]
+    si (t == "rc") {
+        sea p = _an_vec(it["p"], f, [0, 0])
+        sea s = _an_vec(it["s"], f, [0, 0])
+        sea r = _an_num(it["r"] ?? nulo, f, 0)
+        r = minimo(r, minimo(s[0], s[1]) / 2)
+        si (r > 0) { vector_rectangulo_redondeado(c, p[0] - s[0] / 2, p[1] - s[1] / 2, s[0], s[1], r) } sino { vector_rectangulo(c, p[0] - s[0] / 2, p[1] - s[1] / 2, s[0], s[1]) }
+        retornar verdadero
+    }
+    si (t == "el") {
+        sea p = _an_vec(it["p"], f, [0, 0])
+        sea s = _an_vec(it["s"], f, [0, 0])
+        vector_elipse(c, p[0], p[1], s[0] / 2, s[1] / 2)
+        retornar verdadero
+    }
+    si (t == "sh") {
+        _an_camino(c, _an_valor(it["ks"], f))
+        retornar verdadero
+    }
+    si (t == "sr") {
+        // Estrella (sy 1) o polígono (sy 2), sin redondeo.
+        sea p = _an_vec(it["p"], f, [0, 0])
+        sea n = redondear(_an_num(it["pt"], f, 5))
+        sea ro = _an_num(it["or"], f, 10)
+        sea ri = _an_num(it["ir"] ?? nulo, f, ro / 2)
+        sea rot = _an_num(it["r"] ?? nulo, f, 0) * _AN_PI / 180 - _AN_PI / 2
+        sea pts = n
+        si ((it["sy"] ?? 1) == 1) { pts = 2 * n }
+        sea k = 0
+        mientras (k < pts) {
+            sea rad = ro
+            si ((it["sy"] ?? 1) == 1 y k % 2 == 1) { rad = ri }
+            sea ang = rot + 2 * _AN_PI * k / pts
+            si (k == 0) { vector_mover(c, p[0] + rad * coseno(ang), p[1] + rad * seno(ang)) } sino { vector_linea(c, p[0] + rad * coseno(ang), p[1] + rad * seno(ang)) }
+            k = k + 1
+        }
+        vector_cerrar(c)
+        retornar verdadero
+    }
+    retornar falso
+}
+
+funcion _an_es_estilo(t) { retornar t == "fl" o t == "st" o t == "gf" o t == "gs" }
+
+funcion _an_paradas(g, f) {
+    sea n = g["p"]
+    sea k = _an_valor(g["k"], f)
+    sea r = []
+    sea i = 0
+    mientras (i < n) {
+        sea al = 1
+        // Opacidades opcionales al final: [pos, alfa] por parada.
+        si (longitud(k) >= 4 * n + 2 * n) { al = k[4 * n + 2 * i + 1] }
+        r.agregar([k[4 * i], [k[4 * i + 1], k[4 * i + 2], k[4 * i + 3], al]])
+        i = i + 1
+    }
+    retornar r
+}
+
+// Aplica un estilo al camino actual (lo conserva).
+funcion _an_estilo(c, st, f, alfa) {
+    sea t = st["ty"]
+    sea o = _an_num(st["o"] ?? nulo, f, 100) / 100 * alfa
+    si (t == "fl" o t == "st") {
+        sea col = _an_valor(st["c"], f)
+        vector_color(c, [col[0], col[1], col[2], o])
+    } sino {
+        sea s = _an_vec(st["s"], f, [0, 0])
+        sea e = _an_vec(st["e"], f, [0, 0])
+        sea ps = []
+        para p en _an_paradas(st["g"], f) { ps.agregar([p[0], [p[1][0], p[1][1], p[1][2], p[1][3] * o]]) }
+        si ((st["t"] ?? 1) == 1) { vector_degradado_lineal(c, s[0], s[1], e[0], e[1], ps) } sino {
+            sea rr = raiz((e[0] - s[0]) * (e[0] - s[0]) + (e[1] - s[1]) * (e[1] - s[1]))
+            vector_degradado_radial(c, s[0], s[1], 0, rr, ps)
+        }
+    }
+    si (t == "fl" o t == "gf") {
+        si ((st["r"] ?? 1) == 2) { vector_regla(c, "par_impar") } sino { vector_regla(c, "no_cero") }
+        vector_rellenar_mantener(c)
+    } sino {
+        vector_grosor(c, _an_num(st["w"], f, 1))
+        sea caps = ["plano", "plano", "redondo", "cuadrado"]
+        sea joins = ["inglete", "inglete", "redonda", "bisel"]
+        vector_extremo(c, caps[st["lc"] ?? 1] ?? "plano")
+        vector_union(c, joins[st["lj"] ?? 1] ?? "inglete")
+        vector_limite_inglete(c, st["ml"] ?? 4)
+        sea g = []
+        sea desf = 0
+        para dd en st["d"] ?? [] {
+            sea v = _an_num(dd["v"], f, 0)
+            si (dd["n"] == "o") { desf = v } sino { g.agregar(v) }
+        }
+        vector_guiones(c, g, desf)
+        vector_trazar_mantener(c)
+        vector_guiones(c, [], 0)
+    }
+}
+
+// Dibuja la lista de elementos de forma (de abajo hacia arriba).
+funcion _an_items(c, items, f, alfa, heredados) {
+    sea i = longitud(items) - 1
+    mientras (i >= 0) {
+        sea it = items[i]
+        si ((it["hd"] ?? falso) == falso) {
+            sea t = it["ty"]
+            si (t == "gr" o _an_es_estilo(t) == falso) {
+                // Estilos que aplican: los que vienen después en la lista y los heredados.
+                sea estilos = []
+                sea k = i + 1
+                mientras (k < longitud(items)) {
+                    si (_an_es_estilo(items[k]["ty"]) y (items[k]["hd"] ?? falso) == falso) { estilos.agregar(items[k]) }
+                    k = k + 1
+                }
+                estilos = estilos + heredados
+                si (t == "gr") {
+                    sea tr = nulo
+                    sea hijos = []
+                    para x en it["it"] ?? [] { si (x["ty"] == "tr") { tr = x } sino { hijos.agregar(x) } }
+                    sea mt = _an_transformacion(tr, f)
+                    vector_guardar(c)
+                    vector_transformar(c, mt[0])
+                    _an_items(c, hijos, f, alfa * mt[1], estilos)
+                    vector_restaurar(c)
+                } sino {
+                    vector_nuevo_camino(c)
+                    si (_an_geometria(c, it, f)) {
+                        sea s = longitud(estilos) - 1
+                        mientras (s >= 0) {
+                            _an_estilo(c, estilos[s], f, alfa)
+                            s = s - 1
+                        }
+                    }
+                    vector_nuevo_camino(c)
+                }
+            }
+        }
+        i = i - 1
+    }
+}
+
+// Matriz de una capa incluyendo sus padres.
+funcion _an_matriz_capa(capas, capa, f) {
+    sea m = _an_transformacion(capa["ks"], f)[0]
+    sea padre = capa["parent"] ?? nulo
+    sea vueltas = 0
+    mientras (padre != nulo y vueltas < 32) {
+        sea p = nulo
+        para x en capas { si ((x["ind"] ?? -1) == padre) { p = x } }
+        si (p == nulo) { padre = nulo } sino {
+            m = _an_mul(_an_transformacion(p["ks"], f)[0], m)
+            padre = p["parent"] ?? nulo
+        }
+        vueltas = vueltas + 1
+    }
+    retornar m
+}
+
+funcion _an_capas(a, c, capas, f) {
+    sea i = longitud(capas) - 1
+    mientras (i >= 0) {
+        sea capa = capas[i]
+        sea ip = capa["ip"] ?? 0
+        sea op = capa["op"] ?? 1000000
+        si ((capa["hd"] ?? falso) == falso y f >= ip y f < op) {
+            sea fl = (f - (capa["st"] ?? 0)) / (capa["sr"] ?? 1)
+            sea m = _an_matriz_capa(capas, capa, f)
+            sea alfa = _an_num((capa["ks"] ?? {})["o"] ?? nulo, f, 100) / 100
+            vector_guardar(c)
+            vector_transformar(c, m)
+            sea t = capa["ty"]
+            si (t == 4) { _an_items(c, capa["shapes"] ?? [], fl, alfa, []) }
+            si (t == 1) {
+                sea col = vector_rgba(capa["sc"] ?? "#000000")
+                vector_rectangulo(c, 0, 0, capa["sw"] ?? 0, capa["sh"] ?? 0)
+                vector_color(c, [col[0], col[1], col[2], col[3] * alfa])
+                vector_rellenar(c)
+            }
+            si (t == 0) {
+                sea pre = a["activos"][capa["refId"]] ?? nulo
+                si (pre != nulo) {
+                    vector_guardar(c)
+                    vector_rectangulo(c, 0, 0, capa["w"] ?? a["ancho"], capa["h"] ?? a["alto"])
+                    vector_recortar(c)
+                    _an_capas(a, c, pre["layers"] ?? [], fl)
+                    vector_restaurar(c)
+                }
+            }
+            vector_restaurar(c)
+        }
+        i = i - 1
+    }
+}
+
+/// Dibuja el cuadro f en un contexto de "vector".
+funcion animacion_dibujar(a, c, f) { _an_capas(a, c, a["d"]["layers"] ?? [], f) }
+
+/// Cuadro f como "svg" (texto), "pdf" o "png" (bytes). opciones: "fondo",
+/// "escala" (multiplica el tamaño).
+funcion animacion_cuadro(a, f, formato, opciones) {
+    sea op = opciones ?? {}
+    sea k = op["escala"] ?? 1
+    sea c = vector_nuevo(formato, a["ancho"] * k, a["alto"] * k, {"fondo": op["fondo"] ?? nulo})
+    si (k != 1) { vector_escalar(c, k, k) }
+    animacion_dibujar(a, c, f)
+    retornar vector_terminar(c)
+}
+
+/// Valor de una propiedad animada en un cuadro (para inspeccionar).
+funcion animacion_valor(propiedad, f) { retornar _an_valor(propiedad, f) }

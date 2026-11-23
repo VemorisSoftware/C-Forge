@@ -4,6 +4,10 @@ Sitio oficial: [c-forge.org](https://c-forge.org)
 
 ## Sin publicar
 
+- **Corregido:** `esperar(t)` podía quedarse colgada para siempre si la
+  tarea terminaba justo entre la comprobación y la espera del futex (volvía
+  a leer el tid y esperaba con 0). Ahora espera con el mismo valor que
+  comprobó.
 - **Bibliotecas del ecosistema (lote 1):** `tinta` (colores ANSI, NO_COLOR),
   `ident` (UUID v4/v7, ULID, NanoID), `csv` (RFC 4180, exportación segura
   contra fórmulas), `progreso` (barras y spinners) y `dinero` (decimales
@@ -65,6 +69,18 @@ Sitio oficial: [c-forge.org](https://c-forge.org)
   `llamada`/`protobuf` (.proto, binario como protoc, marcos gRPC),
   `recolecta`/`crawler` (cookies RFC 6265, formularios, robots.txt,
   rastreo) y `sensor`/`mqtt` (paquetes MQTT, QoS 2, mini broker).
+- Lote 23 de bibliotecas (con alias en inglés y pruebas en ambos idiomas):
+  `enjambre`/`parallel` (paralelismo de datos al estilo Rayon: mapear,
+  filtrar, reducir y ordenar en hilos), `marea`/`asyncrt` (tareas, canales,
+  select, difusión, semáforos, barreras y cancelación al estilo Tokio),
+  `torrente`/`pipeline` (tuberías de manejadores y códecs al estilo Netty,
+  con canal embebido para probar), `pizarra`/`canvasobjects` (objetos
+  interactivos al estilo Fabric.js: arrastrar, escalar, girar, deshacer y
+  JSON), `animacion`/`lottie` (reproductor de Lottie, cruzado con
+  python-lottie), `anillo`/`iouring` (io_uring sin liburing: archivos,
+  sockets, temporizadores, cadenas y cancelación) y
+  `esqueleto`/`skeleton2d` (esqueletos de Spine 3.8 y 4.x con IK, pieles,
+  mallas con pesos, atlas y mezclas entre animaciones).
 - Lote 22 de bibliotecas (con alias en inglés y pruebas en ambos idiomas):
   `piloto`/`browser` (automatizar Chrome por DevTools al estilo Playwright,
   probado con Google Chrome), `mapeador`/`dbmapper` (ORM sobre SQLite con
