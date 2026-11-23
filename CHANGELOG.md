@@ -69,6 +69,8 @@ Sitio oficial: [c-forge.org](https://c-forge.org)
   `llamada`/`protobuf` (.proto, binario como protoc, marcos gRPC),
   `recolecta`/`crawler` (cookies RFC 6265, formularios, robots.txt,
   rastreo) y `sensor`/`mqtt` (paquetes MQTT, QoS 2, mini broker).
+- Las fuentes de mapa de bits (`fuente_basica`) dibujan las letras con
+  tilde y la eñe como su letra ASCII más cercana en vez de "?".
 - Lote 31 de bibliotecas (con alias en inglés y pruebas en ambos idiomas):
   `gpu`/`wgpu` (API al estilo WebGPU con backend de software: buffers,
   texturas, muestreadores, tuberías de render y de cómputo, pases,
