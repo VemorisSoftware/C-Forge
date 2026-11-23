@@ -69,6 +69,18 @@ Sitio oficial: [c-forge.org](https://c-forge.org)
   `llamada`/`protobuf` (.proto, binario como protoc, marcos gRPC),
   `recolecta`/`crawler` (cookies RFC 6265, formularios, robots.txt,
   rastreo) y `sensor`/`mqtt` (paquetes MQTT, QoS 2, mini broker).
+- Lote 32 de bibliotecas (tres que antes se usaban por enlaces y ahora son
+  propias, con alias en inglés y pruebas en ambos idiomas):
+  `cientifica`/`gsl` (gamma, beta, digamma, zeta, erf/erfc, gamma y beta
+  incompletas, Bessel J/Y, elípticas K y E, Runge-Kutta 4 y Dormand-Prince
+  adaptativo con salida densa, Gauss-Kronrod adaptativo con límites
+  infinitos, Brent para raíces y mínimos, splines cúbicos; comparadas con
+  SciPy), `blas`/`openblas` (niveles 1 a 3, LU, Cholesky, QR, mínimos
+  cuadrados, valores propios simétricos, SVD, rango, condición y
+  pseudoinversa; comparadas con NumPy) y `proyeccion`/`proj` (UTM con la
+  serie de Krüger de orden 6, Web Mercator, Mercator, Lambert cónica,
+  ECEF, Helmert, cadenas "+proj", EPSG comunes incluidos SIRGAS-Chile y
+  PSAD56, y geodésicas de Vincenty; comparadas con PROJ 9.8).
 - Las fuentes de mapa de bits (`fuente_basica`) dibujan las letras con
   tilde y la eñe como su letra ASCII más cercana en vez de "?".
 - Lote 31 de bibliotecas (con alias en inglés y pruebas en ambos idiomas):
