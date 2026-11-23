@@ -1,0 +1,370 @@
+// stdlib/torrente.cfv — red de alto tráfico al estilo Netty sobre el
+// bucle de eventos de "latido": cada conexión tiene una tubería de
+// manejadores (entrada y salida) por la que pasan los eventos (activo,
+// lectura, fin de lectura, inactivo, error, escritura, cierre). Trae
+// decodificadores de tramas (por líneas, por largo en la cabecera, por
+// delimitador y de largo fijo), codificador de largo, códec JSON por
+// líneas, detector de inactividad, y un canal embebido para probar
+// tuberías sin red. Servidor y cliente TCP sin bloqueo. Idea de Netty
+// (Apache). En inglés: importar "pipeline".
+//
+//   importar "torrente"
+//   sea b = latido_bucle()
+//   torrente_servidor(b, "127.0.0.1", 9000, funcion(canal) {
+//       torrente_agregar(canal, "lineas", torrente_lineas(8192))
+//       torrente_agregar(canal, "eco", {"leer": funcion(ctx, msg) { torrente_escribir(ctx, msg + "\n") }})
+//   })
+//   latido_correr(b, nulo)
+
+importar "latido"
+importar "json"
+
+// ---------- tubería ----------
+
+// Un canal: transporte (flujo de latido o embebido), manejadores y estado.
+funcion _to_canal(transporte) {
+    retornar {"t": transporte, "manejadores": [], "activo": falso, "atributos": {}, "cerrado": falso}
+}
+
+/// Agrega un manejador al final de la tubería. h: mapa con cualquiera de
+/// "activo"(ctx), "leer"(ctx, msg), "leido"(ctx), "inactivo"(ctx),
+/// "error"(ctx, e), "escribir"(ctx, msg), "cerrar"(ctx), "evento"(ctx, ev).
+/// Los que no están pasan el evento al siguiente.
+funcion torrente_agregar(canal, nombre, h) {
+    canal["manejadores"].agregar({"nombre": nombre, "h": h, "estado": {}})
+    retornar canal
+}
+
+/// Agrega al principio.
+funcion torrente_agregar_primero(canal, nombre, h) {
+    canal["manejadores"] = [{"nombre": nombre, "h": h, "estado": {}}] + canal["manejadores"]
+    retornar canal
+}
+
+funcion torrente_quitar(canal, nombre) {
+    sea r = []
+    para m en canal["manejadores"] { si (m["nombre"] != nombre) { r.agregar(m) } }
+    canal["manejadores"] = r
+}
+
+/// Nombres de la tubería, en orden.
+funcion torrente_nombres(canal) {
+    sea r = []
+    para m en canal["manejadores"] { r.agregar(m["nombre"]) }
+    retornar r
+}
+
+funcion _to_ctx(canal, i) { retornar {"canal": canal, "i": i, "estado": canal["manejadores"][i]["estado"]} }
+
+// Entrada: desde el manejador i hacia el final.
+funcion _to_entrada(canal, i, evento, arg) {
+    sea k = i
+    mientras (k < longitud(canal["manejadores"])) {
+        sea h = canal["manejadores"][k]["h"]
+        sea f = h[evento] ?? nulo
+        si (f != nulo) {
+            sea ctx = _to_ctx(canal, k)
+            intentar {
+                si (evento == "leer" o evento == "error" o evento == "evento") { f(ctx, arg) } sino { f(ctx) }
+            } capturar (e) {
+                si (evento == "error") { lanzar e }
+                _to_entrada(canal, k + 1, "error", e)
+            }
+            retornar nulo
+        }
+        k = k + 1
+    }
+    // Llegó al final: errores sin manejar se informan y cierran el canal.
+    si (evento == "error") {
+        mostrar("torrente: error sin manejar: " + arg)
+        torrente_cerrar_canal(canal)
+    }
+}
+
+// Salida: desde el manejador i hacia el principio; al final, al transporte.
+funcion _to_salida(canal, i, evento, arg) {
+    sea k = i
+    mientras (k >= 0) {
+        sea h = canal["manejadores"][k]["h"]
+        sea f = h[evento] ?? nulo
+        si (f != nulo) {
+            sea ctx = _to_ctx(canal, k)
+            si (evento == "escribir") { f(ctx, arg) } sino { f(ctx) }
+            retornar nulo
+        }
+        k = k - 1
+    }
+    si (evento == "escribir") { canal["t"]["escribir"](arg) }
+    si (evento == "cerrar") { canal["t"]["cerrar"]() }
+}
+
+// ---------- operaciones desde un contexto ----------
+
+/// Pasa un mensaje leído al siguiente manejador.
+funcion torrente_pasar(ctx, msg) { _to_entrada(ctx["canal"], ctx["i"] + 1, "leer", msg) }
+
+/// Pasa "activo", "leido" o "inactivo" al siguiente.
+funcion torrente_pasar_evento(ctx, nombre) { _to_entrada(ctx["canal"], ctx["i"] + 1, nombre, nulo) }
+
+/// Pasa un error al siguiente.
+funcion torrente_pasar_error(ctx, e) { _to_entrada(ctx["canal"], ctx["i"] + 1, "error", e) }
+
+/// Evento de usuario (por ejemplo de inactividad) al siguiente.
+funcion torrente_pasar_usuario(ctx, ev) { _to_entrada(ctx["canal"], ctx["i"] + 1, "evento", ev) }
+
+/// Escribe desde este manejador hacia la red (pasa por los de salida previos).
+funcion torrente_escribir(ctx, msg) { _to_salida(ctx["canal"], ctx["i"] - 1, "escribir", msg) }
+
+/// Escribe desde el final de la tubería (recorre todos los de salida).
+funcion torrente_escribir_canal(canal, msg) { _to_salida(canal, longitud(canal["manejadores"]) - 1, "escribir", msg) }
+
+/// Cierra el canal (pasa por los manejadores de salida).
+funcion torrente_cerrar(ctx) { _to_salida(ctx["canal"], ctx["i"] - 1, "cerrar", nulo) }
+
+funcion torrente_cerrar_canal(canal) { _to_salida(canal, longitud(canal["manejadores"]) - 1, "cerrar", nulo) }
+
+/// Atributos por conexión.
+funcion torrente_atributo(canal, clave, valor) {
+    si (valor != nulo) { canal["atributos"][clave] = valor }
+    retornar canal["atributos"][clave] ?? nulo
+}
+
+// ---------- eventos del transporte ----------
+
+funcion _to_activar(canal) {
+    canal["activo"] = verdadero
+    _to_entrada(canal, 0, "activo", nulo)
+}
+
+funcion _to_datos(canal, d) {
+    _to_entrada(canal, 0, "leer", d)
+    _to_entrada(canal, 0, "leido", nulo)
+}
+
+funcion _to_fin(canal) {
+    si (canal["activo"]) {
+        canal["activo"] = falso
+        _to_entrada(canal, 0, "inactivo", nulo)
+    }
+}
+
+// ---------- decodificadores y codificadores ----------
+
+/// Separa por "\n" (quita "\r\n"); lanza si una línea supera maximo.
+funcion torrente_lineas(maximo) {
+    retornar {"leer": funcion(ctx, d) {
+        sea buf = (ctx["estado"]["buf"] ?? "") + d
+        mientras (verdadero) {
+            sea k = texto_indice(buf, "\n")
+            si (k < 0) {
+                si (longitud(buf) > (maximo ?? 65536)) {
+                    ctx["estado"]["buf"] = ""
+                    lanzar "torrente: línea demasiado larga"
+                }
+                ctx["estado"]["buf"] = buf
+                retornar nulo
+            }
+            sea l = subcadena(buf, 0, k)
+            si (texto_termina_con(l, "\r")) { l = subcadena(l, 0, longitud(l) - 1) }
+            buf = subcadena(buf, k + 1, longitud(buf))
+            ctx["estado"]["buf"] = buf
+            torrente_pasar(ctx, l)
+        }
+    }}
+}
+
+/// Tramas con un campo de largo: desplaz (bytes antes del campo), bytes
+/// del campo (1, 2, 4 u 8), ajuste (se suma al largo), quitar (bytes que
+/// se quitan del principio de la trama al entregarla), orden (0 = big
+/// endian, 1 = little endian).
+funcion torrente_campo_largo(maximo, desplaz, bytes_largo, ajuste, quitar, orden) {
+    retornar {"leer": funcion(ctx, d) {
+        sea buf = (ctx["estado"]["buf"] ?? "") + d
+        mientras (verdadero) {
+            si (longitud(buf) < desplaz + bytes_largo) {
+                ctx["estado"]["buf"] = buf
+                retornar nulo
+            }
+            sea n = bytes_leer_entero(buf, desplaz, bytes_largo, orden ?? 0) + (ajuste ?? 0)
+            sea total = desplaz + bytes_largo + n
+            si (n < 0 o total > maximo) {
+                ctx["estado"]["buf"] = ""
+                lanzar "torrente: trama de " + total + " bytes supera el máximo"
+            }
+            si (longitud(buf) < total) {
+                ctx["estado"]["buf"] = buf
+                retornar nulo
+            }
+            sea trama = subcadena(buf, quitar ?? 0, total)
+            buf = subcadena(buf, total, longitud(buf))
+            ctx["estado"]["buf"] = buf
+            torrente_pasar(ctx, trama)
+        }
+    }}
+}
+
+/// Antepone el largo (bytes_largo bytes, big endian) a cada mensaje saliente.
+funcion torrente_prefijo_largo(bytes_largo) {
+    retornar {"escribir": funcion(ctx, msg) { torrente_escribir(ctx, bytes_entero(longitud(msg), bytes_largo, 0) + msg) }}
+}
+
+/// Separa por un delimitador cualquiera.
+funcion torrente_delimitador(delim, maximo) {
+    retornar {"leer": funcion(ctx, d) {
+        sea buf = (ctx["estado"]["buf"] ?? "") + d
+        mientras (verdadero) {
+            sea k = texto_indice(buf, delim)
+            si (k < 0) {
+                si (longitud(buf) > (maximo ?? 65536)) {
+                    ctx["estado"]["buf"] = ""
+                    lanzar "torrente: trama demasiado larga"
+                }
+                ctx["estado"]["buf"] = buf
+                retornar nulo
+            }
+            sea t = subcadena(buf, 0, k)
+            buf = subcadena(buf, k + longitud(delim), longitud(buf))
+            ctx["estado"]["buf"] = buf
+            torrente_pasar(ctx, t)
+        }
+    }}
+}
+
+/// Tramas de largo fijo.
+funcion torrente_largo_fijo(n) {
+    retornar {"leer": funcion(ctx, d) {
+        sea buf = (ctx["estado"]["buf"] ?? "") + d
+        mientras (longitud(buf) >= n) {
+            sea t = subcadena(buf, 0, n)
+            buf = subcadena(buf, n, longitud(buf))
+            ctx["estado"]["buf"] = buf
+            torrente_pasar(ctx, t)
+        }
+        ctx["estado"]["buf"] = buf
+    }}
+}
+
+/// JSON: decodifica cada trama entrante y codifica cada mensaje saliente
+/// (agregando fin de línea si linea es verdadero).
+funcion torrente_json(linea) {
+    retornar {
+        "leer": funcion(ctx, t) { torrente_pasar(ctx, json_parsear(t)) },
+        "escribir": funcion(ctx, m) {
+            sea s = json_texto(m)
+            si (linea ?? verdadero) { s = s + "\n" }
+            torrente_escribir(ctx, s)
+        }
+    }
+}
+
+/// Inactividad: si no se lee nada en lectura_ms (o no se escribe en
+/// escritura_ms), manda un evento de usuario {"inactivo": "lectura" |
+/// "escritura"}. Necesita el bucle de latido.
+funcion torrente_inactividad(bucle, lectura_ms, escritura_ms) {
+    retornar {
+        "activo": funcion(ctx) {
+            sea est = ctx["estado"]
+            est["ult_lectura"] = latido_ahora(bucle)
+            est["ult_escritura"] = latido_ahora(bucle)
+            sea paso = minimo(lectura_ms ?? 1000000, escritura_ms ?? 1000000)
+            est["t"] = latido_temporizador(bucle, paso, paso, funcion(t) {
+                sea ahora = latido_ahora(bucle)
+                si (lectura_ms != nulo y ahora - est["ult_lectura"] >= lectura_ms) {
+                    est["ult_lectura"] = ahora
+                    torrente_pasar_usuario(ctx, {"inactivo": "lectura"})
+                }
+                si (escritura_ms != nulo y ahora - est["ult_escritura"] >= escritura_ms) {
+                    est["ult_escritura"] = ahora
+                    torrente_pasar_usuario(ctx, {"inactivo": "escritura"})
+                }
+            })
+            torrente_pasar_evento(ctx, "activo")
+        },
+        "leer": funcion(ctx, msg) {
+            ctx["estado"]["ult_lectura"] = latido_ahora(bucle)
+            torrente_pasar(ctx, msg)
+        },
+        "escribir": funcion(ctx, msg) {
+            ctx["estado"]["ult_escritura"] = latido_ahora(bucle)
+            torrente_escribir(ctx, msg)
+        },
+        "inactivo": funcion(ctx) {
+            si ((ctx["estado"]["t"] ?? nulo) != nulo) { latido_detener(ctx["estado"]["t"]) }
+            torrente_pasar_evento(ctx, "inactivo")
+        }
+    }
+}
+
+// ---------- TCP ----------
+
+funcion _to_transporte_flujo(flujo) {
+    retornar {"escribir": funcion(d) { latido_escribir(flujo, d, nulo) }, "cerrar": funcion() { latido_terminar(flujo, nulo) }}
+}
+
+funcion _to_conectar_flujo(flujo, inicializador) {
+    sea canal = _to_canal(_to_transporte_flujo(flujo))
+    canal["flujo"] = flujo
+    inicializador(canal)
+    _to_activar(canal)
+    latido_leer(flujo, funcion(s, d) {
+        si (d == nulo) {
+            _to_fin(canal)
+            latido_cerrar(s, nulo)
+        } sino { _to_datos(canal, d) }
+    })
+    retornar canal
+}
+
+/// Servidor: inicializador(canal) arma la tubería de cada conexión.
+funcion torrente_servidor(bucle, host, puerto, inicializador) {
+    retornar latido_tcp_servidor(bucle, host, puerto, funcion(flujo) { _to_conectar_flujo(flujo, inicializador) })
+}
+
+/// Cliente: inicializador(canal); listo(canal, error) al conectar.
+funcion torrente_cliente(bucle, host, puerto, inicializador, listo) {
+    latido_tcp_conectar(bucle, host, puerto, funcion(flujo, err) {
+        si (err != nulo) {
+            si (listo != nulo) { listo(nulo, err) }
+            retornar nulo
+        }
+        sea c = _to_conectar_flujo(flujo, inicializador)
+        si (listo != nulo) { listo(c, nulo) }
+    })
+}
+
+// ---------- canal embebido (para pruebas) ----------
+
+/// Canal sin red: manejadores en orden. Lo escrito hacia la red queda en
+/// "salida" (lista) y lo que llega al final de la tubería en "entrada".
+funcion torrente_embebido(manejadores) {
+    sea est = {"salida": [], "entrada": [], "cerrado": falso, "eventos": []}
+    sea canal = _to_canal({"escribir": funcion(d) { est["salida"].agregar(d) }, "cerrar": funcion() { est["cerrado"] = verdadero }})
+    canal["emb"] = est
+    para par en manejadores { torrente_agregar(canal, par[0], par[1]) }
+    // Recolector al final: guarda lo que llega.
+    torrente_agregar(canal, "__fin", {
+        "leer": funcion(ctx, msg) { est["entrada"].agregar(msg) },
+        "evento": funcion(ctx, ev) { est["eventos"].agregar(ev) },
+        "error": funcion(ctx, e) { est["eventos"].agregar({"error": e}) }
+    })
+    _to_activar(canal)
+    retornar canal
+}
+
+/// Entrega bytes al canal embebido como si llegaran de la red.
+funcion torrente_embebido_entrar(canal, datos) { _to_datos(canal, datos) }
+
+/// Escribe un mensaje desde el final del canal embebido.
+funcion torrente_embebido_salir(canal, msg) { _to_salida(canal, longitud(canal["manejadores"]) - 2, "escribir", msg) }
+
+/// Mensajes que llegaron al final y lo escrito hacia la red (y los vacía).
+funcion torrente_embebido_leer(canal) {
+    sea r = {"entrada": canal["emb"]["entrada"], "salida": canal["emb"]["salida"], "eventos": canal["emb"]["eventos"], "cerrado": canal["emb"]["cerrado"]}
+    canal["emb"]["entrada"] = []
+    canal["emb"]["salida"] = []
+    canal["emb"]["eventos"] = []
+    retornar r
+}
+
+/// Simula el fin de la conexión.
+funcion torrente_embebido_fin(canal) { _to_fin(canal) }

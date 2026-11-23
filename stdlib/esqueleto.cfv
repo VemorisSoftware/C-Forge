@@ -1,0 +1,1222 @@
+// stdlib/esqueleto.cfv — animación 2D por huesos que lee los esqueletos
+// exportados en JSON por Spine (3.8 y 4.x) y los atlas de texturas de
+// libGDX/Spine. Huesos con herencia (normal, solo traslación, sin
+// rotación, sin escala), ranuras con color y orden de dibujo, pieles,
+// adjuntos de región, malla (con pesos), punto y caja de colisión,
+// restricciones IK de uno y dos huesos, líneas de tiempo de rotación,
+// traslación, escala, corte, adjunto, color, orden de dibujo y eventos con
+// curvas lineales, escalonadas y bezier. Un estado con pistas y mezclas
+// cruzadas entre animaciones. Dibuja con texturas en una imagen o en
+// colores planos en un lienzo de "vector"; también da los triángulos para
+// dibujarlos con cualquier motor. Escrito desde cero a partir del formato
+// público de los archivos, sin código de los runtimes de Spine.
+// En inglés: importar "skeleton2d".
+//
+//   importar "esqueleto"
+//   sea e = esqueleto_cargar(leer_archivo("heroe.json"))
+//   sea atlas = esqueleto_atlas(leer_archivo("heroe.atlas"), funcion(p) { retornar imagen_cargar(p) })
+//   sea est = esqueleto_estado(e)
+//   esqueleto_estado_poner(est, 0, "correr", verdadero)
+//   esqueleto_estado_actualizar(est, 1 / 30)
+//   esqueleto_estado_aplicar(est)
+//   esqueleto_mundo(e)
+//   esqueleto_dibujar_imagen(e, atlas, imagen_nueva(400, 400, [0, 0, 0, 0]), {"x": 200, "y": 380})
+
+importar "json"
+importar "imagen"
+importar "vector"
+
+sea _ESQ_PI = 3.141592653589793
+sea _ESQ_GRAD = 0.017453292519943295
+
+funcion _esq_atan2(dy, dx) {
+    si (dx == 0) {
+        si (dy > 0) { retornar _ESQ_PI / 2 }
+        si (dy < 0) { retornar 0 - _ESQ_PI / 2 }
+        retornar 0
+    }
+    sea a = arcotangente(dy / dx)
+    si (dx < 0) {
+        si (dy >= 0) { a = a + _ESQ_PI } sino { a = a - _ESQ_PI }
+    }
+    retornar a
+}
+
+// Ángulo en grados llevado a (-180, 180].
+funcion _esq_envolver(a) {
+    sea r = a - piso((a + 180) / 360) * 360
+    si (r <= -180) { r = r + 360 }
+    retornar r
+}
+
+funcion _esq_color(t) {
+    si (t == nulo) { retornar [1, 1, 1, 1] }
+    si (tipo(t) == "lista") { retornar t }
+    sea h = texto_minusculas(t)
+    si (longitud(h) == 6) { h = h + "ff" }
+    sea c = []
+    sea i = 0
+    mientras (i < 8) {
+        c.agregar(byte_en(bytes_de_hex(subtexto(h, i, i + 2)), 0) / 255)
+        i = i + 2
+    }
+    retornar c
+}
+
+funcion _esq_n(v, d) {
+    si (v == nulo) { retornar d }
+    retornar v
+}
+
+sea _ESQ_HERENCIA = {"normal": 0, "onlyTranslation": 1, "noRotationOrReflection": 2, "noScale": 3, "noScaleOrReflection": 4}
+
+/// Carga un esqueleto desde el JSON de Spine (texto o mapa ya leído).
+funcion esqueleto_cargar(fuente) {
+    sea j = fuente
+    si (tipo(fuente) == "texto") { j = json_parsear(fuente) }
+    sea info = j["skeleton"] ?? {}
+    sea version = "" + (info["spine"] ?? "4.1")
+    sea e = {"version": version, "v3": texto_empieza_con(version, "3."), "ancho": _esq_n(info["width"] ?? nulo, 0), "alto": _esq_n(info["height"] ?? nulo, 0),
+        "huesos": [], "hueso_idx": {}, "ranuras": [], "ranura_idx": {}, "orden": [], "pieles": {}, "piel": nulo,
+        "eventos": {}, "animaciones": {}, "ik": [], "x": 0, "y": 0, "escala_x": 1, "escala_y": 1, "tiempo": 0}
+    para b en j["bones"] ?? [] {
+        sea pi = -1
+        si ((b["parent"] ?? nulo) != nulo) {
+            pi = e["hueso_idx"][b["parent"]] ?? -1
+            si (pi < 0) { lanzar "esqueleto: hueso padre desconocido " + b["parent"] }
+        }
+        sea her = b["transform"] ?? b["inherit"] ?? "normal"
+        si ((b["inheritRotation"] ?? nulo) == falso) { her = "noRotationOrReflection" }
+        si ((b["inheritScale"] ?? nulo) == falso) { her = "noScale" }
+        sea s = {"x": _esq_n(b["x"] ?? nulo, 0), "y": _esq_n(b["y"] ?? nulo, 0), "rot": _esq_n(b["rotation"] ?? nulo, 0), "sx": _esq_n(b["scaleX"] ?? nulo, 1), "sy": _esq_n(b["scaleY"] ?? nulo, 1),
+            "shx": _esq_n(b["shearX"] ?? nulo, 0), "shy": _esq_n(b["shearY"] ?? nulo, 0)}
+        sea h = {"nombre": b["name"], "padre": pi, "largo": _esq_n(b["length"] ?? nulo, 0), "herencia": _ESQ_HERENCIA[her] ?? 0, "setup": s,
+            "x": s["x"], "y": s["y"], "rot": s["rot"], "sx": s["sx"], "sy": s["sy"], "shx": s["shx"], "shy": s["shy"],
+            "a": 1, "b": 0, "c": 0, "d": 1, "wx": 0, "wy": 0}
+        e["hueso_idx"][b["name"]] = longitud(e["huesos"])
+        e["huesos"].agregar(h)
+    }
+    para s en j["slots"] ?? [] {
+        sea bi = e["hueso_idx"][s["bone"]] ?? -1
+        si (bi < 0) { lanzar "esqueleto: la ranura " + s["name"] + " usa un hueso desconocido" }
+        sea col = _esq_color(s["color"] ?? nulo)
+        sea r = {"nombre": s["name"], "hueso": bi, "color_setup": col, "color": [col[0], col[1], col[2], col[3]], "adjunto_setup": s["attachment"] ?? nulo,
+            "adjunto": s["attachment"] ?? nulo, "mezcla": s["blend"] ?? "normal"}
+        e["ranura_idx"][s["name"]] = longitud(e["ranuras"])
+        e["orden"].agregar(longitud(e["ranuras"]))
+        e["ranuras"].agregar(r)
+    }
+    // Pieles: lista (4.x) o mapa (3.x).
+    sea pieles = j["skins"] ?? []
+    si (tipo(pieles) == "mapa") {
+        para k en claves(pieles) { e["pieles"][k] = pieles[k] }
+    } sino {
+        para p en pieles { e["pieles"][p["name"]] = p["attachments"] ?? {} }
+    }
+    para k en claves(e["pieles"]) {
+        sea pk = e["pieles"][k]
+        para rn en claves(pk) { para an en claves(pk[rn]) { pk[rn][an] = _esq_adjunto(e, an, pk[rn][an]) } }
+    }
+    para k en claves(j["events"] ?? {}) { e["eventos"][k] = j["events"][k] }
+    para ik en j["ik"] ?? [] {
+        sea hs = []
+        para n en ik["bones"] { hs.agregar(e["hueso_idx"][n]) }
+        sea m = _esq_n(ik["mix"] ?? nulo, 1)
+        sea dobla = 1
+        si ((ik["bendPositive"] ?? nulo) == falso) { dobla = -1 }
+        e["ik"].agregar({"nombre": ik["name"], "huesos": hs, "objetivo": e["hueso_idx"][ik["target"]], "mezcla": m, "dobla": dobla,
+            "mezcla_setup": m, "dobla_setup": dobla, "orden": _esq_n(ik["order"] ?? nulo, 0)})
+    }
+    e["ik"] = ordenar(e["ik"], funcion(a, b) { retornar a["orden"] - b["orden"] })
+    para k en claves(j["animations"] ?? {}) { e["animaciones"][k] = _esq_animacion(e, k, j["animations"][k]) }
+    esqueleto_mundo(e)
+    retornar e
+}
+
+funcion _esq_adjunto(e, clave, a) {
+    sea t = a["type"] ?? "region"
+    sea r = {"tipo": t, "nombre": a["name"] ?? clave, "ruta": a["path"] ?? a["name"] ?? clave, "color": _esq_color(a["color"] ?? nulo)}
+    si (t == "region") {
+        r["x"] = _esq_n(a["x"] ?? nulo, 0)
+        r["y"] = _esq_n(a["y"] ?? nulo, 0)
+        r["rot"] = _esq_n(a["rotation"] ?? nulo, 0)
+        r["sx"] = _esq_n(a["scaleX"] ?? nulo, 1)
+        r["sy"] = _esq_n(a["scaleY"] ?? nulo, 1)
+        r["ancho"] = _esq_n(a["width"] ?? nulo, 32)
+        r["alto"] = _esq_n(a["height"] ?? nulo, 32)
+    } sino si (t == "mesh" o t == "skinnedmesh" o t == "weightedmesh") {
+        r["tipo"] = "mesh"
+        r["uvs"] = a["uvs"]
+        r["triangulos"] = a["triangles"]
+        r["vertices"] = a["vertices"]
+        r["pesado"] = longitud(a["vertices"]) != longitud(a["uvs"])
+        r["casco"] = _esq_n(a["hull"] ?? nulo, 0)
+    } sino si (t == "linkedmesh") {
+        r["padre"] = a["parent"]
+        r["piel_padre"] = a["skin"] ?? "default"
+    } sino si (t == "boundingbox") {
+        r["vertices"] = a["vertices"]
+        r["pesado"] = longitud(a["vertices"]) != _esq_n(a["vertexCount"] ?? nulo, longitud(a["vertices"]) / 2) * 2
+    } sino si (t == "point") {
+        r["x"] = _esq_n(a["x"] ?? nulo, 0)
+        r["y"] = _esq_n(a["y"] ?? nulo, 0)
+        r["rot"] = _esq_n(a["rotation"] ?? nulo, 0)
+    }
+    retornar r
+}
+
+// ---------- animaciones ----------
+
+// Línea de tiempo: {"tipo", "indice", "cuadros": [{"t", "v": [...], "curva"}]}.
+funcion _esq_cuadros(e, lista, nombres, defecto) {
+    sea r = []
+    para f en lista {
+        sea v = []
+        sea k = 0
+        mientras (k < longitud(nombres)) {
+            v.agregar(_esq_n(f[nombres[k]] ?? nulo, defecto[k]))
+            k = k + 1
+        }
+        sea cu = f["curve"] ?? nulo
+        si (e["v3"] y tipo(cu) == "numero") { cu = [cu, _esq_n(f["c2"] ?? nulo, 0), _esq_n(f["c3"] ?? nulo, 1), _esq_n(f["c4"] ?? nulo, 1)] }
+        r.agregar({"t": _esq_n(f["time"] ?? nulo, 0), "v": v, "curva": cu})
+    }
+    retornar r
+}
+
+funcion _esq_animacion(e, nombre, a) {
+    sea tl = []
+    sea dur = 0
+    para hn en claves(a["bones"] ?? {}) {
+        sea bi = e["hueso_idx"][hn] ?? -1
+        si (bi < 0) { lanzar "esqueleto: la animación " + nombre + " usa un hueso desconocido " + hn }
+        sea m = a["bones"][hn]
+        para tn en claves(m) {
+            sea c = nulo
+            si (tn == "rotate") { c = _esq_cuadros(e, m[tn], [ "value" ], [0]) si (e["v3"]) { c = _esq_cuadros(e, m[tn], ["angle"], [0]) } }
+            sino si (tn == "translate") { c = _esq_cuadros(e, m[tn], ["x", "y"], [0, 0]) }
+            sino si (tn == "scale") { c = _esq_cuadros(e, m[tn], ["x", "y"], [1, 1]) }
+            sino si (tn == "shear") { c = _esq_cuadros(e, m[tn], ["x", "y"], [0, 0]) }
+            sino si (tn == "translatex" o tn == "translatey" o tn == "shearx" o tn == "sheary") { c = _esq_cuadros(e, m[tn], ["value"], [0]) }
+            sino si (tn == "scalex" o tn == "scaley") { c = _esq_cuadros(e, m[tn], ["value"], [1]) }
+            si (c != nulo) {
+                tl.agregar({"tipo": tn, "indice": bi, "cuadros": c})
+                si (longitud(c) > 0) { dur = maximo(dur, c[longitud(c) - 1]["t"]) }
+            }
+        }
+    }
+    para sn en claves(a["slots"] ?? {}) {
+        sea si_ = e["ranura_idx"][sn] ?? -1
+        si (si_ < 0) { lanzar "esqueleto: la animación " + nombre + " usa una ranura desconocida " + sn }
+        sea m = a["slots"][sn]
+        para tn en claves(m) {
+            si (tn == "attachment") {
+                sea c = []
+                para f en m[tn] { c.agregar({"t": _esq_n(f["time"] ?? nulo, 0), "v": [f["name"]], "curva": "stepped"}) }
+                tl.agregar({"tipo": "attachment", "indice": si_, "cuadros": c})
+                si (longitud(c) > 0) { dur = maximo(dur, c[longitud(c) - 1]["t"]) }
+            } sino si (tn == "rgba" o tn == "color") {
+                sea c = []
+                para f en m[tn] {
+                    sea cu = f["curve"] ?? nulo
+                    si (e["v3"] y tipo(cu) == "numero") { cu = [cu, _esq_n(f["c2"] ?? nulo, 0), _esq_n(f["c3"] ?? nulo, 1), _esq_n(f["c4"] ?? nulo, 1)] }
+                    c.agregar({"t": _esq_n(f["time"] ?? nulo, 0), "v": _esq_color(f["color"]), "curva": cu})
+                }
+                tl.agregar({"tipo": "rgba", "indice": si_, "cuadros": c})
+                si (longitud(c) > 0) { dur = maximo(dur, c[longitud(c) - 1]["t"]) }
+            }
+        }
+    }
+    para ikn en claves(a["ik"] ?? {}) {
+        sea ii = -1
+        sea k = 0
+        para ik en e["ik"] {
+            si (ik["nombre"] == ikn) { ii = k }
+            k = k + 1
+        }
+        si (ii >= 0) {
+            sea c = []
+            para f en a["ik"][ikn] {
+                sea dob = 1
+                si ((f["bendPositive"] ?? nulo) == falso) { dob = -1 }
+                c.agregar({"t": _esq_n(f["time"] ?? nulo, 0), "v": [_esq_n(f["mix"] ?? nulo, 1), dob], "curva": f["curve"] ?? nulo})
+            }
+            tl.agregar({"tipo": "ik", "indice": ii, "cuadros": c})
+            si (longitud(c) > 0) { dur = maximo(dur, c[longitud(c) - 1]["t"]) }
+        }
+    }
+    sea orden = a["drawOrder"] ?? a["draworder"] ?? nulo
+    si (orden != nulo) {
+        sea c = []
+        para f en orden {
+            sea lista = nulo
+            si ((f["offsets"] ?? nulo) != nulo) { lista = _esq_orden(e, f["offsets"]) }
+            c.agregar({"t": _esq_n(f["time"] ?? nulo, 0), "v": [lista], "curva": "stepped"})
+        }
+        tl.agregar({"tipo": "orden", "indice": 0, "cuadros": c})
+        si (longitud(c) > 0) { dur = maximo(dur, c[longitud(c) - 1]["t"]) }
+    }
+    sea evs = []
+    para f en a["events"] ?? [] {
+        sea base = e["eventos"][f["name"]] ?? {}
+        evs.agregar({"t": _esq_n(f["time"] ?? nulo, 0), "nombre": f["name"], "entero": f["int"] ?? base["int"] ?? 0, "real": f["float"] ?? base["float"] ?? 0,
+            "texto": f["string"] ?? base["string"] ?? ""})
+        dur = maximo(dur, _esq_n(f["time"] ?? nulo, 0))
+    }
+    retornar {"nombre": nombre, "duracion": dur, "lineas": tl, "eventos": evs}
+}
+
+// Orden de dibujo a partir de desplazamientos (como lo guarda Spine).
+funcion _esq_orden(e, desplaz) {
+    sea n = longitud(e["ranuras"])
+    sea orden = []
+    sea sin_cambio = []
+    sea i = 0
+    mientras (i < n) {
+        orden.agregar(-1)
+        i = i + 1
+    }
+    sea original = 0
+    para o en desplaz {
+        sea si_ = e["ranura_idx"][o["slot"]]
+        mientras (original != si_) {
+            sin_cambio.agregar(original)
+            original = original + 1
+        }
+        orden[original + o["offset"]] = original
+        original = original + 1
+    }
+    mientras (original < n) {
+        sin_cambio.agregar(original)
+        original = original + 1
+    }
+    sea j = n - 1
+    sea u = longitud(sin_cambio) - 1
+    mientras (j >= 0) {
+        si (orden[j] == -1) {
+            orden[j] = sin_cambio[u]
+            u = u - 1
+        }
+        j = j - 1
+    }
+    retornar orden
+}
+
+// Bezier cúbica en coordenadas absolutas (tiempo, valor).
+funcion _esq_bezier(t0, v0, cx1, cy1, cx2, cy2, t1, v1, t) {
+    sea lo = 0
+    sea hi = 1
+    sea s = 0.5
+    sea k = 0
+    mientras (k < 30) {
+        s = (lo + hi) / 2
+        sea u = 1 - s
+        sea x = u * u * u * t0 + 3 * u * u * s * cx1 + 3 * u * s * s * cx2 + s * s * s * t1
+        si (x < t) { lo = s } sino { hi = s }
+        k = k + 1
+    }
+    sea u = 1 - s
+    retornar u * u * u * v0 + 3 * u * u * s * cy1 + 3 * u * s * s * cy2 + s * s * s * v1
+}
+
+/// Valores de una línea de tiempo en el tiempo t (nulo antes del primer cuadro).
+funcion _esq_valor(e, cuadros, t) {
+    si (longitud(cuadros) == 0 o t < cuadros[0]["t"]) { retornar nulo }
+    sea n = longitud(cuadros)
+    si (t >= cuadros[n - 1]["t"]) { retornar cuadros[n - 1]["v"] }
+    // Búsqueda binaria del cuadro anterior.
+    sea lo = 0
+    sea hi = n - 1
+    mientras (hi - lo > 1) {
+        sea m = piso((lo + hi) / 2)
+        si (cuadros[m]["t"] <= t) { lo = m } sino { hi = m }
+    }
+    sea a = cuadros[lo]
+    sea b = cuadros[lo + 1]
+    sea cu = a["curva"]
+    si (cu == "stepped") { retornar a["v"] }
+    si (tipo(a["v"][0]) != "numero") { retornar a["v"] }
+    sea r = []
+    sea k = 0
+    mientras (k < longitud(a["v"])) {
+        sea v0 = a["v"][k]
+        sea v1 = b["v"][k]
+        si (cu == nulo o tipo(cu) != "lista") {
+            r.agregar(v0 + (v1 - v0) * (t - a["t"]) / (b["t"] - a["t"]))
+        } sino si (e["v3"]) {
+            // Curva normalizada 0..1 (3.x), la misma para todos los valores.
+            sea dt = b["t"] - a["t"]
+            sea p = _esq_bezier(0, 0, cu[0], cu[1], cu[2], cu[3], 1, 1, (t - a["t"]) / dt)
+            r.agregar(v0 + (v1 - v0) * p)
+        } sino {
+            sea o = k * 4
+            si (o + 3 >= longitud(cu)) { o = 0 }
+            r.agregar(_esq_bezier(a["t"], v0, cu[o], cu[o + 1], cu[o + 2], cu[o + 3], b["t"], v1, t))
+        }
+        k = k + 1
+    }
+    retornar r
+}
+
+/// Devuelve el esqueleto a la pose inicial.
+funcion esqueleto_pose_inicial(e) {
+    para h en e["huesos"] {
+        sea s = h["setup"]
+        h["x"] = s["x"]
+        h["y"] = s["y"]
+        h["rot"] = s["rot"]
+        h["sx"] = s["sx"]
+        h["sy"] = s["sy"]
+        h["shx"] = s["shx"]
+        h["shy"] = s["shy"]
+    }
+    sea i = 0
+    para r en e["ranuras"] {
+        r["color"] = [r["color_setup"][0], r["color_setup"][1], r["color_setup"][2], r["color_setup"][3]]
+        r["adjunto"] = r["adjunto_setup"]
+        e["orden"][i] = i
+        i = i + 1
+    }
+    para ik en e["ik"] {
+        ik["mezcla"] = ik["mezcla_setup"]
+        ik["dobla"] = ik["dobla_setup"]
+    }
+}
+
+funcion _esq_mezclar(actual, objetivo, alfa) { retornar actual + (objetivo - actual) * alfa }
+
+/// Aplica una animación en el tiempo t con peso alfa (0..1). Devuelve los
+/// eventos entre "desde" (exclusivo) y t (inclusivo) si se da "desde".
+funcion esqueleto_aplicar(e, nombre, t, bucle, alfa, desde) {
+    sea an = e["animaciones"][nombre] ?? nulo
+    si (an == nulo) { lanzar "esqueleto: no hay animación " + nombre }
+    sea w = _esq_n(alfa, 1)
+    sea tt = t
+    si (bucle y an["duracion"] > 0) { tt = t % an["duracion"] si (tt < 0) { tt = tt + an["duracion"] } }
+    para l en an["lineas"] {
+        sea v = _esq_valor(e, l["cuadros"], tt)
+        si (v != nulo) {
+            sea tp = l["tipo"]
+            si (tp == "attachment") {
+                si (w >= 0.5) { e["ranuras"][l["indice"]]["adjunto"] = v[0] }
+            } sino si (tp == "rgba") {
+                sea c = e["ranuras"][l["indice"]]["color"]
+                sea k = 0
+                mientras (k < 4) {
+                    c[k] = _esq_mezclar(c[k], v[k], w)
+                    k = k + 1
+                }
+            } sino si (tp == "orden") {
+                si (w >= 0.5) {
+                    sea k = 0
+                    mientras (k < longitud(e["orden"])) {
+                        si (v[0] == nulo) { e["orden"][k] = k } sino { e["orden"][k] = v[0][k] }
+                        k = k + 1
+                    }
+                }
+            } sino si (tp == "ik") {
+                sea ik = e["ik"][l["indice"]]
+                ik["mezcla"] = _esq_mezclar(ik["mezcla"], v[0], w)
+                si (w >= 0.5) { ik["dobla"] = v[1] }
+            } sino {
+                sea h = e["huesos"][l["indice"]]
+                sea s = h["setup"]
+                si (tp == "rotate") { h["rot"] = h["rot"] + _esq_envolver(s["rot"] + v[0] - h["rot"]) * w }
+                sino si (tp == "translate") {
+                    h["x"] = _esq_mezclar(h["x"], s["x"] + v[0], w)
+                    h["y"] = _esq_mezclar(h["y"], s["y"] + v[1], w)
+                } sino si (tp == "translatex") { h["x"] = _esq_mezclar(h["x"], s["x"] + v[0], w) }
+                sino si (tp == "translatey") { h["y"] = _esq_mezclar(h["y"], s["y"] + v[0], w) }
+                sino si (tp == "scale") {
+                    h["sx"] = _esq_mezclar(h["sx"], s["sx"] * v[0], w)
+                    h["sy"] = _esq_mezclar(h["sy"], s["sy"] * v[1], w)
+                } sino si (tp == "scalex") { h["sx"] = _esq_mezclar(h["sx"], s["sx"] * v[0], w) }
+                sino si (tp == "scaley") { h["sy"] = _esq_mezclar(h["sy"], s["sy"] * v[0], w) }
+                sino si (tp == "shear") {
+                    h["shx"] = _esq_mezclar(h["shx"], s["shx"] + v[0], w)
+                    h["shy"] = _esq_mezclar(h["shy"], s["shy"] + v[1], w)
+                } sino si (tp == "shearx") { h["shx"] = _esq_mezclar(h["shx"], s["shx"] + v[0], w) }
+                sino si (tp == "sheary") { h["shy"] = _esq_mezclar(h["shy"], s["shy"] + v[0], w) }
+            }
+        }
+    }
+    si (desde == nulo) { retornar [] }
+    retornar _esq_eventos_entre(an, desde, t, bucle)
+}
+
+funcion _esq_eventos_entre(an, desde, hasta, bucle) {
+    sea r = []
+    si (hasta <= desde) { retornar r }
+    sea d = an["duracion"]
+    si (bucle y d > 0) {
+        // Recorre cada vuelta que se cruzó.
+        sea base = piso(desde / d) * d
+        mientras (base <= hasta) {
+            para ev en an["eventos"] {
+                sea te = base + ev["t"]
+                si (te > desde y te <= hasta) { r.agregar(ev) }
+            }
+            base = base + d
+        }
+    } sino {
+        para ev en an["eventos"] { si (ev["t"] > desde y ev["t"] <= hasta) { r.agregar(ev) } }
+    }
+    retornar r
+}
+
+// ---------- transformaciones del mundo ----------
+
+funcion _esq_hueso_mundo(e, h) {
+    sea rx = (h["rot"] + h["shx"]) * _ESQ_GRAD
+    sea ry = (h["rot"] + 90 + h["shy"]) * _ESQ_GRAD
+    sea la = coseno(rx) * h["sx"]
+    sea lb = coseno(ry) * h["sy"]
+    sea lc = seno(rx) * h["sx"]
+    sea ld = seno(ry) * h["sy"]
+    si (h["padre"] < 0) {
+        h["a"] = la * e["escala_x"]
+        h["b"] = lb * e["escala_x"]
+        h["c"] = lc * e["escala_y"]
+        h["d"] = ld * e["escala_y"]
+        h["wx"] = h["x"] * e["escala_x"] + e["x"]
+        h["wy"] = h["y"] * e["escala_y"] + e["y"]
+        retornar nulo
+    }
+    sea p = e["huesos"][h["padre"]]
+    sea pa = p["a"]
+    sea pb = p["b"]
+    sea pc = p["c"]
+    sea pd = p["d"]
+    h["wx"] = pa * h["x"] + pb * h["y"] + p["wx"]
+    h["wy"] = pc * h["x"] + pd * h["y"] + p["wy"]
+    sea her = h["herencia"]
+    si (her == 0) {
+        h["a"] = pa * la + pb * lc
+        h["b"] = pa * lb + pb * ld
+        h["c"] = pc * la + pd * lc
+        h["d"] = pc * lb + pd * ld
+        retornar nulo
+    }
+    si (her == 1) {
+        // Solo traslación: la rotación y escala del padre no cuentan.
+        h["a"] = la * e["escala_x"]
+        h["b"] = lb * e["escala_x"]
+        h["c"] = lc * e["escala_y"]
+        h["d"] = ld * e["escala_y"]
+        retornar nulo
+    }
+    si (her == 2) {
+        // Sin rotación ni reflexión: hereda la escala del padre.
+        sea sx = raiz(pa * pa + pc * pc)
+        sea sy = raiz(pb * pb + pd * pd)
+        sea r0 = h["rot"] * _ESQ_GRAD
+        sea rxs = (h["rot"] + h["shx"]) * _ESQ_GRAD
+        sea rys = (h["rot"] + 90 + h["shy"]) * _ESQ_GRAD
+        h["a"] = coseno(rxs) * h["sx"] * sx
+        h["b"] = coseno(rys) * h["sy"] * sy
+        h["c"] = seno(rxs) * h["sx"] * sx
+        h["d"] = seno(rys) * h["sy"] * sy
+        retornar nulo
+    }
+    // Sin escala: hereda la rotación del padre pero no su escala.
+    sea ang = _esq_atan2(pc, pa)
+    sea ca = coseno(ang)
+    sea sa = seno(ang)
+    sea za = ca
+    sea zb = 0 - sa
+    sea zc = sa
+    sea zd = ca
+    si (her == 3 y (pa * pd - pb * pc) < 0) {
+        zb = 0 - zb
+        zd = 0 - zd
+    }
+    h["a"] = za * la + zb * lc
+    h["b"] = za * lb + zb * ld
+    h["c"] = zc * la + zd * lc
+    h["d"] = zc * lb + zd * ld
+}
+
+/// Calcula las transformaciones del mundo (con IK) de todos los huesos.
+funcion esqueleto_mundo(e) {
+    para h en e["huesos"] { _esq_hueso_mundo(e, h) }
+    si (longitud(e["ik"]) > 0) {
+        para ik en e["ik"] {
+            si (ik["mezcla"] > 0) {
+                si (longitud(ik["huesos"]) == 1) { _esq_ik1(e, ik) } sino { _esq_ik2(e, ik) }
+                para h en e["huesos"] { _esq_hueso_mundo(e, h) }
+            }
+        }
+    }
+    retornar e
+}
+
+// Rotación local que deja el eje x del hueso apuntando en dirección (dx, dy)
+// del mundo.
+funcion _esq_rot_local(e, h, dx, dy) {
+    sea lx = dx
+    sea ly = dy
+    si (h["padre"] >= 0) {
+        sea p = e["huesos"][h["padre"]]
+        sea det = p["a"] * p["d"] - p["b"] * p["c"]
+        si (det != 0) {
+            lx = (p["d"] * dx - p["b"] * dy) / det
+            ly = (p["a"] * dy - p["c"] * dx) / det
+        }
+    } sino {
+        lx = dx / e["escala_x"]
+        ly = dy / e["escala_y"]
+    }
+    retornar _esq_atan2(ly, lx) / _ESQ_GRAD - h["shx"]
+}
+
+funcion _esq_ik1(e, ik) {
+    sea h = e["huesos"][ik["huesos"][0]]
+    sea t = e["huesos"][ik["objetivo"]]
+    sea r = _esq_rot_local(e, h, t["wx"] - h["wx"], t["wy"] - h["wy"])
+    h["rot"] = h["rot"] + _esq_envolver(r - h["rot"]) * ik["mezcla"]
+}
+
+funcion _esq_ik2(e, ik) {
+    sea p = e["huesos"][ik["huesos"][0]]
+    sea c = e["huesos"][ik["huesos"][1]]
+    sea t = e["huesos"][ik["objetivo"]]
+    sea px = p["wx"]
+    sea py = p["wy"]
+    sea l1 = raiz((c["wx"] - px) * (c["wx"] - px) + (c["wy"] - py) * (c["wy"] - py))
+    sea esc = raiz(c["a"] * c["a"] + c["c"] * c["c"])
+    sea l2 = c["largo"] * esc
+    sea dx = t["wx"] - px
+    sea dy = t["wy"] - py
+    sea d = raiz(dx * dx + dy * dy)
+    si (l1 == 0 o d == 0) { retornar _esq_ik1(e, {"huesos": [ik["huesos"][0]], "objetivo": ik["objetivo"], "mezcla": ik["mezcla"]}) }
+    sea dd = minimo(maximo(d, abs(l1 - l2)), l1 + l2)
+    sea cos_a = (l1 * l1 + dd * dd - l2 * l2) / (2 * l1 * dd)
+    cos_a = minimo(maximo(cos_a, -1), 1)
+    sea linea = _esq_atan2(dy, dx)
+    sea ang_p = linea + ik["dobla"] * arccoseno(cos_a)
+    // Dirección del padre al origen del hijo; el hijo puede no estar sobre
+    // el eje x del padre.
+    sea fi = _esq_atan2(c["wy"] - py, c["wx"] - px) - _esq_atan2(p["c"], p["a"])
+    sea dir_p = ang_p - fi
+    sea r1 = _esq_rot_local(e, p, coseno(dir_p), seno(dir_p))
+    p["rot"] = p["rot"] + _esq_envolver(r1 - p["rot"]) * ik["mezcla"]
+    _esq_hueso_mundo(e, p)
+    _esq_hueso_mundo(e, c)
+    // Ahora el hijo apunta al objetivo (recortado al alcance).
+    sea tx = px + dx / d * dd
+    sea ty = py + dy / d * dd
+    sea r2 = _esq_rot_local(e, c, tx - c["wx"], ty - c["wy"])
+    c["rot"] = c["rot"] + _esq_envolver(r2 - c["rot"]) * ik["mezcla"]
+}
+
+/// Datos de un hueso: posición, rotación y escala en el mundo.
+funcion esqueleto_hueso(e, nombre) {
+    sea i = e["hueso_idx"][nombre] ?? -1
+    si (i < 0) { lanzar "esqueleto: no hay hueso " + nombre }
+    sea h = e["huesos"][i]
+    retornar {"nombre": nombre, "x": h["wx"], "y": h["wy"], "rotacion": _esq_atan2(h["c"], h["a"]) / _ESQ_GRAD,
+        "escala_x": raiz(h["a"] * h["a"] + h["c"] * h["c"]), "escala_y": raiz(h["b"] * h["b"] + h["d"] * h["d"]),
+        "local": {"x": h["x"], "y": h["y"], "rotacion": h["rot"], "escala_x": h["sx"], "escala_y": h["sy"]}, "matriz": [h["a"], h["b"], h["c"], h["d"], h["wx"], h["wy"]]}
+}
+
+/// Cambia valores locales de un hueso (para manejarlo desde el código).
+funcion esqueleto_mover_hueso(e, nombre, valores) {
+    sea i = e["hueso_idx"][nombre] ?? -1
+    si (i < 0) { lanzar "esqueleto: no hay hueso " + nombre }
+    sea h = e["huesos"][i]
+    sea mapa = {"x": "x", "y": "y", "rotacion": "rot", "escala_x": "sx", "escala_y": "sy"}
+    para k en claves(valores) { h[mapa[k] ?? k] = valores[k] }
+}
+
+/// Posición y escala del esqueleto entero.
+funcion esqueleto_posicion(e, x, y, escala_x, escala_y) {
+    e["x"] = x
+    e["y"] = y
+    e["escala_x"] = _esq_n(escala_x, 1)
+    e["escala_y"] = _esq_n(escala_y, _esq_n(escala_x, 1))
+}
+
+/// Pasa de coordenadas del mundo a las locales de un hueso.
+funcion esqueleto_mundo_a_local(e, nombre, x, y) {
+    sea h = e["huesos"][e["hueso_idx"][nombre]]
+    sea det = h["a"] * h["d"] - h["b"] * h["c"]
+    sea dx = x - h["wx"]
+    sea dy = y - h["wy"]
+    retornar [(h["d"] * dx - h["b"] * dy) / det, (h["a"] * dy - h["c"] * dx) / det]
+}
+
+// ---------- pieles y adjuntos ----------
+
+funcion esqueleto_pieles(e) { retornar claves(e["pieles"]) }
+funcion esqueleto_animaciones(e) { retornar claves(e["animaciones"]) }
+funcion esqueleto_duracion(e, nombre) { retornar e["animaciones"][nombre]["duracion"] }
+
+/// Elige la piel activa (los adjuntos que falten se buscan en "default").
+funcion esqueleto_piel(e, nombre) {
+    si (nombre != nulo y tiene_clave(e["pieles"], nombre) == falso) { lanzar "esqueleto: no hay piel " + nombre }
+    e["piel"] = nombre
+}
+
+/// El adjunto de una ranura (nombre de adjunto opcional; por defecto el actual).
+funcion esqueleto_adjunto(e, ranura, nombre) {
+    sea si_ = e["ranura_idx"][ranura] ?? -1
+    si (si_ < 0) { retornar nulo }
+    sea n = nombre ?? e["ranuras"][si_]["adjunto"]
+    si (n == nulo) { retornar nulo }
+    retornar _esq_buscar_adjunto(e, ranura, n)
+}
+
+funcion _esq_buscar_adjunto(e, ranura, n) {
+    sea a = nulo
+    si (e["piel"] != nulo) {
+        sea p = e["pieles"][e["piel"]]
+        si (tiene_clave(p, ranura) y tiene_clave(p[ranura], n)) { a = p[ranura][n] }
+    }
+    si (a == nulo) {
+        sea d = e["pieles"]["default"] ?? {}
+        si (tiene_clave(d, ranura) y tiene_clave(d[ranura], n)) { a = d[ranura][n] }
+    }
+    si (a != nulo y a["tipo"] == "linkedmesh") {
+        sea pp = e["pieles"][a["piel_padre"]] ?? e["pieles"]["default"] ?? {}
+        sea base = nulo
+        si (tiene_clave(pp, ranura) y tiene_clave(pp[ranura], a["padre"])) { base = pp[ranura][a["padre"]] }
+        si (base == nulo) { retornar nulo }
+        retornar {"tipo": "mesh", "nombre": a["nombre"], "ruta": a["ruta"], "color": a["color"], "uvs": base["uvs"], "triangulos": base["triangulos"],
+            "vertices": base["vertices"], "pesado": base["pesado"], "casco": base["casco"]}
+    }
+    retornar a
+}
+
+/// Pone (o quita con nulo) el adjunto de una ranura.
+funcion esqueleto_poner_adjunto(e, ranura, nombre) {
+    sea si_ = e["ranura_idx"][ranura] ?? -1
+    si (si_ < 0) { lanzar "esqueleto: no hay ranura " + ranura }
+    si (nombre != nulo y _esq_buscar_adjunto(e, ranura, nombre) == nulo) { lanzar "esqueleto: la ranura " + ranura + " no tiene el adjunto " + nombre }
+    e["ranuras"][si_]["adjunto"] = nombre
+}
+
+// Vértices del mundo de una lista de vértices (pesados o no).
+funcion _esq_vertices_mundo(e, h, verts, pesado) {
+    sea r = []
+    si (pesado == falso) {
+        sea i = 0
+        mientras (i < longitud(verts)) {
+            sea x = verts[i]
+            sea y = verts[i + 1]
+            r.agregar(h["a"] * x + h["b"] * y + h["wx"])
+            r.agregar(h["c"] * x + h["d"] * y + h["wy"])
+            i = i + 2
+        }
+        retornar r
+    }
+    sea i = 0
+    mientras (i < longitud(verts)) {
+        sea n = verts[i]
+        i = i + 1
+        sea wx = 0
+        sea wy = 0
+        sea k = 0
+        mientras (k < n) {
+            sea b = e["huesos"][verts[i]]
+            sea x = verts[i + 1]
+            sea y = verts[i + 2]
+            sea w = verts[i + 3]
+            wx = wx + (b["a"] * x + b["b"] * y + b["wx"]) * w
+            wy = wy + (b["c"] * x + b["d"] * y + b["wy"]) * w
+            i = i + 4
+            k = k + 1
+        }
+        r.agregar(wx)
+        r.agregar(wy)
+    }
+    retornar r
+}
+
+// Esquinas de un adjunto de región (abajo-izq, arriba-izq, arriba-der,
+// abajo-der) en el mundo.
+funcion _esq_region(e, h, a, reg) {
+    sea w = a["ancho"]
+    sea hh = a["alto"]
+    sea lx = 0 - w / 2 * a["sx"]
+    sea ly = 0 - hh / 2 * a["sy"]
+    sea lx2 = 0 - lx
+    sea ly2 = 0 - ly
+    si (reg != nulo y reg["orig_ancho"] > 0) {
+        sea rsx = w / reg["orig_ancho"] * a["sx"]
+        sea rsy = hh / reg["orig_alto"] * a["sy"]
+        lx = lx + reg["desp_x"] * rsx
+        ly = ly + reg["desp_y"] * rsy
+        lx2 = lx + reg["ancho"] * rsx
+        ly2 = ly + reg["alto"] * rsy
+    }
+    sea cr = coseno(a["rot"] * _ESQ_GRAD)
+    sea sr = seno(a["rot"] * _ESQ_GRAD)
+    sea esquinas = [[lx, ly], [lx, ly2], [lx2, ly2], [lx2, ly]]
+    sea loc = []
+    para q en esquinas {
+        loc.agregar(a["x"] + cr * q[0] - sr * q[1])
+        loc.agregar(a["y"] + sr * q[0] + cr * q[1])
+    }
+    retornar _esq_vertices_mundo(e, h, loc, falso)
+}
+
+/// Lo que hay que dibujar, en orden: [{"ranura", "adjunto", "ruta",
+/// "vertices" (x, y del mundo), "uvs" (0..1 sobre la región o la página si
+/// hay atlas), "triangulos", "color" [r, g, b, a] 0..1, "mezcla", "pagina"}].
+funcion esqueleto_triangulos(e, atlas) {
+    sea r = []
+    para si_ en e["orden"] {
+        sea s = e["ranuras"][si_]
+        si (s["adjunto"] != nulo) {
+            sea a = _esq_buscar_adjunto(e, s["nombre"], s["adjunto"])
+            si (a != nulo y (a["tipo"] == "region" o a["tipo"] == "mesh")) {
+                sea h = e["huesos"][s["hueso"]]
+                sea reg = nulo
+                si (atlas != nulo) { reg = atlas["regiones"][a["ruta"]] ?? nulo }
+                sea col = [s["color"][0] * a["color"][0], s["color"][1] * a["color"][1], s["color"][2] * a["color"][2], s["color"][3] * a["color"][3]]
+                sea vs = nulo
+                sea uv = nulo
+                sea tri = nulo
+                si (a["tipo"] == "region") {
+                    vs = _esq_region(e, h, a, reg)
+                    uv = [0, 1, 0, 0, 1, 0, 1, 1]
+                    si (reg != nulo) {
+                        si (reg["rotada"]) { uv = [reg["u2"], reg["v2"], reg["u"], reg["v2"], reg["u"], reg["v"], reg["u2"], reg["v"]] }
+                        sino { uv = [reg["u"], reg["v2"], reg["u"], reg["v"], reg["u2"], reg["v"], reg["u2"], reg["v2"]] }
+                    }
+                    tri = [0, 1, 2, 2, 3, 0]
+                } sino {
+                    vs = _esq_vertices_mundo(e, h, a["vertices"], a["pesado"])
+                    uv = a["uvs"]
+                    si (reg != nulo) {
+                        uv = []
+                        sea du = reg["u2"] - reg["u"]
+                        sea dv = reg["v2"] - reg["v"]
+                        sea i = 0
+                        mientras (i < longitud(a["uvs"])) {
+                            si (reg["rotada"]) {
+                                uv.agregar(reg["u"] + a["uvs"][i + 1] * du)
+                                uv.agregar(reg["v"] + dv - a["uvs"][i] * dv)
+                            } sino {
+                                uv.agregar(reg["u"] + a["uvs"][i] * du)
+                                uv.agregar(reg["v"] + a["uvs"][i + 1] * dv)
+                            }
+                            i = i + 2
+                        }
+                    }
+                    tri = a["triangulos"]
+                }
+                sea pag = nulo
+                si (reg != nulo) { pag = reg["pagina"] }
+                r.agregar({"ranura": s["nombre"], "adjunto": s["adjunto"], "ruta": a["ruta"], "vertices": vs, "uvs": uv, "triangulos": tri, "color": col,
+                    "mezcla": s["mezcla"], "pagina": pag})
+            }
+        }
+    }
+    retornar r
+}
+
+/// Cajas de colisión activas: [{"ranura", "nombre", "vertices"}].
+funcion esqueleto_cajas(e) {
+    sea r = []
+    para s en e["ranuras"] {
+        si (s["adjunto"] != nulo) {
+            sea a = _esq_buscar_adjunto(e, s["nombre"], s["adjunto"])
+            si (a != nulo y a["tipo"] == "boundingbox") {
+                r.agregar({"ranura": s["nombre"], "nombre": a["nombre"], "vertices": _esq_vertices_mundo(e, e["huesos"][s["hueso"]], a["vertices"], a["pesado"])})
+            }
+        }
+    }
+    retornar r
+}
+
+/// ¿El punto (x, y) cae dentro de alguna caja? Devuelve su nombre o nulo.
+funcion esqueleto_tocar(e, x, y) {
+    para c en esqueleto_cajas(e) {
+        sea v = c["vertices"]
+        sea dentro = falso
+        sea n = longitud(v) / 2
+        sea i = 0
+        sea j = n - 1
+        mientras (i < n) {
+            sea xi = v[i * 2]
+            sea yi = v[i * 2 + 1]
+            sea xj = v[j * 2]
+            sea yj = v[j * 2 + 1]
+            si ((yi > y) != (yj > y) y x < (xj - xi) * (y - yi) / (yj - yi) + xi) { dentro = dentro == falso }
+            j = i
+            i = i + 1
+        }
+        si (dentro) { retornar c["nombre"] }
+    }
+    retornar nulo
+}
+
+/// Punto de un adjunto "point" en el mundo: {"x", "y", "rotacion"}.
+funcion esqueleto_punto(e, ranura, nombre) {
+    sea a = esqueleto_adjunto(e, ranura, nombre)
+    si (a == nulo o a["tipo"] != "point") { retornar nulo }
+    sea h = e["huesos"][e["ranuras"][e["ranura_idx"][ranura]]["hueso"]]
+    sea p = _esq_vertices_mundo(e, h, [a["x"], a["y"]], falso)
+    sea cr = coseno(a["rot"] * _ESQ_GRAD)
+    sea sr = seno(a["rot"] * _ESQ_GRAD)
+    sea rx = h["a"] * cr + h["b"] * sr
+    sea ry = h["c"] * cr + h["d"] * sr
+    retornar {"x": p[0], "y": p[1], "rotacion": _esq_atan2(ry, rx) / _ESQ_GRAD}
+}
+
+/// Caja que contiene todo lo dibujado: [x0, y0, x1, y1].
+funcion esqueleto_limites(e) {
+    sea x0 = nulo
+    sea y0 = 0
+    sea x1 = 0
+    sea y1 = 0
+    para t en esqueleto_triangulos(e, nulo) {
+        sea v = t["vertices"]
+        sea i = 0
+        mientras (i < longitud(v)) {
+            si (x0 == nulo) {
+                x0 = v[i]
+                x1 = v[i]
+                y0 = v[i + 1]
+                y1 = v[i + 1]
+            }
+            x0 = minimo(x0, v[i])
+            x1 = maximo(x1, v[i])
+            y0 = minimo(y0, v[i + 1])
+            y1 = maximo(y1, v[i + 1])
+            i = i + 2
+        }
+    }
+    si (x0 == nulo) { retornar [0, 0, 0, 0] }
+    retornar [x0, y0, x1, y1]
+}
+
+// ---------- atlas ----------
+
+/// Lee un atlas de libGDX/Spine. cargar_pagina(nombre) devuelve la imagen
+/// de cada página (de "imagen"); puede ser nulo para leer solo las regiones.
+funcion esqueleto_atlas(texto, cargar_pagina) {
+    sea at = {"paginas": [], "regiones": {}}
+    sea pag = nulo
+    sea reg = nulo
+    para linea0 en texto_dividir(texto_reemplazar(texto, "\r", ""), "\n") {
+        sea linea = texto_recortar(linea0)
+        si (linea == "") {
+            pag = nulo
+            reg = nulo
+        } sino si (contiene(linea, ":")) {
+            sea i = texto_indice(linea, ":")
+            sea k = texto_recortar(subtexto(linea, 0, i))
+            sea vals = []
+            para p en texto_dividir(subtexto(linea, i + 1, longitud(linea)), ",") { vals.agregar(texto_recortar(p)) }
+            si (reg != nulo) { _esq_atlas_campo(reg, k, vals) }
+            sino si (pag != nulo) {
+                si (k == "size") {
+                    pag["ancho"] = a_numero(vals[0])
+                    pag["alto"] = a_numero(vals[1])
+                }
+                pag[k] = vals
+            }
+        } sino si (pag == nulo) {
+            pag = {"nombre": linea, "ancho": 0, "alto": 0, "imagen": nulo}
+            si (cargar_pagina != nulo) { pag["imagen"] = cargar_pagina(linea) }
+            at["paginas"].agregar(pag)
+        } sino {
+            reg = {"nombre": linea, "pagina": longitud(at["paginas"]) - 1, "x": 0, "y": 0, "ancho": 0, "alto": 0, "rotada": falso, "grados": 0,
+                "desp_x": 0, "desp_y": 0, "orig_ancho": 0, "orig_alto": 0, "indice": -1}
+            at["regiones"][linea] = reg
+        }
+    }
+    // u, v en 0..1 de cada región.
+    para k en claves(at["regiones"]) {
+        sea r = at["regiones"][k]
+        sea p = at["paginas"][r["pagina"]]
+        si (p["ancho"] == 0 y p["imagen"] != nulo) {
+            p["ancho"] = p["imagen"]["ancho"]
+            p["alto"] = p["imagen"]["alto"]
+        }
+        si (r["orig_ancho"] == 0) {
+            r["orig_ancho"] = r["ancho"]
+            r["orig_alto"] = r["alto"]
+        }
+        sea w = r["ancho"]
+        sea h = r["alto"]
+        si (r["rotada"]) {
+            w = r["alto"]
+            h = r["ancho"]
+        }
+        si (p["ancho"] > 0) {
+            r["u"] = r["x"] / p["ancho"]
+            r["v"] = r["y"] / p["alto"]
+            r["u2"] = (r["x"] + w) / p["ancho"]
+            r["v2"] = (r["y"] + h) / p["alto"]
+        }
+    }
+    retornar at
+}
+
+funcion _esq_atlas_campo(reg, k, v) {
+    si (k == "bounds") {
+        reg["x"] = a_numero(v[0])
+        reg["y"] = a_numero(v[1])
+        reg["ancho"] = a_numero(v[2])
+        reg["alto"] = a_numero(v[3])
+    } sino si (k == "xy") {
+        reg["x"] = a_numero(v[0])
+        reg["y"] = a_numero(v[1])
+    } sino si (k == "size") {
+        reg["ancho"] = a_numero(v[0])
+        reg["alto"] = a_numero(v[1])
+    } sino si (k == "offsets") {
+        reg["desp_x"] = a_numero(v[0])
+        reg["desp_y"] = a_numero(v[1])
+        reg["orig_ancho"] = a_numero(v[2])
+        reg["orig_alto"] = a_numero(v[3])
+    } sino si (k == "orig") {
+        reg["orig_ancho"] = a_numero(v[0])
+        reg["orig_alto"] = a_numero(v[1])
+    } sino si (k == "offset") {
+        reg["desp_x"] = a_numero(v[0])
+        reg["desp_y"] = a_numero(v[1])
+    } sino si (k == "rotate") {
+        si (v[0] == "true") { reg["rotada"] = verdadero reg["grados"] = 90 }
+        sino si (v[0] != "false") {
+            reg["grados"] = a_numero(v[0])
+            reg["rotada"] = reg["grados"] == 90
+        }
+    } sino si (k == "index") { reg["indice"] = a_numero(v[0]) }
+    sino { reg[k] = v }
+}
+
+// ---------- dibujo ----------
+
+funcion _esq_pantalla(x, y, op) {
+    sea esc = _esq_n(op["escala"] ?? nulo, 1)
+    sea sy = -1
+    si ((op["y_abajo"] ?? nulo) == verdadero) { sy = 1 }
+    retornar [_esq_n(op["x"] ?? nulo, 0) + x * esc, _esq_n(op["y"] ?? nulo, 0) + y * esc * sy]
+}
+
+/// Dibuja con texturas en una imagen (de "imagen"). opciones: "x", "y"
+/// (dónde queda el origen), "escala", "y_abajo" (las y del esqueleto ya
+/// crecen hacia abajo), "suave" (filtro bilineal, sí por defecto).
+funcion esqueleto_dibujar_imagen(e, atlas, img, opciones) {
+    sea op = opciones ?? {}
+    sea banderas = 16
+    si ((op["suave"] ?? nulo) != falso) { banderas = banderas + 8 }
+    sea zb = lienzo_zbuffer(img["ancho"], img["alto"])
+    sea blanco = imagen_nueva(1, 1, [255, 255, 255, 255])
+    para t en esqueleto_triangulos(e, atlas) {
+        sea tex = blanco["pixeles"]
+        sea tw = 1
+        sea th = 1
+        si (t["pagina"] != nulo) {
+            sea p = atlas["paginas"][t["pagina"]]
+            si (p["imagen"] != nulo) {
+                tex = p["imagen"]["pixeles"]
+                tw = p["imagen"]["ancho"]
+                th = p["imagen"]["alto"]
+            }
+        }
+        sea c = t["color"]
+        sea cr = piso(minimo(maximo(c[0], 0), 1) * 255 + 0.5)
+        sea cg = piso(minimo(maximo(c[1], 0), 1) * 255 + 0.5)
+        sea cb = piso(minimo(maximo(c[2], 0), 1) * 255 + 0.5)
+        sea ca = piso(minimo(maximo(c[3], 0), 1) * 255 + 0.5)
+        sea pts = []
+        sea i = 0
+        mientras (i < longitud(t["vertices"])) {
+            pts.agregar(_esq_pantalla(t["vertices"][i], t["vertices"][i + 1], op))
+            i = i + 2
+        }
+        sea k = 0
+        mientras (k + 2 < longitud(t["triangulos"])) {
+            sea v = []
+            para q en [t["triangulos"][k], t["triangulos"][k + 1], t["triangulos"][k + 2]] {
+                v.agregar(piso(pts[q][0] * 16 + 0.5))
+                v.agregar(piso(pts[q][1] * 16 + 0.5))
+                v.agregar(0)
+                v.agregar(65536)
+                v.agregar(cr)
+                v.agregar(cg)
+                v.agregar(cb)
+                v.agregar(ca)
+                v.agregar(piso(t["uvs"][q * 2] * tw * 65536))
+                v.agregar(piso(t["uvs"][q * 2 + 1] * th * 65536))
+            }
+            lienzo_triangulo(img["pixeles"], zb, img["ancho"], img["alto"], v, tex, tw, th, banderas)
+            k = k + 3
+        }
+    }
+    retornar img
+}
+
+/// Dibuja en colores planos (color de cada ranura) en un lienzo de
+/// "vector"; con "huesos": verdadero también dibuja los huesos.
+funcion esqueleto_dibujar_vector(e, lienzo, opciones) {
+    sea op = opciones ?? {}
+    para t en esqueleto_triangulos(e, nulo) {
+        sea c = t["color"]
+        sea pts = []
+        sea i = 0
+        mientras (i < longitud(t["vertices"])) {
+            pts.agregar(_esq_pantalla(t["vertices"][i], t["vertices"][i + 1], op))
+            i = i + 2
+        }
+        vector_color(lienzo, [piso(c[0] * 255 + 0.5), piso(c[1] * 255 + 0.5), piso(c[2] * 255 + 0.5), c[3]])
+        sea k = 0
+        mientras (k + 2 < longitud(t["triangulos"])) {
+            vector_nuevo_camino(lienzo)
+            sea a = pts[t["triangulos"][k]]
+            sea b = pts[t["triangulos"][k + 1]]
+            sea cc = pts[t["triangulos"][k + 2]]
+            vector_mover(lienzo, a[0], a[1])
+            vector_linea(lienzo, b[0], b[1])
+            vector_linea(lienzo, cc[0], cc[1])
+            vector_cerrar(lienzo)
+            vector_rellenar(lienzo)
+            k = k + 3
+        }
+    }
+    si ((op["huesos"] ?? nulo) == verdadero) {
+        vector_grosor(lienzo, 2)
+        vector_color(lienzo, op["color_huesos"] ?? "#ff8800")
+        para h en e["huesos"] {
+            sea a = _esq_pantalla(h["wx"], h["wy"], op)
+            sea b = _esq_pantalla(h["wx"] + h["a"] * h["largo"], h["wy"] + h["c"] * h["largo"], op)
+            vector_nuevo_camino(lienzo)
+            vector_mover(lienzo, a[0], a[1])
+            vector_linea(lienzo, b[0], b[1])
+            vector_trazar(lienzo)
+            vector_nuevo_camino(lienzo)
+            vector_circulo(lienzo, a[0], a[1], 3)
+            vector_rellenar(lienzo)
+        }
+    }
+    retornar lienzo
+}
+
+// ---------- estado con pistas y mezclas ----------
+
+/// Estado de animación: pistas que suenan a la vez (las de número mayor
+/// encima) y mezclas cruzadas al cambiar de animación.
+funcion esqueleto_estado(e) {
+    retornar {"esqueleto": e, "pistas": {}, "mezclas": {}, "mezcla_defecto": 0, "eventos": [], "velocidad": 1, "al_evento": nulo, "al_terminar": nulo}
+}
+
+/// Duración de la mezcla al pasar de "desde" a "hacia" (o la de siempre si
+/// "desde" es nulo).
+funcion esqueleto_estado_mezcla(est, desde, hacia, segundos) {
+    si (desde == nulo) { est["mezcla_defecto"] = segundos } sino { est["mezclas"][desde + "→" + hacia] = segundos }
+}
+
+/// Pone una animación en una pista (con mezcla desde la anterior).
+funcion esqueleto_estado_poner(est, pista, nombre, bucle) {
+    si (tiene_clave(est["esqueleto"]["animaciones"], nombre) == falso) { lanzar "esqueleto: no hay animación " + nombre }
+    sea k = "" + pista
+    sea antes = est["pistas"][k] ?? nulo
+    sea ent = {"animacion": nombre, "bucle": bucle == verdadero, "tiempo": 0, "previo": 0, "alfa": 1, "desde": nulo, "mezcla": 0, "mezcla_t": 0, "cola": [], "terminada": falso}
+    si (antes != nulo) {
+        sea d = est["mezclas"][antes["animacion"] + "→" + nombre] ?? est["mezcla_defecto"]
+        si (d > 0) {
+            antes["desde"] = nulo
+            ent["desde"] = antes
+            ent["mezcla"] = d
+        }
+    }
+    est["pistas"][k] = ent
+    retornar ent
+}
+
+/// Encola una animación que sigue a la actual cuando termina (o tras
+/// "retraso" segundos si se da).
+funcion esqueleto_estado_encolar(est, pista, nombre, bucle, retraso) {
+    sea k = "" + pista
+    sea ent = est["pistas"][k] ?? nulo
+    si (ent == nulo) { retornar esqueleto_estado_poner(est, pista, nombre, bucle) }
+    ent["cola"].agregar({"animacion": nombre, "bucle": bucle == verdadero, "retraso": retraso})
+}
+
+/// Quita la animación de una pista.
+funcion esqueleto_estado_quitar(est, pista) { quitar_clave(est["pistas"], "" + pista) }
+
+/// Peso con que suena una pista (0..1).
+funcion esqueleto_estado_alfa(est, pista, alfa) { est["pistas"]["" + pista]["alfa"] = alfa }
+
+/// Avanza el tiempo; devuelve los eventos que pasaron.
+funcion esqueleto_estado_actualizar(est, segundos) {
+    sea dt = segundos * est["velocidad"]
+    sea evs = []
+    para k en claves(est["pistas"]) {
+        sea ent = est["pistas"][k]
+        sea e = est["esqueleto"]
+        sea an = e["animaciones"][ent["animacion"]]
+        ent["previo"] = ent["tiempo"]
+        ent["tiempo"] = ent["tiempo"] + dt
+        para ev en _esq_eventos_entre(an, ent["previo"], ent["tiempo"], ent["bucle"]) {
+            sea x = {"pista": a_numero(k), "animacion": ent["animacion"], "nombre": ev["nombre"], "entero": ev["entero"], "real": ev["real"], "texto": ev["texto"]}
+            evs.agregar(x)
+            si (est["al_evento"] != nulo) { est["al_evento"](x) }
+        }
+        si (ent["desde"] != nulo) {
+            ent["mezcla_t"] = ent["mezcla_t"] + dt
+            ent["desde"]["previo"] = ent["desde"]["tiempo"]
+            ent["desde"]["tiempo"] = ent["desde"]["tiempo"] + dt
+            si (ent["mezcla_t"] >= ent["mezcla"]) { ent["desde"] = nulo }
+        }
+        sea fin = ent["bucle"] == falso y ent["tiempo"] >= an["duracion"]
+        si (fin y ent["terminada"] == falso) {
+            ent["terminada"] = verdadero
+            si (est["al_terminar"] != nulo) { est["al_terminar"](a_numero(k), ent["animacion"]) }
+        }
+        si (longitud(ent["cola"]) > 0) {
+            sea sig = ent["cola"][0]
+            sea pasar = fin
+            si (sig["retraso"] != nulo) { pasar = ent["tiempo"] >= sig["retraso"] }
+            sino si (ent["bucle"] y an["duracion"] > 0) { pasar = ent["tiempo"] >= an["duracion"] }
+            si (pasar) {
+                sea resto = []
+                sea i = 1
+                mientras (i < longitud(ent["cola"])) {
+                    resto.agregar(ent["cola"][i])
+                    i = i + 1
+                }
+                sea n = esqueleto_estado_poner(est, a_numero(k), sig["animacion"], sig["bucle"])
+                n["cola"] = resto
+            }
+        }
+    }
+    est["eventos"] = evs
+    retornar evs
+}
+
+/// Deja el esqueleto en la pose del estado (desde la pose inicial) y
+/// calcula el mundo.
+funcion esqueleto_estado_aplicar(est) {
+    sea e = est["esqueleto"]
+    esqueleto_pose_inicial(e)
+    sea ks = []
+    para k en claves(est["pistas"]) { ks.agregar(a_numero(k)) }
+    para k en ordenar(ks, funcion(a, b) { retornar a - b }) {
+        sea ent = est["pistas"]["" + k]
+        sea alfa = ent["alfa"]
+        si (ent["desde"] != nulo) {
+            sea de = ent["desde"]
+            esqueleto_aplicar(e, de["animacion"], de["tiempo"], de["bucle"], alfa, nulo)
+            alfa = alfa * minimo(1, ent["mezcla_t"] / ent["mezcla"])
+        }
+        esqueleto_aplicar(e, ent["animacion"], ent["tiempo"], ent["bucle"], alfa, nulo)
+    }
+    esqueleto_mundo(e)
+    retornar e
+}
+
+/// La animación y el tiempo de una pista (o nulo).
+funcion esqueleto_estado_pista(est, pista) {
+    sea ent = est["pistas"]["" + pista] ?? nulo
+    si (ent == nulo) { retornar nulo }
+    sea desde = nulo
+    si (ent["desde"] != nulo) { desde = ent["desde"]["animacion"] }
+    retornar {"animacion": ent["animacion"], "tiempo": ent["tiempo"], "bucle": ent["bucle"], "terminada": ent["terminada"], "mezclando_desde": desde}
+}

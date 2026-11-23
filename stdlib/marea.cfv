@@ -1,0 +1,371 @@
+// stdlib/marea.cfv — concurrencia para servidores al estilo Tokio sobre
+// los hilos reales de C-Forge: lanzar tareas, esperar con límite de
+// tiempo, carreras (la primera que termina), conjuntos de tareas que se
+// recogen a medida que terminan, canales con espera limitada y selección
+// entre varios, difusión (cada suscriptor recibe todo), vigía (último valor
+// con aviso de cambio), semáforos, barreras, cancelación cooperativa e
+// intervalos. Todo lo compartido entre hilos se protege con mutex y los
+// mapas compartidos se crean con todas sus claves (C-Forge no permite
+// cambiar su forma desde varios hilos a la vez). Idea de Tokio (MIT). En
+// inglés: importar "asyncrt".
+//
+//   importar "marea"
+//   sea h = marea_lanzar(funcion() { retornar consultar_api() })
+//   sea r = marea_esperar(h, 2000)          // lanza si tarda más de 2 s
+//   sea c = marea_canal(16)
+//   marea_lanzar(funcion() { marea_enviar(c, "hola") })
+//   mostrar(marea_recibir(c, 1000))
+
+funcion _mar_ahora() { retornar tiempo_ms() }
+funcion _mar_dormir(ms) { hilo_dormir(ms) }
+
+// ---------- tareas ----------
+
+/// Lanza f en un hilo. Devuelve el manejador.
+funcion marea_lanzar(f) { retornar tarea(f) }
+
+/// Espera el resultado (relanza su error). ms: límite (nulo = sin límite);
+/// si se vence lanza "marea: tiempo agotado".
+funcion marea_esperar(h, ms) {
+    si (ms == nulo) { retornar esperar(h) }
+    sea ok = verdadero
+    sea r = nulo
+    sea err = nulo
+    intentar { r = esperar(h, ms) } capturar (e) {
+        sea t = "" + e
+        si (texto_empieza_con(t, "esperar: la tarea no terminó")) { ok = falso } sino { err = e }
+    }
+    si (ok == falso) { lanzar "marea: tiempo agotado" }
+    si (err != nulo) { lanzar err }
+    retornar r
+}
+
+/// ¿Ya terminó?
+funcion marea_termino(h) {
+    sea r = verdadero
+    intentar { esperar(h, 0) } capturar (e) { si (texto_empieza_con("" + e, "esperar: la tarea no terminó")) { r = falso } }
+    retornar r
+}
+
+/// Corre f con límite de tiempo: {"ok": verdadero, "valor"} o {"ok": falso}
+/// si se venció (el hilo sigue hasta terminar por su cuenta).
+funcion marea_con_limite(f, ms) {
+    sea h = marea_lanzar(f)
+    sea r = {"ok": verdadero, "valor": nulo}
+    intentar { r["valor"] = marea_esperar(h, ms) } capturar (e) {
+        si (e == "marea: tiempo agotado") { r["ok"] = falso } sino { lanzar e }
+    }
+    retornar r
+}
+
+/// Espera todas; devuelve los resultados en orden (relanza el primer error
+/// después de esperar a todas).
+funcion marea_unir_todas(hs) {
+    sea r = []
+    sea err = nulo
+    para h en hs {
+        sea v = nulo
+        intentar { v = esperar(h) } capturar (e) { si (err == nulo) { err = e } }
+        r.agregar(v)
+    }
+    si (err != nulo) { lanzar err }
+    retornar r
+}
+
+/// Carrera: espera a la primera que termine. Devuelve [índice, valor]
+/// (relanza si la primera en terminar falló). ms: límite opcional.
+funcion marea_carrera(hs, ms) {
+    sea limite = nulo
+    si (ms != nulo) { limite = _mar_ahora() + ms }
+    mientras (verdadero) {
+        sea i = 0
+        mientras (i < longitud(hs)) {
+            si (marea_termino(hs[i])) { retornar [i, esperar(hs[i])] }
+            i = i + 1
+        }
+        si (limite != nulo y _mar_ahora() > limite) { lanzar "marea: tiempo agotado" }
+        _mar_dormir(1)
+    }
+}
+
+// ---------- conjunto de tareas ----------
+
+/// Conjunto de tareas que se recogen a medida que terminan.
+funcion marea_conjunto() { retornar {"tareas": [], "ids": []} }
+
+/// Agrega una tarea al conjunto; devuelve su número.
+funcion marea_conjunto_lanzar(cj, f) {
+    cj["tareas"].agregar(marea_lanzar(f))
+    cj["ids"].agregar(longitud(cj["ids"]))
+    retornar longitud(cj["ids"]) - 1
+}
+
+/// Siguiente en terminar: {"id", "valor"} o {"id", "error"}; nulo si no
+/// quedan.
+funcion marea_conjunto_siguiente(cj, ms) {
+    sea limite = nulo
+    si (ms != nulo) { limite = _mar_ahora() + ms }
+    mientras (longitud(cj["tareas"]) > 0) {
+        sea i = 0
+        mientras (i < longitud(cj["tareas"])) {
+            sea h = cj["tareas"][i]
+            si (marea_termino(h)) {
+                sea id = cj["ids"][i]
+                sea nt = []
+                sea ni = []
+                sea k = 0
+                mientras (k < longitud(cj["tareas"])) {
+                    si (k != i) {
+                        nt.agregar(cj["tareas"][k])
+                        ni.agregar(cj["ids"][k])
+                    }
+                    k = k + 1
+                }
+                cj["tareas"] = nt
+                cj["ids"] = ni
+                sea r = {"id": id, "valor": nulo, "error": nulo}
+                intentar { r["valor"] = esperar(h) } capturar (e) { r["error"] = e }
+                retornar r
+            }
+            i = i + 1
+        }
+        si (limite != nulo y _mar_ahora() > limite) { lanzar "marea: tiempo agotado" }
+        _mar_dormir(1)
+    }
+    retornar nulo
+}
+
+funcion marea_conjunto_cantidad(cj) { retornar longitud(cj["tareas"]) }
+
+// ---------- canales ----------
+
+/// Canal con capacidad (0 = sin límite). Seguro entre hilos.
+funcion marea_canal(capacidad) { retornar {"c": canal_nuevo(capacidad ?? 0), "cerrado": falso} }
+
+funcion marea_enviar(c, v) {
+    si (c["cerrado"]) { lanzar "marea: canal cerrado" }
+    canal_enviar(c["c"], [v])
+}
+
+/// Recibe (bloquea hasta ms; nulo = sin límite). Lanza "marea: tiempo
+/// agotado" si se vence y "marea: canal cerrado" si está cerrado y vacío.
+funcion marea_recibir(c, ms) {
+    si (ms == nulo) {
+        sea x = canal_recibir(c["c"])
+        si (tipo(x) != "lista") { lanzar "marea: canal cerrado" }
+        retornar x[0]
+    }
+    sea limite = _mar_ahora() + ms
+    mientras (verdadero) {
+        si (canal_tam(c["c"]) > 0) { retornar canal_recibir(c["c"])[0] }
+        si (c["cerrado"]) { lanzar "marea: canal cerrado" }
+        si (_mar_ahora() >= limite) { lanzar "marea: tiempo agotado" }
+        _mar_dormir(1)
+    }
+}
+
+/// Intenta recibir sin esperar: [verdadero, valor] o [falso, nulo].
+funcion marea_probar_recibir(c) {
+    si (canal_tam(c["c"]) > 0) { retornar [verdadero, canal_recibir(c["c"])[0]] }
+    retornar [falso, nulo]
+}
+
+funcion marea_pendientes(c) { retornar canal_tam(c["c"]) }
+
+funcion marea_cerrar(c) {
+    c["cerrado"] = verdadero
+    canal_cerrar(c["c"])
+}
+
+/// Espera en varios canales: [índice, valor] del primero con datos.
+funcion marea_seleccionar(canales, ms) {
+    sea limite = nulo
+    si (ms != nulo) { limite = _mar_ahora() + ms }
+    mientras (verdadero) {
+        sea i = 0
+        mientras (i < longitud(canales)) {
+            sea r = marea_probar_recibir(canales[i])
+            si (r[0]) { retornar [i, r[1]] }
+            i = i + 1
+        }
+        si (limite != nulo y _mar_ahora() > limite) { lanzar "marea: tiempo agotado" }
+        _mar_dormir(1)
+    }
+}
+
+// ---------- difusión ----------
+
+/// Canal de difusión: cada suscriptor recibe todos los mensajes enviados
+/// después de suscribirse.
+funcion marea_difusion() { retornar {"m": mutex_crear(), "subs": [[]]} }
+
+/// Nuevo suscriptor (un canal propio).
+funcion marea_suscribir(d) {
+    sea c = marea_canal(0)
+    mutex_bloquear(d["m"])
+    sea nuevos = []
+    para s en d["subs"][0] { nuevos.agregar(s) }
+    nuevos.agregar(c)
+    d["subs"][0] = nuevos
+    mutex_desbloquear(d["m"])
+    retornar c
+}
+
+/// Envía a todos; devuelve a cuántos llegó.
+funcion marea_difundir(d, v) {
+    mutex_bloquear(d["m"])
+    sea l = d["subs"][0]
+    mutex_desbloquear(d["m"])
+    para c en l { si (c["cerrado"] == falso) { marea_enviar(c, v) } }
+    retornar longitud(l)
+}
+
+// ---------- vigía ----------
+
+/// Vigía: guarda el último valor; los que esperan se enteran del cambio.
+funcion marea_vigia(inicial) { retornar {"m": mutex_crear(), "v": inicial, "version": 0} }
+
+funcion marea_vigia_poner(w, v) {
+    mutex_bloquear(w["m"])
+    w["v"] = v
+    w["version"] = w["version"] + 1
+    mutex_desbloquear(w["m"])
+}
+
+funcion marea_vigia_leer(w) {
+    mutex_bloquear(w["m"])
+    sea v = w["v"]
+    mutex_desbloquear(w["m"])
+    retornar v
+}
+
+/// Espera un cambio posterior a la versión vista ([versión, valor]).
+funcion marea_vigia_esperar(w, vista, ms) {
+    sea limite = nulo
+    si (ms != nulo) { limite = _mar_ahora() + ms }
+    mientras (verdadero) {
+        mutex_bloquear(w["m"])
+        sea ver = w["version"]
+        sea v = w["v"]
+        mutex_desbloquear(w["m"])
+        si (ver > vista) { retornar [ver, v] }
+        si (limite != nulo y _mar_ahora() > limite) { lanzar "marea: tiempo agotado" }
+        _mar_dormir(1)
+    }
+}
+
+// ---------- sincronización ----------
+
+/// Semáforo con n permisos.
+funcion marea_semaforo(n) {
+    sea c = canal_nuevo(0)
+    sea i = 0
+    mientras (i < n) {
+        canal_enviar(c, 1)
+        i = i + 1
+    }
+    retornar {"c": c}
+}
+
+funcion marea_adquirir(s) { canal_recibir(s["c"]) }
+funcion marea_liberar(s) { canal_enviar(s["c"], 1) }
+
+/// Corre f con un permiso del semáforo (lo devuelve aunque f falle).
+funcion marea_con_permiso(s, f) {
+    marea_adquirir(s)
+    sea r = nulo
+    sea err = nulo
+    intentar { r = f() } capturar (e) { err = e }
+    marea_liberar(s)
+    si (err != nulo) { lanzar err }
+    retornar r
+}
+
+/// Permisos libres.
+funcion marea_disponibles(s) { retornar canal_tam(s["c"]) }
+
+/// Barrera para n hilos: marea_barrera_esperar bloquea hasta que lleguen
+/// todos (reutilizable).
+funcion marea_barrera(n) { retornar {"m": mutex_crear(), "n": n, "llegados": 0, "ronda": 0} }
+
+funcion marea_barrera_esperar(b) {
+    mutex_bloquear(b["m"])
+    sea ronda = b["ronda"]
+    b["llegados"] = b["llegados"] + 1
+    sea ultimo = b["llegados"] == b["n"]
+    si (ultimo) {
+        b["llegados"] = 0
+        b["ronda"] = ronda + 1
+    }
+    mutex_desbloquear(b["m"])
+    si (ultimo) { retornar verdadero }
+    mientras (verdadero) {
+        mutex_bloquear(b["m"])
+        sea r = b["ronda"]
+        mutex_desbloquear(b["m"])
+        si (r != ronda) { retornar falso }
+        _mar_dormir(1)
+    }
+}
+
+/// Cerrojo con nombre corto: corre f con el mutex tomado.
+funcion marea_con_mutex(m, f) {
+    mutex_bloquear(m)
+    sea r = nulo
+    sea err = nulo
+    intentar { r = f() } capturar (e) { err = e }
+    mutex_desbloquear(m)
+    si (err != nulo) { lanzar err }
+    retornar r
+}
+
+/// Contador atómico.
+funcion marea_contador(inicial) { retornar {"m": mutex_crear(), "v": inicial ?? 0} }
+funcion marea_sumar(c, d) {
+    mutex_bloquear(c["m"])
+    c["v"] = c["v"] + d
+    sea v = c["v"]
+    mutex_desbloquear(c["m"])
+    retornar v
+}
+funcion marea_valor(c) { retornar marea_sumar(c, 0) }
+
+// ---------- cancelación e intervalos ----------
+
+/// Ficha de cancelación cooperativa.
+funcion marea_ficha() { retornar {"cancelada": falso, "motivo": nulo} }
+funcion marea_cancelar(f, motivo) {
+    f["motivo"] = motivo ?? "cancelada"
+    f["cancelada"] = verdadero
+}
+funcion marea_cancelada(f) { retornar f["cancelada"] }
+
+/// Duerme ms, pero despierta antes (devolviendo falso) si se cancela.
+funcion marea_dormir(ms, ficha) {
+    sea limite = _mar_ahora() + ms
+    mientras (_mar_ahora() < limite) {
+        si (ficha != nulo y ficha["cancelada"]) { retornar falso }
+        sea resto = limite - _mar_ahora()
+        si (resto > 10) { resto = 10 }
+        si (resto > 0) { _mar_dormir(resto) }
+    }
+    retornar verdadero
+}
+
+/// Llama f(vuelta) cada ms en un hilo hasta que se cancele la ficha o se
+/// cumplan "veces" (nulo = sin fin). Devuelve el manejador.
+funcion marea_intervalo(ms, f, veces, ficha) {
+    retornar marea_lanzar(funcion() {
+        sea k = 0
+        sea siguiente = _mar_ahora() + ms
+        mientras ((veces == nulo o k < veces) y (ficha == nulo o ficha["cancelada"] == falso)) {
+            sea espera = siguiente - _mar_ahora()
+            si (espera > 0 y marea_dormir(espera, ficha) == falso) { retornar k }
+            si (ficha != nulo y ficha["cancelada"]) { retornar k }
+            f(k)
+            k = k + 1
+            siguiente = siguiente + ms
+        }
+        retornar k
+    })
+}

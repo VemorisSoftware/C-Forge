@@ -27,9 +27,9 @@ Estado: ✅ ya existe en C-Forge · 🔗 se usa hoy vía `cforge bindgen`,
 | 8 | `pixel` | Imágenes y tipografías | stb_image, stb_truetype | ✅ `imagen` / `fuente` |
 | 9 | `inercia` | Física 2D y 3D | Box2D, Bullet | ✅ `fisica2d` / `fisica3d` (básica) |
 | 10 | `fotograma` | Audio y video | FFmpeg | ✅ audio PCM/WAV · 🔗 video |
-| 11 | `marea` | Runtime asíncrono para servidores | Tokio | 🛠 |
+| 11 | `marea` / `asyncrt` | Runtime asíncrono para servidores | Tokio | ✅ `marea` |
 | 12 | `molde` / `serde` | Serialización universal | Serde | ✅ `molde` |
-| 13 | `enjambre` | Paralelismo de datos | Rayon | 🛠 |
+| 13 | `enjambre` / `parallel` | Paralelismo de datos | Rayon | ✅ `enjambre` |
 | 14 | `orden` / `cli` | Argumentos de línea de comandos | Clap | ✅ `orden` |
 | 15 | `mensajero` | Cliente HTTP | Reqwest | ✅ `red` |
 | 16 | `portico` | Framework web | Axum, Actix | ✅ `web` (básico) |
@@ -46,7 +46,7 @@ Estado: ✅ ya existe en C-Forge · 🔗 se usa hoy vía `cforge bindgen`,
 | 27 | `calco` / `mapper` | Mapeo entre estructuras | AutoMapper | ✅ `calco` |
 | 28 | `resiste` / `resilience` | Reintentos y circuit breaker | Polly | ✅ `resiste` |
 | 29 | `bitacora` / `logger` | Logs estructurados | Serilog | ✅ `bitacora` |
-| 30 | `torrente` | Red asíncrona de alto tráfico | Netty | 🛠 |
+| 30 | `torrente` / `pipeline` | Red asíncrona de alto tráfico | Netty | ✅ `torrente` |
 | 31 | `caja` / `cache` | Colecciones avanzadas y cachés | Guava | ✅ `caja` |
 | 32 | `formatos` / `dataformat` | JSON, XML, CSV y YAML | Jackson | ✅ `formatos` |
 | 33 | `registro` / `logging` | Registro de eventos desacoplado | SLF4J, Logback | ✅ `registro` |
@@ -104,8 +104,8 @@ Estado: ✅ ya existe en C-Forge · 🔗 se usa hoy vía `cforge bindgen`,
 | 73 | `grafia` / `shaping` | Moldeado de tipografías | HarfBuzz | ✅ `grafia` |
 | 74 | `importa3d` / `meshio` | Modelos 3D (OBJ, glTF) | Assimp | ✅ `importa3d` |
 | 75 | `gpu` | Vulkan, Metal y DirectX | bgfx, wgpu | 🛠 |
-| 76 | `pizarra` | Objetos interactivos en lienzo | Fabric.js | 🛠 |
-| 77 | `animacion` | Animaciones vectoriales | Lottie | 🛠 |
+| 76 | `pizarra` / `canvasobjects` | Objetos interactivos en lienzo | Fabric.js | ✅ `pizarra` |
+| 77 | `animacion` / `lottie` | Animaciones vectoriales | Lottie | ✅ `animacion` |
 | 78 | `estilos` / `tailwind` | Utilidades de estilo y temas | Tailwind | ✅ `estilos` |
 | 79 | `retoque` | Procesamiento de imágenes | ImageSharp | ✅ `imagen` (básico) |
 | 80 | `trazo` | Vectores en GPU | Vello | 🛠 |
@@ -261,7 +261,7 @@ Estado: ✅ ya existe en C-Forge · 🔗 se usa hoy vía `cforge bindgen`,
 | 188 | `inmersiva` | Realidad virtual y aumentada | OpenXR | 🔗 |
 | 189 | `sombreador` | Traducir shaders | naga | 🛠 |
 | 190 | `mosaico` / `tilemap` | Mapas de tiles | Tiled, LDtk | ✅ `mosaico` |
-| 191 | `esqueleto` | Animación por huesos 2D | Spine | 🛠 |
+| 191 | `esqueleto` / `skeleton2d` | Animación por huesos 2D | Spine | ✅ `esqueleto` |
 | 192 | `multitud` / `crowd` | Simulación de multitudes | DetourCrowd | ✅ `multitud` |
 | 193 | `ruido` / `noise` | Terrenos procedurales | FastNoiseLite | ✅ `ruido` |
 | 194 | `carga3d` / `gltf` | Cargar OBJ y glTF | tinyobjloader | ✅ `modelo` (OBJ) · `carga3d` (glTF) |
@@ -318,7 +318,7 @@ Estado: ✅ ya existe en C-Forge · 🔗 se usa hoy vía `cforge bindgen`,
 | 230 | `gramatica` / `parser` | Combinadores de parsers | Pest, Nom | ✅ `gramatica` |
 | 231 | `analiza` | Compilador como servicio | Roslyn | 🛠 |
 | 232 | `nucleo` | Programas en el kernel | eBPF | 🛠 |
-| 233 | `anillo` | E/S asíncrona en Linux | io_uring | 🛠 |
+| 233 | `anillo` / `iouring` | E/S asíncrona en Linux | io_uring | ✅ `anillo` |
 | 234 | `ventanas_api` | APIs nativas de Windows | windows (Rust) | ✅ runtime Windows · 🛠 |
 | 235 | `manzana` | APIs nativas de macOS e iOS | Cocoa | ✅ `apple` (básico) |
 | 236 | `bus` / `dbus` | D-Bus en Linux | zbus | ✅ `bus` |
