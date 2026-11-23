@@ -1,7 +1,7 @@
 #!/bin/sh
-# Genera los manifiestos de WinGet (esquema 1.9.0) de una release publicada.
+# Genera los manifiestos de WinGet (esquema 1.28.0, o $ESQUEMA) de una release publicada.
 #
-#   sh packaging/winget/generar.sh 4.10.0 [salida]
+#   sh packaging/winget/generar.sh 5.0.0 [salida]
 #
 # Toma el SHA256 del zip de Windows de SHA256SUMS de la release (o de $SHA si
 # está definido) y escribe salida/manifests/v/VemorisSoftware/CForgeLang/<versión>/,
@@ -20,18 +20,19 @@ SHA=$(echo "$SHA" | tr 'a-f' 'A-F')
 DIR="$SALIDA/manifests/v/VemorisSoftware/CForgeLang/$VERSION"
 mkdir -p "$DIR"
 FECHA=$(date -u +%Y-%m-%d)
+ESQUEMA="${ESQUEMA:-1.28.0}"
 
 cat > "$DIR/$ID.yaml" <<FIN
-# yaml-language-server: \$schema=https://aka.ms/winget-manifest.version.1.9.0.schema.json
+# yaml-language-server: \$schema=https://aka.ms/winget-manifest.version.$ESQUEMA.schema.json
 PackageIdentifier: $ID
 PackageVersion: $VERSION
 DefaultLocale: es-CL
 ManifestType: version
-ManifestVersion: 1.9.0
+ManifestVersion: $ESQUEMA
 FIN
 
 cat > "$DIR/$ID.installer.yaml" <<FIN
-# yaml-language-server: \$schema=https://aka.ms/winget-manifest.installer.1.9.0.schema.json
+# yaml-language-server: \$schema=https://aka.ms/winget-manifest.installer.$ESQUEMA.schema.json
 PackageIdentifier: $ID
 PackageVersion: $VERSION
 InstallerType: zip
@@ -45,11 +46,11 @@ Installers:
     InstallerUrl: $BASE/$ZIP
     InstallerSha256: $SHA
 ManifestType: installer
-ManifestVersion: 1.9.0
+ManifestVersion: $ESQUEMA
 FIN
 
 cat > "$DIR/$ID.locale.es-CL.yaml" <<FIN
-# yaml-language-server: \$schema=https://aka.ms/winget-manifest.defaultLocale.1.9.0.schema.json
+# yaml-language-server: \$schema=https://aka.ms/winget-manifest.defaultLocale.$ESQUEMA.schema.json
 PackageIdentifier: $ID
 PackageVersion: $VERSION
 PackageLocale: es-CL
@@ -72,11 +73,11 @@ Tags:
   - cfv
 ReleaseNotesUrl: https://github.com/VemorisSoftware/C-Forge/releases/tag/v$VERSION
 ManifestType: defaultLocale
-ManifestVersion: 1.9.0
+ManifestVersion: $ESQUEMA
 FIN
 
 cat > "$DIR/$ID.locale.en-US.yaml" <<FIN
-# yaml-language-server: \$schema=https://aka.ms/winget-manifest.locale.1.9.0.schema.json
+# yaml-language-server: \$schema=https://aka.ms/winget-manifest.locale.$ESQUEMA.schema.json
 PackageIdentifier: $ID
 PackageVersion: $VERSION
 PackageLocale: en-US
@@ -97,7 +98,7 @@ Tags:
   - cfv
 ReleaseNotesUrl: https://github.com/VemorisSoftware/C-Forge/releases/tag/v$VERSION
 ManifestType: locale
-ManifestVersion: 1.9.0
+ManifestVersion: $ESQUEMA
 FIN
 
 echo "✓ manifiestos de WinGet en $DIR"
