@@ -1,0 +1,479 @@
+// stdlib/nodos.cfv — árbol de escena con señales al estilo Godot: nodos
+// con nombre, tipo e hijos; clases con métodos (_entrar_arbol, _listo,
+// _proceso, _fisica, _entrada, _salir_arbol) llamados en el orden de Godot
+// (entrar de arriba abajo, listo de abajo arriba); rutas relativas y
+// absolutas ("../Hermano/Hijo", "/Raiz/Nivel"); señales con conexiones
+// únicas, de una vez o diferidas y argumentos ligados; grupos y llamadas a
+// grupos; pausa con modos por nodo; entrada que se propaga de atrás hacia
+// adelante hasta que alguien la maneja; liberación diferida segura; nodos
+// 2D con transformación global; temporizadores; y escenas empaquetadas que
+// se instancian. Idea de Godot (MIT). En inglés: importar "scenetree".
+//
+//   importar "nodos"
+//   nodos_clase("Jugador", {"_proceso": funcion(yo, dt) { yo["props"]["x"] = yo["props"]["x"] + 60 * dt }})
+//   sea raiz = nodos_nuevo("Raiz", "Nodo", nulo)
+//   sea arbol = nodos_arbol(raiz)
+//   nodos_agregar_hijo(raiz, nodos_nuevo("Jugador", "Jugador", {"x": 0}))
+//   nodos_cuadro(arbol, 1 / 60)
+
+sea _ND_CLASES = {}
+sea _ND_SIG = [0]
+
+/// Registra una clase: {"base": "Otra", métodos y "senales": [nombres]}.
+funcion nodos_clase(nombre, def) { _ND_CLASES[nombre] = def }
+
+funcion _nd_metodo(n, nombre) {
+    sea t = n["tipo"]
+    sea vueltas = 0
+    mientras (t != nulo y vueltas < 32) {
+        sea c = _ND_CLASES[t] ?? nulo
+        si (c == nulo) { retornar nulo }
+        si (tiene_clave(c, nombre)) { retornar c[nombre] }
+        t = c["base"] ?? nulo
+        vueltas = vueltas + 1
+    }
+    retornar nulo
+}
+
+/// ¿El nodo es de esa clase o la hereda?
+funcion nodos_es(n, tipo_c) {
+    sea t = n["tipo"]
+    mientras (t != nulo) {
+        si (t == tipo_c) { retornar verdadero }
+        t = (_ND_CLASES[t] ?? {})["base"] ?? nulo
+    }
+    retornar falso
+}
+
+/// Nuevo nodo suelto.
+funcion nodos_nuevo(nombre, tipo_c, props) {
+    _ND_SIG[0] = _ND_SIG[0] + 1
+    sea p = {}
+    para k en claves(props ?? {}) { p[k] = props[k] }
+    retornar {"id": _ND_SIG[0], "nombre": nombre, "tipo": tipo_c ?? "Nodo", "props": p, "hijos": [], "padre": nulo, "arbol": nulo, "grupos": {}, "conexiones": {}, "pausa": "heredar", "listo": falso, "liberado": falso, "prioridad": 0}
+}
+
+// ---------- árbol ----------
+
+/// Árbol de escena con su raíz. opciones: "fisica_hz" (60).
+funcion nodos_arbol(raiz, opciones) {
+    sea op = opciones ?? {}
+    sea a = {"raiz": raiz, "pausado": falso, "grupos": {}, "diferidas": [], "por_liberar": [], "tiempo": 0, "acumulado": 0, "paso_fisica": 1 / (op["fisica_hz"] ?? 60), "cuadros": 0}
+    _nd_entrar(a, raiz)
+    _nd_listo(raiz)
+    retornar a
+}
+
+funcion _nd_llamar(n, metodo, args) {
+    sea f = _nd_metodo(n, metodo)
+    si (f == nulo) { retornar nulo }
+    si (longitud(args) == 0) { retornar f(n) }
+    si (longitud(args) == 1) { retornar f(n, args[0]) }
+    si (longitud(args) == 2) { retornar f(n, args[0], args[1]) }
+    retornar f(n, args[0], args[1], args[2])
+}
+
+funcion _nd_entrar(a, n) {
+    n["arbol"] = a
+    para g en claves(n["grupos"]) { _nd_grupo_alta(a, g, n) }
+    _nd_llamar(n, "_entrar_arbol", [])
+    nodos_emitir(n, "entro_arbol", [])
+    para h en n["hijos"] { _nd_entrar(a, h) }
+}
+
+funcion _nd_listo(n) {
+    para h en n["hijos"] { _nd_listo(h) }
+    si (n["listo"] == falso) {
+        n["listo"] = verdadero
+        _nd_llamar(n, "_listo", [])
+        nodos_emitir(n, "listo", [])
+    }
+}
+
+funcion _nd_salir(n) {
+    para h en n["hijos"] { _nd_salir(h) }
+    _nd_llamar(n, "_salir_arbol", [])
+    nodos_emitir(n, "salio_arbol", [])
+    sea a = n["arbol"]
+    para g en claves(n["grupos"]) { _nd_grupo_baja(a, g, n) }
+    n["arbol"] = nulo
+}
+
+/// Agrega un hijo (si el padre está en un árbol, el hijo entra y queda listo).
+funcion nodos_agregar_hijo(padre, hijo) {
+    si (hijo["padre"] != nulo) { lanzar "nodos: " + hijo["nombre"] + " ya tiene padre" }
+    // Nombres únicos entre hermanos (como Godot: Nombre2, Nombre3…).
+    sea base = hijo["nombre"]
+    sea k = 2
+    mientras (nodos_hijo(padre, hijo["nombre"]) != nulo) {
+        hijo["nombre"] = base + k
+        k = k + 1
+    }
+    hijo["padre"] = padre
+    padre["hijos"].agregar(hijo)
+    si (padre["arbol"] != nulo) {
+        _nd_entrar(padre["arbol"], hijo)
+        _nd_listo(hijo)
+    }
+    nodos_emitir(padre, "hijo_agregado", [hijo])
+    retornar hijo
+}
+
+/// Quita un hijo (sale del árbol pero no se libera).
+funcion nodos_quitar_hijo(padre, hijo) {
+    si (hijo["arbol"] != nulo) { _nd_salir(hijo) }
+    sea r = []
+    para h en padre["hijos"] { si (h["id"] != hijo["id"]) { r.agregar(h) } }
+    padre["hijos"] = r
+    hijo["padre"] = nulo
+}
+
+/// Libera el nodo al final del cuadro (seguro durante el recorrido).
+funcion nodos_liberar(n) {
+    si (n["liberado"]) { retornar nulo }
+    n["liberado"] = verdadero
+    sea a = n["arbol"]
+    si (a == nulo) { retornar nulo }
+    a["por_liberar"].agregar(n)
+}
+
+funcion nodos_hijo(n, nombre) {
+    para h en n["hijos"] { si (h["nombre"] == nombre) { retornar h } }
+    retornar nulo
+}
+
+/// Nodo por ruta relativa ("Hijo/Nieto", "../Hermano") o absoluta
+/// ("/Raiz/Hijo"). nulo si no existe.
+funcion nodos_obtener(n, ruta) {
+    sea actual = n
+    sea partes = texto_dividir(ruta, "/")
+    sea i = 0
+    si (texto_empieza_con(ruta, "/")) {
+        si (n["arbol"] == nulo) { retornar nulo }
+        actual = n["arbol"]["raiz"]
+        // "/Raiz/…": el primer nombre es la raíz.
+        si (longitud(partes) < 2 o partes[1] != actual["nombre"]) { retornar nulo }
+        i = 2
+    }
+    mientras (i < longitud(partes)) {
+        sea p = partes[i]
+        si (p == "..") { actual = actual["padre"] }
+        sino si (p != "." y p != "") { actual = nodos_hijo(actual, p) }
+        si (actual == nulo) { retornar nulo }
+        i = i + 1
+    }
+    retornar actual
+}
+
+/// Ruta absoluta del nodo ("/Raiz/A/B").
+funcion nodos_ruta(n) {
+    sea p = []
+    sea x = n
+    mientras (x != nulo) {
+        p.agregar(x["nombre"])
+        x = x["padre"]
+    }
+    sea r = []
+    sea i = longitud(p) - 1
+    mientras (i >= 0) {
+        r.agregar(p[i])
+        i = i - 1
+    }
+    retornar "/" + unir(r, "/")
+}
+
+/// Busca el primer descendiente con ese nombre (en profundidad).
+funcion nodos_buscar(n, nombre) {
+    para h en n["hijos"] {
+        si (h["nombre"] == nombre) { retornar h }
+        sea r = nodos_buscar(h, nombre)
+        si (r != nulo) { retornar r }
+    }
+    retornar nulo
+}
+
+// ---------- señales ----------
+
+/// Conecta una señal: destino es una función(args…) o [nodo, "metodo"].
+/// opciones: "una_vez", "diferida", "ligados" (argumentos extra al final).
+funcion nodos_conectar(emisor, senal, destino, opciones) {
+    sea op = opciones ?? {}
+    si (tiene_clave(emisor["conexiones"], senal) == falso) { emisor["conexiones"][senal] = [] }
+    para c en emisor["conexiones"][senal] { si (_nd_mismo(c["destino"], destino)) { lanzar "nodos: la señal " + senal + " ya está conectada a ese destino" } }
+    emisor["conexiones"][senal].agregar({"destino": destino, "una_vez": op["una_vez"] ?? falso, "diferida": op["diferida"] ?? falso, "ligados": op["ligados"] ?? []})
+}
+
+funcion _nd_mismo(a, b) {
+    si (tipo(a) == "lista" y tipo(b) == "lista") { retornar a[0]["id"] == b[0]["id"] y a[1] == b[1] }
+    retornar falso
+}
+
+funcion nodos_desconectar(emisor, senal, destino) {
+    sea r = []
+    para c en emisor["conexiones"][senal] ?? [] { si (_nd_mismo(c["destino"], destino) == falso) { r.agregar(c) } }
+    emisor["conexiones"][senal] = r
+}
+
+funcion nodos_conectado(emisor, senal) { retornar longitud(emisor["conexiones"][senal] ?? []) > 0 }
+
+funcion _nd_invocar(destino, args) {
+    si (tipo(destino) == "lista") {
+        sea n = destino[0]
+        si (n["liberado"]) { retornar nulo }
+        sea f = _nd_metodo(n, destino[1])
+        si (f == nulo) { lanzar "nodos: " + n["nombre"] + " no tiene el método " + destino[1] }
+        retornar _nd_llamar(n, destino[1], args)
+    }
+    si (longitud(args) == 0) { retornar destino() }
+    si (longitud(args) == 1) { retornar destino(args[0]) }
+    si (longitud(args) == 2) { retornar destino(args[0], args[1]) }
+    si (longitud(args) == 3) { retornar destino(args[0], args[1], args[2]) }
+    retornar destino(args)
+}
+
+/// Emite una señal con sus argumentos.
+funcion nodos_emitir(n, senal, args) {
+    sea cs = n["conexiones"][senal] ?? []
+    si (longitud(cs) == 0) { retornar nulo }
+    sea quedan = []
+    para c en cs { si (c["una_vez"] == falso) { quedan.agregar(c) } }
+    n["conexiones"][senal] = quedan
+    para c en cs {
+        sea a = (args ?? []) + c["ligados"]
+        si (c["diferida"] y n["arbol"] != nulo) { n["arbol"]["diferidas"].agregar([c["destino"], a]) } sino { _nd_invocar(c["destino"], a) }
+    }
+}
+
+/// Llama un método (o función) al final del cuadro.
+funcion nodos_diferir(n, destino, args) {
+    si (n["arbol"] == nulo) { lanzar "nodos: diferir necesita un nodo dentro de un árbol" }
+    n["arbol"]["diferidas"].agregar([destino, args ?? []])
+}
+
+// ---------- grupos ----------
+
+funcion _nd_grupo_alta(a, g, n) {
+    si (tiene_clave(a["grupos"], g) == falso) { a["grupos"][g] = [] }
+    a["grupos"][g].agregar(n)
+}
+
+funcion _nd_grupo_baja(a, g, n) {
+    sea r = []
+    para x en a["grupos"][g] ?? [] { si (x["id"] != n["id"]) { r.agregar(x) } }
+    a["grupos"][g] = r
+}
+
+funcion nodos_agregar_grupo(n, g) {
+    si (tiene_clave(n["grupos"], g)) { retornar nulo }
+    n["grupos"][g] = verdadero
+    si (n["arbol"] != nulo) { _nd_grupo_alta(n["arbol"], g, n) }
+}
+
+funcion nodos_quitar_grupo(n, g) {
+    quitar_clave(n["grupos"], g)
+    si (n["arbol"] != nulo) { _nd_grupo_baja(n["arbol"], g, n) }
+}
+
+funcion nodos_en_grupo(n, g) { retornar tiene_clave(n["grupos"], g) }
+
+/// Nodos de un grupo (en orden de llegada).
+funcion nodos_grupo(a, g) { retornar a["grupos"][g] ?? [] }
+
+/// Llama un método en todos los nodos del grupo.
+funcion nodos_llamar_grupo(a, g, metodo, args) {
+    para n en nodos_grupo(a, g) { si (n["liberado"] == falso y _nd_metodo(n, metodo) != nulo) { _nd_llamar(n, metodo, args ?? []) } }
+}
+
+// ---------- cuadros ----------
+
+/// Modo de pausa: "heredar", "pausable", "siempre", "cuando_pausado" o "nunca".
+funcion nodos_modo_pausa(n, modo) { n["pausa"] = modo }
+
+funcion nodos_pausar(a, pausado) { a["pausado"] = pausado }
+
+funcion _nd_modo(n) {
+    sea x = n
+    mientras (x != nulo) {
+        si (x["pausa"] != "heredar") { retornar x["pausa"] }
+        x = x["padre"]
+    }
+    retornar "pausable"
+}
+
+funcion _nd_procesa(a, n) {
+    sea m = _nd_modo(n)
+    si (m == "nunca") { retornar falso }
+    si (m == "siempre") { retornar verdadero }
+    si (m == "cuando_pausado") { retornar a["pausado"] }
+    retornar a["pausado"] == falso
+}
+
+// Lista del árbol en orden (padre antes que hijos), por prioridad estable.
+funcion _nd_orden(n, r) {
+    r.agregar(n)
+    para h en n["hijos"] { _nd_orden(h, r) }
+    retornar r
+}
+
+funcion _nd_por_prioridad(l) {
+    retornar ordenar(l, funcion(x, z) {
+        si (x[1]["prioridad"] != z[1]["prioridad"]) { retornar x[1]["prioridad"] - z[1]["prioridad"] }
+        retornar x[0] - z[0]
+    })
+}
+
+funcion _nd_recorrer(a, metodo, delta) {
+    sea l = []
+    sea i = 0
+    para n en _nd_orden(a["raiz"], []) {
+        l.agregar([i, n])
+        i = i + 1
+    }
+    para par en _nd_por_prioridad(l) {
+        sea n = par[1]
+        si (n["liberado"] == falso y n["arbol"] != nulo y _nd_procesa(a, n)) {
+            si (n["tipo"] == "Temporizador" y metodo == "_proceso") { _nd_temporizador(n, delta) }
+            _nd_llamar(n, metodo, [delta])
+        }
+    }
+}
+
+/// Avanza un cuadro: física en pasos fijos, _proceso, llamadas diferidas
+/// y liberaciones.
+funcion nodos_cuadro(a, delta) {
+    a["tiempo"] = a["tiempo"] + delta
+    a["acumulado"] = a["acumulado"] + delta
+    sea pasos = 0
+    mientras (a["acumulado"] >= a["paso_fisica"] - 0.0000001 y pasos < 8) {
+        a["acumulado"] = a["acumulado"] - a["paso_fisica"]
+        _nd_recorrer(a, "_fisica", a["paso_fisica"])
+        pasos = pasos + 1
+    }
+    _nd_recorrer(a, "_proceso", delta)
+    _nd_vaciar(a)
+    a["cuadros"] = a["cuadros"] + 1
+}
+
+funcion _nd_vaciar(a) {
+    sea vueltas = 0
+    mientras ((longitud(a["diferidas"]) > 0 o longitud(a["por_liberar"]) > 0) y vueltas < 16) {
+        sea ds = a["diferidas"]
+        a["diferidas"] = []
+        para d en ds { _nd_invocar(d[0], d[1]) }
+        sea pl = a["por_liberar"]
+        a["por_liberar"] = []
+        para n en pl {
+            si (n["padre"] != nulo) { nodos_quitar_hijo(n["padre"], n) } sino si (n["arbol"] != nulo) { _nd_salir(n) }
+        }
+        vueltas = vueltas + 1
+    }
+}
+
+/// Propaga un evento de entrada desde el último nodo hacia el primero
+/// hasta que un _entrada devuelva verdadero. Devuelve el nodo que lo manejó.
+funcion nodos_entrada(a, evento) {
+    sea l = _nd_orden(a["raiz"], [])
+    sea i = longitud(l) - 1
+    mientras (i >= 0) {
+        sea n = l[i]
+        si (n["liberado"] == falso y _nd_procesa(a, n) y _nd_metodo(n, "_entrada") != nulo) {
+            si (_nd_llamar(n, "_entrada", [evento]) == verdadero) { retornar n }
+        }
+        i = i - 1
+    }
+    retornar nulo
+}
+
+// ---------- 2D ----------
+
+/// Transformación global de un nodo 2D: {"x", "y", "rotacion", "escala"}
+/// (escala uniforme), componiendo las de sus ancestros 2D.
+funcion nodos_global(n) {
+    sea cadena = []
+    sea x = n
+    mientras (x != nulo) {
+        cadena.agregar(x)
+        x = x["padre"]
+    }
+    sea g = {"x": 0, "y": 0, "rotacion": 0, "escala": 1}
+    sea i = longitud(cadena) - 1
+    mientras (i >= 0) {
+        sea p = cadena[i]["props"]
+        si (tiene_clave(p, "x") o tiene_clave(p, "y") o tiene_clave(p, "rotacion") o tiene_clave(p, "escala")) {
+            sea lx = (p["x"] ?? 0) * g["escala"]
+            sea ly = (p["y"] ?? 0) * g["escala"]
+            sea c = coseno(g["rotacion"])
+            sea s = seno(g["rotacion"])
+            g = {"x": g["x"] + lx * c - ly * s, "y": g["y"] + lx * s + ly * c, "rotacion": g["rotacion"] + (p["rotacion"] ?? 0), "escala": g["escala"] * (p["escala"] ?? 1)}
+        }
+        i = i - 1
+    }
+    retornar g
+}
+
+// ---------- temporizador ----------
+
+/// Temporizador: emite "tiempo_cumplido" cada espera segundos (o una vez).
+funcion nodos_temporizador(nombre, espera, una_vez, autoarranque) {
+    retornar nodos_nuevo(nombre, "Temporizador", {"espera": espera, "una_vez": una_vez ?? falso, "restante": espera, "activo": autoarranque ?? verdadero})
+}
+
+funcion nodos_iniciar_temporizador(n) {
+    n["props"]["restante"] = n["props"]["espera"]
+    n["props"]["activo"] = verdadero
+}
+
+funcion _nd_temporizador(n, delta) {
+    sea p = n["props"]
+    si (p["activo"] == falso) { retornar nulo }
+    p["restante"] = p["restante"] - delta
+    mientras (p["activo"] y p["restante"] <= 0.0000001) {
+        si (p["una_vez"]) { p["activo"] = falso } sino { p["restante"] = p["restante"] + p["espera"] }
+        nodos_emitir(n, "tiempo_cumplido", [])
+    }
+}
+
+// ---------- escenas empaquetadas ----------
+
+/// Empaqueta un subárbol (nombres, tipos, propiedades, grupos y pausa).
+funcion nodos_empaquetar(n) {
+    sea hs = []
+    para h en n["hijos"] { hs.agregar(nodos_empaquetar(h)) }
+    sea p = {}
+    para k en claves(n["props"]) { p[k] = n["props"][k] }
+    retornar {"nombre": n["nombre"], "tipo": n["tipo"], "props": p, "grupos": claves(n["grupos"]), "pausa": n["pausa"], "hijos": hs}
+}
+
+/// Crea nodos nuevos a partir de un paquete (cada instancia es independiente).
+funcion nodos_instanciar(pq) {
+    sea n = nodos_nuevo(pq["nombre"], pq["tipo"], pq["props"])
+    para g en pq["grupos"] ?? [] { n["grupos"][g] = verdadero }
+    n["pausa"] = pq["pausa"] ?? "heredar"
+    para h en pq["hijos"] ?? [] { nodos_agregar_hijo(n, nodos_instanciar(h)) }
+    retornar n
+}
+
+/// Cantidad de nodos del subárbol.
+funcion nodos_contar(n) {
+    sea t = 1
+    para h en n["hijos"] { t = t + nodos_contar(h) }
+    retornar t
+}
+
+/// Árbol como texto con sangría (para depurar).
+funcion nodos_imprimir(n) {
+    sea l = []
+    _nd_imprimir(n, 0, l)
+    retornar unir(l, "\n")
+}
+
+funcion _nd_imprimir(n, nivel, l) {
+    sea s = ""
+    sea i = 0
+    mientras (i < nivel) {
+        s = s + "  "
+        i = i + 1
+    }
+    l.agregar(s + n["nombre"] + " (" + n["tipo"] + ")")
+    para h en n["hijos"] { _nd_imprimir(h, nivel + 1, l) }
+}

@@ -1,0 +1,468 @@
+// stdlib/piloto.cfv — automatizar navegadores Chrome/Chromium por el
+// Chrome DevTools Protocol, al estilo Playwright: lanzar el navegador sin
+// ventana (o conectarse a uno abierto), páginas en pestañas propias, ir a
+// una URL y esperar la carga, evaluar JavaScript (también promesas), leer
+// texto y HTML, esperar selectores o condiciones, hacer clic con el ratón
+// real, escribir y pulsar teclas, capturas PNG, PDF, cookies, mensajes de
+// la consola, errores de la página e interceptar peticiones para
+// responderlas o bloquearlas. Probado con Google Chrome. Idea de Playwright
+// (Apache). En inglés: importar "browser".
+//
+//   importar "piloto"
+//   sea nav = piloto_lanzar(nulo)
+//   sea p = piloto_pagina(nav)
+//   piloto_ir(p, "https://ejemplo.com")
+//   mostrar(piloto_titulo(p))
+//   escribir_archivo("captura.png", piloto_captura(p, nulo))
+//   piloto_cerrar_navegador(nav)
+
+importar "json"
+importar "red"
+importar "base64"
+
+funcion __piloto_declaraciones() {
+    extern "libc" funcion system(cmd: texto): entero
+}
+
+// ---------- conexión CDP ----------
+
+funcion _pi_ws(url) {
+    sea conn = ws_conectar_url(url)
+    ws_limites(conn, 268435456, 268435456)
+    // Una carga lenta puede tardar más que la espera por defecto (15 s).
+    net_espera(conn["sock"], 3600000)
+    retornar {"enviar": funcion(t) { ws_enviar(conn, t) }, "recibir": funcion() { retornar ws_recibir(conn) }, "cerrar": funcion() { intentar { ws_cerrar(conn) } capturar (e) { nulo } }}
+}
+
+/// Conecta a un navegador por su URL de depuración ("ws://…/devtools/browser/…").
+/// opciones: "transporte" (con "enviar", "recibir" y "cerrar", para pruebas).
+funcion piloto_conectar(ws_url, opciones) {
+    sea op = opciones ?? {}
+    sea t = op["transporte"] ?? nulo
+    si (t == nulo) { t = _pi_ws(ws_url) }
+    retornar {"t": t, "sig": 0, "respuestas": {}, "eventos": [], "paginas": {}, "proceso": nulo, "abierto": verdadero}
+}
+
+funcion _pi_recibir(nav) {
+    sea m = nav["t"]["recibir"]()
+    si (m == nulo) { lanzar "piloto: el navegador cerró la conexión" }
+    sea j = json_parsear(m)
+    si (tiene_clave(j, "id")) { nav["respuestas"]["" + j["id"]] = j } sino {
+        // Eventos: los de una página van a su cola.
+        sea sid = j["sessionId"] ?? nulo
+        sea pg = nulo
+        si (sid != nulo) { pg = nav["paginas"][sid] ?? nulo }
+        si (pg != nulo) { _pi_evento_pagina(pg, j) } sino { nav["eventos"].agregar(j) }
+    }
+}
+
+/// Envía un comando CDP y espera su resultado. sesion: id de sesión de una
+/// página (o nulo para el navegador). Lanza el error del protocolo.
+funcion piloto_cdp(nav, metodo, params, sesion) {
+    nav["sig"] = nav["sig"] + 1
+    sea id = nav["sig"]
+    sea m = {"id": id, "method": metodo, "params": params ?? {}}
+    si (sesion != nulo) { m["sessionId"] = sesion }
+    nav["t"]["enviar"](json_texto(m))
+    mientras (tiene_clave(nav["respuestas"], "" + id) == falso) {
+        _pi_recibir(nav)
+        // Peticiones interceptadas: se atienden ya (una navegación espera por ellas).
+        para sid en claves(nav["paginas"]) {
+            sea pg = nav["paginas"][sid]
+            si (longitud(pg["pausadas"]) > 0) { _pi_atender_rutas(pg) }
+        }
+    }
+    sea r = nav["respuestas"]["" + id]
+    quitar_clave(nav["respuestas"], "" + id)
+    si (tiene_clave(r, "error")) { lanzar "piloto: " + metodo + ": " + (r["error"]["message"] ?? "error") }
+    retornar r["result"] ?? {}
+}
+
+// ---------- lanzar ----------
+
+funcion _pi_ejecutable() {
+    para r en ["/usr/bin/google-chrome", "/usr/bin/google-chrome-stable", "/usr/bin/chromium", "/usr/bin/chromium-browser", "/snap/bin/chromium", "/Applications/Google Chrome.app/Contents/MacOS/Google Chrome", "/Applications/Chromium.app/Contents/MacOS/Chromium"] {
+        si (existe_archivo(r)) { retornar r }
+    }
+    retornar nulo
+}
+
+/// Lanza Chrome sin ventana. opciones: "ejecutable", "con_ventana",
+/// "args" (lista extra), "ancho", "alto", "tiempo_ms" (espera al arranque).
+funcion piloto_lanzar(opciones) {
+    __piloto_declaraciones()
+    sea op = opciones ?? {}
+    sea exe = op["ejecutable"] ?? _pi_ejecutable()
+    si (exe == nulo) { lanzar "piloto: no encontré Chrome ni Chromium (usa la opción ejecutable)" }
+    sea dir = "/tmp/cforge-piloto-" + hex_de_bytes(bytes_aleatorios(6))
+    sea args = ["--remote-debugging-port=0", "--user-data-dir=" + dir, "--no-first-run", "--no-default-browser-check", "--disable-background-networking", "--disable-extensions", "--disable-sync", "--mute-audio", "--window-size=" + (op["ancho"] ?? 1280) + "," + (op["alto"] ?? 720)]
+    si ((op["con_ventana"] ?? falso) == falso) { args = args + ["--headless=new", "--no-sandbox", "--disable-gpu"] }
+    args = args + (op["args"] ?? []) + ["about:blank"]
+    sea cmd = "'" + texto_reemplazar(exe, "'", "'\\''") + "'"
+    para a en args { cmd = cmd + " '" + texto_reemplazar(a, "'", "'\\''") + "'" }
+    system("mkdir -p '" + dir + "' && (" + cmd + " >'" + dir + "/salida.log' 2>&1 & echo $! >'" + dir + "/pid')")
+    sea limite = tiempo_ms() + (op["tiempo_ms"] ?? 20000)
+    sea puerto_txt = nulo
+    mientras (puerto_txt == nulo) {
+        si (existe_archivo(dir + "/DevToolsActivePort")) {
+            sea t = leer_archivo(dir + "/DevToolsActivePort")
+            si (contiene(t, "\n")) { puerto_txt = t }
+        }
+        si (puerto_txt == nulo) {
+            si (tiempo_ms() > limite) { lanzar "piloto: Chrome no arrancó a tiempo" }
+            dormir(50)
+        }
+    }
+    sea ls = texto_dividir(puerto_txt, "\n")
+    sea nav = piloto_conectar("ws://127.0.0.1:" + texto_recortar(ls[0]) + texto_recortar(ls[1]), nulo)
+    nav["dir"] = dir
+    intentar { nav["proceso"] = texto_recortar(leer_archivo(dir + "/pid")) } capturar (e) { nulo }
+    retornar nav
+}
+
+/// Versión del navegador: {"product", "protocolVersion", "userAgent"…}.
+funcion piloto_version(nav) { retornar piloto_cdp(nav, "Browser.getVersion", nulo, nulo) }
+
+/// Cierra el navegador (y borra su perfil temporal si lo lanzó piloto).
+funcion piloto_cerrar_navegador(nav) {
+    si (nav["abierto"] == falso) { retornar nulo }
+    nav["abierto"] = falso
+    intentar { piloto_cdp(nav, "Browser.close", nulo, nulo) } capturar (e) { nulo }
+    nav["t"]["cerrar"]()
+    si ((nav["dir"] ?? nulo) != nulo) {
+        __piloto_declaraciones()
+        si (nav["proceso"] != nulo) { system("kill " + nav["proceso"] + " 2>/dev/null; for i in 1 2 3 4 5 6 7 8 9 10; do kill -0 " + nav["proceso"] + " 2>/dev/null || break; sleep 0.2; done") }
+        system("rm -rf '" + nav["dir"] + "' 2>/dev/null")
+    }
+}
+
+// ---------- páginas ----------
+
+funcion _pi_evento_pagina(p, j) {
+    sea m = j["method"]
+    sea pr = j["params"] ?? {}
+    si (m == "Runtime.consoleAPICalled") {
+        sea partes = []
+        para a en pr["args"] ?? [] {
+            si (tiene_clave(a, "value")) { partes.agregar("" + a["value"]) } sino { partes.agregar(a["description"] ?? (a["type"] ?? "")) }
+        }
+        p["consola"].agregar({"tipo": pr["type"], "texto": unir(partes, " ")})
+    } sino si (m == "Runtime.exceptionThrown") {
+        sea d = pr["exceptionDetails"] ?? {}
+        p["errores"].agregar((d["exception"] ?? {})["description"] ?? (d["text"] ?? "error"))
+    } sino si (m == "Fetch.requestPaused") {
+        p["pausadas"].agregar(pr)
+    } sino { p["eventos"].agregar(j) }
+}
+
+/// Nueva página (pestaña) con sus dominios activados.
+funcion piloto_pagina(nav) {
+    sea t = piloto_cdp(nav, "Target.createTarget", {"url": "about:blank"}, nulo)
+    sea s = piloto_cdp(nav, "Target.attachToTarget", {"targetId": t["targetId"], "flatten": verdadero}, nulo)
+    sea p = {"nav": nav, "target": t["targetId"], "sesion": s["sessionId"], "eventos": [], "consola": [], "errores": [], "pausadas": [], "rutas": []}
+    nav["paginas"][s["sessionId"]] = p
+    piloto_cdp(nav, "Page.enable", nulo, p["sesion"])
+    piloto_cdp(nav, "Runtime.enable", nulo, p["sesion"])
+    piloto_cdp(nav, "Page.setLifecycleEventsEnabled", {"enabled": verdadero}, p["sesion"])
+    retornar p
+}
+
+funcion _pi(p, metodo, params) { retornar piloto_cdp(p["nav"], metodo, params, p["sesion"]) }
+
+/// Espera un evento de la página (nombre CDP) que cumpla filtro(params).
+funcion piloto_esperar_evento(p, metodo, filtro) {
+    mientras (verdadero) {
+        sea i = 0
+        mientras (i < longitud(p["eventos"])) {
+            sea e = p["eventos"][i]
+            si (e["method"] == metodo y (filtro == nulo o filtro(e["params"] ?? {}))) {
+                sea r = []
+                sea k = 0
+                mientras (k < longitud(p["eventos"])) {
+                    si (k > i) { r.agregar(p["eventos"][k]) }
+                    k = k + 1
+                }
+                p["eventos"] = r
+                retornar e["params"] ?? {}
+            }
+            i = i + 1
+        }
+        _pi_atender_rutas(p)
+        _pi_recibir(p["nav"])
+    }
+}
+
+/// Va a una URL y espera el evento load. Devuelve {"frameId", "loaderId"}.
+funcion piloto_ir(p, url) {
+    p["eventos"] = []
+    sea r = _pi(p, "Page.navigate", {"url": url})
+    si ((r["errorText"] ?? "") != "") { lanzar "piloto: no se pudo abrir " + url + " (" + r["errorText"] + ")" }
+    piloto_esperar_evento(p, "Page.loadEventFired", nulo)
+    retornar r
+}
+
+/// Carga HTML directamente en la página.
+funcion piloto_html(p, html) {
+    sea arbol = _pi(p, "Page.getFrameTree", nulo)
+    p["eventos"] = []
+    _pi(p, "Page.setDocumentContent", {"frameId": arbol["frameTree"]["frame"]["id"], "html": html})
+}
+
+/// Evalúa JavaScript y devuelve su valor (espera promesas).
+funcion piloto_evaluar(p, expresion) {
+    sea r = _pi(p, "Runtime.evaluate", {"expression": expresion, "returnByValue": verdadero, "awaitPromise": verdadero, "userGesture": verdadero})
+    si (tiene_clave(r, "exceptionDetails")) {
+        sea d = r["exceptionDetails"]
+        lanzar "piloto: error de JavaScript: " + ((d["exception"] ?? {})["description"] ?? (d["text"] ?? ""))
+    }
+    retornar (r["result"] ?? {})["value"] ?? nulo
+}
+
+funcion _pi_js(t) { retornar json_texto(t) }
+
+funcion piloto_titulo(p) { retornar piloto_evaluar(p, "document.title") }
+funcion piloto_url(p) { retornar piloto_evaluar(p, "location.href") }
+funcion piloto_contenido(p) { retornar piloto_evaluar(p, "document.documentElement.outerHTML") }
+
+/// Texto visible del primer elemento que cumple el selector (o nulo).
+funcion piloto_texto(p, selector) { retornar piloto_evaluar(p, "(() => { const e = document.querySelector(" + _pi_js(selector) + "); return e ? e.innerText : null })()") }
+
+/// Atributo de un elemento.
+funcion piloto_atributo(p, selector, nombre) { retornar piloto_evaluar(p, "(() => { const e = document.querySelector(" + _pi_js(selector) + "); return e ? e.getAttribute(" + _pi_js(nombre) + ") : null })()") }
+
+/// Cuántos elementos cumplen el selector.
+funcion piloto_contar(p, selector) { retornar piloto_evaluar(p, "document.querySelectorAll(" + _pi_js(selector) + ").length") }
+
+/// Textos de todos los elementos que cumplen el selector.
+funcion piloto_textos(p, selector) { retornar piloto_evaluar(p, "Array.from(document.querySelectorAll(" + _pi_js(selector) + ")).map(e => e.innerText)") }
+
+/// Espera hasta que la expresión JS sea verdadera (espera_ms, 10 s por defecto).
+funcion piloto_esperar_funcion(p, expresion, espera_ms) {
+    sea limite = tiempo_ms() + (espera_ms ?? 10000)
+    mientras (verdadero) {
+        si (piloto_evaluar(p, "!!(" + expresion + ")") == verdadero) { retornar verdadero }
+        si (tiempo_ms() > limite) { lanzar "piloto: se acabó el tiempo esperando " + expresion }
+        dormir(50)
+    }
+}
+
+/// Espera a que exista (y sea visible) un elemento.
+funcion piloto_esperar_selector(p, selector, espera_ms) {
+    piloto_esperar_funcion(p, "(() => { const e = document.querySelector(" + _pi_js(selector) + "); if (!e) return false; const r = e.getBoundingClientRect(); return r.width > 0 && r.height > 0 })()", espera_ms)
+}
+
+funcion _pi_centro(p, selector) {
+    sea c = piloto_evaluar(p, "(() => { const e = document.querySelector(" + _pi_js(selector) + "); if (!e) return null; e.scrollIntoView({block: 'center', inline: 'center'}); const r = e.getBoundingClientRect(); return [r.left + r.width / 2, r.top + r.height / 2] })()")
+    si (c == nulo) { lanzar "piloto: no hay elemento para " + selector }
+    retornar c
+}
+
+/// Clic de ratón real en el centro del elemento.
+funcion piloto_clic(p, selector) {
+    sea c = _pi_centro(p, selector)
+    _pi(p, "Input.dispatchMouseEvent", {"type": "mouseMoved", "x": c[0], "y": c[1]})
+    _pi(p, "Input.dispatchMouseEvent", {"type": "mousePressed", "x": c[0], "y": c[1], "button": "left", "clickCount": 1})
+    _pi(p, "Input.dispatchMouseEvent", {"type": "mouseReleased", "x": c[0], "y": c[1], "button": "left", "clickCount": 1})
+}
+
+/// Enfoca un campo y escribe texto (como si se tecleara).
+funcion piloto_escribir(p, selector, texto) {
+    piloto_clic(p, selector)
+    _pi(p, "Input.insertText", {"text": texto})
+}
+
+/// Vacía un campo y escribe el texto nuevo.
+funcion piloto_llenar(p, selector, texto) {
+    piloto_evaluar(p, "(() => { const e = document.querySelector(" + _pi_js(selector) + "); e.focus(); e.value = ''; e.dispatchEvent(new Event('input', {bubbles: true})) })()")
+    _pi(p, "Input.insertText", {"text": texto})
+}
+
+sea _PI_TECLAS = {"Enter": [13, "\r"], "Tab": [9, "\t"], "Escape": [27, ""], "Backspace": [8, ""], "ArrowLeft": [37, ""], "ArrowUp": [38, ""], "ArrowRight": [39, ""], "ArrowDown": [40, ""], "Delete": [46, ""], "Home": [36, ""], "End": [35, ""]}
+
+/// Pulsa una tecla ("Enter", "Tab", "Escape", "ArrowDown", "a"…).
+funcion piloto_tecla(p, tecla) {
+    sea info = _PI_TECLAS[tecla] ?? nulo
+    sea codigo = 0
+    sea txt = tecla
+    si (info != nulo) {
+        codigo = info[0]
+        txt = info[1]
+    } sino { codigo = texto_codigos(texto_mayusculas(tecla))[0] }
+    sea abajo = {"type": "keyDown", "key": tecla, "windowsVirtualKeyCode": codigo, "nativeVirtualKeyCode": codigo}
+    si (txt != "") {
+        abajo["text"] = txt
+        abajo["unmodifiedText"] = txt
+    }
+    _pi(p, "Input.dispatchKeyEvent", abajo)
+    _pi(p, "Input.dispatchKeyEvent", {"type": "keyUp", "key": tecla, "windowsVirtualKeyCode": codigo, "nativeVirtualKeyCode": codigo})
+}
+
+/// Captura PNG de la página. opciones: "completa" (toda la página),
+/// "selector" (solo ese elemento).
+funcion piloto_captura(p, opciones) {
+    sea op = opciones ?? {}
+    sea par = {"format": "png"}
+    si ((op["selector"] ?? nulo) != nulo) {
+        sea r = piloto_evaluar(p, "(() => { const e = document.querySelector(" + _pi_js(op["selector"]) + "); const r = e.getBoundingClientRect(); return [r.left + scrollX, r.top + scrollY, r.width, r.height] })()")
+        par["clip"] = {"x": r[0], "y": r[1], "width": r[2], "height": r[3], "scale": 1}
+    }
+    si (op["completa"] ?? falso) { par["captureBeyondViewport"] = verdadero }
+    retornar base64_decodificar(_pi(p, "Page.captureScreenshot", par)["data"])
+}
+
+/// PDF de la página (bytes). opciones: "horizontal", "fondo", "escala".
+funcion piloto_pdf(p, opciones) {
+    sea op = opciones ?? {}
+    retornar base64_decodificar(_pi(p, "Page.printToPDF", {"landscape": op["horizontal"] ?? falso, "printBackground": op["fondo"] ?? verdadero, "scale": op["escala"] ?? 1})["data"])
+}
+
+/// Tamaño de la ventana de la página.
+funcion piloto_tamano(p, ancho, alto) { _pi(p, "Emulation.setDeviceMetricsOverride", {"width": ancho, "height": alto, "deviceScaleFactor": 1, "mobile": falso}) }
+
+/// Cookies de la página: [{"name", "value", "domain", "path"…}].
+funcion piloto_cookies(p) {
+    _pi(p, "Network.enable", nulo)
+    retornar _pi(p, "Network.getCookies", nulo)["cookies"] ?? []
+}
+
+funcion piloto_fijar_cookie(p, nombre, valor, url) {
+    _pi(p, "Network.enable", nulo)
+    retornar _pi(p, "Network.setCookie", {"name": nombre, "value": valor, "url": url})["success"] ?? falso
+}
+
+/// Mensajes de la consola recibidos: [{"tipo", "texto"}].
+funcion piloto_consola(p) { retornar p["consola"] }
+
+/// Errores de JavaScript no capturados.
+funcion piloto_errores(p) { retornar p["errores"] }
+
+// ---------- interceptar peticiones ----------
+
+/// Intercepta peticiones cuya URL contiene patron (o "*" para todas).
+/// manejador(peticion) devuelve nulo (seguir), "bloquear" o una respuesta
+/// {"estado", "cabeceras", "cuerpo"}. peticion: {"url", "metodo",
+/// "cabeceras", "tipo"}.
+funcion piloto_ruta(p, patron, manejador) {
+    p["rutas"].agregar([patron, manejador])
+    _pi(p, "Fetch.enable", {"patterns": [{"urlPattern": "*"}]})
+}
+
+funcion _pi_atender_rutas(p) {
+    mientras (longitud(p["pausadas"]) > 0) {
+        sea pr = p["pausadas"][0]
+        sea r = []
+        sea i = 1
+        mientras (i < longitud(p["pausadas"])) {
+            r.agregar(p["pausadas"][i])
+            i = i + 1
+        }
+        p["pausadas"] = r
+        sea req = pr["request"]
+        sea res = nulo
+        sea hubo = falso
+        para ru en p["rutas"] {
+            si (hubo == falso y (ru[0] == "*" o contiene(req["url"], ru[0]))) {
+                res = ru[1]({"url": req["url"], "metodo": req["method"], "cabeceras": req["headers"] ?? {}, "tipo": pr["resourceType"] ?? ""})
+                si (res != nulo) { hubo = verdadero }
+            }
+        }
+        si (res == nulo) { _pi(p, "Fetch.continueRequest", {"requestId": pr["requestId"]}) }
+        sino si (res == "bloquear") { _pi(p, "Fetch.failRequest", {"requestId": pr["requestId"], "errorReason": "BlockedByClient"}) }
+        sino {
+            sea cab = []
+            sea hs = res["cabeceras"] ?? {"Content-Type": "text/html; charset=utf-8"}
+            para k en claves(hs) { cab.agregar({"name": k, "value": "" + hs[k]}) }
+            _pi(p, "Fetch.fulfillRequest", {"requestId": pr["requestId"], "responseCode": res["estado"] ?? 200, "responseHeaders": cab, "body": base64_codificar(res["cuerpo"] ?? "")})
+        }
+    }
+}
+
+/// Procesa peticiones interceptadas pendientes (útil al esperar a mano).
+funcion piloto_atender(p) {
+    _pi_recibir(p["nav"])
+    _pi_atender_rutas(p)
+}
+
+/// Cierra la página.
+funcion piloto_cerrar(p) {
+    intentar { piloto_cdp(p["nav"], "Target.closeTarget", {"targetId": p["target"]}, nulo) } capturar (e) { nulo }
+    quitar_clave(p["nav"]["paginas"], p["sesion"])
+}
+
+// ---------- navegador simulado (para pruebas) ----------
+
+/// Transporte CDP falso con una página cuyo "DOM" es un mapa
+/// {selector: texto}. Entiende lo justo para probar el flujo: crear y unir
+/// pestañas, Page.navigate (emite loadEventFired), Runtime.evaluate de las
+/// expresiones que arma piloto para título y textos, capturas y cookies.
+funcion piloto_simulado(paginas) {
+    sea est = {"salida": [], "url": "about:blank", "titulo": "", "dom": {}, "cookies": [], "enviados": []}
+    sea emitir = funcion(m) { est["salida"].agregar(json_texto(m)) }
+    sea t = {
+        "enviar": funcion(txt) {
+            sea m = json_parsear(txt)
+            est["enviados"].agregar(m["method"])
+            sea r = {}
+            sea pr = m["params"] ?? {}
+            sea met = m["method"]
+            si (met == "Target.createTarget") { r = {"targetId": "T1"} }
+            sino si (met == "Target.attachToTarget") { r = {"sessionId": "S1"} }
+            sino si (met == "Browser.getVersion") { r = {"product": "Simulado/1.0", "protocolVersion": "1.3"} }
+            sino si (met == "Page.navigate") {
+                sea pg = paginas[pr["url"]] ?? nulo
+                si (pg == nulo) { r = {"frameId": "F1", "errorText": "net::ERR_NAME_NOT_RESOLVED"} } sino {
+                    est["url"] = pr["url"]
+                    est["titulo"] = pg["titulo"] ?? ""
+                    est["dom"] = pg["dom"] ?? {}
+                    r = {"frameId": "F1", "loaderId": "L1"}
+                    emitir({"id": m["id"], "result": r, "sessionId": "S1"})
+                    emitir({"method": "Runtime.consoleAPICalled", "params": {"type": "log", "args": [{"type": "string", "value": "cargó " + pr["url"]}]}, "sessionId": "S1"})
+                    emitir({"method": "Page.loadEventFired", "params": {"timestamp": 1}, "sessionId": "S1"})
+                    retornar nulo
+                }
+            }
+            sino si (met == "Runtime.evaluate") {
+                sea e = pr["expression"]
+                sea v = nulo
+                si (e == "document.title") { v = est["titulo"] }
+                sino si (e == "location.href") { v = est["url"] }
+                sino si (e == "1 + 1") { v = 2 }
+                sino si (e == "lanzar()") {
+                    emitir({"id": m["id"], "result": {"result": {"type": "object"}, "exceptionDetails": {"text": "Uncaught", "exception": {"description": "ReferenceError: lanzar is not defined"}}}, "sessionId": "S1"})
+                    retornar nulo
+                } sino {
+                    // Expresiones de piloto_texto: buscan el selector entre comillas.
+                    para k en claves(est["dom"]) { si (contiene(e, json_texto(k))) { v = est["dom"][k] } }
+                }
+                r = {"result": {"type": "string", "value": v}}
+            }
+            sino si (met == "Page.captureScreenshot") { r = {"data": base64_codificar("PNG simulado")} }
+            sino si (met == "Network.setCookie") {
+                est["cookies"].agregar({"name": pr["name"], "value": pr["value"]})
+                r = {"success": verdadero}
+            }
+            sino si (met == "Network.getCookies") { r = {"cookies": est["cookies"]} }
+            sino si (met == "Fail.metodo") {
+                emitir({"id": m["id"], "error": {"code": -32601, "message": "'Fail.metodo' wasn't found"}})
+                retornar nulo
+            }
+            sea resp = {"id": m["id"], "result": r}
+            si ((m["sessionId"] ?? nulo) != nulo) { resp["sessionId"] = m["sessionId"] }
+            emitir(resp)
+        },
+        "recibir": funcion() {
+            si (longitud(est["salida"]) == 0) { retornar nulo }
+            sea x = est["salida"][0]
+            sea r = []
+            sea i = 1
+            mientras (i < longitud(est["salida"])) {
+                r.agregar(est["salida"][i])
+                i = i + 1
+            }
+            est["salida"] = r
+            retornar x
+        },
+        "cerrar": funcion() { nulo }
+    }
+    retornar {"transporte": t, "estado": est}
+}

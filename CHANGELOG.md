@@ -65,6 +65,14 @@ Sitio oficial: [c-forge.org](https://c-forge.org)
   `llamada`/`protobuf` (.proto, binario como protoc, marcos gRPC),
   `recolecta`/`crawler` (cookies RFC 6265, formularios, robots.txt,
   rastreo) y `sensor`/`mqtt` (paquetes MQTT, QoS 2, mini broker).
+- Lote 22 de bibliotecas (con alias en inglés y pruebas en ambos idiomas):
+  `piloto`/`browser` (automatizar Chrome por DevTools al estilo Playwright,
+  probado con Google Chrome), `mapeador`/`dbmapper` (ORM sobre SQLite con
+  migraciones generadas, relaciones y seguimiento de cambios),
+  `determinista`/`fixedphysics` (física 2D en punto fijo, reproducible bit
+  a bit, con capturas para rollback), `importa3d`/`meshio` (STL, PLY, OFF,
+  OBJ, glTF y 3MF, cruzado con trimesh) y `nodos`/`scenetree` (árbol de
+  escena con señales al estilo Godot).
 - Lote 21 de bibliotecas (con alias en inglés y pruebas en ambos idiomas):
   `vector`/`vectorgfx` (dibujo al estilo Cairo con salida SVG, PDF y PNG;
   las tres coinciden con rsvg-convert y pdftoppm), `voz_activa`/`vad` (port
