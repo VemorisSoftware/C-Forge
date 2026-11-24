@@ -1,0 +1,89 @@
+// Pruebas de emulador. datos/emulador-esperado.json sale de Unicorn 2.1:
+// registros, banderas y memoria al final de 24 programas (x86-64 y ARM64)
+// ensamblados con Keystone en 0x1000, con datos en 0x4000 y pila en 0x8000.
+importar "emulador"
+importar "desarma"
+importar "json"
+funcion eq(a, b, q) { afirmar(("" + a) == ("" + b), q + ": [" + a + "] != [" + b + "]") }
+
+funcion preparar(arq) {
+    sea e = emulador_crear(arq)
+    emulador_mapear(e, 4096, 4096)
+    emulador_mapear(e, 16384, 4096)
+    emulador_mapear(e, 28672, 4096)
+    emulador_fijar_reg(e, si(arq == "x86_64", "rsp", "sp"), 32768)
+    retornar e
+}
+
+sea d = json_parsear(leer_archivo("tests/bibliotecas/datos/emulador-esperado.json"))
+para arq en ["x86", "a64"] {
+    para nombre en mapa_claves(d[arq]) {
+        sea p = d[arq][nombre]
+        sea e = preparar(si(arq == "x86", "x86_64", "arm64"))
+        sea cod = bytes_de_hex(p["bytes"])
+        emulador_escribir(e, 4096, cod)
+        emulador_escribir(e, 16384, bytes_de_hex(d["datos"]))
+        emulador_escribir(e, 16640, bytes_de_hex(d["texto"]))
+        eq(emulador_ejecutar(e, 4096, 4096 + longitud(cod), 100000)["motivo"], "fin", arq + " " + nombre)
+        para k en mapa_claves(p["regs"]) {
+            si (k == "flags") { eq(emulador_banderas(e), p["regs"][k], arq + " " + nombre + " banderas") } sino { eq(emulador_reg_hex(e, k), "0x" + p["regs"][k], arq + " " + nombre + " " + k) }
+        }
+        eq(hex_de_bytes(emulador_leer(e, 16384, 512) + emulador_leer(e, 32512, 256)), p["memoria"], arq + " " + nombre + " memoria")
+    }
+}
+
+// Llamadas al sistema con gancho: write(1, "hola\n", 5) y exit(7).
+funcion con_sistema(arq, codigo) {
+    sea e = preparar(arq)
+    sea salida = []
+    emulador_gancho(e, "syscall", funcion(em) {
+        sea num = emulador_reg(em, si(arq == "x86_64", "rax", "x8"))
+        sea a0 = emulador_reg(em, si(arq == "x86_64", "rdi", "x0"))
+        sea a1 = emulador_reg(em, si(arq == "x86_64", "rsi", "x1"))
+        sea a2 = emulador_reg(em, si(arq == "x86_64", "rdx", "x2"))
+        si (num == 1 o num == 64) {
+            salida.agregar(emulador_leer(em, a1, a2))
+            emulador_fijar_reg(em, si(arq == "x86_64", "rax", "x0"), a2)
+        } sino {
+            salida.agregar("exit " + a0)
+            emulador_detener(em)
+        }
+    })
+    sea cod = ensambla(codigo, arq, 4096)
+    emulador_escribir(e, 4096, cod)
+    emulador_escribir(e, 16384, "hola\n")
+    sea r = emulador_ejecutar(e, 4096, 0, 1000)
+    retornar [r["motivo"], unir(salida, "|")]
+}
+eq(con_sistema("x86_64", "mov eax, 1\nmov edi, 1\nmov esi, 0x4000\nmov edx, 5\nsyscall\nmov eax, 60\nmov edi, 7\nsyscall"), ["detenido", "hola\n|exit 7"], "syscall x86-64")
+eq(con_sistema("arm64", "mov x8, #64\nmov x0, #1\nmov x1, #0x4000\nmov x2, #5\nsvc #0\nmov x8, #93\nmov x0, #7\nsvc #0"), ["detenido", "hola\n|exit 7"], "svc ARM64")
+
+// Gancho por instrucción, límite y hlt.
+sea e = preparar("x86_64")
+emulador_escribir(e, 4096, ensambla_x86("x: inc rax\njmp x", 4096))
+sea vistas = []
+emulador_gancho(e, "instruccion", funcion(em, dir, texto) { si (longitud(vistas) < 3) { vistas.agregar(texto) } })
+eq(emulador_ejecutar(e, 4096, 0, 101), {"instrucciones": 101, "motivo": "limite"}, "límite")
+eq([emulador_reg(e, "rax"), vistas], [51, ["inc rax", "jmp 0x1000", "inc rax"]], "gancho")
+e = preparar("x86_64")
+emulador_escribir(e, 4096, ensambla_x86("mov al, 0xff\nmov ah, 1\nhlt\nnop", 4096))
+eq(emulador_ejecutar(e, 4096, 0, 0)["motivo"], "hlt", "hlt")
+eq([emulador_reg(e, "ax"), emulador_reg(e, "ah"), emulador_reg_hex(e, "rip")], [511, 1, "0x1005"], "ah/al y rip tras hlt")
+emulador_fijar_reg(e, "rbx", "0xfedcba9876543210")
+eq([emulador_reg_hex(e, "rbx"), emulador_reg_hex(e, "ebx"), emulador_reg(e, "bl")], ["0xfedcba9876543210", "0x76543210", 16], "registros de 64 bits exactos")
+
+// Errores.
+funcion error_de(arq, codigo) {
+    sea em = preparar(arq)
+    emulador_escribir(em, 4096, ensambla(codigo, arq, 4096))
+    sea r = ""
+    intentar { emulador_ejecutar(em, 4096, 0, 100) } capturar (x) { r = x }
+    retornar r
+}
+afirmar(texto_contiene(error_de("x86_64", "mov rax, qword ptr [0x9000]"), "memoria no mapeada (lectura) en 0x9000"), "lectura no mapeada")
+afirmar(texto_contiene(error_de("arm64", "mov x0, #0x9000\nstr x1, [x0]"), "memoria no mapeada (escritura)"), "escritura no mapeada")
+afirmar(texto_contiene(error_de("x86_64", "xor ecx, ecx\ndiv rcx"), "división por cero"), "div 0")
+afirmar(texto_contiene(error_de("x86_64", "mov edx, 1\nmov ecx, 1\ndiv ecx"), "#DE"), "desborde de div")
+afirmar(texto_contiene(error_de("x86_64", "syscall"), "sin gancho"), "syscall sin gancho")
+afirmar(texto_contiene(error_de("x86_64", "jmp 0x9000"), "ejecución"), "salto a memoria no mapeada")
+mostrar("[OK] emulador")

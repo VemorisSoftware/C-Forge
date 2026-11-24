@@ -1,0 +1,2645 @@
+// stdlib/analitica.cfv — SQL analítico embebido al estilo de DuckDB, escrito
+// desde cero (idea de DuckDB, MIT). Consulta en memoria tablas, archivos
+// CSV y JSON, y listas de mapas de C-Forge, con el SQL de DuckDB:
+//
+//   · SELECT con DISTINCT, alias, *, tabla.*, expresiones y subconsultas
+//     (escalares, IN, EXISTS; también correlacionadas).
+//   · FROM con tablas, vistas, read_csv('x.csv'), read_json('x.json'),
+//     subconsultas, VALUES y JOIN (INNER, LEFT, RIGHT, FULL, CROSS) con ON
+//     o USING; las igualdades usan join por hash.
+//   · WHERE, GROUP BY (expresiones, posiciones o ALL), HAVING, QUALIFY,
+//     ORDER BY (ASC/DESC, NULLS FIRST/LAST), LIMIT/OFFSET, WITH, UNION
+//     [ALL], INTERSECT, EXCEPT.
+//   · Agregados: count, sum, avg, min, max, median, quantile_cont,
+//     stddev/var (samp/pop), string_agg, bool_and/or, first, last,
+//     arg_min/arg_max, con DISTINCT y FILTER (WHERE …).
+//   · Ventanas: row_number, rank, dense_rank, percent_rank, cume_dist,
+//     ntile, lag, lead, first_value, last_value, nth_value y agregados con
+//     PARTITION BY, ORDER BY y marcos ROWS/RANGE.
+//   · CREATE TABLE [AS], CREATE VIEW, INSERT, UPDATE, DELETE, DROP.
+//
+// En inglés: importar "duckdb".
+//
+//   importar "analitica"
+//   sea db = analitica_abrir()
+//   analitica_ejecutar(db, "CREATE TABLE ventas AS SELECT * FROM read_csv('ventas.csv')")
+//   sea r = analitica_consulta(db, "SELECT region, sum(monto) AS total FROM ventas GROUP BY ALL ORDER BY total DESC", nulo)
+//   mostrar(r["columnas"])      // ["region", "total"]
+//   mostrar(r["filas"][0])      // ["Norte", 1520.5]
+//
+// Los parámetros van como ? o $1 (lista) y nunca se pegan al SQL.
+
+importar "csv"
+importar "json"
+
+// ---------- léxico ----------
+
+sea _ANA_PALABRAS = ["select", "from", "where", "group", "by", "having", "order", "limit", "offset", "as", "and", "or", "not", "null", "is", "in", "between",
+    "like", "ilike", "case", "when", "then", "else", "end", "join", "inner", "left", "right", "full", "outer", "cross", "on", "using", "distinct", "all",
+    "union", "intersect", "except", "with", "asc", "desc", "nulls", "first", "last", "true", "false", "cast", "over", "partition", "rows", "range",
+    "unbounded", "preceding", "following", "current", "row", "filter", "qualify", "exists", "create", "table", "view", "insert", "into", "values", "drop",
+    "if", "update", "set", "delete", "replace", "interval", "extract", "similar", "window"]
+
+funcion _ana_lexico(sql) {
+    sea r = []
+    sea i = 0
+    sea n = longitud(sql)
+    sea letras = "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ_"
+    sea digitos = "0123456789"
+    mientras (i < n) {
+        sea c = subtexto(sql, i, i + 1)
+        si (c == " " o c == "\n" o c == "\t" o c == "\r") { i = i + 1 }
+        sino si (subtexto(sql, i, i + 2) == "--") {
+            mientras (i < n y subtexto(sql, i, i + 1) != "\n") { i = i + 1 }
+        } sino si (subtexto(sql, i, i + 2) == "/*") {
+            sea f = texto_indice(subtexto(sql, i + 2, n), "*/")
+            si (f < 0) { lanzar "analitica: comentario sin cerrar" }
+            i = i + f + 4
+        } sino si (c == "'") {
+            sea v = ""
+            i = i + 1
+            mientras (verdadero) {
+                si (i >= n) { lanzar "analitica: texto sin cerrar" }
+                sea d = subtexto(sql, i, i + 1)
+                si (d == "'") {
+                    si (subtexto(sql, i + 1, i + 2) == "'") {
+                        v = v + "'"
+                        i = i + 2
+                    } sino {
+                        i = i + 1
+                        romper
+                    }
+                } sino {
+                    v = v + d
+                    i = i + 1
+                }
+            }
+            r.agregar({"t": "txt", "v": v})
+        } sino si (c == "\"") {
+            sea f = texto_indice(subtexto(sql, i + 1, n), "\"")
+            si (f < 0) { lanzar "analitica: identificador sin cerrar" }
+            r.agregar({"t": "id", "v": subtexto(sql, i + 1, i + 1 + f), "citado": verdadero})
+            i = i + f + 2
+        } sino si (texto_indice(digitos, c) >= 0 o (c == "." y texto_indice(digitos, subtexto(sql, i + 1, i + 2)) >= 0)) {
+            sea j = i
+            mientras (j < n y texto_indice(digitos + ".", subtexto(sql, j, j + 1)) >= 0) { j = j + 1 }
+            si (j < n y (subtexto(sql, j, j + 1) == "e" o subtexto(sql, j, j + 1) == "E")) {
+                j = j + 1
+                si (subtexto(sql, j, j + 1) == "-" o subtexto(sql, j, j + 1) == "+") { j = j + 1 }
+                mientras (j < n y texto_indice(digitos, subtexto(sql, j, j + 1)) >= 0) { j = j + 1 }
+            }
+            sea txt = subtexto(sql, i, j)
+            r.agregar({"t": "num", "v": a_numero(txt), "entero": texto_contiene(txt, ".") == falso y texto_contiene(texto_minusculas(txt), "e") == falso})
+            i = j
+        } sino si (texto_indice(letras, c) >= 0) {
+            sea j = i
+            mientras (j < n y texto_indice(letras + digitos, subtexto(sql, j, j + 1)) >= 0) { j = j + 1 }
+            sea w = texto_minusculas(subtexto(sql, i, j))
+            si (lista_contiene(_ANA_PALABRAS, w)) { r.agregar({"t": "kw", "v": w}) } sino { r.agregar({"t": "id", "v": w, "citado": falso}) }
+            i = j
+        } sino si (c == "?") {
+            r.agregar({"t": "param", "v": -1})
+            i = i + 1
+        } sino si (c == "$" y texto_indice(digitos, subtexto(sql, i + 1, i + 2)) >= 0) {
+            sea j = i + 1
+            mientras (j < n y texto_indice(digitos, subtexto(sql, j, j + 1)) >= 0) { j = j + 1 }
+            r.agregar({"t": "param", "v": a_numero(subtexto(sql, i + 1, j)) - 1})
+            i = j
+        } sino {
+            sea dos = subtexto(sql, i, i + 2)
+            si (lista_contiene(["<=", ">=", "<>", "!=", "||", "::", "//", "=="], dos)) {
+                r.agregar({"t": "op", "v": si(dos == "!=", "<>", si(dos == "==", "=", dos))})
+                i = i + 2
+            } sino si (texto_indice("+-*/%=<>(),.;[]", c) >= 0) {
+                r.agregar({"t": "op", "v": c})
+                i = i + 1
+            } sino { lanzar "analitica: carácter inesperado '" + c + "'" }
+        }
+    }
+    r.agregar({"t": "fin", "v": ""})
+    retornar r
+}
+
+// ---------- sintaxis ----------
+
+funcion _ana_p(toks) { retornar {"toks": toks, "i": 0, "params": 0, "pend_vent": []} }
+funcion _ana_ver(p) { retornar p["toks"][p["i"]] }
+funcion _ana_ver2(p) { retornar p["toks"][minimo(p["i"] + 1, longitud(p["toks"]) - 1)] }
+funcion _ana_tomar(p) {
+    sea t = p["toks"][p["i"]]
+    si (t["t"] != "fin") { p["i"] = p["i"] + 1 }
+    retornar t
+}
+funcion _ana_es(p, tipo_t, v) {
+    sea t = _ana_ver(p)
+    retornar t["t"] == tipo_t y t["v"] == v
+}
+funcion _ana_kw(p, v) { retornar _ana_es(p, "kw", v) }
+funcion _ana_op(p, v) { retornar _ana_es(p, "op", v) }
+funcion _ana_acepta(p, tipo_t, v) {
+    si (_ana_es(p, tipo_t, v)) {
+        _ana_tomar(p)
+        retornar verdadero
+    }
+    retornar falso
+}
+funcion _ana_espera(p, tipo_t, v) {
+    si (_ana_acepta(p, tipo_t, v) == falso) {
+        sea t = _ana_ver(p)
+        lanzar "analitica: se esperaba '" + v + "' y llegó '" + si(t["t"] == "fin", "fin del SQL", "" + t["v"]) + "'"
+    }
+}
+funcion _ana_ident(p) {
+    sea t = _ana_tomar(p)
+    si (t["t"] == "id") { retornar t["v"] }
+    // Algunas palabras sirven de nombre (p. ej. una columna "first").
+    si (t["t"] == "kw" y lista_contiene(["first", "last", "row", "rows", "range", "replace", "filter", "if", "values", "view", "current"], t["v"])) { retornar t["v"] }
+    lanzar "analitica: se esperaba un nombre y llegó '" + t["v"] + "'"
+}
+
+funcion _ana_sentencias(sql) {
+    sea p = _ana_p(_ana_lexico(sql))
+    sea r = []
+    mientras (_ana_ver(p)["t"] != "fin") {
+        si (_ana_acepta(p, "op", ";") == falso) {
+            r.agregar(_ana_sentencia(p))
+            si (_ana_ver(p)["t"] != "fin" y _ana_op(p, ";") == falso) { lanzar "analitica: sobra texto cerca de '" + _ana_ver(p)["v"] + "'" }
+        }
+    }
+    retornar r
+}
+
+funcion _ana_sentencia(p) {
+    si (_ana_kw(p, "create")) { retornar _ana_create(p) }
+    si (_ana_kw(p, "insert")) { retornar _ana_insert(p) }
+    si (_ana_kw(p, "drop")) {
+        _ana_tomar(p)
+        sea que = _ana_tomar(p)["v"]
+        sea si_existe = falso
+        si (_ana_acepta(p, "kw", "if")) {
+            _ana_espera(p, "kw", "exists")
+            si_existe = verdadero
+        }
+        retornar {"t": "drop", "que": que, "nombre": _ana_ident(p), "si_existe": si_existe}
+    }
+    si (_ana_kw(p, "update")) {
+        _ana_tomar(p)
+        sea nombre = _ana_ident(p)
+        _ana_espera(p, "kw", "set")
+        sea asign = []
+        mientras (verdadero) {
+            sea c = _ana_ident(p)
+            _ana_espera(p, "op", "=")
+            asign.agregar([c, _ana_expr(p)])
+            si (_ana_acepta(p, "op", ",") == falso) { romper }
+        }
+        sea donde = nulo
+        si (_ana_acepta(p, "kw", "where")) { donde = _ana_expr(p) }
+        retornar {"t": "update", "nombre": nombre, "asign": asign, "where": donde}
+    }
+    si (_ana_kw(p, "delete")) {
+        _ana_tomar(p)
+        _ana_espera(p, "kw", "from")
+        sea nombre = _ana_ident(p)
+        sea donde = nulo
+        si (_ana_acepta(p, "kw", "where")) { donde = _ana_expr(p) }
+        retornar {"t": "delete", "nombre": nombre, "where": donde}
+    }
+    retornar _ana_consulta(p)
+}
+
+funcion _ana_create(p) {
+    _ana_tomar(p)
+    sea reemplazar = falso
+    si (_ana_acepta(p, "kw", "or")) {
+        _ana_espera(p, "kw", "replace")
+        reemplazar = verdadero
+    }
+    sea que = _ana_tomar(p)["v"]
+    si (que != "table" y que != "view") { lanzar "analitica: CREATE " + que + " no soportado" }
+    sea si_no = falso
+    si (_ana_acepta(p, "kw", "if")) {
+        _ana_espera(p, "kw", "not")
+        _ana_espera(p, "kw", "exists")
+        si_no = verdadero
+    }
+    sea nombre = _ana_ident(p)
+    si (que == "view") {
+        _ana_espera(p, "kw", "as")
+        retornar {"t": "create_view", "nombre": nombre, "q": _ana_consulta(p), "reemplazar": reemplazar}
+    }
+    si (_ana_acepta(p, "kw", "as")) { retornar {"t": "create_as", "nombre": nombre, "q": _ana_consulta(p), "reemplazar": reemplazar, "si_no": si_no} }
+    _ana_espera(p, "op", "(")
+    sea cols = []
+    mientras (verdadero) {
+        cols.agregar(_ana_ident(p))
+        // Tipo y restricciones: se saltan hasta la coma o el paréntesis.
+        sea nivel = 0
+        mientras (nivel > 0 o (_ana_op(p, ",") == falso y _ana_op(p, ")") == falso)) {
+            si (_ana_ver(p)["t"] == "fin") { lanzar "analitica: CREATE TABLE incompleto" }
+            si (_ana_op(p, "(")) { nivel = nivel + 1 }
+            si (_ana_op(p, ")")) { nivel = nivel - 1 }
+            _ana_tomar(p)
+        }
+        si (_ana_acepta(p, "op", ",") == falso) { romper }
+    }
+    _ana_espera(p, "op", ")")
+    retornar {"t": "create", "nombre": nombre, "cols": cols, "reemplazar": reemplazar, "si_no": si_no}
+}
+
+funcion _ana_insert(p) {
+    _ana_tomar(p)
+    _ana_espera(p, "kw", "into")
+    sea nombre = _ana_ident(p)
+    sea cols = nulo
+    si (_ana_op(p, "(") y _ana_ver2(p)["t"] != "kw") {
+        _ana_tomar(p)
+        cols = []
+        mientras (verdadero) {
+            cols.agregar(_ana_ident(p))
+            si (_ana_acepta(p, "op", ",") == falso) { romper }
+        }
+        _ana_espera(p, "op", ")")
+    }
+    retornar {"t": "insert", "nombre": nombre, "cols": cols, "q": _ana_consulta(p)}
+}
+
+// Consulta completa: WITH, operaciones de conjuntos, ORDER BY y LIMIT.
+funcion _ana_consulta(p) {
+    sea ctes = []
+    si (_ana_acepta(p, "kw", "with")) {
+        mientras (verdadero) {
+            sea nombre = _ana_ident(p)
+            sea cols = nulo
+            si (_ana_acepta(p, "op", "(")) {
+                cols = []
+                mientras (verdadero) {
+                    cols.agregar(_ana_ident(p))
+                    si (_ana_acepta(p, "op", ",") == falso) { romper }
+                }
+                _ana_espera(p, "op", ")")
+            }
+            _ana_espera(p, "kw", "as")
+            _ana_espera(p, "op", "(")
+            ctes.agregar({"nombre": nombre, "cols": cols, "q": _ana_consulta(p)})
+            _ana_espera(p, "op", ")")
+            si (_ana_acepta(p, "op", ",") == falso) { romper }
+        }
+    }
+    sea q = _ana_conjunto(p)
+    // ORDER BY / LIMIT de toda la consulta.
+    sea orden = _ana_orden(p)
+    sea limite = nulo
+    sea desde = nulo
+    mientras (verdadero) {
+        si (_ana_acepta(p, "kw", "limit")) { limite = _ana_expr(p) }
+        sino si (_ana_acepta(p, "kw", "offset")) { desde = _ana_expr(p) }
+        sino { romper }
+    }
+    si (q["t"] == "select" y q["orden"] == nulo y q["limite"] == nulo) {
+        q["orden"] = orden
+        q["limite"] = limite
+        q["desde"] = desde
+    } sino si (orden != nulo o limite != nulo o desde != nulo) { q = {"t": "envoltura", "q": q, "orden": orden, "limite": limite, "desde": desde} }
+    si (longitud(ctes) > 0) { q = {"t": "with", "ctes": ctes, "q": q} }
+    retornar q
+}
+
+funcion _ana_orden(p) {
+    si (_ana_kw(p, "order") == falso) { retornar nulo }
+    _ana_tomar(p)
+    _ana_espera(p, "kw", "by")
+    sea r = []
+    mientras (verdadero) {
+        sea e = _ana_expr(p)
+        sea desc = falso
+        si (_ana_acepta(p, "kw", "desc")) { desc = verdadero } sino { _ana_acepta(p, "kw", "asc") }
+        sea nulos = "last"
+        si (_ana_acepta(p, "kw", "nulls")) { nulos = _ana_tomar(p)["v"] }
+        r.agregar({"e": e, "desc": desc, "nulos": nulos})
+        si (_ana_acepta(p, "op", ",") == falso) { romper }
+    }
+    retornar r
+}
+
+funcion _ana_conjunto(p) {
+    sea a = _ana_operando(p)
+    mientras (_ana_kw(p, "union") o _ana_kw(p, "intersect") o _ana_kw(p, "except")) {
+        sea op = _ana_tomar(p)["v"]
+        sea todo = _ana_acepta(p, "kw", "all")
+        _ana_acepta(p, "kw", "distinct")
+        sea b = _ana_operando(p)
+        a = {"t": "setop", "op": op, "todo": todo, "a": a, "b": b}
+    }
+    retornar a
+}
+
+funcion _ana_operando(p) {
+    si (_ana_op(p, "(")) {
+        _ana_tomar(p)
+        sea q = _ana_consulta(p)
+        _ana_espera(p, "op", ")")
+        retornar q
+    }
+    si (_ana_kw(p, "values")) { retornar _ana_values(p) }
+    si (_ana_kw(p, "from")) {
+        // FROM t … sin SELECT (como en DuckDB): SELECT *.
+        retornar _ana_select_resto(p, {"distinct": falso, "cols": [{"estrella": nulo}]})
+    }
+    _ana_espera(p, "kw", "select")
+    sea distinct = _ana_acepta(p, "kw", "distinct")
+    _ana_acepta(p, "kw", "all")
+    sea cols = []
+    mientras (verdadero) {
+        si (_ana_op(p, "*")) {
+            _ana_tomar(p)
+            cols.agregar({"estrella": nulo})
+        } sino si (_ana_ver(p)["t"] == "id" y _ana_ver2(p)["v"] == "." y p["i"] + 2 < longitud(p["toks"]) y p["toks"][p["i"] + 2]["v"] == "*") {
+            sea t = _ana_ident(p)
+            _ana_tomar(p)
+            _ana_tomar(p)
+            cols.agregar({"estrella": t})
+        } sino {
+            sea e = _ana_expr(p)
+            sea alias = nulo
+            si (_ana_acepta(p, "kw", "as")) { alias = _ana_ident(p) } sino si (_ana_ver(p)["t"] == "id") { alias = _ana_ident(p) }
+            cols.agregar({"e": e, "alias": alias})
+        }
+        si (_ana_acepta(p, "op", ",") == falso) { romper }
+    }
+    retornar _ana_select_resto(p, {"distinct": distinct, "cols": cols})
+}
+
+funcion _ana_select_resto(p, q) {
+    q["t"] = "select"
+    q["from"] = nulo
+    q["where"] = nulo
+    q["group"] = nulo
+    q["group_all"] = falso
+    q["having"] = nulo
+    q["qualify"] = nulo
+    q["orden"] = nulo
+    q["limite"] = nulo
+    q["desde"] = nulo
+    si (_ana_acepta(p, "kw", "from")) { q["from"] = _ana_from(p) }
+    si (_ana_acepta(p, "kw", "where")) { q["where"] = _ana_expr(p) }
+    si (_ana_kw(p, "group")) {
+        _ana_tomar(p)
+        _ana_espera(p, "kw", "by")
+        si (_ana_acepta(p, "kw", "all")) { q["group_all"] = verdadero } sino {
+            q["group"] = []
+            mientras (verdadero) {
+                q["group"].agregar(_ana_expr(p))
+                si (_ana_acepta(p, "op", ",") == falso) { romper }
+            }
+        }
+    }
+    si (_ana_acepta(p, "kw", "having")) { q["having"] = _ana_expr(p) }
+    si (_ana_acepta(p, "kw", "window")) {
+        mientras (verdadero) {
+            sea nombre = _ana_ident(p)
+            _ana_espera(p, "kw", "as")
+            _ana_espera(p, "op", "(")
+            sea v = _ana_espec_ventana(p)
+            _ana_espera(p, "op", ")")
+            para f en p["pend_vent"] {
+                si (f["ventana"]["ref"] == nombre) { f["ventana"] = v }
+            }
+            si (_ana_acepta(p, "op", ",") == falso) { romper }
+        }
+    }
+    si (_ana_acepta(p, "kw", "qualify")) { q["qualify"] = _ana_expr(p) }
+    retornar q
+}
+
+funcion _ana_values(p) {
+    _ana_espera(p, "kw", "values")
+    sea filas = []
+    mientras (verdadero) {
+        _ana_espera(p, "op", "(")
+        sea f = []
+        mientras (verdadero) {
+            f.agregar(_ana_expr(p))
+            si (_ana_acepta(p, "op", ",") == falso) { romper }
+        }
+        _ana_espera(p, "op", ")")
+        filas.agregar(f)
+        si (_ana_acepta(p, "op", ",") == falso) { romper }
+    }
+    retornar {"t": "values", "filas": filas}
+}
+
+funcion _ana_alias_from(p, item) {
+    si (_ana_acepta(p, "kw", "as") o _ana_ver(p)["t"] == "id") {
+        item["alias"] = _ana_ident(p)
+        si (_ana_acepta(p, "op", "(")) {
+            item["cols_alias"] = []
+            mientras (verdadero) {
+                item["cols_alias"].agregar(_ana_ident(p))
+                si (_ana_acepta(p, "op", ",") == falso) { romper }
+            }
+            _ana_espera(p, "op", ")")
+        }
+    }
+    retornar item
+}
+
+funcion _ana_from_item(p) {
+    sea item = nulo
+    si (_ana_op(p, "(")) {
+        _ana_tomar(p)
+        si (_ana_kw(p, "select") o _ana_kw(p, "with") o _ana_kw(p, "values") o _ana_op(p, "(")) {
+            item = {"t": "sub", "q": _ana_consulta(p), "alias": nulo}
+            _ana_espera(p, "op", ")")
+        } sino {
+            item = _ana_from(p)
+            _ana_espera(p, "op", ")")
+            retornar item
+        }
+    } sino si (_ana_ver(p)["t"] == "txt") {
+        // FROM 'archivo.csv'
+        sea ruta = _ana_tomar(p)["v"]
+        item = {"t": "funcion", "nombre": si(texto_termina_con(texto_minusculas(ruta), ".json"), "read_json", "read_csv"), "args": [{"t": "lit", "v": ruta}], "alias": nulo}
+    } sino {
+        sea nombre = _ana_ident(p)
+        si (_ana_op(p, "(")) {
+            _ana_tomar(p)
+            sea args = []
+            si (_ana_op(p, ")") == falso) {
+                mientras (verdadero) {
+                    // Argumentos con nombre (header=true): se aceptan y se guardan.
+                    si (_ana_ver(p)["t"] == "id" y _ana_ver2(p)["t"] == "op" y _ana_ver2(p)["v"] == "=") {
+                        sea k = _ana_ident(p)
+                        _ana_tomar(p)
+                        args.agregar({"t": "nombrado", "k": k, "e": _ana_expr(p)})
+                    } sino { args.agregar(_ana_expr(p)) }
+                    si (_ana_acepta(p, "op", ",") == falso) { romper }
+                }
+            }
+            _ana_espera(p, "op", ")")
+            item = {"t": "funcion", "nombre": nombre, "args": args, "alias": nulo}
+        } sino { item = {"t": "tabla", "nombre": nombre, "alias": nulo} }
+    }
+    retornar _ana_alias_from(p, item)
+}
+
+funcion _ana_from(p) {
+    sea a = _ana_from_item(p)
+    mientras (verdadero) {
+        si (_ana_acepta(p, "op", ",")) {
+            a = {"t": "join", "tipo": "cross", "a": a, "b": _ana_from_item(p), "on": nulo, "using": nulo}
+        } sino si (_ana_kw(p, "join") o _ana_kw(p, "inner") o _ana_kw(p, "left") o _ana_kw(p, "right") o _ana_kw(p, "full") o _ana_kw(p, "cross")) {
+            sea tipo_j = "inner"
+            si (_ana_acepta(p, "kw", "left")) { tipo_j = "left" }
+            sino si (_ana_acepta(p, "kw", "right")) { tipo_j = "right" }
+            sino si (_ana_acepta(p, "kw", "full")) { tipo_j = "full" }
+            sino si (_ana_acepta(p, "kw", "cross")) { tipo_j = "cross" }
+            sino { _ana_acepta(p, "kw", "inner") }
+            _ana_acepta(p, "kw", "outer")
+            _ana_espera(p, "kw", "join")
+            sea b = _ana_from_item(p)
+            sea on = nulo
+            sea using = nulo
+            si (_ana_acepta(p, "kw", "on")) { on = _ana_expr(p) }
+            sino si (_ana_acepta(p, "kw", "using")) {
+                _ana_espera(p, "op", "(")
+                using = []
+                mientras (verdadero) {
+                    using.agregar(_ana_ident(p))
+                    si (_ana_acepta(p, "op", ",") == falso) { romper }
+                }
+                _ana_espera(p, "op", ")")
+            }
+            a = {"t": "join", "tipo": tipo_j, "a": a, "b": b, "on": on, "using": using}
+        } sino { romper }
+    }
+    retornar a
+}
+
+// Expresiones por precedencia.
+funcion _ana_expr(p) { retornar _ana_o(p) }
+
+funcion _ana_o(p) {
+    sea a = _ana_y(p)
+    mientras (_ana_acepta(p, "kw", "or")) { a = {"t": "bin", "op": "or", "a": a, "b": _ana_y(p)} }
+    retornar a
+}
+
+funcion _ana_y(p) {
+    sea a = _ana_no(p)
+    mientras (_ana_acepta(p, "kw", "and")) { a = {"t": "bin", "op": "and", "a": a, "b": _ana_no(p)} }
+    retornar a
+}
+
+funcion _ana_no(p) {
+    si (_ana_kw(p, "not") y _ana_ver2(p)["v"] != "exists") {
+        _ana_tomar(p)
+        retornar {"t": "un", "op": "not", "a": _ana_no(p)}
+    }
+    retornar _ana_comparacion(p)
+}
+
+funcion _ana_comparacion(p) {
+    sea a = _ana_concat(p)
+    mientras (verdadero) {
+        si (_ana_op(p, "=") o _ana_op(p, "<>") o _ana_op(p, "<") o _ana_op(p, ">") o _ana_op(p, "<=") o _ana_op(p, ">=")) {
+            sea op = _ana_tomar(p)["v"]
+            a = {"t": "bin", "op": op, "a": a, "b": _ana_concat(p)}
+        } sino si (_ana_kw(p, "is")) {
+            _ana_tomar(p)
+            sea neg = _ana_acepta(p, "kw", "not")
+            si (_ana_acepta(p, "kw", "null")) { a = {"t": "isnull", "a": a, "no": neg} }
+            sino si (_ana_acepta(p, "kw", "distinct")) {
+                _ana_espera(p, "kw", "from")
+                a = {"t": "distinto", "a": a, "b": _ana_concat(p), "no": neg}
+            } sino si (_ana_acepta(p, "kw", "true")) { a = {"t": "bin", "op": si(neg, "<>", "="), "a": {"t": "fn", "nombre": "coalesce", "args": [a, {"t": "lit", "v": falso}], "distinct": falso, "ventana": nulo, "filtro": nulo, "estrella": falso}, "b": {"t": "lit", "v": verdadero}} }
+            sino si (_ana_acepta(p, "kw", "false")) { a = {"t": "bin", "op": si(neg, "<>", "="), "a": {"t": "fn", "nombre": "coalesce", "args": [a, {"t": "lit", "v": verdadero}], "distinct": falso, "ventana": nulo, "filtro": nulo, "estrella": falso}, "b": {"t": "lit", "v": falso}} }
+            sino { lanzar "analitica: IS inválido" }
+        } sino {
+            sea neg = falso
+            si (_ana_kw(p, "not") y (_ana_ver2(p)["v"] == "in" o _ana_ver2(p)["v"] == "between" o _ana_ver2(p)["v"] == "like" o _ana_ver2(p)["v"] == "ilike")) {
+                _ana_tomar(p)
+                neg = verdadero
+            }
+            si (_ana_acepta(p, "kw", "in")) {
+                _ana_espera(p, "op", "(")
+                si (_ana_kw(p, "select") o _ana_kw(p, "with")) {
+                    a = {"t": "in", "a": a, "sub": _ana_consulta(p), "lista": nulo, "no": neg}
+                } sino {
+                    sea lista = []
+                    mientras (verdadero) {
+                        lista.agregar(_ana_expr(p))
+                        si (_ana_acepta(p, "op", ",") == falso) { romper }
+                    }
+                    a = {"t": "in", "a": a, "sub": nulo, "lista": lista, "no": neg}
+                }
+                _ana_espera(p, "op", ")")
+            } sino si (_ana_acepta(p, "kw", "between")) {
+                sea lo = _ana_concat(p)
+                _ana_espera(p, "kw", "and")
+                a = {"t": "between", "a": a, "lo": lo, "hi": _ana_concat(p), "no": neg}
+            } sino si (_ana_kw(p, "like") o _ana_kw(p, "ilike")) {
+                sea ci = _ana_tomar(p)["v"] == "ilike"
+                a = {"t": "like", "a": a, "patron": _ana_concat(p), "no": neg, "ci": ci}
+            } sino { retornar a }
+        }
+    }
+    retornar a
+}
+
+funcion _ana_concat(p) {
+    sea a = _ana_suma(p)
+    mientras (_ana_op(p, "||")) {
+        _ana_tomar(p)
+        a = {"t": "bin", "op": "||", "a": a, "b": _ana_suma(p)}
+    }
+    retornar a
+}
+
+funcion _ana_suma(p) {
+    sea a = _ana_mult(p)
+    mientras (_ana_op(p, "+") o _ana_op(p, "-")) {
+        sea op = _ana_tomar(p)["v"]
+        a = {"t": "bin", "op": op, "a": a, "b": _ana_mult(p)}
+    }
+    retornar a
+}
+
+funcion _ana_mult(p) {
+    sea a = _ana_unario(p)
+    mientras (_ana_op(p, "*") o _ana_op(p, "/") o _ana_op(p, "%") o _ana_op(p, "//")) {
+        sea op = _ana_tomar(p)["v"]
+        a = {"t": "bin", "op": op, "a": a, "b": _ana_unario(p)}
+    }
+    retornar a
+}
+
+funcion _ana_unario(p) {
+    si (_ana_acepta(p, "op", "-")) { retornar {"t": "un", "op": "-", "a": _ana_unario(p)} }
+    si (_ana_acepta(p, "op", "+")) { retornar _ana_unario(p) }
+    sea a = _ana_primario(p)
+    mientras (_ana_acepta(p, "op", "::")) { a = {"t": "cast", "a": a, "tipo": _ana_tipo(p)} }
+    retornar a
+}
+
+funcion _ana_tipo(p) {
+    sea t = _ana_ident(p)
+    si (_ana_acepta(p, "op", "(")) {
+        mientras (_ana_acepta(p, "op", ")") == falso) { _ana_tomar(p) }
+    }
+    retornar t
+}
+
+funcion _ana_fn(nombre, args) { retornar {"t": "fn", "nombre": nombre, "args": args, "distinct": falso, "ventana": nulo, "filtro": nulo, "estrella": falso} }
+
+funcion _ana_primario(p) {
+    sea t = _ana_ver(p)
+    si (t["t"] == "num") {
+        _ana_tomar(p)
+        retornar {"t": "lit", "v": t["v"]}
+    }
+    si (t["t"] == "txt") {
+        _ana_tomar(p)
+        retornar {"t": "lit", "v": t["v"]}
+    }
+    si (t["t"] == "param") {
+        _ana_tomar(p)
+        sea i = t["v"]
+        si (i < 0) {
+            i = p["params"]
+            p["params"] = i + 1
+        }
+        retornar {"t": "param", "i": i}
+    }
+    si (_ana_acepta(p, "kw", "null")) { retornar {"t": "lit", "v": nulo} }
+    si (_ana_acepta(p, "kw", "true")) { retornar {"t": "lit", "v": verdadero} }
+    si (_ana_acepta(p, "kw", "false")) { retornar {"t": "lit", "v": falso} }
+    si (_ana_op(p, "(")) {
+        _ana_tomar(p)
+        si (_ana_kw(p, "select") o _ana_kw(p, "with")) {
+            sea q = _ana_consulta(p)
+            _ana_espera(p, "op", ")")
+            retornar {"t": "subq", "q": q}
+        }
+        sea e = _ana_expr(p)
+        _ana_espera(p, "op", ")")
+        retornar e
+    }
+    si (_ana_op(p, "[")) {
+        // Lista [a, b, c]
+        _ana_tomar(p)
+        sea args = []
+        si (_ana_op(p, "]") == falso) {
+            mientras (verdadero) {
+                args.agregar(_ana_expr(p))
+                si (_ana_acepta(p, "op", ",") == falso) { romper }
+            }
+        }
+        _ana_espera(p, "op", "]")
+        retornar _ana_fn("list_value", args)
+    }
+    si (_ana_acepta(p, "kw", "exists")) {
+        _ana_espera(p, "op", "(")
+        sea q = _ana_consulta(p)
+        _ana_espera(p, "op", ")")
+        retornar {"t": "exists", "q": q, "no": falso}
+    }
+    si (_ana_kw(p, "not") y _ana_ver2(p)["v"] == "exists") {
+        _ana_tomar(p)
+        _ana_tomar(p)
+        _ana_espera(p, "op", "(")
+        sea q = _ana_consulta(p)
+        _ana_espera(p, "op", ")")
+        retornar {"t": "exists", "q": q, "no": verdadero}
+    }
+    si (_ana_acepta(p, "kw", "case")) {
+        sea base = nulo
+        si (_ana_kw(p, "when") == falso) { base = _ana_expr(p) }
+        sea cuando = []
+        mientras (_ana_acepta(p, "kw", "when")) {
+            sea c = _ana_expr(p)
+            _ana_espera(p, "kw", "then")
+            cuando.agregar([c, _ana_expr(p)])
+        }
+        sea otro = nulo
+        si (_ana_acepta(p, "kw", "else")) { otro = _ana_expr(p) }
+        _ana_espera(p, "kw", "end")
+        retornar {"t": "case", "base": base, "cuando": cuando, "sino": otro}
+    }
+    si (_ana_acepta(p, "kw", "cast")) {
+        _ana_espera(p, "op", "(")
+        sea e = _ana_expr(p)
+        _ana_espera(p, "kw", "as")
+        sea tipo_c = _ana_tipo(p)
+        _ana_espera(p, "op", ")")
+        retornar {"t": "cast", "a": e, "tipo": tipo_c}
+    }
+    si (_ana_acepta(p, "kw", "extract")) {
+        _ana_espera(p, "op", "(")
+        sea parte = _ana_ident(p)
+        _ana_espera(p, "kw", "from")
+        sea e = _ana_expr(p)
+        _ana_espera(p, "op", ")")
+        retornar _ana_fn("date_part", [{"t": "lit", "v": parte}, e])
+    }
+    si (_ana_kw(p, "interval")) { lanzar "analitica: INTERVAL no soportado" }
+    // Nombres que también son palabras clave y funciones: left, right, replace, first, last, if.
+    si (t["t"] == "kw" y lista_contiene(["left", "right", "replace", "first", "last", "if"], t["v"]) y _ana_ver2(p)["v"] == "(") {
+        _ana_tomar(p)
+        retornar _ana_llamada(p, t["v"])
+    }
+    sea nombre = _ana_ident(p)
+    si (_ana_op(p, "(")) { retornar _ana_llamada(p, nombre) }
+    si (_ana_acepta(p, "op", ".")) { retornar {"t": "col", "tabla": nombre, "nombre": _ana_ident(p)} }
+    retornar {"t": "col", "tabla": nulo, "nombre": nombre}
+}
+
+funcion _ana_llamada(p, nombre) {
+    _ana_espera(p, "op", "(")
+    sea f = _ana_fn(nombre, [])
+    si (_ana_op(p, "*")) {
+        _ana_tomar(p)
+        f["estrella"] = verdadero
+    } sino si (_ana_op(p, ")") == falso) {
+        f["distinct"] = _ana_acepta(p, "kw", "distinct")
+        mientras (verdadero) {
+            f["args"].agregar(_ana_expr(p))
+            si (_ana_acepta(p, "op", ",") == falso) { romper }
+        }
+        // ORDER BY dentro del agregado (string_agg(x, ',' ORDER BY y)).
+        f["orden_arg"] = _ana_orden(p)
+    }
+    _ana_espera(p, "op", ")")
+    si (_ana_acepta(p, "kw", "filter")) {
+        _ana_espera(p, "op", "(")
+        _ana_espera(p, "kw", "where")
+        f["filtro"] = _ana_expr(p)
+        _ana_espera(p, "op", ")")
+    }
+    si (_ana_acepta(p, "kw", "over")) {
+        si (_ana_ver(p)["t"] == "id") {
+            f["ventana"] = {"ref": _ana_ident(p), "particion": [], "orden": nulo, "marco": nulo}
+            p["pend_vent"].agregar(f)
+            retornar f
+        }
+        _ana_espera(p, "op", "(")
+        sea v = _ana_espec_ventana(p)
+        _ana_espera(p, "op", ")")
+        f["ventana"] = v
+    }
+    retornar f
+}
+
+
+funcion _ana_espec_ventana(p) {
+    sea v = {"particion": [], "orden": nulo, "marco": nulo}
+    si (_ana_acepta(p, "kw", "partition")) {
+        _ana_espera(p, "kw", "by")
+        mientras (verdadero) {
+            v["particion"].agregar(_ana_expr(p))
+            si (_ana_acepta(p, "op", ",") == falso) { romper }
+        }
+    }
+    v["orden"] = _ana_orden(p)
+    si (_ana_kw(p, "rows") o _ana_kw(p, "range")) {
+        sea modo = _ana_tomar(p)["v"]
+        sea ini = nulo
+        sea fin = {"tipo": "actual"}
+        si (_ana_acepta(p, "kw", "between")) {
+            ini = _ana_limite_marco(p)
+            _ana_espera(p, "kw", "and")
+            fin = _ana_limite_marco(p)
+        } sino { ini = _ana_limite_marco(p) }
+        v["marco"] = {"modo": modo, "ini": ini, "fin": fin}
+    }
+    retornar v
+}
+
+funcion _ana_limite_marco(p) {
+    si (_ana_acepta(p, "kw", "unbounded")) {
+        sea d = _ana_tomar(p)["v"]
+        retornar {"tipo": si(d == "preceding", "ilimitado_antes", "ilimitado_despues")}
+    }
+    si (_ana_acepta(p, "kw", "current")) {
+        _ana_espera(p, "kw", "row")
+        retornar {"tipo": "actual"}
+    }
+    sea n = _ana_tomar(p)["v"]
+    sea d = _ana_tomar(p)["v"]
+    retornar {"tipo": si(d == "preceding", "antes", "despues"), "n": n}
+}
+
+// ---------- valores ----------
+
+funcion _ana_es_num(v) { retornar tipo(v) == "numero" }
+
+funcion _ana_texto(v) {
+    si (v == nulo) { retornar nulo }
+    si (v == verdadero) { retornar "true" }
+    si (v == falso) { retornar "false" }
+    si (_ana_es_num(v)) {
+        si (piso(v) == v y absoluto(v) < 1e15) { retornar "" + v }
+        retornar numero_preciso(v)
+    }
+    si (tipo(v) == "lista") {
+        sea partes = []
+        para x en v { partes.agregar(si(x == nulo, "NULL", _ana_texto(x))) }
+        retornar "[" + unir(partes, ", ") + "]"
+    }
+    retornar "" + v
+}
+
+// Comparación total para ORDER BY, min/max y claves: números < textos;
+// los nulos se tratan aparte.
+funcion _ana_cmp(a, b) {
+    si (_ana_es_num(a) y _ana_es_num(b)) { retornar si(a < b, -1, si(a > b, 1, 0)) }
+    si (a == verdadero o a == falso) {
+        si (b == verdadero o b == falso) { retornar si(a == b, 0, si(a == falso, -1, 1)) }
+    }
+    sea x = _ana_texto(a)
+    sea w = _ana_texto(b)
+    si (_ana_es_num(a) y tipo(b) == "texto") {
+        sea n = _ana_a_numero(b)
+        si (n != nulo) { retornar si(a < n, -1, si(a > n, 1, 0)) }
+    }
+    si (_ana_es_num(b) y tipo(a) == "texto") {
+        sea n = _ana_a_numero(a)
+        si (n != nulo) { retornar si(n < b, -1, si(n > b, 1, 0)) }
+    }
+    retornar si(x < w, -1, si(x > w, 1, 0))
+}
+
+funcion _ana_a_numero(t) {
+    sea s = texto_recortar("" + t)
+    si (s == "") { retornar nulo }
+    sea i = 0
+    sea puntos = 0
+    sea digitos = 0
+    si (subtexto(s, 0, 1) == "-" o subtexto(s, 0, 1) == "+") { i = 1 }
+    mientras (i < longitud(s)) {
+        sea c = subtexto(s, i, i + 1)
+        si (c == ".") { puntos = puntos + 1 } sino si (texto_indice("0123456789", c) >= 0) { digitos = digitos + 1 } sino si ((c == "e" o c == "E") y digitos > 0) {
+            retornar a_numero(s)
+        } sino { retornar nulo }
+        i = i + 1
+    }
+    si (puntos > 1 o digitos == 0) { retornar nulo }
+    retornar a_numero(s)
+}
+
+// Clave de agrupación / DISTINCT (distingue tipos y nulos).
+funcion _ana_clave(vals) {
+    sea partes = []
+    para v en vals {
+        si (v == nulo) { partes.agregar("\u0001N") }
+        sino si (_ana_es_num(v)) { partes.agregar("\u0001#" + _ana_texto(v)) }
+        sino { partes.agregar("\u0001s" + _ana_texto(v)) }
+    }
+    retornar unir(partes, "\u0002")
+}
+
+funcion _ana_verdad(v) { retornar v == verdadero }
+
+// ---------- contexto ----------
+
+funcion _ana_raiz(db) {
+    sea x = db
+    mientras ((x["padre"] ?? nulo) != nulo) { x = x["padre"] }
+    retornar x
+}
+
+funcion _ana_ctx(cols, fila, ambito) { retornar {"cols": cols, "fila": fila, "grupo": nulo, "vent": nulo, "ext": ambito["ext"], "db": ambito["db"], "params": ambito["params"], "alias": nulo} }
+
+funcion _ana_resolver(cols, e) {
+    sea r = -1
+    sea i = 0
+    para c en cols {
+        si (c["nombre"] == e["nombre"] y (e["tabla"] == nulo o c["tabla"] == e["tabla"])) {
+            si (r >= 0 y e["tabla"] == nulo y (cols[r]["oculta"] ?? falso) == falso y (c["oculta"] ?? falso) == falso) { lanzar "analitica: la columna " + e["nombre"] + " es ambigua" }
+            si (r < 0 o (cols[r]["oculta"] ?? falso)) { r = i }
+        }
+        i = i + 1
+    }
+    retornar r
+}
+
+funcion _ana_columna(e, ctx) {
+    sea c = ctx
+    mientras (c != nulo) {
+        sea idx = -1
+        sea cache = e["_res"] ?? nulo
+        si (cache != nulo y es_mismo(cache[0], c["cols"])) { idx = cache[1] } sino {
+            idx = _ana_resolver(c["cols"], e)
+            e["_res"] = [c["cols"], idx]
+        }
+        si (idx >= 0) {
+            si (c != ctx) {
+                sea est = _ana_raiz(ctx["db"])["_estado"]
+                est["ext_usos"] = est["ext_usos"] + 1
+            }
+            si (c["fila"] == nulo) { retornar nulo }
+            retornar c["fila"][idx]
+        }
+        si (e["tabla"] == nulo y c["alias"] != nulo y tiene_clave(c["alias"], e["nombre"])) {
+            sea a = c["alias"][e["nombre"]]
+            c["alias"] = nulo
+            sea v = nulo
+            intentar { v = _ana_eval(a, c) } capturar (x) {
+                c["alias"] = nulo
+                lanzar x
+            }
+            retornar v
+        }
+        c = c["ext"]
+    }
+    lanzar "analitica: columna desconocida " + si(e["tabla"] != nulo, e["tabla"] + ".", "") + e["nombre"]
+}
+
+// ---------- evaluación ----------
+
+funcion _ana_eval(e, ctx) {
+    sea t = e["t"]
+    si (t == "lit") { retornar e["v"] }
+    si (t == "col") { retornar _ana_columna(e, ctx) }
+    si (t == "bin") { retornar _ana_binario(e, ctx) }
+    si (t == "fn") {
+        si (e["ventana"] != nulo) {
+            si (ctx["vent"] == nulo) { lanzar "analitica: función de ventana fuera de lugar" }
+            retornar ctx["vent"][e["_id"]]
+        }
+        si (_ana_es_agregado(e["nombre"])) {
+            si (ctx["grupo"] == nulo) { lanzar "analitica: " + e["nombre"] + "() necesita GROUP BY o una consulta agregada" }
+            retornar _ana_agregado(e, _ana_ctxs_grupo(ctx))
+        }
+        sea args = []
+        para a en e["args"] { args.agregar(_ana_eval(a, ctx)) }
+        retornar _ana_escalar(e["nombre"], args, ctx)
+    }
+    si (t == "un") {
+        sea v = _ana_eval(e["a"], ctx)
+        si (v == nulo) { retornar nulo }
+        si (e["op"] == "not") { retornar v != verdadero }
+        retornar 0 - v
+    }
+    si (t == "param") {
+        sea ps = ctx["params"] ?? []
+        si (e["i"] >= longitud(ps)) { lanzar "analitica: falta el parámetro " + (e["i"] + 1) }
+        retornar ps[e["i"]]
+    }
+    si (t == "isnull") {
+        sea v = _ana_eval(e["a"], ctx)
+        retornar (v == nulo) != e["no"]
+    }
+    si (t == "distinto") {
+        sea a = _ana_eval(e["a"], ctx)
+        sea b = _ana_eval(e["b"], ctx)
+        sea iguales = (a == nulo y b == nulo) o (a != nulo y b != nulo y _ana_cmp(a, b) == 0)
+        retornar iguales == e["no"]
+    }
+    si (t == "case") {
+        si (e["base"] != nulo) {
+            sea b = _ana_eval(e["base"], ctx)
+            para par en e["cuando"] {
+                sea c = _ana_eval(par[0], ctx)
+                si (b != nulo y c != nulo y _ana_cmp(b, c) == 0) { retornar _ana_eval(par[1], ctx) }
+            }
+        } sino {
+            para par en e["cuando"] {
+                si (_ana_verdad(_ana_eval(par[0], ctx))) { retornar _ana_eval(par[1], ctx) }
+            }
+        }
+        si (e["sino"] != nulo) { retornar _ana_eval(e["sino"], ctx) }
+        retornar nulo
+    }
+    si (t == "cast") { retornar _ana_convertir(_ana_eval(e["a"], ctx), e["tipo"]) }
+    si (t == "between") {
+        sea v = _ana_eval(e["a"], ctx)
+        sea lo = _ana_eval(e["lo"], ctx)
+        sea hi = _ana_eval(e["hi"], ctx)
+        si (v == nulo o lo == nulo o hi == nulo) { retornar nulo }
+        retornar (_ana_cmp(v, lo) >= 0 y _ana_cmp(v, hi) <= 0) != e["no"]
+    }
+    si (t == "like") {
+        sea v = _ana_eval(e["a"], ctx)
+        sea pat = _ana_eval(e["patron"], ctx)
+        si (v == nulo o pat == nulo) { retornar nulo }
+        sea x = _ana_texto(v)
+        sea w = _ana_texto(pat)
+        si (e["ci"]) {
+            x = texto_minusculas(x)
+            w = texto_minusculas(w)
+        }
+        retornar _ana_like(x, w) != e["no"]
+    }
+    si (t == "in") {
+        sea v = _ana_eval(e["a"], ctx)
+        si (v == nulo) { retornar nulo }
+        sea vals = []
+        si (e["sub"] != nulo) {
+            para f en _ana_sub(e, e["sub"], ctx)["filas"] { vals.agregar(f[0]) }
+        } sino {
+            para x en e["lista"] { vals.agregar(_ana_eval(x, ctx)) }
+        }
+        sea hay_nulo = falso
+        para x en vals {
+            si (x == nulo) { hay_nulo = verdadero } sino si (_ana_cmp(v, x) == 0) { retornar e["no"] == falso }
+        }
+        si (hay_nulo) { retornar nulo }
+        retornar e["no"]
+    }
+    si (t == "subq") {
+        sea r = _ana_sub(e, e["q"], ctx)
+        si (longitud(r["filas"]) == 0) { retornar nulo }
+        si (longitud(r["filas"]) > 1) { lanzar "analitica: la subconsulta escalar devolvió más de una fila" }
+        retornar r["filas"][0][0]
+    }
+    si (t == "exists") { retornar (longitud(_ana_sub(e, e["q"], ctx)["filas"]) > 0) != e["no"] }
+    lanzar "analitica: expresión no soportada " + t
+}
+
+// Subconsulta: se guarda el resultado si no usó columnas de afuera.
+funcion _ana_sub(nodo, q, ctx) {
+    sea est = _ana_raiz(ctx["db"])["_estado"]
+    si ((nodo["_cache_ej"] ?? -1) == est["ejecucion"]) { retornar nodo["_cache"] }
+    sea antes = est["ext_usos"]
+    sea r = _ana_ejecutar_q(q, ctx["db"], ctx["params"], ctx)
+    si (est["ext_usos"] == antes) {
+        nodo["_cache"] = r
+        nodo["_cache_ej"] = est["ejecucion"]
+    }
+    retornar r
+}
+
+funcion _ana_like(x, pat) {
+    // Programación dinámica sobre % y _.
+    sea n = longitud(x)
+    sea m = longitud(pat)
+    sea fila = [verdadero]
+    para j en lista_rango(1, m + 1) { fila.agregar(fila[j - 1] y subtexto(pat, j - 1, j) == "%") }
+    para i en lista_rango(1, n + 1) {
+        sea nueva = [falso]
+        sea c = subtexto(x, i - 1, i)
+        para j en lista_rango(1, m + 1) {
+            sea pc = subtexto(pat, j - 1, j)
+            si (pc == "%") { nueva.agregar(nueva[j - 1] o fila[j]) }
+            sino si (pc == "_" o pc == c) { nueva.agregar(fila[j - 1]) }
+            sino { nueva.agregar(falso) }
+        }
+        fila = nueva
+    }
+    retornar fila[m]
+}
+
+funcion _ana_binario(e, ctx) {
+    sea op = e["op"]
+    si (op == "and") {
+        sea a = _ana_eval(e["a"], ctx)
+        si (a == falso) { retornar falso }
+        sea b = _ana_eval(e["b"], ctx)
+        si (b == falso) { retornar falso }
+        si (a == nulo o b == nulo) { retornar nulo }
+        retornar verdadero
+    }
+    si (op == "or") {
+        sea a = _ana_eval(e["a"], ctx)
+        si (a == verdadero) { retornar verdadero }
+        sea b = _ana_eval(e["b"], ctx)
+        si (b == verdadero) { retornar verdadero }
+        si (a == nulo o b == nulo) { retornar nulo }
+        retornar falso
+    }
+    sea a = _ana_eval(e["a"], ctx)
+    sea b = _ana_eval(e["b"], ctx)
+    si (a == nulo o b == nulo) { retornar nulo }
+    si (op == "||") { retornar _ana_texto(a) + _ana_texto(b) }
+    si (op == "=") { retornar _ana_cmp(a, b) == 0 }
+    si (op == "<>") { retornar _ana_cmp(a, b) != 0 }
+    si (op == "<") { retornar _ana_cmp(a, b) < 0 }
+    si (op == ">") { retornar _ana_cmp(a, b) > 0 }
+    si (op == "<=") { retornar _ana_cmp(a, b) <= 0 }
+    si (op == ">=") { retornar _ana_cmp(a, b) >= 0 }
+    sea x = _ana_num(a)
+    sea w = _ana_num(b)
+    si (op == "+") { retornar x + w }
+    si (op == "-") { retornar x - w }
+    si (op == "*") { retornar x * w }
+    si (op == "/") {
+        si (w == 0) { retornar nulo }
+        retornar x / w
+    }
+    si (op == "//") {
+        si (w == 0) { retornar nulo }
+        retornar piso(x / w)
+    }
+    si (op == "%") {
+        si (w == 0) { retornar nulo }
+        retornar x - w * _ana_trunc(x / w)
+    }
+    lanzar "analitica: operador desconocido " + op
+}
+
+funcion _ana_trunc(v) {
+    si (v < 0) { retornar 0 - piso(0 - v) }
+    retornar piso(v)
+}
+
+funcion _ana_num(v) {
+    si (_ana_es_num(v)) { retornar v }
+    si (v == verdadero) { retornar 1 }
+    si (v == falso) { retornar 0 }
+    sea n = _ana_a_numero(v)
+    si (n == nulo) { lanzar "analitica: no se puede convertir '" + v + "' a número" }
+    retornar n
+}
+
+funcion _ana_redondear(v, d) {
+    sea f = potencia(10, d)
+    sea x = absoluto(v) * f
+    sea r = piso(x + 0.5)
+    // Corrige errores de representación (2.675 → 2.68 como DuckDB no; se deja como double).
+    sea res = r / f
+    si (v < 0) { retornar 0 - res }
+    retornar res
+}
+
+funcion _ana_convertir(v, tipo_c) {
+    si (v == nulo) { retornar nulo }
+    sea t = texto_minusculas(tipo_c)
+    si (lista_contiene(["integer", "int", "bigint", "smallint", "tinyint", "int4", "int8", "hugeint", "ubigint", "uinteger"], t)) {
+        si (tipo(v) == "texto") {
+            sea n = _ana_a_numero(v)
+            si (n == nulo) { lanzar "analitica: no se puede convertir '" + v + "' a " + tipo_c }
+            v = n
+        }
+        sea n = _ana_num(v)
+        retornar si(n < 0, 0 - piso(0 - n + 0.5), piso(n + 0.5))
+    }
+    si (lista_contiene(["double", "float", "real", "decimal", "numeric", "float8", "float4"], t)) {
+        si (tipo(v) == "texto") {
+            sea n = _ana_a_numero(v)
+            si (n == nulo) { lanzar "analitica: no se puede convertir '" + v + "' a " + tipo_c }
+            retornar n
+        }
+        retornar _ana_num(v)
+    }
+    si (lista_contiene(["varchar", "text", "string", "char"], t)) { retornar _ana_texto(v) }
+    si (t == "boolean" o t == "bool") {
+        si (tipo(v) == "texto") {
+            sea x = texto_minusculas(texto_recortar(v))
+            si (x == "true" o x == "t" o x == "1") { retornar verdadero }
+            si (x == "false" o x == "f" o x == "0") { retornar falso }
+            lanzar "analitica: no se puede convertir '" + v + "' a BOOLEAN"
+        }
+        retornar _ana_num(v) != 0
+    }
+    si (t == "date") { retornar subtexto(_ana_texto(v), 0, 10) }
+    retornar v
+}
+
+// ---------- funciones escalares ----------
+
+funcion _ana_fecha(v) {
+    sea t = _ana_texto(v)
+    si (longitud(t) < 10 o subtexto(t, 4, 5) != "-") { lanzar "analitica: fecha inválida '" + t + "'" }
+    retornar [a_numero(subtexto(t, 0, 4)), a_numero(subtexto(t, 5, 7)), a_numero(subtexto(t, 8, 10))]
+}
+
+funcion _ana_dos(n) { retornar si(n < 10, "0" + n, "" + n) }
+
+funcion _ana_escalar(nombre, a, ctx) {
+    sea n = longitud(a)
+    si (nombre == "coalesce" o nombre == "ifnull") {
+        para v en a {
+            si (v != nulo) { retornar v }
+        }
+        retornar nulo
+    }
+    si (nombre == "nullif") {
+        si (a[0] != nulo y a[1] != nulo y _ana_cmp(a[0], a[1]) == 0) { retornar nulo }
+        retornar a[0]
+    }
+    si (nombre == "if" o nombre == "iif") { retornar si(_ana_verdad(a[0]), a[1], a[2]) }
+    si (nombre == "greatest" o nombre == "least") {
+        sea r = nulo
+        para v en a {
+            si (v != nulo y (r == nulo o (nombre == "greatest" y _ana_cmp(v, r) > 0) o (nombre == "least" y _ana_cmp(v, r) < 0))) { r = v }
+        }
+        retornar r
+    }
+    si (nombre == "concat") {
+        sea r = ""
+        para v en a {
+            si (v != nulo) { r = r + _ana_texto(v) }
+        }
+        retornar r
+    }
+    si (nombre == "concat_ws") {
+        sea partes = []
+        sea i = 1
+        mientras (i < n) {
+            si (a[i] != nulo) { partes.agregar(_ana_texto(a[i])) }
+            i = i + 1
+        }
+        retornar unir(partes, _ana_texto(a[0]))
+    }
+    si (nombre == "list_value" o nombre == "list_pack") { retornar a }
+    si (nombre == "typeof") {
+        sea v = a[0]
+        si (v == nulo) { retornar "NULL" }
+        si (v == verdadero o v == falso) { retornar "BOOLEAN" }
+        si (_ana_es_num(v)) { retornar si(piso(v) == v, "INTEGER", "DOUBLE") }
+        retornar "VARCHAR"
+    }
+    // A partir de aquí, nulo entra → nulo sale.
+    para v en a {
+        si (v == nulo) { retornar nulo }
+    }
+    si (nombre == "abs") { retornar absoluto(_ana_num(a[0])) }
+    si (nombre == "round") {
+        sea d = 0
+        si (n > 1) { d = _ana_num(a[1]) }
+        retornar _ana_redondear(_ana_num(a[0]), d)
+    }
+    si (nombre == "floor") { retornar piso(_ana_num(a[0])) }
+    si (nombre == "ceil" o nombre == "ceiling") { retornar techo(_ana_num(a[0])) }
+    si (nombre == "trunc") { retornar _ana_trunc(_ana_num(a[0])) }
+    si (nombre == "sqrt") {
+        si (_ana_num(a[0]) < 0) { retornar nulo }
+        retornar raiz(_ana_num(a[0]))
+    }
+    si (nombre == "power" o nombre == "pow") { retornar potencia(_ana_num(a[0]), _ana_num(a[1])) }
+    si (nombre == "exp") { retornar exponencial(_ana_num(a[0])) }
+    si (nombre == "ln") { retornar logaritmo(_ana_num(a[0])) }
+    si (nombre == "log10" o nombre == "log") { retornar logaritmo(_ana_num(a[0])) / logaritmo(10) }
+    si (nombre == "log2") { retornar logaritmo(_ana_num(a[0])) / logaritmo(2) }
+    si (nombre == "sign") {
+        sea x = _ana_num(a[0])
+        retornar si(x > 0, 1, si(x < 0, -1, 0))
+    }
+    si (nombre == "mod") {
+        sea x = _ana_num(a[0])
+        sea w = _ana_num(a[1])
+        si (w == 0) { retornar nulo }
+        retornar x - w * _ana_trunc(x / w)
+    }
+    si (nombre == "pi") { retornar 3.141592653589793 }
+    si (nombre == "upper" o nombre == "ucase") { retornar texto_mayusculas(_ana_texto(a[0])) }
+    si (nombre == "lower" o nombre == "lcase") { retornar texto_minusculas(_ana_texto(a[0])) }
+    si (nombre == "length" o nombre == "len" o nombre == "char_length" o nombre == "strlen") {
+        si (tipo(a[0]) == "lista") { retornar longitud(a[0]) }
+        retornar longitud(_ana_texto(a[0]))
+    }
+    si (nombre == "substr" o nombre == "substring") {
+        sea x = _ana_texto(a[0])
+        sea ini = _ana_num(a[1])
+        sea largo = longitud(x)
+        si (n > 2) { largo = _ana_num(a[2]) }
+        si (ini < 1) {
+            largo = largo + ini - 1
+            ini = 1
+        }
+        si (largo <= 0) { retornar "" }
+        retornar subtexto(x, minimo(ini - 1, longitud(x)), minimo(ini - 1 + largo, longitud(x)))
+    }
+    si (nombre == "left") {
+        sea x = _ana_texto(a[0])
+        retornar subtexto(x, 0, maximo(0, minimo(_ana_num(a[1]), longitud(x))))
+    }
+    si (nombre == "right") {
+        sea x = _ana_texto(a[0])
+        retornar subtexto(x, maximo(0, longitud(x) - _ana_num(a[1])), longitud(x))
+    }
+    si (nombre == "replace") { retornar texto_reemplazar(_ana_texto(a[0]), _ana_texto(a[1]), _ana_texto(a[2])) }
+    si (nombre == "trim") { retornar texto_recortar(_ana_texto(a[0])) }
+    si (nombre == "ltrim" o nombre == "rtrim") {
+        sea x = _ana_texto(a[0])
+        si (nombre == "ltrim") {
+            mientras (texto_empieza_con(x, " ")) { x = subtexto(x, 1, longitud(x)) }
+        } sino {
+            mientras (texto_termina_con(x, " ")) { x = subtexto(x, 0, longitud(x) - 1) }
+        }
+        retornar x
+    }
+    si (nombre == "reverse") { retornar texto_invertir(_ana_texto(a[0])) }
+    si (nombre == "strpos" o nombre == "instr" o nombre == "position") { retornar texto_indice(_ana_texto(a[0]), _ana_texto(a[1])) + 1 }
+    si (nombre == "starts_with" o nombre == "prefix") { retornar texto_empieza_con(_ana_texto(a[0]), _ana_texto(a[1])) }
+    si (nombre == "ends_with" o nombre == "suffix") { retornar texto_termina_con(_ana_texto(a[0]), _ana_texto(a[1])) }
+    si (nombre == "contains") { retornar texto_contiene(_ana_texto(a[0]), _ana_texto(a[1])) }
+    si (nombre == "split_part") {
+        sea partes = texto_dividir(_ana_texto(a[0]), _ana_texto(a[1]))
+        sea k = _ana_num(a[2])
+        si (k < 1 o k > longitud(partes)) { retornar "" }
+        retornar partes[k - 1]
+    }
+    si (nombre == "repeat") {
+        sea r = ""
+        para i en lista_rango(0, _ana_num(a[1])) { r = r + _ana_texto(a[0]) }
+        retornar r
+    }
+    si (nombre == "lpad" o nombre == "rpad") {
+        sea x = _ana_texto(a[0])
+        sea largo = _ana_num(a[1])
+        sea relleno = _ana_texto(a[2])
+        si (longitud(x) >= largo) { retornar subtexto(x, 0, largo) }
+        sea extra = ""
+        mientras (longitud(extra) < largo - longitud(x)) { extra = extra + relleno }
+        extra = subtexto(extra, 0, largo - longitud(x))
+        retornar si(nombre == "lpad", extra + x, x + extra)
+    }
+    si (nombre == "regexp_matches") { retornar cfv_regex_buscar(_ana_texto(a[1]), _ana_texto(a[0])) != nulo }
+    si (nombre == "regexp_replace") { retornar cfv_regex_reemplazar(_ana_texto(a[1]), _ana_texto(a[0]), _ana_texto(a[2])) }
+    si (nombre == "year" o nombre == "month" o nombre == "day") {
+        sea f = _ana_fecha(a[0])
+        retornar f[{"year": 0, "month": 1, "day": 2}[nombre]]
+    }
+    si (nombre == "date_part" o nombre == "datepart") {
+        sea parte = texto_minusculas(_ana_texto(a[0]))
+        sea f = _ana_fecha(a[1])
+        si (parte == "year") { retornar f[0] }
+        si (parte == "month") { retornar f[1] }
+        si (parte == "day") { retornar f[2] }
+        si (parte == "quarter") { retornar cociente(f[1] - 1, 3) + 1 }
+        lanzar "analitica: parte de fecha no soportada " + parte
+    }
+    si (nombre == "date_trunc") {
+        sea parte = texto_minusculas(_ana_texto(a[0]))
+        sea f = _ana_fecha(a[1])
+        si (parte == "year") { retornar f[0] + "-01-01" }
+        si (parte == "month") { retornar f[0] + "-" + _ana_dos(f[1]) + "-01" }
+        si (parte == "quarter") { retornar f[0] + "-" + _ana_dos((cociente(f[1] - 1, 3)) * 3 + 1) + "-01" }
+        si (parte == "day") { retornar f[0] + "-" + _ana_dos(f[1]) + "-" + _ana_dos(f[2]) }
+        lanzar "analitica: date_trunc no soportado para " + parte
+    }
+    si (nombre == "list_contains" o nombre == "array_contains") {
+        para x en a[0] {
+            si (x != nulo y _ana_cmp(x, a[1]) == 0) { retornar verdadero }
+        }
+        retornar falso
+    }
+    lanzar "analitica: función desconocida " + nombre + "()"
+}
+
+// ---------- agregados ----------
+
+sea _ANA_AGREGADOS = ["count", "sum", "avg", "mean", "min", "max", "median", "quantile_cont", "quantile", "stddev", "stddev_samp", "stddev_pop", "variance",
+    "var_samp", "var_pop", "string_agg", "group_concat", "listagg", "bool_and", "bool_or", "first", "last", "any_value", "arg_min", "arg_max", "min_by",
+    "max_by", "product", "mode", "list", "array_agg", "count_if", "sumif", "avg_if"]
+
+funcion _ana_es_agregado(nombre) { retornar lista_contiene(_ANA_AGREGADOS, nombre) }
+
+funcion _ana_ctxs_grupo(ctx) {
+    sea r = []
+    para f en ctx["grupo"] {
+        sea c = {"cols": ctx["cols"], "fila": f, "grupo": nulo, "vent": nulo, "ext": ctx["ext"], "db": ctx["db"], "params": ctx["params"], "alias": nulo}
+        r.agregar(c)
+    }
+    retornar r
+}
+
+funcion _ana_ordenar_estable(lista, cmp) {
+    sea idx = lista_rango(0, longitud(lista))
+    sea o = nulo
+    sea orden = ordenar(idx, funcion(i, j) {
+        sea c = cmp(lista[i], lista[j])
+        si (c != 0) { retornar c }
+        retornar i - j
+    })
+    sea r = []
+    para i en orden { r.agregar(lista[i]) }
+    retornar r
+}
+
+// Agregado de la función f evaluada sobre cada contexto de la lista.
+funcion _ana_agregado(f, ctxs) {
+    sea nombre = f["nombre"]
+    si (nombre == "count" y f["estrella"]) {
+        si (f["filtro"] == nulo) { retornar longitud(ctxs) }
+        sea k = 0
+        para c en ctxs {
+            si (_ana_verdad(_ana_eval(f["filtro"], c))) { k = k + 1 }
+        }
+        retornar k
+    }
+    // Filas: [argumentos…] con FILTER y ORDER BY.
+    sea tuplas = []
+    para c en ctxs {
+        si (f["filtro"] == nulo o _ana_verdad(_ana_eval(f["filtro"], c))) {
+            sea t = []
+            para a en f["args"] { t.agregar(_ana_eval(a, c)) }
+            si ((f["orden_arg"] ?? nulo) != nulo) {
+                sea claves_o = []
+                para o en f["orden_arg"] { claves_o.agregar(_ana_eval(o["e"], c)) }
+                t.agregar(claves_o)
+            }
+            tuplas.agregar(t)
+        }
+    }
+    si ((f["orden_arg"] ?? nulo) != nulo) {
+        sea ord = f["orden_arg"]
+        sea k = longitud(f["args"])
+        tuplas = _ana_ordenar_estable(tuplas, funcion(p, q) { retornar _ana_cmp_claves(p[k], q[k], ord) })
+    }
+    sea vals = []
+    para t en tuplas { vals.agregar(t[0]) }
+    si (f["distinct"]) {
+        sea vistos = {}
+        sea u = []
+        sea ut = []
+        sea i = 0
+        para v en vals {
+            sea k = _ana_clave([v])
+            si (tiene_clave(vistos, k) == falso) {
+                vistos[k] = verdadero
+                u.agregar(v)
+                ut.agregar(tuplas[i])
+            }
+            i = i + 1
+        }
+        vals = u
+        tuplas = ut
+    }
+    sea nn = []
+    para v en vals {
+        si (v != nulo) { nn.agregar(v) }
+    }
+    si (nombre == "count") { retornar longitud(nn) }
+    si (nombre == "count_if") {
+        sea k = 0
+        para v en nn {
+            si (v == verdadero) { k = k + 1 }
+        }
+        retornar k
+    }
+    si (nombre == "first" o nombre == "any_value") {
+        si (nombre == "any_value") {
+            si (longitud(nn) == 0) { retornar nulo }
+            retornar nn[0]
+        }
+        si (longitud(vals) == 0) { retornar nulo }
+        retornar vals[0]
+    }
+    si (nombre == "last") {
+        si (longitud(vals) == 0) { retornar nulo }
+        retornar vals[longitud(vals) - 1]
+    }
+    si (nombre == "list" o nombre == "array_agg") { retornar vals }
+    si (nombre == "arg_min" o nombre == "arg_max" o nombre == "min_by" o nombre == "max_by") {
+        sea mejor = nulo
+        sea clave_m = nulo
+        para t en tuplas {
+            si (t[1] != nulo) {
+                sea mayor = nombre == "arg_max" o nombre == "max_by"
+                si (clave_m == nulo o (mayor y _ana_cmp(t[1], clave_m) > 0) o (mayor == falso y _ana_cmp(t[1], clave_m) < 0)) {
+                    clave_m = t[1]
+                    mejor = t[0]
+                }
+            }
+        }
+        retornar mejor
+    }
+    si (nombre == "string_agg" o nombre == "group_concat" o nombre == "listagg") {
+        si (longitud(nn) == 0) { retornar nulo }
+        sea sep = ","
+        si (longitud(tuplas) > 0 y longitud(f["args"]) > 1) { sea s = tuplas[0][1]  si (s != nulo) { sep = _ana_texto(s) } }
+        sea partes = []
+        para v en nn { partes.agregar(_ana_texto(v)) }
+        retornar unir(partes, sep)
+    }
+    si (longitud(nn) == 0) { retornar nulo }
+    si (nombre == "min" o nombre == "max") {
+        sea r = nn[0]
+        para v en nn {
+            si ((nombre == "min" y _ana_cmp(v, r) < 0) o (nombre == "max" y _ana_cmp(v, r) > 0)) { r = v }
+        }
+        retornar r
+    }
+    si (nombre == "bool_and") {
+        para v en nn {
+            si (v != verdadero) { retornar falso }
+        }
+        retornar verdadero
+    }
+    si (nombre == "bool_or") {
+        para v en nn {
+            si (v == verdadero) { retornar verdadero }
+        }
+        retornar falso
+    }
+    si (nombre == "mode") {
+        sea cuenta = {}
+        sea mejor = nn[0]
+        sea mx = 0
+        para v en nn {
+            sea k = _ana_clave([v])
+            cuenta[k] = (cuenta[k] ?? 0) + 1
+            si (cuenta[k] > mx) {
+                mx = cuenta[k]
+                mejor = v
+            }
+        }
+        retornar mejor
+    }
+    sea xs = []
+    para v en nn { xs.agregar(_ana_num(v)) }
+    sea suma = 0
+    para x en xs { suma = suma + x }
+    sea cuantos = longitud(xs)
+    si (nombre == "sum" o nombre == "sumif") { retornar suma }
+    si (nombre == "product") {
+        sea p = 1
+        para x en xs { p = p * x }
+        retornar p
+    }
+    si (nombre == "avg" o nombre == "mean") { retornar suma / cuantos }
+    si (nombre == "median" o nombre == "quantile_cont" o nombre == "quantile") {
+        sea q = 0.5
+        si (nombre != "median") { q = _ana_num(tuplas[0][1]) }
+        sea ord = ordenar(xs, funcion(p, r) { retornar si(p < r, -1, si(p > r, 1, 0)) })
+        sea pos = q * (cuantos - 1)
+        sea lo = piso(pos)
+        sea hi = techo(pos)
+        retornar ord[lo] + (ord[hi] - ord[lo]) * (pos - lo)
+    }
+    // Varianzas.
+    sea media = suma / cuantos
+    sea ss = 0
+    para x en xs { ss = ss + (x - media) * (x - media) }
+    si (nombre == "var_pop") { retornar ss / cuantos }
+    si (nombre == "stddev_pop") { retornar raiz(ss / cuantos) }
+    si (cuantos < 2) { retornar nulo }
+    si (nombre == "variance" o nombre == "var_samp") { retornar ss / (cuantos - 1) }
+    si (nombre == "stddev" o nombre == "stddev_samp") { retornar raiz(ss / (cuantos - 1)) }
+    lanzar "analitica: agregado no soportado " + nombre
+}
+
+// ¿Hay agregados (no de ventana) en la expresión?
+funcion _ana_tiene_agregado(e) {
+    si (e == nulo o tipo(e) != "mapa") { retornar falso }
+    sea t = e["t"]
+    si (t == "fn") {
+        si (e["ventana"] == nulo y _ana_es_agregado(e["nombre"])) { retornar verdadero }
+        para a en e["args"] {
+            si (_ana_tiene_agregado(a)) { retornar verdadero }
+        }
+        retornar falso
+    }
+    si (t == "subq" o t == "exists") { retornar falso }
+    para k en ["a", "b", "lo", "hi", "patron", "base", "sino"] {
+        si (tiene_clave(e, k) y _ana_tiene_agregado(e[k])) { retornar verdadero }
+    }
+    si (t == "case") {
+        para par en e["cuando"] {
+            si (_ana_tiene_agregado(par[0]) o _ana_tiene_agregado(par[1])) { retornar verdadero }
+        }
+    }
+    si (t == "in" y e["lista"] != nulo) {
+        para x en e["lista"] {
+            si (_ana_tiene_agregado(x)) { retornar verdadero }
+        }
+    }
+    retornar falso
+}
+
+// Nodos de funciones de ventana dentro de la expresión.
+funcion _ana_ventanas(e, r) {
+    si (e == nulo o tipo(e) != "mapa") { retornar r }
+    sea t = e["t"]
+    si (t == "subq" o t == "exists") { retornar r }
+    si (t == "fn") {
+        si (e["ventana"] != nulo) { r.agregar(e) }
+        para a en e["args"] { _ana_ventanas(a, r) }
+        retornar r
+    }
+    para k en ["a", "b", "lo", "hi", "patron", "base", "sino"] {
+        si (tiene_clave(e, k)) { _ana_ventanas(e[k], r) }
+    }
+    si (t == "case") {
+        para par en e["cuando"] {
+            _ana_ventanas(par[0], r)
+            _ana_ventanas(par[1], r)
+        }
+    }
+    si (t == "in" y e["lista"] != nulo) {
+        para x en e["lista"] { _ana_ventanas(x, r) }
+    }
+    retornar r
+}
+
+funcion _ana_cmp_claves(a, b, orden) {
+    sea i = 0
+    mientras (i < longitud(orden)) {
+        sea x = a[i]
+        sea w = b[i]
+        sea o = orden[i]
+        sea c = 0
+        si (x == nulo y w == nulo) { c = 0 }
+        sino si (x == nulo) { c = si(o["nulos"] == "first", -1, 1) }
+        sino si (w == nulo) { c = si(o["nulos"] == "first", 1, -1) }
+        sino {
+            c = _ana_cmp(x, w)
+            si (o["desc"]) { c = 0 - c }
+        }
+        si (c != 0) { retornar c }
+        i = i + 1
+    }
+    retornar 0
+}
+
+// ---------- ejecución ----------
+
+funcion _ana_rel(cols, filas) { retornar {"cols": cols, "filas": filas} }
+
+funcion _ana_buscar(db, nombre) {
+    sea x = db
+    mientras (x != nulo) {
+        si (tiene_clave(x["tablas"], nombre)) { retornar x["tablas"][nombre] }
+        x = x["padre"] ?? nulo
+    }
+    retornar nulo
+}
+
+funcion _ana_valor_csv(t) {
+    si (t == "") { retornar nulo }
+    sea n = _ana_a_numero(t)
+    si (n != nulo) { retornar n }
+    sea m = texto_minusculas(t)
+    si (m == "true") { retornar verdadero }
+    si (m == "false") { retornar falso }
+    retornar t
+}
+
+funcion _ana_leer_csv(ruta, sep, cabecera) {
+    sea filas = csv_leer(leer_archivo(ruta), sep)
+    si (longitud(filas) == 0) { retornar _ana_rel([], []) }
+    sea nombres = []
+    sea inicio = 0
+    si (cabecera) {
+        para c en filas[0] { nombres.agregar(texto_minusculas(texto_recortar(c))) }
+        inicio = 1
+    } sino {
+        sea i = 0
+        para c en filas[0] {
+            nombres.agregar("column" + si(i < 10, "0", "") + i)
+            i = i + 1
+        }
+    }
+    // Tipo por columna: si algún valor no es número, la columna es de texto.
+    sea es_num = []
+    para c en nombres { es_num.agregar(verdadero) }
+    sea i = inicio
+    mientras (i < longitud(filas)) {
+        sea j = 0
+        para v en filas[i] {
+            si (j < longitud(es_num) y v != "" y _ana_a_numero(v) == nulo) { es_num[j] = falso }
+            j = j + 1
+        }
+        i = i + 1
+    }
+    sea r = []
+    i = inicio
+    mientras (i < longitud(filas)) {
+        sea f = filas[i]
+        si (longitud(f) > 1 o (longitud(f) == 1 y f[0] != "")) {
+            sea fila = []
+            sea j = 0
+            mientras (j < longitud(nombres)) {
+                sea v = si(j < longitud(f), f[j], "")
+                si (v == "") { fila.agregar(nulo) } sino si (es_num[j]) { fila.agregar(_ana_a_numero(v)) } sino {
+                    sea m = texto_minusculas(v)
+                    fila.agregar(si(m == "true", verdadero, si(m == "false", falso, v)))
+                }
+                j = j + 1
+            }
+            r.agregar(fila)
+        }
+        i = i + 1
+    }
+    sea cols = []
+    para c en nombres { cols.agregar({"tabla": nulo, "nombre": c}) }
+    retornar _ana_rel(cols, r)
+}
+
+funcion _ana_de_mapas(lista) {
+    sea nombres = []
+    sea vistos = {}
+    para m en lista {
+        para k en claves(m) {
+            si (tiene_clave(vistos, k) == falso) {
+                vistos[k] = verdadero
+                nombres.agregar(k)
+            }
+        }
+    }
+    sea filas = []
+    para m en lista {
+        sea f = []
+        para k en nombres { f.agregar(m[k] ?? nulo) }
+        filas.agregar(f)
+    }
+    sea cols = []
+    para k en nombres { cols.agregar({"tabla": nulo, "nombre": texto_minusculas(k)}) }
+    retornar _ana_rel(cols, filas)
+}
+
+// Ordena las columnas como aparecen en el primer objeto del JSON.
+funcion _ana_orden_json(rel, texto) {
+    sea orden = []
+    sea nivel = 0
+    sea i = 0
+    sea n = longitud(texto)
+    sea en_obj = falso
+    mientras (i < n) {
+        sea c = subtexto(texto, i, i + 1)
+        si (c == "\"") {
+            sea j = i + 1
+            mientras (j < n y subtexto(texto, j, j + 1) != "\"") {
+                si (subtexto(texto, j, j + 1) == "\\") { j = j + 1 }
+                j = j + 1
+            }
+            sea k = j + 1
+            mientras (k < n y subtexto(texto, k, k + 1) == " ") { k = k + 1 }
+            si (en_obj y nivel == 1 y subtexto(texto, k, k + 1) == ":") { orden.agregar(texto_minusculas(json_parsear(subtexto(texto, i, j + 1)))) }
+            i = j + 1
+        } sino {
+            si (c == "{") {
+                nivel = nivel + 1
+                en_obj = verdadero
+            }
+            si (c == "[" y en_obj) { nivel = nivel + 1 }
+            si (c == "]" y en_obj) { nivel = nivel - 1 }
+            si (c == "}") {
+                nivel = nivel - 1
+                si (nivel == 0) { romper }
+            }
+            i = i + 1
+        }
+    }
+    sea idx = []
+    para nombre en orden {
+        sea k = _ana_resolver(rel["cols"], {"tabla": nulo, "nombre": nombre})
+        si (k >= 0 y lista_contiene(idx, k) == falso) { idx.agregar(k) }
+    }
+    para k en lista_rango(0, longitud(rel["cols"])) {
+        si (lista_contiene(idx, k) == falso) { idx.agregar(k) }
+    }
+    sea cols = []
+    para k en idx { cols.agregar(rel["cols"][k]) }
+    sea filas = []
+    para f en rel["filas"] {
+        sea x = []
+        para k en idx { x.agregar(f[k]) }
+        filas.agregar(x)
+    }
+    retornar _ana_rel(cols, filas)
+}
+
+funcion _ana_renombrar(rel, alias, cols_alias) {
+    sea cols = []
+    sea i = 0
+    para c en rel["cols"] {
+        sea n = c["nombre"]
+        si (cols_alias != nulo y i < longitud(cols_alias)) { n = cols_alias[i] }
+        cols.agregar({"tabla": alias ?? c["tabla"], "nombre": n, "oculta": c["oculta"] ?? falso})
+        i = i + 1
+    }
+    retornar _ana_rel(cols, rel["filas"])
+}
+
+funcion _ana_from_eval(item, db, params, ext) {
+    sea t = item["t"]
+    sea alias = item["alias"] ?? nulo
+    sea cols_alias = item["cols_alias"] ?? nulo
+    si (t == "tabla") {
+        sea x = _ana_buscar(db, item["nombre"])
+        si (x == nulo) { lanzar "analitica: la tabla " + item["nombre"] + " no existe" }
+        sea rel = x
+        si (tiene_clave(x, "vista")) { rel = _ana_ejecutar_q(x["vista"], db, params, nulo) }
+        retornar _ana_renombrar(rel, alias ?? item["nombre"], cols_alias)
+    }
+    si (t == "sub") { retornar _ana_renombrar(_ana_ejecutar_q(item["q"], db, params, ext), alias, cols_alias) }
+    si (t == "funcion") {
+        sea ctx = {"cols": [], "fila": [], "grupo": nulo, "vent": nulo, "ext": ext, "db": db, "params": params, "alias": nulo}
+        sea args = []
+        sea opciones = {}
+        para a en item["args"] {
+            si (a["t"] == "nombrado") { opciones[a["k"]] = _ana_eval(a["e"], ctx) } sino { args.agregar(_ana_eval(a, ctx)) }
+        }
+        sea n = item["nombre"]
+        sea rel = nulo
+        si (n == "read_csv" o n == "read_csv_auto") {
+            sea sep = opciones["delim"] ?? (opciones["sep"] ?? ",")
+            sea cab = opciones["header"] ?? verdadero
+            rel = _ana_leer_csv(args[0], sep, cab)
+        } sino si (n == "read_json" o n == "read_json_auto") {
+            sea texto = leer_archivo(args[0])
+            sea datos = nulo
+            si (texto_empieza_con(texto_recortar(texto), "[")) { datos = json_parsear(texto) } sino {
+                datos = []
+                para ln en texto_dividir(texto, "\n") {
+                    si (texto_recortar(ln) != "") { datos.agregar(json_parsear(ln)) }
+                }
+            }
+            rel = _ana_de_mapas(datos)
+            rel = _ana_orden_json(rel, texto)
+        } sino si (n == "range" o n == "generate_series") {
+            sea ini = 0
+            sea fin = args[0]
+            sea paso = 1
+            si (longitud(args) > 1) {
+                ini = args[0]
+                fin = args[1]
+            }
+            si (longitud(args) > 2) { paso = args[2] }
+            si (n == "generate_series") { fin = fin + si(paso > 0, 1, -1) * 0.5 }
+            sea filas = []
+            sea v = ini
+            mientras ((paso > 0 y v < fin) o (paso < 0 y v > fin)) {
+                filas.agregar([v])
+                v = v + paso
+            }
+            rel = _ana_rel([{"tabla": nulo, "nombre": n}], filas)
+        } sino { lanzar "analitica: función de tabla desconocida " + n }
+        retornar _ana_renombrar(rel, alias ?? n, cols_alias)
+    }
+    si (t == "join") { retornar _ana_join(item, db, params, ext) }
+    lanzar "analitica: FROM no soportado"
+}
+
+// ¿Qué lados usa la expresión? "a", "b", "ambos" o "ninguno".
+funcion _ana_lados(e, ca, cb) {
+    sea cols = []
+    _ana_columnas_de(e, cols)
+    sea a = falso
+    sea b = falso
+    para c en cols {
+        sea en_a = _ana_resolver(ca, c) >= 0
+        sea en_b = falso
+        intentar { en_b = _ana_resolver(cb, c) >= 0 } capturar (x) { en_b = verdadero }
+        si (en_a y en_b) { retornar "ambos" }
+        si (en_a) { a = verdadero } sino si (en_b) { b = verdadero } sino { retornar "ambos" }
+    }
+    si (a y b) { retornar "ambos" }
+    si (a) { retornar "a" }
+    si (b) { retornar "b" }
+    retornar "ninguno"
+}
+
+funcion _ana_columnas_de(e, r) {
+    si (e == nulo o tipo(e) != "mapa") { retornar r }
+    si (e["t"] == "col") {
+        r.agregar(e)
+        retornar r
+    }
+    si (e["t"] == "subq" o e["t"] == "exists" o (e["t"] == "in" y e["sub"] != nulo)) {
+        // Puede depender de cualquier lado.
+        r.agregar({"t": "col", "tabla": "\u0001", "nombre": "\u0001"})
+        retornar r
+    }
+    si (e["t"] == "fn") {
+        para a en e["args"] { _ana_columnas_de(a, r) }
+        retornar r
+    }
+    para k en ["a", "b", "lo", "hi", "patron", "base", "sino"] {
+        si (tiene_clave(e, k)) { _ana_columnas_de(e[k], r) }
+    }
+    si (e["t"] == "case") {
+        para par en e["cuando"] {
+            _ana_columnas_de(par[0], r)
+            _ana_columnas_de(par[1], r)
+        }
+    }
+    si (e["t"] == "in" y e["lista"] != nulo) {
+        para x en e["lista"] { _ana_columnas_de(x, r) }
+    }
+    retornar r
+}
+
+funcion _ana_conjunciones(e, r) {
+    si (e != nulo y e["t"] == "bin" y e["op"] == "and") {
+        _ana_conjunciones(e["a"], r)
+        _ana_conjunciones(e["b"], r)
+    } sino si (e != nulo) { r.agregar(e) }
+    retornar r
+}
+
+funcion _ana_join(item, db, params, ext) {
+    sea ra = _ana_from_eval(item["a"], db, params, ext)
+    sea rb = _ana_from_eval(item["b"], db, params, ext)
+    sea tipo_j = item["tipo"]
+    sea on = item["on"]
+    sea pares_using = []
+    sea cols_b = []
+    para c en rb["cols"] { cols_b.agregar({"tabla": c["tabla"], "nombre": c["nombre"], "oculta": c["oculta"] ?? falso}) }
+    si (item["using"] != nulo) {
+        para u en item["using"] {
+            sea ia = _ana_resolver(ra["cols"], {"tabla": nulo, "nombre": u})
+            sea ib = _ana_resolver(rb["cols"], {"tabla": nulo, "nombre": u})
+            si (ia < 0 o ib < 0) { lanzar "analitica: USING(" + u + ") no está en ambos lados" }
+            pares_using.agregar([ia, ib])
+            cols_b[ib]["oculta"] = verdadero
+        }
+    }
+    sea cols = []
+    para c en ra["cols"] { cols.agregar(c) }
+    para c en cols_b { cols.agregar(c) }
+    sea na = longitud(ra["cols"])
+    sea nb = longitud(rb["cols"])
+    // Igualdades a un lado y otro: join por hash.
+    sea claves_a = []
+    sea claves_b = []
+    sea resto = []
+    para pu en pares_using {
+        claves_a.agregar({"t": "idx", "i": pu[0]})
+        claves_b.agregar({"t": "idx", "i": pu[1]})
+    }
+    si (on != nulo) {
+        para c en _ana_conjunciones(on, []) {
+            sea usado = falso
+            si (c["t"] == "bin" y c["op"] == "=") {
+                sea la = _ana_lados(c["a"], ra["cols"], rb["cols"])
+                sea lb = _ana_lados(c["b"], ra["cols"], rb["cols"])
+                si (la == "a" y lb == "b") {
+                    claves_a.agregar(c["a"])
+                    claves_b.agregar(c["b"])
+                    usado = verdadero
+                } sino si (la == "b" y lb == "a") {
+                    claves_a.agregar(c["b"])
+                    claves_b.agregar(c["a"])
+                    usado = verdadero
+                }
+            }
+            si (usado == falso) { resto.agregar(c) }
+        }
+    }
+    sea ambito = {"ext": ext, "db": db, "params": params}
+    sea ctx_a = _ana_ctx(ra["cols"], nulo, ambito)
+    sea ctx_b = _ana_ctx(rb["cols"], nulo, ambito)
+    sea ctx_ab = _ana_ctx(cols, nulo, ambito)
+    sea clave_de = funcion(exprs, ctx, fila) {
+        ctx["fila"] = fila
+        sea vals = []
+        para x en exprs {
+            si (x["t"] == "idx") { vals.agregar(fila[x["i"]]) } sino { vals.agregar(_ana_eval(x, ctx)) }
+        }
+        para v en vals {
+            si (v == nulo) { retornar nulo }
+        }
+        // Números y textos numéricos casan entre sí.
+        sea norm = []
+        para v en vals { norm.agregar(si(_ana_es_num(v), _ana_texto(v), "" + v)) }
+        retornar unir(norm, "\u0002")
+    }
+    sea indice = nulo
+    si (longitud(claves_a) > 0) {
+        indice = {}
+        sea j = 0
+        para fb en rb["filas"] {
+            sea k = clave_de(claves_b, ctx_b, fb)
+            si (k != nulo) {
+                si (tiene_clave(indice, k) == falso) { indice[k] = [] }
+                indice[k].agregar(j)
+            }
+            j = j + 1
+        }
+    }
+    sea vacio_a = []
+    para c en ra["cols"] { vacio_a.agregar(nulo) }
+    sea vacio_b = []
+    para c en rb["cols"] { vacio_b.agregar(nulo) }
+    sea usados_b = {}
+    sea filas = []
+    para fa en ra["filas"] {
+        sea candidatos = nulo
+        si (indice != nulo) {
+            sea k = clave_de(claves_a, ctx_a, fa)
+            candidatos = si(k == nulo, [], indice[k] ?? [])
+        } sino { candidatos = lista_rango(0, longitud(rb["filas"])) }
+        sea alguno = falso
+        para j en candidatos {
+            sea fb = rb["filas"][j]
+            sea fila = []
+            para v en fa { fila.agregar(v) }
+            para v en fb { fila.agregar(v) }
+            sea ok = verdadero
+            si (tipo_j != "cross") {
+                ctx_ab["fila"] = fila
+                para c en resto {
+                    si (ok y _ana_verdad(_ana_eval(c, ctx_ab)) == falso) { ok = falso }
+                }
+            }
+            si (ok) {
+                alguno = verdadero
+                usados_b["" + j] = verdadero
+                filas.agregar(fila)
+            }
+        }
+        si (alguno == falso y (tipo_j == "left" o tipo_j == "full")) {
+            sea fila = []
+            para v en fa { fila.agregar(v) }
+            para v en vacio_b { fila.agregar(v) }
+            filas.agregar(fila)
+        }
+    }
+    si (tipo_j == "right" o tipo_j == "full") {
+        sea j = 0
+        para fb en rb["filas"] {
+            si (tiene_clave(usados_b, "" + j) == falso) {
+                sea fila = []
+                para v en vacio_a { fila.agregar(v) }
+                para v en fb { fila.agregar(v) }
+                // USING: la columna visible toma el valor de la derecha.
+                para pu en pares_using { fila[pu[0]] = fb[pu[1]] }
+                filas.agregar(fila)
+            }
+            j = j + 1
+        }
+    }
+    retornar _ana_rel(cols, filas)
+}
+
+// Nombre de una columna de salida.
+funcion _ana_nombre_expr(e) {
+    si (e["t"] == "col") { retornar e["nombre"] }
+    si (e["t"] == "fn") {
+        si (e["estrella"]) { retornar e["nombre"] + "_star()" }
+        sea partes = []
+        para a en e["args"] { partes.agregar(_ana_nombre_expr(a)) }
+        retornar e["nombre"] + "(" + si(e["distinct"], "DISTINCT ", "") + unir(partes, ", ") + ")"
+    }
+    si (e["t"] == "lit") {
+        si (tipo(e["v"]) == "texto") { retornar "'" + e["v"] + "'" }
+        retornar si(e["v"] == nulo, "NULL", _ana_texto(e["v"]))
+    }
+    si (e["t"] == "bin") { retornar "(" + _ana_nombre_expr(e["a"]) + " " + e["op"] + " " + _ana_nombre_expr(e["b"]) + ")" }
+    si (e["t"] == "cast") { retornar "CAST(" + _ana_nombre_expr(e["a"]) + " AS " + texto_mayusculas(e["tipo"]) + ")" }
+    retornar e["t"]
+}
+
+funcion _ana_ejecutar_q(q, db, params, ext) {
+    sea t = q["t"]
+    si (t == "select") { retornar _ana_select(q, db, params, ext) }
+    si (t == "values") {
+        sea ctx = {"cols": [], "fila": [], "grupo": nulo, "vent": nulo, "ext": ext, "db": db, "params": params, "alias": nulo}
+        sea filas = []
+        para f en q["filas"] {
+            sea r = []
+            para e en f { r.agregar(_ana_eval(e, ctx)) }
+            filas.agregar(r)
+        }
+        sea cols = []
+        para i en lista_rango(0, longitud(q["filas"][0])) { cols.agregar({"tabla": nulo, "nombre": "col" + i}) }
+        retornar _ana_rel(cols, filas)
+    }
+    si (t == "with") {
+        sea local = {"tablas": {}, "padre": db}
+        para c en q["ctes"] {
+            sea r = _ana_ejecutar_q(c["q"], local, params, ext)
+            local["tablas"][c["nombre"]] = _ana_renombrar(r, nulo, c["cols"])
+        }
+        retornar _ana_ejecutar_q(q["q"], local, params, ext)
+    }
+    si (t == "setop") {
+        sea a = _ana_ejecutar_q(q["a"], db, params, ext)
+        sea b = _ana_ejecutar_q(q["b"], db, params, ext)
+        si (longitud(a["cols"]) != longitud(b["cols"])) { lanzar "analitica: " + texto_mayusculas(q["op"]) + " con distinta cantidad de columnas" }
+        sea filas = []
+        si (q["op"] == "union") {
+            para f en a["filas"] { filas.agregar(f) }
+            para f en b["filas"] { filas.agregar(f) }
+            si (q["todo"] == falso) { filas = _ana_distintas(filas) }
+        } sino {
+            sea cuenta = {}
+            para f en b["filas"] {
+                sea k = _ana_clave(f)
+                cuenta[k] = (cuenta[k] ?? 0) + 1
+            }
+            sea base = si(q["todo"], a["filas"], _ana_distintas(a["filas"]))
+            para f en base {
+                sea k = _ana_clave(f)
+                sea hay = (cuenta[k] ?? 0) > 0
+                si ((q["op"] == "intersect") == hay) {
+                    filas.agregar(f)
+                    si (q["todo"] y hay) { cuenta[k] = cuenta[k] - 1 }
+                } sino si (q["todo"] y hay) { cuenta[k] = cuenta[k] - 1 }
+            }
+        }
+        sea cols = []
+        para c en a["cols"] { cols.agregar({"tabla": nulo, "nombre": c["nombre"]}) }
+        retornar _ana_rel(cols, filas)
+    }
+    si (t == "envoltura") {
+        sea r = _ana_ejecutar_q(q["q"], db, params, ext)
+        sea cols = []
+        para c en r["cols"] { cols.agregar({"tabla": nulo, "nombre": c["nombre"]}) }
+        sea ambito = {"ext": ext, "db": db, "params": params}
+        sea items = []
+        para f en r["filas"] { items.agregar({"ctx": _ana_ctx(cols, f, ambito), "salida": f}) }
+        retornar _ana_rel(cols, _ana_ordenar_limitar(items, q, cols, nulo, {"ext": ext, "db": db, "params": params}))
+    }
+    lanzar "analitica: consulta no soportada " + t
+}
+
+funcion _ana_distintas(filas) {
+    sea vistos = {}
+    sea r = []
+    para f en filas {
+        sea k = _ana_clave(f)
+        si (tiene_clave(vistos, k) == falso) {
+            vistos[k] = verdadero
+            r.agregar(f)
+        }
+    }
+    retornar r
+}
+
+funcion _ana_entero_lit(e) { retornar e["t"] == "lit" y _ana_es_num(e["v"]) y piso(e["v"]) == e["v"] }
+
+funcion _ana_select(q, db, params, ext) {
+    sea ambito = {"ext": ext, "db": db, "params": params}
+    sea rel = nulo
+    si (q["from"] == nulo) { rel = _ana_rel([], [[]]) } sino { rel = _ana_from_eval(q["from"], db, params, ext) }
+    sea cols = rel["cols"]
+    // Alias del SELECT, usables en WHERE, GROUP BY y HAVING.
+    sea alias = {}
+    para c en q["cols"] {
+        si ((c["alias"] ?? nulo) != nulo) { alias[c["alias"]] = c["e"] }
+    }
+    sea ctx = _ana_ctx(cols, nulo, ambito)
+    ctx["alias"] = alias
+    sea filas = rel["filas"]
+    si (q["where"] != nulo) {
+        sea f2 = []
+        para f en filas {
+            ctx["fila"] = f
+            ctx["alias"] = alias
+            si (_ana_verdad(_ana_eval(q["where"], ctx))) { f2.agregar(f) }
+        }
+        filas = f2
+    }
+    // ¿Agregación?
+    sea agregada = q["group"] != nulo o q["group_all"] o _ana_tiene_agregado(q["having"])
+    para c en q["cols"] {
+        si (tiene_clave(c, "e") y _ana_tiene_agregado(c["e"])) { agregada = verdadero }
+    }
+    si (q["orden"] != nulo) {
+        para o en q["orden"] {
+            si (_ana_tiene_agregado(o["e"])) { agregada = verdadero }
+        }
+    }
+    sea items = []
+    si (agregada) {
+        sea claves_g = []
+        si (q["group_all"]) {
+            para c en q["cols"] {
+                si (tiene_clave(c, "e") y _ana_tiene_agregado(c["e"]) == falso y longitud(_ana_ventanas(c["e"], [])) == 0) { claves_g.agregar(c["e"]) }
+            }
+        } sino si (q["group"] != nulo) {
+            para g en q["group"] {
+                si (_ana_entero_lit(g)) { claves_g.agregar(q["cols"][g["v"] - 1]["e"]) } sino { claves_g.agregar(g) }
+            }
+        }
+        sea grupos = {}
+        sea orden_g = []
+        para f en filas {
+            ctx["fila"] = f
+            ctx["alias"] = alias
+            sea vals = []
+            para g en claves_g { vals.agregar(_ana_eval(g, ctx)) }
+            sea k = _ana_clave(vals)
+            si (tiene_clave(grupos, k) == falso) {
+                grupos[k] = []
+                orden_g.agregar(k)
+            }
+            grupos[k].agregar(f)
+        }
+        si (longitud(claves_g) == 0 y longitud(orden_g) == 0) {
+            grupos[""] = []
+            orden_g.agregar("")
+        }
+        sea vacia = []
+        para c en cols { vacia.agregar(nulo) }
+        para k en orden_g {
+            sea g = grupos[k]
+            sea c = _ana_ctx(cols, si(longitud(g) > 0, g[0], vacia), ambito)
+            c["grupo"] = g
+            c["alias"] = alias
+            items.agregar({"ctx": c})
+        }
+        si (q["having"] != nulo) {
+            sea i2 = []
+            para it en items {
+                si (_ana_verdad(_ana_eval(q["having"], it["ctx"]))) { i2.agregar(it) }
+            }
+            items = i2
+        }
+    } sino {
+        para f en filas {
+            sea c = _ana_ctx(cols, f, ambito)
+            c["alias"] = alias
+            items.agregar({"ctx": c})
+        }
+    }
+    // Ventanas.
+    sea vents = []
+    para c en q["cols"] {
+        si (tiene_clave(c, "e")) { _ana_ventanas(c["e"], vents) }
+    }
+    _ana_ventanas(q["qualify"], vents)
+    si (q["orden"] != nulo) {
+        para o en q["orden"] { _ana_ventanas(o["e"], vents) }
+    }
+    si (longitud(vents) > 0) {
+        para it en items { it["ctx"]["vent"] = {} }
+        sea est = _ana_raiz(db)["_estado"]
+        para w en vents {
+            si (tiene_clave(w, "_id") == falso) {
+                est["ids"] = est["ids"] + 1
+                w["_id"] = "v" + est["ids"]
+            }
+            _ana_calcular_ventana(w, items)
+        }
+    }
+    si (q["qualify"] != nulo) {
+        sea i2 = []
+        para it en items {
+            si (_ana_verdad(_ana_eval(q["qualify"], it["ctx"]))) { i2.agregar(it) }
+        }
+        items = i2
+    }
+    // Proyección.
+    sea cols_sal = []
+    para c en q["cols"] {
+        si (tiene_clave(c, "estrella")) {
+            sea i = 0
+            para col en cols {
+                si ((col["oculta"] ?? falso) == falso y (c["estrella"] == nulo o col["tabla"] == c["estrella"])) { cols_sal.agregar({"tabla": nulo, "nombre": col["nombre"], "idx": i}) }
+                i = i + 1
+            }
+        } sino { cols_sal.agregar({"tabla": nulo, "nombre": c["alias"] ?? _ana_nombre_expr(c["e"]), "e": c["e"]}) }
+    }
+    para it en items {
+        sea sal = []
+        para cs en cols_sal {
+            si (tiene_clave(cs, "idx")) { sal.agregar(it["ctx"]["fila"][cs["idx"]]) } sino {
+                it["ctx"]["alias"] = nulo
+                sal.agregar(_ana_eval(cs["e"], it["ctx"]))
+            }
+        }
+        it["salida"] = sal
+    }
+    sea cols_finales = []
+    para cs en cols_sal { cols_finales.agregar({"tabla": nulo, "nombre": cs["nombre"]}) }
+    sea filas_sal = _ana_ordenar_limitar(items, q, cols_finales, q["distinct"], ambito)
+    retornar _ana_rel(cols_finales, filas_sal)
+}
+
+// ORDER BY (alias, posiciones o expresiones), DISTINCT, OFFSET y LIMIT.
+funcion _ana_ordenar_limitar(items, q, cols_sal, distinct, ambito) {
+    sea lista = items
+    si (distinct == verdadero) {
+        sea vistos = {}
+        sea r = []
+        para it en lista {
+            sea k = _ana_clave(it["salida"])
+            si (tiene_clave(vistos, k) == falso) {
+                vistos[k] = verdadero
+                r.agregar(it)
+            }
+        }
+        lista = r
+    }
+    si (q["orden"] != nulo) {
+        para it en lista {
+            sea ks = []
+            para o en q["orden"] {
+                sea e = o["e"]
+                sea v = nulo
+                si (_ana_entero_lit(e)) { v = it["salida"][e["v"] - 1] }
+                sino {
+                    sea idx = -1
+                    si (e["t"] == "col" y e["tabla"] == nulo) {
+                        sea i = 0
+                        para c en cols_sal {
+                            si (idx < 0 y c["nombre"] == e["nombre"]) { idx = i }
+                            i = i + 1
+                        }
+                    }
+                    si (idx >= 0) { v = it["salida"][idx] } sino {
+                        it["ctx"]["alias"] = nulo
+                        v = _ana_eval(e, it["ctx"])
+                    }
+                }
+                ks.agregar(v)
+            }
+            it["claves"] = ks
+        }
+        sea ord = q["orden"]
+        lista = _ana_ordenar_estable(lista, funcion(p, r) { retornar _ana_cmp_claves(p["claves"], r["claves"], ord) })
+    }
+    sea ctx0 = {"cols": [], "fila": [], "grupo": nulo, "vent": nulo, "ext": ambito["ext"], "db": ambito["db"], "params": ambito["params"], "alias": nulo}
+    sea desde = 0
+    si (q["desde"] != nulo) { desde = _ana_num(_ana_eval(q["desde"], ctx0)) }
+    sea hasta = longitud(lista)
+    si (q["limite"] != nulo) { hasta = minimo(hasta, desde + _ana_num(_ana_eval(q["limite"], ctx0))) }
+    sea r = []
+    sea i = desde
+    mientras (i < hasta) {
+        r.agregar(lista[i]["salida"])
+        i = i + 1
+    }
+    retornar r
+}
+
+// ---------- ventanas ----------
+
+funcion _ana_calcular_ventana(w, items) {
+    sea v = w["ventana"]
+    sea parts = {}
+    sea orden_p = []
+    para it en items {
+        sea vals = []
+        para e en v["particion"] { vals.agregar(_ana_eval(e, it["ctx"])) }
+        sea k = _ana_clave(vals)
+        si (tiene_clave(parts, k) == falso) {
+            parts[k] = []
+            orden_p.agregar(k)
+        }
+        parts[k].agregar(it)
+    }
+    sea ord = v["orden"]
+    para k en orden_p {
+        sea p = parts[k]
+        si (ord != nulo) {
+            para it en p {
+                sea ks = []
+                para o en ord { ks.agregar(_ana_eval(o["e"], it["ctx"])) }
+                it["_ko"] = ks
+            }
+            p = _ana_ordenar_estable(p, funcion(a, b) { retornar _ana_cmp_claves(a["_ko"], b["_ko"], ord) })
+        }
+        _ana_ventana_particion(w, p)
+    }
+}
+
+funcion _ana_pares(p, ord, i) {
+    // [inicio, fin) del grupo de pares (mismo orden) de la fila i.
+    si (ord == nulo) { retornar [0, longitud(p)] }
+    sea a = i
+    mientras (a > 0 y _ana_cmp_claves(p[a - 1]["_ko"], p[i]["_ko"], ord) == 0) { a = a - 1 }
+    sea b = i + 1
+    mientras (b < longitud(p) y _ana_cmp_claves(p[b]["_ko"], p[i]["_ko"], ord) == 0) { b = b + 1 }
+    retornar [a, b]
+}
+
+funcion _ana_marco(w, p, i) {
+    sea v = w["ventana"]
+    sea n = longitud(p)
+    sea m = v["marco"]
+    si (m == nulo) {
+        si (v["orden"] == nulo) { retornar [0, n] }
+        retornar [0, _ana_pares(p, v["orden"], i)[1]]
+    }
+    sea lim = funcion(b, es_inicio) {
+        si (b["tipo"] == "ilimitado_antes") { retornar 0 }
+        si (b["tipo"] == "ilimitado_despues") { retornar n }
+        si (b["tipo"] == "actual") {
+            si (m["modo"] == "range") {
+                sea pr = _ana_pares(p, v["orden"], i)
+                retornar si(es_inicio, pr[0], pr[1])
+            }
+            retornar si(es_inicio, i, i + 1)
+        }
+        sea k = b["n"]
+        si (m["modo"] == "rows") {
+            si (b["tipo"] == "antes") { retornar si(es_inicio, i - k, i - k + 1) }
+            retornar si(es_inicio, i + k, i + k + 1)
+        }
+        // RANGE con desplazamiento numérico sobre la primera clave de orden.
+        sea x = p[i]["_ko"][0]
+        sea desc = v["orden"][0]["desc"]
+        sea objetivo = si((b["tipo"] == "antes") != desc, x - k, x + k)
+        si (es_inicio) {
+            sea j = 0
+            mientras (j < n y (p[j]["_ko"][0] == nulo o (si(desc, p[j]["_ko"][0] > objetivo, p[j]["_ko"][0] < objetivo)))) { j = j + 1 }
+            retornar j
+        }
+        sea j = n
+        mientras (j > 0 y (p[j - 1]["_ko"][0] == nulo o (si(desc, p[j - 1]["_ko"][0] < objetivo, p[j - 1]["_ko"][0] > objetivo)))) { j = j - 1 }
+        retornar j
+    }
+    sea a = maximo(0, lim(m["ini"], verdadero))
+    sea b = minimo(n, lim(m["fin"], falso))
+    retornar [a, maximo(a, b)]
+}
+
+funcion _ana_ventana_particion(w, p) {
+    sea nombre = w["nombre"]
+    sea id = w["_id"]
+    sea n = longitud(p)
+    sea ord = w["ventana"]["orden"]
+    si (nombre == "row_number") {
+        para i en lista_rango(0, n) { p[i]["ctx"]["vent"][id] = i + 1 }
+        retornar nulo
+    }
+    si (nombre == "rank" o nombre == "dense_rank" o nombre == "percent_rank" o nombre == "cume_dist") {
+        sea rango = 1
+        sea denso = 1
+        para i en lista_rango(0, n) {
+            si (i > 0 y ord != nulo y _ana_cmp_claves(p[i - 1]["_ko"], p[i]["_ko"], ord) != 0) {
+                rango = i + 1
+                denso = denso + 1
+            }
+            sea val = rango
+            si (nombre == "dense_rank") { val = denso }
+            si (nombre == "percent_rank") { val = si(n > 1, (rango - 1) / (n - 1), 0) }
+            si (nombre == "cume_dist") { val = _ana_pares(p, ord, i)[1] / n }
+            p[i]["ctx"]["vent"][id] = val
+        }
+        retornar nulo
+    }
+    si (nombre == "ntile") {
+        sea k = _ana_num(_ana_eval(w["args"][0], p[0]["ctx"]))
+        sea base = cociente(n, k)
+        sea extra = n % k
+        sea i = 0
+        sea grupo = 1
+        mientras (i < n) {
+            sea tam = base + si(grupo <= extra, 1, 0)
+            sea j = 0
+            mientras (j < tam y i < n) {
+                p[i]["ctx"]["vent"][id] = grupo
+                i = i + 1
+                j = j + 1
+            }
+            grupo = grupo + 1
+        }
+        retornar nulo
+    }
+    si (nombre == "lag" o nombre == "lead") {
+        para i en lista_rango(0, n) {
+            sea c = p[i]["ctx"]
+            sea desp = 1
+            si (longitud(w["args"]) > 1) { desp = _ana_num(_ana_eval(w["args"][1], c)) }
+            sea j = si(nombre == "lag", i - desp, i + desp)
+            sea val = nulo
+            si (j >= 0 y j < n) { val = _ana_eval(w["args"][0], p[j]["ctx"]) } sino si (longitud(w["args"]) > 2) { val = _ana_eval(w["args"][2], c) }
+            c["vent"][id] = val
+        }
+        retornar nulo
+    }
+    // Funciones sobre el marco.
+    para i en lista_rango(0, n) {
+        sea fr = _ana_marco(w, p, i)
+        sea val = nulo
+        si (nombre == "first_value" o nombre == "last_value" o nombre == "nth_value") {
+            sea j = fr[0]
+            si (nombre == "last_value") { j = fr[1] - 1 }
+            si (nombre == "nth_value") { j = fr[0] + _ana_num(_ana_eval(w["args"][1], p[i]["ctx"])) - 1 }
+            si (j >= fr[0] y j < fr[1]) { val = _ana_eval(w["args"][0], p[j]["ctx"]) }
+        } sino si (_ana_es_agregado(nombre)) {
+            sea ctxs = []
+            sea j = fr[0]
+            mientras (j < fr[1]) {
+                ctxs.agregar(p[j]["ctx"])
+                j = j + 1
+            }
+            sea sin_v = {}
+            para k en claves(w) { sin_v[k] = w[k] }
+            sin_v["ventana"] = nulo
+            val = _ana_agregado(sin_v, ctxs)
+        } sino { lanzar "analitica: función de ventana desconocida " + nombre }
+        p[i]["ctx"]["vent"][id] = val
+    }
+    retornar nulo
+}
+
+// ---------- API ----------
+
+/// Base en memoria vacía.
+funcion analitica_abrir() { retornar {"tablas": {}, "padre": nulo, "_estado": {"ext_usos": 0, "ejecucion": 0, "ids": 0}} }
+
+/// Registra una tabla desde una lista de mapas (o una tabla de "tabla").
+funcion analitica_registrar(db, nombre, datos) {
+    sea filas = datos
+    si (tipo(datos) == "mapa" y tiene_clave(datos, "filas")) { filas = datos["filas"] }
+    db["tablas"][texto_minusculas(nombre)] = _ana_de_mapas(filas)
+}
+
+/// Tablas y vistas existentes.
+funcion analitica_tablas(db) { retornar ordenar(claves(db["tablas"]), funcion(a, b) { retornar si(a < b, -1, si(a > b, 1, 0)) }) }
+
+funcion _ana_sentencia_ejecutar(db, s, params) {
+    sea est = db["_estado"]
+    est["ejecucion"] = est["ejecucion"] + 1
+    sea t = s["t"]
+    si (t == "create" o t == "create_as" o t == "create_view") {
+        si (tiene_clave(db["tablas"], s["nombre"])) {
+            si (s["si_no"] ?? falso) { retornar {"columnas": [], "filas": [], "cambios": 0} }
+            si (s["reemplazar"] == falso) { lanzar "analitica: la tabla " + s["nombre"] + " ya existe" }
+        }
+        si (t == "create_view") {
+            sea cols = _ana_ejecutar_q(s["q"], db, params, nulo)["cols"]
+            db["tablas"][s["nombre"]] = {"vista": s["q"], "cols": cols, "filas": []}
+            retornar {"columnas": [], "filas": [], "cambios": 0}
+        }
+        si (t == "create") {
+            sea cols = []
+            para c en s["cols"] { cols.agregar({"tabla": nulo, "nombre": c}) }
+            db["tablas"][s["nombre"]] = _ana_rel(cols, [])
+            retornar {"columnas": [], "filas": [], "cambios": 0}
+        }
+        sea r = _ana_ejecutar_q(s["q"], db, params, nulo)
+        db["tablas"][s["nombre"]] = _ana_renombrar(r, nulo, nulo)
+        retornar {"columnas": [], "filas": [], "cambios": longitud(r["filas"])}
+    }
+    si (t == "drop") {
+        si (tiene_clave(db["tablas"], s["nombre"]) == falso) {
+            si (s["si_existe"]) { retornar {"columnas": [], "filas": [], "cambios": 0} }
+            lanzar "analitica: la tabla " + s["nombre"] + " no existe"
+        }
+        quitar_clave(db["tablas"], s["nombre"])
+        retornar {"columnas": [], "filas": [], "cambios": 0}
+    }
+    si (t == "insert") {
+        sea tb = _ana_buscar(db, s["nombre"])
+        si (tb == nulo o tiene_clave(tb, "vista")) { lanzar "analitica: la tabla " + s["nombre"] + " no existe" }
+        sea r = _ana_ejecutar_q(s["q"], db, params, nulo)
+        sea destino = []
+        si (s["cols"] == nulo) { destino = lista_rango(0, longitud(tb["cols"])) } sino {
+            para c en s["cols"] {
+                sea i = _ana_resolver(tb["cols"], {"tabla": nulo, "nombre": c})
+                si (i < 0) { lanzar "analitica: la columna " + c + " no existe en " + s["nombre"] }
+                destino.agregar(i)
+            }
+        }
+        para f en r["filas"] {
+            si (longitud(f) != longitud(destino)) { lanzar "analitica: INSERT con " + longitud(f) + " valores para " + longitud(destino) + " columnas" }
+            sea nueva = []
+            para c en tb["cols"] { nueva.agregar(nulo) }
+            sea i = 0
+            para d en destino {
+                nueva[d] = f[i]
+                i = i + 1
+            }
+            tb["filas"].agregar(nueva)
+        }
+        retornar {"columnas": [], "filas": [], "cambios": longitud(r["filas"])}
+    }
+    si (t == "update" o t == "delete") {
+        sea tb = _ana_buscar(db, s["nombre"])
+        si (tb == nulo o tiene_clave(tb, "vista")) { lanzar "analitica: la tabla " + s["nombre"] + " no existe" }
+        sea ctx = _ana_ctx(tb["cols"], nulo, {"ext": nulo, "db": db, "params": params})
+        sea quedan = []
+        sea cambios = 0
+        para f en tb["filas"] {
+            ctx["fila"] = f
+            sea toca = s["where"] == nulo o _ana_verdad(_ana_eval(s["where"], ctx))
+            si (toca) { cambios = cambios + 1 }
+            si (t == "delete") {
+                si (toca == falso) { quedan.agregar(f) }
+            } sino {
+                si (toca) {
+                    sea nuevos = []
+                    para a en s["asign"] { nuevos.agregar([_ana_resolver(tb["cols"], {"tabla": nulo, "nombre": a[0]}), _ana_eval(a[1], ctx)]) }
+                    para nv en nuevos {
+                        si (nv[0] < 0) { lanzar "analitica: columna desconocida en UPDATE" }
+                        f[nv[0]] = nv[1]
+                    }
+                }
+                quedan.agregar(f)
+            }
+        }
+        tb["filas"] = quedan
+        retornar {"columnas": [], "filas": [], "cambios": cambios}
+    }
+    sea r = _ana_ejecutar_q(s, db, params, nulo)
+    sea nombres = []
+    para c en r["cols"] { nombres.agregar(c["nombre"]) }
+    retornar {"columnas": nombres, "filas": r["filas"], "cambios": 0}
+}
+
+/// Ejecuta una o varias sentencias (separadas por ;). Devuelve el resultado
+/// de la última: {"columnas", "filas" (listas), "cambios"}.
+funcion analitica_consulta(db, sql, params) {
+    sea r = nulo
+    para s en _ana_sentencias(sql) { r = _ana_sentencia_ejecutar(db, s, params ?? []) }
+    si (r == nulo) { retornar {"columnas": [], "filas": [], "cambios": 0} }
+    retornar r
+}
+
+/// Ejecuta sentencias sin resultado (CREATE, INSERT…); devuelve las filas afectadas.
+funcion analitica_ejecutar(db, sql) { retornar analitica_consulta(db, sql, nulo)["cambios"] }
+
+/// Resultado como lista de mapas columna → valor.
+funcion analitica_filas(db, sql, params) {
+    sea r = analitica_consulta(db, sql, params)
+    sea lista = []
+    para f en r["filas"] {
+        sea m = {}
+        sea i = 0
+        para c en r["columnas"] {
+            m[c] = f[i]
+            i = i + 1
+        }
+        lista.agregar(m)
+    }
+    retornar lista
+}
+
+/// Primer valor de la primera fila (o nulo).
+funcion analitica_valor(db, sql, params) {
+    sea r = analitica_consulta(db, sql, params)
+    si (longitud(r["filas"]) == 0) { retornar nulo }
+    retornar r["filas"][0][0]
+}
+
+/// Resultado como CSV con cabecera.
+funcion analitica_csv(resultado) {
+    sea filas = [resultado["columnas"]]
+    para f en resultado["filas"] {
+        sea x = []
+        para v en f { x.agregar(si(v == nulo, "", _ana_texto(v))) }
+        filas.agregar(x)
+    }
+    retornar csv_escribir(filas, ",")
+}

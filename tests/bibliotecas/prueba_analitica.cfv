@@ -1,0 +1,59 @@
+// Pruebas de analitica. datos/analitica/esperado.json sale de DuckDB 1.x:
+// 59 consultas (agregados, joins, ventanas, CTE, subconsultas, conjuntos…)
+// sobre ventas.csv, clientes.csv y productos.json.
+importar "analitica"
+importar "json"
+funcion eq(a, b, q) { afirmar(("" + a) == ("" + b), q + ": [" + a + "] != [" + b + "]") }
+funcion igual(a, b) {
+    si (a == nulo o b == nulo) { retornar a == nulo y b == nulo }
+    si (tipo(a) == "numero" y tipo(b) == "numero") { retornar absoluto(a - b) <= 1e-6 * maximo(1, absoluto(b)) }
+    si (tipo(a) == "lista" y tipo(b) == "lista") {
+        si (longitud(a) != longitud(b)) { retornar falso }
+        para i en lista_rango(0, longitud(a)) {
+            si (igual(a[i], b[i]) == falso) { retornar falso }
+        }
+        retornar verdadero
+    }
+    retornar ("" + a) == ("" + b)
+}
+
+sea D = "tests/bibliotecas/datos/analitica/"
+sea db = analitica_abrir()
+analitica_ejecutar(db, "CREATE TABLE ventas AS SELECT * FROM read_csv('" + D + "ventas.csv');\nCREATE TABLE clientes AS SELECT * FROM read_csv('" + D + "clientes.csv');\nCREATE TABLE productos AS SELECT * FROM read_json('" + D + "productos.json')")
+eq(analitica_tablas(db), ["clientes", "productos", "ventas"], "tablas")
+para c en json_parsear(leer_archivo(D + "esperado.json")) {
+    sea r = analitica_consulta(db, c["sql"], nulo)["filas"]
+    afirmar(igual(r, c["filas"]), c["sql"] + "\n  " + r + "\n  " + c["filas"])
+}
+
+// Nombres de columnas, parámetros y valores sueltos.
+sea r = analitica_consulta(db, "SELECT region AS zona, count(*) FROM ventas WHERE cantidad > ? GROUP BY 1 ORDER BY 1 LIMIT $2", [18, 2])
+eq(r["columnas"], ["zona", "count_star()"], "nombres de columnas")
+eq(longitud(r["filas"]), 2, "parámetros")
+eq(analitica_valor(db, "SELECT count(*) FROM ventas WHERE region = ?", ["Norte"]), analitica_valor(db, "SELECT count(*) FROM ventas WHERE region = 'Norte'", nulo), "parámetro de texto")
+eq(analitica_valor(db, "SELECT 'O''Higgins'", nulo), "O'Higgins", "comillas")
+
+// DML y vistas.
+sea m = analitica_abrir()
+eq(analitica_ejecutar(m, "CREATE TABLE t (id INTEGER PRIMARY KEY, nombre VARCHAR(20), x DOUBLE); INSERT INTO t VALUES (1, 'a', 1.5), (2, 'b', NULL), (3, 'c', 3)"), 3, "insert")
+analitica_ejecutar(m, "INSERT INTO t (nombre, id) SELECT 'd', 4")
+eq(analitica_ejecutar(m, "UPDATE t SET x = coalesce(x, 0) + 10 WHERE id >= 2"), 3, "update")
+eq(analitica_ejecutar(m, "DELETE FROM t WHERE nombre = 'c'"), 1, "delete")
+analitica_ejecutar(m, "CREATE VIEW v AS SELECT nombre, x * 2 AS doble FROM t")
+eq(analitica_filas(m, "SELECT * FROM v ORDER BY nombre", nulo), [{"doble": 3, "nombre": "a"}, {"doble": 20, "nombre": "b"}, {"doble": 20, "nombre": "d"}], "vista")
+analitica_ejecutar(m, "INSERT INTO t VALUES (5, 'e', 1)")
+eq(analitica_valor(m, "SELECT count(*) FROM v", nulo), 4, "la vista ve los cambios")
+analitica_registrar(m, "gente", [{"nombre": "Ana", "edad": 30}, {"nombre": "Luis", "edad": 25}])
+eq(analitica_valor(m, "SELECT nombre FROM gente ORDER BY edad LIMIT 1", nulo), "Luis", "registrar lista de mapas")
+eq(texto_reemplazar(analitica_csv(analitica_consulta(m, "SELECT id, nombre FROM t WHERE id < 3 ORDER BY id", nulo)), "\r", ""), "id,nombre\n1,a\n2,b\n", "csv")
+analitica_ejecutar(m, "DROP TABLE gente; DROP VIEW IF EXISTS nada")
+eq(analitica_tablas(m), ["t", "v"], "drop")
+
+// Errores claros.
+para mal en [["SELECT * FROM nada", "no existe"], ["SELECT zzz FROM t", "columna desconocida"], ["SELECT id FROM t, t t2", "ambigua"], ["SELEC 1", "se esperaba"],
+    ["SELECT (SELECT id FROM t)", "más de una fila"], ["SELECT nombre, sum(x) FROM t WHERE sum(x) > 1", "GROUP BY"], ["SELECT foo(1)", "función desconocida"], ["SELECT 'a", "sin cerrar"]] {
+    sea error = ""
+    intentar { analitica_consulta(m, mal[0], nulo) } capturar (e) { error = e }
+    afirmar(texto_contiene(error, mal[1]), mal[0] + " → " + error)
+}
+mostrar("[OK] analitica")

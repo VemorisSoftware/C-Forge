@@ -1,0 +1,98 @@
+// Pruebas de consola_remota. Sin red: claves OpenSSH, huellas y derivación
+// de claves contra paramiko/cryptography (datos/consola/vectores.json). Con
+// python3 + paramiko: un servidor SSH real (datos/consola/servidor_ssh.py)
+// para comandos, SFTP, túneles y los dos tipos de autenticación.
+importar "consola_remota"
+importar "sistema"
+importar "json"
+funcion eq(a, b, q) { afirmar(("" + a) == ("" + b), q + ": [" + a + "] != [" + b + "]") }
+
+sea dir_datos = "tests/bibliotecas/datos/consola/"
+sea v = json_parsear(leer_archivo(dir_datos + "vectores.json"))
+sea semilla = bytes_de_hex("000102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f")
+sea privada = "-----BEGIN OPENSSH " + "PRIVATE KEY-----\n" + v["privada_cuerpo"] + "\n-----END OPENSSH " + "PRIVATE KEY-----\n"
+sea k = consola_leer_clave(privada)
+eq([k["semilla"] == semilla, hex_de_bytes(k["publica"])], [verdadero, "03a107bff3ce10be1d70dd18e74bc09967e4d6309ba50d5f1ddc8664125531b8"], "leer clave de cryptography")
+eq(consola_leer_clave(semilla)["publica"], k["publica"], "semilla suelta")
+sea g = consola_generar_clave("prueba", semilla)
+eq(g["publica"], v["publica"] + " prueba", "línea authorized_keys")
+eq(consola_leer_clave(g["privada"])["comentario"], "prueba", "vuelta completa de la clave generada")
+eq(consola_huella_de(bytes_de_hex(v["blob"])), v["huella"], "huella SHA256")
+sea kmp = _ssh_mpint(bytes_de_hex(v["K"]))
+eq(hex_de_bytes(consola_derivar(kmp, bytes_de_hex(v["H"]), "C", bytes_de_hex(v["sid"]), 40)), v["C40"], "derivación de 40 bytes")
+eq(hex_de_bytes(consola_derivar(kmp, bytes_de_hex(v["H"]), "A", bytes_de_hex(v["sid"]), 16)), v["A16"], "derivación de 16 bytes")
+eq(hex_de_bytes(_ssh_mpint(bytes_de_hex("0080ff"))), "000000030080ff", "mpint con bit alto")
+sea error = ""
+intentar { consola_leer_clave("-----BEGIN X-----\nAAAA\n-----END X-----") } capturar (e) { error = e }
+afirmar(texto_contiene(error, "no es una clave privada OpenSSH"), "clave inválida")
+
+sea hay_python = texto_recortar(sistema_comando("python3 -c 'import paramiko; print(1)' 2>/dev/null") ?? "") == "1"
+si (hay_python == falso) {
+    mostrar("[OK] consola_remota (sin paramiko: se saltó el servidor SSH)")
+} sino {
+    sea raiz = "/tmp/cforge_prueba_ssh_" + aleatorio_entero(100000, 999999)
+    crear_carpeta(raiz)
+    crear_carpeta(raiz + "/sftp")
+    sea host = consola_generar_clave("host", nulo)
+    escribir_archivo(raiz + "/host", host["privada"])
+    escribir_archivo(raiz + "/autorizada.pub", g["publica"] + "\n")
+    sea puerto = aleatorio_entero(38000, 39999)
+    sea pid = texto_recortar(sistema_comando("python3 " + dir_datos + "servidor_ssh.py " + raiz + "/sftp " + puerto + " " + raiz + "/host " + raiz + "/autorizada.pub >/dev/null 2>&1 & echo $!"))
+    dormir(1500)
+    sea huella_host = consola_huella_de(_ssh_blob_ed25519(consola_leer_clave(host["privada"])["publica"]))
+    intentar {
+        sea s = consola_conectar("127.0.0.1", puerto, {"usuario": "javier", "clave": "clave secreta", "huella": huella_host})
+        eq(consola_huella(s), huella_host, "huella del servidor")
+        eq(consola_algoritmos(s), {"cifrado": "aes128-ctr", "mac": "hmac-sha2-256-etm@openssh.com"}, "algoritmos")
+        eq(consola_ejecutar(s, "echo hola mundo", nulo), {"codigo": 0, "error": "", "salida": "hola mundo\n"}, "exec")
+        eq(consola_ejecutar(s, "falla", nulo), {"codigo": 3, "error": "algo fallo\n", "salida": ""}, "stderr y código")
+        sea entrada = bytes_aleatorios(50000) + bytes_aleatorios(50000)
+        eq(consola_ejecutar(s, "cat", entrada)["salida"] == entrada, verdadero, "stdin de 100 KB")
+        sea grande = consola_ejecutar(s, "grande", nulo)["salida"]
+        eq([longitud(grande), subtexto(grande, 250, 260) == bytes_de_hex("fafbfcfdfeff00010203")], [1024000, verdadero], "salida de 1 MB (ventana)")
+        // SFTP
+        eq(consola_sftp_escribir(s, "/a.txt", "contenido de a"), 14, "sftp escribir")
+        eq(consola_sftp_leer(s, "/a.txt"), "contenido de a", "sftp leer")
+        consola_sftp_crear_carpeta(s, "/sub")
+        sea binario = bytes_aleatorios(60000) + bytes_aleatorios(10000)
+        consola_sftp_escribir(s, "/sub/b.bin", binario)
+        eq(consola_sftp_leer(s, "/sub/b.bin") == binario, verdadero, "sftp binario de 70 KB")
+        eq(leer_archivo(raiz + "/sftp/sub/b.bin") == binario, verdadero, "el archivo quedó en el servidor")
+        sea lista = []
+        para x en consola_sftp_listar(s, "/") { lista.agregar([x["nombre"], x["es_carpeta"]]) }
+        eq(lista, [["a.txt", falso], ["sub", verdadero]], "sftp listar")
+        eq([consola_sftp_info(s, "/sub/b.bin")["tamano"], consola_sftp_info(s, "/no-existe")], [70000, nulo], "sftp info")
+        eq(consola_sftp_ruta_real(s, "/sub/../a.txt"), "/a.txt", "sftp ruta real")
+        consola_sftp_renombrar(s, "/a.txt", "/sub/c.txt")
+        consola_sftp_borrar(s, "/sub/b.bin")
+        eq(consola_sftp_listar(s, "/sub")[0]["nombre"], "c.txt", "renombrar y borrar")
+        consola_sftp_borrar(s, "/sub/c.txt")
+        consola_sftp_borrar_carpeta(s, "/sub")
+        eq(consola_sftp_listar(s, "/"), [], "carpeta vacía")
+        sea fallo = ""
+        intentar { consola_sftp_leer(s, "/nada.txt") } capturar (e) { fallo = e }
+        afirmar(texto_contiene(fallo, "no existe"), "sftp error claro")
+        // Túnel
+        sea t = consola_tunel_abrir(s, "localhost", 80)
+        consola_tunel_enviar(s, t, "hola tunel")
+        eq(consola_tunel_recibir(s, t), "HOLA TUNEL", "túnel")
+        consola_tunel_cerrar(s, t)
+        consola_cerrar(s)
+        // Clave pública.
+        sea s2 = consola_conectar("127.0.0.1", puerto, {"usuario": "javier", "clave_privada": g["privada"]})
+        eq(consola_ejecutar(s2, "echo con clave", nulo)["salida"], "con clave\n", "autenticación con clave ed25519")
+        consola_cerrar(s2)
+        // Rechazos.
+        sea r1 = ""
+        intentar { consola_conectar("127.0.0.1", puerto, {"usuario": "javier", "clave": "mala"}) } capturar (e) { r1 = e }
+        afirmar(texto_contiene(r1, "autenticación rechazada") y texto_contiene(r1, "password"), "contraseña mala: " + r1)
+        sea r2 = ""
+        intentar { consola_conectar("127.0.0.1", puerto, {"usuario": "javier", "clave": "clave secreta", "huella": "SHA256:otra"}) } capturar (e) { r2 = e }
+        afirmar(texto_contiene(r2, "no es la esperada"), "huella distinta: " + r2)
+    } capturar (e) {
+        sistema_comando("kill " + pid)
+        lanzar e
+    }
+    sistema_comando("kill " + pid)
+    mostrar("[OK] consola_remota")
+}

@@ -129,14 +129,14 @@ Estado: ✅ ya existe en C-Forge · 🔗 se usa hoy vía `cforge bindgen`,
 | 93 | `directo` | Audio/video P2P | WebRTC | ✅ `directo` / `webrtc` |
 | 94 | `transporte` | Transferencia multiprotocolo | libcurl | ✅ `transporte` / `libcurl` (HTTP, FTP, TFTP, file, data) |
 | 95 | `freno` / `ratelimit` | Límite de peticiones | Governor | ✅ `freno` |
-| 96 | `consola_remota` | SSH y SFTP | libssh2 | 🔗 |
+| 96 | `consola_remota` | SSH y SFTP | libssh2 | ✅ `consola_remota` / `libssh2` |
 
 ### D. Bases de datos y formatos
 
 | # | Nombre | Para qué | Inspiración | Estado |
 |---|---|---|---|---|
 | 97 | `archivo_kv` / `kvstore` | Clave-valor en disco | RocksDB | ✅ `archivo_kv` |
-| 98 | `analitica` | SQL analítico embebido | DuckDB | 🔗 |
+| 98 | `analitica` | SQL analítico embebido | DuckDB | ✅ `analitica` / `duckdb` |
 | 99 | `cofre` / `embeddb` | Base embebida ACID | sled, redb | ✅ `cofre` |
 | 100 | `paquete_bin` / `msgpack` | Serialización binaria compacta | MessagePack | ✅ `paquete_bin` |
 | 101 | `sin_copia` / `flatbuffers` | Serialización zero-copy | FlatBuffers | ✅ `sin_copia` |
@@ -216,7 +216,7 @@ Estado: ✅ ya existe en C-Forge · 🔗 se usa hoy vía `cforge bindgen`,
 | 153 | `primitiva` | Cripto a prueba de errores | Tink | ✅ `crypto` (AEAD) |
 | 154 | `huella` | Patrones de malware | YARA | ✅ `huella` / `yara` |
 | 155 | `desarma` | Ensamblador y desensamblador | Capstone, Keystone | ✅ `desarma` / `capstone` |
-| 156 | `emulador` | Emulación de CPU | Unicorn | 🔗 |
+| 156 | `emulador` | Emulación de CPU | Unicorn | ✅ `emulador` / `unicorn` |
 | 157 | `curva` / `secp256k1` | Curva secp256k1 | libsecp256k1 | ✅ `curva` |
 | 158 | `cadena` / `evm` | Contratos EVM y Web3 | ethers-rs | ✅ `cadena` |
 | 159 | `semilla` / `hdwallet` | Frases mnemónicas y billeteras HD | BIP39 | ✅ `semilla` |
