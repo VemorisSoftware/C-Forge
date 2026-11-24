@@ -1,0 +1,489 @@
+// stdlib/antivirus.cfv — Escáner de firmas al estilo de ClamAV, escrito desde
+// cero (idea de ClamAV, GPL: solo la idea y los formatos de firmas, que son
+// públicos). Lee bases .hdb/.hsb (hashes MD5/SHA-1/SHA-256 con tamaño),
+// .ndb (hexadecimal con comodines ?? a? ?a, * {n} {n-m} {-m} {n-},
+// alternativas (aa|bb) y !(aa|bb), desplazamientos *, n, n,m, EOF-n) y un
+// subconjunto de .ldb (firmas lógicas con & | ( ) =n >n <n), además de
+// listas .ign2. Entra en ZIP y GZIP, y trae la firma de prueba EICAR.
+//
+// En inglés: importar "clamav".
+//
+//   importar "antivirus"
+//   sea base = antivirus_base()
+//   antivirus_cargar(base, "Prueba.Hola:0:*:686f6c61??6d756e646f", "ndb")
+//   mostrar(antivirus_escanear(base, "dice hola mundo"))   // ["Prueba.Hola"]
+//   para r en antivirus_escanear_carpeta(base, "descargas") { mostrar(r) }
+
+importar "archivador"
+
+sea _AV_EICAR = "58354f2150254041505b345c505a58353428505e2937434329377d2445494341522d5354414e444152442d414e544956495255532d544553542d46494c452124482b482a"
+
+/// Base de firmas vacía. opciones: {"eicar": verdadero} (por defecto trae la
+/// firma de prueba EICAR), {"profundidad": 3} (niveles de ZIP/GZIP).
+funcion antivirus_base(opciones) {
+    sea op = opciones ?? {}
+    sea b = {"hashes": {}, "hex": [], "logicas": [], "ignorar": {}, "profundidad": op["profundidad"] ?? 3, "cuantas": 0}
+    si (op["eicar"] ?? verdadero) { antivirus_cargar(b, "Eicar-Test-Signature:0:0:" + _AV_EICAR, "ndb") }
+    retornar b
+}
+
+/// Cantidad de firmas cargadas.
+funcion antivirus_cuantas(base) { retornar base["cuantas"] }
+
+/// Carga firmas en texto; formato: "hdb", "hsb", "ndb", "ldb" o "ign2".
+/// Las líneas vacías y las que empiezan con "#" se saltan. Devuelve cuántas
+/// firmas cargó; una línea inválida lanza un error con su número.
+funcion antivirus_cargar(base, texto, formato) {
+    sea n = 0
+    sea linea_n = 0
+    para cruda en texto_dividir(texto_reemplazar(texto, "\r", ""), "\n") {
+        linea_n = linea_n + 1
+        sea l = texto_recortar(cruda)
+        si (l != "" y texto_empieza_con(l, "#") == falso) {
+            intentar {
+                si (formato == "hdb" o formato == "hsb") { _av_cargar_hash(base, l) }
+                sino si (formato == "ndb") { base["hex"].agregar(_av_cargar_ndb(l)) }
+                sino si (formato == "ldb") { base["logicas"].agregar(_av_cargar_ldb(l)) }
+                sino si (formato == "ign2" o formato == "ign") { base["ignorar"][texto_dividir(l, ":")[0]] = verdadero }
+                sino { lanzar "formato desconocido " + formato }
+            } capturar (e) { lanzar "antivirus: línea " + linea_n + " (" + formato + "): " + e }
+            si (formato != "ign2" y formato != "ign") { n = n + 1 }
+        }
+    }
+    base["cuantas"] = base["cuantas"] + n
+    retornar n
+}
+
+/// Carga un archivo de firmas; el formato sale de la extensión.
+funcion antivirus_cargar_archivo(base, ruta) {
+    sea partes = texto_dividir(ruta, ".")
+    retornar antivirus_cargar(base, leer_archivo(ruta), texto_minusculas(partes[longitud(partes) - 1]))
+}
+
+funcion _av_cargar_hash(base, l) {
+    sea p = texto_dividir(l, ":")
+    si (longitud(p) < 3) { lanzar "se esperaba hash:tamaño:nombre" }
+    sea h = texto_minusculas(p[0])
+    si (longitud(h) != 32 y longitud(h) != 40 y longitud(h) != 64) { lanzar "hash de largo inválido" }
+    para i en lista_rango(0, longitud(h)) {
+        si (texto_indice("0123456789abcdef", subtexto(h, i, i + 1)) < 0) { lanzar "hash no hexadecimal" }
+    }
+    si (p[1] != "*" y texto_indice("0123456789", subtexto(p[1], 0, 1)) < 0) { lanzar "tamaño inválido" }
+    base["hashes"][h] = {"tamano": p[1], "nombre": p[2]}
+}
+
+funcion _av_cargar_ndb(l) {
+    sea p = texto_dividir(l, ":")
+    si (longitud(p) < 4) { lanzar "se esperaba nombre:tipo:desplazamiento:firma" }
+    // El desplazamiento puede llevar "," pero no ":"; la firma es el 4.º campo.
+    retornar {"nombre": p[0], "tipo": a_numero(p[1]), "desp": _av_desp(p[2]), "patron": _av_compilar(p[3])}
+}
+
+funcion _av_desp(t) {
+    si (t == "*") { retornar {"tipo": "cualquiera"} }
+    sea partes = texto_dividir(t, ",")
+    sea margen = 0
+    si (longitud(partes) > 1) { margen = a_numero(partes[1]) }
+    sea base_t = partes[0]
+    si (texto_empieza_con(base_t, "EOF-")) { retornar {"tipo": "fin", "n": a_numero(subtexto(base_t, 4, longitud(base_t))), "margen": margen} }
+    si (texto_empieza_con(base_t, "EP") o texto_empieza_con(base_t, "S") o texto_empieza_con(base_t, "SE") o texto_empieza_con(base_t, "SL")) { retornar {"tipo": "no_soportado"} }
+    si (texto_indice("0123456789", subtexto(base_t, 0, 1)) < 0) { lanzar "desplazamiento inválido " + t }
+    retornar {"tipo": "inicio", "n": a_numero(base_t), "margen": margen}
+}
+
+funcion _av_hex(c) {
+    sea v = texto_indice("0123456789abcdef", texto_minusculas(c))
+    si (v < 0) { lanzar "carácter no hexadecimal '" + c + "'" }
+    retornar v
+}
+
+// Compila la firma hexadecimal a una lista de piezas:
+//   {"t": "lit", "b"}            bytes exactos
+//   {"t": "masc", "v", "k"}      un byte con máscara (?? a? ?a)
+//   {"t": "alt", "op": [...], "no"}  alternativas del mismo largo
+//   {"t": "hueco", "min", "max"}  max -1 = sin límite
+funcion _av_compilar(t) {
+    sea r = []
+    sea lit = ""
+    sea i = 0
+    sea n = longitud(t)
+    sea vaciar = funcion() {
+        si (lit != "") {
+            r.agregar({"t": "lit", "b": lit})
+            lit = ""
+        }
+    }
+    mientras (i < n) {
+        sea c = subtexto(t, i, i + 1)
+        si (c == "*") {
+            vaciar()
+            r.agregar({"t": "hueco", "min": 0, "max": -1})
+            i = i + 1
+        } sino si (c == "{" o c == "[") {
+            vaciar()
+            sea cierre = si(c == "{", "}", "]")
+            sea fin = texto_indice(subtexto(t, i, n), cierre)
+            si (fin < 0) { lanzar "falta " + cierre }
+            sea dentro = subtexto(t, i + 1, i + fin)
+            sea mn = 0
+            sea mx = -1
+            si (texto_contiene(dentro, "-")) {
+                sea q = texto_dividir(dentro, "-")
+                si (q[0] != "") { mn = a_numero(q[0]) }
+                si (q[1] != "") { mx = a_numero(q[1]) }
+            } sino {
+                mn = a_numero(dentro)
+                mx = mn
+            }
+            r.agregar({"t": "hueco", "min": mn, "max": mx})
+            i = i + fin + 1
+        } sino si (c == "(" o (c == "!" y subtexto(t, i + 1, i + 2) == "(")) {
+            vaciar()
+            sea negar = c == "!"
+            si (negar) { i = i + 1 }
+            sea fin = texto_indice(subtexto(t, i, n), ")")
+            si (fin < 0) { lanzar "falta )" }
+            sea ops = []
+            para a en texto_dividir(subtexto(t, i + 1, i + fin), "|") { ops.agregar(bytes_de_hex(a)) }
+            si (longitud(ops) == 0) { lanzar "alternativa vacía" }
+            para op2 en ops {
+                si (longitud(op2) != longitud(ops[0])) { lanzar "alternativas de distinto largo" }
+            }
+            r.agregar({"t": "alt", "op": ops, "no": negar})
+            i = i + fin + 1
+        } sino {
+            si (i + 1 >= n) { lanzar "byte incompleto" }
+            sea a = c
+            sea b = subtexto(t, i + 1, i + 2)
+            si (a == "?" o b == "?") {
+                vaciar()
+                sea v = 0
+                sea k = 0
+                si (a != "?") {
+                    v = _av_hex(a) * 16
+                    k = 240
+                }
+                si (b != "?") {
+                    v = v + _av_hex(b)
+                    k = k + 15
+                }
+                r.agregar({"t": "masc", "v": v, "k": k})
+            } sino { lit = lit + char_de(_av_hex(a) * 16 + _av_hex(b)) }
+            i = i + 2
+        }
+    }
+    vaciar()
+    si (longitud(r) == 0) { lanzar "firma vacía" }
+    retornar r
+}
+
+// ¿Casan las piezas desde la pieza k en la posición pos? Devuelve el final o -1.
+funcion _av_casar(piezas, k, datos, pos) {
+    si (k == longitud(piezas)) { retornar pos }
+    sea p = piezas[k]
+    sea n = longitud(datos)
+    si (p["t"] == "lit") {
+        sea l = longitud(p["b"])
+        si (pos + l > n o subtexto(datos, pos, pos + l) != p["b"]) { retornar -1 }
+        retornar _av_casar(piezas, k + 1, datos, pos + l)
+    }
+    si (p["t"] == "masc") {
+        si (pos >= n) { retornar -1 }
+        sea x = byte_en(datos, pos)
+        si (bits_y(x, p["k"]) != p["v"]) { retornar -1 }
+        retornar _av_casar(piezas, k + 1, datos, pos + 1)
+    }
+    si (p["t"] == "alt") {
+        sea l = longitud(p["op"][0])
+        si (pos + l > n) { retornar -1 }
+        sea trozo = subtexto(datos, pos, pos + l)
+        sea esta = lista_contiene(p["op"], trozo)
+        si (esta == p["no"]) { retornar -1 }
+        retornar _av_casar(piezas, k + 1, datos, pos + l)
+    }
+    // Hueco: si lo que sigue es literal, se salta directo a sus apariciones.
+    sea desde = pos + p["min"]
+    sea hasta = n
+    si (p["max"] >= 0) { hasta = minimo(n, pos + p["max"]) }
+    si (k + 1 < longitud(piezas) y piezas[k + 1]["t"] == "lit") {
+        sea b = piezas[k + 1]["b"]
+        sea x = bytes_buscar(datos, b, desde)
+        mientras (x >= 0 y x <= hasta) {
+            sea f = _av_casar(piezas, k + 2, datos, x + longitud(b))
+            si (f >= 0) { retornar f }
+            x = bytes_buscar(datos, b, x + 1)
+        }
+        retornar -1
+    }
+    sea x = desde
+    mientras (x <= hasta) {
+        sea f = _av_casar(piezas, k + 1, datos, x)
+        si (f >= 0) { retornar f }
+        x = x + 1
+    }
+    retornar -1
+}
+
+// Posiciones de inicio donde casa el patrón, respetando el desplazamiento.
+// Se detiene tras "tope" coincidencias.
+funcion _av_coincidencias(patron, desp, datos, tope) {
+    sea r = []
+    sea n = longitud(datos)
+    si (desp["tipo"] == "no_soportado") { retornar r }
+    sea ini = 0
+    sea fin = n
+    si (desp["tipo"] == "inicio") {
+        ini = desp["n"]
+        fin = desp["n"] + desp["margen"]
+    } sino si (desp["tipo"] == "fin") {
+        ini = n - desp["n"]
+        fin = ini + desp["margen"]
+    }
+    si (ini < 0 o ini > n) { retornar r }
+    fin = minimo(fin, n)
+    sea primero = patron[0]
+    si (primero["t"] == "lit") {
+        sea x = bytes_buscar(datos, primero["b"], ini)
+        mientras (x >= 0 y x <= fin y longitud(r) < tope) {
+            si (_av_casar(patron, 0, datos, x) >= 0) { r.agregar(x) }
+            x = bytes_buscar(datos, primero["b"], x + 1)
+        }
+        retornar r
+    }
+    sea x = ini
+    mientras (x <= fin y longitud(r) < tope) {
+        si (_av_casar(patron, 0, datos, x) >= 0) { r.agregar(x) }
+        x = x + 1
+    }
+    retornar r
+}
+
+funcion _av_tipo_ok(tipo, datos) {
+    si (tipo == 1) { retornar subtexto(datos, 0, 2) == "MZ" }
+    si (tipo == 6) { retornar subtexto(datos, 0, 4) == bytes_de_hex("7f454c46") }
+    si (tipo == 9) {
+        sea m = hex_de_bytes(subtexto(datos, 0, 4))
+        retornar m == "cefaedfe" o m == "cffaedfe" o m == "feedface" o m == "feedfacf" o m == "cafebabe"
+    }
+    retornar verdadero
+}
+
+// ---------- firmas lógicas ----------
+
+funcion _av_cargar_ldb(l) {
+    sea p = texto_dividir(l, ";")
+    si (longitud(p) < 4) { lanzar "se esperaba nombre;bloque;expresión;subfirma…" }
+    sea tipo = 0
+    para kv en texto_dividir(p[1], ",") {
+        sea q = texto_dividir(kv, ":")
+        si (longitud(q) == 2 y q[0] == "Target") { tipo = a_numero(q[1]) }
+    }
+    sea subs = []
+    sea i = 3
+    mientras (i < longitud(p)) {
+        sea s = p[i]
+        sea partes = texto_dividir(s, ":")
+        si (longitud(partes) == 1) { subs.agregar({"desp": {"tipo": "cualquiera"}, "patron": _av_compilar(s)}) }
+        sino { subs.agregar({"desp": _av_desp(partes[0]), "patron": _av_compilar(partes[1])}) }
+        i = i + 1
+    }
+    sea expr = _av_expr(p[2], longitud(subs))
+    retornar {"nombre": p[0], "tipo": tipo, "expr": expr, "subs": subs}
+}
+
+// Expresión lógica: nodos {"t": "sub", "i"} | {"t": "y"/"o", "a", "b"} con
+// modificador opcional {"cmp": "=", ">", "<", "n"}.
+funcion _av_expr(t, cuantas) {
+    sea toks = []
+    sea i = 0
+    mientras (i < longitud(t)) {
+        sea c = subtexto(t, i, i + 1)
+        si (texto_indice("0123456789", c) >= 0) {
+            sea num = 0
+            mientras (i < longitud(t) y texto_indice("0123456789", subtexto(t, i, i + 1)) >= 0) {
+                num = num * 10 + a_numero(subtexto(t, i, i + 1))
+                i = i + 1
+            }
+            toks.agregar(num)
+        } sino {
+            si (c != " ") { toks.agregar(c) }
+            i = i + 1
+        }
+    }
+    sea pos = 0
+    sea primaria = nulo
+    sea expresion = nulo
+    sea modif = funcion(nodo) {
+        si (pos < longitud(toks) y (toks[pos] == "=" o toks[pos] == ">" o toks[pos] == "<")) {
+            nodo["cmp"] = toks[pos]
+            nodo["n"] = toks[pos + 1]
+            pos = pos + 2
+            // "=n,m": se ignora el segundo número (cantidad de subfirmas distintas).
+            si (pos < longitud(toks) y toks[pos] == ",") { pos = pos + 2 }
+        }
+        retornar nodo
+    }
+    primaria = funcion() {
+        si (pos >= longitud(toks)) { lanzar "expresión incompleta" }
+        sea x = toks[pos]
+        si (x == "(") {
+            pos = pos + 1
+            sea e = expresion()
+            si (pos >= longitud(toks) o toks[pos] != ")") { lanzar "falta ) en la expresión" }
+            pos = pos + 1
+            retornar modif(e)
+        }
+        si (tipo(x) != "numero" y tipo(x) != "entero") { lanzar "expresión inválida cerca de " + x }
+        si (x >= cuantas) { lanzar "la expresión usa la subfirma " + x + " que no existe" }
+        pos = pos + 1
+        retornar modif({"t": "sub", "i": x})
+    }
+    expresion = funcion() {
+        sea a = primaria()
+        mientras (pos < longitud(toks) y (toks[pos] == "&" o toks[pos] == "|")) {
+            sea op = toks[pos]
+            pos = pos + 1
+            sea b = primaria()
+            a = {"t": si(op == "&", "y", "o"), "a": a, "b": b}
+        }
+        retornar a
+    }
+    sea r = expresion()
+    si (pos != longitud(toks)) { lanzar "sobra texto en la expresión" }
+    retornar r
+}
+
+funcion _av_valor(nodo, cuentas) {
+    sea v = 0
+    si (nodo["t"] == "sub") { v = cuentas[nodo["i"]] }
+    sino si (nodo["t"] == "o") { v = _av_valor(nodo["a"], cuentas) + _av_valor(nodo["b"], cuentas) }
+    sino {
+        sea a = _av_valor(nodo["a"], cuentas)
+        sea b = _av_valor(nodo["b"], cuentas)
+        si (a > 0 y b > 0) { v = a + b }
+    }
+    si (tiene_clave(nodo, "cmp")) {
+        sea ok = falso
+        si (nodo["cmp"] == "=") { ok = v == nodo["n"] }
+        sino si (nodo["cmp"] == ">") { ok = v > nodo["n"] }
+        sino { ok = v < nodo["n"] }
+        v = si(ok, 1, 0)
+    }
+    retornar v
+}
+
+// ---------- escaneo ----------
+
+funcion _av_tipo_archivo(datos) {
+    si (subtexto(datos, 0, 4) == bytes_de_hex("504b0304") o subtexto(datos, 0, 4) == bytes_de_hex("504b0506")) { retornar "zip" }
+    si (subtexto(datos, 0, 3) == bytes_de_hex("1f8b08")) { retornar "gzip" }
+    retornar "datos"
+}
+
+/// Detalle del escaneo de unos bytes: [{"firma", "tipo" ("hash", "hex",
+/// "logica"), "desplazamiento"?, "dentro"? (ruta dentro de un ZIP/GZIP)}].
+funcion antivirus_detalle(base, datos) { retornar _av_escanear(base, datos, "", 0) }
+
+funcion _av_escanear(base, datos, dentro, nivel) {
+    sea r = []
+    sea agregar = funcion(d) {
+        si (tiene_clave(base["ignorar"], d["firma"]) == falso) {
+            si (dentro != "") { d["dentro"] = dentro }
+            r.agregar(d)
+        }
+    }
+    si (longitud(mapa_claves(base["hashes"])) > 0) {
+        sea tam = "" + longitud(datos)
+        para h en [cfv_md5(datos), hex_de_bytes(sha1_bytes(datos)), cfv_sha256(datos)] {
+            sea e = base["hashes"][texto_minusculas(h)] ?? nulo
+            si (e != nulo y (e["tamano"] == "*" o e["tamano"] == tam)) { agregar({"firma": e["nombre"], "tipo": "hash"}) }
+        }
+    }
+    para f en base["hex"] {
+        si (_av_tipo_ok(f["tipo"], datos)) {
+            sea c = _av_coincidencias(f["patron"], f["desp"], datos, 1)
+            si (longitud(c) > 0) { agregar({"firma": f["nombre"], "tipo": "hex", "desplazamiento": c[0]}) }
+        }
+    }
+    para f en base["logicas"] {
+        si (_av_tipo_ok(f["tipo"], datos)) {
+            sea cuentas = []
+            para s en f["subs"] { cuentas.agregar(longitud(_av_coincidencias(s["patron"], s["desp"], datos, 255))) }
+            si (_av_valor(f["expr"], cuentas) > 0) { agregar({"firma": f["nombre"], "tipo": "logica"}) }
+        }
+    }
+    // Contenedores.
+    si (nivel < base["profundidad"]) {
+        sea tipo = _av_tipo_archivo(datos)
+        si (tipo == "zip") {
+            sea entradas = []
+            intentar { entradas = archivador_leer_zip(datos, {"max_total": 268435456}) } capturar (e) { agregar({"firma": "Heuristics.Broken.Zip", "tipo": "heuristica"}) }
+            para en2 en entradas {
+                si (en2["es_carpeta"] == falso) {
+                    para d en _av_escanear(base, en2["datos"], dentro + si(dentro == "", "", "/") + en2["nombre"], nivel + 1) { r.agregar(d) }
+                }
+            }
+        } sino si (tipo == "gzip") {
+            sea plano = nulo
+            intentar { plano = gzip_descomprimir(datos, 268435456) } capturar (e) { plano = nulo }
+            si (plano != nulo) {
+                para d en _av_escanear(base, plano, dentro + si(dentro == "", "", "/") + "(gzip)", nivel + 1) { r.agregar(d) }
+            }
+        }
+    }
+    retornar r
+}
+
+/// Nombres de las firmas que aparecen en los bytes (sin repetir).
+funcion antivirus_escanear(base, datos) {
+    sea r = []
+    para d en antivirus_detalle(base, datos) {
+        si (lista_contiene(r, d["firma"]) == falso) { r.agregar(d["firma"]) }
+    }
+    retornar r
+}
+
+/// Escanea un archivo: {"ruta", "infectado", "firmas", "detalle"}.
+funcion antivirus_escanear_archivo(base, ruta) {
+    sea d = antivirus_detalle(base, leer_archivo(ruta))
+    sea nombres = []
+    para x en d {
+        si (lista_contiene(nombres, x["firma"]) == falso) { nombres.agregar(x["firma"]) }
+    }
+    retornar {"ruta": ruta, "infectado": longitud(nombres) > 0, "firmas": nombres, "detalle": d}
+}
+
+/// Escanea una carpeta (con subcarpetas). Devuelve un resultado por archivo,
+/// en orden alfabético; solo_infectados deja únicamente los positivos.
+funcion antivirus_escanear_carpeta(base, carpeta, solo_infectados) {
+    sea r = []
+    sea nombres = ordenar(listar_carpeta(carpeta), funcion(p, q) { retornar si(p < q, -1, si(p > q, 1, 0)) })
+    para n en nombres {
+        sea ruta = carpeta + "/" + n
+        si (es_carpeta(ruta)) {
+            para x en antivirus_escanear_carpeta(base, ruta, solo_infectados) { r.agregar(x) }
+        } sino {
+            sea x = antivirus_escanear_archivo(base, ruta)
+            si (x["infectado"] o solo_infectados != verdadero) { r.agregar(x) }
+        }
+    }
+    retornar r
+}
+
+/// Resumen como el de clamscan: {"archivos", "infectados", "firmas"}.
+funcion antivirus_resumen(resultados) {
+    sea inf = 0
+    para x en resultados {
+        si (x["infectado"]) { inf = inf + 1 }
+    }
+    retornar {"archivos": longitud(resultados), "infectados": inf}
+}
+
+/// Línea .hdb para unos bytes (como sigtool --md5).
+funcion antivirus_firma_md5(datos, nombre) { retornar cfv_md5(datos) + ":" + longitud(datos) + ":" + nombre }
+
+/// Línea .hsb con SHA-256 (como sigtool --sha256).
+funcion antivirus_firma_sha256(datos, nombre) { retornar cfv_sha256(datos) + ":" + longitud(datos) + ":" + nombre }
+
+/// Línea .ndb que reconoce exactamente esos bytes en cualquier lugar.
+funcion antivirus_firma_hex(datos, nombre) { retornar nombre + ":0:*:" + hex_de_bytes(datos) }
