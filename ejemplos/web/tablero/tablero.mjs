@@ -1,6 +1,6 @@
 // Generado por cforge build --target wasm. No editar.
-const FUNCIONES = {"nav_externas": 1369, "nav_texto": 1370, "nav_html": 1374, "nav_estilo": 1378, "nav_atributo": 1383, "nav_clase": 1388, "nav_valor": 1393, "nav_consola": 1397, "nav_ancho": 1400, "nav_alto": 1402, "nav_scroll": 1404, "nav_scroll_y": 1406, "nav_mouse_x": 1408, "nav_mouse_y": 1410, "nav_mouse_activo": 1412, "nav_tiempo": 1414, "nav_dato": 1417, "nav_registrar_animacion": 1419, "nav_registrar_evento": 1422, "nav_evento": 1427, "nav_registrar_tecla": 1431, "nav_registrar_arrastre": 1435, "nav_css": 1440, "nav_lienzo": 1443, "nav_limpiar": 1446, "nav_rect": 1449, "nav_circulo": 1456, "nav_linea": 1462, "nav_escribir": 1470, "nav_particulas_crudo": 1477, "nav_lienzo_pintar": 1485, "nav_registrar": 1493, "navegador_despachar": 1504, "nav_al_hacer": 1513, "nav_al_tecla": 1517, "nav_al_soltar": 1521, "buscar": 1573, "dibujar": 1589};
-const EXTERNAS = [["navegador", "nav_texto", [2, 2], 4], ["navegador", "nav_html", [2, 2], 4], ["navegador", "nav_estilo", [2, 2, 2], 4], ["navegador", "nav_atributo", [2, 2, 2], 4], ["navegador", "nav_clase", [2, 2, 3], 4], ["navegador", "nav_valor", [2], 2], ["navegador", "nav_consola", [2], 4], ["navegador", "nav_ancho", [], 5], ["navegador", "nav_alto", [], 5], ["navegador", "nav_scroll", [], 5], ["navegador", "nav_scroll_y", [], 5], ["navegador", "nav_mouse_x", [], 5], ["navegador", "nav_mouse_y", [], 5], ["navegador", "nav_mouse_activo", [], 3], ["navegador", "nav_tiempo", [], 1], ["navegador", "nav_dato", [], 5], ["navegador", "nav_registrar_animacion", [5], 4], ["navegador", "nav_registrar_evento", [2, 2, 5], 4], ["navegador", "nav_evento", [2], 2], ["navegador", "nav_registrar_tecla", [2, 5], 4], ["navegador", "nav_registrar_arrastre", [2, 2, 5], 4], ["navegador", "nav_css", [2], 4], ["navegador", "nav_lienzo", [2], 5], ["navegador", "nav_limpiar", [2], 4], ["navegador", "nav_rect", [1, 1, 1, 1, 2], 4], ["navegador", "nav_circulo", [1, 1, 1, 2], 4], ["navegador", "nav_linea", [1, 1, 1, 1, 1, 2], 4], ["navegador", "nav_escribir", [1, 1, 2, 1, 2], 4], ["navegador", "nav_particulas_crudo", [2, 0, 0, 0, 0, 5], 4], ["navegador", "nav_lienzo_pintar", [2, 0, 5, 5], 4]];
+const FUNCIONES = {"nav_externas": 1661, "nav_texto": 1662, "nav_html": 1666, "nav_estilo": 1670, "nav_atributo": 1675, "nav_clase": 1680, "nav_valor": 1685, "nav_consola": 1689, "nav_ancho": 1692, "nav_alto": 1694, "nav_scroll": 1696, "nav_scroll_y": 1698, "nav_mouse_x": 1700, "nav_mouse_y": 1702, "nav_mouse_activo": 1704, "nav_tiempo": 1706, "nav_dato": 1709, "nav_registrar_animacion": 1711, "nav_registrar_evento": 1714, "nav_evento": 1719, "nav_registrar_tecla": 1723, "nav_registrar_arrastre": 1727, "nav_css": 1732, "nav_lienzo": 1735, "nav_limpiar": 1738, "nav_rect": 1741, "nav_circulo": 1748, "nav_linea": 1754, "nav_escribir": 1762, "nav_particulas_crudo": 1769, "nav_lienzo_pintar": 1777, "nav_cuantos": 1783, "nav_clase_n": 1786, "nav_estilo_n": 1792, "nav_caja": 1798, "nav_medio": 1804, "nav_lienzo_alto": 1807, "nav_relleno": 1809, "nav_trazo": 1812, "nav_relleno_lineal": 1816, "nav_relleno_radial": 1823, "nav_rellenar_rect": 1832, "nav_ruta_nueva": 1838, "nav_ruta_mover": 1840, "nav_ruta_linea": 1844, "nav_ruta_arco": 1848, "nav_ruta_rombo": 1856, "nav_ruta_cerrar": 1862, "nav_rellenar": 1864, "nav_trazar": 1866, "nav_recortar": 1868, "nav_guardar": 1870, "nav_restaurar": 1872, "nav_alfa": 1874, "nav_mezcla": 1877, "nav_sombra": 1880, "nav_grano": 1884, "nav_registrar": 1892, "navegador_despachar": 1903, "nav_al_hacer": 1912, "nav_al_tecla": 1916, "nav_al_soltar": 1920, "buscar": 1972, "dibujar": 1988};
+const EXTERNAS = [["navegador", "nav_texto", [2, 2], 4], ["navegador", "nav_html", [2, 2], 4], ["navegador", "nav_estilo", [2, 2, 2], 4], ["navegador", "nav_atributo", [2, 2, 2], 4], ["navegador", "nav_clase", [2, 2, 3], 4], ["navegador", "nav_valor", [2], 2], ["navegador", "nav_consola", [2], 4], ["navegador", "nav_ancho", [], 5], ["navegador", "nav_alto", [], 5], ["navegador", "nav_scroll", [], 5], ["navegador", "nav_scroll_y", [], 5], ["navegador", "nav_mouse_x", [], 5], ["navegador", "nav_mouse_y", [], 5], ["navegador", "nav_mouse_activo", [], 3], ["navegador", "nav_tiempo", [], 1], ["navegador", "nav_dato", [], 5], ["navegador", "nav_registrar_animacion", [5], 4], ["navegador", "nav_registrar_evento", [2, 2, 5], 4], ["navegador", "nav_evento", [2], 2], ["navegador", "nav_registrar_tecla", [2, 5], 4], ["navegador", "nav_registrar_arrastre", [2, 2, 5], 4], ["navegador", "nav_css", [2], 4], ["navegador", "nav_lienzo", [2], 5], ["navegador", "nav_limpiar", [2], 4], ["navegador", "nav_rect", [1, 1, 1, 1, 2], 4], ["navegador", "nav_circulo", [1, 1, 1, 2], 4], ["navegador", "nav_linea", [1, 1, 1, 1, 1, 2], 4], ["navegador", "nav_escribir", [1, 1, 2, 1, 2], 4], ["navegador", "nav_particulas_crudo", [2, 0, 0, 0, 0, 5], 4], ["navegador", "nav_lienzo_pintar", [2, 0, 5, 5], 4], ["navegador", "nav_cuantos", [2], 5], ["navegador", "nav_clase_n", [2, 5, 2, 3], 4], ["navegador", "nav_estilo_n", [2, 5, 2, 2], 4], ["navegador", "nav_caja", [2, 5, 2], 1], ["navegador", "nav_medio", [2], 3], ["navegador", "nav_lienzo_alto", [], 5], ["navegador", "nav_relleno", [2], 4], ["navegador", "nav_trazo", [2, 1], 4], ["navegador", "nav_relleno_lineal", [1, 1, 1, 1, 2], 4], ["navegador", "nav_relleno_radial", [1, 1, 1, 1, 1, 1, 2], 4], ["navegador", "nav_rellenar_rect", [1, 1, 1, 1], 4], ["navegador", "nav_ruta_nueva", [], 4], ["navegador", "nav_ruta_mover", [1, 1], 4], ["navegador", "nav_ruta_linea", [1, 1], 4], ["navegador", "nav_ruta_arco", [1, 1, 1, 1, 1, 3], 4], ["navegador", "nav_ruta_rombo", [1, 1, 1, 1], 4], ["navegador", "nav_ruta_cerrar", [], 4], ["navegador", "nav_rellenar", [], 4], ["navegador", "nav_trazar", [], 4], ["navegador", "nav_recortar", [], 4], ["navegador", "nav_guardar", [], 4], ["navegador", "nav_restaurar", [], 4], ["navegador", "nav_alfa", [1], 4], ["navegador", "nav_mezcla", [2], 4], ["navegador", "nav_sombra", [2, 1], 4], ["navegador", "nav_grano", [1, 1, 1, 2], 4]];
 const WASM = "./tablero.wasm";
 // ── Cargador de C-Forge para WebAssembly (navegador y Node.js) ──────────────
 // Uso en el navegador:
@@ -226,7 +226,61 @@ export async function iniciar(opciones = {}) {
       const px = new Uint8ClampedArray(memoria.buffer, Number(dir), w * h * 4).slice();
       c.getContext("2d").putImageData(new ImageData(px, w, h), 0, 0);
     },
+    // Elementos por índice (querySelectorAll): el i-ésimo que calza con el selector.
+    nav_cuantos: (s) => document.querySelectorAll(s).length,
+    nav_clase_n: (s, i, c, a) => { const e = document.querySelectorAll(s)[i]; if (e) e.classList.toggle(c, a); },
+    nav_estilo_n: (s, i, p, v) => { const e = document.querySelectorAll(s)[i]; if (e) e.style.setProperty(p, v); },
+    // Caja en pantalla: "arriba", "abajo", "izquierda", "derecha", "ancho", "alto".
+    nav_caja: (s, i, campo) => {
+      const e = document.querySelectorAll(s)[i]; if (!e) return 0;
+      const r = e.getBoundingClientRect();
+      return { arriba: r.top, abajo: r.bottom, izquierda: r.left, derecha: r.right, ancho: r.width, alto: r.height }[campo] ?? 0;
+    },
+    // Media query: nav_medio("(prefers-reduced-motion: reduce)").
+    nav_medio: (q) => typeof matchMedia === "function" && matchMedia(q).matches,
+    // Lienzo 2D: rellenos, degradados, rutas, recortes, transparencia y grano.
+    nav_lienzo_alto: () => (lienzo2d ? lienzo2d.canvas.clientHeight : 0),
+    nav_relleno: (color) => { lienzo2d.fillStyle = color; },
+    nav_trazo: (color, g) => { lienzo2d.strokeStyle = color; lienzo2d.lineWidth = g; },
+    nav_relleno_lineal: (x0, y0, x1, y1, paradas) => { const g = lienzo2d.createLinearGradient(x0, y0, x1, y1); pintarParadas(g, paradas); lienzo2d.fillStyle = g; },
+    nav_relleno_radial: (x0, y0, r0, x1, y1, r1, paradas) => { const g = lienzo2d.createRadialGradient(x0, y0, r0, x1, y1, r1); pintarParadas(g, paradas); lienzo2d.fillStyle = g; },
+    nav_rellenar_rect: (x, y, w, h) => { lienzo2d.fillRect(x, y, w, h); },
+    nav_ruta_nueva: () => { lienzo2d.beginPath(); },
+    nav_ruta_mover: (x, y) => { lienzo2d.moveTo(x, y); },
+    nav_ruta_linea: (x, y) => { lienzo2d.lineTo(x, y); },
+    nav_ruta_arco: (x, y, r, a0, a1, anti) => { lienzo2d.arc(x, y, r, a0, a1, anti); },
+    nav_ruta_rombo: (x, y, w, h) => { lienzo2d.moveTo(x, y - h); lienzo2d.lineTo(x + w, y); lienzo2d.lineTo(x, y + h); lienzo2d.lineTo(x - w, y); lienzo2d.closePath(); },
+    nav_ruta_cerrar: () => { lienzo2d.closePath(); },
+    nav_rellenar: () => { lienzo2d.fill(); },
+    nav_trazar: () => { lienzo2d.stroke(); },
+    nav_recortar: () => { lienzo2d.clip(); },
+    nav_guardar: () => { lienzo2d.save(); },
+    nav_restaurar: () => { lienzo2d.restore(); },
+    nav_alfa: (a) => { lienzo2d.globalAlpha = a; },
+    nav_mezcla: (modo) => { lienzo2d.globalCompositeOperation = modo; },
+    nav_sombra: (color, desenfoque) => { lienzo2d.shadowColor = color; lienzo2d.shadowBlur = desenfoque; },
+    nav_grano: (alfa, dx, dy, modo) => {
+      if (!grano) {
+        grano = document.createElement("canvas"); grano.width = grano.height = 180;
+        const g = grano.getContext("2d"), img = g.createImageData(180, 180);
+        for (let k = 0; k < img.data.length; k += 4) { const v = Math.random() * 255; img.data[k] = img.data[k + 1] = img.data[k + 2] = v; img.data[k + 3] = 255; }
+        g.putImageData(img, 0, 0);
+      }
+      const c = lienzo2d.canvas;
+      lienzo2d.save(); lienzo2d.globalAlpha = alfa; lienzo2d.globalCompositeOperation = modo || "source-over";
+      lienzo2d.translate(-(dx % 180), -(dy % 180)); lienzo2d.fillStyle = lienzo2d.createPattern(grano, "repeat");
+      lienzo2d.fillRect(0, 0, c.clientWidth + 180, c.clientHeight + 180); lienzo2d.restore();
+    },
   };
+  // Paradas de un degradado: "0 #D5C6B1; 0.45 rgba(228,184,142,.5); 1 #E9A56E".
+  let grano = null;
+  function pintarParadas(g, paradas) {
+    for (const p of String(paradas).split(";")) {
+      const t = p.trim(); if (!t) continue;
+      const i = t.indexOf(" ");
+      g.addColorStop(parseFloat(t.slice(0, i)), t.slice(i + 1).trim());
+    }
+  }
   // Partículas: listas de enteros etiquetados (2v + 1) en milésimas, leídas
   // directo de la memoria del módulo y dibujadas como puntos aditivos.
   const dibujos = new Map();
@@ -257,10 +311,27 @@ export async function iniciar(opciones = {}) {
     gl.drawArrays(gl.POINTS, 0, n);
   }
 
+  // Paquetes npm: extern "npm:paquete" funcion f(...) los importa solos.
+  // Node.js: desde node_modules (npm install paquete). Navegador: el
+  // empaquetador o el import map si lo resuelven; si no, desde esm.sh.
+  const npm = {};
+  for (const [modulo] of EXTERNAS) {
+    if (!modulo.startsWith("npm:") || npm[modulo] || (opciones.modulos || {})[modulo]) continue;
+    const paquete = modulo.slice(4);
+    try {
+      npm[modulo] = await import(paquete);
+    } catch (e) {
+      if (ES_NODE) throw new Error(`C-Forge: falta el paquete npm "${paquete}" (npm install ${paquete})`);
+      npm[modulo] = await import("https://esm.sh/" + paquete);
+    }
+  }
+
   // Externas: módulo (biblioteca del extern) → nombre → función de JavaScript.
   const importaciones = { cf: { sys } };
   for (const [modulo, nombre, tipos, resultado] of EXTERNAS) {
-    const fuente = modulo === "js" ? js : modulo === "navegador" ? NAVEGADOR : (opciones.modulos || {})[modulo] || {};
+    let fuente = modulo === "js" ? js : modulo === "navegador" ? NAVEGADOR : (opciones.modulos || {})[modulo] || npm[modulo] || {};
+    // Paquetes CommonJS (lodash…): las funciones viven en default.
+    if (fuente[nombre] === undefined && fuente.default && typeof fuente.default[nombre] === "function") fuente = fuente.default;
     const f = fuente[nombre] !== undefined ? fuente[nombre] : globalThis[nombre];
     if (typeof f !== "function") {
       // Biblioteca nativa (SDL2, sqlite3…) que no existe en la web: solo

@@ -222,7 +222,61 @@ export async function iniciar(opciones = {}) {
       const px = new Uint8ClampedArray(memoria.buffer, Number(dir), w * h * 4).slice();
       c.getContext("2d").putImageData(new ImageData(px, w, h), 0, 0);
     },
+    // Elementos por índice (querySelectorAll): el i-ésimo que calza con el selector.
+    nav_cuantos: (s) => document.querySelectorAll(s).length,
+    nav_clase_n: (s, i, c, a) => { const e = document.querySelectorAll(s)[i]; if (e) e.classList.toggle(c, a); },
+    nav_estilo_n: (s, i, p, v) => { const e = document.querySelectorAll(s)[i]; if (e) e.style.setProperty(p, v); },
+    // Caja en pantalla: "arriba", "abajo", "izquierda", "derecha", "ancho", "alto".
+    nav_caja: (s, i, campo) => {
+      const e = document.querySelectorAll(s)[i]; if (!e) return 0;
+      const r = e.getBoundingClientRect();
+      return { arriba: r.top, abajo: r.bottom, izquierda: r.left, derecha: r.right, ancho: r.width, alto: r.height }[campo] ?? 0;
+    },
+    // Media query: nav_medio("(prefers-reduced-motion: reduce)").
+    nav_medio: (q) => typeof matchMedia === "function" && matchMedia(q).matches,
+    // Lienzo 2D: rellenos, degradados, rutas, recortes, transparencia y grano.
+    nav_lienzo_alto: () => (lienzo2d ? lienzo2d.canvas.clientHeight : 0),
+    nav_relleno: (color) => { lienzo2d.fillStyle = color; },
+    nav_trazo: (color, g) => { lienzo2d.strokeStyle = color; lienzo2d.lineWidth = g; },
+    nav_relleno_lineal: (x0, y0, x1, y1, paradas) => { const g = lienzo2d.createLinearGradient(x0, y0, x1, y1); pintarParadas(g, paradas); lienzo2d.fillStyle = g; },
+    nav_relleno_radial: (x0, y0, r0, x1, y1, r1, paradas) => { const g = lienzo2d.createRadialGradient(x0, y0, r0, x1, y1, r1); pintarParadas(g, paradas); lienzo2d.fillStyle = g; },
+    nav_rellenar_rect: (x, y, w, h) => { lienzo2d.fillRect(x, y, w, h); },
+    nav_ruta_nueva: () => { lienzo2d.beginPath(); },
+    nav_ruta_mover: (x, y) => { lienzo2d.moveTo(x, y); },
+    nav_ruta_linea: (x, y) => { lienzo2d.lineTo(x, y); },
+    nav_ruta_arco: (x, y, r, a0, a1, anti) => { lienzo2d.arc(x, y, r, a0, a1, anti); },
+    nav_ruta_rombo: (x, y, w, h) => { lienzo2d.moveTo(x, y - h); lienzo2d.lineTo(x + w, y); lienzo2d.lineTo(x, y + h); lienzo2d.lineTo(x - w, y); lienzo2d.closePath(); },
+    nav_ruta_cerrar: () => { lienzo2d.closePath(); },
+    nav_rellenar: () => { lienzo2d.fill(); },
+    nav_trazar: () => { lienzo2d.stroke(); },
+    nav_recortar: () => { lienzo2d.clip(); },
+    nav_guardar: () => { lienzo2d.save(); },
+    nav_restaurar: () => { lienzo2d.restore(); },
+    nav_alfa: (a) => { lienzo2d.globalAlpha = a; },
+    nav_mezcla: (modo) => { lienzo2d.globalCompositeOperation = modo; },
+    nav_sombra: (color, desenfoque) => { lienzo2d.shadowColor = color; lienzo2d.shadowBlur = desenfoque; },
+    nav_grano: (alfa, dx, dy, modo) => {
+      if (!grano) {
+        grano = document.createElement("canvas"); grano.width = grano.height = 180;
+        const g = grano.getContext("2d"), img = g.createImageData(180, 180);
+        for (let k = 0; k < img.data.length; k += 4) { const v = Math.random() * 255; img.data[k] = img.data[k + 1] = img.data[k + 2] = v; img.data[k + 3] = 255; }
+        g.putImageData(img, 0, 0);
+      }
+      const c = lienzo2d.canvas;
+      lienzo2d.save(); lienzo2d.globalAlpha = alfa; lienzo2d.globalCompositeOperation = modo || "source-over";
+      lienzo2d.translate(-(dx % 180), -(dy % 180)); lienzo2d.fillStyle = lienzo2d.createPattern(grano, "repeat");
+      lienzo2d.fillRect(0, 0, c.clientWidth + 180, c.clientHeight + 180); lienzo2d.restore();
+    },
   };
+  // Paradas de un degradado: "0 #D5C6B1; 0.45 rgba(228,184,142,.5); 1 #E9A56E".
+  let grano = null;
+  function pintarParadas(g, paradas) {
+    for (const p of String(paradas).split(";")) {
+      const t = p.trim(); if (!t) continue;
+      const i = t.indexOf(" ");
+      g.addColorStop(parseFloat(t.slice(0, i)), t.slice(i + 1).trim());
+    }
+  }
   // Partículas: listas de enteros etiquetados (2v + 1) en milésimas, leídas
   // directo de la memoria del módulo y dibujadas como puntos aditivos.
   const dibujos = new Map();
