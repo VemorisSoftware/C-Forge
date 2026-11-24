@@ -1,0 +1,366 @@
+// stdlib/usb.cfv — USB de bajo nivel al estilo de libusb, escrito desde cero
+// (idea de libusb, LGPL: solo la idea).
+//
+//   · Enumeración por sysfs (/sys/bus/usb/devices) con descriptores crudos.
+//   · Analizador de descriptores: dispositivo, configuración, asociación de
+//     interfaces (IAD), interfaz con alternativas, endpoint (y su compañero
+//     SuperSpeed), BOS y descriptores de clase (HID, CDC, audio…) guardados
+//     como "extra", como hace libusb.
+//   · E/S con usbfs (/dev/bus/usb/BBB/DDD): transferencias de control, bulk
+//     e interrupción, reclamar y liberar interfaces, reinicio y descriptores
+//     de texto (UTF-16LE).
+//
+// En inglés: importar "libusb".
+//
+//   importar "usb"
+//   para d en usb_dispositivos() { mostrar(usb_hex4(d["vendor_id"]) + ":" + usb_hex4(d["product_id"]) + " " + d["producto"]) }
+//   sea h = usb_abrir(0x2E8A, 0x000A)
+//   usb_reclamar(h, 0)
+//   usb_bulk(h, 0x01, "hola", 1000)
+
+funcion __usb_declaraciones() {
+    extern "libc" funcion open(ruta: texto, banderas: entero, modo: entero): entero
+    extern "libc" funcion close(fd: entero): entero
+    extern "libc" funcion ioctl(fd: entero, peticion: largo, arg: puntero): entero
+}
+
+sea _usb_ctx = {"sysfs": "/sys/bus/usb/devices", "dev": "/dev/bus/usb"}
+
+sea _USB_CLASES = {"0": "por interfaz", "1": "audio", "2": "comunicaciones", "3": "HID", "5": "física", "6": "imagen", "7": "impresora", "8": "almacenamiento masivo",
+    "9": "concentrador", "10": "datos CDC", "11": "tarjeta inteligente", "13": "seguridad de contenido", "14": "video", "15": "salud personal", "16": "audio/video",
+    "17": "billboard", "18": "USB-C bridge", "220": "diagnóstico", "224": "inalámbrico", "239": "miscelánea", "254": "específica de aplicación", "255": "de fabricante"}
+
+/// Nombre de una clase USB.
+funcion usb_nombre_clase(c) { retornar _USB_CLASES["" + c] ?? "desconocida" }
+
+/// Número en hexadecimal de 4 dígitos (para vendor/product).
+funcion usb_hex4(v) {
+    sea d = "0123456789abcdef"
+    sea t = ""
+    para i en lista_rango(0, 4) {
+        t = subtexto(d, v % 16, v % 16 + 1) + t
+        v = cociente(v, 16)
+    }
+    retornar t
+}
+
+// ---------- descriptores ----------
+
+funcion _usb_b(d, i) { retornar byte_en(d, i) }
+funcion _usb_w(d, i) { retornar byte_en(d, i) + 256 * byte_en(d, i + 1) }
+
+funcion _usb_bcd(v) {
+    sea hi = cociente(v, 256)
+    sea lo = v % 256
+    retornar (cociente(hi, 16) * 10 + hi % 16) + "." + cociente(lo, 16) + "" + lo % 16
+}
+
+/// Descriptor de dispositivo (18 bytes).
+funcion usb_descriptor_dispositivo(d) {
+    si (longitud(d) < 18 o _usb_b(d, 1) != 1) { lanzar "usb: descriptor de dispositivo inválido" }
+    retornar {"bcdUSB": _usb_w(d, 2), "usb": _usb_bcd(_usb_w(d, 2)), "clase": _usb_b(d, 4), "subclase": _usb_b(d, 5), "protocolo": _usb_b(d, 6), "max_paquete0": _usb_b(d, 7),
+        "vendor_id": _usb_w(d, 8), "product_id": _usb_w(d, 10), "bcdDevice": _usb_w(d, 12), "i_fabricante": _usb_b(d, 14), "i_producto": _usb_b(d, 15), "i_serie": _usb_b(d, 16),
+        "num_configuraciones": _usb_b(d, 17)}
+}
+
+/// Analiza un descriptor de configuración completo (wTotalLength bytes).
+funcion usb_descriptor_configuracion(d) {
+    si (longitud(d) < 9 o _usb_b(d, 1) != 2) { lanzar "usb: descriptor de configuración inválido" }
+    sea total = minimo(_usb_w(d, 2), longitud(d))
+    sea atr = _usb_b(d, 7)
+    sea c = {"total": _usb_w(d, 2), "num_interfaces": _usb_b(d, 4), "valor": _usb_b(d, 5), "i_configuracion": _usb_b(d, 6), "atributos": atr,
+        "autoalimentado": cociente(atr, 64) % 2 == 1, "despertar_remoto": cociente(atr, 32) % 2 == 1, "max_ma": _usb_b(d, 8) * 2, "interfaces": [], "asociaciones": [], "extra": ""}
+    sea p = 9
+    sea alt = nulo
+    sea ep = nulo
+    mientras (p + 2 <= total) {
+        sea n = _usb_b(d, p)
+        sea t = _usb_b(d, p + 1)
+        si (n < 2 o p + n > total) { lanzar "usb: descriptor truncado en el byte " + p }
+        sea trozo = subtexto(d, p, p + n)
+        si (t == 4) {
+            alt = {"numero": _usb_b(d, p + 2), "alternativa": _usb_b(d, p + 3), "num_endpoints": _usb_b(d, p + 4), "clase": _usb_b(d, p + 5), "subclase": _usb_b(d, p + 6),
+                "protocolo": _usb_b(d, p + 7), "i_interfaz": _usb_b(d, p + 8), "endpoints": [], "extra": ""}
+            ep = nulo
+            sea iface = nulo
+            para x en c["interfaces"] {
+                si (x["numero"] == alt["numero"]) { iface = x }
+            }
+            si (iface == nulo) {
+                iface = {"numero": alt["numero"], "alternativas": []}
+                c["interfaces"].agregar(iface)
+            }
+            iface["alternativas"].agregar(alt)
+        } sino si (t == 5) {
+            si (alt == nulo) { lanzar "usb: endpoint fuera de una interfaz" }
+            sea dir = _usb_b(d, p + 2)
+            sea atr_e = _usb_b(d, p + 3)
+            sea mp = _usb_w(d, p + 4)
+            ep = {"direccion": dir, "numero": dir % 16, "entrada": dir >= 128, "atributos": atr_e, "tipo": ["control", "isocrono", "bulk", "interrupcion"][atr_e % 4],
+                "max_paquete": mp % 2048, "transacciones_extra": cociente(mp, 2048) % 4, "intervalo": _usb_b(d, p + 6), "extra": ""}
+            si (n >= 9) {
+                ep["refresco"] = _usb_b(d, p + 7)
+                ep["sincronizacion"] = _usb_b(d, p + 8)
+            }
+            alt["endpoints"].agregar(ep)
+        } sino si (t == 11) {
+            c["asociaciones"].agregar({"primera_interfaz": _usb_b(d, p + 2), "num_interfaces": _usb_b(d, p + 3), "clase": _usb_b(d, p + 4), "subclase": _usb_b(d, p + 5),
+                "protocolo": _usb_b(d, p + 6), "i_funcion": _usb_b(d, p + 7)})
+        } sino si (t == 48 y ep != nulo) {
+            ep["compañero_ss"] = {"max_rafaga": _usb_b(d, p + 2), "atributos": _usb_b(d, p + 3), "bytes_por_intervalo": _usb_w(d, p + 4)}
+        } sino {
+            // Descriptores de clase o de fabricante: al "extra" del último nivel.
+            si (ep != nulo) { ep["extra"] = ep["extra"] + trozo } sino si (alt != nulo) { alt["extra"] = alt["extra"] + trozo } sino { c["extra"] = c["extra"] + trozo }
+        }
+        p = p + n
+    }
+    retornar c
+}
+
+/// Parte un bloque "extra" en descriptores: [{"tipo", "datos"}]. Los HID
+/// (0x21) traen además {"hid": {"bcdHID", "pais", "descriptores": [[tipo, largo]]}}.
+funcion usb_descriptores_extra(extra) {
+    sea r = []
+    sea p = 0
+    mientras (p + 2 <= longitud(extra)) {
+        sea n = _usb_b(extra, p)
+        si (n < 2) { romper }
+        sea t = _usb_b(extra, p + 1)
+        sea x = {"tipo": t, "datos": subtexto(extra, p, p + n)}
+        si (t == 33 y n >= 9) {
+            sea ds = []
+            para k en lista_rango(0, _usb_b(extra, p + 5)) { ds.agregar([_usb_b(extra, p + 6 + 3 * k), _usb_w(extra, p + 7 + 3 * k)]) }
+            x["hid"] = {"bcdHID": _usb_w(extra, p + 2), "pais": _usb_b(extra, p + 4), "descriptores": ds}
+        }
+        si (t == 36 y n >= 3) { x["subtipo"] = _usb_b(extra, p + 2) }
+        r.agregar(x)
+        p = p + n
+    }
+    retornar r
+}
+
+/// Descriptor BOS (SuperSpeed): capacidades [{"tipo", "datos"}].
+funcion usb_descriptor_bos(d) {
+    si (longitud(d) < 5 o _usb_b(d, 1) != 15) { lanzar "usb: descriptor BOS inválido" }
+    sea caps = []
+    sea p = 5
+    mientras (p + 3 <= minimo(_usb_w(d, 2), longitud(d))) {
+        sea n = _usb_b(d, p)
+        si (n < 3) { romper }
+        sea cap = {"tipo": _usb_b(d, p + 2), "datos": subtexto(d, p, p + n)}
+        si (cap["tipo"] == 2 y n >= 7) { cap["lpm"] = cociente(_usb_b(d, p + 3), 2) % 2 == 1 }
+        caps.agregar(cap)
+        p = p + n
+    }
+    retornar {"num_capacidades": _usb_b(d, 4), "capacidades": caps}
+}
+
+/// Descriptores crudos de sysfs (dispositivo + configuraciones seguidas).
+funcion usb_analizar_descriptores(d) {
+    sea dev = usb_descriptor_dispositivo(d)
+    sea confs = []
+    sea p = 18
+    mientras (p + 4 <= longitud(d)) {
+        sea total = _usb_w(d, p + 2)
+        confs.agregar(usb_descriptor_configuracion(subtexto(d, p, minimo(longitud(d), p + total))))
+        p = p + total
+    }
+    dev["configuraciones"] = confs
+    retornar dev
+}
+
+/// Descriptor de texto (UTF-16LE) → texto UTF-8.
+funcion usb_texto_descriptor(d) {
+    si (longitud(d) < 2 o _usb_b(d, 1) != 3) { lanzar "usb: descriptor de texto inválido" }
+    sea r = ""
+    sea n = minimo(_usb_b(d, 0), longitud(d))
+    sea i = 2
+    mientras (i + 1 < n) {
+        sea cp = _usb_w(d, i)
+        i = i + 2
+        si (cp >= 55296 y cp < 56320 y i + 1 < n) {
+            sea bajo = _usb_w(d, i)
+            i = i + 2
+            cp = 65536 + (cp - 55296) * 1024 + (bajo - 56320)
+        }
+        r = r + _usb_utf8(cp)
+    }
+    retornar r
+}
+
+funcion _usb_utf8(cp) {
+    si (cp < 128) { retornar char_de(cp) }
+    si (cp < 2048) { retornar char_de(192 + cociente(cp, 64)) + char_de(128 + cp % 64) }
+    si (cp < 65536) { retornar char_de(224 + cociente(cp, 4096)) + char_de(128 + cociente(cp, 64) % 64) + char_de(128 + cp % 64) }
+    retornar char_de(240 + cociente(cp, 262144)) + char_de(128 + cociente(cp, 4096) % 64) + char_de(128 + cociente(cp, 64) % 64) + char_de(128 + cp % 64)
+}
+
+/// Paquete SETUP de 8 bytes para una transferencia de control.
+funcion usb_paquete_setup(tipo_req, peticion, valor, indice, largo) {
+    retornar char_de(tipo_req) + char_de(peticion) + bytes_entero(valor, 2, 1) + bytes_entero(indice, 2, 1) + bytes_entero(largo, 2, 1)
+}
+
+/// bmRequestType a partir de dirección ("entrada" | "salida"), tipo
+/// ("estandar" | "clase" | "fabricante") y destino ("dispositivo" |
+/// "interfaz" | "endpoint" | "otro").
+funcion usb_tipo_peticion(direccion, tipo_r, destino) {
+    sea d = si(direccion == "entrada", 128, 0)
+    sea t = si(tipo_r == "clase", 32, si(tipo_r == "fabricante", 64, 0))
+    sea r = si(destino == "interfaz", 1, si(destino == "endpoint", 2, si(destino == "otro", 3, 0)))
+    retornar d + t + r
+}
+
+// ---------- enumeración ----------
+
+/// Cambia las raíces de sysfs y usbfs (para pruebas).
+funcion usb_raices(sysfs, dev) {
+    _usb_ctx["sysfs"] = sysfs
+    _usb_ctx["dev"] = dev
+    retornar nulo
+}
+
+funcion _usb_leer(base, n) {
+    sea r = base + "/" + n
+    si (existe_archivo(r) == falso) { retornar nulo }
+    retornar texto_recortar(leer_archivo(r))
+}
+
+funcion _usb_hexnum(t) {
+    sea v = 0
+    para i en lista_rango(0, longitud(t)) { v = v * 16 + texto_indice("0123456789abcdef", texto_minusculas(subtexto(t, i, i + 1))) }
+    retornar v
+}
+
+/// Dispositivos conectados: {"bus", "direccion", "puertos", "vendor_id",
+/// "product_id", "fabricante", "producto", "serie", "velocidad" (Mb/s),
+/// "clase", "descriptores" (crudos)}.
+funcion usb_dispositivos() {
+    sea r = []
+    si (existe_archivo(_usb_ctx["sysfs"]) == falso) { retornar r }
+    para n en ordenar(listar_carpeta(_usb_ctx["sysfs"]), funcion(a, b) { retornar si(a < b, -1, si(a > b, 1, 0)) }) {
+        sea base = _usb_ctx["sysfs"] + "/" + n
+        // Solo dispositivos (las interfaces llevan ':' en el nombre).
+        si (texto_contiene(n, ":") == falso y existe_archivo(base + "/idVendor")) {
+            sea desc = nulo
+            si (existe_archivo(base + "/descriptors")) { desc = leer_archivo(base + "/descriptors") }
+            r.agregar({"nombre": n, "bus": a_numero(_usb_leer(base, "busnum") ?? "0"), "direccion": a_numero(_usb_leer(base, "devnum") ?? "0"),
+                "puertos": si(texto_contiene(n, "-"), texto_dividir(texto_dividir(n, "-")[1], "."), []), "vendor_id": _usb_hexnum(_usb_leer(base, "idVendor")),
+                "product_id": _usb_hexnum(_usb_leer(base, "idProduct")), "fabricante": _usb_leer(base, "manufacturer") ?? "", "producto": _usb_leer(base, "product") ?? "",
+                "serie": _usb_leer(base, "serial") ?? "", "velocidad": a_numero(_usb_leer(base, "speed") ?? "0"), "clase": _usb_hexnum(_usb_leer(base, "bDeviceClass") ?? "0"),
+                "descriptores": desc})
+        }
+    }
+    retornar r
+}
+
+// ---------- usbfs ----------
+
+funcion _usb_ioc(dir, nr, tam) { retornar dir * 1073741824 + tam * 65536 + 85 * 256 + nr }
+
+funcion _usb_3d(n) {
+    sea t = "" + n
+    mientras (longitud(t) < 3) { t = "0" + t }
+    retornar t
+}
+
+/// Abre el primer dispositivo con ese vendor/product.
+funcion usb_abrir(vendor, producto) {
+    para d en usb_dispositivos() {
+        si (d["vendor_id"] == vendor y d["product_id"] == producto) { retornar usb_abrir_dispositivo(d) }
+    }
+    lanzar "usb: dispositivo no encontrado"
+}
+
+/// Abre un dispositivo de usb_dispositivos().
+funcion usb_abrir_dispositivo(d) {
+    sea ruta = _usb_ctx["dev"] + "/" + _usb_3d(d["bus"]) + "/" + _usb_3d(d["direccion"])
+    sea fd = open(ruta, 2, 0)
+    si (fd < 0) { lanzar "usb: no se pudo abrir " + ruta + " (¿permisos?)" }
+    retornar {"fd": fd, "ruta": ruta, "dispositivo": d}
+}
+
+/// Transferencia de control. Si bmRequestType es de entrada, "datos" es el
+/// largo a leer y devuelve los bytes; si no, envía "datos" y devuelve el
+/// número de bytes escritos.
+funcion usb_control(h, tipo_req, peticion, valor, indice, datos, tiempo_ms) {
+    sea entrada = tipo_req >= 128
+    sea largo = si(entrada, datos, longitud(datos))
+    sea buf = c_desde_bytes(si(entrada, _usb_ceros(largo), datos))
+    sea s = c_desde_bytes(char_de(tipo_req) + char_de(peticion) + bytes_entero(valor, 2, 1) + bytes_entero(indice, 2, 1) + bytes_entero(largo, 2, 1) + bytes_entero(tiempo_ms ?? 1000, 4, 1) +
+        _usb_ceros(4) + _usb_ceros(8))
+    c_escribir64(s, 16, buf)
+    sea r = ioctl(h["fd"], _usb_ioc(3, 0, 24), s)
+    c_liberar(s)
+    si (r < 0) {
+        c_liberar(buf)
+        lanzar "usb: la transferencia de control falló"
+    }
+    sea res = r
+    si (entrada) { res = c_bytes(buf, r) }
+    c_liberar(buf)
+    retornar res
+}
+
+funcion _usb_ceros(n) {
+    sea r = ""
+    para i en lista_rango(0, n) { r = r + char_de(0) }
+    retornar r
+}
+
+/// Transferencia bulk (o de interrupción: usbfs usa la misma llamada).
+/// endpoint ≥ 0x80 lee "datos" bytes; si no, escribe "datos".
+funcion usb_bulk(h, endpoint, datos, tiempo_ms) {
+    sea entrada = endpoint >= 128
+    sea largo = si(entrada, datos, longitud(datos))
+    sea buf = c_desde_bytes(si(entrada, _usb_ceros(largo), datos))
+    sea s = c_desde_bytes(bytes_entero(endpoint, 4, 1) + bytes_entero(largo, 4, 1) + bytes_entero(tiempo_ms ?? 1000, 4, 1) + _usb_ceros(4) + _usb_ceros(8))
+    c_escribir64(s, 16, buf)
+    sea r = ioctl(h["fd"], _usb_ioc(3, 2, 24), s)
+    c_liberar(s)
+    si (r < 0) {
+        c_liberar(buf)
+        lanzar "usb: la transferencia bulk falló"
+    }
+    sea res = r
+    si (entrada) { res = c_bytes(buf, r) }
+    c_liberar(buf)
+    retornar res
+}
+
+/// Transferencia de interrupción.
+funcion usb_interrupcion(h, endpoint, datos, tiempo_ms) { retornar usb_bulk(h, endpoint, datos, tiempo_ms) }
+
+funcion _usb_ioctl_entero(h, nr, v, error) {
+    sea b = c_desde_bytes(bytes_entero(v, 4, 1))
+    sea r = ioctl(h["fd"], _usb_ioc(2, nr, 4), b)
+    c_liberar(b)
+    si (r < 0) { lanzar "usb: " + error }
+    retornar nulo
+}
+
+/// Reclama una interfaz (USBDEVFS_CLAIMINTERFACE).
+funcion usb_reclamar(h, interfaz) { retornar _usb_ioctl_entero(h, 15, interfaz, "no se pudo reclamar la interfaz " + interfaz) }
+
+/// Libera una interfaz (USBDEVFS_RELEASEINTERFACE).
+funcion usb_liberar(h, interfaz) { retornar _usb_ioctl_entero(h, 16, interfaz, "no se pudo liberar la interfaz " + interfaz) }
+
+/// Reinicia el dispositivo (USBDEVFS_RESET).
+funcion usb_reiniciar(h) {
+    si (ioctl(h["fd"], _usb_ioc(0, 20, 0), c_reservar(8)) < 0) { lanzar "usb: el reinicio falló" }
+    retornar nulo
+}
+
+/// Elige la configuración activa (SET_CONFIGURATION).
+funcion usb_fijar_configuracion(h, valor) { retornar usb_control(h, 0, 9, valor, 0, "", 1000) }
+
+/// Lee un descriptor de texto del dispositivo (idioma 0x0409 por defecto).
+funcion usb_texto(h, indice, idioma) {
+    si (indice == 0) { retornar "" }
+    retornar usb_texto_descriptor(usb_control(h, 128, 6, 768 + indice, idioma ?? 1033, 255, 1000))
+}
+
+/// Cierra el dispositivo.
+funcion usb_cerrar(h) {
+    close(h["fd"])
+    retornar nulo
+}

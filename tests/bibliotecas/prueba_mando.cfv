@@ -1,0 +1,88 @@
+// Pruebas de mando. datos/mando/esperado.json sale de hid-tools (campos y
+// get_values) para un ratón y un teclado de arranque y un mando con IDs de
+// reporte, hat con unidades, Push/Pop, página de fabricante, controles de
+// consumo en arreglo y un uso extendido de 32 bits.
+importar "mando"
+importar "json"
+importar "sistema"
+funcion eq(a, b, q) { afirmar(("" + a) == ("" + b), q + ": [" + a + "] != [" + b + "]") }
+
+sea e = json_parsear(leer_archivo("tests/bibliotecas/datos/mando/esperado.json"))
+para k en claves(e) {
+    sea x = e[k]
+    sea d = mando_analizar_descriptor(x["descriptor"])
+    // hid-tools ordena por tipo y luego por ID.
+    sea ordenados = []
+    para t en ["entrada", "salida", "caracteristica"] {
+        para id en lista_rango(0, 256) {
+            para c en d["campos"] {
+                si (c["tipo"] == t y c["id"] == id) { ordenados.agregar(c) }
+            }
+        }
+    }
+    eq(longitud(ordenados), longitud(x["campos"]), k + ": número de campos")
+    para i en lista_rango(0, longitud(ordenados)) {
+        sea a = ordenados[i]
+        sea b = x["campos"][i]
+        sea q = k + " campo " + i
+        eq([a["tipo"], a["id"], a["uso"], a["inicio"], a["tam"], a["cuenta"], a["lmin"], a["lmax"], a["arreglo"], a["constante"], a["pagina"]],
+           [b["tipo"], b["id"], b["uso"], b["inicio"], b["tam"], b["cuenta"], b["lmin"], b["lmax"], b["arreglo"], b["constante"], b["pagina"]], q)
+        si (b["usos"] != nulo) { eq([a["usos"][0], a["usos"][longitud(a["usos"]) - 1], longitud(a["usos"])], b["usos"], q + " usos") }
+        si (cociente(b["uso"], 65536) != 9 y texto_empieza_con(b["nombre"], "0x") == falso) { eq(a["nombre"], b["nombre"], q + " nombre") }
+    }
+    para j en lista_rango(0, longitud(x["muestras"])) {
+        sea dec = mando_decodificar(d, x["muestras"][j], "entrada")
+        sea esp = x["decodificado"][j]
+        eq(longitud(dec), longitud(esp), k + " muestra " + j)
+        para i en lista_rango(0, longitud(dec)) { eq([dec[i]["campo"]["inicio"], dec[i]["valores"]], esp[i], k + " muestra " + j + " campo " + i) }
+    }
+}
+
+// Valores con nombre y nombres de la HUT.
+sea teclado = mando_analizar_descriptor(e["teclado"]["descriptor"])
+sea v = mando_valores(teclado, e["teclado"]["muestras"][0])
+eq([v["LeftShift"], v["RightShift"], v["Keyboard"]], [1, 1, ["a and A", "b and B", "Spacebar"]], "valores del teclado")
+eq(mando_nombre_uso(589827), "Button 3", "botón")
+eq(mando_nombre_pagina(65280), "Vendor Defined Page 1", "página de fabricante")
+
+// Codificar: LEDs del teclado y la salida con signo del mando.
+sea led = mando_codificar(teclado, 0, {"Num Lock": 1, "Caps Lock": 1, "Kana": 1}, "salida")
+eq([longitud(led), byte_en(led, 0)], [1, 19], "reporte de LEDs")
+sea mando = mando_analizar_descriptor(e["mando"]["descriptor"])
+sea s = mando_codificar(mando, 1, {"131120": -3}, "salida")
+eq([byte_en(s, 0), byte_en(s, 1)], [1, 253], "salida con ID y signo")
+sea f = mando_codificar(mando, 1, {"4278190112": [9]}, "caracteristica")
+eq(longitud(f), 5, "característica de 4 bytes + ID")
+eq(mando["colecciones"][0]["nombre"], "Game Pad", "colección")
+sea entrada = mando_codificar(mando, 1, {"X": -32768, "Y": 32767, "Hat switch": 5, "Button 1": 1, "Brake": 128}, "entrada")
+sea vals = mando_valores(mando, entrada)
+eq([vals["X"], vals["Y"], vals["Hat switch"], vals["Button 1"], vals["Button 2"], vals["Brake"]], [-32768, 32767, 5, 1, 0, 128], "ida y vuelta")
+sea error = ""
+intentar { mando_codificar(mando, 7, {}, "salida") } capturar (x) { error = x }
+afirmar(texto_contiene(error, "ID 7"), "ID inexistente")
+
+// Enumeración con un sysfs falso y E/S sobre un archivo común.
+sea raiz = "/tmp/cforge_hid_sys"
+sistema_comando("rm -rf " + raiz + " && mkdir -p " + raiz + "/hidraw3/device " + raiz + "/hidraw7/device")
+escribir_archivo(raiz + "/hidraw3/device/uevent", "DRIVER=hid-generic\nHID_ID=0003:0000046D:0000C216\nHID_NAME=Logitech Gamepad F310\nHID_UNIQ=AB12\n")
+sea crudo = ""
+para x en e["mando"]["descriptor"] { crudo = crudo + char_de(x) }
+escribir_archivo(raiz + "/hidraw3/device/report_descriptor", crudo)
+escribir_archivo(raiz + "/hidraw7/device/uevent", "HID_ID=0005:0000054C:000009CC\nHID_NAME=Wireless Controller\n")
+mando_raices(raiz, "/tmp")
+eq(longitud(mando_enumerar(0, 0)), 2, "dos dispositivos")
+sea ds = mando_enumerar(1133, 0)
+eq([ds[0]["ruta"], ds[0]["product_id"], ds[0]["serie"], ds[0]["producto"], ds[0]["bus"], ds[0]["pagina_uso"], ds[0]["uso"]],
+   ["/tmp/hidraw3", 49686, "AB12", "Logitech Gamepad F310", "usb", 1, 5], "enumerar")
+eq(mando_enumerar(1356, 0)[0]["bus"], "bluetooth", "bluetooth")
+escribir_archivo("/tmp/hidraw3", "")
+sea m = mando_abrir(1133, 49686, "AB12")
+eq(mando_descriptor(m), crudo, "descriptor")
+mando_escribir(m, s)
+mando_cerrar(m)
+eq(leer_archivo("/tmp/hidraw3"), s, "escritura")
+sea m2 = mando_abrir_ruta("/tmp/hidraw3")
+eq(mando_leer(m2, 64, 0), s, "lectura")
+eq(mando_leer(m2, 64, 0), "", "sin datos")
+mando_cerrar(m2)
+mostrar("[OK] mando")

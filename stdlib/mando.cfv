@@ -1,0 +1,441 @@
+// stdlib/mando.cfv — Dispositivos USB HID al estilo de hidapi, escrito desde
+// cero (idea de hidapi, licencia BSD/GPL a elegir: solo la idea).
+//
+//   · Enumeración por sysfs (/sys/class/hidraw) y E/S con /dev/hidrawN:
+//     reportes de entrada y salida, y reportes de característica (ioctl).
+//   · Analizador de descriptores de reporte HID (ítems principales, globales
+//     con Push/Pop y locales, usos extendidos de 32 bits, rangos de uso,
+//     IDs de reporte) con campos al estilo de hid-tools.
+//   · Decodifica y codifica reportes por campo, con nombres de la HID
+//     Usage Tables para las páginas comunes.
+//
+// En inglés: importar "hidapi".
+//
+//   importar "mando"
+//   para d en mando_enumerar(1133, 0) { mostrar(d["producto"]) }
+//   sea m = mando_abrir(1133, 49686, nulo)
+//   sea desc = mando_analizar_descriptor(mando_descriptor(m))
+//   mostrar(mando_valores(desc, mando_leer(m, 64, 1000)))
+
+funcion __mando_declaraciones() {
+    extern "libc" funcion open(ruta: texto, banderas: entero, modo: entero): entero
+    extern "libc" funcion close(fd: entero): entero
+    extern "libc" funcion read(fd: entero, buf: puntero, n: entero): largo
+    extern "libc" funcion write(fd: entero, datos: texto, n: entero): largo
+    extern "libc" funcion ioctl(fd: entero, peticion: largo, arg: puntero): entero
+}
+
+sea _hid_ctx = {"raiz": "/sys/class/hidraw", "dev": "/dev"}
+
+// ---------- tablas de uso ----------
+
+sea _HID_PAGINAS = {"1": "Generic Desktop", "2": "Simulation Controls", "3": "VR Controls", "4": "Sport Controls", "5": "Game Controls", "6": "Generic Device Controls",
+    "7": "Keyboard", "8": "LEDs", "9": "Button", "10": "Ordinal", "11": "Telephony Devices", "12": "Consumer Devices", "13": "Digitizers", "15": "Physical Interface Device",
+    "20": "Alphanumeric Display", "32": "Sensor", "64": "Medical Instrument", "132": "Power Device", "133": "Battery System"}
+
+sea _HID_USOS = {
+    "1": {"1": "Pointer", "2": "Mouse", "4": "Joystick", "5": "Game Pad", "6": "Keyboard", "7": "Keypad", "8": "Multi-axis Controller", "48": "X", "49": "Y", "50": "Z", "51": "Rx",
+        "52": "Ry", "53": "Rz", "54": "Slider", "55": "Dial", "56": "Wheel", "57": "Hat switch", "61": "Start", "62": "Select", "64": "Vx", "65": "Vy", "66": "Vz",
+        "128": "System Control", "129": "System Power Down", "130": "System Sleep", "131": "System Wake Up", "144": "D-pad Up", "145": "D-pad Down", "146": "D-pad Right", "147": "D-pad Left"},
+    "2": {"186": "Rudder", "187": "Throttle", "196": "Accelerator", "197": "Brake", "200": "Steering"},
+    "7": {"40": "Return (ENTER)", "41": "ESCAPE", "42": "DELETE (Backspace)", "43": "Tab", "44": "Spacebar", "57": "Caps Lock", "224": "LeftControl", "225": "LeftShift", "226": "LeftAlt",
+        "227": "Left GUI", "228": "RightControl", "229": "RightShift", "230": "RightAlt", "231": "Right GUI"},
+    "8": {"1": "Num Lock", "2": "Caps Lock", "3": "Scroll Lock", "4": "Compose", "5": "Kana", "6": "Power", "7": "Shift"},
+    "12": {"1": "Consumer Control", "176": "Play", "177": "Pause", "181": "Scan Next Track", "182": "Scan Previous Track", "183": "Stop", "205": "Play/Pause", "226": "Mute",
+        "233": "Volume Up", "234": "Volume Down"},
+    "13": {"1": "Digitizer", "2": "Pen", "4": "Touch Screen", "5": "Touch Pad", "50": "In Range", "66": "Tip Switch", "48": "Tip Pressure", "81": "Contact Identifier", "84": "Contact Count"}
+}
+
+funcion _hid_hex(v) {
+    sea d = "0123456789abcdef"
+    si (v == 0) { retornar "0x0" }
+    sea t = ""
+    sea x = v
+    mientras (x > 0) {
+        t = subtexto(d, x % 16, x % 16 + 1) + t
+        x = cociente(x, 16)
+    }
+    retornar "0x" + t
+}
+
+/// Nombre de la página de uso (16 bits altos o la página sola).
+funcion mando_nombre_pagina(pagina) {
+    si (pagina >= 65280 y pagina <= 65535) { retornar "Vendor Defined Page " + (pagina - 65279) }
+    retornar _HID_PAGINAS["" + pagina] ?? _hid_hex(pagina)
+}
+
+/// Nombre de un uso extendido (página << 16 | uso), como la HUT.
+funcion mando_nombre_uso(uso) {
+    sea pagina = cociente(uso, 65536)
+    sea u = uso % 65536
+    si (pagina == 9) { retornar si(u == 0, "No Button Pressed", "Button " + u) }
+    si (pagina == 7 y u >= 4 y u <= 29) {
+        sea l = char_de(97 + u - 4)
+        retornar l + " and " + texto_mayusculas(l)
+    }
+    si (pagina == 7 y u >= 30 y u <= 39) {
+        sea dig = ["1 and !", "2 and @", "3 and #", "4 and $", "5 and %", "6 and ^", "7 and &", "8 and *", "9 and (", "0 and )"]
+        retornar dig[u - 30]
+    }
+    sea t = _HID_USOS["" + pagina] ?? nulo
+    si (t != nulo y tiene_clave(t, "" + u)) { retornar t["" + u] }
+    retornar _hid_hex(uso)
+}
+
+// ---------- descriptor ----------
+
+funcion _hid_con_signo(v, bytes_) {
+    si (bytes_ == 0) { retornar 0 }
+    sea lim = potencia(2, 8 * bytes_ - 1)
+    retornar si(v >= lim, v - 2 * lim, v)
+}
+
+/// Analiza un descriptor de reporte (bytes o lista de enteros). Devuelve
+/// {"campos": [...], "bits": {"entrada"|"salida"|"caracteristica": {id: bits}},
+/// "con_id": bool, "colecciones": [...]}. Cada campo: {"tipo", "id", "uso",
+/// "usos", "inicio" (bit, incluye el byte de ID), "tam", "cuenta", "lmin",
+/// "lmax", "pmin", "pmax", "unidad", "exponente", "arreglo", "constante",
+/// "relativo", "nulo", "nombre", "pagina"}.
+funcion mando_analizar_descriptor(datos) {
+    sea b = datos
+    si (tipo(datos) == "texto") {
+        b = []
+        para i en lista_rango(0, longitud(datos)) { b.agregar(byte_en(datos, i)) }
+    }
+    sea g = {"pagina": 0, "lmin": 0, "lmax": 0, "pmin": 0, "pmax": 0, "unidad": 0, "exp": 0, "tam": 0, "id": 0, "cuenta": 0}
+    sea pila = []
+    sea usos = []
+    sea umin = nulo
+    sea colecciones = []
+    sea abiertas = []
+    sea aplicacion = 0
+    sea campos = []
+    sea bits = {"entrada": {}, "salida": {}, "caracteristica": {}}
+    sea con_id = falso
+    sea p = 0
+    mientras (p < longitud(b)) {
+        sea pre = b[p]
+        si (pre == 254) {
+            p = p + 3 + b[p + 1]
+        } sino {
+            sea tam = [0, 1, 2, 4][pre % 4]
+            sea clase = cociente(pre, 4) % 4
+            sea etiqueta = cociente(pre, 16)
+            sea v = 0
+            para k en lista_rango(0, tam) { v = v + b[p + 1 + k] * potencia(256, k) }
+            p = p + 1 + tam
+            si (clase == 1) {
+                si (etiqueta == 0) { g["pagina"] = v }
+                sino si (etiqueta == 1) { g["lmin"] = _hid_con_signo(v, tam) }
+                sino si (etiqueta == 2) { g["lmax"] = _hid_con_signo(v, tam) }
+                sino si (etiqueta == 3) { g["pmin"] = _hid_con_signo(v, tam) }
+                sino si (etiqueta == 4) { g["pmax"] = _hid_con_signo(v, tam) }
+                sino si (etiqueta == 5) { g["exp"] = si(v >= 8, v - 16, v) }
+                sino si (etiqueta == 6) { g["unidad"] = v }
+                sino si (etiqueta == 7) { g["tam"] = v }
+                sino si (etiqueta == 8) {
+                    g["id"] = v
+                    con_id = verdadero
+                } sino si (etiqueta == 9) { g["cuenta"] = v }
+                sino si (etiqueta == 10) {
+                    sea copia = {}
+                    para k en claves(g) { copia[k] = g[k] }
+                    pila.agregar(copia)
+                } sino si (etiqueta == 11) {
+                    si (longitud(pila) == 0) { lanzar "mando: Pop sin Push" }
+                    g = quitar_ultimo(pila)
+                }
+            } sino si (clase == 2) {
+                sea completo = si(tam == 4, v, g["pagina"] * 65536 + v)
+                si (etiqueta == 0) { usos.agregar(completo) }
+                sino si (etiqueta == 1) { umin = completo }
+                sino si (etiqueta == 2) {
+                    si (umin != nulo) {
+                        para u en lista_rango(umin, completo + 1) { usos.agregar(u) }
+                    }
+                    umin = nulo
+                }
+            } sino si (clase == 0) {
+                si (etiqueta == 10) {
+                    sea u = si(longitud(usos) > 0, usos[0], 0)
+                    colecciones.agregar({"tipo": v, "uso": u, "nombre": mando_nombre_uso(u), "nivel": longitud(abiertas)})
+                    abiertas.agregar(v)
+                    si (v == 1) { aplicacion = u }
+                } sino si (etiqueta == 12) {
+                    si (longitud(abiertas) > 0) { quitar_ultimo(abiertas) }
+                } sino si (etiqueta == 8 o etiqueta == 9 o etiqueta == 11) {
+                    sea t = si(etiqueta == 8, "entrada", si(etiqueta == 9, "salida", "caracteristica"))
+                    sea clave = "" + g["id"]
+                    sea inicio = bits[t][clave] ?? si(con_id, 8, 0)
+                    sea constante = v % 2 == 1
+                    sea variable = cociente(v, 2) % 2 == 1
+                    sea base = {"tipo": t, "id": g["id"], "lmin": g["lmin"], "lmax": g["lmax"], "pmin": g["pmin"], "pmax": g["pmax"], "unidad": g["unidad"], "exponente": g["exp"],
+                        "arreglo": variable == falso, "constante": constante, "relativo": cociente(v, 4) % 2 == 1, "nulo": cociente(v, 64) % 2 == 1, "pagina": mando_nombre_pagina(g["pagina"])}
+                    si (constante) {
+                        campos.agregar(_hid_campo(base, 0, nulo, inicio, g["tam"], g["cuenta"]))
+                    } sino si (variable) {
+                        para i en lista_rango(0, g["cuenta"]) {
+                            sea u = 0
+                            si (longitud(usos) > 0) { u = usos[minimo(i, longitud(usos) - 1)] }
+                            campos.agregar(_hid_campo(base, u, nulo, inicio + i * g["tam"], g["tam"], 1))
+                        }
+                    } sino {
+                        campos.agregar(_hid_campo(base, aplicacion, usos, inicio, g["tam"], g["cuenta"]))
+                    }
+                    bits[t][clave] = inicio + g["tam"] * g["cuenta"]
+                }
+                usos = []
+                umin = nulo
+            }
+        }
+    }
+    retornar {"campos": campos, "bits": bits, "con_id": con_id, "colecciones": colecciones}
+}
+
+funcion _hid_campo(base, uso, usos, inicio, tam, cuenta) {
+    sea c = {}
+    para k en claves(base) { c[k] = base[k] }
+    c["uso"] = uso
+    c["usos"] = usos
+    c["inicio"] = inicio
+    c["tam"] = tam
+    c["cuenta"] = cuenta
+    c["nombre"] = si(uso == 0, "Undefined", mando_nombre_uso(uso))
+    si (uso != 0 y usos == nulo) { c["pagina"] = mando_nombre_pagina(cociente(uso, 65536)) }
+    retornar c
+}
+
+// ---------- reportes ----------
+
+funcion _hid_bytes(r) {
+    si (tipo(r) == "lista") { retornar r }
+    sea l = []
+    para i en lista_rango(0, longitud(r)) { l.agregar(byte_en(r, i)) }
+    retornar l
+}
+
+funcion _hid_leer_bits(b, inicio, tam) {
+    sea v = 0
+    para k en lista_rango(0, tam) {
+        sea bit = inicio + k
+        sea byte_ = cociente(bit, 8)
+        si (byte_ < longitud(b) y cociente(b[byte_], potencia(2, bit % 8)) % 2 == 1) { v = v + potencia(2, k) }
+    }
+    retornar v
+}
+
+/// Campos de un reporte: el ID es el primer byte si el descriptor usa IDs.
+funcion mando_campos_reporte(desc, id, tipo_r) {
+    sea r = []
+    para c en desc["campos"] {
+        si (c["tipo"] == (tipo_r ?? "entrada") y c["id"] == id) { r.agregar(c) }
+    }
+    retornar r
+}
+
+/// Decodifica un reporte: lista de {"campo", "valores"} con valores crudos
+/// (con signo si lmin < 0), como get_values de hid-tools.
+funcion mando_decodificar(desc, reporte, tipo_r) {
+    sea b = _hid_bytes(reporte)
+    sea id = si(desc["con_id"], b[0], 0)
+    sea r = []
+    para c en mando_campos_reporte(desc, id, tipo_r) {
+        sea vals = []
+        para i en lista_rango(0, c["cuenta"]) {
+            sea v = _hid_leer_bits(b, c["inicio"] + i * c["tam"], c["tam"])
+            si (c["lmin"] < 0) {
+                sea lim = potencia(2, c["tam"] - 1)
+                si (v >= lim) { v = v - 2 * lim }
+            }
+            vals.agregar(v)
+        }
+        r.agregar({"campo": c, "valores": vals})
+    }
+    retornar r
+}
+
+/// Valores con nombre: {nombre: valor} de los campos variables y, para los
+/// arreglos, {nombre: lista de usos activos}.
+funcion mando_valores(desc, reporte) {
+    sea r = {}
+    para d en mando_decodificar(desc, reporte, "entrada") {
+        sea c = d["campo"]
+        si (c["constante"] == falso) {
+            si (c["arreglo"]) {
+                sea act = []
+                para v en d["valores"] {
+                    sea i = v - c["lmin"]
+                    si (v >= c["lmin"] y v <= c["lmax"] y c["usos"] != nulo y i < longitud(c["usos"]) y c["usos"][i] % 65536 != 0) { act.agregar(mando_nombre_uso(c["usos"][i])) }
+                }
+                r[c["nombre"]] = act
+            } sino { r[c["nombre"]] = d["valores"][0] }
+        }
+    }
+    retornar r
+}
+
+/// Arma un reporte: valores {uso extendido o nombre: valor | lista}. Devuelve bytes.
+funcion mando_codificar(desc, id, valores, tipo_r) {
+    sea t = tipo_r ?? "salida"
+    sea total = desc["bits"][t]["" + id] ?? nulo
+    si (total == nulo) { lanzar "mando: no hay reporte " + t + " con ID " + id }
+    sea n = cociente(total + 7, 8)
+    sea b = []
+    para i en lista_rango(0, n) { b.agregar(0) }
+    si (desc["con_id"]) { b[0] = id }
+    para c en mando_campos_reporte(desc, id, t) {
+        sea v = valores["" + c["uso"]] ?? valores[c["nombre"]] ?? nulo
+        si (v != nulo y c["constante"] == falso) {
+            sea lista = si(tipo(v) == "lista", v, [v])
+            para i en lista_rango(0, minimo(longitud(lista), c["cuenta"])) {
+                sea x = lista[i]
+                si (x < 0) { x = x + potencia(2, c["tam"]) }
+                para k en lista_rango(0, c["tam"]) {
+                    si (cociente(x, potencia(2, k)) % 2 == 1) {
+                        sea bit = c["inicio"] + i * c["tam"] + k
+                        b[cociente(bit, 8)] = b[cociente(bit, 8)] + potencia(2, bit % 8)
+                    }
+                }
+            }
+        }
+    }
+    sea partes = []
+    para x en b { partes.agregar(char_de(x)) }
+    retornar unir(partes, "")
+}
+
+// ---------- dispositivos ----------
+
+/// Cambia las raíces de sysfs y /dev (para pruebas o sistemas raros).
+funcion mando_raices(sysfs, dev) {
+    _hid_ctx["raiz"] = sysfs
+    _hid_ctx["dev"] = dev
+    retornar nulo
+}
+
+funcion _hid_uevent(t) {
+    sea r = {}
+    para l en texto_dividir(t, "\n") {
+        sea i = texto_indice(l, "=")
+        si (i > 0) { r[subtexto(l, 0, i)] = subtexto(l, i + 1, longitud(l)) }
+    }
+    retornar r
+}
+
+funcion _hid_hexnum(t) {
+    sea v = 0
+    para i en lista_rango(0, longitud(t)) {
+        sea c = texto_minusculas(subtexto(t, i, i + 1))
+        v = v * 16 + texto_indice("0123456789abcdef", c)
+    }
+    retornar v
+}
+
+/// Lista dispositivos HID (vendor/product 0 = cualquiera): {"ruta",
+/// "vendor_id", "product_id", "serie", "producto", "bus", "pagina_uso", "uso"}.
+funcion mando_enumerar(vendor, producto) {
+    sea r = []
+    si (existe_archivo(_hid_ctx["raiz"]) == falso) { retornar r }
+    sea nombres = ordenar(listar_carpeta(_hid_ctx["raiz"]), funcion(a, b) { retornar si(a < b, -1, si(a > b, 1, 0)) })
+    para n en nombres {
+        sea base = _hid_ctx["raiz"] + "/" + n + "/device"
+        si (existe_archivo(base + "/uevent")) {
+            sea ue = _hid_uevent(leer_archivo(base + "/uevent"))
+            sea id = texto_dividir(ue["HID_ID"] ?? "0:0:0", ":")
+            sea v = _hid_hexnum(id[1])
+            sea p = _hid_hexnum(id[2])
+            si ((vendor == 0 o vendor == nulo o vendor == v) y (producto == 0 o producto == nulo o producto == p)) {
+                sea pu = 0
+                sea u = 0
+                si (existe_archivo(base + "/report_descriptor")) {
+                    sea d = mando_analizar_descriptor(leer_archivo(base + "/report_descriptor"))
+                    si (longitud(d["colecciones"]) > 0) {
+                        pu = cociente(d["colecciones"][0]["uso"], 65536)
+                        u = d["colecciones"][0]["uso"] % 65536
+                    }
+                }
+                sea bus = _hid_hexnum(id[0])
+                r.agregar({"ruta": _hid_ctx["dev"] + "/" + n, "vendor_id": v, "product_id": p, "serie": ue["HID_UNIQ"] ?? "", "producto": ue["HID_NAME"] ?? "",
+                    "bus": si(bus == 3, "usb", si(bus == 5, "bluetooth", si(bus == 24, "i2c", "otro"))), "pagina_uso": pu, "uso": u, "sysfs": base})
+            }
+        }
+    }
+    retornar r
+}
+
+/// Abre un dispositivo por ruta (/dev/hidrawN).
+funcion mando_abrir_ruta(ruta) {
+    sea fd = open(ruta, 2 + 2048, 0)
+    si (fd < 0) { lanzar "mando: no se pudo abrir " + ruta + " (¿permisos?)" }
+    sea sysfs = nulo
+    para d en mando_enumerar(0, 0) {
+        si (d["ruta"] == ruta) { sysfs = d["sysfs"] }
+    }
+    retornar {"fd": fd, "ruta": ruta, "sysfs": sysfs, "buf": c_reservar(4096)}
+}
+
+/// Abre el primer dispositivo con ese vendor/product (y serie, si se da).
+funcion mando_abrir(vendor, producto, serie) {
+    para d en mando_enumerar(vendor, producto) {
+        si (serie == nulo o d["serie"] == serie) { retornar mando_abrir_ruta(d["ruta"]) }
+    }
+    lanzar "mando: dispositivo no encontrado"
+}
+
+/// Descriptor de reporte del dispositivo (bytes).
+funcion mando_descriptor(m) {
+    si (m["sysfs"] == nulo) { lanzar "mando: no se encontró el descriptor en sysfs" }
+    retornar leer_archivo(m["sysfs"] + "/report_descriptor")
+}
+
+/// Escribe un reporte de salida (el primer byte es el ID, 0 si no hay).
+funcion mando_escribir(m, datos) {
+    sea n = write(m["fd"], datos, longitud(datos))
+    si (n < 0) { lanzar "mando: error de escritura" }
+    retornar n
+}
+
+/// Lee un reporte de entrada; "" si vence el tiempo (ms; 0 = no esperar).
+funcion mando_leer(m, tam, tiempo_max) {
+    sea fin = reloj_ms() + (tiempo_max ?? 0)
+    mientras (verdadero) {
+        sea n = read(m["fd"], m["buf"], minimo(tam, 4096))
+        si (n > 0) { retornar c_bytes(m["buf"], n) }
+        si (reloj_ms() >= fin) { retornar "" }
+        hilo_dormir(1)
+    }
+    retornar ""
+}
+
+funcion _hid_ioc(nr, largo) { retornar 3 * 1073741824 + largo * 65536 + 72 * 256 + nr }
+
+/// Envía un reporte de característica (HIDIOCSFEATURE).
+funcion mando_enviar_caracteristica(m, datos) {
+    sea buf = c_desde_bytes(datos)
+    sea r = ioctl(m["fd"], _hid_ioc(6, longitud(datos)), buf)
+    c_liberar(buf)
+    si (r < 0) { lanzar "mando: HIDIOCSFEATURE falló" }
+    retornar r
+}
+
+/// Pide un reporte de característica (HIDIOCGFEATURE) con ese ID.
+funcion mando_obtener_caracteristica(m, id, tam) {
+    sea inicial = char_de(id)
+    para i en lista_rango(1, tam) { inicial = inicial + char_de(0) }
+    sea buf = c_desde_bytes(inicial)
+    sea r = ioctl(m["fd"], _hid_ioc(7, tam), buf)
+    si (r < 0) {
+        c_liberar(buf)
+        lanzar "mando: HIDIOCGFEATURE falló"
+    }
+    sea d = c_bytes(buf, r)
+    c_liberar(buf)
+    retornar d
+}
+
+/// Cierra el dispositivo.
+funcion mando_cerrar(m) {
+    close(m["fd"])
+    c_liberar(m["buf"])
+    retornar nulo
+}
