@@ -11,7 +11,7 @@ VERSION="${1:?uso: generar.sh VERSION [salida]}"
 SALIDA="${2:-dist-winget}"
 ID=VemorisSoftware.CForgeLang
 ZIP="cforge-$VERSION-windows-x64.zip"
-BASE="https://github.com/VemorisSoftware/C-Forge/releases/download/v$VERSION"
+BASE="https://github.com/VemorisSoftware/cforge/releases/download/v$VERSION"
 if [ -z "${SHA:-}" ]; then
     SHA=$(curl -fsSL "$BASE/SHA256SUMS" | awk -v z="$ZIP" '$2 == z { print $1 }')
 fi
@@ -56,11 +56,11 @@ PackageVersion: $VERSION
 PackageLocale: es-CL
 Publisher: Vemoris Group
 PublisherUrl: https://c-forge.org
-PublisherSupportUrl: https://github.com/VemorisSoftware/C-Forge/issues
+PublisherSupportUrl: https://github.com/VemorisSoftware/cforge/issues
 PackageName: C-Forge
 PackageUrl: https://c-forge.org
 License: Uso libre (C-Forge License)
-LicenseUrl: https://github.com/VemorisSoftware/C-Forge/blob/main/LICENSE
+LicenseUrl: https://github.com/VemorisSoftware/cforge/blob/main/LICENSE
 Copyright: Copyright (c) 2026 Vemoris Group S.A.
 ShortDescription: Lenguaje de programación compilado con sintaxis en español e inglés
 Description: C-Forge es un lenguaje compilado que se escribe en español o en inglés y genera ejecutables nativos para Windows, macOS, Linux y WebAssembly, con su biblioteca estándar incluida.
@@ -71,7 +71,7 @@ Tags:
   - lenguaje-de-programacion
   - programming-language
   - cfv
-ReleaseNotesUrl: https://github.com/VemorisSoftware/C-Forge/releases/tag/v$VERSION
+ReleaseNotesUrl: https://github.com/VemorisSoftware/cforge/releases/tag/v$VERSION
 ManifestType: defaultLocale
 ManifestVersion: $ESQUEMA
 FIN
@@ -83,11 +83,11 @@ PackageVersion: $VERSION
 PackageLocale: en-US
 Publisher: Vemoris Group
 PublisherUrl: https://c-forge.org
-PublisherSupportUrl: https://github.com/VemorisSoftware/C-Forge/issues
+PublisherSupportUrl: https://github.com/VemorisSoftware/cforge/issues
 PackageName: C-Forge
 PackageUrl: https://c-forge.org
 License: Freeware (C-Forge License)
-LicenseUrl: https://github.com/VemorisSoftware/C-Forge/blob/main/LICENSE
+LicenseUrl: https://github.com/VemorisSoftware/cforge/blob/main/LICENSE
 Copyright: Copyright (c) 2026 Vemoris Group S.A.
 ShortDescription: Compiled programming language with Spanish and English syntax
 Description: C-Forge is a compiled language you can write in Spanish or English. It builds native executables for Windows, macOS, Linux and WebAssembly and ships its standard library.
@@ -96,7 +96,7 @@ Tags:
   - programming-language
   - spanish
   - cfv
-ReleaseNotesUrl: https://github.com/VemorisSoftware/C-Forge/releases/tag/v$VERSION
+ReleaseNotesUrl: https://github.com/VemorisSoftware/cforge/releases/tag/v$VERSION
 ManifestType: locale
 ManifestVersion: $ESQUEMA
 FIN

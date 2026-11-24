@@ -841,7 +841,7 @@ Sitio oficial: [c-forge.org](https://c-forge.org)
   (duplicado).
 - **Web**: c-forge.org vive en `site/` y se despliega en Cloudflare Pages; se
   quitan comandos de brew/winget/scoop que no existían.
-- Repositorio oficial: `VemorisSoftware/C-Forge`.
+- Repositorio oficial: `VemorisSoftware/cforge`.
 
 ## 3.7.0 — CLI completo + versión centralizada + SDL2 estable + release automatizado
 

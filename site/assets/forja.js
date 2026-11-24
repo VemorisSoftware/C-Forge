@@ -234,7 +234,7 @@
       var d = new DataView(cf.memoria.buffer);
       for (var i = 0; i < N; i++) for (var e = 0; e < 3; e++) d.setBigInt64(listaCF[e] + i * 8, BigInt(Math.round(pos[i * 3 + e] * 1000)) * 2n + 1n, true);
       var marca = document.createElement("a");
-      marca.className = "forja-motor"; marca.href = "https://github.com/VemorisSoftware/C-Forge/blob/main/site/forja/forja.cfv";
+      marca.className = "forja-motor"; marca.href = "https://github.com/VemorisSoftware/cforge/blob/main/site/forja/forja.cfv";
       marca.rel = "noopener"; marca.textContent = "partículas: C-Forge → WebAssembly";
       document.body.appendChild(marca); api.marca = marca;
     }).catch(function (e) { api.errorCF = String(e); });
