@@ -25,7 +25,7 @@
 4. Agregar el grammar:
    ```bash
    # Copiar grammars/c-forge.json a vendor/grammars/
-   # O usar: script/add-grammar https://github.com/VemorisSoftware/C-Forge
+   # O usar: script/add-grammar https://github.com/VemorisSoftware/cforge
    ```
 
 5. Copiar los samples:

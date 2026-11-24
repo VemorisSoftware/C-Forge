@@ -11,7 +11,7 @@
 # ============================================================================
 set -eu
 
-REPO="VemorisSoftware/C-Forge"
+REPO="VemorisSoftware/cforge"
 GITHUB="https://github.com/${REPO}"
 
 if [ -t 1 ]; then

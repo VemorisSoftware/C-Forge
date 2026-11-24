@@ -2,7 +2,7 @@
 
 ![C-Forge](assets/cforgev-logo.svg)
 
-**[c-forge.org](https://c-forge.org)** · [GitHub](https://github.com/VemorisSoftware/C-Forge) · [Releases](https://github.com/VemorisSoftware/C-Forge/releases)
+**[c-forge.org](https://c-forge.org)** · [GitHub](https://github.com/VemorisSoftware/cforge) · [Releases](https://github.com/VemorisSoftware/cforge/releases)
 
 C-Forge es un lenguaje de programación creado por Vemoris Group. Su objetivo es ofrecer una sintaxis clara, ejecución nativa y una biblioteca estándar escrita en el propio lenguaje.
 
@@ -39,13 +39,13 @@ curl -fsSL https://c-forge.org/install.sh | CFORGE_PREFIX=$HOME/.local sh   # si
 ### Linux x64 (.deb)
 
 ```sh
-wget https://github.com/VemorisSoftware/C-Forge/releases/download/v5.0.0/cforge_5.0.0_amd64.deb
+wget https://github.com/VemorisSoftware/cforge/releases/download/v5.0.0/cforge_5.0.0_amd64.deb
 sudo dpkg -i cforge_5.0.0_amd64.deb
 ```
 
 ### Windows x64
 
-1. Descarga `cforge-5.0.0-windows-x64.zip` desde [Releases](https://github.com/VemorisSoftware/C-Forge/releases/latest).
+1. Descarga `cforge-5.0.0-windows-x64.zip` desde [Releases](https://github.com/VemorisSoftware/cforge/releases/latest).
 2. Extrae el ZIP en una carpeta fija, por ejemplo `C:\cforge`.
 3. Añade esa carpeta al `PATH`. La `stdlib` incluida junto a `cforge.exe` se detecta sola.
 4. Abre una nueva terminal y ejecuta `cforge --version`.
@@ -144,7 +144,7 @@ s.decir()                     // Hola desde C-Forge
 
 ## Extensión de Visual Studio Code
 
-1. Descarga `c-forge-5.0.0.vsix` desde [Releases](https://github.com/VemorisSoftware/C-Forge/releases/tag/v5.0.0).
+1. Descarga `c-forge-5.0.0.vsix` desde [Releases](https://github.com/VemorisSoftware/cforge/releases/tag/v5.0.0).
 2. En VS Code: **Extensions** (⇧⌘X) → **···** → **Install from VSIX…** → selecciona el archivo.
 3. Los archivos `.cfv` tendrán resaltado de sintaxis, snippets y diagnósticos automáticos al guardar.
 
@@ -232,7 +232,7 @@ C-Forge se compila a sí mismo: la semilla `bootstrap/semilla/cforge-linux-x64`
 (un `cforge` para Linux x64) compila las fuentes. Solo hace falta `make`:
 
 ```sh
-git clone https://github.com/VemorisSoftware/C-Forge.git
+git clone https://github.com/VemorisSoftware/cforge.git
 cd C-Forge
 make                 # la semilla compila ./cforge
 ./cforge --version

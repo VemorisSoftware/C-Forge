@@ -9,7 +9,7 @@
 $ErrorActionPreference = 'Stop'
 $ProgressPreference = 'SilentlyContinue'
 
-$Repo = 'VemorisSoftware/C-Forge'
+$Repo = 'VemorisSoftware/cforge'
 $GitHub = "https://github.com/$Repo"
 
 function Info($m) { Write-Host "[C-Forge] $m" }
