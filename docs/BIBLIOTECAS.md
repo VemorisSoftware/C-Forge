@@ -181,7 +181,7 @@ Estado: ✅ ya existe en C-Forge · 🔗 se usa hoy vía `cforge bindgen`,
 | 130 | `entidades` / `entities` | ECS de alto rendimiento | EnTT | ✅ `entidades` |
 | 131 | `navegacion` / `navmesh` | Pathfinding y NavMesh | Recast & Detour | ✅ `navegacion` |
 | 132 | `serie` / `serialport` | Puertos serie (Arduino) | serialport | ✅ `serie` |
-| 133 | `mando` | Dispositivos USB HID | hidapi | 🔗 |
+| 133 | `mando` | Dispositivos USB HID | hidapi | ✅ `mando` / `hidapi` |
 | 134 | `pines` / `gpio` | GPIO, I2C y SPI | rppal | ✅ `es` / `en` |
 | 135 | `rebote` | Física 2D determinista | Chipmunk2D | ✅ `fisica2d` |
 | 136 | `espacial` / `audio3d` | Audio 3D | OpenAL | ✅ `espacial` |
@@ -294,7 +294,7 @@ Estado: ✅ ya existe en C-Forge · 🔗 se usa hoy vía `cforge bindgen`,
 |---|---|---|---|---|
 | 212 | `traza` / `tracing` | Trazas y métricas distribuidas | OpenTelemetry | ✅ `traza` |
 | 213 | `metricas` / `metrics` | Métricas en tiempo real | Prometheus | ✅ `metricas` |
-| 214 | `flujo` | Streaming de eventos | Kafka | 🔗 |
+| 214 | `flujo` | Streaming de eventos | Kafka | ✅ `flujo` / `kafka` (cliente y broker propio) |
 | 215 | `correo_rapido` / `nats` | Mensajería entre microservicios | NATS | ✅ `correo_rapido` |
 | 216 | `colas` / `amqp` | Colas AMQP | RabbitMQ | ✅ `colas` |
 | 217 | `descubre` / `discovery` | Descubrimiento de servicios | etcd, Consul | ✅ `descubre` |
@@ -335,5 +335,5 @@ Estado: ✅ ya existe en C-Forge · 🔗 se usa hoy vía `cforge bindgen`,
 | 247 | `bandeja` / `mailbox` | Leer correo IMAP/POP3 | IMAP | ✅ `bandeja` |
 | 248 | `vecinos` / `zeroconf` | Descubrimiento mDNS | Zeroconf | ✅ `vecinos` |
 | 249 | `puertos` / `portmap` | Abrir puertos en el router | UPnP | ✅ `puertos` |
-| 250 | `usb` | USB de bajo nivel | libusb | 🔗 |
+| 250 | `usb` | USB de bajo nivel | libusb | ✅ `usb` / `libusb` (Linux, usbfs) |
 | 251 | `alerta` / `errors` | Reportes de errores en producción | Sentry | ✅ `alerta` |

@@ -4,6 +4,12 @@ Sitio oficial: [c-forge.org](https://c-forge.org)
 
 ## Sin publicar
 
+- Lote 40 de bibliotecas (tres más que pasan de enlaces a nativas):
+  `mando`/`hidapi` (enumeración por sysfs, E/S con hidraw y analizador de
+  descriptores HID con los mismos campos que hid-tools), `usb`/`libusb`
+  (descriptores USB 2.0/3.x, enumeración por sysfs y transferencias por
+  usbfs) y `flujo`/`kafka` (protocolo de Kafka con lotes v2, productor,
+  consumidor y un broker propio que sirve a kafka-python).
 - Lote 39 de bibliotecas (tres más que pasan de enlaces a nativas):
   `lector`/`tesseract` (OCR de texto impreso con plantillas generadas desde
   cualquier fuente TrueType: Otsu, renglones, glifos de varias partes,

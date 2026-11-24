@@ -1,0 +1,766 @@
+// stdlib/flujo.cfv — Streaming de eventos con el protocolo de Apache Kafka,
+// escrito desde cero (idea de Kafka, Apache 2.0):
+//
+//   · Protocolo binario de Kafka: ApiVersions (0–1), Metadata (0–4),
+//     Produce (3), Fetch (4), ListOffsets (1), CreateTopics (0) e
+//     InitProducerId (0–1).
+//   · Lotes de registros v2 (magic 2) con CRC-32C, varints en zigzag,
+//     claves, valores y cabeceras.
+//   · Cliente: productor con particionador murmur2 (el de Kafka), consumidor
+//     con offsets por partición, metadatos y creación de temas.
+//   · Broker propio en memoria (un nodo) que habla el mismo protocolo por
+//     TCP: sirve a clientes Kafka reales como kafka-python.
+//
+// En inglés: importar "kafka".
+//
+//   importar "flujo"
+//   sea c = flujo_conectar("localhost", 9092)
+//   sea p = flujo_productor(c, nulo)
+//   flujo_enviar(p, "pedidos", "{\"id\": 1}", "cliente-7", nulo)
+//   flujo_vaciar(p)
+//   sea k = flujo_consumidor(c, ["pedidos"], {"desde": "inicio"})
+//   para r en flujo_sondear(k, 1000) { mostrar(r["valor"]) }
+
+importar "latido"
+
+// ---------- enteros ----------
+
+funcion _kf_i(v, n) {
+    si (v < 0) { v = v + potencia(2, 8 * n) }
+    retornar bytes_entero(v, n, 0)
+}
+
+funcion _kf_i64(v) {
+    si (v >= 0) { retornar bytes_entero(cociente(v, 4294967296), 4, 0) + bytes_entero(v % 4294967296, 4, 0) }
+    sea a = 0 - v - 1
+    sea hi = 4294967295 - cociente(a, 4294967296)
+    sea lo = 4294967295 - a % 4294967296
+    retornar bytes_entero(hi, 4, 0) + bytes_entero(lo, 4, 0)
+}
+
+funcion _kf_cad(t) {
+    si (t == nulo) { retornar _kf_i(-1, 2) }
+    retornar _kf_i(longitud(t), 2) + t
+}
+
+funcion _kf_byt(t) {
+    si (t == nulo) { retornar _kf_i(-1, 4) }
+    retornar _kf_i(longitud(t), 4) + t
+}
+
+funcion _kf_arr(items, f) {
+    si (items == nulo) { retornar _kf_i(-1, 4) }
+    sea partes = [_kf_i(longitud(items), 4)]
+    para x en items { partes.agregar(f(x)) }
+    retornar unir(partes, "")
+}
+
+// Lector secuencial.
+funcion _kf_lector(d) { retornar {"d": d, "p": 0} }
+
+funcion _kf_u(r, n) {
+    si (r["p"] + n > longitud(r["d"])) { lanzar "flujo: mensaje truncado" }
+    sea v = bytes_leer_entero(r["d"], r["p"], n, 0)
+    r["p"] = r["p"] + n
+    retornar v
+}
+
+funcion _kf_s(r, n) {
+    sea v = _kf_u(r, n)
+    sea lim = potencia(2, 8 * n - 1)
+    retornar si(v >= lim, v - 2 * lim, v)
+}
+
+funcion _kf_s64(r) {
+    sea hi = _kf_u(r, 4)
+    sea lo = _kf_u(r, 4)
+    si (hi >= 2147483648) { retornar 0 - ((4294967295 - hi) * 4294967296 + (4294967295 - lo)) - 1 }
+    retornar hi * 4294967296 + lo
+}
+
+funcion _kf_rcad(r) {
+    sea n = _kf_s(r, 2)
+    si (n < 0) { retornar nulo }
+    sea t = subtexto(r["d"], r["p"], r["p"] + n)
+    r["p"] = r["p"] + n
+    retornar t
+}
+
+funcion _kf_rbyt(r) {
+    sea n = _kf_s(r, 4)
+    si (n < 0) { retornar nulo }
+    sea t = subtexto(r["d"], r["p"], r["p"] + n)
+    r["p"] = r["p"] + n
+    retornar t
+}
+
+funcion _kf_rarr(r, f) {
+    sea n = _kf_s(r, 4)
+    si (n < 0) { retornar nulo }
+    sea l = []
+    para i en lista_rango(0, n) { l.agregar(f(r)) }
+    retornar l
+}
+
+// Varints en zigzag (como protobuf sint64).
+funcion _kf_var(v) {
+    sea z = si(v >= 0, 2 * v, 0 - 2 * v - 1)
+    sea r = ""
+    mientras (z >= 128) {
+        r = r + char_de(128 + z % 128)
+        z = cociente(z, 128)
+    }
+    retornar r + char_de(z)
+}
+
+funcion _kf_rvar(r) {
+    sea z = 0
+    sea mult = 1
+    mientras (verdadero) {
+        sea b = _kf_u(r, 1)
+        z = z + (b % 128) * mult
+        mult = mult * 128
+        si (b < 128) { romper }
+    }
+    retornar si(z % 2 == 0, cociente(z, 2), 0 - cociente(z + 1, 2))
+}
+
+// ---------- CRC-32C y murmur2 ----------
+
+sea _KF_CRC = []
+
+funcion _kf_tabla_crc() {
+    si (longitud(_KF_CRC) > 0) { retornar _KF_CRC }
+    para i en lista_rango(0, 256) {
+        sea c = i
+        para k en lista_rango(0, 8) {
+            si (c % 2 == 1) { c = bits_xo(cociente(c, 2), 2197175160) } sino { c = cociente(c, 2) }
+        }
+        _KF_CRC.agregar(c)
+    }
+    retornar _KF_CRC
+}
+
+/// CRC-32C (Castagnoli) de unos bytes.
+funcion flujo_crc32c(d) {
+    sea t = _kf_tabla_crc()
+    sea c = 4294967295
+    para i en lista_rango(0, longitud(d)) { c = bits_xo(t[bits_xo(c, byte_en(d, i)) % 256], cociente(c, 256)) }
+    retornar bits_xo(c, 4294967295)
+}
+
+funcion _kf_mul32(a, b) { retornar ((a * (b % 65536)) % 4294967296 + ((a * cociente(b, 65536)) % 65536) * 65536) % 4294967296 }
+
+/// Hash murmur2 de Kafka (el del particionador por defecto), sin signo.
+funcion flujo_murmur2(d) {
+    sea m = 1540483477
+    sea n = longitud(d)
+    sea h = bits_xo(2538058380, n)
+    sea i = 0
+    mientras (i + 4 <= n) {
+        sea k = bytes_leer_entero(d, i, 4, 1)
+        k = _kf_mul32(k, m)
+        k = bits_xo(k, cociente(k, 16777216))
+        k = _kf_mul32(k, m)
+        h = bits_xo(_kf_mul32(h, m), k)
+        i = i + 4
+    }
+    sea resto = n - i
+    si (resto == 3) { h = bits_xo(h, byte_en(d, i + 2) * 65536) }
+    si (resto >= 2) { h = bits_xo(h, byte_en(d, i + 1) * 256) }
+    si (resto >= 1) {
+        h = bits_xo(h, byte_en(d, i))
+        h = _kf_mul32(h, m)
+    }
+    h = bits_xo(h, cociente(h, 8192))
+    h = _kf_mul32(h, m)
+    h = bits_xo(h, cociente(h, 32768))
+    retornar h
+}
+
+/// Partición de una clave como el particionador por defecto de Kafka.
+funcion flujo_particion_clave(clave, n) { retornar bits_y(flujo_murmur2(clave), 2147483647) % n }
+
+// ---------- lotes de registros v2 ----------
+
+/// Codifica un lote: registros [{"clave", "valor", "cabeceras": [[k, v]],
+/// "marca_tiempo"}] a partir de base_offset.
+funcion flujo_lote(registros, base_offset) {
+    sea t0 = (registros[0]["marca_tiempo"] ?? 0)
+    sea tmax = t0
+    sea cuerpos = []
+    para i en lista_rango(0, longitud(registros)) {
+        sea r = registros[i]
+        sea ts = r["marca_tiempo"] ?? t0
+        tmax = maximo(tmax, ts)
+        sea cab = r["cabeceras"] ?? []
+        sea c = char_de(0) + _kf_var(ts - t0) + _kf_var(i)
+        sea rk = r["clave"] ?? nulo
+        sea rv = r["valor"] ?? nulo
+        si (rk == nulo) { c = c + _kf_var(-1) } sino { c = c + _kf_var(longitud(rk)) + rk }
+        si (rv == nulo) { c = c + _kf_var(-1) } sino { c = c + _kf_var(longitud(rv)) + rv }
+        c = c + _kf_var(longitud(cab))
+        para h en cab {
+            c = c + _kf_var(longitud(h[0])) + h[0]
+            sea hv = nulo
+            si (longitud(h) > 1) { hv = h[1] }
+            si (hv == nulo) { c = c + _kf_var(-1) } sino { c = c + _kf_var(longitud(hv)) + hv }
+        }
+        cuerpos.agregar(_kf_var(longitud(c)) + c)
+    }
+    sea tras_crc = _kf_i(0, 2) + _kf_i(longitud(registros) - 1, 4) + _kf_i64(t0) + _kf_i64(tmax) + _kf_i64(-1) + _kf_i(-1, 2) + _kf_i(-1, 4) + _kf_i(longitud(registros), 4) + unir(cuerpos, "")
+    sea resto = _kf_i(0, 4) + char_de(2) + bytes_entero(flujo_crc32c(tras_crc), 4, 0) + tras_crc
+    retornar _kf_i64(base_offset) + _kf_i(longitud(resto), 4) + resto
+}
+
+/// Decodifica uno o más lotes seguidos: lista de registros con "offset",
+/// "marca_tiempo", "clave", "valor" y "cabeceras". Verifica el CRC.
+funcion flujo_leer_lotes(d) {
+    sea r = _kf_lector(d)
+    sea regs = []
+    mientras (r["p"] + 12 <= longitud(d)) {
+        sea base = _kf_s64(r)
+        sea largo = _kf_s(r, 4)
+        si (r["p"] + largo > longitud(d)) { romper }
+        sea fin = r["p"] + largo
+        _kf_s(r, 4)
+        sea magic = _kf_u(r, 1)
+        si (magic != 2) { lanzar "flujo: formato de mensajes " + magic + " no soportado" }
+        sea crc = _kf_u(r, 4)
+        si (flujo_crc32c(subtexto(d, r["p"], fin)) != crc) { lanzar "flujo: CRC inválido en el lote " + base }
+        sea atr = _kf_s(r, 2)
+        si (atr % 8 != 0) { lanzar "flujo: compresión no soportada (" + (atr % 8) + ")" }
+        _kf_s(r, 4)
+        sea t0 = _kf_s64(r)
+        _kf_s64(r)
+        _kf_s64(r)
+        _kf_s(r, 2)
+        _kf_s(r, 4)
+        sea n = _kf_s(r, 4)
+        para i en lista_rango(0, n) {
+            _kf_rvar(r)
+            _kf_u(r, 1)
+            sea dt = _kf_rvar(r)
+            sea doff = _kf_rvar(r)
+            sea kl = _kf_rvar(r)
+            sea k = nulo
+            si (kl >= 0) {
+                k = subtexto(d, r["p"], r["p"] + kl)
+                r["p"] = r["p"] + kl
+            }
+            sea vl = _kf_rvar(r)
+            sea v = nulo
+            si (vl >= 0) {
+                v = subtexto(d, r["p"], r["p"] + vl)
+                r["p"] = r["p"] + vl
+            }
+            sea cab = []
+            para j en lista_rango(0, _kf_rvar(r)) {
+                sea hl = _kf_rvar(r)
+                sea hk = subtexto(d, r["p"], r["p"] + hl)
+                r["p"] = r["p"] + hl
+                sea hvl = _kf_rvar(r)
+                sea hv = nulo
+                si (hvl >= 0) {
+                    hv = subtexto(d, r["p"], r["p"] + hvl)
+                    r["p"] = r["p"] + hvl
+                }
+                cab.agregar([hk, hv])
+            }
+            regs.agregar({"offset": base + doff, "marca_tiempo": t0 + dt, "clave": k, "valor": v, "cabeceras": cab})
+        }
+        r["p"] = fin
+    }
+    retornar regs
+}
+
+// ---------- broker ----------
+
+sea _KF_VERSIONES = [[0, 3, 3], [1, 4, 4], [2, 1, 1], [3, 0, 4], [18, 0, 1], [19, 0, 0], [22, 0, 1]]
+
+/// Crea un broker en memoria. opciones: "particiones" (por tema creado
+/// automáticamente, 1), "nodo" (0), "host", "puerto" (para Metadata),
+/// "crear_temas" (verdadero).
+funcion flujo_broker(opciones) {
+    sea op = opciones ?? {}
+    retornar {"temas": {}, "particiones": op["particiones"] ?? 1, "nodo": op["nodo"] ?? 0, "host": op["host"] ?? "localhost", "puerto": op["puerto"] ?? 9092,
+        "crear": op["crear_temas"] ?? verdadero, "peticiones": 0, "cluster": "cforge-flujo"}
+}
+
+/// Crea un tema en el broker.
+funcion flujo_broker_crear_tema(b, tema, particiones) {
+    si (tiene_clave(b["temas"], tema)) { retornar falso }
+    sea ps = []
+    para i en lista_rango(0, particiones) { ps.agregar({"registros": [], "siguiente": 0}) }
+    b["temas"][tema] = ps
+    retornar verdadero
+}
+
+funcion _kf_tema(b, tema) {
+    si (tiene_clave(b["temas"], tema) == falso y b["crear"]) { flujo_broker_crear_tema(b, tema, b["particiones"]) }
+    retornar b["temas"][tema] ?? nulo
+}
+
+/// Atiende una petición (sin el prefijo de tamaño) y devuelve la respuesta
+/// (sin prefijo). Sirve para usar el broker en el mismo proceso.
+funcion flujo_broker_atender(b, peticion) {
+    sea r = _kf_lector(peticion)
+    sea clave = _kf_s(r, 2)
+    sea version = _kf_s(r, 2)
+    sea corr = _kf_s(r, 4)
+    _kf_rcad(r)
+    b["peticiones"] = b["peticiones"] + 1
+    sea cuerpo = ""
+    sea soportada = falso
+    para v en _KF_VERSIONES {
+        si (v[0] == clave y version >= v[1] y version <= v[2]) { soportada = verdadero }
+    }
+    si (soportada == falso) {
+        // Como Kafka: ApiVersions de una versión desconocida responde en v0 con error 35.
+        si (clave == 18) { retornar _kf_i(corr, 4) + _kf_i(35, 2) + _kf_arr(_KF_VERSIONES, funcion(x) { retornar _kf_i(x[0], 2) + _kf_i(x[1], 2) + _kf_i(x[2], 2) }) }
+        lanzar "flujo: API " + clave + " v" + version + " no soportada"
+    }
+    si (clave == 18) {
+        cuerpo = _kf_i(0, 2) + _kf_arr(_KF_VERSIONES, funcion(x) { retornar _kf_i(x[0], 2) + _kf_i(x[1], 2) + _kf_i(x[2], 2) })
+        si (version >= 1) { cuerpo = cuerpo + _kf_i(0, 4) }
+    } sino si (clave == 3) {
+        cuerpo = _kf_metadata(b, r, version)
+    } sino si (clave == 0) {
+        cuerpo = _kf_produce(b, r)
+    } sino si (clave == 1) {
+        cuerpo = _kf_fetch(b, r)
+    } sino si (clave == 2) {
+        cuerpo = _kf_list_offsets(b, r)
+    } sino si (clave == 19) {
+        cuerpo = _kf_create_topics(b, r)
+    } sino si (clave == 22) {
+        // InitProducerId: un id nuevo por productor (idempotencia sin transacciones).
+        _kf_rcad(r)
+        _kf_s(r, 4)
+        b["productores"] = (b["productores"] ?? 0) + 1
+        cuerpo = _kf_i(0, 4) + _kf_i(0, 2) + _kf_i64(1000 + b["productores"]) + _kf_i(0, 2)
+    }
+    retornar _kf_i(corr, 4) + cuerpo
+}
+
+funcion _kf_metadata(b, r, version) {
+    sea pedidos = _kf_rarr(r, funcion(x) { retornar _kf_rcad(x) })
+    si (version >= 4) { _kf_u(r, 1) }
+    sea nombres = pedidos
+    si (nombres == nulo o (version == 0 y longitud(nombres) == 0)) { nombres = ordenar(claves(b["temas"]), funcion(x, y) { retornar si(x < y, -1, si(x > y, 1, 0)) }) }
+    sea out = ""
+    si (version >= 3) { out = out + _kf_i(0, 4) }
+    out = out + _kf_i(1, 4) + _kf_i(b["nodo"], 4) + _kf_cad(b["host"]) + _kf_i(b["puerto"], 4)
+    si (version >= 1) { out = out + _kf_cad(nulo) }
+    si (version >= 2) { out = out + _kf_cad(b["cluster"]) }
+    si (version >= 1) { out = out + _kf_i(b["nodo"], 4) }
+    out = out + _kf_arr(nombres, funcion(t) {
+        sea ps = _kf_tema(b, t)
+        si (ps == nulo) {
+            sea e = _kf_i(3, 2) + _kf_cad(t)
+            si (version >= 1) { e = e + char_de(0) }
+            retornar e + _kf_arr([], nulo)
+        }
+        sea e = _kf_i(0, 2) + _kf_cad(t)
+        si (version >= 1) { e = e + char_de(0) }
+        retornar e + _kf_arr(lista_rango(0, longitud(ps)), funcion(i) { retornar _kf_i(0, 2) + _kf_i(i, 4) + _kf_i(b["nodo"], 4) + _kf_arr([b["nodo"]], funcion(n) { retornar _kf_i(n, 4) }) + _kf_arr([b["nodo"]], funcion(n) { retornar _kf_i(n, 4) }) })
+    })
+    retornar out
+}
+
+funcion _kf_produce(b, r) {
+    _kf_rcad(r)
+    _kf_s(r, 2)
+    _kf_s(r, 4)
+    sea ahora = reloj_ms()
+    sea temas = _kf_rarr(r, funcion(x) {
+        sea t = _kf_rcad(x)
+        sea ps = _kf_rarr(x, funcion(y) { retornar [_kf_s(y, 4), _kf_rbyt(y)] })
+        retornar [t, ps]
+    })
+    sea out = _kf_arr(temas, funcion(tp) {
+        sea ps = _kf_tema(b, tp[0])
+        retornar _kf_cad(tp[0]) + _kf_arr(tp[1], funcion(p) {
+            si (ps == nulo o p[0] < 0 o p[0] >= longitud(ps)) { retornar _kf_i(p[0], 4) + _kf_i(3, 2) + _kf_i64(-1) + _kf_i64(-1) }
+            sea part = ps[p[0]]
+            sea base = part["siguiente"]
+            sea regs = nulo
+            intentar { regs = flujo_leer_lotes(p[1] ?? "") } capturar (e) { regs = nulo }
+            si (regs == nulo) { retornar _kf_i(p[0], 4) + _kf_i(2, 2) + _kf_i64(-1) + _kf_i64(-1) }
+            para x en regs {
+                part["registros"].agregar({"offset": part["siguiente"], "marca_tiempo": si(x["marca_tiempo"] > 0, x["marca_tiempo"], ahora), "clave": x["clave"] ?? nulo, "valor": x["valor"] ?? nulo, "cabeceras": x["cabeceras"]})
+                part["siguiente"] = part["siguiente"] + 1
+            }
+            retornar _kf_i(p[0], 4) + _kf_i(0, 2) + _kf_i64(base) + _kf_i64(-1)
+        })
+    })
+    retornar out + _kf_i(0, 4)
+}
+
+funcion _kf_fetch(b, r) {
+    _kf_s(r, 4)
+    _kf_s(r, 4)
+    _kf_s(r, 4)
+    sea max_total = _kf_s(r, 4)
+    _kf_u(r, 1)
+    sea temas = _kf_rarr(r, funcion(x) {
+        sea t = _kf_rcad(x)
+        retornar [t, _kf_rarr(x, funcion(y) { retornar [_kf_s(y, 4), _kf_s64(y), _kf_s(y, 4)] })]
+    })
+    retornar _kf_i(0, 4) + _kf_arr(temas, funcion(tp) {
+        sea ps = b["temas"][tp[0]] ?? nulo
+        retornar _kf_cad(tp[0]) + _kf_arr(tp[1], funcion(p) {
+            si (ps == nulo o p[0] >= longitud(ps)) { retornar _kf_i(p[0], 4) + _kf_i(3, 2) + _kf_i64(-1) + _kf_i64(-1) + _kf_arr(nulo, nulo) + _kf_byt(nulo) }
+            sea part = ps[p[0]]
+            si (p[1] > part["siguiente"] o p[1] < 0) { retornar _kf_i(p[0], 4) + _kf_i(1, 2) + _kf_i64(part["siguiente"]) + _kf_i64(part["siguiente"]) + _kf_arr(nulo, nulo) + _kf_byt(nulo) }
+            sea sel = []
+            sea tam = 0
+            para i en lista_rango(p[1], part["siguiente"]) {
+                sea x = part["registros"][i]
+                tam = tam + longitud(x["valor"] ?? "") + longitud(x["clave"] ?? "") + 20
+                si (longitud(sel) > 0 y tam > p[2]) { romper }
+                sel.agregar(x)
+            }
+            sea lote = ""
+            si (longitud(sel) > 0) { lote = flujo_lote(sel, sel[0]["offset"]) }
+            retornar _kf_i(p[0], 4) + _kf_i(0, 2) + _kf_i64(part["siguiente"]) + _kf_i64(part["siguiente"]) + _kf_arr(nulo, nulo) + _kf_byt(lote)
+        })
+    })
+}
+
+funcion _kf_list_offsets(b, r) {
+    _kf_s(r, 4)
+    sea temas = _kf_rarr(r, funcion(x) {
+        sea t = _kf_rcad(x)
+        retornar [t, _kf_rarr(x, funcion(y) { retornar [_kf_s(y, 4), _kf_s64(y)] })]
+    })
+    retornar _kf_arr(temas, funcion(tp) {
+        sea ps = _kf_tema(b, tp[0])
+        retornar _kf_cad(tp[0]) + _kf_arr(tp[1], funcion(p) {
+            si (ps == nulo o p[0] >= longitud(ps)) { retornar _kf_i(p[0], 4) + _kf_i(3, 2) + _kf_i64(-1) + _kf_i64(-1) }
+            sea part = ps[p[0]]
+            sea off = si(p[1] == -2, 0, part["siguiente"])
+            si (p[1] >= 0) {
+                off = part["siguiente"]
+                para x en part["registros"] {
+                    si (x["marca_tiempo"] >= p[1] y x["offset"] < off) { off = x["offset"] }
+                }
+            }
+            retornar _kf_i(p[0], 4) + _kf_i(0, 2) + _kf_i64(-1) + _kf_i64(off)
+        })
+    })
+}
+
+funcion _kf_create_topics(b, r) {
+    sea pedidos = _kf_rarr(r, funcion(x) {
+        sea t = _kf_rcad(x)
+        sea n = _kf_s(x, 4)
+        _kf_s(x, 2)
+        _kf_rarr(x, funcion(y) {
+            _kf_s(y, 4)
+            retornar _kf_rarr(y, funcion(z) { retornar _kf_s(z, 4) })
+        })
+        _kf_rarr(x, funcion(y) { retornar [_kf_rcad(y), _kf_rcad(y)] })
+        retornar [t, n]
+    })
+    _kf_s(r, 4)
+    retornar _kf_arr(pedidos, funcion(p) {
+        si (tiene_clave(b["temas"], p[0])) { retornar _kf_cad(p[0]) + _kf_i(36, 2) }
+        si (p[1] < 1) { retornar _kf_cad(p[0]) + _kf_i(37, 2) }
+        flujo_broker_crear_tema(b, p[0], p[1])
+        retornar _kf_cad(p[0]) + _kf_i(0, 2)
+    })
+}
+
+/// Sirve el broker por TCP en host:puerto (0 = uno libre). Corre el bucle
+/// hasta que "hasta" (función sin argumentos) devuelva verdadero o pasen
+/// "max_ms". Devuelve el servidor (latido) tras terminar.
+funcion flujo_broker_servir(b, host, puerto, hasta, max_ms) {
+    sea bucle = latido_bucle()
+    sea srv = latido_tcp_servidor(bucle, host, puerto, funcion(cli) {
+        sea pend = {"d": ""}
+        latido_leer(cli, funcion(s, datos) {
+            si (datos == nulo) {
+                latido_cerrar(s, nulo)
+                retornar nulo
+            }
+            pend["d"] = pend["d"] + datos
+            mientras (longitud(pend["d"]) >= 4) {
+                sea n = bytes_leer_entero(pend["d"], 0, 4, 0)
+                si (longitud(pend["d"]) < 4 + n) { romper }
+                sea pet = subtexto(pend["d"], 4, 4 + n)
+                pend["d"] = subtexto(pend["d"], 4 + n, longitud(pend["d"]))
+                sea resp = nulo
+                intentar { resp = flujo_broker_atender(b, pet) } capturar (e) { resp = nulo }
+                si (resp == nulo) {
+                    latido_cerrar(s, nulo)
+                    retornar nulo
+                }
+                latido_escribir(s, _kf_i(longitud(resp), 4) + resp, nulo)
+            }
+            retornar nulo
+        })
+    })
+    b["puerto"] = latido_puerto(srv)
+    sea inicio = reloj_ms()
+    latido_temporizador(bucle, 5, 5, funcion(t) {
+        si ((hasta != nulo y hasta()) o (max_ms != nulo y reloj_ms() - inicio > max_ms)) { latido_parar(bucle) }
+    })
+    latido_correr(bucle, nulo)
+    latido_cerrar_servidor(srv)
+    retornar b["puerto"]
+}
+
+// ---------- cliente ----------
+
+/// Conecta con un broker Kafka por TCP.
+funcion flujo_conectar(host, puerto) {
+    sea c = {"tipo": "tcp", "fd": net_conectar(host, puerto), "corr": 0, "cliente": "cforge-flujo", "host": host, "puerto": puerto}
+    c["versiones"] = _kf_api_versions(c)
+    retornar c
+}
+
+/// Conexión en el mismo proceso con un broker de flujo_broker.
+funcion flujo_conectar_local(b) {
+    sea c = {"tipo": "local", "broker": b, "corr": 0, "cliente": "cforge-flujo"}
+    c["versiones"] = _kf_api_versions(c)
+    retornar c
+}
+
+funcion _kf_peticion(c, clave, version, cuerpo) {
+    c["corr"] = c["corr"] + 1
+    sea pet = _kf_i(clave, 2) + _kf_i(version, 2) + _kf_i(c["corr"], 4) + _kf_cad(c["cliente"]) + cuerpo
+    sea resp = nulo
+    si (c["tipo"] == "local") { resp = flujo_broker_atender(c["broker"], pet) } sino {
+        net_enviar(c["fd"], _kf_i(longitud(pet), 4) + pet)
+        sea n = bytes_leer_entero(net_recibir_exacto(c["fd"], 4), 0, 4, 0)
+        resp = net_recibir_exacto(c["fd"], n)
+    }
+    sea r = _kf_lector(resp)
+    si (_kf_s(r, 4) != c["corr"]) { lanzar "flujo: respuesta con correlation_id inesperado" }
+    retornar r
+}
+
+funcion _kf_api_versions(c) {
+    sea r = _kf_peticion(c, 18, 0, "")
+    sea err = _kf_s(r, 2)
+    si (err != 0) { lanzar "flujo: ApiVersions falló con " + err }
+    sea m = {}
+    _kf_rarr(r, funcion(x) {
+        sea k = _kf_s(x, 2)
+        m["" + k] = [_kf_s(x, 2), _kf_s(x, 2)]
+        retornar nulo
+    })
+    retornar m
+}
+
+funcion _kf_version(c, clave, deseadas) {
+    sea v = c["versiones"]["" + clave] ?? nulo
+    si (v == nulo) { lanzar "flujo: el broker no soporta la API " + clave }
+    para d en deseadas {
+        si (d >= v[0] y d <= v[1]) { retornar d }
+    }
+    lanzar "flujo: sin versión común para la API " + clave
+}
+
+/// Metadatos del clúster: {"brokers", "temas": {tema: particiones}}. temas
+/// nulo = todos.
+funcion flujo_metadatos(c, temas) {
+    sea v = _kf_version(c, 3, [1, 4, 3, 2, 0])
+    sea cuerpo = _kf_arr(temas, funcion(t) { retornar _kf_cad(t) })
+    si (v >= 4) { cuerpo = cuerpo + char_de(0) }
+    sea r = _kf_peticion(c, 3, v, cuerpo)
+    si (v >= 3) { _kf_s(r, 4) }
+    sea brokers = _kf_rarr(r, funcion(x) {
+        sea b = {"nodo": _kf_s(x, 4), "host": _kf_rcad(x), "puerto": _kf_s(x, 4)}
+        si (v >= 1) { _kf_rcad(x) }
+        retornar b
+    })
+    si (v >= 2) { _kf_rcad(r) }
+    si (v >= 1) { _kf_s(r, 4) }
+    sea t = {}
+    _kf_rarr(r, funcion(x) {
+        sea err = _kf_s(x, 2)
+        sea nombre = _kf_rcad(x)
+        si (v >= 1) { _kf_u(x, 1) }
+        sea ps = _kf_rarr(x, funcion(y) {
+            _kf_s(y, 2)
+            sea id = _kf_s(y, 4)
+            _kf_s(y, 4)
+            _kf_rarr(y, funcion(z) { retornar _kf_s(z, 4) })
+            _kf_rarr(y, funcion(z) { retornar _kf_s(z, 4) })
+            retornar id
+        })
+        si (err == 0) { t[nombre] = longitud(ps) }
+        retornar nulo
+    })
+    retornar {"brokers": brokers, "temas": t}
+}
+
+/// Crea un tema; devuelve verdadero si se creó y falso si ya existía.
+funcion flujo_crear_tema(c, tema, particiones) {
+    _kf_version(c, 19, [0])
+    sea cuerpo = _kf_arr([tema], funcion(t) { retornar _kf_cad(t) + _kf_i(particiones, 4) + _kf_i(1, 2) + _kf_arr([], nulo) + _kf_arr([], nulo) }) + _kf_i(5000, 4)
+    sea r = _kf_peticion(c, 19, 0, cuerpo)
+    sea res = _kf_rarr(r, funcion(x) { retornar [_kf_rcad(x), _kf_s(x, 2)] })
+    si (res[0][1] == 36) { retornar falso }
+    si (res[0][1] != 0) { lanzar "flujo: CreateTopics falló con " + res[0][1] }
+    retornar verdadero
+}
+
+/// Productor. opciones: "acks" (1).
+funcion flujo_productor(c, opciones) {
+    retornar {"c": c, "acks": (opciones ?? {})["acks"] ?? 1, "pendientes": {}, "rr": 0, "particiones": {}}
+}
+
+funcion _kf_n_particiones(p, tema) {
+    si (tiene_clave(p["particiones"], tema) == falso) {
+        sea m = flujo_metadatos(p["c"], [tema])
+        p["particiones"][tema] = m["temas"][tema] ?? 1
+    }
+    retornar p["particiones"][tema]
+}
+
+/// Encola un registro. particion nulo = por clave (murmur2) o rotando.
+funcion flujo_enviar(p, tema, valor, clave, particion) { retornar flujo_enviar_con(p, tema, {"valor": valor, "clave": clave, "particion": particion}) }
+
+/// Encola un registro con todos sus campos: {"valor", "clave", "particion",
+/// "cabeceras": [[k, v]], "marca_tiempo"}.
+funcion flujo_enviar_con(p, tema, registro) {
+    // Acepta también los nombres en inglés (value, key, partition, headers, timestamp).
+    sea reg = {"valor": registro["valor"] ?? registro["value"] ?? nulo, "clave": registro["clave"] ?? registro["key"] ?? nulo, "particion": registro["particion"] ?? registro["partition"] ?? nulo,
+        "cabeceras": registro["cabeceras"] ?? registro["headers"] ?? [], "marca_tiempo": registro["marca_tiempo"] ?? registro["timestamp"] ?? reloj_ms()}
+    sea part = reg["particion"] ?? nulo
+    si (part == nulo) {
+        sea n = _kf_n_particiones(p, tema)
+        si ((reg["clave"] ?? nulo) != nulo) { part = flujo_particion_clave(reg["clave"], n) } sino {
+            part = p["rr"] % n
+            p["rr"] = p["rr"] + 1
+        }
+    }
+    sea k = tema + "\n" + part
+    si (tiene_clave(p["pendientes"], k) == falso) { p["pendientes"][k] = {"tema": tema, "particion": part, "regs": []} }
+    p["pendientes"][k]["regs"].agregar({"valor": reg["valor"] ?? nulo, "clave": reg["clave"] ?? nulo, "cabeceras": reg["cabeceras"] ?? [], "marca_tiempo": reg["marca_tiempo"] ?? reloj_ms()})
+    retornar part
+}
+
+/// Envía lo encolado. Devuelve [{"tema", "particion", "offset"}] (offset base).
+funcion flujo_vaciar(p) {
+    sea grupos = {}
+    para k en claves(p["pendientes"]) {
+        sea x = p["pendientes"][k]
+        si (tiene_clave(grupos, x["tema"]) == falso) { grupos[x["tema"]] = [] }
+        grupos[x["tema"]].agregar(x)
+    }
+    p["pendientes"] = {}
+    si (longitud(claves(grupos)) == 0) { retornar [] }
+    _kf_version(p["c"], 0, [3])
+    sea cuerpo = _kf_cad(nulo) + _kf_i(p["acks"], 2) + _kf_i(30000, 4) + _kf_arr(claves(grupos), funcion(t) {
+        retornar _kf_cad(t) + _kf_arr(grupos[t], funcion(x) { retornar _kf_i(x["particion"], 4) + _kf_byt(flujo_lote(x["regs"], 0)) })
+    })
+    sea r = _kf_peticion(p["c"], 0, 3, cuerpo)
+    sea res = []
+    _kf_rarr(r, funcion(x) {
+        sea t = _kf_rcad(x)
+        _kf_rarr(x, funcion(y) {
+            sea part = _kf_s(y, 4)
+            sea err = _kf_s(y, 2)
+            sea off = _kf_s64(y)
+            _kf_s64(y)
+            si (err != 0) { lanzar "flujo: Produce falló en " + t + "/" + part + " con " + err }
+            res.agregar({"tema": t, "particion": part, "offset": off})
+            retornar nulo
+        })
+        retornar nulo
+    })
+    retornar res
+}
+
+/// Consumidor de varias particiones. opciones: "desde" ("inicio" | "fin"),
+/// "max_bytes" (1 MiB por partición).
+funcion flujo_consumidor(c, temas, opciones) {
+    sea op = opciones ?? {}
+    sea k = {"c": c, "posiciones": {}, "max": op["max_bytes"] ?? 1048576}
+    sea m = flujo_metadatos(c, temas)
+    para t en temas {
+        para i en lista_rango(0, m["temas"][t] ?? 0) { sea desde = op["desde"] ?? "fin"
+            k["posiciones"][t + "\n" + i] = flujo_offset(c, t, i, si(desde == "inicio" o desde == "earliest", -2, -1)) }
+    }
+    retornar k
+}
+
+/// Offset de una partición: tiempo -2 = el primero, -1 = el siguiente libre,
+/// o el primero con marca de tiempo ≥ tiempo (ms).
+funcion flujo_offset(c, tema, particion, tiempo) {
+    _kf_version(c, 2, [1])
+    sea cuerpo = _kf_i(-1, 4) + _kf_arr([tema], funcion(t) { retornar _kf_cad(t) + _kf_arr([particion], funcion(pp) { retornar _kf_i(pp, 4) + _kf_i64(tiempo) }) })
+    sea r = _kf_peticion(c, 2, 1, cuerpo)
+    sea res = {"off": -1}
+    _kf_rarr(r, funcion(x) {
+        _kf_rcad(x)
+        _kf_rarr(x, funcion(y) {
+            _kf_s(y, 4)
+            sea err = _kf_s(y, 2)
+            _kf_s64(y)
+            res["off"] = _kf_s64(y)
+            si (err != 0) { lanzar "flujo: ListOffsets falló con " + err }
+            retornar nulo
+        })
+        retornar nulo
+    })
+    retornar res["off"]
+}
+
+/// Mueve la posición de lectura de una partición.
+funcion flujo_buscar(k, tema, particion, offset) {
+    k["posiciones"][tema + "\n" + particion] = offset
+    retornar nulo
+}
+
+/// Trae registros nuevos de todas las particiones asignadas: lista de
+/// {"tema", "particion", "offset", "clave", "valor", "cabeceras", "marca_tiempo"}.
+funcion flujo_sondear(k, espera_ms) {
+    _kf_version(k["c"], 1, [4])
+    sea por_tema = {}
+    para clave en claves(k["posiciones"]) {
+        sea partes = texto_dividir(clave, "\n")
+        si (tiene_clave(por_tema, partes[0]) == falso) { por_tema[partes[0]] = [] }
+        por_tema[partes[0]].agregar(a_numero(partes[1]))
+    }
+    sea cuerpo = _kf_i(-1, 4) + _kf_i(espera_ms ?? 0, 4) + _kf_i(0, 4) + _kf_i(52428800, 4) + char_de(0) + _kf_arr(claves(por_tema), funcion(t) {
+        retornar _kf_cad(t) + _kf_arr(por_tema[t], funcion(pp) { retornar _kf_i(pp, 4) + _kf_i64(k["posiciones"][t + "\n" + pp]) + _kf_i(k["max"], 4) })
+    })
+    sea r = _kf_peticion(k["c"], 1, 4, cuerpo)
+    _kf_s(r, 4)
+    sea res = []
+    _kf_rarr(r, funcion(x) {
+        sea t = _kf_rcad(x)
+        _kf_rarr(x, funcion(y) {
+            sea part = _kf_s(y, 4)
+            sea err = _kf_s(y, 2)
+            _kf_s64(y)
+            _kf_s64(y)
+            _kf_rarr(y, funcion(z) { retornar [_kf_s64(z), _kf_s64(z)] })
+            sea datos = _kf_rbyt(y)
+            si (err != 0) { lanzar "flujo: Fetch falló en " + t + "/" + part + " con " + err }
+            sea clave = t + "\n" + part
+            para reg en flujo_leer_lotes(datos ?? "") {
+                si (reg["offset"] >= k["posiciones"][clave]) {
+                    reg["tema"] = t
+                    reg["particion"] = part
+                    res.agregar(reg)
+                    k["posiciones"][clave] = reg["offset"] + 1
+                }
+            }
+            retornar nulo
+        })
+        retornar nulo
+    })
+    retornar res
+}
+
+/// Cierra la conexión.
+funcion flujo_cerrar(c) {
+    si (c["tipo"] == "tcp") { net_cerrar(c["fd"]) }
+    retornar nulo
+}

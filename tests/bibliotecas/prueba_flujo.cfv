@@ -1,0 +1,118 @@
+// Pruebas de flujo: varints, CRC-32C y murmur2 contra kafka-python, lote v2
+// idéntico byte a byte al de kafka-python, broker en el mismo proceso,
+// cliente de flujo por TCP contra un broker de flujo en otro proceso y,
+// si hay python3 + kafka-python, un productor y un consumidor Kafka reales
+// contra el broker de flujo.
+importar "flujo"
+importar "sistema"
+importar "json"
+funcion eq(a, b, q) { afirmar(("" + a) == ("" + b), q + ": [" + a + "] != [" + b + "]") }
+
+// Valores de kafka-python (kafka.partitioner.default.murmur2, calc_crc32c).
+sea claves_ = ["", "a", "ab", "abc", "cliente-7", "hola mundo!!"]
+sea hashes = [275646681, 2731586172, 316155434, 479470107, 1343667432, 718845181]
+para i en lista_rango(0, longitud(claves_)) {
+    eq(flujo_murmur2(claves_[i]), hashes[i], "murmur2 " + claves_[i])
+}
+eq([flujo_particion_clave("a", 3), flujo_particion_clave("ab", 3)], [1, 2], "partición por clave")
+eq(flujo_crc32c("123456789"), 3808858755, "CRC-32C")
+
+// DefaultRecordBatchBuilder de kafka-python con el mismo registro.
+sea lote = flujo_lote([{"valor": "tres", "cabeceras": [["tipo", "x"]], "marca_tiempo": 1000}], 0)
+sea hex = ""
+para i en lista_rango(0, longitud(lote)) {
+    sea b = byte_en(lote, i)
+    hex = hex + subtexto("0123456789abcdef", cociente(b, 16), cociente(b, 16) + 1) + subtexto("0123456789abcdef", b % 16, b % 16 + 1)
+}
+eq(hex, "000000000000000000000043000000000220e072af00000000000000000000000003e800000000000003e8ffffffffffffffffffffffffffff000000012200000001087472657302087469706f0278", "lote v2")
+sea regs = flujo_leer_lotes(lote + flujo_lote([{"clave": "k", "valor": nulo, "marca_tiempo": 5}, {"clave": nulo, "valor": "v", "marca_tiempo": 9}], 7))
+eq(longitud(regs), 3, "dos lotes seguidos")
+eq([regs[1]["offset"], regs[1]["clave"], regs[1]["valor"] ?? "NULO", regs[2]["offset"], regs[2]["clave"] ?? "NULO", regs[2]["marca_tiempo"]], [7, "k", "NULO", 8, "NULO", 9], "nulos")
+sea roto = subtexto(lote, 0, 70) + "X" + subtexto(lote, 71, longitud(lote))
+sea error = ""
+intentar { flujo_leer_lotes(roto) } capturar (x) { error = x }
+afirmar(texto_contiene(error, "CRC"), "CRC verificado")
+
+// Broker en el mismo proceso.
+sea b = flujo_broker({"particiones": 3})
+sea c = flujo_conectar_local(b)
+eq(c["versiones"]["1"], [4, 4], "ApiVersions")
+eq(flujo_crear_tema(c, "pedidos", 2), verdadero, "tema creado")
+eq(flujo_crear_tema(c, "pedidos", 2), falso, "tema existente")
+sea p = flujo_productor(c, nulo)
+para i en lista_rango(0, 5) { flujo_enviar(p, "pedidos", "pedido " + i, "cliente-" + i, nulo) }
+flujo_enviar_con(p, "eventos", {"valor": "alta", "cabeceras": [["origen", "web"], ["vacia", nulo]], "marca_tiempo": 1700000000000, "particion": 2})
+sea res = flujo_vaciar(p)
+eq(longitud(res), 3, "tres particiones escritas")
+eq(flujo_metadatos(c, nulo)["temas"], {"eventos": 3, "pedidos": 2}, "metadatos")
+sea k = flujo_consumidor(c, ["pedidos", "eventos"], {"desde": "inicio"})
+sea leidos = flujo_sondear(k, 0)
+eq(longitud(leidos), 6, "todo leído")
+para r en leidos {
+    si (r["tema"] == "pedidos") {
+        eq(r["particion"], flujo_particion_clave(r["clave"], 2), "partición de " + r["clave"])
+        eq(r["valor"], "pedido " + subtexto(r["clave"], 8, 9), "valor de " + r["clave"])
+    } sino {
+        eq([r["particion"], r["offset"], r["marca_tiempo"], r["cabeceras"][0], longitud(r["cabeceras"][1])], [2, 0, 1700000000000, ["origen", "web"], 2], "eventos")
+        afirmar(r["cabeceras"][1][1] == nulo, "cabecera nula")
+    }
+}
+eq(longitud(flujo_sondear(k, 0)), 0, "nada nuevo")
+flujo_enviar(p, "pedidos", "tarde", "cliente-1", nulo)
+flujo_vaciar(p)
+eq(flujo_sondear(k, 0)[0]["valor"], "tarde", "lo nuevo")
+eq(flujo_offset(c, "eventos", 2, 1700000000001), 1, "offset por tiempo")
+flujo_buscar(k, "eventos", 2, 0)
+eq(flujo_sondear(k, 0)[0]["valor"], "alta", "buscar")
+
+// Cliente TCP de flujo contra un broker de flujo en otro proceso.
+sea puerto = 19300 + reloj_ms() % 500
+sea fin = "/tmp/cforge_flujo_fin_" + puerto
+sistema_comando("rm -f " + fin + "; CFORGE_STDLIB=stdlib ./cforge tests/bibliotecas/datos/flujo/broker.cfv " + puerto + " " + fin + " >/dev/null 2>&1 &")
+sea t = nulo
+para intento en lista_rango(0, 100) {
+    si (t == nulo) {
+        intentar { t = flujo_conectar("127.0.0.1", puerto) } capturar (x) { hilo_dormir(100) }
+    }
+}
+afirmar(t != nulo, "conexión TCP")
+sea pt = flujo_productor(t, nulo)
+para i en lista_rango(0, 20) { flujo_enviar(pt, "tcp", "m" + i, nulo, nulo) }
+flujo_vaciar(pt)
+sea kt = flujo_consumidor(t, ["tcp"], {"desde": "inicio"})
+sea todos = []
+para i en lista_rango(0, 3) {
+    para r en flujo_sondear(kt, 10) { todos.agregar(r["valor"]) }
+}
+eq(longitud(todos), 20, "20 por TCP")
+eq(flujo_metadatos(t, ["tcp"])["temas"]["tcp"], 3, "3 particiones")
+flujo_cerrar(t)
+escribir_archivo(fin, "fin")
+
+// kafka-python real contra el broker de flujo.
+sea hay = texto_recortar(sistema_comando("python3 -c 'import kafka; print(1)' 2>/dev/null") ?? "") == "1"
+si (hay) {
+    sea b2 = flujo_broker({"particiones": 3})
+    sea c2 = flujo_conectar_local(b2)
+    sea p2 = flujo_productor(c2, nulo)
+    flujo_enviar_con(p2, "desde-cforge", {"valor": "hola desde C-Forge", "clave": "cf", "cabeceras": [["lenguaje", "C-Forge"]]})
+    flujo_vaciar(p2)
+    sea puerto2 = 19900 + reloj_ms() % 90
+    sea fin2 = "/tmp/cforge_flujo_py_fin_" + puerto2
+    sea salida = "/tmp/cforge_flujo_py_" + puerto2 + ".json"
+    sistema_comando("rm -f " + fin2 + " " + salida + "; (sleep 0.3; python3 tests/bibliotecas/datos/flujo/cliente.py " + puerto2 + " " + salida + " " + fin2 + ") >/dev/null 2>&1 &")
+    flujo_broker_servir(b2, "127.0.0.1", puerto2, funcion() { retornar existe_archivo(fin2) }, 30000)
+    sea r = json_parsear(leer_archivo(salida))
+    eq(longitud(r["leidos"]), 7, "kafka-python leyó todo")
+    para x en r["leidos"] {
+        si (x[0] == "pedidos") {
+            sea i = a_numero(subtexto(x[3], 8, 9))
+            eq([x[1], x[4], x[5]], [flujo_particion_clave(x[3], 3), "pedido " + i + " ñ", [["h", "v" + i]]], "kafka-python " + x[3])
+        } sino { eq([x[3], x[4], x[5]], ["cf", "hola desde C-Forge", [["lenguaje", "C-Forge"]]], "lote de C-Forge leído por kafka-python") }
+    }
+    sea k2 = flujo_consumidor(c2, ["pedidos"], {"desde": "inicio"})
+    sea de_py = flujo_sondear(k2, 0)
+    eq(longitud(de_py), 6, "lotes de kafka-python leídos por flujo")
+    eq(de_py[0]["cabeceras"][0][0], "h", "cabeceras de kafka-python")
+}
+mostrar("[OK] flujo")
