@@ -1,0 +1,94 @@
+// Pruebas de estudio con dispositivos virtuales (bucle, archivo y nulo):
+// callbacks, formatos, intercalado, modo bloqueante, reloj y WAV.
+importar "estudio"
+funcion eq(a, b, q) { afirmar(("" + a) == ("" + b), q + ": [" + a + "] != [" + b + "]") }
+
+estudio_iniciar()
+eq(estudio_apis(), ["SDL", "Bucle", "Archivo", "Nulo"], "apis")
+sea ds = estudio_dispositivos()
+eq([ds[0]["nombre"], ds[0]["max_salidas"], ds[0]["max_entradas"]], ["SDL", 2, 0], "SDL solo salida")
+eq(estudio_formato_soportado(nulo, {"dispositivo": "SDL", "canales": 1}, 44100), "estudio: SDL solo admite salida estéreo", "SDL mono")
+afirmar(texto_contiene(estudio_formato_soportado({"dispositivo": "Bucle", "canales": 9}, nulo, 44100), "canales"), "canales")
+afirmar(texto_contiene(estudio_formato_soportado(nulo, {"dispositivo": "Bucle", "formato": "float64"}, 44100), "formato"), "formato")
+eq(estudio_formato_soportado({"dispositivo": "Bucle"}, {"dispositivo": "Bucle"}, 8000), verdadero, "bucle dúplex")
+
+// Conversión como PortAudio: redondeo y recorte.
+eq(estudio_convertir([0.5, -1.0, 1.5, -0.25], "float32", "int16"), [16384, -32767, 32767, -8192], "float32 → int16")
+eq(estudio_convertir([-32768, 0, 16384], "int16", "uint8"), [1, 128, 192], "int16 → uint8")
+eq(estudio_convertir([100], "int8", "int24"), [6553599], "int8 → int24")
+
+// Salida a WAV con callback: seno de 1 kHz estéreo, 0,1 s exactos.
+sea fase = {"n": 0}
+estudio_archivo_salida("disco", "/tmp/cforge_estudio.wav")
+sea f = estudio_abrir({"salida": {"dispositivo": "disco", "canales": 2, "formato": "int16"}, "tasa": 8000, "cuadros_por_bufer": 100,
+    "callback": funcion(ent, cuadros, info) {
+        sea r = []
+        para i en lista_rango(0, cuadros) {
+            sea v = piso(16000 * seno(2 * 3.141592653589793 * 1000 * (fase["n"] + i) / 8000))
+            r.agregar(v)
+            r.agregar(0 - v)
+        }
+        fase["n"] = fase["n"] + cuadros
+        si (fase["n"] >= 800) { retornar {"salida": r, "estado": "completar"} }
+        retornar r
+    }})
+estudio_iniciar_flujo(f)
+afirmar(estudio_activo(f), "activo")
+eq(estudio_procesar(f, 1.0), 8, "ciclos hasta completar")
+afirmar(estudio_detenido(f), "detenido al completar")
+afirmar(absoluto(estudio_tiempo(f) - 0.1) < 1e-12, "reloj del flujo")
+estudio_cerrar(f)
+sea wav = leer_archivo("/tmp/cforge_estudio.wav")
+eq(longitud(wav), 44 + 800 * 4, "tamaño del WAV")
+eq([bytes_leer_entero(wav, 22, 2, 1), bytes_leer_entero(wav, 24, 4, 1), bytes_leer_entero(wav, 34, 2, 1)], [2, 8000, 16], "cabecera")
+eq([bytes_leer_entero(wav, 44 + 8, 2, 1), bytes_leer_entero(wav, 44 + 10, 2, 1)], [16000, 65536 - 16000], "muestras L/R")
+
+// Entrada desde ese WAV, no intercalada y en float32.
+estudio_archivo_entrada("grabacion", wav)
+sea picos = {"l": 0.0, "r": 0.0, "n": 0}
+sea g = estudio_abrir({"entrada": {"dispositivo": "grabacion", "canales": 2, "intercalado": falso}, "tasa": 8000, "cuadros_por_bufer": 200,
+    "callback": funcion(ent, cuadros, info) {
+        para v en ent[0] { picos["l"] = maximo(picos["l"], v) }
+        para v en ent[1] { picos["r"] = minimo(picos["r"], v) }
+        picos["n"] = picos["n"] + cuadros
+        retornar nulo
+    }})
+estudio_iniciar_flujo(g)
+estudio_procesar(g, 0.1)
+eq(picos["n"], 800, "cuadros leídos")
+afirmar(absoluto(picos["l"] - 16000 / 32768) < 1e-9 y absoluto(picos["r"] + 16000 / 32768) < 1e-9, "picos")
+estudio_cerrar(g)
+afirmar(texto_contiene(estudio_formato_soportado({"dispositivo": "grabacion", "canales": 2}, nulo, 44100), "tasa"), "tasa del archivo")
+
+// Bucle dúplex: lo escrito vuelve por la entrada un ciclo después.
+sea vistos = []
+sea d = estudio_abrir({"entrada": {"dispositivo": "Bucle", "canales": 1}, "salida": {"dispositivo": "Bucle", "canales": 1}, "tasa": 1000, "cuadros_por_bufer": 4,
+    "callback": funcion(ent, cuadros, info) {
+        vistos.agregar(ent)
+        retornar [longitud(vistos), 0.25, 0.5, 2.0]
+    }})
+estudio_iniciar_flujo(d)
+estudio_procesar(d, 0.012)
+eq(vistos, [[0, 0, 0, 0], [1, 0.25, 0.5, 1], [1, 0.25, 0.5, 1]], "bucle con recorte")
+afirmar(absoluto(estudio_info(d)["latencia_salida"] - 0.004) < 1e-12, "latencia")
+estudio_cerrar(d)
+
+// Modo bloqueante entre dos flujos sobre el bucle (vacío tras reiniciar).
+estudio_terminar()
+estudio_iniciar()
+sea sal = estudio_abrir({"salida": {"dispositivo": "Bucle", "canales": 2, "formato": "int16"}, "tasa": 1000})
+sea ent = estudio_abrir({"entrada": {"dispositivo": "Bucle", "canales": 1, "formato": "int16"}, "tasa": 1000})
+estudio_iniciar_flujo(sal)
+estudio_iniciar_flujo(ent)
+estudio_escribir(sal, [100, -100, 200, -200, 300, -300])
+eq(estudio_disponible_lectura(ent), 3, "disponibles")
+eq(estudio_leer(ent, 2), [100, 200], "lectura")
+eq(estudio_leer(ent, 2), [300, 0], "lectura con faltante")
+eq(estudio_info(ent)["sobrecargas"], 1, "faltante contado")
+sea error = ""
+intentar { estudio_leer(sal, 1) } capturar (x) { error = x }
+eq(error, "estudio: el flujo no tiene entrada", "sin entrada")
+estudio_cerrar(sal)
+estudio_cerrar(ent)
+estudio_terminar()
+mostrar("[OK] estudio")

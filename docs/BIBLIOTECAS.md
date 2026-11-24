@@ -83,8 +83,8 @@ Estado: ✅ ya existe en C-Forge · 🔗 se usa hoy vía `cforge bindgen`,
 | 57 | `fichas` / `tokenizers` | Tokenización (BPE, WordPiece) | Tokenizers | ✅ `fichas` |
 | 58 | `vecindad` / `vectors` | Búsqueda vectorial | FAISS | ✅ `vecindad` |
 | 59 | `aprende` / `ml` | ML clásico | scikit-learn | ✅ `aprende` |
-| 60 | `lector` | OCR | Tesseract | 🔗 |
-| 61 | `oido` | Voz a texto | Whisper.cpp | 🔗 |
+| 60 | `lector` | OCR | Tesseract | ✅ `lector` / `tesseract` (texto impreso con fuentes TrueType) |
+| 61 | `oido` | Voz a texto | Whisper.cpp | ✅ `oido` / `whispercpp` (modelos ggml F32/F16) |
 | 62 | `prediccion` | Entrenar y predecir | ML.NET | 🔗 `dotnet` |
 | 63 | `numerica` / `numeric` | Estadística y FFT | Math.NET | ✅ `numerica` |
 | 64 | `simbolo` / `symbolic` | Matemáticas simbólicas | SymPy | ✅ `simbolo` |
@@ -177,7 +177,7 @@ Estado: ✅ ya existe en C-Forge · 🔗 se usa hoy vía `cforge bindgen`,
 |---|---|---|---|---|
 | 127 | `sonido` | Reproducir y capturar audio | miniaudio | ✅ `audio` |
 | 128 | `mezcla` / `mixer` | Mezclador y decodificadores | Rodio | ✅ WAV · `mezcla` (FLAC y mezcla) · `mezcla_mp3` / `mp3` · `mezcla_vorbis` / `vorbis` |
-| 129 | `estudio` | Audio en tiempo real | PortAudio | 🔗 |
+| 129 | `estudio` | Audio en tiempo real | PortAudio | ✅ `estudio` / `portaudio` (salida por SDL2; entrada real, por enlaces) |
 | 130 | `entidades` / `entities` | ECS de alto rendimiento | EnTT | ✅ `entidades` |
 | 131 | `navegacion` / `navmesh` | Pathfinding y NavMesh | Recast & Detour | ✅ `navegacion` |
 | 132 | `serie` / `serialport` | Puertos serie (Arduino) | serialport | ✅ `serie` |

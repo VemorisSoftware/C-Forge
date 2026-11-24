@@ -1,0 +1,485 @@
+// stdlib/estudio.cfv — E/S de audio en tiempo real al estilo de PortAudio,
+// escrito desde cero (idea de PortAudio, MIT). Flujos de entrada, salida o
+// dúplex con callback o en modo bloqueante, formatos de muestra con
+// conversión y recorte, reloj del flujo e información de latencia.
+//
+// APIs de anfitrión:
+//   · "SDL"     salida real por la tarjeta de sonido (SDL2, como "audio").
+//   · "Bucle"   lo que se escribe en su salida vuelve por su entrada.
+//   · "Archivo" entrada desde un WAV y salida a un WAV (sin tiempo real).
+//   · "Nulo"    descarta la salida y entrega silencio.
+// Los dispositivos virtuales avanzan con estudio_procesar (tiempo simulado);
+// los reales con estudio_bombear en el bucle del programa.
+//
+// En inglés: importar "portaudio".
+//
+//   importar "estudio"
+//   sea f = estudio_abrir({"salida": {"dispositivo": "SDL", "canales": 2}, "tasa": 48000,
+//       "callback": funcion(entrada, cuadros, info) { retornar mi_sinte(cuadros) }})
+//   estudio_iniciar_flujo(f)
+//   mientras (estudio_activo(f)) { estudio_bombear(f) }
+
+importar "audio"
+
+sea _pa_ctx = {"iniciado": falso, "archivos": {}, "bucle": [], "bucle_pos": 0}
+sea _PA_FORMATOS = ["float32", "int32", "int24", "int16", "int8", "uint8"]
+
+/// Inicia la biblioteca (Pa_Initialize). Se puede llamar varias veces.
+funcion estudio_iniciar() {
+    _pa_ctx["iniciado"] = verdadero
+    retornar nulo
+}
+
+/// Cierra todos los flujos abiertos (Pa_Terminate).
+funcion estudio_terminar() {
+    _pa_ctx["iniciado"] = falso
+    _pa_ctx["bucle"] = []
+    _pa_ctx["bucle_pos"] = 0
+    retornar nulo
+}
+
+/// Versión de la API emulada.
+funcion estudio_version() { retornar {"numero": 1, "texto": "estudio (C-Forge) — API de PortAudio v19"} }
+
+/// APIs de anfitrión disponibles.
+funcion estudio_apis() { retornar ["SDL", "Bucle", "Archivo", "Nulo"] }
+
+/// Registra un WAV como dispositivo de entrada con ese nombre.
+funcion estudio_archivo_entrada(nombre, datos_wav) {
+    _pa_ctx["archivos"][nombre] = {"tipo": "entrada", "wav": _pa_wav_leer(datos_wav), "pos": 0}
+    retornar nulo
+}
+
+/// Crea un dispositivo de salida a WAV (lo escribe al cerrar el flujo).
+funcion estudio_archivo_salida(nombre, ruta) {
+    _pa_ctx["archivos"][nombre] = {"tipo": "salida", "ruta": ruta}
+    retornar nulo
+}
+
+/// Lista de dispositivos: {"indice", "nombre", "api", "max_entradas",
+/// "max_salidas", "tasa_defecto", "latencia_baja", "latencia_alta"}.
+funcion estudio_dispositivos() {
+    sea r = []
+    r.agregar(_pa_disp("SDL", "SDL", 0, 2))
+    r.agregar(_pa_disp("Bucle", "Bucle", 8, 8))
+    r.agregar(_pa_disp("Nulo", "Nulo", 8, 8))
+    para k en ordenar(claves(_pa_ctx["archivos"]), funcion(a, b) { retornar si(a < b, -1, si(a > b, 1, 0)) }) {
+        sea a = _pa_ctx["archivos"][k]
+        si (a["tipo"] == "entrada") { r.agregar(_pa_disp(k, "Archivo", a["wav"]["canales"], 0)) } sino { r.agregar(_pa_disp(k, "Archivo", 0, 8)) }
+    }
+    para i en lista_rango(0, longitud(r)) { r[i]["indice"] = i }
+    retornar r
+}
+
+funcion _pa_disp(nombre, api, ent, sal) {
+    sea tasa = 44100
+    si (api == "Archivo" y ent > 0) { tasa = _pa_ctx["archivos"][nombre]["wav"]["tasa"] }
+    retornar {"nombre": nombre, "api": api, "max_entradas": ent, "max_salidas": sal, "tasa_defecto": tasa,
+        "latencia_baja": si(api == "SDL", 0.02, 0.0), "latencia_alta": si(api == "SDL", 0.1, 0.0)}
+}
+
+funcion _pa_buscar(d) {
+    para x en estudio_dispositivos() {
+        si (x["nombre"] == d o x["indice"] == d) { retornar x }
+    }
+    lanzar "estudio: dispositivo inválido " + d
+}
+
+/// Dispositivo de salida por defecto (la tarjeta de sonido vía SDL).
+funcion estudio_salida_defecto() { retornar 0 }
+
+/// Dispositivo de entrada por defecto (el bucle).
+funcion estudio_entrada_defecto() { retornar 1 }
+
+funcion _pa_param(p, entrada) {
+    si (p == nulo) { retornar nulo }
+    sea d = _pa_buscar(p["dispositivo"] ?? p["device"] ?? si(entrada, estudio_entrada_defecto(), estudio_salida_defecto()))
+    sea canales = p["canales"] ?? p["channels"] ?? 1
+    sea formato = p["formato"] ?? p["format"] ?? "float32"
+    si (lista_contiene(_PA_FORMATOS, formato) == falso) { lanzar "estudio: formato de muestra no soportado " + formato }
+    sea maximo_ = si(entrada, d["max_entradas"], d["max_salidas"])
+    si (canales < 1 o canales > maximo_) { lanzar "estudio: número de canales inválido (" + canales + ") para " + d["nombre"] }
+    retornar {"disp": d, "canales": canales, "formato": formato, "intercalado": p["intercalado"] ?? p["interleaved"] ?? verdadero}
+}
+
+/// Comprueba unos parámetros (Pa_IsFormatSupported): verdadero o el texto
+/// del error.
+funcion estudio_formato_soportado(entrada, salida, tasa) {
+    intentar {
+        sea e = _pa_param(entrada, verdadero)
+        sea s = _pa_param(salida, falso)
+        si (s != nulo y s["disp"]["api"] == "SDL" y (s["canales"] != 2 o tasa < 8000)) { lanzar "estudio: SDL solo admite salida estéreo" }
+        si (tasa <= 0) { lanzar "estudio: tasa de muestreo inválida" }
+        si (e != nulo y e["disp"]["api"] == "Archivo" y tasa != e["disp"]["tasa_defecto"]) { lanzar "estudio: tasa de muestreo inválida para " + e["disp"]["nombre"] }
+        retornar verdadero
+    } capturar (x) { retornar "" + x }
+    retornar verdadero
+}
+
+/// Abre un flujo (Pa_OpenStream). opciones: "entrada" y/o "salida" ({"dispositivo",
+/// "canales", "formato", "intercalado"}), "tasa" (44100), "cuadros_por_bufer"
+/// (256), "callback" (función(entrada, cuadros, info) → muestras de salida o
+/// {"salida", "estado": "continuar" | "completar" | "abortar"}), "fin"
+/// (función al terminar), "recortar" (verdadero).
+funcion estudio_abrir(opciones) {
+    si (_pa_ctx["iniciado"] == falso) { estudio_iniciar() }
+    // Nombres de PortAudio en inglés.
+    sea equiv = {"input": "entrada", "output": "salida", "sample_rate": "tasa", "frames_per_buffer": "cuadros_por_bufer", "finished": "fin", "clip": "recortar"}
+    sea op = {}
+    para k en claves(opciones) { op[equiv[k] ?? k] = opciones[k] }
+    opciones = op
+    sea tasa = opciones["tasa"] ?? 44100
+    sea ok = estudio_formato_soportado(opciones["entrada"] ?? nulo, opciones["salida"] ?? nulo, tasa)
+    si (ok != verdadero) { lanzar ok }
+    sea e = _pa_param(opciones["entrada"] ?? nulo, verdadero)
+    sea s = _pa_param(opciones["salida"] ?? nulo, falso)
+    si (e == nulo y s == nulo) { lanzar "estudio: el flujo necesita entrada o salida" }
+    sea f = {"entrada": e, "salida": s, "tasa": tasa, "cuadros": opciones["cuadros_por_bufer"] ?? 256, "callback": opciones["callback"] ?? nulo,
+        "fin": opciones["fin"] ?? nulo, "recortar": opciones["recortar"] ?? verdadero, "estado": "detenido", "cuadro": 0, "inicio_ms": 0,
+        "escritos": [], "sobrecargas": 0, "subcargas": 0, "callbacks": 0}
+    retornar f
+}
+
+/// Atajo como Pa_OpenDefaultStream.
+funcion estudio_abrir_defecto(canales_entrada, canales_salida, formato, tasa, cuadros, callback) {
+    sea op = {"tasa": tasa, "cuadros_por_bufer": cuadros, "callback": callback}
+    si (canales_entrada > 0) { op["entrada"] = {"canales": canales_entrada, "formato": formato} }
+    si (canales_salida > 0) { op["salida"] = {"canales": canales_salida, "formato": formato} }
+    retornar estudio_abrir(op)
+}
+
+/// Inicia el flujo (Pa_StartStream).
+funcion estudio_iniciar_flujo(f) {
+    si (f["estado"] == "activo") { lanzar "estudio: el flujo ya está activo" }
+    f["estado"] = "activo"
+    f["inicio_ms"] = reloj_ms()
+    si (f["salida"] != nulo y f["salida"]["disp"]["api"] == "SDL") { audio_iniciar(f["tasa"], piso(f["salida"]["disp"]["latencia_alta"] * 1000)) }
+    retornar nulo
+}
+
+/// Detiene el flujo dejando sonar lo pendiente (Pa_StopStream).
+funcion estudio_detener(f) {
+    si (f["estado"] != "detenido") {
+        f["estado"] = "detenido"
+        _pa_terminar(f)
+    }
+    retornar nulo
+}
+
+/// Detiene el flujo de inmediato (Pa_AbortStream).
+funcion estudio_abortar(f) {
+    retornar estudio_detener(f)
+}
+
+/// Cierra el flujo (Pa_CloseStream); escribe los WAV de salida.
+funcion estudio_cerrar(f) {
+    estudio_detener(f)
+    sea s = f["salida"]
+    si (s != nulo y s["disp"]["api"] == "Archivo" y f["estado"] != "cerrado") {
+        sea a = _pa_ctx["archivos"][s["disp"]["nombre"]]
+        escribir_archivo(a["ruta"], _pa_wav(f["escritos"], s["canales"], f["tasa"], s["formato"]))
+    }
+    f["estado"] = "cerrado"
+    retornar nulo
+}
+
+funcion _pa_terminar(f) {
+    si (f["fin"] != nulo) { f["fin"](f) }
+    retornar nulo
+}
+
+/// ¿El flujo está activo? (Pa_IsStreamActive)
+funcion estudio_activo(f) { retornar f["estado"] == "activo" }
+
+/// ¿El flujo está detenido? (Pa_IsStreamStopped)
+funcion estudio_detenido(f) { retornar f["estado"] != "activo" }
+
+/// Tiempo del flujo en segundos (Pa_GetStreamTime): cuadros procesados / tasa.
+funcion estudio_tiempo(f) { retornar f["cuadro"] / f["tasa"] }
+
+/// Información del flujo: {"tasa", "latencia_entrada", "latencia_salida"}.
+funcion estudio_info(f) {
+    sea lat_s = 0.0
+    si (f["salida"] != nulo) { lat_s = maximo(f["salida"]["disp"]["latencia_alta"], f["cuadros"] / f["tasa"]) }
+    sea lat_e = 0.0
+    si (f["entrada"] != nulo) { lat_e = f["cuadros"] / f["tasa"] }
+    retornar {"tasa": f["tasa"], "latencia_entrada": lat_e, "latencia_salida": lat_s, "subcargas": f["subcargas"], "sobrecargas": f["sobrecargas"], "callbacks": f["callbacks"]}
+}
+
+// ---------- conversión de formatos ----------
+
+funcion _pa_a_formato(x, formato, recortar) {
+    si (recortar) { x = maximo(-1, minimo(1, x)) }
+    si (formato == "float32") { retornar x }
+    si (formato == "int16") { retornar maximo(-32768, minimo(32767, _pa_red(x * 32767))) }
+    si (formato == "int32") { retornar maximo(-2147483648, minimo(2147483647, _pa_red(x * 2147483647))) }
+    si (formato == "int24") { retornar maximo(-8388608, minimo(8388607, _pa_red(x * 8388607))) }
+    si (formato == "int8") { retornar maximo(-128, minimo(127, _pa_red(x * 127))) }
+    retornar maximo(0, minimo(255, _pa_red(x * 127) + 128))
+}
+
+funcion _pa_red(v) { retornar si(v >= 0, piso(v + 0.5), 0 - piso(0.5 - v)) }
+
+funcion _pa_de_formato(v, formato) {
+    si (formato == "float32") { retornar v }
+    si (formato == "int16") { retornar v / 32768 }
+    si (formato == "int32") { retornar v / 2147483648 }
+    si (formato == "int24") { retornar v / 8388608 }
+    si (formato == "int8") { retornar v / 128 }
+    retornar (v - 128) / 128
+}
+
+/// Convierte una lista de muestras entre formatos (como los conversores de
+/// PortAudio, redondeando y recortando).
+funcion estudio_convertir(muestras, de, a) {
+    sea r = []
+    para v en muestras { r.agregar(_pa_a_formato(_pa_de_formato(v, de), a, verdadero)) }
+    retornar r
+}
+
+// Intercalado ↔ por canal.
+funcion _pa_desintercalar(m, canales) {
+    sea r = []
+    para c en lista_rango(0, canales) { r.agregar([]) }
+    para i en lista_rango(0, longitud(m)) { r[i % canales].agregar(m[i]) }
+    retornar r
+}
+
+funcion _pa_intercalar(chs) {
+    sea r = []
+    si (longitud(chs) == 0) { retornar r }
+    para i en lista_rango(0, longitud(chs[0])) {
+        para ch en chs { r.agregar(ch[i]) }
+    }
+    retornar r
+}
+
+// ---------- fuentes y sumideros ----------
+
+// n cuadros de entrada (flotantes intercalados) desde el dispositivo.
+funcion _pa_tomar(f, n) {
+    sea e = f["entrada"]
+    sea ch = e["canales"]
+    sea r = []
+    sea api = e["disp"]["api"]
+    si (api == "Archivo") {
+        sea a = _pa_ctx["archivos"][e["disp"]["nombre"]]
+        sea w = a["wav"]
+        para i en lista_rango(0, n) {
+            para c en lista_rango(0, ch) {
+                sea k = (a["pos"] + i) * w["canales"] + minimo(c, w["canales"] - 1)
+                si (k < longitud(w["muestras"])) { r.agregar(w["muestras"][k]) } sino { r.agregar(0.0) }
+            }
+        }
+        a["pos"] = a["pos"] + n
+        retornar r
+    }
+    si (api == "Bucle") {
+        sea cola = _pa_ctx["bucle"]
+        sea p0 = _pa_ctx["bucle_pos"]
+        para i en lista_rango(0, n) {
+            para c en lista_rango(0, ch) {
+                si (p0 + i < longitud(cola)) {
+                    sea cu = cola[p0 + i]
+                    r.agregar(cu[minimo(c, longitud(cu) - 1)])
+                } sino { r.agregar(0.0) }
+            }
+        }
+        si (longitud(cola) - p0 < n) { f["sobrecargas"] = f["sobrecargas"] + 1 }
+        _pa_ctx["bucle_pos"] = minimo(longitud(cola), p0 + n)
+        si (_pa_ctx["bucle_pos"] > 4096) {
+            sea resto = []
+            para i en lista_rango(_pa_ctx["bucle_pos"], longitud(cola)) { resto.agregar(cola[i]) }
+            _pa_ctx["bucle"] = resto
+            _pa_ctx["bucle_pos"] = 0
+        }
+        retornar r
+    }
+    para i en lista_rango(0, n * ch) { r.agregar(0.0) }
+    retornar r
+}
+
+funcion _pa_entregar(f, flot) {
+    sea s = f["salida"]
+    sea api = s["disp"]["api"]
+    si (api == "Archivo") {
+        para v en flot { f["escritos"].agregar(v) }
+    } sino si (api == "Bucle") {
+        // Cuadros completos; la entrada del bucle toma sus canales.
+        sea n = cociente(longitud(flot), s["canales"])
+        para i en lista_rango(0, n) {
+            sea cu = []
+            para c en lista_rango(0, s["canales"]) { cu.agregar(flot[i * s["canales"] + c]) }
+            _pa_ctx["bucle"].agregar(cu)
+        }
+    } sino si (api == "SDL") {
+        sea partes = []
+        para v en flot {
+            sea x = _pa_a_formato(v, "int16", verdadero)
+            partes.agregar(bytes_entero(si(x < 0, x + 65536, x), 2, 1))
+        }
+        audio_enviar(unir(partes, ""))
+    }
+    retornar nulo
+}
+
+// Un ciclo de callback de n cuadros.
+funcion _pa_ciclo(f, n) {
+    sea info = {"tiempo_actual": estudio_tiempo(f), "tiempo_entrada": estudio_tiempo(f), "tiempo_salida": estudio_tiempo(f) + estudio_info(f)["latencia_salida"], "banderas": []}
+    sea ent = nulo
+    si (f["entrada"] != nulo) {
+        sea crudo = _pa_tomar(f, n)
+        sea fm = f["entrada"]["formato"]
+        ent = []
+        para v en crudo { ent.agregar(_pa_a_formato(v, fm, verdadero)) }
+        si (f["entrada"]["intercalado"] == falso) { ent = _pa_desintercalar(ent, f["entrada"]["canales"]) }
+    }
+    sea res = f["callback"](ent, n, info)
+    f["callbacks"] = f["callbacks"] + 1
+    sea estado = "continuar"
+    sea sal = res
+    si (tipo(res) == "mapa") {
+        sal = res["salida"] ?? res["output"] ?? nulo
+        estado = res["estado"] ?? res["status"] ?? "continuar"
+        si (estado == "continue") { estado = "continuar" }
+        si (estado == "complete") { estado = "completar" }
+        si (estado == "abort") { estado = "abortar" }
+    }
+    si (f["salida"] != nulo) {
+        sea s = f["salida"]
+        si (sal != nulo y s["intercalado"] == falso) { sal = _pa_intercalar(sal) }
+        sea flot = []
+        para i en lista_rango(0, n * s["canales"]) {
+            sea v = 0.0
+            si (sal != nulo y i < longitud(sal)) { v = _pa_de_formato(_pa_a_formato(_pa_de_formato(sal[i], s["formato"]), s["formato"], f["recortar"]), s["formato"]) }
+            flot.agregar(v)
+        }
+        si (sal == nulo o longitud(sal) < n * s["canales"]) { f["subcargas"] = f["subcargas"] + si(estado == "continuar", 1, 0) }
+        _pa_entregar(f, flot)
+    }
+    f["cuadro"] = f["cuadro"] + n
+    si (estado == "completar") { estudio_detener(f) }
+    si (estado == "abortar") { estudio_abortar(f) }
+    retornar nulo
+}
+
+/// Avanza un flujo con callback durante tantos segundos de tiempo del flujo
+/// (sin esperar: sirve para dispositivos virtuales y para generar audio).
+/// Devuelve los ciclos ejecutados.
+funcion estudio_procesar(f, segundos) {
+    si (f["callback"] == nulo) { lanzar "estudio: el flujo no tiene callback" }
+    sea objetivo = f["cuadro"] + piso(segundos * f["tasa"] + 0.5)
+    sea ciclos = 0
+    mientras (f["estado"] == "activo" y f["cuadro"] < objetivo) {
+        _pa_ciclo(f, f["cuadros"])
+        ciclos = ciclos + 1
+    }
+    retornar ciclos
+}
+
+/// Mantiene lleno el dispositivo real según el reloj (llamar en el bucle).
+funcion estudio_bombear(f) {
+    si (f["estado"] != "activo" o f["callback"] == nulo) { retornar 0 }
+    si (f["salida"] == nulo o f["salida"]["disp"]["api"] != "SDL") { retornar estudio_procesar(f, f["cuadros"] / f["tasa"]) }
+    sea objetivo = f["salida"]["disp"]["latencia_alta"] * 1000
+    sea ciclos = 0
+    mientras (f["estado"] == "activo" y audio_pendiente_ms() < objetivo) {
+        _pa_ciclo(f, f["cuadros"])
+        ciclos = ciclos + 1
+    }
+    retornar ciclos
+}
+
+// ---------- modo bloqueante ----------
+
+/// Escribe muestras intercaladas (Pa_WriteStream). Con SDL espera si la
+/// cola supera la latencia.
+funcion estudio_escribir(f, muestras) {
+    sea s = f["salida"]
+    si (s == nulo) { lanzar "estudio: el flujo no tiene salida" }
+    si (f["estado"] != "activo") { lanzar "estudio: el flujo no está activo" }
+    sea flot = []
+    para v en muestras { flot.agregar(_pa_de_formato(_pa_a_formato(_pa_de_formato(v, s["formato"]), s["formato"], f["recortar"]), s["formato"])) }
+    si (s["disp"]["api"] == "SDL") {
+        mientras (audio_pendiente_ms() > s["disp"]["latencia_alta"] * 1000) { hilo_dormir(2) }
+    }
+    _pa_entregar(f, flot)
+    f["cuadro"] = f["cuadro"] + cociente(longitud(muestras), s["canales"])
+    retornar nulo
+}
+
+/// Lee cuadros de entrada intercalados (Pa_ReadStream).
+funcion estudio_leer(f, cuadros) {
+    sea e = f["entrada"]
+    si (e == nulo) { lanzar "estudio: el flujo no tiene entrada" }
+    si (f["estado"] != "activo") { lanzar "estudio: el flujo no está activo" }
+    sea r = []
+    para v en _pa_tomar(f, cuadros) { r.agregar(_pa_a_formato(v, e["formato"], verdadero)) }
+    si (f["salida"] == nulo) { f["cuadro"] = f["cuadro"] + cuadros }
+    retornar r
+}
+
+/// Cuadros que se pueden leer sin esperar (Pa_GetStreamReadAvailable).
+funcion estudio_disponible_lectura(f) {
+    sea e = f["entrada"]
+    si (e == nulo) { retornar 0 }
+    si (e["disp"]["api"] == "Bucle") { retornar longitud(_pa_ctx["bucle"]) - _pa_ctx["bucle_pos"] }
+    si (e["disp"]["api"] == "Archivo") {
+        sea a = _pa_ctx["archivos"][e["disp"]["nombre"]]
+        retornar maximo(0, cociente(longitud(a["wav"]["muestras"]), a["wav"]["canales"]) - a["pos"])
+    }
+    retornar f["cuadros"]
+}
+
+// ---------- WAV ----------
+
+funcion _pa_wav_leer(d) {
+    si (subtexto(d, 0, 4) != "RIFF" o subtexto(d, 8, 12) != "WAVE") { lanzar "estudio: no es un WAV" }
+    sea p = 12
+    sea fmt = nulo
+    mientras (p + 8 <= longitud(d)) {
+        sea id = subtexto(d, p, p + 4)
+        sea tam = bytes_leer_entero(d, p + 4, 4, 1)
+        si (id == "fmt ") { fmt = {"f": bytes_leer_entero(d, p + 8, 2, 1), "c": bytes_leer_entero(d, p + 10, 2, 1), "r": bytes_leer_entero(d, p + 12, 4, 1), "b": bytes_leer_entero(d, p + 22, 2, 1)} }
+        si (id == "data") {
+            sea m = []
+            sea paso = cociente(fmt["b"], 8)
+            sea i = p + 8
+            sea fin = minimo(longitud(d), p + 8 + tam)
+            mientras (i + paso <= fin) {
+                sea v = bytes_leer_entero(d, i, paso, 1)
+                si (paso == 1) { m.agregar((v - 128) / 128) } sino {
+                    sea lim = potencia(2, 8 * paso - 1)
+                    si (v >= lim) { v = v - 2 * lim }
+                    m.agregar(v / lim)
+                }
+                i = i + paso
+            }
+            retornar {"canales": fmt["c"], "tasa": fmt["r"], "muestras": m}
+        }
+        p = p + 8 + tam + tam % 2
+    }
+    lanzar "estudio: WAV sin datos"
+}
+
+funcion _pa_wav(flot, canales, tasa, formato) {
+    sea bits = 16
+    si (formato == "int32" o formato == "float32") { bits = 32 }
+    si (formato == "int24") { bits = 24 }
+    si (formato == "int8" o formato == "uint8") { bits = 8 }
+    sea paso = cociente(bits, 8)
+    sea partes = []
+    para v en flot {
+        sea x = 0
+        si (bits == 8) { x = _pa_a_formato(v, "uint8", verdadero) } sino {
+            x = _pa_a_formato(v, si(bits == 16, "int16", si(bits == 24, "int24", "int32")), verdadero)
+            si (x < 0) { x = x + potencia(2, bits) }
+        }
+        partes.agregar(bytes_entero(x, paso, 1))
+    }
+    sea datos = unir(partes, "")
+    sea fmt = "fmt " + bytes_entero(16, 4, 1) + bytes_entero(1, 2, 1) + bytes_entero(canales, 2, 1) + bytes_entero(tasa, 4, 1) + bytes_entero(tasa * canales * paso, 4, 1) +
+        bytes_entero(canales * paso, 2, 1) + bytes_entero(bits, 2, 1)
+    sea cuerpo = "WAVE" + fmt + "data" + bytes_entero(longitud(datos), 4, 1) + datos
+    retornar "RIFF" + bytes_entero(longitud(cuerpo), 4, 1) + cuerpo
+}
