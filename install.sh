@@ -11,6 +11,10 @@
 # ============================================================================
 set -eu
 
+# Todo va dentro de main(): si la descarga de este script se corta a la
+# mitad, sh no ejecuta un fragmento incompleto.
+main() {
+
 REPO="VemorisSoftware/cforge"
 GITHUB="https://github.com/${REPO}"
 
@@ -42,6 +46,9 @@ if [ -z "$VERSION" ]; then
   [ -n "$VERSION" ] || fail "no se pudo detectar la última versión; usa CFORGE_VERSION=5.0.0"
 fi
 VERSION="${VERSION#v}"
+case "$VERSION" in
+  ""|*[!0-9.]*) fail "versión inválida: ${VERSION} (ejemplo: CFORGE_VERSION=5.0.0)" ;;
+esac
 
 # ── Plataforma ─────────────────────────────────────────────────────────────
 OS=$(uname -s); ARCH=$(uname -m)
@@ -78,15 +85,17 @@ if [ -n "$PAQUETE" ]; then
   info "descargando ${PAQUETE}.tar.gz"
   descargar "${BASE}/${PAQUETE}.tar.gz" "$TMP/${PAQUETE}.tar.gz" \
     || fail "no se pudo descargar ${BASE}/${PAQUETE}.tar.gz"
-  if descargar "${BASE}/SHA256SUMS" "$TMP/SHA256SUMS" 2>/dev/null; then
-    ESPERADO=$(grep " ${PAQUETE}.tar.gz\$" "$TMP/SHA256SUMS" | cut -d' ' -f1 || true)
-    if [ -n "$ESPERADO" ]; then
-      if tiene sha256sum; then REAL=$(sha256sum "$TMP/${PAQUETE}.tar.gz" | cut -d' ' -f1)
-      else REAL=$(shasum -a 256 "$TMP/${PAQUETE}.tar.gz" | cut -d' ' -f1); fi
-      [ "$ESPERADO" = "$REAL" ] || fail "la suma SHA-256 no coincide; descarga corrupta"
-      ok "SHA-256 verificado"
-    fi
-  fi
+  # La verificación es obligatoria: sin SHA256SUMS o sin la línea del
+  # paquete no se instala nada (antes se omitía en silencio).
+  descargar "${BASE}/SHA256SUMS" "$TMP/SHA256SUMS" \
+    || fail "no se pudo descargar SHA256SUMS para verificar la descarga"
+  ESPERADO=$(grep " ${PAQUETE}.tar.gz\$" "$TMP/SHA256SUMS" | cut -d' ' -f1 || true)
+  [ -n "$ESPERADO" ] || fail "SHA256SUMS no incluye ${PAQUETE}.tar.gz"
+  if tiene sha256sum; then REAL=$(sha256sum "$TMP/${PAQUETE}.tar.gz" | cut -d' ' -f1)
+  elif tiene shasum; then REAL=$(shasum -a 256 "$TMP/${PAQUETE}.tar.gz" | cut -d' ' -f1)
+  else fail "se necesita sha256sum o shasum para verificar la descarga"; fi
+  [ "$ESPERADO" = "$REAL" ] || fail "la suma SHA-256 no coincide; descarga corrupta"
+  ok "SHA-256 verificado"
   tar -xzf "$TMP/${PAQUETE}.tar.gz" -C "$TMP"
   ORIGEN="$TMP/${PAQUETE}"
   [ -x "$ORIGEN/cforge" ] || fail "el paquete no contiene el binario cforge"
@@ -97,7 +106,7 @@ elif [ "$OS" = "Linux" ] && { [ "$ARCH" = "x86_64" ] || [ "$ARCH" = "amd64" ]; }
   descargar "${GITHUB}/archive/refs/tags/v${VERSION}.tar.gz" "$TMP/src.tar.gz" \
     || fail "no existe la versión v${VERSION}"
   tar -xzf "$TMP/src.tar.gz" -C "$TMP"
-  ORIGEN=$(find "$TMP" -maxdepth 1 -type d -name 'C-Forge-*' | head -1)
+  ORIGEN=$(find "$TMP" -maxdepth 1 -type d \( -name 'cforge-*' -o -name 'C-Forge-*' \) | head -1)
   [ -f "$ORIGEN/bootstrap/semilla/cforge-linux-x64" ] || fail "esta versión no trae la semilla nativa"
   info "compilando cforge con la semilla (C-Forge se compila a sí mismo)"
   (cd "$ORIGEN" && make build >/dev/null) || fail "la compilación falló"
@@ -126,3 +135,7 @@ case ":$PATH:" in
   *) warn "agrega ${BIN_DIR} a tu PATH:  export PATH=\"${BIN_DIR}:\$PATH\"" ;;
 esac
 printf "\n  Prueba:\n    echo 'mostrar(\"Hola, mundo\")' > hola.cfv\n    cforge hola.cfv\n\n"
+
+}
+
+main "$@"

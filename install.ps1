@@ -30,6 +30,7 @@ if (-not $Version) {
   if (-not $Version) { Fail 'no se pudo detectar la última versión; define $env:CFORGE_VERSION' }
 }
 $Version = $Version.TrimStart('v')
+if ($Version -notmatch '^[0-9]+(\.[0-9]+)*$') { Fail "versión inválida: $Version (ejemplo: 5.0.0)" }
 
 $Name = "cforge-$Version-windows-x64"
 $Base = "$GitHub/releases/download/v$Version"
@@ -42,18 +43,17 @@ try {
   $Zip = Join-Path $Tmp "$Name.zip"
   Invoke-WebRequest "$Base/$Name.zip" -OutFile $Zip -UseBasicParsing
 
-  # Verificación SHA-256 (si el release publica SHA256SUMS)
+  # Verificación SHA-256 obligatoria: sin SHA256SUMS no se instala nada.
   try {
     $sums = (Invoke-WebRequest "$Base/SHA256SUMS" -UseBasicParsing).Content
-    if ($sums -is [byte[]]) { $sums = [Text.Encoding]::UTF8.GetString($sums) }
-    $line = ($sums -split "`n") | Where-Object { $_ -match " $([regex]::Escape("$Name.zip"))\s*$" } | Select-Object -First 1
-    if ($line) {
-      $expected = ($line -split '\s+')[0].ToLower()
-      $actual = (Get-FileHash $Zip -Algorithm SHA256).Hash.ToLower()
-      if ($expected -ne $actual) { Fail 'la suma SHA-256 no coincide; descarga corrupta' }
-      Info 'SHA-256 verificado'
-    }
-  } catch [System.Net.WebException] { }
+  } catch { Fail 'no se pudo descargar SHA256SUMS para verificar la descarga' }
+  if ($sums -is [byte[]]) { $sums = [Text.Encoding]::UTF8.GetString($sums) }
+  $line = ($sums -split "`n") | Where-Object { $_ -match " $([regex]::Escape("$Name.zip"))\s*$" } | Select-Object -First 1
+  if (-not $line) { Fail "SHA256SUMS no incluye $Name.zip" }
+  $expected = ($line -split '\s+')[0].ToLower()
+  $actual = (Get-FileHash $Zip -Algorithm SHA256).Hash.ToLower()
+  if ($expected -ne $actual) { Fail 'la suma SHA-256 no coincide; descarga corrupta' }
+  Info 'SHA-256 verificado'
 
   Expand-Archive $Zip -DestinationPath $Tmp -Force
   $Src = Join-Path $Tmp $Name
