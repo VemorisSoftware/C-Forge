@@ -1,0 +1,313 @@
+// stdlib/escaner.cfv — Procesamiento de documentos escaneados al estilo de
+// Leptonica, escrito desde cero (idea de Leptonica, BSD-2). Trabaja con las
+// matrices de un canal de "vision" (0 = negro, 255 = blanco):
+//
+//   · Binarización global (Otsu) y local (Sauvola, como scikit-image).
+//   · Detección de inclinación por perfiles de proyección y enderezado con
+//     rotación bilineal sobre fondo blanco.
+//   · Morfología binaria con elementos rectangulares, recorte automático
+//     de márgenes, detección de renglones y de bloques de texto.
+//
+// En inglés: importar "leptonica".
+//
+//   importar "escaner"
+//   sea g = vision_gris(vision_desde_imagen(imagen_cargar("pagina.png")))
+//   sea b = escaner_sauvola(g, 25, 0.2, 128)
+//   sea r = escaner_inclinacion(b, 7, 0.1)        // {"angulo": -2.3, "confianza": …}
+//   sea derecha = escaner_rotar(b, 0 - r["angulo"])
+
+importar "vision"
+
+funcion _esc_mat(f, c, d) { retornar {"filas": f, "columnas": c, "canales": 1, "datos": d} }
+
+/// Binariza con el umbral de Otsu (texto negro = 0, fondo = 255).
+funcion escaner_otsu(g) { retornar vision_umbral(g, 0, 255, "otsu")["imagen"] }
+
+// Media y desviación local con imágenes integrales y borde reflejado (sin repetir el borde).
+funcion _esc_media_desv(g, ventana) {
+    sea r = cociente(ventana, 2)
+    sea filas = g["filas"]
+    sea cols = g["columnas"]
+    sea pf = filas + 2 * r
+    sea pc = cols + 2 * r
+    sea refl = funcion(i, n) {
+        sea k = i
+        mientras (k < 0 o k >= n) {
+            si (k < 0) { k = 0 - k }
+            si (k >= n) { k = 2 * n - k - 2 }
+        }
+        retornar k
+    }
+    // Integrales (pf + 1) × (pc + 1) de x y x².
+    sea s1 = []
+    sea s2 = []
+    para i en lista_rango(0, (pf + 1) * (pc + 1)) {
+        s1.agregar(0.0)
+        s2.agregar(0.0)
+    }
+    para f en lista_rango(0, pf) {
+        sea fila1 = 0.0
+        sea fila2 = 0.0
+        sea sf = refl(f - r, filas)
+        para c en lista_rango(0, pc) {
+            sea v = g["datos"][sf * cols + refl(c - r, cols)]
+            fila1 = fila1 + v
+            fila2 = fila2 + v * v
+            s1[(f + 1) * (pc + 1) + c + 1] = s1[f * (pc + 1) + c + 1] + fila1
+            s2[(f + 1) * (pc + 1) + c + 1] = s2[f * (pc + 1) + c + 1] + fila2
+        }
+    }
+    sea n = ventana * ventana
+    sea medias = []
+    sea desv = []
+    para f en lista_rango(0, filas) {
+        para c en lista_rango(0, cols) {
+            sea a = f * (pc + 1) + c
+            sea b = (f + ventana) * (pc + 1) + c
+            sea t1 = s1[b + ventana] - s1[b] - s1[a + ventana] + s1[a]
+            sea t2 = s2[b + ventana] - s2[b] - s2[a + ventana] + s2[a]
+            sea m = t1 / n
+            medias.agregar(m)
+            desv.agregar(raiz(maximo(0, t2 / n - m * m)))
+        }
+    }
+    retornar [medias, desv]
+}
+
+/// Umbral local de Sauvola: T = m · (1 + k · (s / r − 1)); píxel > T → blanco.
+/// Devuelve la imagen binaria (y escaner_sauvola_umbral da los umbrales).
+funcion escaner_sauvola(g, ventana, k, r) {
+    sea t = escaner_sauvola_umbral(g, ventana, k, r)
+    sea d = []
+    para i en lista_rango(0, longitud(g["datos"])) { d.agregar(si(g["datos"][i] > t[i], 255, 0)) }
+    retornar _esc_mat(g["filas"], g["columnas"], d)
+}
+
+funcion escaner_sauvola_umbral(g, ventana, k, r) {
+    sea md = _esc_media_desv(g, ventana)
+    sea t = []
+    para i en lista_rango(0, longitud(g["datos"])) { t.agregar(md[0][i] * (1 + k * (md[1][i] / (r ?? 128) - 1))) }
+    retornar t
+}
+
+// Puntos negros como [x, y].
+funcion _esc_negros(b) {
+    sea r = []
+    para f en lista_rango(0, b["filas"]) {
+        para c en lista_rango(0, b["columnas"]) {
+            si (b["datos"][f * b["columnas"] + c] == 0) { r.agregar([c, f]) }
+        }
+    }
+    retornar r
+}
+
+funcion _esc_puntaje(puntos, angulo, filas) {
+    // Proyección horizontal tras cortar con la pendiente del ángulo (como el
+    // barrido de Leptonica): suma de cuadrados de las diferencias entre filas.
+    sea t = seno(angulo * 3.141592653589793 / 180) / coseno(angulo * 3.141592653589793 / 180)
+    sea desp = 2 * filas
+    sea cuentas = {}
+    sea minimo_f = 1000000000
+    sea maximo_f = -1000000000
+    para p en puntos {
+        sea yy = piso(p[1] - p[0] * t + 0.5)
+        cuentas["" + yy] = (cuentas["" + yy] ?? 0) + 1
+        minimo_f = minimo(minimo_f, yy)
+        maximo_f = maximo(maximo_f, yy)
+    }
+    sea s = 0
+    sea previo = 0
+    para yy en lista_rango(minimo_f - 1, maximo_f + 2) {
+        sea v = cuentas["" + yy] ?? 0
+        s = s + (v - previo) * (v - previo)
+        previo = v
+    }
+    retornar s
+}
+
+/// Inclinación del texto en grados (positivo = sube a la derecha) buscando
+/// en ±rango con el paso dado y afinando a un décimo del paso.
+/// Devuelve {"angulo", "confianza"} (confianza = mejor / promedio).
+funcion escaner_inclinacion(b, rango, paso) {
+    sea puntos = _esc_negros(b)
+    si (longitud(puntos) == 0) { retornar {"angulo": 0, "confianza": 0} }
+    sea mejor = 0.0
+    sea mejor_s = -1
+    sea suma = 0.0
+    sea n = 0
+    sea a = 0 - rango
+    mientras (a <= rango + 0.0000001) {
+        sea s = _esc_puntaje(puntos, a, b["filas"])
+        suma = suma + s
+        n = n + 1
+        si (s > mejor_s) {
+            mejor_s = s
+            mejor = a
+        }
+        a = a + paso
+    }
+    sea fino = paso / 10
+    sea centro = mejor
+    a = centro - paso
+    mientras (a <= centro + paso + 0.0000001) {
+        sea s = _esc_puntaje(puntos, a, b["filas"])
+        si (s > mejor_s) {
+            mejor_s = s
+            mejor = a
+        }
+        a = a + fino
+    }
+    // El corte usa y − x·tan: el texto que sube a la derecha da ángulo negativo.
+    retornar {"angulo": 0 - redondear(mejor * 1000) / 1000, "confianza": mejor_s / (suma / n)}
+}
+
+/// Rota alrededor del centro (grados, antihorario como PIL) con
+/// interpolación bilineal y fondo blanco; conserva el tamaño.
+funcion escaner_rotar(g, grados) {
+    sea rad = grados * 3.141592653589793 / 180
+    sea cs = coseno(rad)
+    sea sn = seno(rad)
+    sea filas = g["filas"]
+    sea cols = g["columnas"]
+    sea cx = cols / 2
+    sea cy = filas / 2
+    sea d = []
+    para f en lista_rango(0, filas) {
+        para c en lista_rango(0, cols) {
+            // Origen del píxel destino (centro del píxel).
+            sea x = (c + 0.5 - cx) * cs - (f + 0.5 - cy) * sn + cx - 0.5
+            sea yy = (c + 0.5 - cx) * sn + (f + 0.5 - cy) * cs + cy - 0.5
+            sea x0 = piso(x)
+            sea y0 = piso(yy)
+            sea fx = x - x0
+            sea fy = yy - y0
+            sea v = 0.0
+            para dy en [0, 1] {
+                para dx en [0, 1] {
+                    sea xx = x0 + dx
+                    sea ry = y0 + dy
+                    sea w = si(dx == 1, fx, 1 - fx) * si(dy == 1, fy, 1 - fy)
+                    sea pv = 255
+                    si (xx >= 0 y ry >= 0 y xx < cols y ry < filas) { pv = g["datos"][ry * cols + xx] }
+                    v = v + w * pv
+                }
+            }
+            d.agregar(maximo(0, minimo(255, piso(v + 0.5))))
+        }
+    }
+    retornar _esc_mat(filas, cols, d)
+}
+
+/// Endereza: detecta la inclinación y rota al revés. Devuelve {"imagen", "angulo"}.
+funcion escaner_enderezar(g, rango) {
+    sea b = escaner_otsu(g)
+    sea r = escaner_inclinacion(b, rango ?? 7, 0.1)
+    retornar {"imagen": escaner_rotar(g, 0 - r["angulo"]), "angulo": r["angulo"]}
+}
+
+// Morfología binaria: el negro (0) es el primer plano.
+funcion _esc_morfo(b, alto, ancho, dilatar) {
+    sea filas = b["filas"]
+    sea cols = b["columnas"]
+    sea ry = cociente(alto, 2)
+    sea rx = cociente(ancho, 2)
+    sea d = []
+    para f en lista_rango(0, filas) {
+        para c en lista_rango(0, cols) {
+            sea negro = si(dilatar, falso, verdadero)
+            para dy en lista_rango(0 - ry, alto - ry) {
+                para dx en lista_rango(0 - rx, ancho - rx) {
+                    sea ff = f + dy
+                    sea cc = c + dx
+                    sea v = 255
+                    si (ff >= 0 y cc >= 0 y ff < filas y cc < cols) { v = b["datos"][ff * cols + cc] }
+                    si (dilatar y v == 0) { negro = verdadero }
+                    si (dilatar == falso y v != 0 y ff >= 0 y cc >= 0 y ff < filas y cc < cols) { negro = falso }
+                }
+            }
+            d.agregar(si(negro, 0, 255))
+        }
+    }
+    retornar _esc_mat(filas, cols, d)
+}
+
+funcion escaner_dilatar(b, alto, ancho) { retornar _esc_morfo(b, alto, ancho, verdadero) }
+funcion escaner_erosionar(b, alto, ancho) { retornar _esc_morfo(b, alto, ancho, falso) }
+funcion escaner_cerrar(b, alto, ancho) { retornar escaner_erosionar(escaner_dilatar(b, alto, ancho), alto, ancho) }
+funcion escaner_abrir(b, alto, ancho) { retornar escaner_dilatar(escaner_erosionar(b, alto, ancho), alto, ancho) }
+
+/// Caja [x, y, ancho, alto] del contenido negro (o nulo si está en blanco).
+funcion escaner_caja_contenido(b) {
+    sea minx = b["columnas"]
+    sea miny = b["filas"]
+    sea maxx = -1
+    sea maxy = -1
+    para f en lista_rango(0, b["filas"]) {
+        para c en lista_rango(0, b["columnas"]) {
+            si (b["datos"][f * b["columnas"] + c] == 0) {
+                minx = minimo(minx, c)
+                miny = minimo(miny, f)
+                maxx = maximo(maxx, c)
+                maxy = maximo(maxy, f)
+            }
+        }
+    }
+    si (maxx < 0) { retornar nulo }
+    retornar [minx, miny, maxx - minx + 1, maxy - miny + 1]
+}
+
+/// Recorta los márgenes en blanco dejando "margen" píxeles.
+funcion escaner_recortar_margenes(g, b, margen) {
+    sea caja = escaner_caja_contenido(b)
+    si (caja == nulo) { retornar g }
+    sea m = margen ?? 0
+    sea x = maximo(0, caja[0] - m)
+    sea yy = maximo(0, caja[1] - m)
+    sea x2 = minimo(g["columnas"], caja[0] + caja[2] + m)
+    sea y2 = minimo(g["filas"], caja[1] + caja[3] + m)
+    sea d = []
+    para f en lista_rango(yy, y2) {
+        para c en lista_rango(x, x2) { d.agregar(g["datos"][f * g["columnas"] + c]) }
+    }
+    retornar _esc_mat(y2 - yy, x2 - x, d)
+}
+
+/// Renglones de texto: franjas [y_inicio, y_fin] con al menos "minimo"
+/// píxeles negros por fila.
+funcion escaner_renglones(b, minimo_) {
+    sea r = []
+    sea dentro = falso
+    sea ini = 0
+    para f en lista_rango(0, b["filas"] + 1) {
+        sea n = 0
+        si (f < b["filas"]) {
+            para c en lista_rango(0, b["columnas"]) {
+                si (b["datos"][f * b["columnas"] + c] == 0) { n = n + 1 }
+            }
+        }
+        si (n >= (minimo_ ?? 1) y dentro == falso) {
+            dentro = verdadero
+            ini = f
+        } sino si (n < (minimo_ ?? 1) y dentro) {
+            dentro = falso
+            r.agregar([ini, f - 1])
+        }
+    }
+    retornar r
+}
+
+/// Bloques de texto: une letras cercanas con un cierre horizontal y
+/// devuelve las cajas [x, y, ancho, alto] de las regiones resultantes.
+funcion escaner_bloques(b, separacion_x, separacion_y) {
+    sea unido = escaner_dilatar(b, separacion_y ?? 3, separacion_x ?? 15)
+    sea inv = []
+    para v en unido["datos"] { inv.agregar(si(v == 0, 255, 0)) }
+    sea comp = vision_componentes(_esc_mat(b["filas"], b["columnas"], inv), 8)
+    sea r = []
+    sea i = 0
+    para e en comp["estadisticas"] {
+        si (i > 0) { r.agregar([e[0], e[1], e[2], e[3]]) }
+        i = i + 1
+    }
+    retornar r
+}

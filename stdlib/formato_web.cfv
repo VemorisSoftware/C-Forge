@@ -1,0 +1,707 @@
+// stdlib/formato_web.cfv — WebP sin pérdida (VP8L) al estilo de libwebp,
+// escrito desde cero según la especificación del formato (RFC 9649; idea de
+// libwebp, BSD). Decodifica cualquier WebP sin pérdida (las cuatro
+// transformaciones, caché de colores, códigos de prefijo por bloques y
+// LZ77) y codifica con resta de verde, LZ77 y Huffman propios. Trabaja con
+// las imágenes RGBA de "imagen".
+//
+// En inglés: importar "libwebp".
+//
+//   importar "formato_web"
+//   sea img = webp_decodificar(leer_archivo("logo.webp"))
+//   escribir_archivo("copia.webp", webp_codificar(img))
+//
+// El WebP con pérdida (VP8) y AVIF no se decodifican aquí: lanzan un error claro.
+
+importar "imagen"
+
+// ---------- bits ----------
+
+funcion _wp_lector(datos, desde) { retornar {"d": datos, "p": desde, "acum": 0, "n": 0} }
+
+funcion _wp_bits(l, n) {
+    mientras (l["n"] < n) {
+        sea b = 0
+        si (l["p"] < longitud(l["d"])) { b = byte_en(l["d"], l["p"]) }
+        l["acum"] = l["acum"] + b * potencia(2, l["n"])
+        l["n"] = l["n"] + 8
+        l["p"] = l["p"] + 1
+    }
+    sea m = potencia(2, n)
+    sea v = l["acum"] % m
+    l["acum"] = cociente(l["acum"], m)
+    l["n"] = l["n"] - n
+    retornar v
+}
+
+// ---------- códigos de prefijo ----------
+
+// Tabla canónica: {"unico": símbolo} o {"por_largo": [[primer código, primer índice, cuántos]…], "simbolos": [...]}.
+funcion _wp_construir(largos) {
+    sea usados = []
+    para s en lista_rango(0, longitud(largos)) {
+        si (largos[s] > 0) { usados.agregar(s) }
+    }
+    si (longitud(usados) == 0) { retornar {"unico": 0} }
+    si (longitud(usados) == 1) { retornar {"unico": usados[0]} }
+    sea cuenta = []
+    para i en lista_rango(0, 16) { cuenta.agregar(0) }
+    para s en usados { cuenta[largos[s]] = cuenta[largos[s]] + 1 }
+    sea simbolos = []
+    para lg en lista_rango(1, 16) {
+        para s en usados {
+            si (largos[s] == lg) { simbolos.agregar(s) }
+        }
+    }
+    retornar {"cuenta": cuenta, "simbolos": simbolos}
+}
+
+funcion _wp_leer_simbolo(l, t) {
+    si (tiene_clave(t, "unico")) { retornar t["unico"] }
+    sea codigo = 0
+    sea primero = 0
+    sea indice = 0
+    para lg en lista_rango(1, 16) {
+        codigo = codigo + _wp_bits(l, 1)
+        sea c = t["cuenta"][lg]
+        si (codigo - c < primero) { retornar t["simbolos"][indice + codigo - primero] }
+        indice = indice + c
+        primero = (primero + c) * 2
+        codigo = codigo * 2
+    }
+    lanzar "formato_web: código de prefijo inválido"
+}
+
+sea _WP_ORDEN = [17, 18, 0, 1, 2, 3, 4, 5, 16, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15]
+
+funcion _wp_leer_codigo(l, tam) {
+    sea largos = []
+    para i en lista_rango(0, tam) { largos.agregar(0) }
+    si (_wp_bits(l, 1) == 1) {
+        sea n = _wp_bits(l, 1) + 1
+        sea s0 = _wp_bits(l, si(_wp_bits(l, 1) == 1, 8, 1))
+        si (n == 1) { retornar {"unico": s0} }
+        sea s1 = _wp_bits(l, 8)
+        largos[s0] = 1
+        largos[s1] = 1
+        retornar _wp_construir(largos)
+    }
+    sea cl = []
+    para i en lista_rango(0, 19) { cl.agregar(0) }
+    sea num = _wp_bits(l, 4) + 4
+    para i en lista_rango(0, num) { cl[_WP_ORDEN[i]] = _wp_bits(l, 3) }
+    sea tcl = _wp_construir(cl)
+    sea max_s = tam
+    si (_wp_bits(l, 1) == 1) {
+        sea nb = 2 + 2 * _wp_bits(l, 3)
+        max_s = 2 + _wp_bits(l, nb)
+    }
+    sea previo = 8
+    sea s = 0
+    mientras (s < tam) {
+        si (max_s == 0) { romper }
+        max_s = max_s - 1
+        sea c = _wp_leer_simbolo(l, tcl)
+        si (c < 16) {
+            largos[s] = c
+            s = s + 1
+            si (c != 0) { previo = c }
+        } sino {
+            sea rep = 0
+            sea val = 0
+            si (c == 16) {
+                rep = 3 + _wp_bits(l, 2)
+                val = previo
+            } sino si (c == 17) { rep = 3 + _wp_bits(l, 3) } sino { rep = 11 + _wp_bits(l, 7) }
+            si (s + rep > tam) { lanzar "formato_web: longitudes de código desbordadas" }
+            para k en lista_rango(0, rep) {
+                largos[s] = val
+                s = s + 1
+            }
+        }
+    }
+    retornar _wp_construir(largos)
+}
+
+sea _WP_DISTANCIAS = [[0, 1], [1, 0], [1, 1], [-1, 1], [0, 2], [2, 0], [1, 2], [-1, 2], [2, 1], [-2, 1], [2, 2], [-2, 2], [0, 3], [3, 0], [1, 3], [-1, 3],
+    [3, 1], [-3, 1], [2, 3], [-2, 3], [3, 2], [-3, 2], [0, 4], [4, 0], [1, 4], [-1, 4], [4, 1], [-4, 1], [3, 3], [-3, 3], [2, 4], [-2, 4],
+    [4, 2], [-4, 2], [0, 5], [3, 4], [-3, 4], [4, 3], [-4, 3], [5, 0], [1, 5], [-1, 5], [5, 1], [-5, 1], [2, 5], [-2, 5], [5, 2], [-5, 2],
+    [4, 4], [-4, 4], [3, 5], [-3, 5], [5, 3], [-5, 3], [0, 6], [6, 0], [1, 6], [-1, 6], [6, 1], [-6, 1], [2, 6], [-2, 6], [6, 2], [-6, 2],
+    [4, 5], [-4, 5], [5, 4], [-5, 4], [3, 6], [-3, 6], [6, 3], [-6, 3], [0, 7], [7, 0], [1, 7], [-1, 7], [5, 5], [-5, 5], [7, 1], [-7, 1],
+    [4, 6], [-4, 6], [6, 4], [-6, 4], [2, 7], [-2, 7], [7, 2], [-7, 2], [3, 7], [-3, 7], [7, 3], [-7, 3], [5, 6], [-5, 6], [6, 5], [-6, 5],
+    [8, 0], [4, 7], [-4, 7], [7, 4], [-7, 4], [8, 1], [8, 2], [6, 6], [-6, 6], [8, 3], [5, 7], [-5, 7], [7, 5], [-7, 5], [8, 4], [6, 7],
+    [-6, 7], [7, 6], [-7, 6], [8, 5], [7, 7], [-7, 7], [8, 6], [8, 7]]
+
+funcion _wp_valor_prefijo(l, prefijo) {
+    si (prefijo < 4) { retornar prefijo + 1 }
+    sea extra = cociente(prefijo - 2, 2)
+    sea base = (2 + prefijo % 2) * potencia(2, extra)
+    retornar base + _wp_bits(l, extra) + 1
+}
+
+// Píxeles como [a, r, g, b] para no pelear con enteros de 32 bits.
+funcion _wp_hash(px, bits) {
+    // (0x1e35a7bd · argb) mod 2^32 >> (32 − bits), en trozos de 16 bits.
+    sea argb_alto = px[0] * 256 + px[1]
+    sea argb_bajo = px[2] * 256 + px[3]
+    sea k_alto = 7733
+    sea k_bajo = 42941
+    sea bajo = k_bajo * argb_bajo
+    sea medio = (k_alto * argb_bajo + k_bajo * argb_alto + cociente(bajo, 65536)) % 65536
+    sea v = medio * 65536 + bajo % 65536
+    retornar cociente(v, potencia(2, 32 - bits))
+}
+
+funcion _wp_div(a, b) { retornar cociente(a + b - 1, b) }
+
+// Decodifica un flujo de imagen de ancho × alto. Devuelve la lista de píxeles [a, r, g, b].
+funcion _wp_flujo(l, ancho, alto, nivel0) {
+    sea transformaciones = []
+    sea w = ancho
+    si (nivel0) {
+        mientras (_wp_bits(l, 1) == 1) {
+            sea tipo_t = _wp_bits(l, 2)
+            si (tipo_t == 0 o tipo_t == 1) {
+                sea bits = _wp_bits(l, 3) + 2
+                sea sub = _wp_flujo(l, _wp_div(w, potencia(2, bits)), _wp_div(alto, potencia(2, bits)), falso)
+                transformaciones.agregar({"t": tipo_t, "bits": bits, "datos": sub, "ancho": w})
+            } sino si (tipo_t == 2) { transformaciones.agregar({"t": 2, "ancho": w}) }
+            sino {
+                sea tam = _wp_bits(l, 8) + 1
+                sea tabla = _wp_flujo(l, tam, 1, falso)
+                para i en lista_rango(1, tam) {
+                    para k en lista_rango(0, 4) { tabla[i][k] = (tabla[i][k] + tabla[i - 1][k]) % 256 }
+                }
+                sea bits = si(tam <= 2, 3, si(tam <= 4, 2, si(tam <= 16, 1, 0)))
+                transformaciones.agregar({"t": 3, "bits": bits, "tabla": tabla, "ancho": w})
+                w = _wp_div(w, potencia(2, bits))
+            }
+        }
+    }
+    sea cache_bits = 0
+    si (_wp_bits(l, 1) == 1) {
+        cache_bits = _wp_bits(l, 4)
+        si (cache_bits < 1 o cache_bits > 11) { lanzar "formato_web: caché de colores inválida" }
+    }
+    sea cache_tam = si(cache_bits > 0, potencia(2, cache_bits), 0)
+    sea meta_bits = 0
+    sea meta = nulo
+    sea meta_ancho = 0
+    sea grupos_n = 1
+    si (nivel0 y _wp_bits(l, 1) == 1) {
+        meta_bits = _wp_bits(l, 3) + 2
+        meta_ancho = _wp_div(w, potencia(2, meta_bits))
+        meta = _wp_flujo(l, meta_ancho, _wp_div(alto, potencia(2, meta_bits)), falso)
+        para px en meta { grupos_n = maximo(grupos_n, px[1] * 256 + px[2] + 1) }
+    }
+    sea grupos = []
+    para g en lista_rango(0, grupos_n) {
+        grupos.agregar([_wp_leer_codigo(l, 256 + 24 + cache_tam), _wp_leer_codigo(l, 256), _wp_leer_codigo(l, 256), _wp_leer_codigo(l, 256), _wp_leer_codigo(l, 40)])
+    }
+    sea cache = []
+    para i en lista_rango(0, cache_tam) { cache.agregar([0, 0, 0, 0]) }
+    sea total = w * alto
+    sea px = []
+    mientras (longitud(px) < total) {
+        sea pos = longitud(px)
+        sea g = grupos[0]
+        si (meta != nulo) {
+            sea x = pos % w
+            sea yy = cociente(pos, w)
+            sea m = meta[cociente(yy, potencia(2, meta_bits)) * meta_ancho + cociente(x, potencia(2, meta_bits))]
+            g = grupos[m[1] * 256 + m[2]]
+        }
+        sea s = _wp_leer_simbolo(l, g[0])
+        si (s < 256) {
+            sea r = _wp_leer_simbolo(l, g[1])
+            sea b = _wp_leer_simbolo(l, g[2])
+            sea a = _wp_leer_simbolo(l, g[3])
+            sea c = [a, r, s, b]
+            px.agregar(c)
+            si (cache_tam > 0) { cache[_wp_hash(c, cache_bits)] = c }
+        } sino si (s < 280) {
+            sea largo = _wp_valor_prefijo(l, s - 256)
+            sea codigo = _wp_valor_prefijo(l, _wp_leer_simbolo(l, g[4]))
+            sea dist = 0
+            si (codigo > 120) { dist = codigo - 120 } sino {
+                sea par = _WP_DISTANCIAS[codigo - 1]
+                dist = par[0] + par[1] * w
+                si (dist < 1) { dist = 1 }
+            }
+            si (dist > pos) { lanzar "formato_web: distancia LZ77 fuera de la imagen" }
+            para k en lista_rango(0, largo) {
+                si (longitud(px) < total) {
+                    sea o2 = px[longitud(px) - dist]
+                    sea c = [o2[0], o2[1], o2[2], o2[3]]
+                    px.agregar(c)
+                    si (cache_tam > 0) { cache[_wp_hash(c, cache_bits)] = c }
+                }
+            }
+        } sino {
+            sea o2 = cache[s - 280]
+            px.agregar([o2[0], o2[1], o2[2], o2[3]])
+        }
+    }
+    // Transformaciones inversas, de la última a la primera.
+    sea i = longitud(transformaciones) - 1
+    mientras (i >= 0) {
+        px = _wp_inversa(transformaciones[i], px, alto)
+        i = i - 1
+    }
+    retornar px
+}
+
+funcion _wp_prom(a, b) { retornar [cociente(a[0] + b[0], 2), cociente(a[1] + b[1], 2), cociente(a[2] + b[2], 2), cociente(a[3] + b[3], 2)] }
+
+funcion _wp_clamp(v) { retornar maximo(0, minimo(255, v)) }
+
+funcion _wp_predecir(modo, izq, arr, arr_der, arr_izq) {
+    si (modo == 0) { retornar [255, 0, 0, 0] }
+    si (modo == 1) { retornar izq }
+    si (modo == 2) { retornar arr }
+    si (modo == 3) { retornar arr_der }
+    si (modo == 4) { retornar arr_izq }
+    si (modo == 5) { retornar _wp_prom(_wp_prom(izq, arr_der), arr) }
+    si (modo == 6) { retornar _wp_prom(izq, arr_izq) }
+    si (modo == 7) { retornar _wp_prom(izq, arr) }
+    si (modo == 8) { retornar _wp_prom(arr_izq, arr) }
+    si (modo == 9) { retornar _wp_prom(arr, arr_der) }
+    si (modo == 10) { retornar _wp_prom(_wp_prom(izq, arr_izq), _wp_prom(arr, arr_der)) }
+    si (modo == 11) {
+        sea pl = 0
+        sea pt = 0
+        para k en lista_rango(0, 4) {
+            sea p = izq[k] + arr[k] - arr_izq[k]
+            pl = pl + absoluto(p - izq[k])
+            pt = pt + absoluto(p - arr[k])
+        }
+        retornar si(pl < pt, izq, arr)
+    }
+    si (modo == 12) {
+        sea r = []
+        para k en lista_rango(0, 4) { r.agregar(_wp_clamp(izq[k] + arr[k] - arr_izq[k])) }
+        retornar r
+    }
+    si (modo == 13) {
+        sea a = _wp_prom(izq, arr)
+        sea r = []
+        para k en lista_rango(0, 4) {
+            sea d = a[k] - arr_izq[k]
+            r.agregar(_wp_clamp(a[k] + si(d < 0, 0 - cociente(0 - d, 2), cociente(d, 2))))
+        }
+        retornar r
+    }
+    retornar [255, 0, 0, 0]
+}
+
+funcion _wp_s8(v) { retornar si(v >= 128, v - 256, v) }
+
+funcion _wp_delta(t, c) {
+    sea p = _wp_s8(t) * _wp_s8(c)
+    retornar si(p < 0, 0 - cociente(0 - p + 31, 32), cociente(p, 32))
+}
+
+funcion _wp_inversa(t, px, alto) {
+    sea w = t["ancho"]
+    si (t["t"] == 2) {
+        sea r = []
+        para c en px { r.agregar([c[0], (c[1] + c[2]) % 256, c[2], (c[3] + c[2]) % 256]) }
+        retornar r
+    }
+    si (t["t"] == 0) {
+        sea bw = _wp_div(w, potencia(2, t["bits"]))
+        para yy en lista_rango(0, alto) {
+            para x en lista_rango(0, w) {
+                sea i = yy * w + x
+                sea pred = nulo
+                si (yy == 0 y x == 0) { pred = [255, 0, 0, 0] }
+                sino si (yy == 0) { pred = px[i - 1] }
+                sino si (x == 0) { pred = px[i - w] }
+                sino {
+                    sea modo = t["datos"][cociente(yy, potencia(2, t["bits"])) * bw + cociente(x, potencia(2, t["bits"]))][2]
+                    // Arriba a la derecha (en la última columna es el primer píxel de la fila actual).
+                    pred = _wp_predecir(modo, px[i - 1], px[i - w], px[i - w + 1], px[i - w - 1])
+                }
+                sea c = px[i]
+                px[i] = [(c[0] + pred[0]) % 256, (c[1] + pred[1]) % 256, (c[2] + pred[2]) % 256, (c[3] + pred[3]) % 256]
+            }
+        }
+        retornar px
+    }
+    si (t["t"] == 1) {
+        sea bw = _wp_div(w, potencia(2, t["bits"]))
+        para yy en lista_rango(0, alto) {
+            para x en lista_rango(0, w) {
+                sea m = t["datos"][cociente(yy, potencia(2, t["bits"])) * bw + cociente(x, potencia(2, t["bits"]))]
+                sea c = px[yy * w + x]
+                // ARGB del bloque: azul = green_to_red, verde = green_to_blue, rojo = red_to_blue.
+                sea r = (c[1] + _wp_delta(m[3], c[2]) + 256) % 256
+                sea b = (c[3] + _wp_delta(m[2], c[2]) + 256) % 256
+                b = (b + _wp_delta(m[1], r) + 256) % 256
+                px[yy * w + x] = [c[0], r, c[2], b]
+            }
+        }
+        retornar px
+    }
+    // Índices de color.
+    sea bits = t["bits"]
+    sea por_byte = potencia(2, bits)
+    sea bpp = cociente(8, por_byte)
+    sea pw = _wp_div(w, por_byte)
+    sea r = []
+    para yy en lista_rango(0, alto) {
+        para x en lista_rango(0, w) {
+            sea g = px[yy * pw + cociente(x, por_byte)][2]
+            sea idx = cociente(g, potencia(2, (x % por_byte) * bpp)) % potencia(2, bpp)
+            r.agregar(si(idx < longitud(t["tabla"]), t["tabla"][idx], [0, 0, 0, 0]))
+        }
+    }
+    retornar r
+}
+
+/// Decodifica un WebP sin pérdida a una imagen RGBA {"ancho", "alto", "pixeles"}.
+funcion webp_decodificar(datos) {
+    si (longitud(datos) < 12 o subtexto(datos, 0, 4) != "RIFF" o subtexto(datos, 8, 12) != "WEBP") { lanzar "formato_web: no es un archivo WebP" }
+    sea p = 12
+    mientras (p + 8 <= longitud(datos)) {
+        sea id = subtexto(datos, p, p + 4)
+        sea tam = bytes_leer_entero(datos, p + 4, 4, 1)
+        si (id == "VP8L") { retornar _wp_vp8l(subtexto(datos, p + 8, p + 8 + tam)) }
+        si (id == "VP8 ") { lanzar "formato_web: el WebP con pérdida (VP8) no está soportado; solo sin pérdida" }
+        p = p + 8 + tam + tam % 2
+    }
+    lanzar "formato_web: el WebP no tiene datos de imagen"
+}
+
+funcion _wp_vp8l(d) {
+    si (byte_en(d, 0) != 47) { lanzar "formato_web: firma VP8L inválida" }
+    sea l = _wp_lector(d, 1)
+    sea ancho = _wp_bits(l, 14) + 1
+    sea alto = _wp_bits(l, 14) + 1
+    _wp_bits(l, 1)
+    si (_wp_bits(l, 3) != 0) { lanzar "formato_web: versión VP8L desconocida" }
+    sea px = _wp_flujo(l, ancho, alto, verdadero)
+    sea partes = []
+    para c en px { partes.agregar(char_de(c[1]) + char_de(c[2]) + char_de(c[3]) + char_de(c[0])) }
+    retornar {"ancho": ancho, "alto": alto, "pixeles": unir(partes, "")}
+}
+
+/// Ancho y alto de un WebP sin decodificarlo.
+funcion webp_info(datos) {
+    si (subtexto(datos, 0, 4) != "RIFF" o subtexto(datos, 8, 12) != "WEBP") { lanzar "formato_web: no es un archivo WebP" }
+    sea id = subtexto(datos, 12, 16)
+    si (id == "VP8L") {
+        sea l = _wp_lector(datos, 21)
+        sea w = _wp_bits(l, 14) + 1
+        retornar {"ancho": w, "alto": _wp_bits(l, 14) + 1, "sin_perdida": verdadero}
+    }
+    si (id == "VP8X") { retornar {"ancho": bytes_leer_entero(datos, 24, 3, 1) + 1, "alto": bytes_leer_entero(datos, 27, 3, 1) + 1, "sin_perdida": nulo} }
+    si (id == "VP8 ") { retornar {"ancho": bytes_leer_entero(datos, 26, 2, 1) % 16384, "alto": bytes_leer_entero(datos, 28, 2, 1) % 16384, "sin_perdida": falso} }
+    lanzar "formato_web: cabecera WebP desconocida"
+}
+
+// ---------- codificador ----------
+
+funcion _wp_escritor() { retornar {"bytes": [], "acum": 0, "n": 0} }
+
+funcion _wp_poner(e, v, n) {
+    sea x = v
+    para i en lista_rango(0, n) {
+        e["acum"] = e["acum"] + (x % 2) * potencia(2, e["n"])
+        x = cociente(x, 2)
+        e["n"] = e["n"] + 1
+        si (e["n"] == 8) {
+            e["bytes"].agregar(e["acum"])
+            e["acum"] = 0
+            e["n"] = 0
+        }
+    }
+}
+
+funcion _wp_terminar(e) {
+    si (e["n"] > 0) { e["bytes"].agregar(e["acum"]) }
+    sea partes = []
+    para b en e["bytes"] { partes.agregar(char_de(b)) }
+    retornar unir(partes, "")
+}
+
+// Largos de Huffman limitados a 15 bits.
+funcion _wp_largos(frec) {
+    sea f = []
+    para v en frec { f.agregar(v) }
+    mientras (verdadero) {
+        sea nodos = []
+        para s en lista_rango(0, longitud(f)) {
+            si (f[s] > 0) { nodos.agregar({"p": f[s], "s": [s]}) }
+        }
+        sea largos = []
+        para s en lista_rango(0, longitud(f)) { largos.agregar(0) }
+        si (longitud(nodos) <= 1) {
+            si (longitud(nodos) == 1) { largos[nodos[0]["s"][0]] = 1 }
+            retornar largos
+        }
+        mientras (longitud(nodos) > 1) {
+            nodos = ordenar(nodos, funcion(a, b) { retornar a["p"] - b["p"] })
+            sea a = nodos[0]
+            sea b = nodos[1]
+            sea juntos = []
+            para s en a["s"] {
+                largos[s] = largos[s] + 1
+                juntos.agregar(s)
+            }
+            para s en b["s"] {
+                largos[s] = largos[s] + 1
+                juntos.agregar(s)
+            }
+            sea resto = [{"p": a["p"] + b["p"], "s": juntos}]
+            para i en lista_rango(2, longitud(nodos)) { resto.agregar(nodos[i]) }
+            nodos = resto
+        }
+        sea mx = 0
+        para v en largos { mx = maximo(mx, v) }
+        si (mx <= 15) { retornar largos }
+        para i en lista_rango(0, longitud(f)) {
+            si (f[i] > 0) { f[i] = maximo(1, cociente(f[i], 2)) }
+        }
+    }
+    retornar nulo
+}
+
+// Códigos canónicos (con los bits ya invertidos para escribir LSB primero).
+funcion _wp_codigos(largos) {
+    sea cuenta = []
+    para i en lista_rango(0, 16) { cuenta.agregar(0) }
+    para v en largos { cuenta[v] = cuenta[v] + 1 }
+    cuenta[0] = 0
+    sea siguiente = []
+    para i en lista_rango(0, 16) { siguiente.agregar(0) }
+    sea c = 0
+    para lg en lista_rango(1, 16) {
+        c = (c + cuenta[lg - 1]) * 2
+        siguiente[lg] = c
+    }
+    sea r = []
+    para s en lista_rango(0, longitud(largos)) {
+        sea lg = largos[s]
+        si (lg == 0) { r.agregar([0, 0]) } sino {
+            sea codigo = siguiente[lg]
+            siguiente[lg] = codigo + 1
+            sea inv = 0
+            para k en lista_rango(0, lg) {
+                inv = inv * 2 + codigo % 2
+                codigo = cociente(codigo, 2)
+            }
+            r.agregar([inv, lg])
+        }
+    }
+    retornar r
+}
+
+// Escribe un código y devuelve la tabla [código, largo] por símbolo.
+funcion _wp_escribir_codigo(e, frec) {
+    sea usados = []
+    para s en lista_rango(0, longitud(frec)) {
+        si (frec[s] > 0) { usados.agregar(s) }
+    }
+    si (longitud(usados) <= 1 y (longitud(usados) == 0 o usados[0] < 256)) {
+        sea s0 = si(longitud(usados) == 0, 0, usados[0])
+        _wp_poner(e, 1, 1)
+        _wp_poner(e, 0, 1)
+        si (s0 < 2) {
+            _wp_poner(e, 0, 1)
+            _wp_poner(e, s0, 1)
+        } sino {
+            _wp_poner(e, 1, 1)
+            _wp_poner(e, s0, 8)
+        }
+        sea r = []
+        para s en lista_rango(0, longitud(frec)) { r.agregar([0, 0]) }
+        retornar r
+    }
+    sea f2 = frec
+    si (longitud(usados) == 1) {
+        // Un solo símbolo grande: se agrega otro para tener un código válido.
+        f2 = []
+        para v en frec { f2.agregar(v) }
+        f2[si(usados[0] == 0, 1, 0)] = 1
+    }
+    sea largos = _wp_largos(f2)
+    // Longitudes codificadas con el código de longitudes (sin repeticiones, salvo ceros con 17/18).
+    sea tokens = []
+    sea i = 0
+    mientras (i < longitud(largos)) {
+        si (largos[i] == 0) {
+            sea j = i
+            mientras (j < longitud(largos) y largos[j] == 0 y j - i < 138) { j = j + 1 }
+            sea run = j - i
+            si (run >= 11) { tokens.agregar([18, run - 11, 7]) }
+            sino si (run >= 3) { tokens.agregar([17, run - 3, 3]) }
+            sino { para k en lista_rango(0, run) { tokens.agregar([0, 0, 0]) } }
+            i = j
+        } sino {
+            tokens.agregar([largos[i], 0, 0])
+            i = i + 1
+        }
+    }
+    sea fcl = []
+    para k en lista_rango(0, 19) { fcl.agregar(0) }
+    para t en tokens { fcl[t[0]] = fcl[t[0]] + 1 }
+    sea lcl = _wp_largos(fcl)
+    // Los largos del código de longitudes van en 3 bits (máximo 7).
+    mientras (verdadero) {
+        sea mx = 0
+        para v en lcl { mx = maximo(mx, v) }
+        si (mx <= 7) { romper }
+        para k en lista_rango(0, 19) {
+            si (fcl[k] > 0) { fcl[k] = maximo(1, cociente(fcl[k], 2)) }
+        }
+        lcl = _wp_largos(fcl)
+    }
+    sea usados_cl = 0
+    para k en lista_rango(0, 19) {
+        si (lcl[k] > 0) { usados_cl = usados_cl + 1 }
+    }
+    si (usados_cl == 1) {
+        // Un código de un solo símbolo no se puede leer: se le agrega un hermano.
+        para k en lista_rango(0, 19) {
+            si (lcl[k] == 0 y usados_cl == 1) {
+                lcl[k] = 1
+                usados_cl = 2
+            }
+        }
+        para k en lista_rango(0, 19) {
+            si (lcl[k] > 0) { lcl[k] = 1 }
+        }
+    }
+    sea ccl = _wp_codigos(lcl)
+    sea num = 19
+    mientras (num > 4 y lcl[_WP_ORDEN[num - 1]] == 0) { num = num - 1 }
+    _wp_poner(e, 0, 1)
+    _wp_poner(e, num - 4, 4)
+    para k en lista_rango(0, num) { _wp_poner(e, lcl[_WP_ORDEN[k]], 3) }
+    _wp_poner(e, 0, 1)
+    para t en tokens {
+        sea c = ccl[t[0]]
+        _wp_poner(e, c[0], c[1])
+        si (t[2] > 0) { _wp_poner(e, t[1], t[2]) }
+    }
+    retornar _wp_codigos(largos)
+}
+
+funcion _wp_prefijo(v) {
+    // v ≥ 1 → [código de prefijo, bits extra, valor extra].
+    sea x = v - 1
+    si (x < 4) { retornar [x, 0, 0] }
+    sea alto = 0
+    sea t = x
+    mientras (t > 1) {
+        t = cociente(t, 2)
+        alto = alto + 1
+    }
+    sea segundo = cociente(x, potencia(2, alto - 1)) % 2
+    sea extra = alto - 1
+    retornar [2 * alto + segundo, extra, x % potencia(2, extra)]
+}
+
+/// Codifica una imagen RGBA como WebP sin pérdida.
+funcion webp_codificar(img) {
+    sea w = img["ancho"]
+    sea h = img["alto"]
+    si (w > 16384 o h > 16384) { lanzar "formato_web: WebP admite hasta 16384 × 16384" }
+    sea p = img["pixeles"]
+    // Píxeles con resta de verde: [a, r - g, g, b - g].
+    sea px = []
+    sea i = 0
+    mientras (i < w * h * 4) {
+        sea g = byte_en(p, i + 1)
+        px.agregar([byte_en(p, i + 3), (byte_en(p, i) - g + 256) % 256, g, (byte_en(p, i + 2) - g + 256) % 256])
+        i = i + 4
+    }
+    // LZ77 sencillo: repetición del píxel anterior (distancia 1) o del de arriba (distancia w).
+    sea simbolos = []
+    sea n = w * h
+    i = 0
+    mientras (i < n) {
+        sea mejor = 0
+        sea dist = 0
+        para d en [1, w] {
+            si (d <= i) {
+                sea k = 0
+                mientras (i + k < n y k < 4096 y px[i + k] == px[i + k - d]) { k = k + 1 }
+                si (k > mejor) {
+                    mejor = k
+                    dist = d
+                }
+            }
+        }
+        si (mejor >= 3) {
+            simbolos.agregar({"t": "copia", "largo": mejor, "codigo": si(dist == 1, 2, 1)})
+            i = i + mejor
+        } sino {
+            simbolos.agregar({"t": "lit", "c": px[i]})
+            i = i + 1
+        }
+    }
+    sea fg = []
+    para k en lista_rango(0, 280) { fg.agregar(0) }
+    sea fr = []
+    sea fb = []
+    sea fa = []
+    para k en lista_rango(0, 256) {
+        fr.agregar(0)
+        fb.agregar(0)
+        fa.agregar(0)
+    }
+    sea fd = []
+    para k en lista_rango(0, 40) { fd.agregar(0) }
+    para s en simbolos {
+        si (s["t"] == "lit") {
+            sea c = s["c"]
+            fg[c[2]] = fg[c[2]] + 1
+            fr[c[1]] = fr[c[1]] + 1
+            fb[c[3]] = fb[c[3]] + 1
+            fa[c[0]] = fa[c[0]] + 1
+        } sino {
+            sea pl = _wp_prefijo(s["largo"])
+            fg[256 + pl[0]] = fg[256 + pl[0]] + 1
+            sea pd = _wp_prefijo(s["codigo"])
+            fd[pd[0]] = fd[pd[0]] + 1
+        }
+    }
+    sea e = _wp_escritor()
+    _wp_poner(e, w - 1, 14)
+    _wp_poner(e, h - 1, 14)
+    _wp_poner(e, 1, 1)
+    _wp_poner(e, 0, 3)
+    // Transformación: resta de verde.
+    _wp_poner(e, 1, 1)
+    _wp_poner(e, 2, 2)
+    _wp_poner(e, 0, 1)
+    // Sin caché ni metacódigos.
+    _wp_poner(e, 0, 1)
+    _wp_poner(e, 0, 1)
+    sea cg = _wp_escribir_codigo(e, fg)
+    sea cr = _wp_escribir_codigo(e, fr)
+    sea cb = _wp_escribir_codigo(e, fb)
+    sea ca = _wp_escribir_codigo(e, fa)
+    sea cd = _wp_escribir_codigo(e, fd)
+    para s en simbolos {
+        si (s["t"] == "lit") {
+            sea c = s["c"]
+            _wp_poner(e, cg[c[2]][0], cg[c[2]][1])
+            _wp_poner(e, cr[c[1]][0], cr[c[1]][1])
+            _wp_poner(e, cb[c[3]][0], cb[c[3]][1])
+            _wp_poner(e, ca[c[0]][0], ca[c[0]][1])
+        } sino {
+            sea pl = _wp_prefijo(s["largo"])
+            _wp_poner(e, cg[256 + pl[0]][0], cg[256 + pl[0]][1])
+            _wp_poner(e, pl[2], pl[1])
+            sea pd = _wp_prefijo(s["codigo"])
+            _wp_poner(e, cd[pd[0]][0], cd[pd[0]][1])
+            _wp_poner(e, pd[2], pd[1])
+        }
+    }
+    sea vp8l = char_de(47) + _wp_terminar(e)
+    sea trozo = "VP8L" + bytes_entero(longitud(vp8l), 4, 1) + vp8l + si(longitud(vp8l) % 2 == 1, char_de(0), "")
+    retornar "RIFF" + bytes_entero(4 + longitud(trozo), 4, 1) + "WEBP" + trozo
+}

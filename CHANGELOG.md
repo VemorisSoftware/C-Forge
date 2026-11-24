@@ -4,6 +4,14 @@ Sitio oficial: [c-forge.org](https://c-forge.org)
 
 ## Sin publicar
 
+- Lote 37 de bibliotecas (tres más que pasan de enlaces a nativas):
+  `vision`/`opencv` (color, umbrales con Otsu y adaptativo, filtros,
+  Canny, morfología, componentes, contornos, momentos y plantillas; mismos
+  resultados que OpenCV 5, salvo el gaussiano con σ > 0, a 1 nivel),
+  `formato_web`/`libwebp` (WebP sin pérdida: decodificador completo y
+  codificador propio; el WebP con pérdida y AVIF siguen por enlaces) y
+  `escaner`/`leptonica` (Sauvola idéntico a scikit-image, detección de
+  inclinación, enderezado, morfología binaria, renglones y bloques).
 - Lote 36 de bibliotecas (tres más que pasan de enlaces a nativas):
   `sintaxis`/`treesitter` (árboles de sintaxis de Python y JSON con los
   mismos nodos, campos y posiciones que tree-sitter, y consultas con su
