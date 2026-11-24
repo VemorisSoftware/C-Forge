@@ -127,10 +127,12 @@ def novedades(idioma: str) -> str:
     }[idioma]
     sufijo = "" if idioma == "es" else "_" + idioma
     items = []
+    fecha = rel["date_display" if idioma == "es" else "date_display_" + idioma]
     for c in rel["changelog"]:
         items.append(
-            f'<article class="novedad r"><div class="novedad-tipo">{tipos.get(c["type"], c["type"])}</div>'
-            f'<div><h3>{html.escape(c["title" + sufijo])}</h3><p>{html.escape(c["desc" + sufijo])}</p></div></article>'
+            f'<article class="novedad r"><p><b>{html.escape(c["title" + sufijo])}:</b> {html.escape(c["desc" + sufijo])}</p>'
+            f'<div class="novedad-meta"><span class="novedad-tipo">{tipos.get(c["type"], c["type"])} · v{rel["version"]}</span>'
+            f'<span>{html.escape(fecha)}</span></div></article>'
         )
     return "\n".join(items)
 
