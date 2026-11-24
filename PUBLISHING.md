@@ -8,7 +8,7 @@
 ## GitHub
 
 Antes de crear el repositorio, revisa que el nombre público sea `C-Forge` y que
-la licencia propietaria incluida represente la decisión de Vemoris Group.
+la licencia incluida (C-Forge License, uso libre) represente la decisión de Vemoris Group.
 
 ```bash
 git init

@@ -4,6 +4,12 @@ Sitio oficial: [c-forge.org](https://c-forge.org)
 
 ## Sin publicar
 
+- **C-Forge es de uso libre:** la nueva licencia (`LICENSE`) deja usar
+  C-Forge gratis y sin pedir permiso para cualquier fin, también en el trabajo,
+  empresas y producción. Los programas que se hagan con C-Forge son de sus
+  autores. C-Forge sigue siendo de Vemoris Group: no se puede vender C-Forge en
+  sí ni distribuir versiones modificadas sin autorización. El sitio, el
+  registro de paquetes y WinGet lo dicen así.
 - Librerías de C++ y de Rust desde C-Forge, sin código puente:
   `cforge bindgen geo.hpp` (clang++) y `cforge bindgen rust:crate` (cargo,
   desde crates.io o una ruta) generan la capa con interfaz C, la compilan y
