@@ -45,6 +45,10 @@ else
 fi
 export CFORGE_INTEROP="$T/interop"
 if command -v clang++ >/dev/null 2>&1; then
+    # El repositorio no guarda archivos .hpp/.cpp (100 % C-Forge): la
+    # librería de ejemplo vive como .txt y se renombra aquí.
+    mv cpp/geo.hpp.txt cpp/geo.hpp
+    mv cpp/geo.cpp.txt cpp/geo.cpp
     "$C" bindgen cpp/geo.hpp --fuentes cpp/geo.cpp | grep -q '31 funciones; 1 omitidas → importar "cpp:geo"'
     "$C" cpp.cfv > cpp.txt
     cat > cpp.esperado <<'F'
