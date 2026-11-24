@@ -1,0 +1,521 @@
+// stdlib/tuberia.cfv — Tuberías multimedia al estilo de GStreamer, escrito
+// desde cero (idea de GStreamer, LGPL: solo la idea y la sintaxis de
+// gst-launch). Una descripción "fuente ! filtro ! sumidero" se arma con
+// elementos que pasan búferes con marcas de tiempo y caps, hasta EOS:
+//
+//   · Audio: audiotestsrc (sine, square, saw, triangle, silence,
+//     white-noise), wavparse, wavenc, volume, audioconvert (S16LE / F32LE,
+//     mono / estéreo), audioresample (lineal) y level (RMS y pico en dB).
+//   · Video: videotestsrc (smpte, black, white, snow, checkers-8, gradient),
+//     videoflip, pngenc.
+//   · Generales: filesrc, filesink, multifilesink, appsink, fakesink,
+//     identity, capsfilter ("audio/x-raw,rate=8000,channels=1").
+//
+// En inglés: importar "gstreamer".
+//
+//   importar "tuberia"
+//   sea r = tuberia_lanzar("audiotestsrc freq=440 num-buffers=10 ! audio/x-raw,rate=16000 ! volume volume=0.5 ! wavenc ! filesink location=la.wav")
+//   mostrar(r["estado"])          // "eos"
+
+importar "imagen"
+
+// ---------- descripción ----------
+
+funcion _tub_valor(t) {
+    sea s = texto_recortar(t)
+    si (texto_empieza_con(s, "\"") y texto_termina_con(s, "\"")) { retornar subtexto(s, 1, longitud(s) - 1) }
+    si (s == "true") { retornar verdadero }
+    si (s == "false") { retornar falso }
+    si (s == "") { retornar s }
+    sea num = verdadero
+    sea puntos = 0
+    para i en lista_rango(0, longitud(s)) {
+        sea c = subtexto(s, i, i + 1)
+        si (c == ".") { puntos = puntos + 1 }
+        sino si (c == "-" y i == 0) { }
+        sino si (texto_indice("0123456789", c) < 0) { num = falso }
+    }
+    si (num y puntos <= 1 y s != "-" y s != ".") { retornar a_numero(s) }
+    retornar s
+}
+
+funcion _tub_caps(t) {
+    sea partes = texto_dividir(t, ",")
+    sea r = {"tipo": texto_recortar(partes[0])}
+    para i en lista_rango(1, longitud(partes)) {
+        sea kv = texto_dividir(partes[i], "=")
+        si (longitud(kv) == 2) {
+            sea v = texto_recortar(kv[1])
+            si (texto_contiene(v, ")")) { v = subtexto(v, texto_indice(v, ")") + 1, longitud(v)) }
+            si (texto_contiene(v, "/") y texto_recortar(kv[0]) == "framerate") {
+                sea fr = texto_dividir(v, "/")
+                r["framerate"] = a_numero(fr[0]) / a_numero(fr[1])
+            } sino { r[texto_recortar(kv[0])] = _tub_valor(v) }
+        }
+    }
+    retornar r
+}
+
+/// Analiza una descripción de gst-launch: lista de {"elemento", "props"}.
+funcion tuberia_analizar(descripcion) {
+    sea r = []
+    para trozo en texto_dividir(descripcion, "!") {
+        sea t = texto_recortar(trozo)
+        si (t == "") { lanzar "tuberia: elemento vacío entre '!'" }
+        // Palabras respetando comillas.
+        sea palabras = []
+        sea actual = ""
+        sea comillas = falso
+        para i en lista_rango(0, longitud(t)) {
+            sea c = subtexto(t, i, i + 1)
+            si (c == "\"") { comillas = comillas == falso }
+            si (c == " " y comillas == falso) {
+                si (actual != "") { palabras.agregar(actual) }
+                actual = ""
+            } sino { actual = actual + c }
+        }
+        si (actual != "") { palabras.agregar(actual) }
+        si (texto_contiene(palabras[0], "/")) { r.agregar({"elemento": "capsfilter", "props": {"caps": _tub_caps(unir(palabras, ""))}}) } sino {
+            sea props = {}
+            para i en lista_rango(1, longitud(palabras)) {
+                sea k = texto_indice(palabras[i], "=")
+                si (k < 0) { lanzar "tuberia: propiedad sin valor '" + palabras[i] + "'" }
+                sea nombre = subtexto(palabras[i], 0, k)
+                sea val = subtexto(palabras[i], k + 1, longitud(palabras[i]))
+                si (nombre == "caps") { props[nombre] = _tub_caps(_tub_valor(val)) } sino { props[nombre] = _tub_valor(val) }
+            }
+            r.agregar({"elemento": palabras[0], "props": props})
+        }
+    }
+    retornar r
+}
+
+// ---------- muestras ----------
+
+// Audio interno: lista de canales con muestras en punto flotante [-1, 1].
+funcion _tub_audio(rate, canales, muestras) { retornar {"tipo": "audio/x-raw", "rate": rate, "channels": canales, "datos": muestras} }
+
+funcion _tub_s16(v) {
+    sea x = piso(v * 32767 + si(v < 0, -0.5, 0.5))
+    si (v >= 0) { x = piso(v * 32767 + 0.5) } sino { x = 0 - piso(0 - v * 32767 + 0.5) }
+    retornar maximo(-32768, minimo(32767, x))
+}
+
+funcion _tub_a_bytes(buf, formato) {
+    sea partes = []
+    sea n = longitud(buf["datos"][0])
+    para i en lista_rango(0, n) {
+        para ch en buf["datos"] {
+            si (formato == "F32LE") { partes.agregar(_tub_f32_bytes(ch[i])) } sino {
+                sea v = _tub_s16(ch[i])
+                partes.agregar(bytes_entero(si(v < 0, v + 65536, v), 2, 1))
+            }
+        }
+    }
+    retornar unir(partes, "")
+}
+
+funcion _tub_f32_bytes(v) {
+    si (v == 0) { retornar bytes_entero(0, 4, 1) }
+    sea s = si(v < 0, 1, 0)
+    sea a = absoluto(v)
+    sea e = piso(logaritmo(a) / logaritmo(2))
+    si (potencia(2, e) > a) { e = e - 1 }
+    si (potencia(2, e + 1) <= a) { e = e + 1 }
+    sea m = piso((a / potencia(2, e) - 1) * 8388608 + 0.5)
+    si (m >= 8388608) {
+        m = 0
+        e = e + 1
+    }
+    retornar bytes_entero(s * 2147483648 + (e + 127) * 8388608 + m, 4, 1)
+}
+
+funcion _tub_f32(b, i) {
+    sea bits = bytes_leer_entero(b, i, 4, 1)
+    sea signo = si(bits >= 2147483648, -1, 1)
+    sea e = cociente(bits, 8388608) % 256
+    sea m = bits % 8388608
+    si (e == 0) { retornar signo * m * potencia(2, -149) }
+    retornar signo * (1 + m / 8388608) * potencia(2, e - 127)
+}
+
+// ---------- elementos ----------
+
+funcion _tub_nuevo(nombre, props, ctx) {
+    sea e = {"nombre": nombre, "props": props, "estado": {}}
+    sea conocidos = ["audiotestsrc", "videotestsrc", "filesrc", "filesink", "multifilesink", "appsink", "fakesink", "identity", "capsfilter", "wavparse", "wavenc", "volume",
+        "audioconvert", "audioresample", "level", "pngenc", "videoflip"]
+    si (lista_contiene(conocidos, nombre) == falso) { lanzar "tuberia: elemento desconocido '" + nombre + "'" }
+    retornar e
+}
+
+funcion _tub_prop(e, k, defecto) { retornar e["props"][k] ?? defecto }
+
+// Pide las caps que fija el capsfilter siguiente (si lo hay) para una fuente.
+funcion _tub_caps_siguiente(tub, i) {
+    si (i + 1 < longitud(tub) y tub[i + 1]["nombre"] == "capsfilter") { retornar tub[i + 1]["props"]["caps"] }
+    retornar {}
+}
+
+// Genera los búferes de una fuente (lista completa).
+funcion _tub_fuente(tub, i, ctx) {
+    sea e = tub[i]
+    sea caps = _tub_caps_siguiente(tub, i)
+    sea n = _tub_prop(e, "num-buffers", -1)
+    si (e["nombre"] == "audiotestsrc") {
+        si (n < 0) { n = 100 }
+        sea rate = caps["rate"] ?? 44100
+        sea canales = caps["channels"] ?? 1
+        sea por_buf = _tub_prop(e, "samplesperbuffer", 1024)
+        sea onda = _tub_prop(e, "wave", "sine")
+        sea freq = _tub_prop(e, "freq", 440)
+        sea vol = _tub_prop(e, "volume", 0.8)
+        sea semilla = 12345
+        sea r = []
+        sea pos = 0
+        para b en lista_rango(0, n) {
+            sea m = []
+            para k en lista_rango(0, por_buf) {
+                sea t = (pos + k) * freq / rate
+                sea fase = t - piso(t)
+                sea v = 0.0
+                si (onda == "sine") { v = seno(2 * 3.141592653589793 * t) }
+                sino si (onda == "square") { v = si(fase < 0.5, 1.0, -1.0) }
+                sino si (onda == "saw") { v = 2 * fase - 1 }
+                sino si (onda == "triangle") { v = si(fase < 0.5, 4 * fase - 1, 3 - 4 * fase) }
+                sino si (onda == "white-noise") {
+                    semilla = (semilla * 1103515245 + 12345) % 2147483648
+                    v = semilla / 1073741824 - 1
+                } sino si (onda == "silence") { v = 0.0 }
+                sino { lanzar "tuberia: forma de onda desconocida " + onda }
+                m.agregar(v * vol)
+            }
+            sea chs = []
+            para c en lista_rango(0, canales) { chs.agregar(m) }
+            sea buf = _tub_audio(rate, canales, chs)
+            buf["pts"] = pos / rate
+            buf["duracion"] = por_buf / rate
+            buf["formato"] = caps["format"] ?? "S16LE"
+            r.agregar(buf)
+            pos = pos + por_buf
+        }
+        retornar r
+    }
+    si (e["nombre"] == "videotestsrc") {
+        si (n < 0) { n = 1 }
+        sea w = caps["width"] ?? 320
+        sea h = caps["height"] ?? 240
+        sea fps = caps["framerate"] ?? 30
+        sea patron = _tub_prop(e, "pattern", "smpte")
+        sea r = []
+        sea semilla = 777
+        para f en lista_rango(0, n) {
+            sea img = nulo
+            si (patron == "smpte") {
+                sea barras = [[192, 192, 192], [192, 192, 0], [0, 192, 192], [0, 192, 0], [192, 0, 192], [192, 0, 0], [0, 0, 192]]
+                img = imagen_nueva(w, h, [0, 0, 0, 255])
+                para x en lista_rango(0, w) {
+                    sea c = barras[minimo(6, cociente(x * 7, w))]
+                    para yy en lista_rango(0, h) { imagen_fijar_pixel(img, x, yy, [c[0], c[1], c[2], 255]) }
+                }
+            } sino si (patron == "black" o patron == "white") {
+                sea v = si(patron == "white", 255, 0)
+                img = imagen_nueva(w, h, [v, v, v, 255])
+            } sino si (patron == "checkers-8") {
+                img = imagen_nueva(w, h, [0, 0, 0, 255])
+                para yy en lista_rango(0, h) {
+                    para x en lista_rango(0, w) {
+                        si ((cociente(x, 8) + cociente(yy, 8)) % 2 == 0) { imagen_fijar_pixel(img, x, yy, [255, 255, 255, 255]) }
+                    }
+                }
+            } sino si (patron == "gradient") {
+                img = imagen_nueva(w, h, [0, 0, 0, 255])
+                para yy en lista_rango(0, h) {
+                    sea v = cociente(yy * 255, maximo(1, h - 1))
+                    para x en lista_rango(0, w) { imagen_fijar_pixel(img, x, yy, [v, v, v, 255]) }
+                }
+            } sino si (patron == "snow") {
+                img = imagen_nueva(w, h, [0, 0, 0, 255])
+                para yy en lista_rango(0, h) {
+                    para x en lista_rango(0, w) {
+                        semilla = (semilla * 1103515245 + 12345) % 2147483648
+                        sea v = cociente(semilla, 8388608)
+                        imagen_fijar_pixel(img, x, yy, [v, v, v, 255])
+                    }
+                }
+            } sino { lanzar "tuberia: patrón desconocido " + patron }
+            r.agregar({"tipo": "video/x-raw", "imagen": img, "width": w, "height": h, "pts": f / fps, "duracion": 1 / fps})
+        }
+        retornar r
+    }
+    si (e["nombre"] == "filesrc") {
+        sea ruta = _tub_prop(e, "location", nulo)
+        si (ruta == nulo) { lanzar "tuberia: filesrc necesita location" }
+        retornar [{"tipo": "application/octet-stream", "bytes": leer_archivo(ruta), "pts": 0, "duracion": 0}]
+    }
+    lanzar "tuberia: '" + e["nombre"] + "' no es una fuente"
+}
+
+funcion _tub_wav_leer(datos) {
+    si (subtexto(datos, 0, 4) != "RIFF" o subtexto(datos, 8, 12) != "WAVE") { lanzar "tuberia: wavparse recibió algo que no es WAV" }
+    sea p = 12
+    sea fmt = nulo
+    mientras (p + 8 <= longitud(datos)) {
+        sea id = subtexto(datos, p, p + 4)
+        sea tam = bytes_leer_entero(datos, p + 4, 4, 1)
+        si (id == "fmt ") {
+            fmt = {"formato": bytes_leer_entero(datos, p + 8, 2, 1), "canales": bytes_leer_entero(datos, p + 10, 2, 1), "rate": bytes_leer_entero(datos, p + 12, 4, 1), "bits": bytes_leer_entero(datos, p + 22, 2, 1)}
+        }
+        si (id == "data") {
+            si (fmt == nulo) { lanzar "tuberia: WAV sin fmt" }
+            sea d = subtexto(datos, p + 8, minimo(longitud(datos), p + 8 + tam))
+            sea chs = []
+            para c en lista_rango(0, fmt["canales"]) { chs.agregar([]) }
+            sea paso = cociente(fmt["bits"], 8)
+            sea i = 0
+            mientras (i + paso * fmt["canales"] <= longitud(d)) {
+                para c en lista_rango(0, fmt["canales"]) {
+                    sea v = 0.0
+                    si (fmt["formato"] == 3) { v = _tub_f32(d, i) } sino si (fmt["bits"] == 16) {
+                        sea x = bytes_leer_entero(d, i, 2, 1)
+                        v = si(x >= 32768, x - 65536, x) / 32767
+                    } sino si (fmt["bits"] == 8) { v = (byte_en(d, i) - 128) / 127 } sino { lanzar "tuberia: WAV de " + fmt["bits"] + " bits no soportado" }
+                    chs[c].agregar(v)
+                    i = i + paso
+                }
+            }
+            sea buf = _tub_audio(fmt["rate"], fmt["canales"], chs)
+            buf["formato"] = si(fmt["formato"] == 3, "F32LE", "S16LE")
+            buf["pts"] = 0
+            buf["duracion"] = longitud(chs[0]) / fmt["rate"]
+            retornar buf
+        }
+        p = p + 8 + tam + tam % 2
+    }
+    lanzar "tuberia: WAV sin datos"
+}
+
+// Procesa un búfer en un elemento: devuelve lista de búferes de salida.
+funcion _tub_procesar(e, buf, ctx) {
+    sea n = e["nombre"]
+    si (n == "identity" o n == "fakesink") { retornar [buf] }
+    si (n == "capsfilter") {
+        sea caps = e["props"]["caps"]
+        si (caps["tipo"] != buf["tipo"] y buf["tipo"] != "application/octet-stream") { lanzar "tuberia: caps incompatibles: " + buf["tipo"] + " no es " + caps["tipo"] }
+        para k en claves(caps) {
+            si (k != "tipo" y k != "format" y tiene_clave(buf, k) y ("" + buf[k]) != ("" + caps[k])) { lanzar "tuberia: no se pudo negociar " + k + "=" + caps[k] + " (llega " + buf[k] + ")" }
+        }
+        si (tiene_clave(caps, "format") y buf["tipo"] == "audio/x-raw") { buf["formato"] = caps["format"] }
+        retornar [buf]
+    }
+    si (n == "volume") {
+        sea v = _tub_prop(e, "volume", 1.0)
+        si (_tub_prop(e, "mute", falso)) { v = 0 }
+        sea chs = []
+        para ch en buf["datos"] {
+            sea r = []
+            para x en ch { r.agregar(maximo(-1, minimo(1, x * v))) }
+            chs.agregar(r)
+        }
+        buf["datos"] = chs
+        retornar [buf]
+    }
+    si (n == "audioconvert") {
+        // Los canales se ajustan al capsfilter que sigue (lo aplica _tub_ejecutar).
+        retornar [buf]
+    }
+    si (n == "audioresample") { retornar [buf] }
+    si (n == "level") {
+        sea rms = []
+        sea picos = []
+        para ch en buf["datos"] {
+            sea s = 0.0
+            sea pk = 0.0
+            para x en ch {
+                s = s + x * x
+                pk = maximo(pk, absoluto(x))
+            }
+            sea r = raiz(s / maximo(1, longitud(ch)))
+            rms.agregar(si(r > 0, 20 * logaritmo(r) / logaritmo(10), -700))
+            picos.agregar(si(pk > 0, 20 * logaritmo(pk) / logaritmo(10), -700))
+        }
+        ctx["mensajes"].agregar({"tipo": "element", "origen": "level", "pts": buf["pts"], "rms": rms, "pico": picos})
+        retornar [buf]
+    }
+    si (n == "wavparse") {
+        si (buf["tipo"] != "application/octet-stream") { lanzar "tuberia: wavparse espera bytes" }
+        retornar [_tub_wav_leer(buf["bytes"])]
+    }
+    si (n == "wavenc") {
+        // Acumula hasta EOS.
+        si (tiene_clave(e["estado"], "acum") == falso) {
+            e["estado"]["acum"] = []
+            e["estado"]["rate"] = buf["rate"]
+            e["estado"]["canales"] = buf["channels"]
+            e["estado"]["formato"] = buf["formato"] ?? "S16LE"
+        }
+        e["estado"]["acum"].agregar(_tub_a_bytes(buf, e["estado"]["formato"]))
+        retornar []
+    }
+    si (n == "pngenc") {
+        si (buf["tipo"] != "video/x-raw") { lanzar "tuberia: pngenc espera video/x-raw" }
+        retornar [{"tipo": "image/png", "bytes": imagen_codificar_png(buf["imagen"]), "pts": buf["pts"], "duracion": buf["duracion"]}]
+    }
+    si (n == "videoflip") {
+        sea m = _tub_prop(e, "method", "horizontal-flip")
+        sea img = buf["imagen"]
+        sea w = img["ancho"]
+        sea h = img["alto"]
+        sea r = imagen_nueva(w, h, [0, 0, 0, 255])
+        para yy en lista_rango(0, h) {
+            para x en lista_rango(0, w) {
+                sea sx = si(m == "horizontal-flip" o m == "rotate-180", w - 1 - x, x)
+                sea sy = si(m == "vertical-flip" o m == "rotate-180", h - 1 - yy, yy)
+                imagen_fijar_pixel(r, x, yy, imagen_pixel(img, sx, sy))
+            }
+        }
+        buf["imagen"] = r
+        retornar [buf]
+    }
+    si (n == "filesink" o n == "multifilesink" o n == "appsink") {
+        si (n == "appsink") {
+            sea nombre = _tub_prop(e, "name", "appsink")
+            si (tiene_clave(ctx["sumideros"], nombre) == falso) { ctx["sumideros"][nombre] = [] }
+            ctx["sumideros"][nombre].agregar(buf)
+            retornar []
+        }
+        sea datos = _tub_bytes_de(buf)
+        si (n == "multifilesink") {
+            sea k = e["estado"]["indice"] ?? _tub_prop(e, "index", 0)
+            sea ruta = texto_reemplazar(_tub_prop(e, "location", "%05d"), "%05d", _tub_relleno(k, 5))
+            ruta = texto_reemplazar(ruta, "%d", "" + k)
+            escribir_archivo(ruta, datos)
+            e["estado"]["indice"] = k + 1
+        } sino {
+            si (tiene_clave(e["estado"], "partes") == falso) { e["estado"]["partes"] = [] }
+            e["estado"]["partes"].agregar(datos)
+        }
+        retornar []
+    }
+    lanzar "tuberia: '" + n + "' no puede procesar búferes"
+}
+
+funcion _tub_relleno(k, n) {
+    sea t = "" + k
+    mientras (longitud(t) < n) { t = "0" + t }
+    retornar t
+}
+
+funcion _tub_bytes_de(buf) {
+    si (tiene_clave(buf, "bytes")) { retornar buf["bytes"] }
+    si (buf["tipo"] == "audio/x-raw") { retornar _tub_a_bytes(buf, buf["formato"] ?? "S16LE") }
+    si (buf["tipo"] == "video/x-raw") { retornar buf["imagen"]["pixeles"] }
+    lanzar "tuberia: no sé escribir " + buf["tipo"]
+}
+
+// EOS: vacía acumulados.
+funcion _tub_eos(e, ctx) {
+    si (e["nombre"] == "wavenc" y tiene_clave(e["estado"], "acum")) {
+        sea d = unir(e["estado"]["acum"], "")
+        sea ch = e["estado"]["canales"]
+        sea flt = e["estado"]["formato"] == "F32LE"
+        sea bits = si(flt, 32, 16)
+        sea fmt = "fmt " + bytes_entero(16, 4, 1) + bytes_entero(si(flt, 3, 1), 2, 1) + bytes_entero(ch, 2, 1) + bytes_entero(e["estado"]["rate"], 4, 1) +
+            bytes_entero(e["estado"]["rate"] * ch * cociente(bits, 8), 4, 1) + bytes_entero(ch * cociente(bits, 8), 2, 1) + bytes_entero(bits, 2, 1)
+        sea cuerpo = "WAVE" + fmt + "data" + bytes_entero(longitud(d), 4, 1) + d
+        retornar [{"tipo": "audio/x-wav", "bytes": "RIFF" + bytes_entero(longitud(cuerpo), 4, 1) + cuerpo, "pts": 0, "duracion": 0}]
+    }
+    si (e["nombre"] == "filesink" y tiene_clave(e["estado"], "partes")) {
+        escribir_archivo(_tub_prop(e, "location", "salida.bin"), unir(e["estado"]["partes"], ""))
+    }
+    retornar []
+}
+
+// Ajustes que dependen del capsfilter posterior (audioconvert / audioresample).
+funcion _tub_ajustar(e, sig, buf) {
+    si (sig == nulo o sig["nombre"] != "capsfilter" o buf["tipo"] != "audio/x-raw") { retornar buf }
+    sea caps = sig["props"]["caps"]
+    si (e["nombre"] == "audioconvert" y tiene_clave(caps, "channels") y caps["channels"] != buf["channels"]) {
+        sea n = caps["channels"]
+        sea chs = []
+        si (n == 1) {
+            sea m = []
+            para i en lista_rango(0, longitud(buf["datos"][0])) {
+                sea s = 0.0
+                para ch en buf["datos"] { s = s + ch[i] }
+                m.agregar(s / longitud(buf["datos"]))
+            }
+            chs.agregar(m)
+        } sino {
+            para c en lista_rango(0, n) { chs.agregar(buf["datos"][minimo(c, longitud(buf["datos"]) - 1)]) }
+        }
+        buf["datos"] = chs
+        buf["channels"] = n
+    }
+    si (e["nombre"] == "audioresample" y tiene_clave(caps, "rate") y caps["rate"] != buf["rate"]) {
+        sea razon = buf["rate"] / caps["rate"]
+        sea chs = []
+        para ch en buf["datos"] {
+            sea n_sal = piso(longitud(ch) / razon)
+            sea r = []
+            para i en lista_rango(0, n_sal) {
+                sea x = i * razon
+                sea k = piso(x)
+                sea f = x - k
+                sea a = ch[minimo(k, longitud(ch) - 1)]
+                sea b = ch[minimo(k + 1, longitud(ch) - 1)]
+                r.agregar(a + (b - a) * f)
+            }
+            chs.agregar(r)
+        }
+        buf["datos"] = chs
+        buf["rate"] = caps["rate"]
+        buf["duracion"] = longitud(chs[0]) / caps["rate"]
+    }
+    retornar buf
+}
+
+/// Ejecuta una descripción de gst-launch hasta EOS. Devuelve {"estado":
+/// "eos" | "error", "error"?, "mensajes", "sumideros" (búferes por appsink)}.
+funcion tuberia_lanzar(descripcion) {
+    sea desc = tuberia_analizar(descripcion)
+    sea ctx = {"mensajes": [], "sumideros": {}}
+    sea tub = []
+    para d en desc { tub.agregar(_tub_nuevo(d["elemento"], d["props"], ctx)) }
+    intentar {
+        // La fuente es el primero; si el segundo es su capsfilter, se salta.
+        sea bufs = _tub_fuente(tub, 0, ctx)
+        sea ini = 1
+        si (longitud(tub) > 1 y tub[1]["nombre"] == "capsfilter" y tub[0]["nombre"] != "filesrc") { ini = 2 }
+        para b en bufs { _tub_empujar(tub, ini, b, ctx) }
+        _tub_fin(tub, ini, ctx)
+        ctx["mensajes"].agregar({"tipo": "eos"})
+        retornar {"estado": "eos", "mensajes": ctx["mensajes"], "sumideros": ctx["sumideros"]}
+    } capturar (x) {
+        ctx["mensajes"].agregar({"tipo": "error", "texto": "" + x})
+        retornar {"estado": "error", "error": "" + x, "mensajes": ctx["mensajes"], "sumideros": ctx["sumideros"]}
+    }
+    retornar nulo
+}
+
+funcion _tub_empujar(tub, i, buf, ctx) {
+    si (i >= longitud(tub)) { retornar nulo }
+    sea e = tub[i]
+    sea sig = nulo
+    si (i + 1 < longitud(tub)) { sig = tub[i + 1] }
+    para s en _tub_procesar(e, buf, ctx) { _tub_empujar(tub, i + 1, _tub_ajustar(e, sig, s), ctx) }
+    retornar nulo
+}
+
+funcion _tub_fin(tub, i, ctx) {
+    si (i >= longitud(tub)) { retornar nulo }
+    para s en _tub_eos(tub[i], ctx) { _tub_empujar(tub, i + 1, s, ctx) }
+    _tub_fin(tub, i + 1, ctx)
+    retornar nulo
+}
+
+/// Elementos disponibles.
+funcion tuberia_elementos() {
+    retornar ["appsink", "audioconvert", "audioresample", "audiotestsrc", "capsfilter", "fakesink", "filesink", "filesrc", "identity", "level", "multifilesink", "pngenc",
+        "videoflip", "videotestsrc", "volume", "wavenc", "wavparse"]
+}
