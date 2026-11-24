@@ -1,0 +1,373 @@
+// Genera las páginas de c-forge.org a partir de plantillas y datos del repo.
+//
+// Todo lo que el sitio afirma sale de una fuente verificable:
+//   - versión ............ Makefile (VERSION)
+//   - estado ............. capabilities.json
+//   - novedades .......... site/data/releases.json
+//   - ejemplos ........... site/ejemplos/*.cfv y su salida real *.salida
+//                          (verificar.sh los ejecuta en CI)
+//
+// Uso (desde la raíz del repo):
+//   ./cforge site/generar.cfv            regenera las páginas
+//   ./cforge site/generar.cfv --check    falla si las páginas no están al día
+//   ./cforge site/generar.cfv --sitio DIR   carpeta del sitio (por defecto: site)
+
+sea PALABRAS = ["sea", "funcion", "retornar", "si", "sino", "mientras", "para", "en",
+    "intentar", "capturar", "lanzar", "clase", "esto", "importar", "romper",
+    "continuar", "y", "o", "no",
+    "let", "function", "return", "if", "else", "while", "for", "in", "try",
+    "catch", "throw", "class", "this", "import", "break", "continue", "and",
+    "or", "not"]
+sea LITERALES = ["verdadero", "falso", "nulo", "true", "false", "null"]
+
+sea ESTADO_CLASE = {
+    "verified-stable": "estable", "experimental": "experimental", "partial": "parcial",
+    "planned": "planificado", "not-certified": "no-certificado"
+}
+sea ESTADO_ES = {
+    "verified-stable": "Estable", "experimental": "Experimental", "partial": "En desarrollo",
+    "planned": "Planificado", "not-certified": "No certificado"
+}
+sea ESTADO_EN = {
+    "verified-stable": "Stable", "experimental": "Experimental", "partial": "In progress",
+    "planned": "Planned", "not-certified": "Not certified"
+}
+sea TIPOS_ES = {"new": "Nuevo", "fix": "Arreglo", "change": "Cambio"}
+sea TIPOS_EN = {"new": "New", "fix": "Fix", "change": "Change"}
+
+// ── Texto ────────────────────────────────────────────────────────────
+
+funcion escapar(t) {
+    sea r = texto_reemplazar(t, "&", "&amp;")
+    r = texto_reemplazar(r, "<", "&lt;")
+    r = texto_reemplazar(r, ">", "&gt;")
+    r = texto_reemplazar(r, "\"", "&quot;")
+    retornar texto_reemplazar(r, "'", "&#x27;")
+}
+
+funcion comienza(t, p) { retornar longitud(t) >= longitud(p) y subcadena(t, 0, longitud(p)) == p }
+funcion acaba(t, p) { retornar longitud(t) >= longitud(p) y subcadena(t, longitud(t) - longitud(p), longitud(t)) == p }
+
+// Quita espacios, saltos y tabulaciones del final
+funcion recortar_final(t) {
+    sea fin = longitud(t)
+    mientras (fin > 0 y es_espacio(byte_en(t, fin - 1))) { fin = fin - 1 }
+    retornar subcadena(t, 0, fin)
+}
+
+funcion es_espacio(b) {
+    retornar b == 32 o (b >= 9 y b <= 13)
+}
+
+funcion es_digito(b) { retornar b >= 48 y b <= 57 }
+
+// Largo en bytes de la letra que empieza en i (0 si no es letra).
+// ASCII, guion bajo y letras latinas con tilde (á, é, ñ, ü…).
+funcion largo_letra(t, i) {
+    si (i >= longitud(t)) { retornar 0 }
+    sea b = byte_en(t, i)
+    si ((b >= 65 y b <= 90) o (b >= 97 y b <= 122) o b == 95) { retornar 1 }
+    si (b >= 195 y b <= 197 y i + 1 < longitud(t)) { retornar 2 }
+    retornar 0
+}
+
+// Largo del carácter de palabra (letra o dígito) en i
+funcion largo_palabra(t, i) {
+    si (i < longitud(t) y es_digito(byte_en(t, i))) { retornar 1 }
+    retornar largo_letra(t, i)
+}
+
+// ¿El carácter que termina justo antes de i es de palabra?
+funcion palabra_antes(t, i) {
+    si (i == 0) { retornar falso }
+    sea b = byte_en(t, i - 1)
+    si (b < 128) { retornar es_digito(b) o largo_letra(t, i - 1) == 1 }
+    retornar i >= 2 y largo_letra(t, i - 2) == 2
+}
+
+// ── Resaltado de sintaxis ────────────────────────────────────────────
+
+// Fin de una cadena "…" que empieza en i, o -1 si no cierra
+funcion fin_cadena(t, i) {
+    sea j = i + 1
+    mientras (j < longitud(t)) {
+        sea b = byte_en(t, j)
+        si (b == 34) { retornar j + 1 }
+        si (b == 92) {
+            si (j + 1 < longitud(t) y byte_en(t, j + 1) != 10) { j = j + 2 } sino { retornar -1 }
+        } sino {
+            j = j + 1
+        }
+    }
+    retornar -1
+}
+
+// Fin de un número que empieza en i (con límite de palabra), o -1
+funcion fin_numero(t, i) {
+    si (palabra_antes(t, i)) { retornar -1 }
+    sea j = i
+    mientras (j < longitud(t) y es_digito(byte_en(t, j))) { j = j + 1 }
+    // con decimales
+    si (j + 1 < longitud(t) y byte_en(t, j) == 46 y es_digito(byte_en(t, j + 1))) {
+        sea k = j + 1
+        mientras (k < longitud(t) y es_digito(byte_en(t, k))) { k = k + 1 }
+        si (largo_palabra(t, k) == 0) { retornar k }
+    }
+    si (largo_palabra(t, j) == 0) { retornar j }
+    retornar -1
+}
+
+funcion resaltar(codigo) {
+    sea salida = []
+    sea n = longitud(codigo)
+    sea pos = 0
+    sea i = 0
+    mientras (i < n) {
+        sea b = byte_en(codigo, i)
+        sea fin = -1
+        sea trozo = ""
+        // comentario
+        si (b == 47 y i + 1 < n y byte_en(codigo, i + 1) == 47) {
+            fin = i
+            mientras (fin < n y byte_en(codigo, fin) != 10) { fin = fin + 1 }
+            trozo = "<span class=\"c\">" + escapar(subcadena(codigo, i, fin)) + "</span>"
+        } sino {
+            si (b == 34) {
+                fin = fin_cadena(codigo, i)
+                si (fin >= 0) { trozo = "<span class=\"s\">" + escapar(subcadena(codigo, i, fin)) + "</span>" }
+            } sino {
+                si (es_digito(b)) {
+                    fin = fin_numero(codigo, i)
+                    si (fin >= 0) { trozo = "<span class=\"n\">" + subcadena(codigo, i, fin) + "</span>" }
+                } sino {
+                    si (largo_letra(codigo, i) > 0) {
+                        fin = i + largo_letra(codigo, i)
+                        mientras (largo_palabra(codigo, fin) > 0) { fin = fin + largo_palabra(codigo, fin) }
+                        sea palabra = subcadena(codigo, i, fin)
+                        sea k = fin
+                        mientras (k < n y es_espacio(byte_en(codigo, k))) { k = k + 1 }
+                        sea llamada = ""
+                        si (k < n y byte_en(codigo, k) == 40) {
+                            llamada = subcadena(codigo, fin, k + 1)
+                            fin = k + 1
+                        }
+                        sea clase = ""
+                        si (contiene(PALABRAS, palabra)) { clase = "k" } sino {
+                            si (contiene(LITERALES, palabra)) { clase = "b" } sino {
+                                si (llamada != "") { clase = "f" }
+                            }
+                        }
+                        si (clase != "") {
+                            trozo = "<span class=\"" + clase + "\">" + escapar(palabra) + "</span>"
+                        } sino {
+                            trozo = escapar(palabra)
+                        }
+                        trozo = trozo + escapar(llamada)
+                    }
+                }
+            }
+        }
+        si (fin >= 0) {
+            agregar(salida, escapar(subcadena(codigo, pos, i)))
+            agregar(salida, trozo)
+            pos = fin
+            i = fin
+        } sino {
+            i = i + 1
+        }
+    }
+    agregar(salida, escapar(subcadena(codigo, pos, n)))
+    retornar unir(salida, "")
+}
+
+// ── Piezas de la página ──────────────────────────────────────────────
+
+funcion ejemplo(sitio, nombre, idioma, con_salida) {
+    sea fuente = recortar_final(leer_archivo(sitio + "/ejemplos/" + nombre + ".cfv"))
+    sea partes = texto_dividir(nombre, "/")
+    sea archivo = partes[longitud(partes) - 1]
+    sea html = "<figure class=\"codigo\">"
+        + "<figcaption class=\"codigo-barra\"><span class=\"puntos\"><i></i><i></i><i></i></span>" + archivo + ".cfv</figcaption>"
+        + "<pre><code>" + resaltar(fuente) + "</code></pre>"
+    si (con_salida) {
+        sea salida = recortar_final(leer_archivo(sitio + "/ejemplos/" + nombre + ".salida"))
+        sea titulo = "Salida"
+        si (idioma == "en") { titulo = "Output" }
+        html = html + "<div class=\"salida\"><div class=\"salida-titulo\">" + titulo + "</div>"
+            + "<pre><samp>" + escapar(salida) + "</samp></pre></div>"
+    }
+    retornar html + "</figure>"
+}
+
+funcion version(raiz) {
+    para linea en texto_dividir(leer_archivo(raiz + "/Makefile"), "\n") {
+        si (comienza(linea, "VERSION")) {
+            sea resto = subcadena(linea, 7, longitud(linea))
+            sea i = 0
+            mientras (i < longitud(resto) y es_espacio(byte_en(resto, i))) { i = i + 1 }
+            si (subcadena(resto, i, i + 2) == ":=") {
+                i = i + 2
+                mientras (i < longitud(resto) y es_espacio(byte_en(resto, i))) { i = i + 1 }
+                sea j = i
+                mientras (j < longitud(resto) y no es_espacio(byte_en(resto, j))) { j = j + 1 }
+                si (j > i) { retornar subcadena(resto, i, j) }
+            }
+        }
+    }
+    lanzar "no encontré VERSION en el Makefile"
+}
+
+funcion sufijo(idioma) {
+    si (idioma == "es") { retornar "" }
+    retornar "_" + idioma
+}
+
+funcion tabla_estado(raiz, idioma) {
+    sea datos = cfv_json_parsear(leer_archivo(raiz + "/capabilities.json"))
+    sea etiquetas = ESTADO_ES
+    si (idioma == "en") { etiquetas = ESTADO_EN }
+    sea filas = []
+    para cap en datos["capabilities"] {
+        agregar(filas, "<tr><td>" + escapar(cap["name" + sufijo(idioma)]) + "</td>"
+            + "<td><span class=\"estado estado-" + ESTADO_CLASE[cap["status"]] + "\">" + etiquetas[cap["status"]] + "</span></td>"
+            + "<td>" + escapar(cap["scope" + sufijo(idioma)]) + "</td></tr>")
+    }
+    retornar unir(filas, "\n")
+}
+
+funcion version_actual(sitio) {
+    sea datos = cfv_json_parsear(leer_archivo(sitio + "/data/releases.json"))
+    para r en datos["releases"] {
+        si (r["version"] == datos["latest"]) { retornar r }
+    }
+    lanzar "releases.json: no está la versión " + datos["latest"]
+}
+
+funcion fecha(rel, idioma) {
+    retornar rel["date_display" + sufijo(idioma)]
+}
+
+funcion novedades(sitio, idioma) {
+    sea rel = version_actual(sitio)
+    sea tipos = TIPOS_ES
+    si (idioma == "en") { tipos = TIPOS_EN }
+    sea items = []
+    para c en rel["changelog"] {
+        sea tipo = tipos[c["type"]] ?? c["type"]
+        agregar(items, "<article class=\"novedad r\"><p><b>" + escapar(c["title" + sufijo(idioma)]) + ":</b> " + escapar(c["desc" + sufijo(idioma)]) + "</p>"
+            + "<div class=\"novedad-meta\"><span class=\"novedad-tipo\">" + tipo + " · v" + rel["version"] + "</span>"
+            + "<span>" + escapar(fecha(rel, idioma)) + "</span></div></article>")
+    }
+    retornar unir(items, "\n")
+}
+
+funcion contar_cfv(carpeta) {
+    sea n = 0
+    para nombre en listar_carpeta(carpeta) {
+        si (acaba(nombre, ".cfv") y no comienza(nombre, ".")) { n = n + 1 }
+    }
+    retornar n
+}
+
+// ── Plantillas ───────────────────────────────────────────────────────
+
+funcion es_clave(t) {
+    si (t == "") { retornar falso }
+    sea i = 0
+    mientras (i < longitud(t)) {
+        sea b = byte_en(t, i)
+        si (no ((b >= 97 y b <= 122) o b == 58 o b == 95 o b == 47 o b == 45)) { retornar falso }
+        i = i + 1
+    }
+    retornar verdadero
+}
+
+funcion renderizar(sitio, raiz, plantilla, idioma) {
+    sea reemplazos = {
+        "version": version(raiz),
+        "estado": tabla_estado(raiz, idioma),
+        "novedades": novedades(sitio, idioma),
+        "modulos": "" + contar_cfv(raiz + "/stdlib"),
+        "pruebas": "" + contar_cfv(raiz + "/tests/cfv"),
+        "fecha": fecha(version_actual(sitio), idioma)
+    }
+    sea partes = []
+    sea pos = 0
+    sea i = texto_indice(plantilla, "{{")
+    mientras (i >= 0) {
+        sea abs = pos + i
+        sea cierre = texto_indice(subcadena(plantilla, abs + 2, longitud(plantilla)), "}}")
+        sea clave = ""
+        si (cierre >= 0) { clave = subcadena(plantilla, abs + 2, abs + 2 + cierre) }
+        si (cierre >= 0 y es_clave(clave)) {
+            agregar(partes, subcadena(plantilla, pos, abs))
+            si (comienza(clave, "ejemplo:")) {
+                agregar(partes, ejemplo(sitio, subcadena(clave, 8, longitud(clave)), idioma, verdadero))
+            } sino {
+                si (comienza(clave, "codigo:")) {
+                    agregar(partes, ejemplo(sitio, subcadena(clave, 7, longitud(clave)), idioma, falso))
+                } sino {
+                    si (clave == "mascota") {
+                        agregar(partes, texto_recortar(leer_archivo(sitio + "/plantillas/mascota.svg")))
+                    } sino {
+                        si (no tiene_clave(reemplazos, clave)) { lanzar "marcador desconocido: {{" + clave + "}}" }
+                        agregar(partes, reemplazos[clave])
+                    }
+                }
+            }
+            pos = abs + 2 + cierre + 2
+        } sino {
+            agregar(partes, subcadena(plantilla, pos, abs + 1))
+            pos = abs + 1
+        }
+        i = texto_indice(subcadena(plantilla, pos, longitud(plantilla)), "{{")
+    }
+    agregar(partes, subcadena(plantilla, pos, longitud(plantilla)))
+    sea pagina = unir(partes, "")
+    // Versión de cada recurso según su contenido: así el navegador no usa un
+    // estilo viejo con una página nueva.
+    para recurso en ["estilo.css", "app.js", "tema.js"] {
+        sea huella = subcadena(cfv_sha256(leer_archivo(sitio + "/assets/" + recurso)), 0, 10)
+        pagina = texto_reemplazar(pagina, "\"/assets/" + recurso + "\"", "\"/assets/" + recurso + "?v=" + huella + "\"")
+    }
+    retornar pagina
+}
+
+// ── Principal ────────────────────────────────────────────────────────
+
+sea args = argumentos_programa()
+sea comprobar = contiene(args, "--check")
+sea sitio = "site"
+sea k = 0
+mientras (k < longitud(args)) {
+    si (args[k] == "--sitio" y k + 1 < longitud(args)) { sitio = args[k + 1] }
+    k = k + 1
+}
+si (no existe_archivo(sitio + "/plantillas/es/index.html") y existe_archivo("plantillas/es/index.html")) { sitio = "." }
+sea raiz = sitio + "/.."
+
+// [plantilla, destino, idioma]
+sea PAGINAS = [
+    ["es/index.html", "index.html", "es"],
+    ["es/aprende.html", "aprende.html", "es"],
+    ["es/404.html", "404.html", "es"],
+    ["en/index.html", "en/index.html", "en"],
+    ["en/learn.html", "en/learn.html", "en"]
+]
+
+sea desactualizadas = []
+para p en PAGINAS {
+    sea resultado = renderizar(sitio, raiz, leer_archivo(sitio + "/plantillas/" + p[0]), p[2])
+    sea destino = sitio + "/" + p[1]
+    si (comprobar) {
+        si (no existe_archivo(destino) o leer_archivo(destino) != resultado) { agregar(desactualizadas, p[1]) }
+    } sino {
+        si (texto_indice(p[1], "/") >= 0) { crear_carpeta(sitio + "/" + texto_dividir(p[1], "/")[0]) }
+        escribir_archivo(destino, resultado)
+        mostrar("  GEN  site/" + p[1])
+    }
+}
+si (longitud(desactualizadas) > 0) {
+    mostrar("Páginas desactualizadas (ejecuta ./cforge site/generar.cfv): " + unir(desactualizadas, ", "))
+    salir(1)
+}

@@ -20,7 +20,7 @@ comprueba que las páginas generadas estén al día. Corre en CI en cada cambio.
 1. Cambia `site/plantillas/*.html`, `site/assets/` o los ejemplos.
 2. Si cambias un ejemplo, actualiza su salida:
    `(cd /tmp && ./cforge site/ejemplos/X.cfv) > site/ejemplos/X.salida`
-3. Regenera: `python3 site/generar.py`
+3. Regenera: `./cforge site/generar.cfv`
 4. Verifica: `sh site/verificar.sh ./cforge`
 
 `build.sh` copia `install.sh` e `install.ps1` desde la raíz del repo: el
