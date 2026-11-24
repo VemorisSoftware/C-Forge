@@ -77,6 +77,14 @@ Tras un `.` las palabras no se traducen (`objeto.in` es un campo llamado `in`).
 `numero`, `texto`, `booleano`, `lista`, `mapa`, `nulo`, funciones y objetos de
 clase.
 
+**Enteros sin límite:** los enteros no se desbordan. Si una suma,
+resta, multiplicación, `potencia` o un literal no cabe en 64 bits, el
+resultado es un entero grande exacto (`potencia(2, 100)`, `30!`,
+`123456789012345678901234567890`), y vuelve a ser un entero normal cuando
+cabe. División, `%` y `cociente` truncan igual que con enteros chicos. Los
+enteros chicos siguen en la ruta rápida; solo se paga por los grandes.
+`bits_y`/`bits_o`/`bits_xo` aceptan hasta 62 bits.
+
 `==` y `!=` comparan listas y mapas por contenido (`[1, [2]] == [1, [2]]`,
 `{"a": 1} == {"a": 1}` y `[] == []` son `verdadero`; el orden de las claves
 no importa). Los objetos de clase se comparan por identidad, y
@@ -119,8 +127,9 @@ ejecutarlo; no hay conversiones implícitas con pérdida.
 **Parámetros `entero` (5.0):** un parámetro anotado `n: entero` se
 comprueba una vez al entrar a la función (si llega otro tipo: `error de
 tipos: el parámetro n espera entero y recibe …`, capturable) y, si el cuerpo
-solo le reasigna enteros, se compila como entero probado: aritmética,
-`%` y comparaciones sin comprobaciones dinámicas. `decimal` / `numero` solo
+solo le reasigna enteros, se compila como entero probado. Como un entero
+puede ser grande, la aritmética sigue comprobando la etiqueta y el
+desborde en línea (sin llamar al runtime). `decimal` / `numero` solo
 los verifica `cforge check`.
 
 ### 3.3 Opcionales y punteros seguros ✅
@@ -571,7 +580,8 @@ etiquetados de 64 bits, igual que el intérprete:
 |---|---|
 | `nulo` | 0 |
 | `falso` / `verdadero` | 2 / 4 |
-| entero | n·2 + 1 (impar) |
+| entero | n·2 + 1 (impar), rango [-2^62, 2^62) |
+| entero grande | caja `[12][signo, n, cifras en base 10^9]` |
 | texto, lista, mapa, flotante | caja `[tipo][dato]` |
 
 - `runtime/map.cfv`: tabla hash FNV-1a con direccionamiento abierto,

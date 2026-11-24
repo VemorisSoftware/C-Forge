@@ -4,6 +4,12 @@ Sitio oficial: [c-forge.org](https://c-forge.org)
 
 ## Sin publicar
 
+- **Enteros sin límite:** los enteros ya no se desbordan en silencio (antes
+  `9223372036854775807` se mostraba como `-1` y pasado ~4,6 trillones el
+  resultado era incorrecto). Ahora suma, resta, multiplicación, `potencia`,
+  `a_numero` y los literales dan el número exacto, del tamaño que sea, en
+  x86-64, ARM64 y WebAssembly. Los enteros normales siguen en la ruta
+  rápida con una comprobación de desborde en línea.
 - **Navegador (`importar "navegador"`, `--target wasm`):** lienzo 2D completo
   desde C-Forge (degradados lineales y radiales, rutas con arcos y rombos,
   recortes, transparencia, modos de mezcla, sombras y grano de película) y
