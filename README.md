@@ -200,16 +200,23 @@ C-Forge usa librerías de otros lenguajes sin escribir código puente:
 | Lenguaje | Cómo | Ejemplo |
 |---|---|---|
 | **C** | `cforge bindgen cabecera.h --lib nombre` genera el módulo desde la cabecera | `cforge bindgen /usr/include/zlib.h --lib z` |
-| **Rust, C++, Zig** | Igual que C, si la librería expone una interfaz C (`extern "C"`) | — |
+| **C++** | `cforge bindgen geo.hpp --fuentes geo.cpp` y luego `importar "cpp:geo"`: clases, métodos, sobrecargas, `std::string`, `std::vector`, enums y excepciones (clang++) | `sea p = geo_Punto_nuevo_2(3, 4)` |
+| **Rust** | `cforge bindgen rust:crate[@versión]` (crates.io o una ruta) y luego `importar "rust:crate"`: funciones, structs con sus métodos y campos, `Result`, `Option`, `Vec`, `String` y pánicos (cargo) | `cforge bindgen rust:strsim` → `strsim_levenshtein("casa", "cosa")` |
+| **Zig** | Igual que C, si la librería expone una interfaz C (`export fn`) | — |
 | **JavaScript / npm** | `extern "npm:paquete" funcion f(...)` con `--target wasm` | `extern "npm:lodash" funcion kebabCase(t: texto): texto` |
 | **TypeScript** | `cforge bindgen paquete/index.d.ts --lib paquete` | `cforge bindgen node_modules/camelcase/index.d.ts --lib camelcase` |
 | **Java** | `importar "java"`: la JVM corre dentro del programa (JNI) | `java_estatico("java.lang.Math", "max", "(II)I", [3, 9])` |
 | **C# / .NET** | `importar "dotnet"`: métodos `[UnmanagedCallersOnly]` (hostfxr) | `dotnet_llamar(dotnet_funcion("Calc.dll", "Calc, Calc", "Sumar"), [40, 2])` |
 | **HTML / CSS** | `importar "navegador"`: DOM, eventos, `nav_css`, `--html` | `nav_al_soltar(".tarjeta", ".columna", f)` |
 
-Límites actuales: `float` de 32 bits, structs por valor y métodos de Java o
-C# que devuelven `double`; C++ sin interfaz C (clases, plantillas) no se
-puede llamar directamente. Todo está probado en el CI (`tests/herramientas`,
+Para C++ y Rust, `cforge bindgen` lee la API pública (el AST de clang o el
+JSON de rustdoc), genera una capa con interfaz C, la compila y deja el
+módulo en `~/.cforge/interop` (o `$CFORGE_INTEROP`). Los objetos se usan
+como valores opacos (`Clase_nuevo`, `Clase_metodo`, `Clase_liberar`); las
+excepciones, los `Err` y los pánicos llegan como errores de C-Forge. Lo que
+no se puede traducir (plantillas, genéricos, callbacks, mapas) se omite con
+un comentario en el módulo. Límites actuales: structs de C por valor y
+métodos de Java o C# que devuelven `double`. Todo está probado en el CI (`tests/herramientas`,
 `tests/npm`, `tests/interop`).
 
 ## Ecosistema de bibliotecas
