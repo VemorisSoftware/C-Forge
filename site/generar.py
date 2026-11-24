@@ -12,6 +12,7 @@ Uso:
   python3 site/generar.py           # regenera index.html y aprende.html
   python3 site/generar.py --check   # falla si las páginas no están al día
 """
+import hashlib
 import html
 import json
 import re
@@ -169,7 +170,13 @@ def renderizar(plantilla: str, idioma: str) -> str:
             raise KeyError(f"marcador desconocido: {{{{{clave}}}}}")
         return reemplazos[clave]
 
-    return re.sub(r"\{\{([a-z:_/-]+)\}\}", sustituir, plantilla)
+    pagina = re.sub(r"\{\{([a-z:_/-]+)\}\}", sustituir, plantilla)
+    # Versión de cada recurso según su contenido: así el navegador no usa un
+    # estilo viejo con una página nueva.
+    for recurso in ("estilo.css", "app.js", "tema.js"):
+        huella = hashlib.sha256((SITIO / "assets" / recurso).read_bytes()).hexdigest()[:10]
+        pagina = pagina.replace(f'"/assets/{recurso}"', f'"/assets/{recurso}?v={huella}"')
+    return pagina
 
 
 def main() -> int:
