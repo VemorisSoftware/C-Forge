@@ -1,0 +1,1714 @@
+// stdlib/sintaxis.cfv — Árboles de sintaxis concretos al estilo de
+// tree-sitter, escrito desde cero (idea de tree-sitter, MIT). Analiza
+// Python 3 y JSON y produce los mismos nodos, campos y posiciones que las
+// gramáticas tree-sitter-python y tree-sitter-json (solo nodos con nombre),
+// con consultas en el lenguaje de patrones de tree-sitter.
+//
+// En inglés: importar "treesitter".
+//
+//   importar "sintaxis"
+//   sea a = sintaxis_analizar("def f(x):\n    return x + 1\n", "python")
+//   mostrar(sintaxis_sexp(a))
+//   // (module (function_definition name: (identifier) parameters: (parameters (identifier)) …
+//   para c en sintaxis_consulta(a, "(function_definition name: (identifier) @nombre)") {
+//       mostrar(c["nombre"] + " = " + c["texto"])        // nombre = f
+//   }
+//
+// Cada nodo: {"tipo", "campo", "inicio", "fin" (bytes), "punto_inicio",
+// "punto_fin" ([fila, columna]), "hijos"}.
+
+funcion _sx_nodo(tipo_n, ini, fin, hijos) { retornar {"tipo": tipo_n, "campo": nulo, "inicio": ini, "fin": fin, "hijos": hijos} }
+
+funcion _sx_con(n, campo) {
+    n["campo"] = campo
+    retornar n
+}
+
+funcion _sx_error(p, msj) {
+    sea t = p["toks"][p["i"]]
+    lanzar "sintaxis: " + msj + " en el byte " + t["ini"]
+}
+
+// ---------- léxico de Python ----------
+
+sea _SX_OPS3 = ["**=", "//=", ">>=", "<<=", "...", "!="]
+sea _SX_OPS2 = ["**", "//", ">>", "<<", "<=", ">=", "==", "!=", "->", "+=", "-=", "*=", "/=", "%=", "&=", "|=", "^=", "@=", ":="]
+
+funcion _sx_es_letra(c) { retornar c != "" y (texto_indice("abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ_", c) >= 0 o byte_en(c, 0) >= 128) }
+funcion _sx_es_digito(c) { retornar c != "" y texto_indice("0123456789", c) >= 0 }
+
+funcion _sx_lexico_py(src) {
+    sea toks = []
+    sea comentarios = []
+    sea pila = [0]
+    sea nivel = 0
+    sea i = 0
+    sea n = longitud(src)
+    sea inicio_linea = verdadero
+    mientras (i <= n) {
+        si (inicio_linea y nivel == 0) {
+            // Indentación de la línea lógica.
+            sea j = i
+            sea col = 0
+            mientras (j < n y (subtexto(src, j, j + 1) == " " o subtexto(src, j, j + 1) == "\t")) {
+                col = col + si(subtexto(src, j, j + 1) == "\t", 8 - col % 8, 1)
+                j = j + 1
+            }
+            sea c = subtexto(src, j, j + 1)
+            si (c == "\n" o c == "\r" o c == "#" o j >= n) {
+                // Línea vacía o solo comentario.
+                si (c == "#") {
+                    sea k = j
+                    mientras (k < n y subtexto(src, k, k + 1) != "\n") { k = k + 1 }
+                    sea fin_c = k
+                    si (fin_c > j y subtexto(src, fin_c - 1, fin_c) == "\r") { fin_c = fin_c - 1 }
+                    comentarios.agregar({"ini": j, "fin": fin_c, "col": col})
+                    j = k
+                }
+                si (j >= n) {
+                    i = n + 1
+                    romper
+                }
+                i = j + 1
+                continuar
+            }
+            si (col > pila[longitud(pila) - 1]) {
+                pila.agregar(col)
+                toks.agregar({"t": "INDENT", "v": "", "ini": j, "fin": j, "col": col})
+            } sino {
+                mientras (col < pila[longitud(pila) - 1]) {
+                    quitar_ultimo(pila)
+                    toks.agregar({"t": "DEDENT", "v": "", "ini": j, "fin": j, "col": col})
+                }
+                si (col != pila[longitud(pila) - 1]) { lanzar "sintaxis: indentación inconsistente en el byte " + j }
+            }
+            i = j
+            inicio_linea = falso
+        }
+        si (i >= n) { romper }
+        sea c = subtexto(src, i, i + 1)
+        si (c == " " o c == "\t" o c == "\r" o c == char_de(12)) { i = i + 1 }
+        sino si (c == "\\" y (subtexto(src, i + 1, i + 2) == "\n" o subtexto(src, i + 1, i + 3) == "\r\n")) { i = i + si(subtexto(src, i + 1, i + 2) == "\n", 2, 3) }
+        sino si (c == "\n") {
+            si (nivel == 0 y longitud(toks) > 0 y toks[longitud(toks) - 1]["t"] != "NEWLINE" y toks[longitud(toks) - 1]["t"] != "INDENT" y toks[longitud(toks) - 1]["t"] != "DEDENT") {
+                sea u = toks[longitud(toks) - 1]
+                toks.agregar({"t": "NEWLINE", "v": "", "ini": u["fin"], "fin": u["fin"]})
+            }
+            i = i + 1
+            inicio_linea = verdadero
+        } sino si (c == "#") {
+            sea k = i
+            mientras (k < n y subtexto(src, k, k + 1) != "\n") { k = k + 1 }
+            sea fin_c = k
+            si (fin_c > i y subtexto(src, fin_c - 1, fin_c) == "\r") { fin_c = fin_c - 1 }
+            comentarios.agregar({"ini": i, "fin": fin_c, "col": -1})
+            i = k
+        } sino si (_sx_es_letra(c)) {
+            sea j = i
+            mientras (j < n y (_sx_es_letra(subtexto(src, j, j + 1)) o _sx_es_digito(subtexto(src, j, j + 1)))) { j = j + 1 }
+            sea w = subtexto(src, i, j)
+            sea q = subtexto(src, j, j + 1)
+            sea prefijo = texto_minusculas(w)
+            si ((q == "\"" o q == "'") y longitud(w) <= 2 y lista_contiene(["r", "u", "b", "f", "br", "rb", "fr", "rf"], prefijo)) {
+                sea f = _sx_fin_cadena(src, j)
+                toks.agregar({"t": "STRING", "v": subtexto(src, i, f), "ini": i, "fin": f, "pref": prefijo, "comillas": j})
+                i = f
+            } sino {
+                toks.agregar({"t": "NAME", "v": w, "ini": i, "fin": j})
+                i = j
+            }
+        } sino si (_sx_es_digito(c) o (c == "." y _sx_es_digito(subtexto(src, i + 1, i + 2)))) {
+            sea j = i
+            sea flotante = falso
+            si (c == "0" y texto_indice("xXoObB", subtexto(src, i + 1, i + 2)) >= 0) {
+                j = i + 2
+                mientras (j < n y texto_indice("0123456789abcdefABCDEF_", subtexto(src, j, j + 1)) >= 0) { j = j + 1 }
+            } sino {
+                mientras (j < n y texto_indice("0123456789_", subtexto(src, j, j + 1)) >= 0) { j = j + 1 }
+                si (subtexto(src, j, j + 1) == ".") {
+                    flotante = verdadero
+                    j = j + 1
+                    mientras (j < n y texto_indice("0123456789_", subtexto(src, j, j + 1)) >= 0) { j = j + 1 }
+                }
+                si (texto_indice("eE", subtexto(src, j, j + 1)) >= 0 y (_sx_es_digito(subtexto(src, j + 1, j + 2)) o (texto_indice("+-", subtexto(src, j + 1, j + 2)) >= 0 y _sx_es_digito(subtexto(src, j + 2, j + 3))))) {
+                    flotante = verdadero
+                    j = j + 2
+                    mientras (j < n y _sx_es_digito(subtexto(src, j, j + 1))) { j = j + 1 }
+                }
+            }
+            si (texto_indice("jJlL", subtexto(src, j, j + 1)) >= 0 y subtexto(src, j, j + 1) != "") { j = j + 1 }
+            toks.agregar({"t": "NUMBER", "v": subtexto(src, i, j), "ini": i, "fin": j, "flotante": flotante})
+            i = j
+        } sino si (c == "\"" o c == "'") {
+            sea f = _sx_fin_cadena(src, i)
+            toks.agregar({"t": "STRING", "v": subtexto(src, i, f), "ini": i, "fin": f, "pref": "", "comillas": i})
+            i = f
+        } sino {
+            sea op = c
+            si (lista_contiene(_SX_OPS3, subtexto(src, i, i + 3))) { op = subtexto(src, i, i + 3) }
+            sino si (lista_contiene(_SX_OPS2, subtexto(src, i, i + 2))) { op = subtexto(src, i, i + 2) }
+            si (op == "(" o op == "[" o op == "{") { nivel = nivel + 1 }
+            si (op == ")" o op == "]" o op == "}") { nivel = maximo(0, nivel - 1) }
+            toks.agregar({"t": "OP", "v": op, "ini": i, "fin": i + longitud(op)})
+            i = i + longitud(op)
+        }
+    }
+    si (longitud(toks) > 0 y toks[longitud(toks) - 1]["t"] != "NEWLINE" y toks[longitud(toks) - 1]["t"] != "DEDENT") {
+        sea u = toks[longitud(toks) - 1]
+        toks.agregar({"t": "NEWLINE", "v": "", "ini": u["fin"], "fin": u["fin"]})
+    }
+    mientras (longitud(pila) > 1) {
+        quitar_ultimo(pila)
+        toks.agregar({"t": "DEDENT", "v": "", "ini": n, "fin": n, "col": 0})
+    }
+    toks.agregar({"t": "END", "v": "", "ini": n, "fin": n})
+    retornar {"toks": toks, "comentarios": comentarios}
+}
+
+funcion _sx_fin_cadena(src, i) {
+    sea q = subtexto(src, i, i + 1)
+    sea triple = subtexto(src, i, i + 3) == q + q + q
+    sea delim = si(triple, q + q + q, q)
+    sea j = i + longitud(delim)
+    sea n = longitud(src)
+    mientras (j < n) {
+        sea c = subtexto(src, j, j + 1)
+        si (c == "\\") { j = j + 2 }
+        sino si (subtexto(src, j, j + longitud(delim)) == delim) { retornar j + longitud(delim) }
+        sino si (c == "\n" y triple == falso) { lanzar "sintaxis: cadena sin cerrar en el byte " + i }
+        sino { j = j + 1 }
+    }
+    lanzar "sintaxis: cadena sin cerrar en el byte " + i
+}
+
+// ---------- análisis de Python ----------
+
+funcion _sx_ver(p) { retornar p["toks"][p["i"]] }
+funcion _sx_ver_en(p, k) { retornar p["toks"][minimo(p["i"] + k, longitud(p["toks"]) - 1)] }
+funcion _sx_tomar(p) {
+    sea t = p["toks"][p["i"]]
+    si (t["t"] != "END") { p["i"] = p["i"] + 1 }
+    p["ultimo"] = t
+    retornar t
+}
+funcion _sx_op(p, v) {
+    sea t = _sx_ver(p)
+    retornar t["t"] == "OP" y t["v"] == v
+}
+funcion _sx_kw(p, v) {
+    sea t = _sx_ver(p)
+    retornar t["t"] == "NAME" y t["v"] == v
+}
+funcion _sx_acepta(p, v) {
+    si (_sx_op(p, v) o _sx_kw(p, v)) {
+        _sx_tomar(p)
+        retornar verdadero
+    }
+    retornar falso
+}
+funcion _sx_espera(p, v) {
+    si (_sx_acepta(p, v) == falso) { _sx_error(p, "se esperaba '" + v + "'") }
+    retornar p["ultimo"]
+}
+funcion _sx_tipo(p, t) { retornar _sx_ver(p)["t"] == t }
+
+sea _SX_RESERVADAS = ["False", "None", "True", "and", "as", "assert", "async", "await", "break", "class", "continue", "def", "del", "elif", "else", "except",
+    "finally", "for", "from", "global", "if", "import", "in", "is", "lambda", "nonlocal", "not", "or", "pass", "raise", "return", "try", "while", "with", "yield"]
+
+funcion _sx_identificador(p) {
+    sea t = _sx_ver(p)
+    si (t["t"] != "NAME" o (lista_contiene(_SX_RESERVADAS, t["v"]) y t["v"] != "async" y t["v"] != "await")) { _sx_error(p, "se esperaba un nombre") }
+    _sx_tomar(p)
+    retornar _sx_nodo("identifier", t["ini"], t["fin"], [])
+}
+
+funcion _sx_modulo(p, n) {
+    sea hijos = []
+    mientras (_sx_tipo(p, "END") == falso) {
+        si (_sx_tipo(p, "NEWLINE")) { _sx_tomar(p) } sino {
+            para s en _sx_sentencia(p) { hijos.agregar(s) }
+        }
+    }
+    retornar _sx_nodo("module", 0, n, hijos)
+}
+
+// Devuelve una lista (una línea puede tener varias sentencias simples).
+funcion _sx_sentencia(p) {
+    sea t = _sx_ver(p)
+    si (t["t"] == "NAME") {
+        sea w = t["v"]
+        si (w == "def" o w == "class" o w == "if" o w == "while" o w == "for" o w == "try" o w == "with" o (w == "async" y lista_contiene(["def", "for", "with"], _sx_ver_en(p, 1)["v"]))) { retornar [_sx_compuesta(p)] }
+    }
+    si (t["t"] == "OP" y t["v"] == "@") { retornar [_sx_decorada(p)] }
+    sea r = []
+    mientras (verdadero) {
+        r.agregar(_sx_simple(p))
+        si (_sx_acepta(p, ";") == falso) { romper }
+        si (_sx_tipo(p, "NEWLINE")) { romper }
+    }
+    si (_sx_tipo(p, "NEWLINE")) { _sx_tomar(p) } sino si (_sx_tipo(p, "END") == falso y _sx_tipo(p, "DEDENT") == falso) { _sx_error(p, "se esperaba fin de línea") }
+    retornar r
+}
+
+funcion _sx_decorada(p) {
+    sea ini = _sx_ver(p)["ini"]
+    sea hijos = []
+    mientras (_sx_op(p, "@")) {
+        sea a = _sx_tomar(p)["ini"]
+        sea e = _sx_expresion(p)
+        hijos.agregar(_sx_nodo("decorator", a, e["fin"], [e]))
+        _sx_espera_newline(p)
+    }
+    sea d = _sx_compuesta(p)
+    hijos.agregar(_sx_con(d, "definition"))
+    retornar _sx_nodo("decorated_definition", ini, d["fin"], hijos)
+}
+
+funcion _sx_espera_newline(p) {
+    si (_sx_tipo(p, "NEWLINE") == falso) { _sx_error(p, "se esperaba fin de línea") }
+    _sx_tomar(p)
+}
+
+// Bloque tras ':' (con sangría o en la misma línea).
+funcion _sx_bloque(p) {
+    si (_sx_tipo(p, "NEWLINE")) {
+        _sx_tomar(p)
+        si (_sx_tipo(p, "INDENT") == falso) { _sx_error(p, "se esperaba un bloque con sangría") }
+        sea col = _sx_tomar(p)["col"]
+        sea hijos = []
+        mientras (_sx_tipo(p, "DEDENT") == falso y _sx_tipo(p, "END") == falso) {
+            si (_sx_tipo(p, "NEWLINE")) { _sx_tomar(p) } sino {
+                para s en _sx_sentencia(p) { hijos.agregar(s) }
+            }
+        }
+        sea fin_tok = _sx_ver(p)["ini"]
+        si (_sx_tipo(p, "DEDENT")) { _sx_tomar(p) }
+        sea b = _sx_nodo("block", hijos[0]["inicio"], hijos[longitud(hijos) - 1]["fin"], hijos)
+        b["_col"] = col
+        b["_limite"] = fin_tok
+        p["bloques"].agregar(b)
+        retornar b
+    }
+    sea hijos = []
+    mientras (verdadero) {
+        hijos.agregar(_sx_simple(p))
+        si (_sx_acepta(p, ";") == falso o _sx_tipo(p, "NEWLINE")) { romper }
+    }
+    si (_sx_tipo(p, "NEWLINE")) { _sx_tomar(p) }
+    retornar _sx_nodo("block", hijos[0]["inicio"], hijos[longitud(hijos) - 1]["fin"], hijos)
+}
+
+funcion _sx_compuesta(p) {
+    sea t = _sx_ver(p)
+    sea ini = t["ini"]
+    si (t["v"] == "async") {
+        _sx_tomar(p)
+        sea c = _sx_compuesta(p)
+        c["inicio"] = ini
+        retornar c
+    }
+    _sx_tomar(p)
+    sea w = t["v"]
+    si (w == "def") {
+        sea nombre = _sx_con(_sx_identificador(p), "name")
+        sea params = _sx_con(_sx_parametros(p, ")", "parameters"), "parameters")
+        sea hijos = [nombre, params]
+        si (_sx_acepta(p, "->")) {
+            sea e = _sx_expresion(p)
+            hijos.agregar(_sx_con(_sx_nodo("type", e["inicio"], e["fin"], [e]), "return_type"))
+        }
+        _sx_espera(p, ":")
+        sea b = _sx_con(_sx_bloque(p), "body")
+        hijos.agregar(b)
+        retornar _sx_nodo("function_definition", ini, b["fin"], hijos)
+    }
+    si (w == "class") {
+        sea hijos = [_sx_con(_sx_identificador(p), "name")]
+        si (_sx_op(p, "(")) { hijos.agregar(_sx_con(_sx_argumentos(p), "superclasses")) }
+        _sx_espera(p, ":")
+        sea b = _sx_con(_sx_bloque(p), "body")
+        hijos.agregar(b)
+        retornar _sx_nodo("class_definition", ini, b["fin"], hijos)
+    }
+    si (w == "if") {
+        sea hijos = [_sx_con(_sx_named(p), "condition")]
+        _sx_espera(p, ":")
+        sea b = _sx_con(_sx_bloque(p), "consequence")
+        hijos.agregar(b)
+        sea fin = b["fin"]
+        mientras (_sx_kw(p, "elif")) {
+            sea a = _sx_tomar(p)["ini"]
+            sea c = _sx_con(_sx_named(p), "condition")
+            _sx_espera(p, ":")
+            sea b2 = _sx_con(_sx_bloque(p), "consequence")
+            hijos.agregar(_sx_con(_sx_nodo("elif_clause", a, b2["fin"], [c, b2]), "alternative"))
+            fin = b2["fin"]
+        }
+        si (_sx_kw(p, "else")) {
+            sea e = _sx_else(p)
+            hijos.agregar(_sx_con(e, "alternative"))
+            fin = e["fin"]
+        }
+        retornar _sx_nodo("if_statement", ini, fin, hijos)
+    }
+    si (w == "while") {
+        sea hijos = [_sx_con(_sx_named(p), "condition")]
+        _sx_espera(p, ":")
+        sea b = _sx_con(_sx_bloque(p), "body")
+        hijos.agregar(b)
+        sea fin = b["fin"]
+        si (_sx_kw(p, "else")) {
+            sea e = _sx_else(p)
+            hijos.agregar(_sx_con(e, "alternative"))
+            fin = e["fin"]
+        }
+        retornar _sx_nodo("while_statement", ini, fin, hijos)
+    }
+    si (w == "for") {
+        sea izq = _sx_con(_sx_objetivos(p), "left")
+        _sx_espera(p, "in")
+        sea der = _sx_con(_sx_lista_expr(p, "expression_list"), "right")
+        _sx_espera(p, ":")
+        sea b = _sx_con(_sx_bloque(p), "body")
+        sea hijos = [izq, der, b]
+        sea fin = b["fin"]
+        si (_sx_kw(p, "else")) {
+            sea e = _sx_else(p)
+            hijos.agregar(_sx_con(e, "alternative"))
+            fin = e["fin"]
+        }
+        retornar _sx_nodo("for_statement", ini, fin, hijos)
+    }
+    si (w == "try") {
+        _sx_espera(p, ":")
+        sea b = _sx_con(_sx_bloque(p), "body")
+        sea hijos = [b]
+        sea fin = b["fin"]
+        mientras (_sx_kw(p, "except")) {
+            sea a = _sx_tomar(p)["ini"]
+            sea hs = []
+            si (_sx_op(p, ":") == falso) {
+                sea e = _sx_expresion(p)
+                si (_sx_kw(p, "as")) {
+                    _sx_tomar(p)
+                    sea al = _sx_identificador(p)
+                    e = _sx_nodo("as_pattern", e["inicio"], al["fin"], [e, _sx_con(_sx_nodo("as_pattern_target", al["inicio"], al["fin"], [al]), "alias")])
+                }
+                hs.agregar(_sx_con(e, "value"))
+            }
+            _sx_espera(p, ":")
+            sea bl = _sx_bloque(p)
+            hs.agregar(bl)
+            hijos.agregar(_sx_nodo("except_clause", a, bl["fin"], hs))
+            fin = bl["fin"]
+        }
+        si (_sx_kw(p, "else")) {
+            sea e = _sx_else(p)
+            hijos.agregar(e)
+            fin = e["fin"]
+        }
+        si (_sx_kw(p, "finally")) {
+            sea a = _sx_tomar(p)["ini"]
+            _sx_espera(p, ":")
+            sea bl = _sx_bloque(p)
+            hijos.agregar(_sx_nodo("finally_clause", a, bl["fin"], [bl]))
+            fin = bl["fin"]
+        }
+        retornar _sx_nodo("try_statement", ini, fin, hijos)
+    }
+    si (w == "with") {
+        sea items = []
+        sea a = _sx_ver(p)["ini"]
+        mientras (verdadero) {
+            sea e = _sx_expresion(p)
+            si (_sx_kw(p, "as")) {
+                _sx_tomar(p)
+                sea al = _sx_or(p)
+                e = _sx_nodo("as_pattern", e["inicio"], al["fin"], [e, _sx_con(_sx_nodo("as_pattern_target", al["inicio"], al["fin"], [al]), "alias")])
+            }
+            items.agregar(_sx_nodo("with_item", e["inicio"], e["fin"], [_sx_con(e, "value")]))
+            si (_sx_acepta(p, ",") == falso) { romper }
+        }
+        sea clausula = _sx_nodo("with_clause", a, items[longitud(items) - 1]["fin"], items)
+        _sx_espera(p, ":")
+        sea b = _sx_con(_sx_bloque(p), "body")
+        retornar _sx_nodo("with_statement", ini, b["fin"], [clausula, b])
+    }
+    _sx_error(p, "sentencia inesperada")
+    retornar nulo
+}
+
+funcion _sx_else(p) {
+    sea a = _sx_tomar(p)["ini"]
+    _sx_espera(p, ":")
+    sea b = _sx_con(_sx_bloque(p), "body")
+    retornar _sx_nodo("else_clause", a, b["fin"], [b])
+}
+
+funcion _sx_parametros(p, cierre, tipo_n) {
+    sea ini = _sx_ver(p)["ini"]
+    si (cierre == ")") { _sx_espera(p, "(") }
+    sea hijos = []
+    mientras (_sx_op(p, cierre) == falso) {
+        sea t = _sx_ver(p)
+        si (_sx_op(p, "*") y (_sx_ver_en(p, 1)["v"] == "," o _sx_ver_en(p, 1)["v"] == cierre)) {
+            _sx_tomar(p)
+            hijos.agregar(_sx_nodo("keyword_separator", t["ini"], t["fin"], []))
+        } sino si (_sx_op(p, "/")) {
+            _sx_tomar(p)
+            hijos.agregar(_sx_nodo("positional_separator", t["ini"], t["fin"], []))
+        } sino si (_sx_op(p, "*") o _sx_op(p, "**")) {
+            _sx_tomar(p)
+            sea id = _sx_identificador(p)
+            sea nodo = _sx_nodo(si(t["v"] == "*", "list_splat_pattern", "dictionary_splat_pattern"), t["ini"], id["fin"], [id])
+            si (cierre == ")" y _sx_op(p, ":")) {
+                _sx_tomar(p)
+                sea e = _sx_expresion(p)
+                nodo = _sx_nodo("typed_parameter", t["ini"], e["fin"], [nodo, _sx_con(_sx_nodo("type", e["inicio"], e["fin"], [e]), "type")])
+            }
+            hijos.agregar(nodo)
+        } sino {
+            sea id = _sx_identificador(p)
+            sea tipo_p = nulo
+            si (cierre == ")" y _sx_acepta(p, ":")) {
+                sea e = _sx_expresion(p)
+                tipo_p = _sx_con(_sx_nodo("type", e["inicio"], e["fin"], [e]), "type")
+            }
+            si (_sx_acepta(p, "=")) {
+                sea v = _sx_con(_sx_expresion(p), "value")
+                si (tipo_p != nulo) { hijos.agregar(_sx_nodo("typed_default_parameter", id["inicio"], v["fin"], [_sx_con(id, "name"), tipo_p, v])) }
+                sino { hijos.agregar(_sx_nodo("default_parameter", id["inicio"], v["fin"], [_sx_con(id, "name"), v])) }
+            } sino si (tipo_p != nulo) { hijos.agregar(_sx_nodo("typed_parameter", id["inicio"], tipo_p["fin"], [id, tipo_p])) }
+            sino { hijos.agregar(id) }
+        }
+        si (_sx_acepta(p, ",") == falso) { romper }
+    }
+    sea fin = _sx_ver(p)["fin"]
+    si (cierre == ")") { _sx_espera(p, ")") } sino { fin = si(longitud(hijos) > 0, hijos[longitud(hijos) - 1]["fin"], ini) }
+    retornar _sx_nodo(tipo_n, ini, fin, hijos)
+}
+
+sea _SX_AUMENTADAS = ["+=", "-=", "*=", "/=", "//=", "%=", "**=", ">>=", "<<=", "&=", "^=", "|=", "@="]
+
+funcion _sx_simple(p) {
+    sea t = _sx_ver(p)
+    sea ini = t["ini"]
+    si (t["t"] == "NAME") {
+        sea w = t["v"]
+        si (w == "pass" o w == "break" o w == "continue") {
+            _sx_tomar(p)
+            retornar _sx_nodo(w + "_statement", ini, t["fin"], [])
+        }
+        si (w == "return") {
+            _sx_tomar(p)
+            si (_sx_fin_simple(p)) { retornar _sx_nodo("return_statement", ini, t["fin"], []) }
+            sea e = _sx_lista_expr(p, "expression_list")
+            retornar _sx_nodo("return_statement", ini, e["fin"], [e])
+        }
+        si (w == "del") {
+            _sx_tomar(p)
+            sea e = _sx_lista_expr(p, "expression_list")
+            retornar _sx_nodo("delete_statement", ini, e["fin"], [e])
+        }
+        si (w == "raise") {
+            _sx_tomar(p)
+            si (_sx_fin_simple(p)) { retornar _sx_nodo("raise_statement", ini, t["fin"], []) }
+            sea e = _sx_expresion(p)
+            sea hijos = [e]
+            sea fin = e["fin"]
+            si (_sx_acepta(p, "from")) {
+                sea c = _sx_con(_sx_expresion(p), "cause")
+                hijos.agregar(c)
+                fin = c["fin"]
+            }
+            retornar _sx_nodo("raise_statement", ini, fin, hijos)
+        }
+        si (w == "global" o w == "nonlocal") {
+            _sx_tomar(p)
+            sea hijos = []
+            mientras (verdadero) {
+                hijos.agregar(_sx_identificador(p))
+                si (_sx_acepta(p, ",") == falso) { romper }
+            }
+            retornar _sx_nodo(w + "_statement", ini, hijos[longitud(hijos) - 1]["fin"], hijos)
+        }
+        si (w == "assert") {
+            _sx_tomar(p)
+            sea hijos = [_sx_expresion(p)]
+            si (_sx_acepta(p, ",")) { hijos.agregar(_sx_expresion(p)) }
+            retornar _sx_nodo("assert_statement", ini, hijos[longitud(hijos) - 1]["fin"], hijos)
+        }
+        si (w == "import") {
+            _sx_tomar(p)
+            sea hijos = []
+            mientras (verdadero) {
+                hijos.agregar(_sx_con(_sx_importado(p), "name"))
+                si (_sx_acepta(p, ",") == falso) { romper }
+            }
+            retornar _sx_nodo("import_statement", ini, hijos[longitud(hijos) - 1]["fin"], hijos)
+        }
+        si (w == "from") {
+            _sx_tomar(p)
+            sea modulo = nulo
+            si (_sx_op(p, ".") o _sx_op(p, "...")) {
+                sea a = _sx_ver(p)["ini"]
+                sea b = a
+                mientras (_sx_op(p, ".") o _sx_op(p, "...")) { b = _sx_tomar(p)["fin"] }
+                sea pref = _sx_nodo("import_prefix", a, b, [])
+                sea hs = [pref]
+                sea fin_r = b
+                si (_sx_kw(p, "import") == falso) {
+                    sea d = _sx_nombre_punteado(p)
+                    hs.agregar(d)
+                    fin_r = d["fin"]
+                }
+                modulo = _sx_nodo("relative_import", a, fin_r, hs)
+            } sino { modulo = _sx_nombre_punteado(p) }
+            _sx_espera(p, "import")
+            sea hijos = [_sx_con(modulo, "module_name")]
+            si (_sx_op(p, "*")) {
+                sea s = _sx_tomar(p)
+                hijos.agregar(_sx_nodo("wildcard_import", s["ini"], s["fin"], []))
+                retornar _sx_nodo("import_from_statement", ini, s["fin"], hijos)
+            }
+            sea paren = _sx_acepta(p, "(")
+            mientras (verdadero) {
+                si (paren y _sx_op(p, ")")) { romper }
+                hijos.agregar(_sx_con(_sx_importado(p), "name"))
+                si (_sx_acepta(p, ",") == falso) { romper }
+            }
+            sea fin = hijos[longitud(hijos) - 1]["fin"]
+            si (paren) { fin = _sx_espera(p, ")")["fin"] }
+            retornar _sx_nodo("import_from_statement", ini, fin, hijos)
+        }
+    }
+    si (_sx_kw(p, "yield")) { retornar _sx_expr_stmt(_sx_yield(p)) }
+    // Expresión, asignación o asignación aumentada.
+    sea izq = _sx_lista_expr(p, "expression_list")
+    si (_sx_op(p, "=")) {
+        retornar _sx_expr_stmt(_sx_asignacion(p, izq))
+    }
+    si (_sx_op(p, ":") y izq["tipo"] != "expression_list") {
+        _sx_tomar(p)
+        sea e = _sx_expresion(p)
+        sea hijos = [_sx_con(_sx_patron(izq), "left"), _sx_con(_sx_nodo("type", e["inicio"], e["fin"], [e]), "type")]
+        sea fin = e["fin"]
+        si (_sx_acepta(p, "=")) {
+            sea d = _sx_con(_sx_lado_derecho(p), "right")
+            hijos.agregar(d)
+            fin = d["fin"]
+        }
+        retornar _sx_expr_stmt(_sx_nodo("assignment", izq["inicio"], fin, hijos))
+    }
+    sea t2 = _sx_ver(p)
+    si (t2["t"] == "OP" y lista_contiene(_SX_AUMENTADAS, t2["v"])) {
+        _sx_tomar(p)
+        sea d = _sx_con(_sx_lado_derecho(p), "right")
+        retornar _sx_expr_stmt(_sx_nodo("augmented_assignment", izq["inicio"], d["fin"], [_sx_con(izq, "left"), d]))
+    }
+    retornar _sx_expr_stmt(izq)
+}
+
+funcion _sx_expr_stmt(e) { retornar _sx_nodo("expression_statement", e["inicio"], e["fin"], [e]) }
+
+funcion _sx_fin_simple(p) { retornar _sx_tipo(p, "NEWLINE") o _sx_tipo(p, "END") o _sx_op(p, ";") o _sx_tipo(p, "DEDENT") }
+
+funcion _sx_lado_derecho(p) {
+    si (_sx_kw(p, "yield")) { retornar _sx_yield(p) }
+    retornar _sx_lista_expr(p, "expression_list")
+}
+
+funcion _sx_asignacion(p, izq) {
+    _sx_espera(p, "=")
+    sea der = _sx_lado_derecho(p)
+    si (_sx_op(p, "=")) { der = _sx_asignacion(p, der) }
+    retornar _sx_nodo("assignment", izq["inicio"], der["fin"], [_sx_con(_sx_patron(izq), "left"), _sx_con(der, "right")])
+}
+
+// Convierte una expresión en patrón (lado izquierdo).
+funcion _sx_patron(e) {
+    sea t = e["tipo"]
+    si (t == "expression_list" o t == "pattern_list") {
+        sea hs = []
+        para h en e["hijos"] { hs.agregar(_sx_patron(h)) }
+        retornar _sx_nodo("pattern_list", e["inicio"], e["fin"], hs)
+    }
+    si (t == "tuple" o t == "list") {
+        sea hs = []
+        para h en e["hijos"] { hs.agregar(_sx_patron(h)) }
+        retornar _sx_nodo(si(t == "tuple", "tuple_pattern", "list_pattern"), e["inicio"], e["fin"], hs)
+    }
+    si (t == "list_splat") { retornar _sx_nodo("list_splat_pattern", e["inicio"], e["fin"], [_sx_patron(e["hijos"][0])]) }
+    retornar e
+}
+
+funcion _sx_yield(p) {
+    sea t = _sx_tomar(p)
+    si (_sx_acepta(p, "from")) {
+        sea e = _sx_expresion(p)
+        retornar _sx_nodo("yield", t["ini"], e["fin"], [e])
+    }
+    si (_sx_fin_simple(p) o _sx_op(p, ")")) { retornar _sx_nodo("yield", t["ini"], t["fin"], []) }
+    sea e = _sx_lista_expr(p, "expression_list")
+    retornar _sx_nodo("yield", t["ini"], e["fin"], [e])
+}
+
+funcion _sx_nombre_punteado(p) {
+    sea hs = [_sx_identificador(p)]
+    mientras (_sx_op(p, ".")) {
+        _sx_tomar(p)
+        hs.agregar(_sx_identificador(p))
+    }
+    retornar _sx_nodo("dotted_name", hs[0]["inicio"], hs[longitud(hs) - 1]["fin"], hs)
+}
+
+funcion _sx_importado(p) {
+    sea d = _sx_nombre_punteado(p)
+    si (_sx_kw(p, "as")) {
+        _sx_tomar(p)
+        sea al = _sx_identificador(p)
+        retornar _sx_nodo("aliased_import", d["inicio"], al["fin"], [_sx_con(d, "name"), _sx_con(al, "alias")])
+    }
+    retornar d
+}
+
+// Objetivos de for: lista de patrones sin "in".
+funcion _sx_objetivos(p) {
+    sea antes = p["sin_in"]
+    p["sin_in"] = verdadero
+    sea e = _sx_lista_expr(p, "expression_list")
+    p["sin_in"] = antes
+    retornar _sx_patron(e)
+}
+
+funcion _sx_objetivo_simple(p) {
+    sea antes = p["sin_in"]
+    p["sin_in"] = verdadero
+    sea e = _sx_or(p)
+    p["sin_in"] = antes
+    retornar _sx_patron(e)
+}
+
+// Lista separada por comas: un solo elemento sin coma se devuelve tal cual.
+funcion _sx_lista_expr(p, tipo_n) {
+    sea primero = _sx_estrella_o_expr(p)
+    si (_sx_op(p, ",") == falso) { retornar primero }
+    sea hs = [primero]
+    mientras (_sx_acepta(p, ",")) {
+        si (_sx_fin_lista(p)) { romper }
+        hs.agregar(_sx_estrella_o_expr(p))
+    }
+    retornar _sx_nodo(tipo_n, hs[0]["inicio"], hs[longitud(hs) - 1]["fin"], hs)
+}
+
+funcion _sx_fin_lista(p) {
+    sea t = _sx_ver(p)
+    retornar _sx_fin_simple(p) o (t["t"] == "OP" y lista_contiene(["=", ")", "]", "}", ":"], t["v"])) o lista_contiene(_SX_AUMENTADAS, t["v"]) o _sx_kw(p, "in")
+}
+
+funcion _sx_estrella_o_expr(p) {
+    si (_sx_op(p, "*")) {
+        sea t = _sx_tomar(p)
+        sea e = _sx_or(p)
+        retornar _sx_nodo("list_splat", t["ini"], e["fin"], [e])
+    }
+    si (p["sin_in"]) { retornar _sx_or(p) }
+    retornar _sx_expresion(p)
+}
+
+// named_expression permitida (condiciones, argumentos, paréntesis).
+funcion _sx_named(p) {
+    si (_sx_tipo(p, "NAME") y _sx_ver_en(p, 1)["v"] == ":=") {
+        sea id = _sx_identificador(p)
+        _sx_tomar(p)
+        sea v = _sx_expresion(p)
+        retornar _sx_nodo("named_expression", id["inicio"], v["fin"], [_sx_con(id, "name"), _sx_con(v, "value")])
+    }
+    retornar _sx_expresion(p)
+}
+
+funcion _sx_expresion(p) {
+    si (_sx_kw(p, "lambda")) {
+        sea t = _sx_tomar(p)
+        sea hs = []
+        si (_sx_op(p, ":") == falso) { hs.agregar(_sx_con(_sx_parametros(p, ":", "lambda_parameters"), "parameters")) }
+        _sx_espera(p, ":")
+        sea cuerpo = _sx_con(_sx_expresion(p), "body")
+        hs.agregar(cuerpo)
+        retornar _sx_nodo("lambda", t["ini"], cuerpo["fin"], hs)
+    }
+    sea e = _sx_or(p)
+    si (_sx_kw(p, "if") y p["en_comprension"] == falso) {
+        _sx_tomar(p)
+        sea c = _sx_or(p)
+        _sx_espera(p, "else")
+        sea otro = _sx_expresion(p)
+        retornar _sx_nodo("conditional_expression", e["inicio"], otro["fin"], [e, c, otro])
+    }
+    retornar e
+}
+
+funcion _sx_bin(tipo_n, a, b) { retornar _sx_nodo(tipo_n, a["inicio"], b["fin"], [_sx_con(a, "left"), _sx_con(b, "right")]) }
+
+funcion _sx_or(p) {
+    sea a = _sx_and(p)
+    mientras (_sx_kw(p, "or")) {
+        _sx_tomar(p)
+        a = _sx_bin("boolean_operator", a, _sx_and(p))
+    }
+    retornar a
+}
+
+funcion _sx_and(p) {
+    sea a = _sx_not(p)
+    mientras (_sx_kw(p, "and")) {
+        _sx_tomar(p)
+        a = _sx_bin("boolean_operator", a, _sx_not(p))
+    }
+    retornar a
+}
+
+funcion _sx_not(p) {
+    si (_sx_kw(p, "not")) {
+        sea t = _sx_tomar(p)
+        sea e = _sx_not(p)
+        retornar _sx_nodo("not_operator", t["ini"], e["fin"], [_sx_con(e, "argument")])
+    }
+    retornar _sx_comparacion(p)
+}
+
+funcion _sx_es_comparador(p) {
+    sea t = _sx_ver(p)
+    si (t["t"] == "OP" y lista_contiene(["<", ">", "==", ">=", "<=", "!=", "<>"], t["v"])) { retornar 1 }
+    si (t["t"] == "NAME") {
+        si (t["v"] == "in" y p["sin_in"] == falso) { retornar 1 }
+        si (t["v"] == "is") { retornar si(_sx_ver_en(p, 1)["v"] == "not", 2, 1) }
+        si (t["v"] == "not" y _sx_ver_en(p, 1)["v"] == "in" y p["sin_in"] == falso) { retornar 2 }
+    }
+    retornar 0
+}
+
+funcion _sx_comparacion(p) {
+    sea a = _sx_bor(p)
+    si (_sx_es_comparador(p) == 0) { retornar a }
+    sea hs = [a]
+    mientras (_sx_es_comparador(p) > 0) {
+        sea k = _sx_es_comparador(p)
+        para i en lista_rango(0, k) { _sx_tomar(p) }
+        hs.agregar(_sx_bor(p))
+    }
+    retornar _sx_nodo("comparison_operator", hs[0]["inicio"], hs[longitud(hs) - 1]["fin"], hs)
+}
+
+funcion _sx_nivel_bin(p, ops, siguiente) {
+    sea a = siguiente(p)
+    mientras (_sx_ver(p)["t"] == "OP" y lista_contiene(ops, _sx_ver(p)["v"])) {
+        _sx_tomar(p)
+        a = _sx_bin("binary_operator", a, siguiente(p))
+    }
+    retornar a
+}
+
+funcion _sx_bor(p) { retornar _sx_nivel_bin(p, ["|"], _sx_band) }
+funcion _sx_band(p) { retornar _sx_nivel_bin(p, ["&"], _sx_bxor) }
+funcion _sx_bxor(p) { retornar _sx_nivel_bin(p, ["^"], _sx_shift) }
+funcion _sx_shift(p) { retornar _sx_nivel_bin(p, ["<<", ">>"], _sx_arit) }
+funcion _sx_arit(p) { retornar _sx_nivel_bin(p, ["+", "-"], _sx_term) }
+funcion _sx_term(p) { retornar _sx_nivel_bin(p, ["*", "/", "//", "%", "@"], _sx_factor) }
+
+funcion _sx_factor(p) {
+    si (_sx_op(p, "-") o _sx_op(p, "+") o _sx_op(p, "~")) {
+        sea t = _sx_tomar(p)
+        sea e = _sx_factor(p)
+        retornar _sx_nodo("unary_operator", t["ini"], e["fin"], [_sx_con(e, "argument")])
+    }
+    retornar _sx_potencia(p)
+}
+
+funcion _sx_potencia(p) {
+    sea a = _sx_await(p)
+    si (_sx_op(p, "**")) {
+        _sx_tomar(p)
+        retornar _sx_bin("binary_operator", a, _sx_factor(p))
+    }
+    retornar a
+}
+
+funcion _sx_await(p) {
+    si (_sx_kw(p, "await")) {
+        sea t = _sx_tomar(p)
+        sea e = _sx_primario(p)
+        retornar _sx_nodo("await", t["ini"], e["fin"], [e])
+    }
+    retornar _sx_primario(p)
+}
+
+funcion _sx_primario(p) {
+    sea a = _sx_atomo(p)
+    mientras (verdadero) {
+        si (_sx_op(p, ".")) {
+            _sx_tomar(p)
+            sea id = _sx_identificador(p)
+            a = _sx_nodo("attribute", a["inicio"], id["fin"], [_sx_con(a, "object"), _sx_con(id, "attribute")])
+        } sino si (_sx_op(p, "(")) {
+            sea args = _sx_argumentos(p)
+            a = _sx_nodo("call", a["inicio"], args["fin"], [_sx_con(a, "function"), _sx_con(args, "arguments")])
+        } sino si (_sx_op(p, "[")) {
+            _sx_tomar(p)
+            sea hs = [_sx_con(a, "value")]
+            mientras (_sx_op(p, "]") == falso) {
+                hs.agregar(_sx_con(_sx_subindice(p), "subscript"))
+                si (_sx_acepta(p, ",") == falso) { romper }
+            }
+            sea fin = _sx_espera(p, "]")["fin"]
+            a = _sx_nodo("subscript", a["inicio"], fin, hs)
+        } sino { romper }
+    }
+    retornar a
+}
+
+funcion _sx_subindice(p) {
+    sea ini = _sx_ver(p)["ini"]
+    sea partes = []
+    sea es_slice = falso
+    si (_sx_op(p, ":") == falso) { partes.agregar(_sx_expresion(p)) }
+    si (_sx_op(p, ":")) {
+        es_slice = verdadero
+        _sx_tomar(p)
+        sea fin = p["ultimo"]["fin"]
+        si (_sx_op(p, ":") == falso y _sx_op(p, "]") == falso y _sx_op(p, ",") == falso) {
+            sea e = _sx_expresion(p)
+            partes.agregar(e)
+            fin = e["fin"]
+        }
+        si (_sx_acepta(p, ":")) {
+            fin = p["ultimo"]["fin"]
+            si (_sx_op(p, "]") == falso y _sx_op(p, ",") == falso) {
+                sea e = _sx_expresion(p)
+                partes.agregar(e)
+                fin = e["fin"]
+            }
+        }
+        retornar _sx_nodo("slice", ini, fin, partes)
+    }
+    retornar partes[0]
+}
+
+funcion _sx_argumentos(p) {
+    sea ini = _sx_espera(p, "(")["ini"]
+    sea hs = []
+    sea antes = p["en_comprension"]
+    p["en_comprension"] = falso
+    mientras (_sx_op(p, ")") == falso) {
+        sea t = _sx_ver(p)
+        si (_sx_op(p, "*") o _sx_op(p, "**")) {
+            _sx_tomar(p)
+            sea e = _sx_expresion(p)
+            hs.agregar(_sx_nodo(si(t["v"] == "*", "list_splat", "dictionary_splat"), t["ini"], e["fin"], [e]))
+        } sino si (t["t"] == "NAME" y _sx_ver_en(p, 1)["v"] == "=" y _sx_ver_en(p, 1)["t"] == "OP") {
+            sea id = _sx_identificador(p)
+            _sx_tomar(p)
+            sea v = _sx_expresion(p)
+            hs.agregar(_sx_nodo("keyword_argument", id["inicio"], v["fin"], [_sx_con(id, "name"), _sx_con(v, "value")]))
+        } sino {
+            sea e = _sx_named(p)
+            si (_sx_kw(p, "for") o _sx_kw(p, "async")) {
+                // f(x for x in y): el argumento entero es un generador.
+                sea cl = _sx_clausulas(p)
+                sea fin = _sx_espera(p, ")")["fin"]
+                p["en_comprension"] = antes
+                sea hijos = [_sx_con(e, "body")]
+                para c en cl { hijos.agregar(c) }
+                retornar _sx_nodo("generator_expression", ini, fin, hijos)
+            }
+            hs.agregar(e)
+        }
+        si (_sx_acepta(p, ",") == falso) { romper }
+    }
+    sea fin = _sx_espera(p, ")")["fin"]
+    p["en_comprension"] = antes
+    retornar _sx_nodo("argument_list", ini, fin, hs)
+}
+
+// Cláusulas for/if de una comprensión.
+funcion _sx_clausulas(p) {
+    sea r = []
+    mientras (_sx_kw(p, "for") o _sx_kw(p, "if") o (_sx_kw(p, "async") y _sx_ver_en(p, 1)["v"] == "for")) {
+        sea t = _sx_tomar(p)
+        si (t["v"] == "async") { _sx_tomar(p) }
+        si (t["v"] == "if") {
+            sea antes = p["en_comprension"]
+            p["en_comprension"] = verdadero
+            sea c = _sx_or(p)
+            p["en_comprension"] = antes
+            r.agregar(_sx_nodo("if_clause", t["ini"], c["fin"], [c]))
+        } sino {
+            sea izq = _sx_con(_sx_objetivos(p), "left")
+            _sx_espera(p, "in")
+            sea antes = p["en_comprension"]
+            p["en_comprension"] = verdadero
+            sea der = _sx_con(_sx_or(p), "right")
+            p["en_comprension"] = antes
+            r.agregar(_sx_nodo("for_in_clause", t["ini"], der["fin"], [izq, der]))
+        }
+    }
+    retornar r
+}
+
+funcion _sx_comprension(tipo_n, ini, cuerpo, p, cierre) {
+    sea cl = _sx_clausulas(p)
+    sea fin = _sx_espera(p, cierre)["fin"]
+    sea hijos = [_sx_con(cuerpo, "body")]
+    para c en cl { hijos.agregar(c) }
+    retornar _sx_nodo(tipo_n, ini, fin, hijos)
+}
+
+funcion _sx_atomo(p) {
+    sea t = _sx_ver(p)
+    si (t["t"] == "NAME") {
+        si (t["v"] == "True" o t["v"] == "False" o t["v"] == "None") {
+            _sx_tomar(p)
+            retornar _sx_nodo(texto_minusculas(t["v"]), t["ini"], t["fin"], [])
+        }
+        retornar _sx_identificador(p)
+    }
+    si (t["t"] == "NUMBER") {
+        _sx_tomar(p)
+        retornar _sx_nodo(si(t["flotante"], "float", "integer"), t["ini"], t["fin"], [])
+    }
+    si (t["t"] == "STRING") {
+        sea cadenas = []
+        mientras (_sx_tipo(p, "STRING")) { cadenas.agregar(_sx_cadena(p, _sx_tomar(p))) }
+        si (longitud(cadenas) == 1) { retornar cadenas[0] }
+        retornar _sx_nodo("concatenated_string", cadenas[0]["inicio"], cadenas[longitud(cadenas) - 1]["fin"], cadenas)
+    }
+    si (t["t"] == "OP") {
+        si (t["v"] == "...") {
+            _sx_tomar(p)
+            retornar _sx_nodo("ellipsis", t["ini"], t["fin"], [])
+        }
+        si (t["v"] == "(") { retornar _sx_parentesis(p) }
+        si (t["v"] == "[") {
+            _sx_tomar(p)
+            sea antes = p["en_comprension"]
+            p["en_comprension"] = falso
+            sea hs = []
+            si (_sx_op(p, "]") == falso) {
+                sea e = _sx_estrella_o_expr(p)
+                si (_sx_kw(p, "for") o _sx_kw(p, "async")) {
+                    sea r = _sx_comprension("list_comprehension", t["ini"], e, p, "]")
+                    p["en_comprension"] = antes
+                    retornar r
+                }
+                hs.agregar(e)
+                mientras (_sx_acepta(p, ",")) {
+                    si (_sx_op(p, "]")) { romper }
+                    hs.agregar(_sx_estrella_o_expr(p))
+                }
+            }
+            sea fin = _sx_espera(p, "]")["fin"]
+            p["en_comprension"] = antes
+            retornar _sx_nodo("list", t["ini"], fin, hs)
+        }
+        si (t["v"] == "{") { retornar _sx_llaves(p) }
+    }
+    _sx_error(p, "expresión inesperada '" + t["v"] + "'")
+    retornar nulo
+}
+
+funcion _sx_parentesis(p) {
+    sea t = _sx_tomar(p)
+    sea antes = p["en_comprension"]
+    sea antes_in = p["sin_in"]
+    p["en_comprension"] = falso
+    p["sin_in"] = falso
+    sea r = nulo
+    si (_sx_op(p, ")")) {
+        sea f = _sx_tomar(p)
+        r = _sx_nodo("tuple", t["ini"], f["fin"], [])
+    } sino si (_sx_kw(p, "yield")) {
+        sea y2 = _sx_yield(p)
+        sea f = _sx_espera(p, ")")
+        r = _sx_nodo("parenthesized_expression", t["ini"], f["fin"], [y2])
+    } sino {
+        sea e = nulo
+        si (_sx_op(p, "*")) { e = _sx_estrella_o_expr(p) } sino { e = _sx_named(p) }
+        si (_sx_kw(p, "for") o _sx_kw(p, "async")) { r = _sx_comprension("generator_expression", t["ini"], e, p, ")") }
+        sino si (_sx_op(p, ",")) {
+            sea hs = [e]
+            mientras (_sx_acepta(p, ",")) {
+                si (_sx_op(p, ")")) { romper }
+                hs.agregar(_sx_estrella_o_expr(p))
+            }
+            sea f = _sx_espera(p, ")")
+            r = _sx_nodo("tuple", t["ini"], f["fin"], hs)
+        } sino {
+            sea f = _sx_espera(p, ")")
+            r = _sx_nodo("parenthesized_expression", t["ini"], f["fin"], [e])
+        }
+    }
+    p["en_comprension"] = antes
+    p["sin_in"] = antes_in
+    retornar r
+}
+
+funcion _sx_llaves(p) {
+    sea t = _sx_tomar(p)
+    sea antes = p["en_comprension"]
+    p["en_comprension"] = falso
+    sea r = nulo
+    si (_sx_op(p, "}")) {
+        sea f = _sx_tomar(p)
+        r = _sx_nodo("dictionary", t["ini"], f["fin"], [])
+    } sino {
+        sea primero = _sx_elemento_llave(p)
+        sea es_dic = primero["tipo"] == "pair" o primero["tipo"] == "dictionary_splat"
+        si (_sx_kw(p, "for") o _sx_kw(p, "async")) { r = _sx_comprension(si(es_dic, "dictionary_comprehension", "set_comprehension"), t["ini"], primero, p, "}") }
+        sino {
+            sea hs = [primero]
+            mientras (_sx_acepta(p, ",")) {
+                si (_sx_op(p, "}")) { romper }
+                hs.agregar(_sx_elemento_llave(p))
+            }
+            sea f = _sx_espera(p, "}")
+            r = _sx_nodo(si(es_dic, "dictionary", "set"), t["ini"], f["fin"], hs)
+        }
+    }
+    p["en_comprension"] = antes
+    retornar r
+}
+
+funcion _sx_elemento_llave(p) {
+    si (_sx_op(p, "**")) {
+        sea t = _sx_tomar(p)
+        sea e = _sx_bor(p)
+        retornar _sx_nodo("dictionary_splat", t["ini"], e["fin"], [e])
+    }
+    si (_sx_op(p, "*")) { retornar _sx_estrella_o_expr(p) }
+    sea k = _sx_expresion(p)
+    si (_sx_acepta(p, ":")) {
+        sea v = _sx_expresion(p)
+        retornar _sx_nodo("pair", k["inicio"], v["fin"], [_sx_con(k, "key"), _sx_con(v, "value")])
+    }
+    retornar k
+}
+
+// Cadena: string_start, string_content (con escape_sequence), interpolation, string_end.
+funcion _sx_cadena(p, t) {
+    sea src = p["src"]
+    sea pref = t["pref"]
+    sea q = t["comillas"]
+    sea comilla = subtexto(src, q, q + 1)
+    sea triple = subtexto(src, q, q + 3) == comilla + comilla + comilla
+    sea largo_d = si(triple, 3, 1)
+    sea a = q + largo_d
+    sea b = t["fin"] - largo_d
+    sea hijos = [_sx_nodo("string_start", t["ini"], a, [])]
+    sea crudo = texto_contiene(pref, "r")
+    sea es_f = texto_contiene(pref, "f")
+    para h en _sx_partes_cadena(p, a, b, crudo, es_f) { hijos.agregar(h) }
+    hijos.agregar(_sx_nodo("string_end", b, t["fin"], []))
+    retornar _sx_nodo("string", t["ini"], t["fin"], hijos)
+}
+
+funcion _sx_partes_cadena(p, a, b, crudo, es_f) {
+    sea src = p["src"]
+    sea r = []
+    sea ini_c = a
+    sea escapes = []
+    sea i = a
+    sea cerrar = funcion(hasta) {
+        si (hasta > ini_c) { r.agregar(_sx_nodo("string_content", ini_c, hasta, escapes)) }
+        escapes = []
+    }
+    mientras (i < b) {
+        sea c = subtexto(src, i, i + 1)
+        si (c == "\\" y crudo == falso) {
+            sea largo = 2
+            sea d = subtexto(src, i + 1, i + 2)
+            si (d == "x") { largo = 4 } sino si (d == "u") { largo = 6 } sino si (d == "U") { largo = 10 } sino si (texto_indice("01234567", d) >= 0) {
+                largo = 2
+                mientras (largo < 4 y texto_indice("01234567", subtexto(src, i + largo, i + largo + 1)) >= 0) { largo = largo + 1 }
+            } sino si (d == "N" y subtexto(src, i + 2, i + 3) == "{") {
+                largo = texto_indice(subtexto(src, i, b), "}") + 1
+            } sino si (d == "\n") { largo = 2 }
+            escapes.agregar(_sx_nodo("escape_sequence", i, i + largo, []))
+            i = i + largo
+        } sino si (es_f y (c == "{" o c == "}") y subtexto(src, i + 1, i + 2) == c) {
+            escapes.agregar(_sx_nodo("escape_interpolation", i, i + 2, []))
+            i = i + 2
+        } sino si (es_f y c == "{") {
+            cerrar(i)
+            sea fin = _sx_interpolacion(p, i, b, r)
+            i = fin
+            ini_c = i
+        } sino { i = i + 1 }
+    }
+    cerrar(b)
+    retornar r
+}
+
+// Analiza "{expr!r:fmt}" que empieza en i; agrega el nodo a r y devuelve el fin.
+funcion _sx_interpolacion(p, i, b, r) {
+    sea src = p["src"]
+    // Busca el cierre respetando anidamiento y cadenas.
+    sea nivel = 0
+    sea j = i
+    mientras (j < b) {
+        sea c = subtexto(src, j, j + 1)
+        si (c == "{" o c == "[" o c == "(") { nivel = nivel + 1 }
+        sino si (c == "}" o c == "]" o c == ")") {
+            nivel = nivel - 1
+            si (nivel == 0) { romper }
+        } sino si (c == "'" o c == "\"") {
+            j = _sx_fin_cadena(src, j) - 1
+        }
+        j = j + 1
+    }
+    sea cierre = j
+    // Expresión: hasta "!" o ":" de nivel 0 o "=" final.
+    sea k = i + 1
+    nivel = 0
+    mientras (k < cierre) {
+        sea c = subtexto(src, k, k + 1)
+        si (c == "(" o c == "[" o c == "{") { nivel = nivel + 1 }
+        sino si (c == ")" o c == "]" o c == "}") { nivel = nivel - 1 }
+        sino si (c == "'" o c == "\"") { k = _sx_fin_cadena(src, k) - 1 }
+        sino si (nivel == 0 y (c == ":" o (c == "!" y subtexto(src, k + 1, k + 2) != "="))) { romper }
+        k = k + 1
+    }
+    sea e = _sx_sub_expresion(p, i + 1, k)
+    sea hijos = [_sx_con(e, "expression")]
+    sea x = k
+    si (subtexto(src, x, x + 1) == "!") {
+        hijos.agregar(_sx_con(_sx_nodo("type_conversion", x, x + 2, []), "type_conversion"))
+        x = x + 2
+    }
+    si (subtexto(src, x, x + 1) == ":") {
+        sea fhs = []
+        sea m = x + 1
+        mientras (m < cierre) {
+            si (subtexto(src, m, m + 1) == "{") {
+                sea fin_i = m
+                sea niv = 0
+                mientras (fin_i < cierre) {
+                    sea c = subtexto(src, fin_i, fin_i + 1)
+                    si (c == "{") { niv = niv + 1 }
+                    si (c == "}") {
+                        niv = niv - 1
+                        si (niv == 0) { romper }
+                    }
+                    fin_i = fin_i + 1
+                }
+                sea ex = _sx_sub_expresion(p, m + 1, fin_i)
+                fhs.agregar(_sx_nodo("format_expression", m, fin_i + 1, [_sx_con(ex, "expression")]))
+                m = fin_i + 1
+            } sino { m = m + 1 }
+        }
+        hijos.agregar(_sx_con(_sx_nodo("format_specifier", x, cierre, fhs), "format_specifier"))
+    }
+    r.agregar(_sx_nodo("interpolation", i, cierre + 1, hijos))
+    retornar cierre + 1
+}
+
+funcion _sx_sub_expresion(p, a, b) {
+    // Re-analiza un trozo de la fuente como expresión (con los mismos bytes).
+    sea toks = []
+    para t en _sx_lexico_py(subtexto(p["src"], a, b))["toks"] {
+        si (t["t"] != "NEWLINE" y t["t"] != "INDENT" y t["t"] != "DEDENT") {
+            t["ini"] = t["ini"] + a
+            t["fin"] = t["fin"] + a
+            si (tiene_clave(t, "comillas")) { t["comillas"] = t["comillas"] + a }
+            toks.agregar(t)
+        }
+    }
+    sea q = {"toks": toks, "i": 0, "src": p["src"], "sin_in": falso, "en_comprension": falso, "bloques": p["bloques"], "ultimo": nulo}
+    sea e = _sx_lista_expr(q, "expression_list")
+    retornar e
+}
+
+// ---------- JSON ----------
+
+funcion _sx_json(src) {
+    sea p = {"src": src, "i": 0}
+    sea saltar = funcion() {
+        mientras (p["i"] < longitud(src) y texto_indice(" \t\r\n", subtexto(src, p["i"], p["i"] + 1)) >= 0) { p["i"] = p["i"] + 1 }
+    }
+    sea valor = nulo
+    valor = funcion() {
+        saltar()
+        sea i = p["i"]
+        sea c = subtexto(src, i, i + 1)
+        si (c == "{" o c == "[") {
+            p["i"] = i + 1
+            sea hs = []
+            sea cierre = si(c == "{", "}", "]")
+            saltar()
+            si (subtexto(src, p["i"], p["i"] + 1) != cierre) {
+                mientras (verdadero) {
+                    si (c == "{") {
+                        sea k = valor()
+                        saltar()
+                        si (subtexto(src, p["i"], p["i"] + 1) != ":") { lanzar "sintaxis: se esperaba ':' en el byte " + p["i"] }
+                        p["i"] = p["i"] + 1
+                        sea v = valor()
+                        hs.agregar(_sx_nodo("pair", k["inicio"], v["fin"], [_sx_con(k, "key"), _sx_con(v, "value")]))
+                    } sino { hs.agregar(valor()) }
+                    saltar()
+                    si (subtexto(src, p["i"], p["i"] + 1) == ",") { p["i"] = p["i"] + 1 } sino { romper }
+                }
+            }
+            saltar()
+            si (subtexto(src, p["i"], p["i"] + 1) != cierre) { lanzar "sintaxis: se esperaba '" + cierre + "' en el byte " + p["i"] }
+            p["i"] = p["i"] + 1
+            retornar _sx_nodo(si(c == "{", "object", "array"), i, p["i"], hs)
+        }
+        si (c == "\"") {
+            sea j = i + 1
+            sea partes = []
+            sea ini_c = j
+            mientras (j < longitud(src) y subtexto(src, j, j + 1) != "\"") {
+                si (subtexto(src, j, j + 1) == "\\") {
+                    si (j > ini_c) { partes.agregar(_sx_nodo("string_content", ini_c, j, [])) }
+                    sea largo = si(subtexto(src, j + 1, j + 2) == "u", 6, 2)
+                    partes.agregar(_sx_nodo("escape_sequence", j, j + largo, []))
+                    j = j + largo
+                    ini_c = j
+                } sino { j = j + 1 }
+            }
+            si (j >= longitud(src)) { lanzar "sintaxis: cadena sin cerrar en el byte " + i }
+            si (j > ini_c) { partes.agregar(_sx_nodo("string_content", ini_c, j, [])) }
+            p["i"] = j + 1
+            retornar _sx_nodo("string", i, j + 1, partes)
+        }
+        para w en ["true", "false", "null"] {
+            si (subtexto(src, i, i + longitud(w)) == w) {
+                p["i"] = i + longitud(w)
+                retornar _sx_nodo(w, i, p["i"], [])
+            }
+        }
+        sea j = i
+        mientras (j < longitud(src) y texto_indice("0123456789+-.eE", subtexto(src, j, j + 1)) >= 0) { j = j + 1 }
+        si (j == i) { lanzar "sintaxis: valor JSON inesperado en el byte " + i }
+        p["i"] = j
+        retornar _sx_nodo("number", i, j, [])
+    }
+    sea hs = []
+    saltar()
+    mientras (p["i"] < longitud(src)) {
+        hs.agregar(valor())
+        saltar()
+    }
+    retornar _sx_nodo("document", 0, longitud(src), hs)
+}
+
+// ---------- comentarios y posiciones ----------
+
+funcion _sx_extender_bloques(bloques, comentarios, src) {
+    // Comentarios al final de un bloque con su sangría (o en la línea del último
+    // enunciado) le pertenecen. Los bloques internos se procesan primero.
+    sea ordenados = ordenar(bloques, funcion(a, b) { retornar b["inicio"] - a["inicio"] })
+    para b en ordenados {
+        para c en comentarios {
+            si (c["ini"] >= b["fin"] y c["ini"] < b["_limite"]) {
+                sea misma_linea = texto_contiene(subtexto(src, b["fin"], c["ini"]), "\n") == falso
+                si (misma_linea o c["col"] >= b["_col"]) {
+                    si (c["fin"] > b["fin"]) { b["fin"] = c["fin"] }
+                }
+            }
+        }
+    }
+}
+
+funcion _sx_ajustar_fines(n) {
+    // Los padres terminan al menos donde termina su último hijo.
+    para h en n["hijos"] {
+        _sx_ajustar_fines(h)
+        si (h["fin"] > n["fin"]) { n["fin"] = h["fin"] }
+    }
+}
+
+funcion _sx_insertar_comentario(n, c) {
+    para h en n["hijos"] {
+        si (h["tipo"] != "comment" y c["inicio"] >= h["inicio"] y c["fin"] <= h["fin"] y h["tipo"] != "string") {
+            _sx_insertar_comentario(h, c)
+            retornar nulo
+        }
+    }
+    sea k = 0
+    mientras (k < longitud(n["hijos"]) y n["hijos"][k]["inicio"] < c["inicio"]) { k = k + 1 }
+    sea nuevos = []
+    para i en lista_rango(0, k) { nuevos.agregar(n["hijos"][i]) }
+    nuevos.agregar(c)
+    para i en lista_rango(k, longitud(n["hijos"])) { nuevos.agregar(n["hijos"][i]) }
+    n["hijos"] = nuevos
+    retornar nulo
+}
+
+funcion _sx_puntos(n, lineas) {
+    n["punto_inicio"] = _sx_punto(lineas, n["inicio"])
+    n["punto_fin"] = _sx_punto(lineas, n["fin"])
+    para h en n["hijos"] { _sx_puntos(h, lineas) }
+    // Limpieza de campos internos.
+    si (tiene_clave(n, "_col")) {
+        quitar_clave(n, "_col")
+        quitar_clave(n, "_limite")
+    }
+}
+
+funcion _sx_punto(lineas, b) {
+    sea lo = 0
+    sea hi = longitud(lineas) - 1
+    mientras (lo < hi) {
+        sea m = cociente(lo + hi + 1, 2)
+        si (lineas[m] <= b) { lo = m } sino { hi = m - 1 }
+    }
+    retornar [lo, b - lineas[lo]]
+}
+
+// ---------- API ----------
+
+/// Analiza código ("python" o "json"). Devuelve {"raiz", "fuente",
+/// "lenguaje", "tiene_error", "error"}; con error, la raíz es (ERROR).
+funcion sintaxis_analizar(codigo, lenguaje) {
+    sea leng = texto_minusculas(lenguaje ?? "python")
+    sea raiz = nulo
+    sea error = nulo
+    intentar {
+        si (leng == "json") { raiz = _sx_json(codigo) }
+        sino si (leng == "python" o leng == "py") {
+            sea lx = _sx_lexico_py(codigo)
+            sea p = {"toks": lx["toks"], "i": 0, "src": codigo, "sin_in": falso, "en_comprension": falso, "bloques": [], "ultimo": nulo}
+            raiz = _sx_modulo(p, longitud(codigo))
+            _sx_extender_bloques(p["bloques"], lx["comentarios"], codigo)
+            _sx_ajustar_fines(raiz)
+            para c en lx["comentarios"] { _sx_insertar_comentario(raiz, _sx_nodo("comment", c["ini"], c["fin"], [])) }
+        } sino { lanzar "sintaxis: lenguaje no soportado " + lenguaje }
+    } capturar (e) {
+        si (texto_empieza_con("" + e, "sintaxis: lenguaje")) { lanzar e }
+        error = "" + e
+        raiz = _sx_nodo("ERROR", 0, longitud(codigo), [])
+    }
+    sea lineas = [0]
+    para i en lista_rango(0, longitud(codigo)) {
+        si (byte_en(codigo, i) == 10) { lineas.agregar(i + 1) }
+    }
+    _sx_puntos(raiz, lineas)
+    retornar {"raiz": raiz, "fuente": codigo, "lenguaje": leng, "tiene_error": error != nulo, "error": error}
+}
+
+funcion _sx_raiz_de(x) {
+    si (tiene_clave(x, "raiz")) { retornar x["raiz"] }
+    retornar x
+}
+
+/// Árbol como S-expresión (igual que str(nodo) en py-tree-sitter).
+funcion sintaxis_sexp(arbol_o_nodo) {
+    sea n = _sx_raiz_de(arbol_o_nodo)
+    sea r = "(" + n["tipo"]
+    para h en n["hijos"] {
+        r = r + " " + si(h["campo"] != nulo, h["campo"] + ": ", "") + sintaxis_sexp(h)
+    }
+    retornar r + ")"
+}
+
+/// Texto de la fuente que cubre el nodo.
+funcion sintaxis_texto(arbol, nodo) { retornar subtexto(arbol["fuente"], nodo["inicio"], nodo["fin"]) }
+
+/// Hijo con ese campo (o nulo); sintaxis_hijos_campo da todos.
+funcion sintaxis_hijo(nodo, campo) {
+    para h en nodo["hijos"] {
+        si (h["campo"] == campo) { retornar h }
+    }
+    retornar nulo
+}
+
+funcion sintaxis_hijos_campo(nodo, campo) {
+    sea r = []
+    para h en nodo["hijos"] {
+        si (h["campo"] == campo) { r.agregar(h) }
+    }
+    retornar r
+}
+
+/// Todos los nodos (en preorden) de ese tipo.
+funcion sintaxis_buscar(arbol_o_nodo, tipo_n) {
+    sea r = []
+    _sx_preorden(_sx_raiz_de(arbol_o_nodo), funcion(n) { si (n["tipo"] == tipo_n) { r.agregar(n) } })
+    retornar r
+}
+
+funcion _sx_preorden(n, f) {
+    f(n)
+    para h en n["hijos"] { _sx_preorden(h, f) }
+}
+
+/// Nodo más profundo que contiene el rango de bytes [a, b).
+funcion sintaxis_nodo_en(arbol, a, b) {
+    sea n = arbol["raiz"]
+    sea fin_r = b ?? a
+    mientras (verdadero) {
+        sea siguiente = nulo
+        para h en n["hijos"] {
+            si (siguiente == nulo y h["inicio"] <= a y fin_r <= h["fin"] y (h["fin"] > a o a == fin_r)) { siguiente = h }
+        }
+        si (siguiente == nulo) { retornar n }
+        n = siguiente
+    }
+    retornar n
+}
+
+// ---------- consultas ----------
+
+funcion _sx_q_lexico(t) {
+    sea r = []
+    sea i = 0
+    sea n = longitud(t)
+    mientras (i < n) {
+        sea c = subtexto(t, i, i + 1)
+        si (c == " " o c == "\n" o c == "\t" o c == "\r") { i = i + 1 }
+        sino si (c == ";") {
+            mientras (i < n y subtexto(t, i, i + 1) != "\n") { i = i + 1 }
+        } sino si (c == "(" o c == ")" o c == "[" o c == "]") {
+            r.agregar({"t": c, "v": c})
+            i = i + 1
+        } sino si (c == "\"") {
+            sea j = i + 1
+            sea v = ""
+            mientras (j < n y subtexto(t, j, j + 1) != "\"") {
+                si (subtexto(t, j, j + 1) == "\\") {
+                    j = j + 1
+                    sea d = subtexto(t, j, j + 1)
+                    v = v + si(d == "n", "\n", d)
+                } sino { v = v + subtexto(t, j, j + 1) }
+                j = j + 1
+            }
+            r.agregar({"t": "txt", "v": v})
+            i = j + 1
+        } sino {
+            sea j = i
+            mientras (j < n y texto_indice(" \n\t\r()[]\";", subtexto(t, j, j + 1)) < 0) { j = j + 1 }
+            r.agregar({"t": "w", "v": subtexto(t, i, j)})
+            i = j
+        }
+    }
+    retornar r
+}
+
+funcion _sx_q_patron(p) {
+    sea t = p["toks"][p["i"]]
+    sea r = nulo
+    si (t["t"] == "(" y (p["toks"][p["i"] + 1]["t"] == "(" o p["toks"][p["i"] + 1]["t"] == "[")) {
+        // Agrupación: ((patrón) @x (#pred? …)).
+        p["i"] = p["i"] + 1
+        r = _sx_q_patron(p)
+        mientras (p["toks"][p["i"]]["t"] != ")") {
+            si (p["toks"][p["i"]]["t"] == "(" y texto_empieza_con(p["toks"][p["i"] + 1]["v"], "#")) {
+                p["i"] = p["i"] + 1
+                sea pred = {"nombre": p["toks"][p["i"]]["v"], "args": []}
+                p["i"] = p["i"] + 1
+                mientras (p["toks"][p["i"]]["t"] != ")") {
+                    pred["args"].agregar(p["toks"][p["i"]])
+                    p["i"] = p["i"] + 1
+                }
+                p["i"] = p["i"] + 1
+                r["predicados"].agregar(pred)
+            } sino { lanzar "sintaxis: solo se soportan agrupaciones de un patrón" }
+        }
+        p["i"] = p["i"] + 1
+    } sino si (t["t"] == "(") {
+        p["i"] = p["i"] + 1
+        sea tipo_n = p["toks"][p["i"]]["v"]
+        p["i"] = p["i"] + 1
+        r = {"t": "nodo", "tipo": tipo_n, "hijos": [], "capturas": [], "predicados": []}
+        mientras (p["toks"][p["i"]]["t"] != ")") {
+            sea x = p["toks"][p["i"]]
+            si (x["t"] == "(" y texto_empieza_con(p["toks"][p["i"] + 1]["v"], "#")) {
+                p["i"] = p["i"] + 1
+                sea pred = {"nombre": p["toks"][p["i"]]["v"], "args": []}
+                p["i"] = p["i"] + 1
+                mientras (p["toks"][p["i"]]["t"] != ")") {
+                    pred["args"].agregar(p["toks"][p["i"]])
+                    p["i"] = p["i"] + 1
+                }
+                p["i"] = p["i"] + 1
+                r["predicados"].agregar(pred)
+            } sino si (x["t"] == "w" y texto_termina_con(x["v"], ":")) {
+                p["i"] = p["i"] + 1
+                sea h = _sx_q_patron(p)
+                h["campo"] = subtexto(x["v"], 0, longitud(x["v"]) - 1)
+                r["hijos"].agregar(h)
+            } sino si (x["t"] == "w" y texto_empieza_con(x["v"], "!")) {
+                r["sin_campo"] = subtexto(x["v"], 1, longitud(x["v"]))
+                p["i"] = p["i"] + 1
+            } sino { r["hijos"].agregar(_sx_q_patron(p)) }
+        }
+        p["i"] = p["i"] + 1
+    } sino si (t["t"] == "[") {
+        p["i"] = p["i"] + 1
+        r = {"t": "alt", "opciones": [], "capturas": [], "predicados": []}
+        mientras (p["toks"][p["i"]]["t"] != "]") { r["opciones"].agregar(_sx_q_patron(p)) }
+        p["i"] = p["i"] + 1
+    } sino si (t["t"] == "w" y t["v"] == "_") {
+        p["i"] = p["i"] + 1
+        r = {"t": "nodo", "tipo": "_", "hijos": [], "capturas": [], "predicados": []}
+    } sino { lanzar "sintaxis: consulta inválida cerca de '" + t["v"] + "'" }
+    // Capturas y cuantificadores.
+    mientras (p["i"] < longitud(p["toks"]) y p["toks"][p["i"]]["t"] == "w" y (texto_empieza_con(p["toks"][p["i"]]["v"], "@") o lista_contiene(["?", "*", "+"], p["toks"][p["i"]]["v"]))) {
+        sea v = p["toks"][p["i"]]["v"]
+        si (texto_empieza_con(v, "@")) { r["capturas"].agregar(subtexto(v, 1, longitud(v))) } sino { r["cuant"] = v }
+        p["i"] = p["i"] + 1
+    }
+    retornar r
+}
+
+funcion _sx_q_compilar(consulta) {
+    sea p = {"toks": _sx_q_lexico(consulta), "i": 0}
+    sea r = []
+    mientras (p["i"] < longitud(p["toks"])) { r.agregar(_sx_q_patron(p)) }
+    retornar r
+}
+
+// Casa el patrón con el nodo; devuelve lista de asignaciones posibles (listas de [captura, nodo]).
+funcion _sx_q_casar(pat, n) {
+    si (pat["t"] == "alt") {
+        sea r = []
+        para o en pat["opciones"] {
+            para a en _sx_q_casar(o, n) {
+                sea x = []
+                para c en a { x.agregar(c) }
+                para c en pat["capturas"] { x.agregar([c, n]) }
+                r.agregar(x)
+            }
+        }
+        retornar r
+    }
+    si (pat["tipo"] != "_" y pat["tipo"] != n["tipo"]) { retornar [] }
+    si ((pat["campo"] ?? nulo) != nulo y n["campo"] != pat["campo"]) { retornar [] }
+    si ((pat["sin_campo"] ?? nulo) != nulo y sintaxis_hijo(n, pat["sin_campo"]) != nulo) { retornar [] }
+    sea base = []
+    para c en pat["capturas"] { base.agregar([c, n]) }
+    retornar _sx_q_hijos(pat["hijos"], 0, n["hijos"], 0, base)
+}
+
+funcion _sx_q_hijos(pats, i, hijos, j, acum) {
+    si (i == longitud(pats)) { retornar [acum] }
+    sea pat = pats[i]
+    sea r = []
+    sea cuant = pat["cuant"] ?? ""
+    si (cuant == "?" o cuant == "*") {
+        para a en _sx_q_hijos(pats, i + 1, hijos, j, acum) { r.agregar(a) }
+    }
+    sea k = j
+    mientras (k < longitud(hijos)) {
+        sea h = hijos[k]
+        si (h["tipo"] != "comment" o pat["tipo"] == "comment") {
+            sea campo_ok = (pat["campo"] ?? nulo) == nulo o h["campo"] == pat["campo"]
+            si (campo_ok) {
+                para a en _sx_q_casar(pat, h) {
+                    sea x = []
+                    para c en acum { x.agregar(c) }
+                    para c en a { x.agregar(c) }
+                    para res en _sx_q_hijos(pats, i + 1, hijos, k + 1, x) { r.agregar(res) }
+                    si (cuant == "*" o cuant == "+") {
+                        sea otro = []
+                        para c en pats { otro.agregar(c) }
+                        para res en _sx_q_hijos(pats, i, hijos, k + 1, x) { r.agregar(res) }
+                    }
+                }
+            }
+        }
+        k = k + 1
+    }
+    retornar r
+}
+
+funcion _sx_q_predicados(pat, asign, arbol) {
+    sea preds = []
+    _sx_q_juntar_preds(pat, preds)
+    para pr en preds {
+        sea vals = []
+        para a en pr["args"] {
+            si (a["t"] == "w" y texto_empieza_con(a["v"], "@")) {
+                sea nombre = subtexto(a["v"], 1, longitud(a["v"]))
+                sea v = nulo
+                para c en asign {
+                    si (c[0] == nombre y v == nulo) { v = sintaxis_texto(arbol, c[1]) }
+                }
+                vals.agregar(v)
+            } sino { vals.agregar(a["v"]) }
+        }
+        sea nombre = pr["nombre"]
+        si (nombre == "#eq?" y vals[0] != vals[1]) { retornar falso }
+        si (nombre == "#not-eq?" y vals[0] == vals[1]) { retornar falso }
+        si (nombre == "#match?" y cfv_regex_buscar(vals[1], vals[0]) == nulo) { retornar falso }
+        si (nombre == "#not-match?" y cfv_regex_buscar(vals[1], vals[0]) != nulo) { retornar falso }
+        si (nombre == "#any-of?") {
+            sea esta = falso
+            para k en lista_rango(1, longitud(vals)) {
+                si (vals[k] == vals[0]) { esta = verdadero }
+            }
+            si (esta == falso) { retornar falso }
+        }
+    }
+    retornar verdadero
+}
+
+funcion _sx_q_juntar_preds(pat, r) {
+    para x en pat["predicados"] { r.agregar(x) }
+    para h en pat["hijos"] ?? [] { _sx_q_juntar_preds(h, r) }
+    para h en pat["opciones"] ?? [] { _sx_q_juntar_preds(h, r) }
+}
+
+/// Coincidencias de una consulta: [{"patron", "capturas": [[nombre, nodo]…]}]
+/// en el orden en que tree-sitter las entrega (por posición del nodo).
+funcion sintaxis_coincidencias(arbol, consulta) {
+    sea pats = _sx_q_compilar(consulta)
+    sea r = []
+    _sx_preorden(arbol["raiz"], funcion(n) {
+        sea ip = 0
+        para pat en pats {
+            sea vistas = {}
+            para a en _sx_q_casar(pat, n) {
+                sea clave = ""
+                para c en a { clave = clave + c[0] + ":" + c[1]["inicio"] + "-" + c[1]["fin"] + ";" }
+                si (tiene_clave(vistas, clave) == falso y _sx_q_predicados(pat, a, arbol)) {
+                    vistas[clave] = verdadero
+                    r.agregar({"patron": ip, "capturas": a})
+                }
+            }
+            ip = ip + 1
+        }
+    })
+    retornar r
+}
+
+/// Capturas de una consulta: [{"nombre", "nodo", "texto"}] ordenadas por
+/// posición (como QueryCursor.captures).
+funcion sintaxis_consulta(arbol, consulta) {
+    sea r = []
+    sea vistas = {}
+    para m en sintaxis_coincidencias(arbol, consulta) {
+        para c en m["capturas"] {
+            sea clave = c[0] + ":" + c[1]["inicio"] + "-" + c[1]["fin"] + ":" + c[1]["tipo"]
+            si (tiene_clave(vistas, clave) == falso) {
+                vistas[clave] = verdadero
+                r.agregar({"nombre": c[0], "nodo": c[1], "texto": sintaxis_texto(arbol, c[1])})
+            }
+        }
+    }
+    retornar _sx_ordenar_capturas(r)
+}
+
+funcion _sx_ordenar_capturas(r) {
+    sea idx = ordenar(lista_rango(0, longitud(r)), funcion(a, b) {
+        sea x = r[a]["nodo"]
+        sea w = r[b]["nodo"]
+        si (x["inicio"] != w["inicio"]) { retornar x["inicio"] - w["inicio"] }
+        si (x["fin"] != w["fin"]) { retornar w["fin"] - x["fin"] }
+        retornar a - b
+    })
+    sea s = []
+    para i en idx { s.agregar(r[i]) }
+    retornar s
+}

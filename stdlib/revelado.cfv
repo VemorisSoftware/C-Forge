@@ -1,0 +1,862 @@
+// stdlib/revelado.cfv — Procesamiento de imágenes al estilo de libvips,
+// escrito desde cero (idea de libvips, LGPL: solo la idea). Trabaja con las
+// imágenes RGBA de "imagen" ({"ancho", "alto", "pixeles"}), así que se puede
+// mezclar con ese módulo.
+//
+//   · Redimensionar con nearest, bilinear, bicubic, lanczos3 y box (mismos
+//     coeficientes y redondeo que Pillow), miniaturas que conservan la
+//     proporción.
+//   · Recortar, voltear, rotar 90/180/270, incrustar en un lienzo, unir en
+//     mosaico, insertar una imagen sobre otra y componer con alfa ("over").
+//   · Gris, negativo, lineal (a·x + b), gamma, umbral, autocontraste,
+//     ecualización de histograma, desenfoque gaussiano, enfoque (máscara de
+//     enfoque), convolución con núcleo propio y bordes de Sobel.
+//   · Histograma y estadísticas por banda; JPEG baseline (codificador
+//     propio, 4:2:0 o 4:4:4) además de PNG.
+//
+// En inglés: importar "vips".
+//
+//   importar "revelado"
+//   sea img = revelado_cargar("foto.jpg")
+//   sea mini = revelado_miniatura(img, 200, 200)
+//   revelado_guardar(revelado_enfocar(mini, 1.0, 0.8), "mini.jpg", {"calidad": 85})
+
+importar "imagen"
+
+funcion _rv_img(ancho, alto, px) { retornar {"ancho": ancho, "alto": alto, "pixeles": px} }
+
+// Bytes desde una lista de enteros 0..255.
+funcion _rv_bytes(lista) {
+    sea partes = []
+    para v en lista { partes.agregar(char_de(v)) }
+    retornar unir(partes, "")
+}
+
+funcion _rv_lista(img) {
+    sea p = img["pixeles"]
+    sea r = []
+    para i en lista_rango(0, img["ancho"] * img["alto"] * 4) { r.agregar(byte_en(p, i)) }
+    retornar r
+}
+
+funcion _rv_clip(v) {
+    si (v < 0) { retornar 0 }
+    si (v > 255) { retornar 255 }
+    retornar v
+}
+
+funcion _rv_redondear(v) { retornar _rv_clip(piso(v + 0.5)) }
+
+// ---------- entrada y salida ----------
+
+/// Carga PNG, JPEG o BMP.
+funcion revelado_cargar(ruta) { retornar imagen_cargar(ruta) }
+
+/// Decodifica bytes PNG, JPEG o BMP.
+funcion revelado_desde_bytes(datos) { retornar imagen_decodificar(datos) }
+
+/// Codifica a "png" o "jpeg". opciones: {"calidad": 75, "submuestreo": "4:2:0" | "4:4:4", "nivel": 6}.
+funcion revelado_a_bytes(img, formato, opciones) {
+    sea op = opciones ?? {}
+    sea f = texto_minusculas(formato ?? "png")
+    si (f == "png") { retornar png_codificar(img["pixeles"], img["ancho"], img["alto"], op["nivel"] ?? 6) }
+    si (f == "jpeg" o f == "jpg") { retornar _rv_jpeg(img, op["calidad"] ?? 75, (op["submuestreo"] ?? "4:2:0") == "4:2:0") }
+    lanzar "revelado: formato no soportado " + formato
+}
+
+/// Guarda según la extensión (.png, .jpg, .jpeg).
+funcion revelado_guardar(img, ruta, opciones) {
+    sea partes = texto_dividir(ruta, ".")
+    escribir_archivo(ruta, revelado_a_bytes(img, partes[longitud(partes) - 1], opciones))
+    retornar ruta
+}
+
+// ---------- geometría ----------
+
+funcion revelado_recortar(img, x, y, ancho, alto) {
+    si (x < 0 o y < 0 o ancho <= 0 o alto <= 0 o x + ancho > img["ancho"] o y + alto > img["alto"]) { lanzar "revelado: recorte fuera de la imagen" }
+    sea p = img["pixeles"]
+    sea filas = []
+    para f en lista_rango(y, y + alto) {
+        sea ini = (f * img["ancho"] + x) * 4
+        filas.agregar(subtexto(p, ini, ini + ancho * 4))
+    }
+    retornar _rv_img(ancho, alto, unir(filas, ""))
+}
+
+/// Voltea "horizontal" (espejo) o "vertical".
+funcion revelado_voltear(img, direccion) {
+    sea w = img["ancho"]
+    sea h = img["alto"]
+    sea p = img["pixeles"]
+    sea filas = []
+    si (direccion == "vertical") {
+        sea f = h - 1
+        mientras (f >= 0) {
+            filas.agregar(subtexto(p, f * w * 4, (f + 1) * w * 4))
+            f = f - 1
+        }
+        retornar _rv_img(w, h, unir(filas, ""))
+    }
+    para f en lista_rango(0, h) {
+        sea px = []
+        sea c = w - 1
+        mientras (c >= 0) {
+            px.agregar(subtexto(p, (f * w + c) * 4, (f * w + c) * 4 + 4))
+            c = c - 1
+        }
+        filas.agregar(unir(px, ""))
+    }
+    retornar _rv_img(w, h, unir(filas, ""))
+}
+
+/// Rota 90, 180 o 270 grados en sentido horario.
+funcion revelado_rotar(img, grados) {
+    sea g = ((grados % 360) + 360) % 360
+    si (g == 0) { retornar img }
+    si (g == 180) { retornar revelado_voltear(revelado_voltear(img, "vertical"), "horizontal") }
+    si (g != 90 y g != 270) { lanzar "revelado: solo se rota en múltiplos de 90 grados" }
+    sea w = img["ancho"]
+    sea h = img["alto"]
+    sea p = img["pixeles"]
+    sea px = []
+    // Nueva imagen h × w.
+    para f en lista_rango(0, w) {
+        para c en lista_rango(0, h) {
+            sea sx = 0
+            sea sy = 0
+            si (g == 90) {
+                sx = f
+                sy = h - 1 - c
+            } sino {
+                sx = w - 1 - f
+                sy = c
+            }
+            px.agregar(subtexto(p, (sy * w + sx) * 4, (sy * w + sx) * 4 + 4))
+        }
+    }
+    retornar _rv_img(h, w, unir(px, ""))
+}
+
+/// Coloca la imagen en un lienzo de ancho × alto en (x, y) con un color de fondo.
+funcion revelado_incrustar(img, x, y, ancho, alto, fondo) {
+    sea base = imagen_nueva(ancho, alto, fondo ?? [0, 0, 0, 255])
+    retornar revelado_insertar(base, img, x, y)
+}
+
+/// Copia "sub" encima de "base" en (x, y) (sin mezclar; recorta lo que sobra).
+funcion revelado_insertar(base, sub, x, y) {
+    sea w = base["ancho"]
+    sea p = base["pixeles"]
+    sea q = sub["pixeles"]
+    sea filas = []
+    para f en lista_rango(0, base["alto"]) {
+        sea sf = f - y
+        si (sf < 0 o sf >= sub["alto"]) { filas.agregar(subtexto(p, f * w * 4, (f + 1) * w * 4)) } sino {
+            sea a = maximo(0, x)
+            sea b = minimo(w, x + sub["ancho"])
+            si (b <= a) { filas.agregar(subtexto(p, f * w * 4, (f + 1) * w * 4)) } sino {
+                filas.agregar(subtexto(p, f * w * 4, (f * w + a) * 4) + subtexto(q, (sf * sub["ancho"] + a - x) * 4, (sf * sub["ancho"] + b - x) * 4) + subtexto(p, (f * w + b) * 4, (f + 1) * w * 4))
+            }
+        }
+    }
+    retornar _rv_img(w, base["alto"], unir(filas, ""))
+}
+
+/// Une imágenes en una cuadrícula de "columnas" columnas (como arrayjoin).
+funcion revelado_mosaico(imagenes, columnas, fondo) {
+    sea cw = 0
+    sea ch = 0
+    para im en imagenes {
+        cw = maximo(cw, im["ancho"])
+        ch = maximo(ch, im["alto"])
+    }
+    sea cols = minimo(columnas, longitud(imagenes))
+    sea filas = cociente(longitud(imagenes) + cols - 1, cols)
+    sea r = imagen_nueva(cw * cols, ch * filas, fondo ?? [0, 0, 0, 0])
+    sea i = 0
+    para im en imagenes {
+        r = revelado_insertar(r, im, (i % cols) * cw, cociente(i, cols) * ch)
+        i = i + 1
+    }
+    retornar r
+}
+
+// ---------- remuestreo (como Pillow) ----------
+
+funcion _rv_sinc(x) {
+    si (x == 0) { retornar 1.0 }
+    sea a = x * 3.141592653589793
+    retornar seno(a) / a
+}
+
+funcion _rv_filtro(nombre, x) {
+    si (nombre == "box") { retornar si(x > -0.5 y x <= 0.5, 1.0, 0.0) }
+    si (nombre == "bilinear") {
+        sea a = absoluto(x)
+        retornar si(a < 1.0, 1.0 - a, 0.0)
+    }
+    si (nombre == "bicubic") {
+        sea a = absoluto(x)
+        si (a < 1.0) { retornar ((-0.5 + 2.0) * a - (-0.5 + 3.0)) * a * a + 1 }
+        si (a < 2.0) { retornar (((a - 5) * a + 8) * a - 4) * -0.5 }
+        retornar 0.0
+    }
+    si (nombre == "lanczos" o nombre == "lanczos3") {
+        si (x > -3.0 y x < 3.0) { retornar _rv_sinc(x) * _rv_sinc(x / 3.0) }
+        retornar 0.0
+    }
+    lanzar "revelado: núcleo desconocido " + nombre
+}
+
+funcion _rv_soporte(nombre) { retornar {"box": 0.5, "bilinear": 1.0, "bicubic": 2.0, "lanczos": 3.0, "lanczos3": 3.0}[nombre] }
+
+// Coeficientes en punto fijo de 22 bits para cada píxel de salida: [xmin, [k…]].
+funcion _rv_coeficientes(tam_ent, tam_sal, nombre) {
+    sea escala = tam_ent / tam_sal
+    sea fescala = maximo(escala, 1.0)
+    sea soporte = _rv_soporte(nombre) * fescala
+    sea ss = 1.0 / fescala
+    sea r = []
+    para xx en lista_rango(0, tam_sal) {
+        sea centro = (xx + 0.5) * escala
+        sea xmin = _rv_trunc(centro - soporte + 0.5)
+        si (xmin < 0) { xmin = 0 }
+        sea xmax = _rv_trunc(centro + soporte + 0.5)
+        si (xmax > tam_ent) { xmax = tam_ent }
+        sea ks = []
+        sea total = 0.0
+        para x en lista_rango(0, xmax - xmin) {
+            sea w = _rv_filtro(nombre, (x + xmin - centro + 0.5) * ss)
+            ks.agregar(w)
+            total = total + w
+        }
+        sea fijos = []
+        para k en ks {
+            sea v = si(total != 0, k / total, k)
+            fijos.agregar(si(v < 0, _rv_trunc(-0.5 + v * 4194304), _rv_trunc(0.5 + v * 4194304)))
+        }
+        r.agregar([xmin, fijos])
+    }
+    retornar r
+}
+
+funcion _rv_trunc(v) {
+    si (v < 0) { retornar 0 - piso(0 - v) }
+    retornar piso(v)
+}
+
+funcion _rv_clip22(v) {
+    si (v <= 0) { retornar 0 }
+    si (v >= 1073741824) { retornar 255 }
+    retornar cociente(v, 4194304)
+}
+
+// Premultiplica / despremultiplica el alfa (como RGBA ↔ RGBa de Pillow).
+funcion _rv_opaca(img) {
+    sea p = img["pixeles"]
+    sea i = 3
+    mientras (i < longitud(p)) {
+        si (byte_en(p, i) != 255) { retornar falso }
+        i = i + 4
+    }
+    retornar verdadero
+}
+
+funcion _rv_premultiplicar(lista, inverso) {
+    sea i = 0
+    mientras (i < longitud(lista)) {
+        sea a = lista[i + 3]
+        para k en lista_rango(0, 3) {
+            sea c = lista[i + k]
+            si (inverso) {
+                lista[i + k] = si(a == 0, 0, _rv_clip(cociente(c * 255 + cociente(a, 2), a)))
+            } sino {
+                sea t = c * a + 128
+                lista[i + k] = cociente(t + cociente(t, 256), 256)
+            }
+        }
+        i = i + 4
+    }
+    retornar lista
+}
+
+/// Redimensiona a ancho × alto. núcleo: "nearest", "bilinear", "bicubic",
+/// "lanczos" (por defecto) o "box".
+funcion revelado_redimensionar(img, ancho, alto, nucleo) {
+    sea nombre = texto_minusculas(nucleo ?? "lanczos")
+    sea w = img["ancho"]
+    sea h = img["alto"]
+    si (nombre == "nearest") {
+        sea p = img["pixeles"]
+        sea px = []
+        para f en lista_rango(0, alto) {
+            sea sy = minimo(h - 1, piso((f + 0.5) * h / alto))
+            para c en lista_rango(0, ancho) {
+                sea sx = minimo(w - 1, piso((c + 0.5) * w / ancho))
+                px.agregar(subtexto(p, (sy * w + sx) * 4, (sy * w + sx) * 4 + 4))
+            }
+        }
+        retornar _rv_img(ancho, alto, unir(px, ""))
+    }
+    sea datos = _rv_lista(img)
+    sea opaca = _rv_opaca(img)
+    si (opaca == falso) { datos = _rv_premultiplicar(datos, falso) }
+    // Pasada horizontal.
+    si (ancho != w) {
+        sea co = _rv_coeficientes(w, ancho, nombre)
+        sea r = []
+        para f en lista_rango(0, h) {
+            sea base = f * w * 4
+            para c en co {
+                sea xmin = c[0]
+                sea ks = c[1]
+                para banda en lista_rango(0, 4) {
+                    sea s = 2097152
+                    sea k = 0
+                    mientras (k < longitud(ks)) {
+                        s = s + datos[base + (xmin + k) * 4 + banda] * ks[k]
+                        k = k + 1
+                    }
+                    r.agregar(_rv_clip22(s))
+                }
+            }
+        }
+        datos = r
+        w = ancho
+    }
+    si (alto != h) {
+        sea co = _rv_coeficientes(h, alto, nombre)
+        sea r = []
+        para c en co {
+            sea ymin = c[0]
+            sea ks = c[1]
+            para x en lista_rango(0, w) {
+                para banda en lista_rango(0, 4) {
+                    sea s = 2097152
+                    sea k = 0
+                    mientras (k < longitud(ks)) {
+                        s = s + datos[((ymin + k) * w + x) * 4 + banda] * ks[k]
+                        k = k + 1
+                    }
+                    r.agregar(_rv_clip22(s))
+                }
+            }
+        }
+        datos = r
+    }
+    si (opaca == falso) { datos = _rv_premultiplicar(datos, verdadero) }
+    retornar _rv_img(ancho, alto, _rv_bytes(datos))
+}
+
+/// Achica (o agranda) para caber en ancho × alto sin deformar.
+funcion revelado_miniatura(img, ancho, alto, nucleo) {
+    sea escala = minimo(ancho / img["ancho"], alto / img["alto"])
+    sea w = maximo(1, _rv_trunc(img["ancho"] * escala + 0.5))
+    sea h = maximo(1, _rv_trunc(img["alto"] * escala + 0.5))
+    retornar revelado_redimensionar(img, w, h, nucleo ?? "lanczos")
+}
+
+// ---------- color y tono ----------
+
+// Aplica f(valor, banda) a cada byte (las bandas 0-2 si solo_color).
+funcion _rv_por_byte(img, solo_color, f) {
+    sea p = img["pixeles"]
+    sea r = []
+    sea n = longitud(p)
+    sea i = 0
+    mientras (i < n) {
+        sea banda = i % 4
+        si (solo_color y banda == 3) { r.agregar(byte_en(p, i)) } sino { r.agregar(f(byte_en(p, i), banda)) }
+        i = i + 1
+    }
+    retornar _rv_img(img["ancho"], img["alto"], _rv_bytes(r))
+}
+
+/// Escala de grises (luma ITU-R 601 en enteros, como Pillow "L").
+funcion revelado_gris(img) {
+    sea p = img["pixeles"]
+    sea r = []
+    sea i = 0
+    mientras (i < longitud(p)) {
+        sea l = cociente(byte_en(p, i) * 19595 + byte_en(p, i + 1) * 38470 + byte_en(p, i + 2) * 7471 + 32768, 65536)
+        r.agregar(l)
+        r.agregar(l)
+        r.agregar(l)
+        r.agregar(byte_en(p, i + 3))
+        i = i + 4
+    }
+    retornar _rv_img(img["ancho"], img["alto"], _rv_bytes(r))
+}
+
+/// Aplica una tabla de 256 valores a cada banda de color (como maplut).
+funcion revelado_tabla(img, tabla) { retornar _rv_por_byte(img, verdadero, funcion(v, banda) { retornar tabla[v] }) }
+
+funcion revelado_negativo(img) { retornar _rv_por_byte(img, verdadero, funcion(v, b) { retornar 255 - v }) }
+
+/// a·x + b por banda de color, con redondeo y recorte a 0..255.
+funcion revelado_lineal(img, a, b) {
+    sea t = []
+    para v en lista_rango(0, 256) { t.agregar(_rv_redondear(a * v + b)) }
+    retornar _rv_por_byte(img, verdadero, funcion(v, banda) { retornar t[v] })
+}
+
+/// Corrección gamma: 255·(x/255)^(1/gamma).
+funcion revelado_gamma(img, gamma) {
+    sea t = []
+    para v en lista_rango(0, 256) { t.agregar(_rv_redondear(255 * potencia(v / 255, 1 / gamma))) }
+    retornar _rv_por_byte(img, verdadero, funcion(v, banda) { retornar t[v] })
+}
+
+/// Blanco y negro: 255 si el gris ≥ umbral.
+funcion revelado_umbral(img, umbral) {
+    sea g = revelado_gris(img)
+    retornar _rv_por_byte(g, verdadero, funcion(v, b) { retornar si(v >= umbral, 255, 0) })
+}
+
+/// Histograma de 256 casillas por banda: [[…R…], [G], [B], [A]].
+funcion revelado_histograma(img) {
+    sea r = []
+    para b en lista_rango(0, 4) {
+        sea h = []
+        para v en lista_rango(0, 256) { h.agregar(0) }
+        r.agregar(h)
+    }
+    sea p = img["pixeles"]
+    sea i = 0
+    mientras (i < longitud(p)) {
+        r[i % 4][byte_en(p, i)] = r[i % 4][byte_en(p, i)] + 1
+        i = i + 1
+    }
+    retornar r
+}
+
+/// Estadísticas por banda: [{"min", "max", "media", "desviacion"}] (R, G, B, A).
+funcion revelado_estadisticas(img) {
+    sea r = []
+    sea n = img["ancho"] * img["alto"]
+    para hist en revelado_histograma(img) {
+        sea mn = -1
+        sea mx = 0
+        sea suma = 0
+        sea suma2 = 0
+        para v en lista_rango(0, 256) {
+            si (hist[v] > 0) {
+                si (mn < 0) { mn = v }
+                mx = v
+                suma = suma + v * hist[v]
+                suma2 = suma2 + v * v * hist[v]
+            }
+        }
+        sea media = suma / n
+        r.agregar({"min": mn, "max": mx, "media": media, "desviacion": raiz(maximo(0, suma2 / n - media * media))})
+    }
+    retornar r
+}
+
+/// Estira cada banda de color para usar todo el rango (ImageOps.autocontrast).
+funcion revelado_autocontraste(img) {
+    sea hs = revelado_histograma(img)
+    sea tablas = []
+    para b en lista_rango(0, 3) {
+        sea h = hs[b]
+        sea lo = 0
+        mientras (lo < 256 y h[lo] == 0) { lo = lo + 1 }
+        sea hi = 255
+        mientras (hi >= 0 y h[hi] == 0) { hi = hi - 1 }
+        sea t = []
+        si (hi <= lo) { para v en lista_rango(0, 256) { t.agregar(v) } } sino {
+            sea escala = 255.0 / (hi - lo)
+            sea desp = 0 - lo * escala
+            para v en lista_rango(0, 256) { t.agregar(_rv_clip(_rv_trunc(v * escala + desp))) }
+        }
+        tablas.agregar(t)
+    }
+    retornar _rv_por_byte(img, verdadero, funcion(v, banda) { retornar tablas[banda][v] })
+}
+
+/// Ecualización del histograma por banda (ImageOps.equalize).
+funcion revelado_ecualizar(img) {
+    sea hs = revelado_histograma(img)
+    sea tablas = []
+    para b en lista_rango(0, 3) {
+        sea h = hs[b]
+        sea no_cero = []
+        para v en h {
+            si (v > 0) { no_cero.agregar(v) }
+        }
+        sea t = []
+        si (longitud(no_cero) <= 1) { para v en lista_rango(0, 256) { t.agregar(v) } } sino {
+            sea total = 0
+            para v en h { total = total + v }
+            sea paso = cociente(total - no_cero[longitud(no_cero) - 1], 255)
+            si (paso == 0) { para v en lista_rango(0, 256) { t.agregar(v) } } sino {
+                sea n = cociente(paso, 2)
+                para v en lista_rango(0, 256) {
+                    t.agregar(minimo(255, cociente(n, paso)))
+                    n = n + h[v]
+                }
+            }
+        }
+        tablas.agregar(t)
+    }
+    retornar _rv_por_byte(img, verdadero, funcion(v, banda) { retornar tablas[banda][v] })
+}
+
+/// Composición "over": "arriba" (con alfa) sobre "abajo", en (x, y).
+funcion revelado_componer(abajo, arriba, x, y) {
+    sea w = abajo["ancho"]
+    sea h = abajo["alto"]
+    sea p = abajo["pixeles"]
+    sea q = arriba["pixeles"]
+    sea r = _rv_lista(abajo)
+    para f en lista_rango(maximo(0, y), minimo(h, y + arriba["alto"])) {
+        para c en lista_rango(maximo(0, x), minimo(w, x + arriba["ancho"])) {
+            sea i = (f * w + c) * 4
+            sea j = ((f - y) * arriba["ancho"] + (c - x)) * 4
+            sea sa = byte_en(q, j + 3)
+            si (sa == 255) {
+                para k en lista_rango(0, 4) { r[i + k] = byte_en(q, j + k) }
+            } sino si (sa > 0) {
+                sea da = r[i + 3]
+                // Como Image.alpha_composite (en punto flotante y redondeo).
+                sea oa = sa + da * (255 - sa) / 255
+                para k en lista_rango(0, 3) {
+                    sea v = (byte_en(q, j + k) * sa + r[i + k] * da * (255 - sa) / 255) / oa
+                    r[i + k] = _rv_redondear(v)
+                }
+                r[i + 3] = _rv_redondear(oa)
+            }
+        }
+    }
+    retornar _rv_img(w, h, _rv_bytes(r))
+}
+
+// ---------- filtros ----------
+
+// Convolución separable en punto flotante con bordes extendidos.
+funcion _rv_separable(img, nucleo, solo_color) {
+    sea w = img["ancho"]
+    sea h = img["alto"]
+    sea datos = _rv_lista(img)
+    sea radio = cociente(longitud(nucleo) - 1, 2)
+    sea tmp = []
+    para f en lista_rango(0, h) {
+        para c en lista_rango(0, w) {
+            para b en lista_rango(0, 4) {
+                si (solo_color y b == 3) { tmp.agregar(datos[(f * w + c) * 4 + 3]) } sino {
+                    sea s = 0.0
+                    para k en lista_rango(0, longitud(nucleo)) {
+                        sea x = minimo(w - 1, maximo(0, c + k - radio))
+                        s = s + datos[(f * w + x) * 4 + b] * nucleo[k]
+                    }
+                    tmp.agregar(s)
+                }
+            }
+        }
+    }
+    sea r = []
+    para f en lista_rango(0, h) {
+        para c en lista_rango(0, w) {
+            para b en lista_rango(0, 4) {
+                si (solo_color y b == 3) { r.agregar(datos[(f * w + c) * 4 + 3]) } sino {
+                    sea s = 0.0
+                    para k en lista_rango(0, longitud(nucleo)) {
+                        sea fy = minimo(h - 1, maximo(0, f + k - radio))
+                        s = s + tmp[(fy * w + c) * 4 + b] * nucleo[k]
+                    }
+                    r.agregar(s)
+                }
+            }
+        }
+    }
+    retornar r
+}
+
+funcion _rv_gauss(sigma) {
+    sea radio = piso(3 * sigma + 0.5)
+    sea ks = []
+    sea total = 0.0
+    para i en lista_rango(0 - radio, radio + 1) {
+        sea v = exponencial(0 - (i * i) / (2 * sigma * sigma))
+        ks.agregar(v)
+        total = total + v
+    }
+    sea r = []
+    para k en ks { r.agregar(k / total) }
+    retornar r
+}
+
+/// Desenfoque gaussiano (radio 3σ, bordes extendidos).
+funcion revelado_desenfocar(img, sigma) {
+    si (sigma <= 0) { retornar img }
+    sea r = []
+    para v en _rv_separable(img, _rv_gauss(sigma), verdadero) { r.agregar(_rv_redondear(v)) }
+    retornar _rv_img(img["ancho"], img["alto"], _rv_bytes(r))
+}
+
+/// Máscara de enfoque: x + cantidad·(x − gauss(x, sigma)).
+funcion revelado_enfocar(img, sigma, cantidad) {
+    sea borroso = _rv_separable(img, _rv_gauss(sigma), verdadero)
+    sea p = img["pixeles"]
+    sea r = []
+    sea i = 0
+    mientras (i < longitud(p)) {
+        si (i % 4 == 3) { r.agregar(byte_en(p, i)) } sino {
+            sea v = byte_en(p, i)
+            r.agregar(_rv_redondear(v + cantidad * (v - borroso[i])))
+        }
+        i = i + 1
+    }
+    retornar _rv_img(img["ancho"], img["alto"], _rv_bytes(r))
+}
+
+/// Convolución con un núcleo cuadrado (lista de filas), dividido por
+/// "escala" y sumado "desplazamiento"; bordes extendidos.
+funcion revelado_convolucion(img, nucleo, escala, desplazamiento) {
+    sea w = img["ancho"]
+    sea h = img["alto"]
+    sea datos = _rv_lista(img)
+    sea n = longitud(nucleo)
+    sea radio = cociente(n - 1, 2)
+    sea es = escala ?? 1
+    sea de = desplazamiento ?? 0
+    sea r = []
+    para f en lista_rango(0, h) {
+        para c en lista_rango(0, w) {
+            para b en lista_rango(0, 4) {
+                si (b == 3) { r.agregar(datos[(f * w + c) * 4 + 3]) } sino {
+                    sea s = 0.0
+                    para ky en lista_rango(0, n) {
+                        sea fy = minimo(h - 1, maximo(0, f + ky - radio))
+                        para kx en lista_rango(0, n) {
+                            sea x = minimo(w - 1, maximo(0, c + kx - radio))
+                            s = s + datos[(fy * w + x) * 4 + b] * nucleo[ky][kx]
+                        }
+                    }
+                    r.agregar(_rv_redondear(s / es + de))
+                }
+            }
+        }
+    }
+    retornar _rv_img(w, h, _rv_bytes(r))
+}
+
+/// Magnitud del gradiente de Sobel sobre el gris (en gris).
+funcion revelado_bordes(img) {
+    sea g = revelado_gris(img)
+    sea w = g["ancho"]
+    sea h = g["alto"]
+    sea p = g["pixeles"]
+    sea v = funcion(x, y) { retornar byte_en(p, (minimo(h - 1, maximo(0, y)) * w + minimo(w - 1, maximo(0, x))) * 4) }
+    sea r = []
+    para f en lista_rango(0, h) {
+        para c en lista_rango(0, w) {
+            sea gx = v(c + 1, f - 1) + 2 * v(c + 1, f) + v(c + 1, f + 1) - v(c - 1, f - 1) - 2 * v(c - 1, f) - v(c - 1, f + 1)
+            sea gy = v(c - 1, f + 1) + 2 * v(c, f + 1) + v(c + 1, f + 1) - v(c - 1, f - 1) - 2 * v(c, f - 1) - v(c + 1, f - 1)
+            sea m = _rv_redondear(raiz(gx * gx + gy * gy))
+            r.agregar(m)
+            r.agregar(m)
+            r.agregar(m)
+            r.agregar(byte_en(p, (f * w + c) * 4 + 3))
+        }
+    }
+    retornar _rv_img(w, h, _rv_bytes(r))
+}
+
+// ---------- JPEG baseline ----------
+
+sea _RV_ZIGZAG = [0, 1, 8, 16, 9, 2, 3, 10, 17, 24, 32, 25, 18, 11, 4, 5, 12, 19, 26, 33, 40, 48, 41, 34, 27, 20, 13, 6, 7, 14, 21, 28, 35, 42, 49, 56, 57, 50, 43, 36, 29, 22, 15, 23, 30, 37, 44, 51, 58, 59, 52, 45, 38, 31, 39, 46, 53, 60, 61, 54, 47, 55, 62, 63]
+sea _RV_QL = [16, 11, 10, 16, 24, 40, 51, 61, 12, 12, 14, 19, 26, 58, 60, 55, 14, 13, 16, 24, 40, 57, 69, 56, 14, 17, 22, 29, 51, 87, 80, 62, 18, 22, 37, 56, 68, 109, 103, 77, 24, 35, 55, 64, 81, 104, 113, 92, 49, 64, 78, 87, 103, 121, 120, 101, 72, 92, 95, 98, 112, 100, 103, 99]
+sea _RV_QC = [17, 18, 24, 47, 99, 99, 99, 99, 18, 21, 26, 66, 99, 99, 99, 99, 24, 26, 56, 99, 99, 99, 99, 99, 47, 66, 99, 99, 99, 99, 99, 99, 99, 99, 99, 99, 99, 99, 99, 99, 99, 99, 99, 99, 99, 99, 99, 99, 99, 99, 99, 99, 99, 99, 99, 99, 99, 99, 99, 99, 99, 99, 99, 99]
+// Tablas de Huffman estándar (JPEG anexo K): [cuentas por largo, símbolos].
+sea _RV_DC_L = [[0, 1, 5, 1, 1, 1, 1, 1, 1, 0, 0, 0, 0, 0, 0, 0], [0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11]]
+sea _RV_DC_C = [[0, 3, 1, 1, 1, 1, 1, 1, 1, 1, 1, 0, 0, 0, 0, 0], [0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11]]
+sea _RV_AC_L = [[0, 2, 1, 3, 3, 2, 4, 3, 5, 5, 4, 4, 0, 0, 1, 125], [1, 2, 3, 0, 4, 17, 5, 18, 33, 49, 65, 6, 19, 81, 97, 7, 34, 113, 20, 50, 129, 145, 161, 8, 35, 66, 177, 193, 21, 82, 209, 240, 36, 51, 98, 114, 130, 9, 10, 22, 23, 24, 25, 26, 37, 38, 39, 40, 41, 42, 52, 53, 54, 55, 56, 57, 58, 67, 68, 69, 70, 71, 72, 73, 74, 83, 84, 85, 86, 87, 88, 89, 90, 99, 100, 101, 102, 103, 104, 105, 106, 115, 116, 117, 118, 119, 120, 121, 122, 131, 132, 133, 134, 135, 136, 137, 138, 146, 147, 148, 149, 150, 151, 152, 153, 154, 162, 163, 164, 165, 166, 167, 168, 169, 170, 178, 179, 180, 181, 182, 183, 184, 185, 186, 194, 195, 196, 197, 198, 199, 200, 201, 202, 210, 211, 212, 213, 214, 215, 216, 217, 218, 225, 226, 227, 228, 229, 230, 231, 232, 233, 234, 241, 242, 243, 244, 245, 246, 247, 248, 249, 250]]
+sea _RV_AC_C = [[0, 2, 1, 2, 4, 4, 3, 4, 7, 5, 4, 4, 0, 1, 2, 119], [0, 1, 2, 3, 17, 4, 5, 33, 49, 6, 18, 65, 81, 7, 97, 113, 19, 34, 50, 129, 8, 20, 66, 145, 161, 177, 193, 9, 35, 51, 82, 240, 21, 98, 114, 209, 10, 22, 36, 52, 225, 37, 241, 23, 24, 25, 26, 38, 39, 40, 41, 42, 53, 54, 55, 56, 57, 58, 67, 68, 69, 70, 71, 72, 73, 74, 83, 84, 85, 86, 87, 88, 89, 90, 99, 100, 101, 102, 103, 104, 105, 106, 115, 116, 117, 118, 119, 120, 121, 122, 130, 131, 132, 133, 134, 135, 136, 137, 138, 146, 147, 148, 149, 150, 151, 152, 153, 154, 162, 163, 164, 165, 166, 167, 168, 169, 170, 178, 179, 180, 181, 182, 183, 184, 185, 186, 194, 195, 196, 197, 198, 199, 200, 201, 202, 210, 211, 212, 213, 214, 215, 216, 217, 218, 226, 227, 228, 229, 230, 231, 232, 233, 234, 242, 243, 244, 245, 246, 247, 248, 249, 250]]
+
+funcion _rv_codigos(tabla) {
+    sea r = {}
+    sea codigo = 0
+    sea k = 0
+    para largo en lista_rango(1, 17) {
+        para i en lista_rango(0, tabla[0][largo - 1]) {
+            r["" + tabla[1][k]] = [codigo, largo]
+            codigo = codigo + 1
+            k = k + 1
+        }
+        codigo = codigo * 2
+    }
+    retornar r
+}
+
+funcion _rv_cuant(base, calidad) {
+    sea q = maximo(1, minimo(100, calidad))
+    sea escala = si(q < 50, cociente(5000, q), 200 - q * 2)
+    sea r = []
+    para v en base { r.agregar(maximo(1, minimo(255, cociente(v * escala + 50, 100)))) }
+    retornar r
+}
+
+funcion _rv_jpeg(img, calidad, sub420) {
+    sea w = img["ancho"]
+    sea h = img["alto"]
+    sea p = img["pixeles"]
+    // YCbCr en planos.
+    sea yp = []
+    sea cb = []
+    sea cr = []
+    sea i = 0
+    mientras (i < w * h * 4) {
+        sea r = byte_en(p, i)
+        sea g = byte_en(p, i + 1)
+        sea b = byte_en(p, i + 2)
+        yp.agregar(0.299 * r + 0.587 * g + 0.114 * b)
+        cb.agregar(128 - 0.168736 * r - 0.331264 * g + 0.5 * b)
+        cr.agregar(128 + 0.5 * r - 0.418688 * g - 0.081312 * b)
+        i = i + 4
+    }
+    sea ql = _rv_cuant(_RV_QL, calidad)
+    sea qc = _rv_cuant(_RV_QC, calidad)
+    sea dcl = _rv_codigos(_RV_DC_L)
+    sea acl = _rv_codigos(_RV_AC_L)
+    sea dcc = _rv_codigos(_RV_DC_C)
+    sea acc = _rv_codigos(_RV_AC_C)
+    sea mcu = si(sub420, 16, 8)
+    sea bits = {"acum": 0, "n": 0, "salida": []}
+    sea previos = [0, 0, 0]
+    // Coseno precalculado.
+    sea cosenos = []
+    para x en lista_rango(0, 8) {
+        para u en lista_rango(0, 8) { cosenos.agregar(coseno((2 * x + 1) * u * 3.141592653589793 / 16)) }
+    }
+    sea bloque = funcion(plano, pw, ph, bx, by, paso, q, dc_t, ac_t, comp) {
+        // Muestras (con promedio si paso = 2) centradas en 0.
+        sea m = []
+        para yy en lista_rango(0, 8) {
+            para xx en lista_rango(0, 8) {
+                si (paso == 1) {
+                    sea sx = minimo(pw - 1, bx + xx)
+                    sea sy = minimo(ph - 1, by + yy)
+                    m.agregar(plano[sy * pw + sx] - 128)
+                } sino {
+                    sea s = 0.0
+                    para dy en [0, 1] {
+                        para dx en [0, 1] {
+                            sea sx = minimo(pw - 1, bx + xx * 2 + dx)
+                            sea sy = minimo(ph - 1, by + yy * 2 + dy)
+                            s = s + plano[sy * pw + sx]
+                        }
+                    }
+                    m.agregar(s / 4 - 128)
+                }
+            }
+        }
+        // DCT 2D separable.
+        sea t = []
+        para yy en lista_rango(0, 8) {
+            para u en lista_rango(0, 8) {
+                sea s = 0.0
+                para xx en lista_rango(0, 8) { s = s + m[yy * 8 + xx] * cosenos[xx * 8 + u] }
+                t.agregar(s * si(u == 0, 0.7071067811865476, 1.0) / 2)
+            }
+        }
+        sea coef = []
+        para v en lista_rango(0, 8) {
+            para u en lista_rango(0, 8) {
+                sea s = 0.0
+                para yy en lista_rango(0, 8) { s = s + t[yy * 8 + u] * cosenos[yy * 8 + v] }
+                s = s * si(v == 0, 0.7071067811865476, 1.0) / 2
+                sea qv = s / q[v * 8 + u]
+                coef.agregar(si(qv < 0, 0 - piso(0.5 - qv), piso(qv + 0.5)))
+            }
+        }
+        // Entropía.
+        sea dc = coef[0] - previos[comp]
+        previos[comp] = coef[0]
+        _rv_codificar_valor(bits, dc, dc_t, 0)
+        sea ceros = 0
+        para k en lista_rango(1, 64) {
+            sea v = coef[_RV_ZIGZAG[k]]
+            si (v == 0) { ceros = ceros + 1 } sino {
+                mientras (ceros > 15) {
+                    _rv_poner(bits, ac_t["240"])
+                    ceros = ceros - 16
+                }
+                _rv_codificar_valor(bits, v, ac_t, ceros)
+                ceros = 0
+            }
+        }
+        si (ceros > 0) { _rv_poner(bits, ac_t["0"]) }
+    }
+    sea cw = si(sub420, cociente(w + 1, 2), w)
+    sea chh = si(sub420, cociente(h + 1, 2), h)
+    sea by = 0
+    mientras (by < h) {
+        sea bx = 0
+        mientras (bx < w) {
+            si (sub420) {
+                para k en [[0, 0], [8, 0], [0, 8], [8, 8]] { bloque(yp, w, h, bx + k[0], by + k[1], 1, ql, dcl, acl, 0) }
+                bloque(cb, w, h, bx, by, 2, qc, dcc, acc, 1)
+                bloque(cr, w, h, bx, by, 2, qc, dcc, acc, 2)
+            } sino {
+                bloque(yp, w, h, bx, by, 1, ql, dcl, acl, 0)
+                bloque(cb, w, h, bx, by, 1, qc, dcc, acc, 1)
+                bloque(cr, w, h, bx, by, 1, qc, dcc, acc, 2)
+            }
+            bx = bx + mcu
+        }
+        by = by + mcu
+    }
+    // Relleno con unos hasta el byte.
+    mientras (bits["n"] % 8 != 0) { _rv_poner(bits, [1, 1]) }
+    sea cuerpo = _rv_bytes(bits["salida"])
+    // Cabeceras.
+    sea seg = funcion(marca, datos) { retornar char_de(255) + char_de(marca) + bytes_entero(longitud(datos) + 2, 2, 0) + datos }
+    sea dqt = char_de(0) + _rv_bytes(_rv_zig(ql)) + char_de(1) + _rv_bytes(_rv_zig(qc))
+    sea muestreo = si(sub420, 34, 17)
+    sea sof = char_de(8) + bytes_entero(h, 2, 0) + bytes_entero(w, 2, 0) + char_de(3) + char_de(1) + char_de(muestreo) + char_de(0) + char_de(2) + char_de(17) + char_de(1) + char_de(3) + char_de(17) + char_de(1)
+    sea dht = _rv_dht(0, _RV_DC_L) + _rv_dht(16, _RV_AC_L) + _rv_dht(1, _RV_DC_C) + _rv_dht(17, _RV_AC_C)
+    sea sos = char_de(3) + char_de(1) + char_de(0) + char_de(2) + char_de(17) + char_de(3) + char_de(17) + char_de(0) + char_de(63) + char_de(0)
+    sea app0 = "JFIF" + char_de(0) + char_de(1) + char_de(1) + char_de(0) + bytes_entero(1, 2, 0) + bytes_entero(1, 2, 0) + char_de(0) + char_de(0)
+    retornar char_de(255) + char_de(216) + seg(224, app0) + seg(219, dqt) + seg(192, sof) + seg(196, dht) + seg(218, sos) + cuerpo + char_de(255) + char_de(217)
+}
+
+funcion _rv_zig(q) {
+    sea r = []
+    para k en lista_rango(0, 64) { r.agregar(q[_RV_ZIGZAG[k]]) }
+    retornar r
+}
+
+funcion _rv_dht(clase, tabla) { retornar char_de(clase) + _rv_bytes(tabla[0]) + _rv_bytes(tabla[1]) }
+
+funcion _rv_poner(bits, cod) {
+    sea codigo = cod[0]
+    sea largo = cod[1]
+    sea k = largo - 1
+    mientras (k >= 0) {
+        bits["acum"] = bits["acum"] * 2 + cociente(codigo, potencia(2, k)) % 2
+        bits["n"] = bits["n"] + 1
+        si (bits["n"] % 8 == 0) {
+            sea b = bits["acum"]
+            bits["salida"].agregar(b)
+            si (b == 255) { bits["salida"].agregar(0) }
+            bits["acum"] = 0
+        }
+        k = k - 1
+    }
+}
+
+funcion _rv_codificar_valor(bits, v, tabla, ceros) {
+    sea a = absoluto(v)
+    sea tam = 0
+    mientras (a > 0) {
+        tam = tam + 1
+        a = cociente(a, 2)
+    }
+    _rv_poner(bits, tabla["" + (ceros * 16 + tam)])
+    si (tam > 0) {
+        sea extra = si(v < 0, v + potencia(2, tam) - 1, v)
+        _rv_poner(bits, [extra, tam])
+    }
+}
