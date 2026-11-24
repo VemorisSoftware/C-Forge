@@ -1,0 +1,695 @@
+// stdlib/consola_remota.cfv — Cliente SSH 2 al estilo de libssh2, escrito
+// desde cero (idea de libssh2, BSD; protocolo de los RFC 4251-4254, 4344,
+// 8731 y draft-ietf-secsh-filexfer-02). Ejecuta comandos remotos, transfiere
+// archivos por SFTP y abre túneles TCP.
+//
+//   · Intercambio de claves curve25519-sha256, clave de host ssh-ed25519.
+//   · Cifrado aes128-ctr / aes256-ctr con hmac-sha2-256 (normal o -etm).
+//   · Autenticación por contraseña o con clave ed25519 (formato OpenSSH).
+//
+// En inglés: importar "libssh2".
+//
+//   importar "consola_remota"
+//   sea s = consola_conectar("servidor", 22, {"usuario": "ana", "clave": "…"})
+//   mostrar(consola_huella(s))                         // SHA256:…
+//   mostrar(consola_ejecutar(s, "uname -a", nulo)["salida"])
+//   consola_sftp_escribir(s, "notas.txt", "hola")
+//   consola_cerrar(s)
+//
+// Conviene comparar consola_huella con la huella conocida del servidor (o
+// pasarla en opciones["huella"], y la conexión se rechaza si no coincide).
+
+sea _SSH_VERSION = "SSH-2.0-CForge_consola_remota_1.0"
+
+// ---------- codificación ----------
+
+funcion _ssh_u32(n) { retornar bytes_entero(n, 4, 0) }
+funcion _ssh_u64(n) { retornar bytes_entero(n, 8, 0) }
+funcion _ssh_cad(t) { retornar _ssh_u32(longitud(t)) + t }
+funcion _ssh_bool(v) { retornar char_de(si(v, 1, 0)) }
+
+funcion _ssh_mpint(b) {
+    sea x = b
+    mientras (longitud(x) > 0 y byte_en(x, 0) == 0) { x = subtexto(x, 1, longitud(x)) }
+    si (longitud(x) > 0 y byte_en(x, 0) >= 128) { x = char_de(0) + x }
+    retornar _ssh_cad(x)
+}
+
+funcion _ssh_lector(d) { retornar {"d": d, "p": 0} }
+
+funcion _ssh_byte(l) {
+    si (l["p"] >= longitud(l["d"])) { lanzar "consola_remota: mensaje truncado" }
+    sea v = byte_en(l["d"], l["p"])
+    l["p"] = l["p"] + 1
+    retornar v
+}
+
+funcion _ssh_leer_u32(l) {
+    si (l["p"] + 4 > longitud(l["d"])) { lanzar "consola_remota: mensaje truncado" }
+    sea v = bytes_leer_entero(l["d"], l["p"], 4, 0)
+    l["p"] = l["p"] + 4
+    retornar v
+}
+
+funcion _ssh_leer_u64(l) {
+    sea alto = _ssh_leer_u32(l)
+    retornar alto * 4294967296 + _ssh_leer_u32(l)
+}
+
+funcion _ssh_leer_cad(l) {
+    sea n = _ssh_leer_u32(l)
+    si (l["p"] + n > longitud(l["d"])) { lanzar "consola_remota: cadena truncada" }
+    sea v = subtexto(l["d"], l["p"], l["p"] + n)
+    l["p"] = l["p"] + n
+    retornar v
+}
+
+funcion _ssh_leer_bool(l) { retornar _ssh_byte(l) != 0 }
+
+// ---------- claves ed25519 (formato OpenSSH) ----------
+
+funcion _ssh_blob_ed25519(publica) { retornar _ssh_cad("ssh-ed25519") + _ssh_cad(publica) }
+
+/// Lee una clave privada ed25519 en formato OpenSSH (sin contraseña) o una
+/// semilla de 32 bytes. Devuelve {"semilla", "publica", "comentario"}.
+funcion consola_leer_clave(texto) {
+    si (longitud(texto) == 32 y texto_contiene(texto, "-----") == falso) { retornar {"semilla": texto, "publica": ed25519_publica(texto), "comentario": ""} }
+    sea lineas = []
+    para ln en texto_dividir(texto_reemplazar(texto, "\r", ""), "\n") {
+        sea t = texto_recortar(ln)
+        si (t != "" y texto_empieza_con(t, "-----") == falso) { lineas.agregar(t) }
+    }
+    sea d = cfv_base64_decodificar(unir(lineas, ""))
+    sea magia = "openssh-key-v1" + char_de(0)
+    si (subtexto(d, 0, longitud(magia)) != magia) { lanzar "consola_remota: no es una clave privada OpenSSH" }
+    sea l = _ssh_lector(d)
+    l["p"] = longitud(magia)
+    sea cifrado = _ssh_leer_cad(l)
+    sea kdf = _ssh_leer_cad(l)
+    _ssh_leer_cad(l)
+    si (cifrado != "none" o kdf != "none") { lanzar "consola_remota: la clave está protegida con contraseña (no soportado)" }
+    si (_ssh_leer_u32(l) != 1) { lanzar "consola_remota: se esperaba una sola clave" }
+    _ssh_leer_cad(l)
+    sea priv = _ssh_lector(_ssh_leer_cad(l))
+    si (_ssh_leer_u32(priv) != _ssh_leer_u32(priv)) { lanzar "consola_remota: clave privada dañada" }
+    sea tipo_clave = _ssh_leer_cad(priv)
+    si (tipo_clave != "ssh-ed25519") { lanzar "consola_remota: solo se soportan claves ssh-ed25519 (es " + tipo_clave + ")" }
+    sea publica = _ssh_leer_cad(priv)
+    sea privada = _ssh_leer_cad(priv)
+    sea comentario = _ssh_leer_cad(priv)
+    sea semilla = subtexto(privada, 0, 32)
+    si (ed25519_publica(semilla) != publica) { lanzar "consola_remota: la clave pública no corresponde a la privada" }
+    retornar {"semilla": semilla, "publica": publica, "comentario": comentario}
+}
+
+/// Genera una clave ed25519 nueva: {"privada": texto OpenSSH, "publica":
+/// línea "ssh-ed25519 AAAA… comentario" para authorized_keys}.
+funcion consola_generar_clave(comentario, semilla) {
+    sea s = semilla ?? bytes_aleatorios(32)
+    sea pub = ed25519_publica(s)
+    sea blob = _ssh_blob_ed25519(pub)
+    sea control = bytes_aleatorios(4)
+    sea priv = control + control + _ssh_cad("ssh-ed25519") + _ssh_cad(pub) + _ssh_cad(s + pub) + _ssh_cad(comentario ?? "")
+    sea k = 1
+    mientras (longitud(priv) % 8 != 0) {
+        priv = priv + char_de(k)
+        k = k + 1
+    }
+    sea d = "openssh-key-v1" + char_de(0) + _ssh_cad("none") + _ssh_cad("none") + _ssh_cad("") + _ssh_u32(1) + _ssh_cad(blob) + _ssh_cad(priv)
+    sea b64 = cfv_base64_codificar(d)
+    sea lineas = ["-----BEGIN OPENSSH PRIVATE KEY-----"]
+    sea i = 0
+    mientras (i < longitud(b64)) {
+        lineas.agregar(subtexto(b64, i, minimo(i + 70, longitud(b64))))
+        i = i + 70
+    }
+    lineas.agregar("-----END OPENSSH PRIVATE KEY-----")
+    retornar {"privada": unir(lineas, "\n") + "\n", "publica": texto_recortar("ssh-ed25519 " + cfv_base64_codificar(blob) + " " + (comentario ?? ""))}
+}
+
+/// Huella SHA256 de una clave pública (blob SSH) como la muestra ssh-keygen.
+funcion consola_huella_de(blob) {
+    sea b = cfv_base64_codificar(sha256_bytes(blob))
+    mientras (texto_termina_con(b, "=")) { b = subtexto(b, 0, longitud(b) - 1) }
+    retornar "SHA256:" + b
+}
+
+// ---------- transporte ----------
+
+funcion _ssh_leer_exacto(s, n) {
+    mientras (longitud(s["buf"]) < n) {
+        sea x = net_recibir(s["sock"], 65536)
+        si (x == "") { lanzar "consola_remota: la conexión se cerró o no respondió" }
+        s["buf"] = s["buf"] + x
+    }
+    sea r = subtexto(s["buf"], 0, n)
+    s["buf"] = subtexto(s["buf"], n, longitud(s["buf"]))
+    retornar r
+}
+
+funcion _ssh_leer_linea(s) {
+    mientras (texto_contiene(s["buf"], "\n") == falso) {
+        si (longitud(s["buf"]) > 8192) { lanzar "consola_remota: el servidor no envió una versión SSH" }
+        sea x = net_recibir(s["sock"], 65536)
+        si (x == "") { lanzar "consola_remota: la conexión se cerró antes de la versión" }
+        s["buf"] = s["buf"] + x
+    }
+    sea k = texto_indice(s["buf"], "\n")
+    sea r = subtexto(s["buf"], 0, k)
+    s["buf"] = subtexto(s["buf"], k + 1, longitud(s["buf"]))
+    retornar texto_reemplazar(r, "\r", "")
+}
+
+// Flujo AES-CTR: n bytes (múltiplo de 16) de clave de flujo.
+funcion _ssh_ctr(c, n) {
+    sea partes = []
+    sea k = 0
+    mientras (k < n) {
+        partes.agregar(aes_bloque(c["clave"], c["contador"]))
+        // Contador de 128 bits big endian.
+        sea ctr = c["contador"]
+        sea i = 15
+        sea nuevo = ""
+        sea acarreo = 1
+        mientras (i >= 0) {
+            sea v = byte_en(ctr, i) + acarreo
+            acarreo = si(v > 255, 1, 0)
+            nuevo = char_de(v % 256) + nuevo
+            i = i - 1
+        }
+        c["contador"] = nuevo
+        k = k + 16
+    }
+    retornar unir(partes, "")
+}
+
+funcion _ssh_enviar(s, payload) {
+    sea c = s["tx"]
+    sea bloque = si(c == nulo, 8, 16)
+    sea etm = c != nulo y c["etm"]
+    sea base = si(etm, 1, 5) + longitud(payload)
+    sea relleno = bloque - base % bloque
+    si (relleno < 4) { relleno = relleno + bloque }
+    sea cuerpo = char_de(relleno) + payload + bytes_aleatorios(relleno)
+    sea plano = _ssh_u32(longitud(cuerpo)) + cuerpo
+    sea seq = _ssh_u32(s["seq_tx"])
+    s["seq_tx"] = (s["seq_tx"] + 1) % 4294967296
+    si (c == nulo) {
+        net_enviar(s["sock"], plano)
+        retornar nulo
+    }
+    si (etm) {
+        sea cif = bytes_xor(cuerpo, _ssh_ctr(c, longitud(cuerpo)))
+        sea cab = subtexto(plano, 0, 4)
+        net_enviar(s["sock"], cab + cif + hmac_sha256_bytes(c["mac"], seq + cab + cif))
+    } sino {
+        sea mac = hmac_sha256_bytes(c["mac"], seq + plano)
+        net_enviar(s["sock"], bytes_xor(plano, _ssh_ctr(c, longitud(plano))) + mac)
+    }
+    retornar nulo
+}
+
+// Siguiente paquete (payload), saltando ignore/debug/unimplemented.
+funcion _ssh_recibir(s) {
+    mientras (verdadero) {
+        sea p = _ssh_recibir_crudo(s)
+        sea t = byte_en(p, 0)
+        si (t == 1) {
+            sea l = _ssh_lector(p)
+            l["p"] = 1
+            sea codigo = _ssh_leer_u32(l)
+            lanzar "consola_remota: el servidor cerró la conexión (" + codigo + "): " + _ssh_leer_cad(l)
+        }
+        si (t != 2 y t != 3 y t != 4) { retornar p }
+    }
+    retornar nulo
+}
+
+funcion _ssh_recibir_crudo(s) {
+    sea c = s["rx"]
+    sea seq = _ssh_u32(s["seq_rx"])
+    s["seq_rx"] = (s["seq_rx"] + 1) % 4294967296
+    sea plano = ""
+    si (c == nulo) {
+        sea cab = _ssh_leer_exacto(s, 4)
+        sea n = bytes_leer_entero(cab, 0, 4, 0)
+        si (n > 262144) { lanzar "consola_remota: paquete demasiado grande" }
+        plano = cab + _ssh_leer_exacto(s, n)
+    } sino si (c["etm"]) {
+        sea cab = _ssh_leer_exacto(s, 4)
+        sea n = bytes_leer_entero(cab, 0, 4, 0)
+        si (n > 262144 o n % 16 != 0) { lanzar "consola_remota: paquete inválido" }
+        sea cif = _ssh_leer_exacto(s, n)
+        sea mac = _ssh_leer_exacto(s, 32)
+        si (hmac_sha256_bytes(c["mac"], seq + cab + cif) != mac) { lanzar "consola_remota: MAC incorrecta (datos alterados)" }
+        plano = cab + bytes_xor(cif, _ssh_ctr(c, n))
+    } sino {
+        sea primero = bytes_xor(_ssh_leer_exacto(s, 16), _ssh_ctr(c, 16))
+        sea n = bytes_leer_entero(primero, 0, 4, 0)
+        si (n > 262144 o (n + 4) % 16 != 0) { lanzar "consola_remota: paquete inválido" }
+        sea resto = n + 4 - 16
+        plano = primero
+        si (resto > 0) { plano = plano + bytes_xor(_ssh_leer_exacto(s, resto), _ssh_ctr(c, resto)) }
+        sea mac = _ssh_leer_exacto(s, 32)
+        si (hmac_sha256_bytes(c["mac"], seq + plano) != mac) { lanzar "consola_remota: MAC incorrecta (datos alterados)" }
+    }
+    sea relleno = byte_en(plano, 4)
+    retornar subtexto(plano, 5, longitud(plano) - relleno)
+}
+
+funcion _ssh_esperar_tipo(s, t, que) {
+    sea p = _ssh_recibir(s)
+    si (byte_en(p, 0) != t) { lanzar "consola_remota: se esperaba " + que + " y llegó el mensaje " + byte_en(p, 0) }
+    retornar p
+}
+
+// ---------- intercambio de claves ----------
+
+sea _SSH_KEX = ["curve25519-sha256", "curve25519-sha256@libssh.org"]
+sea _SSH_CIFRADOS = ["aes128-ctr", "aes256-ctr"]
+sea _SSH_MACS = ["hmac-sha2-256-etm@openssh.com", "hmac-sha2-256"]
+
+funcion _ssh_elegir(nuestros, suyos, que) {
+    sea lista = texto_dividir(suyos, ",")
+    para a en nuestros {
+        si (lista_contiene(lista, a)) { retornar a }
+    }
+    lanzar "consola_remota: no hay " + que + " en común (el servidor ofrece " + suyos + ")"
+}
+
+/// Deriva una clave de sesión (RFC 4253 §7.2). k es el mpint ya codificado.
+funcion consola_derivar(k, h, letra, sid, n) {
+    sea r = sha256_bytes(k + h + letra + sid)
+    mientras (longitud(r) < n) { r = r + sha256_bytes(k + h + r) }
+    retornar subtexto(r, 0, n)
+}
+
+funcion _ssh_kex(s) {
+    sea kexinit = char_de(20) + bytes_aleatorios(16) + _ssh_cad(unir(_SSH_KEX, ",")) + _ssh_cad("ssh-ed25519") + _ssh_cad(unir(_SSH_CIFRADOS, ",")) + _ssh_cad(unir(_SSH_CIFRADOS, ",")) +
+        _ssh_cad(unir(_SSH_MACS, ",")) + _ssh_cad(unir(_SSH_MACS, ",")) + _ssh_cad("none") + _ssh_cad("none") + _ssh_cad("") + _ssh_cad("") + _ssh_bool(falso) + _ssh_u32(0)
+    _ssh_enviar(s, kexinit)
+    sea suyo = _ssh_esperar_tipo(s, 20, "KEXINIT")
+    sea l = _ssh_lector(suyo)
+    l["p"] = 17
+    sea listas = []
+    para i en lista_rango(0, 10) { listas.agregar(_ssh_leer_cad(l)) }
+    _ssh_elegir(_SSH_KEX, listas[0], "intercambio de claves")
+    _ssh_elegir(["ssh-ed25519"], listas[1], "tipo de clave de host")
+    sea cif_tx = _ssh_elegir(_SSH_CIFRADOS, listas[2], "cifrado")
+    sea cif_rx = _ssh_elegir(_SSH_CIFRADOS, listas[3], "cifrado")
+    sea mac_tx = _ssh_elegir(_SSH_MACS, listas[4], "MAC")
+    sea mac_rx = _ssh_elegir(_SSH_MACS, listas[5], "MAC")
+    _ssh_elegir(["none"], listas[6], "compresión")
+    _ssh_elegir(["none"], listas[7], "compresión")
+    // ECDH con X25519.
+    sea priv = bytes_aleatorios(32)
+    sea q_c = x25519_base(priv)
+    _ssh_enviar(s, char_de(30) + _ssh_cad(q_c))
+    sea r = _ssh_lector(_ssh_esperar_tipo(s, 31, "KEX_ECDH_REPLY"))
+    r["p"] = 1
+    sea k_s = _ssh_leer_cad(r)
+    sea q_s = _ssh_leer_cad(r)
+    sea firma = _ssh_leer_cad(r)
+    sea kl = _ssh_lector(k_s)
+    si (_ssh_leer_cad(kl) != "ssh-ed25519") { lanzar "consola_remota: clave de host inesperada" }
+    sea pub_host = _ssh_leer_cad(kl)
+    sea compartido = x25519(priv, q_s)
+    si (compartido == bytes_de_hex("0000000000000000000000000000000000000000000000000000000000000000")) { lanzar "consola_remota: clave efímera inválida" }
+    sea k = _ssh_mpint(compartido)
+    sea h = sha256_bytes(_ssh_cad(_SSH_VERSION) + _ssh_cad(s["version_servidor"]) + _ssh_cad(kexinit) + _ssh_cad(suyo) + _ssh_cad(k_s) + _ssh_cad(q_c) + _ssh_cad(q_s) + k)
+    sea fl = _ssh_lector(firma)
+    si (_ssh_leer_cad(fl) != "ssh-ed25519") { lanzar "consola_remota: firma de host inesperada" }
+    si (ed25519_verificar(pub_host, h, _ssh_leer_cad(fl)) == falso) { lanzar "consola_remota: la firma del servidor no es válida" }
+    s["huella"] = consola_huella_de(k_s)
+    s["clave_host"] = k_s
+    si (s["huella_esperada"] != nulo y s["huella_esperada"] != s["huella"]) { lanzar "consola_remota: la huella del servidor (" + s["huella"] + ") no es la esperada" }
+    si (s["sid"] == nulo) { s["sid"] = h }
+    _ssh_enviar(s, char_de(21))
+    _ssh_esperar_tipo(s, 21, "NEWKEYS")
+    sea sid = s["sid"]
+    sea largo_tx = si(cif_tx == "aes256-ctr", 32, 16)
+    sea largo_rx = si(cif_rx == "aes256-ctr", 32, 16)
+    s["tx"] = {"clave": consola_derivar(k, h, "C", sid, largo_tx), "contador": consola_derivar(k, h, "A", sid, 16), "mac": consola_derivar(k, h, "E", sid, 32), "etm": texto_contiene(mac_tx, "etm")}
+    s["rx"] = {"clave": consola_derivar(k, h, "D", sid, largo_rx), "contador": consola_derivar(k, h, "B", sid, 16), "mac": consola_derivar(k, h, "F", sid, 32), "etm": texto_contiene(mac_rx, "etm")}
+    s["algoritmos"] = {"cifrado": cif_tx, "mac": mac_tx}
+}
+
+// ---------- conexión y autenticación ----------
+
+/// Conecta y se autentica. opciones: "usuario", "clave" (contraseña) o
+/// "clave_privada" (texto OpenSSH o semilla de 32 bytes), "huella"
+/// ("SHA256:…" esperada). Devuelve la sesión.
+funcion consola_conectar(host, puerto, opciones) {
+    sea op = opciones ?? {}
+    sea sock = net_conectar(host, puerto ?? 22)
+    sea s = {"sock": sock, "buf": "", "seq_tx": 0, "seq_rx": 0, "tx": nulo, "rx": nulo, "sid": nulo, "huella_esperada": op["huella"] ?? nulo,
+        "canales": {}, "siguiente": 0, "sftp": nulo, "sftp_id": 0}
+    net_enviar(sock, _SSH_VERSION + "\r\n")
+    sea v = _ssh_leer_linea(s)
+    mientras (texto_empieza_con(v, "SSH-") == falso) { v = _ssh_leer_linea(s) }
+    si (texto_empieza_con(v, "SSH-2.0-") == falso y texto_empieza_con(v, "SSH-1.99-") == falso) { lanzar "consola_remota: versión de protocolo no soportada: " + v }
+    s["version_servidor"] = v
+    _ssh_kex(s)
+    _ssh_enviar(s, char_de(5) + _ssh_cad("ssh-userauth"))
+    _ssh_esperar_tipo(s, 6, "SERVICE_ACCEPT")
+    sea usuario = op["usuario"] ?? "root"
+    sea ok = falso
+    sea metodos = ""
+    si ((op["clave_privada"] ?? nulo) != nulo) {
+        sea k = consola_leer_clave(op["clave_privada"])
+        sea blob = _ssh_blob_ed25519(k["publica"])
+        sea datos = _ssh_cad(s["sid"]) + char_de(50) + _ssh_cad(usuario) + _ssh_cad("ssh-connection") + _ssh_cad("publickey") + _ssh_bool(verdadero) + _ssh_cad("ssh-ed25519") + _ssh_cad(blob)
+        sea firma = _ssh_cad("ssh-ed25519") + _ssh_cad(ed25519_firmar(k["semilla"], datos))
+        _ssh_enviar(s, subtexto(datos, 4 + longitud(s["sid"]), longitud(datos)) + _ssh_cad(firma))
+        sea r = _ssh_respuesta_auth(s)
+        ok = r[0]
+        metodos = r[1]
+    }
+    si (ok == falso y (op["clave"] ?? nulo) != nulo) {
+        _ssh_enviar(s, char_de(50) + _ssh_cad(usuario) + _ssh_cad("ssh-connection") + _ssh_cad("password") + _ssh_bool(falso) + _ssh_cad(op["clave"]))
+        sea r = _ssh_respuesta_auth(s)
+        ok = r[0]
+        metodos = r[1]
+    }
+    si (ok == falso) {
+        net_cerrar(sock)
+        lanzar "consola_remota: autenticación rechazada para " + usuario + si(metodos != "", " (métodos aceptados: " + metodos + ")", "")
+    }
+    s["usuario"] = usuario
+    retornar s
+}
+
+funcion _ssh_respuesta_auth(s) {
+    mientras (verdadero) {
+        sea p = _ssh_recibir(s)
+        sea t = byte_en(p, 0)
+        si (t == 52) { retornar [verdadero, ""] }
+        si (t == 51) {
+            sea l = _ssh_lector(p)
+            l["p"] = 1
+            retornar [falso, _ssh_leer_cad(l)]
+        }
+        si (t != 53) { lanzar "consola_remota: respuesta de autenticación inesperada " + t }
+    }
+    retornar nulo
+}
+
+/// Huella SHA256 de la clave del servidor.
+funcion consola_huella(s) { retornar s["huella"] }
+
+/// Algoritmos negociados: {"cifrado", "mac"}.
+funcion consola_algoritmos(s) { retornar s["algoritmos"] }
+
+/// Cierra la sesión.
+funcion consola_cerrar(s) {
+    intentar { _ssh_enviar(s, char_de(1) + _ssh_u32(11) + _ssh_cad("adiós") + _ssh_cad("")) } capturar (e) { }
+    net_cerrar(s["sock"])
+}
+
+// ---------- canales ----------
+
+sea _SSH_VENTANA = 2097152
+
+funcion _ssh_abrir_canal(s, tipo_canal, extra) {
+    sea id = s["siguiente"]
+    s["siguiente"] = id + 1
+    sea c = {"id": id, "remoto": -1, "ventana": 0, "max": 32768, "datos": "", "error": "", "eof": falso, "cerrado": falso, "cerre": falso, "estado": nulo,
+        "respuesta": nulo, "consumido": 0, "abierto": nulo}
+    s["canales"]["" + id] = c
+    _ssh_enviar(s, char_de(90) + _ssh_cad(tipo_canal) + _ssh_u32(id) + _ssh_u32(_SSH_VENTANA) + _ssh_u32(32768) + extra)
+    mientras (c["abierto"] == nulo) { _ssh_procesar(s) }
+    si (c["abierto"] != verdadero) { lanzar "consola_remota: el servidor rechazó el canal " + tipo_canal + ": " + c["abierto"] }
+    retornar c
+}
+
+// Procesa un mensaje del servidor y actualiza el canal que corresponda.
+funcion _ssh_procesar(s) {
+    sea p = _ssh_recibir(s)
+    sea t = byte_en(p, 0)
+    sea l = _ssh_lector(p)
+    l["p"] = 1
+    si (t == 80) {
+        _ssh_leer_cad(l)
+        si (_ssh_leer_bool(l)) { _ssh_enviar(s, char_de(82)) }
+        retornar nulo
+    }
+    si (t < 91 o t > 100) { retornar nulo }
+    sea c = s["canales"]["" + _ssh_leer_u32(l)] ?? nulo
+    si (c == nulo) { retornar nulo }
+    si (t == 91) {
+        c["remoto"] = _ssh_leer_u32(l)
+        c["ventana"] = _ssh_leer_u32(l)
+        c["max"] = minimo(_ssh_leer_u32(l), 32768)
+        c["abierto"] = verdadero
+    } sino si (t == 92) {
+        _ssh_leer_u32(l)
+        c["abierto"] = _ssh_leer_cad(l)
+    } sino si (t == 93) { c["ventana"] = c["ventana"] + _ssh_leer_u32(l) }
+    sino si (t == 94 o t == 95) {
+        sea flujo = 0
+        si (t == 95) { flujo = _ssh_leer_u32(l) }
+        sea d = _ssh_leer_cad(l)
+        si (flujo == 0) { c["datos"] = c["datos"] + d } sino { c["error"] = c["error"] + d }
+        c["consumido"] = c["consumido"] + longitud(d)
+        si (c["consumido"] > _SSH_VENTANA / 2 y c["cerrado"] == falso) {
+            _ssh_enviar(s, char_de(93) + _ssh_u32(c["remoto"]) + _ssh_u32(c["consumido"]))
+            c["consumido"] = 0
+        }
+    } sino si (t == 96) { c["eof"] = verdadero }
+    sino si (t == 97) {
+        c["cerrado"] = verdadero
+        c["eof"] = verdadero
+        si (c["cerre"] == falso) {
+            _ssh_enviar(s, char_de(97) + _ssh_u32(c["remoto"]))
+            c["cerre"] = verdadero
+        }
+    } sino si (t == 98) {
+        sea pedido = _ssh_leer_cad(l)
+        sea quiere = _ssh_leer_bool(l)
+        si (pedido == "exit-status") { c["estado"] = _ssh_leer_u32(l) }
+        si (pedido == "exit-signal") { c["estado"] = "señal " + _ssh_leer_cad(l) }
+        si (quiere) { _ssh_enviar(s, char_de(100) + _ssh_u32(c["remoto"])) }
+    } sino si (t == 99) { c["respuesta"] = verdadero }
+    sino si (t == 100) { c["respuesta"] = falso }
+    retornar nulo
+}
+
+funcion _ssh_pedido(s, c, pedido, extra) {
+    c["respuesta"] = nulo
+    _ssh_enviar(s, char_de(98) + _ssh_u32(c["remoto"]) + _ssh_cad(pedido) + _ssh_bool(verdadero) + extra)
+    mientras (c["respuesta"] == nulo) { _ssh_procesar(s) }
+    si (c["respuesta"] == falso) { lanzar "consola_remota: el servidor rechazó el pedido " + pedido }
+}
+
+funcion _ssh_canal_enviar(s, c, datos) {
+    sea i = 0
+    mientras (i < longitud(datos)) {
+        mientras (c["ventana"] <= 0) {
+            si (c["cerrado"]) { lanzar "consola_remota: el canal se cerró" }
+            _ssh_procesar(s)
+        }
+        sea n = minimo(minimo(c["ventana"], c["max"]), longitud(datos) - i)
+        _ssh_enviar(s, char_de(94) + _ssh_u32(c["remoto"]) + _ssh_cad(subtexto(datos, i, i + n)))
+        c["ventana"] = c["ventana"] - n
+        i = i + n
+    }
+}
+
+funcion _ssh_canal_cerrar(s, c) {
+    si (c["cerre"] == falso) {
+        _ssh_enviar(s, char_de(97) + _ssh_u32(c["remoto"]))
+        c["cerre"] = verdadero
+    }
+    mientras (c["cerrado"] == falso) { _ssh_procesar(s) }
+    quitar_clave(s["canales"], "" + c["id"])
+}
+
+/// Ejecuta un comando. entrada (o nulo) se envía como stdin. Devuelve
+/// {"salida", "error", "codigo"}.
+funcion consola_ejecutar(s, comando, entrada) {
+    sea c = _ssh_abrir_canal(s, "session", "")
+    _ssh_pedido(s, c, "exec", _ssh_cad(comando))
+    si (entrada != nulo) { _ssh_canal_enviar(s, c, entrada) }
+    _ssh_enviar(s, char_de(96) + _ssh_u32(c["remoto"]))
+    mientras (c["cerrado"] == falso) { _ssh_procesar(s) }
+    _ssh_canal_cerrar(s, c)
+    retornar {"salida": c["datos"], "error": c["error"], "codigo": c["estado"]}
+}
+
+/// Abre un túnel TCP hacia host:puerto visto desde el servidor.
+funcion consola_tunel_abrir(s, host, puerto) {
+    retornar _ssh_abrir_canal(s, "direct-tcpip", _ssh_cad(host) + _ssh_u32(puerto) + _ssh_cad("127.0.0.1") + _ssh_u32(0))
+}
+
+funcion consola_tunel_enviar(s, tunel, datos) { _ssh_canal_enviar(s, tunel, datos) }
+
+/// Lo que haya llegado por el túnel (espera si aún no hay nada); "" al terminar.
+funcion consola_tunel_recibir(s, tunel) {
+    mientras (tunel["datos"] == "" y tunel["eof"] == falso) { _ssh_procesar(s) }
+    sea d = tunel["datos"]
+    tunel["datos"] = ""
+    retornar d
+}
+
+funcion consola_tunel_cerrar(s, tunel) {
+    _ssh_enviar(s, char_de(96) + _ssh_u32(tunel["remoto"]))
+    _ssh_canal_cerrar(s, tunel)
+}
+
+// ---------- SFTP (versión 3) ----------
+
+funcion _ssh_sftp(s) {
+    si (s["sftp"] != nulo) { retornar s["sftp"] }
+    sea c = _ssh_abrir_canal(s, "session", "")
+    _ssh_pedido(s, c, "subsystem", _ssh_cad("sftp"))
+    _ssh_canal_enviar(s, c, _ssh_cad(char_de(1) + _ssh_u32(3)))
+    sea r = _ssh_sftp_paquete(s, c)
+    si (byte_en(r, 0) != 2) { lanzar "consola_remota: el servidor no habla SFTP" }
+    s["sftp"] = c
+    retornar c
+}
+
+funcion _ssh_sftp_paquete(s, c) {
+    mientras (longitud(c["datos"]) < 4 o longitud(c["datos"]) < 4 + bytes_leer_entero(c["datos"], 0, 4, 0)) {
+        si (c["eof"]) { lanzar "consola_remota: el canal SFTP se cerró" }
+        _ssh_procesar(s)
+    }
+    sea n = bytes_leer_entero(c["datos"], 0, 4, 0)
+    sea p = subtexto(c["datos"], 4, 4 + n)
+    c["datos"] = subtexto(c["datos"], 4 + n, longitud(c["datos"]))
+    retornar p
+}
+
+sea _SSH_SFTP_ERRORES = ["bien", "fin de archivo", "no existe", "permiso denegado", "falla", "mensaje inválido", "sin conexión", "conexión perdida", "operación no soportada"]
+
+// Envía un pedido y devuelve [tipo, lector] de la respuesta; STATUS con
+// error lanza (salvo EOF si se acepta).
+funcion _ssh_sftp_pedir(s, tipo_p, cuerpo, ruta, eof_ok) {
+    sea c = _ssh_sftp(s)
+    sea id = s["sftp_id"]
+    s["sftp_id"] = id + 1
+    _ssh_canal_enviar(s, c, _ssh_cad(char_de(tipo_p) + _ssh_u32(id) + cuerpo))
+    sea p = _ssh_sftp_paquete(s, c)
+    sea l = _ssh_lector(p)
+    sea t = _ssh_byte(l)
+    si (_ssh_leer_u32(l) != id) { lanzar "consola_remota: respuesta SFTP fuera de orden" }
+    si (t == 101) {
+        sea codigo = _ssh_leer_u32(l)
+        si (codigo == 0 o (codigo == 1 y eof_ok)) { retornar [101, codigo] }
+        sea msj = "error " + codigo
+        si (codigo < longitud(_SSH_SFTP_ERRORES)) { msj = _SSH_SFTP_ERRORES[codigo] }
+        lanzar "consola_remota: SFTP " + ruta + ": " + msj
+    }
+    retornar [t, l]
+}
+
+funcion _ssh_attrs(l) {
+    sea f = _ssh_leer_u32(l)
+    sea r = {}
+    si (bits_y(f, 1) != 0) { r["tamano"] = _ssh_leer_u64(l) }
+    si (bits_y(f, 2) != 0) {
+        r["uid"] = _ssh_leer_u32(l)
+        r["gid"] = _ssh_leer_u32(l)
+    }
+    si (bits_y(f, 4) != 0) {
+        sea p = _ssh_leer_u32(l)
+        r["permisos"] = p % 4096
+        r["es_carpeta"] = cociente(p, 4096) % 16 == 4
+    }
+    si (bits_y(f, 8) != 0) {
+        r["acceso"] = _ssh_leer_u32(l)
+        r["modificado"] = _ssh_leer_u32(l)
+    }
+    si (bits_y(f, 2147483648) != 0) {
+        sea n = _ssh_leer_u32(l)
+        para i en lista_rango(0, n) {
+            _ssh_leer_cad(l)
+            _ssh_leer_cad(l)
+        }
+    }
+    retornar r
+}
+
+funcion _ssh_abrir_archivo(s, ruta, banderas) {
+    sea r = _ssh_sftp_pedir(s, 3, _ssh_cad(ruta) + _ssh_u32(banderas) + _ssh_u32(0), ruta, falso)
+    si (r[0] != 102) { lanzar "consola_remota: SFTP " + ruta + ": respuesta inesperada" }
+    retornar _ssh_leer_cad(r[1])
+}
+
+funcion _ssh_cerrar_handle(s, h, ruta) { _ssh_sftp_pedir(s, 4, _ssh_cad(h), ruta, falso) }
+
+/// Lee un archivo remoto completo.
+funcion consola_sftp_leer(s, ruta) {
+    sea h = _ssh_abrir_archivo(s, ruta, 1)
+    sea partes = []
+    sea pos = 0
+    mientras (verdadero) {
+        sea r = _ssh_sftp_pedir(s, 5, _ssh_cad(h) + _ssh_u64(pos) + _ssh_u32(32768), ruta, verdadero)
+        si (r[0] == 101) { romper }
+        sea d = _ssh_leer_cad(r[1])
+        si (d == "") { romper }
+        partes.agregar(d)
+        pos = pos + longitud(d)
+    }
+    _ssh_cerrar_handle(s, h, ruta)
+    retornar unir(partes, "")
+}
+
+/// Escribe (crea o reemplaza) un archivo remoto.
+funcion consola_sftp_escribir(s, ruta, datos) {
+    sea h = _ssh_abrir_archivo(s, ruta, 2 + 8 + 16)
+    sea pos = 0
+    mientras (pos < longitud(datos)) {
+        sea n = minimo(30000, longitud(datos) - pos)
+        _ssh_sftp_pedir(s, 6, _ssh_cad(h) + _ssh_u64(pos) + _ssh_cad(subtexto(datos, pos, pos + n)), ruta, falso)
+        pos = pos + n
+    }
+    _ssh_cerrar_handle(s, h, ruta)
+    retornar longitud(datos)
+}
+
+/// Lista una carpeta: [{"nombre", "tamano", "permisos", "es_carpeta", "modificado", …}]
+/// ordenada por nombre, sin "." ni "..".
+funcion consola_sftp_listar(s, ruta) {
+    sea r = _ssh_sftp_pedir(s, 11, _ssh_cad(ruta), ruta, falso)
+    sea h = _ssh_leer_cad(r[1])
+    sea lista = []
+    mientras (verdadero) {
+        sea x = _ssh_sftp_pedir(s, 12, _ssh_cad(h), ruta, verdadero)
+        si (x[0] == 101) { romper }
+        sea n = _ssh_leer_u32(x[1])
+        para i en lista_rango(0, n) {
+            sea nombre = _ssh_leer_cad(x[1])
+            _ssh_leer_cad(x[1])
+            sea a = _ssh_attrs(x[1])
+            si (nombre != "." y nombre != "..") {
+                a["nombre"] = nombre
+                lista.agregar(a)
+            }
+        }
+    }
+    _ssh_cerrar_handle(s, h, ruta)
+    retornar ordenar(lista, funcion(p, q) { retornar si(p["nombre"] < q["nombre"], -1, si(p["nombre"] > q["nombre"], 1, 0)) })
+}
+
+/// Atributos de un archivo o carpeta remotos (o nulo si no existe).
+funcion consola_sftp_info(s, ruta) {
+    sea r = nulo
+    intentar { r = _ssh_sftp_pedir(s, 17, _ssh_cad(ruta), ruta, falso) } capturar (e) {
+        si (texto_contiene(e, "no existe")) { retornar nulo }
+        lanzar e
+    }
+    retornar _ssh_attrs(r[1])
+}
+
+funcion consola_sftp_borrar(s, ruta) { _ssh_sftp_pedir(s, 13, _ssh_cad(ruta), ruta, falso) }
+funcion consola_sftp_crear_carpeta(s, ruta) { _ssh_sftp_pedir(s, 14, _ssh_cad(ruta) + _ssh_u32(0), ruta, falso) }
+funcion consola_sftp_borrar_carpeta(s, ruta) { _ssh_sftp_pedir(s, 15, _ssh_cad(ruta), ruta, falso) }
+funcion consola_sftp_renombrar(s, de, a) { _ssh_sftp_pedir(s, 18, _ssh_cad(de) + _ssh_cad(a), de, falso) }
+
+/// Ruta absoluta según el servidor ("." da la carpeta inicial).
+funcion consola_sftp_ruta_real(s, ruta) {
+    sea r = _ssh_sftp_pedir(s, 16, _ssh_cad(ruta), ruta, falso)
+    _ssh_leer_u32(r[1])
+    retornar _ssh_leer_cad(r[1])
+}

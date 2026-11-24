@@ -1,0 +1,1227 @@
+// stdlib/emulador.cfv — Emulador de CPU x86-64 y ARM64 al estilo de Unicorn,
+// escrito desde cero (idea de Unicorn/QEMU, GPL: solo la idea). Usa el
+// decodificador de "desarma" y ejecuta el código instrucción por
+// instrucción sobre memoria mapeada en páginas de 4 KB, con registros de
+// 64 bits exactos, banderas y ganchos para instrucciones y llamadas al
+// sistema.
+//
+//   · x86-64: mov/movabs/movzx/movsx/movsxd, lea, push/pop, aritmética y
+//     lógica con banderas (add, adc, sub, sbb, cmp, and, or, xor, test,
+//     inc, dec, neg, not), mul/imul/div/idiv de 8 a 64 bits, shl/shr/sar/
+//     rol/ror, call/ret/jmp/jcc, cmovcc, setcc, xchg, cdq/cqo/cdqe/cwde,
+//     bswap, popcnt/tzcnt/lzcnt/bsf/bsr, stc/clc/cmc, leave, syscall, hlt.
+//   · ARM64: add/sub(s), lógica (and, orr, eor, ands, bic, orn, eon),
+//     mov/movz/movk, mul/madd/msub/smulh/umulh/udiv/sdiv, lsl/lsr/asr/ror,
+//     ubfx/sbfx/sxt*/uxt*, csel y alias, b/bl/b.cond/cbz/cbnz/tbz/tbnz/
+//     br/blr/ret, adr/adrp, ldr/str (todas las formas), ldp/stp, svc.
+//
+// En inglés: importar "unicorn".
+//
+//   importar "emulador"
+//   importar "desarma"
+//   sea e = emulador_crear("x86_64")
+//   emulador_mapear(e, 4096, 4096)
+//   sea codigo = ensambla_x86("mov rax, 6\nimul rax, rax, 7", 4096)
+//   emulador_escribir(e, 4096, codigo)
+//   emulador_ejecutar(e, 4096, 4096 + longitud(codigo), 0)
+//   mostrar(emulador_reg(e, "rax"))   // 42
+
+importar "desarma"
+
+sea _EMU_T = 4294967296
+sea _EMU_M = 4294967295
+
+// ---------- enteros de 64 bits como pares [alto, bajo] de 32 bits ----------
+
+funcion _emu_mod(n, m) {
+    sea r = n % m
+    si (r < 0) { r = r + m }
+    retornar r
+}
+
+funcion _emu_de(n) {
+    sea l = _emu_mod(n, _EMU_T)
+    retornar [_emu_mod(cociente(n - l, _EMU_T), _EMU_T), l]
+}
+
+funcion _emu_cero(a) { retornar a[0] == 0 y a[1] == 0 }
+
+funcion _emu_igual(a, b) { retornar a[0] == b[0] y a[1] == b[1] }
+
+funcion _emu_menor_u(a, b) { retornar a[0] < b[0] o (a[0] == b[0] y a[1] < b[1]) }
+
+// Entero con signo (si cabe en 63 bits) o número aproximado.
+funcion _emu_num(a) {
+    si (a[0] < 1073741824) { retornar a[0] * _EMU_T + a[1] }
+    si (a[0] >= 3221225472) { retornar (a[0] - _EMU_T) * _EMU_T + a[1] }
+    si (a[0] >= 2147483648) { retornar (a[0] - _EMU_T) * 4294967296.0 + a[1] }
+    retornar a[0] * 4294967296.0 + a[1]
+}
+
+// Dirección de memoria (sin signo; las del espacio de usuario caben).
+funcion _emu_dir(a) {
+    si (a[0] >= 1073741824) { lanzar "emulador: dirección fuera de rango 0x" + _emu_hex(a) }
+    retornar a[0] * _EMU_T + a[1]
+}
+
+funcion _emu_hex(a) {
+    sea h = "0123456789abcdef"
+    sea r = ""
+    sea x = a[1]
+    sea k = 0
+    mientras (k < 8) {
+        r = subtexto(h, x % 16, x % 16 + 1) + r
+        x = cociente(x, 16)
+        k = k + 1
+    }
+    x = a[0]
+    k = 0
+    mientras (k < 8) {
+        r = subtexto(h, x % 16, x % 16 + 1) + r
+        x = cociente(x, 16)
+        k = k + 1
+    }
+    mientras (longitud(r) > 1 y subtexto(r, 0, 1) == "0") { r = subtexto(r, 1, longitud(r)) }
+    retornar r
+}
+
+funcion _emu_suma(a, b, c) {
+    sea l = a[1] + b[1] + c
+    sea cl = si(l >= _EMU_T, 1, 0)
+    sea h = a[0] + b[0] + cl
+    sea ch = si(h >= _EMU_T, 1, 0)
+    retornar [[h % _EMU_T, l % _EMU_T], ch]
+}
+
+funcion _emu_resta(a, b, c) {
+    sea l = a[1] - b[1] - c
+    sea bl = 0
+    si (l < 0) {
+        l = l + _EMU_T
+        bl = 1
+    }
+    sea h = a[0] - b[0] - bl
+    sea bh = 0
+    si (h < 0) {
+        h = h + _EMU_T
+        bh = 1
+    }
+    retornar [[h, l], bh]
+}
+
+funcion _emu_y(a, b) { retornar [bits_y(a[0], b[0]), bits_y(a[1], b[1])] }
+funcion _emu_ob(a, b) { retornar [bits_o(a[0], b[0]), bits_o(a[1], b[1])] }
+funcion _emu_xo(a, b) { retornar [bits_xo(a[0], b[0]), bits_xo(a[1], b[1])] }
+funcion _emu_no(a) { retornar [_EMU_M - a[0], _EMU_M - a[1]] }
+funcion _emu_neg(a) { retornar _emu_resta([0, 0], a, 0)[0] }
+
+funcion _emu_izq(a, k) {
+    si (k <= 0) { retornar a }
+    si (k >= 64) { retornar [0, 0] }
+    si (k >= 32) { retornar [(a[1] % potencia(2, 64 - k)) * potencia(2, k - 32), 0] }
+    sea p = potencia(2, 32 - k)
+    retornar [(a[0] % p) * potencia(2, k) + cociente(a[1], p), (a[1] % p) * potencia(2, k)]
+}
+
+funcion _emu_der(a, k) {
+    si (k <= 0) { retornar a }
+    si (k >= 64) { retornar [0, 0] }
+    si (k >= 32) { retornar [0, cociente(a[0], potencia(2, k - 32))] }
+    sea p = potencia(2, k)
+    retornar [cociente(a[0], p), cociente(a[1], p) + (a[0] % p) * potencia(2, 32 - k)]
+}
+
+// Bits bajos de un ancho (8, 16, 32, 64).
+funcion _emu_masc(a, n) {
+    si (n >= 64) { retornar a }
+    si (n == 32) { retornar [0, a[1]] }
+    retornar [0, a[1] % potencia(2, n)]
+}
+
+funcion _emu_bit(a, i) {
+    si (i >= 32) { retornar cociente(a[0], potencia(2, i - 32)) % 2 }
+    retornar cociente(a[1], potencia(2, i)) % 2
+}
+
+funcion _emu_signo(a, n) { retornar _emu_bit(a, n - 1) }
+
+funcion _emu_ext(a, n) {
+    sea m = _emu_masc(a, n)
+    si (n >= 64 o _emu_signo(m, n) == 0) { retornar m }
+    retornar _emu_ob(m, _emu_izq([_EMU_M, _EMU_M], n))
+}
+
+funcion _emu_ari_der(a, k) {
+    si (_emu_signo(a, 64) == 0) { retornar _emu_der(a, k) }
+    si (k >= 64) { retornar [_EMU_M, _EMU_M] }
+    retornar _emu_ob(_emu_der(a, k), _emu_izq([_EMU_M, _EMU_M], 64 - k))
+}
+
+funcion _emu_rotar_der(a, k, n) {
+    sea m = _emu_masc(a, n)
+    sea r = k % n
+    si (r == 0) { retornar m }
+    retornar _emu_masc(_emu_ob(_emu_der(m, r), _emu_izq(m, n - r)), n)
+}
+
+funcion _emu_partes(a) { retornar [a[1] % 65536, cociente(a[1], 65536), a[0] % 65536, cociente(a[0], 65536)] }
+
+// Producto sin signo de 128 bits: [alto, bajo].
+funcion _emu_mul(a, b) {
+    sea x = _emu_partes(a)
+    sea w = _emu_partes(b)
+    sea r = [0, 0, 0, 0, 0, 0, 0, 0]
+    sea i = 0
+    mientras (i < 4) {
+        sea acarreo = 0
+        sea j = 0
+        mientras (j < 4) {
+            sea t = r[i + j] + x[i] * w[j] + acarreo
+            r[i + j] = t % 65536
+            acarreo = cociente(t, 65536)
+            j = j + 1
+        }
+        r[i + 4] = acarreo
+        i = i + 1
+    }
+    retornar [[r[7] * 65536 + r[6], r[5] * 65536 + r[4]], [r[3] * 65536 + r[2], r[1] * 65536 + r[0]]]
+}
+
+funcion _emu_neg128(hl) {
+    sea bajo = _emu_resta([0, 0], hl[1], 0)
+    sea alto = _emu_resta([0, 0], hl[0], bajo[1])
+    retornar [alto[0], bajo[0]]
+}
+
+funcion _emu_mul_s(a, b) {
+    sea na = _emu_signo(a, 64) == 1
+    sea nb = _emu_signo(b, 64) == 1
+    sea r = _emu_mul(si(na, _emu_neg(a), a), si(nb, _emu_neg(b), b))
+    si (na != nb) { retornar _emu_neg128(r) }
+    retornar r
+}
+
+// División sin signo de 128 bits entre 64: [cociente128_alto, cociente_bajo, resto].
+funcion _emu_div(alto, bajo, d) {
+    si (_emu_cero(d)) { lanzar "emulador: división por cero" }
+    si (_emu_cero(alto) y bajo[0] < 1073741824 y d[0] < 1073741824) {
+        sea x = _emu_num(bajo)
+        sea z = _emu_num(d)
+        retornar [[0, 0], _emu_de(cociente(x, z)), _emu_de(x - cociente(x, z) * z)]
+    }
+    sea resto = [0, 0]
+    sea qa = [0, 0]
+    sea qb = [0, 0]
+    sea i = 127
+    mientras (i >= 0) {
+        sea arriba = _emu_signo(resto, 64)
+        sea bit = si(i >= 64, _emu_bit(alto, i - 64), _emu_bit(bajo, i))
+        resto = _emu_ob(_emu_izq(resto, 1), [0, bit])
+        qa = _emu_ob(_emu_izq(qa, 1), [0, _emu_signo(qb, 64)])
+        qb = _emu_izq(qb, 1)
+        si (arriba == 1 o _emu_menor_u(resto, d) == falso) {
+            resto = _emu_resta(resto, d, 0)[0]
+            qb = _emu_ob(qb, [0, 1])
+        }
+        i = i - 1
+    }
+    retornar [qa, qb, resto]
+}
+
+// Texto ("0x1f", "-0x10", "#12", "-5") a par.
+funcion _emu_texto(t) {
+    sea s = texto_minusculas(texto_recortar(t))
+    si (texto_empieza_con(s, "#")) { s = subtexto(s, 1, longitud(s)) }
+    sea neg = falso
+    si (texto_empieza_con(s, "-")) {
+        neg = verdadero
+        s = subtexto(s, 1, longitud(s))
+    }
+    sea r = [0, 0]
+    si (texto_empieza_con(s, "0x")) {
+        sea i = 2
+        mientras (i < longitud(s)) {
+            sea d = texto_indice("0123456789abcdef", subtexto(s, i, i + 1))
+            si (d < 0) { lanzar "emulador: número inválido " + t }
+            r = _emu_ob(_emu_izq(r, 4), [0, d])
+            i = i + 1
+        }
+    } sino {
+        sea i = 0
+        mientras (i < longitud(s)) {
+            sea d = texto_indice("0123456789", subtexto(s, i, i + 1))
+            si (d < 0) { lanzar "emulador: número inválido " + t }
+            r = _emu_suma(_emu_suma(_emu_izq(r, 3), _emu_izq(r, 1), 0)[0], [0, d], 0)[0]
+            i = i + 1
+        }
+    }
+    si (neg) { retornar _emu_neg(r) }
+    retornar r
+}
+
+funcion _emu_valor(v) {
+    si (tipo(v) == "texto") { retornar _emu_texto(v) }
+    retornar _emu_de(v)
+}
+
+// ---------- memoria ----------
+
+/// Crea un emulador para "x86_64" o "arm64".
+funcion emulador_crear(arquitectura) {
+    sea arq = si(arquitectura == "arm64" o arquitectura == "aarch64", "arm64", "x86_64")
+    sea e = {"arq": arq, "paginas": {}, "cache": {}, "ganchos": {}, "detener": falso, "pc": 0, "contador": 0, "cod_min": nulo, "cod_max": nulo}
+    si (arq == "x86_64") {
+        e["r"] = []
+        para i en lista_rango(0, 16) { e["r"].agregar([0, 0]) }
+        e["f"] = {"C": 0, "P": 0, "Z": 0, "S": 0, "O": 0, "D": 0}
+    } sino {
+        e["x"] = []
+        para i en lista_rango(0, 31) { e["x"].agregar([0, 0]) }
+        e["sp"] = [0, 0]
+        e["f"] = {"N": 0, "Z": 0, "C": 0, "V": 0}
+    }
+    retornar e
+}
+
+/// Mapea memoria (dirección y tamaño múltiplos de 4096), llena de ceros.
+funcion emulador_mapear(e, dir, tam) {
+    si (dir % 4096 != 0 o tam % 4096 != 0 o tam <= 0) { lanzar "emulador: dirección y tamaño deben ser múltiplos de 4096" }
+    sea p = cociente(dir, 4096)
+    mientras (p < cociente(dir + tam, 4096)) {
+        si (tiene_clave(e["paginas"], "" + p) == falso) {
+            sea pag = []
+            para i en lista_rango(0, 4096) { pag.agregar(0) }
+            e["paginas"]["" + p] = pag
+        }
+        p = p + 1
+    }
+}
+
+funcion _emu_pagina(e, dir, que) {
+    sea pag = e["paginas"]["" + cociente(dir, 4096)] ?? nulo
+    si (pag == nulo) { lanzar "emulador: memoria no mapeada (" + que + ") en 0x" + _emu_hex(_emu_de(dir)) }
+    retornar pag
+}
+
+/// Escribe bytes en memoria mapeada.
+funcion emulador_escribir(e, dir, datos) {
+    sea i = 0
+    mientras (i < longitud(datos)) {
+        sea pag = _emu_pagina(e, dir + i, "escritura")
+        pag[(dir + i) % 4096] = byte_en(datos, i)
+        i = i + 1
+    }
+    // El código pudo cambiar.
+    e["cache"] = {}
+}
+
+/// Lee n bytes de memoria mapeada.
+funcion emulador_leer(e, dir, n) {
+    sea partes = []
+    sea i = 0
+    mientras (i < n) {
+        partes.agregar(char_de(_emu_pagina(e, dir + i, "lectura")[(dir + i) % 4096]))
+        i = i + 1
+    }
+    retornar unir(partes, "")
+}
+
+funcion _emu_leer(e, dir, n) {
+    _emu_pagina(e, dir, "lectura")
+    sea l = 0
+    sea h = 0
+    sea i = n - 1
+    mientras (i >= 0) {
+        sea b = _emu_pagina(e, dir + i, "lectura")[(dir + i) % 4096]
+        si (i >= 4) { h = h * 256 + b } sino { l = l * 256 + b }
+        i = i - 1
+    }
+    retornar [h, l]
+}
+
+funcion _emu_escribir(e, dir, n, v) {
+    sea i = 0
+    mientras (i < n) {
+        sea b = 0
+        si (i < 4) { b = cociente(v[1], potencia(2, 8 * i)) % 256 } sino { b = cociente(v[0], potencia(2, 8 * (i - 4))) % 256 }
+        sea pag = _emu_pagina(e, dir + i, "escritura")
+        pag[(dir + i) % 4096] = b
+        i = i + 1
+    }
+    _emu_invalidar(e, dir, n)
+}
+
+funcion _emu_invalidar(e, dir, n) {
+    // Solo importa si se escribe sobre código ya decodificado.
+    si (e["cod_min"] == nulo) { retornar nulo }
+    si (dir + n > e["cod_min"] y dir < e["cod_max"]) { e["cache"] = {} }
+    retornar nulo
+}
+
+// ---------- registros ----------
+
+sea _EMU_X86_NOMBRES = ["rax", "rcx", "rdx", "rbx", "rsp", "rbp", "rsi", "rdi", "r8", "r9", "r10", "r11", "r12", "r13", "r14", "r15"]
+
+funcion _emu_reg_par(e, nombre) {
+    sea n = texto_minusculas(nombre)
+    si (e["arq"] == "x86_64") {
+        si (n == "rip") { retornar _emu_de(e["pc"]) }
+        si (n == "rflags" o n == "eflags") {
+            sea f = e["f"]
+            retornar [0, 2 + f["C"] + f["P"] * 4 + f["Z"] * 64 + f["S"] * 128 + f["D"] * 1024 + f["O"] * 2048]
+        }
+        sea op = desarma_operando_x86(n)
+        si (op["t"] != "reg") { lanzar "emulador: registro desconocido " + nombre }
+        retornar _emu_x86_reg(e, op)
+    }
+    si (n == "pc") { retornar _emu_de(e["pc"]) }
+    si (n == "nzcv") {
+        sea f = e["f"]
+        retornar [(f["N"] * 8 + f["Z"] * 4 + f["C"] * 2 + f["V"]) * 268435456, 0]
+    }
+    retornar _emu_a64_reg(e, n)
+}
+
+/// Valor de un registro como entero con signo ("rax", "eax", "al", "x0",
+/// "w0", "sp", "pc", "rip"…).
+funcion emulador_reg(e, nombre) { retornar _emu_num(_emu_reg_par(e, nombre)) }
+
+/// Valor de un registro en hexadecimal sin signo ("0x…"), exacto en 64 bits.
+funcion emulador_reg_hex(e, nombre) { retornar "0x" + _emu_hex(_emu_reg_par(e, nombre)) }
+
+/// Fija un registro; el valor puede ser un número o un texto "0x…".
+funcion emulador_fijar_reg(e, nombre, valor) {
+    sea v = _emu_valor(valor)
+    sea n = texto_minusculas(nombre)
+    si (n == "rip" o n == "pc") {
+        e["pc"] = _emu_dir(v)
+        retornar nulo
+    }
+    si (e["arq"] == "x86_64") {
+        si (n == "rflags" o n == "eflags") {
+            sea x = v[1]
+            e["f"] = {"C": x % 2, "P": cociente(x, 4) % 2, "Z": cociente(x, 64) % 2, "S": cociente(x, 128) % 2, "D": cociente(x, 1024) % 2, "O": cociente(x, 2048) % 2}
+            retornar nulo
+        }
+        sea op = desarma_operando_x86(n)
+        _emu_x86_fijar_reg(e, op, _emu_masc(v, op["tam"]))
+        retornar nulo
+    }
+    si (n == "nzcv") {
+        sea x = cociente(v[0], 268435456)
+        e["f"] = {"N": cociente(x, 8) % 2, "Z": cociente(x, 4) % 2, "C": cociente(x, 2) % 2, "V": x % 2}
+        retornar nulo
+    }
+    _emu_a64_fijar(e, n, v)
+    retornar nulo
+}
+
+/// Banderas activas como texto: x86 "C P Z S O" (en ese orden), ARM64 "N Z C V".
+funcion emulador_banderas(e) {
+    sea r = ""
+    sea orden = si(e["arq"] == "x86_64", ["C", "P", "Z", "S", "O"], ["N", "Z", "C", "V"])
+    para k en orden {
+        si (e["f"][k] == 1) { r = r + k }
+    }
+    retornar r
+}
+
+/// Ganchos: "instruccion" f(e, direccion, texto) antes de cada instrucción;
+/// "syscall" f(e) en syscall (x86-64) o svc (ARM64).
+funcion emulador_gancho(e, tipo_gancho, f) { e["ganchos"][tipo_gancho] = f }
+
+/// Detiene la ejecución al terminar la instrucción actual.
+funcion emulador_detener(e) { e["detener"] = verdadero }
+
+/// Ejecuta desde inicio hasta llegar a fin (sin ejecutarla), o hasta
+/// "maximo" instrucciones (0 = sin límite), hlt/int3 o emulador_detener.
+/// Devuelve {"instrucciones", "motivo": "fin" | "limite" | "hlt" | "detenido"}.
+funcion emulador_ejecutar(e, inicio, fin, maximo_) {
+    e["pc"] = inicio
+    e["detener"] = falso
+    sea n = 0
+    sea motivo = "fin"
+    mientras (e["pc"] != fin) {
+        si (maximo_ != nulo y maximo_ > 0 y n >= maximo_) {
+            motivo = "limite"
+            romper
+        }
+        sea r = nulo
+        si (e["arq"] == "x86_64") { r = _emu_x86_paso(e) } sino { r = _emu_a64_paso(e) }
+        n = n + 1
+        si (r == "hlt") {
+            motivo = "hlt"
+            romper
+        }
+        si (e["detener"]) {
+            motivo = "detenido"
+            romper
+        }
+    }
+    e["contador"] = e["contador"] + n
+    retornar {"instrucciones": n, "motivo": motivo}
+}
+
+funcion _emu_decodificar(e) {
+    sea pc = e["pc"]
+    sea clave = "" + pc
+    sea c = e["cache"][clave] ?? nulo
+    si (c != nulo) { retornar c }
+    sea n = si(e["arq"] == "x86_64", 15, 4)
+    // Lee lo que haya mapeado (el código puede terminar justo antes del final de la página).
+    sea bytes_ = ""
+    sea i = 0
+    mientras (i < n) {
+        sea pag = e["paginas"]["" + cociente(pc + i, 4096)] ?? nulo
+        si (pag == nulo) { romper }
+        bytes_ = bytes_ + char_de(pag[(pc + i) % 4096])
+        i = i + 1
+    }
+    si (bytes_ == "") { lanzar "emulador: memoria no mapeada (ejecución) en 0x" + _emu_hex(_emu_de(pc)) }
+    sea d = nulo
+    si (e["arq"] == "x86_64") { d = desarma_x86(bytes_, pc)[0] } sino { d = desarma_arm64(bytes_, pc)[0] }
+    si (texto_empieza_con(d["mnemonico"], ".")) { lanzar "emulador: instrucción inválida en 0x" + _emu_hex(_emu_de(pc)) + " (" + hex_de_bytes(subtexto(bytes_, 0, minimo(4, longitud(bytes_)))) + ")" }
+    sea ops = []
+    si (e["arq"] == "x86_64") {
+        si (d["operandos"] != "") {
+            para t en texto_dividir(d["operandos"], ",") {
+                sea s = texto_recortar(t)
+                si (texto_indice("0123456789-", subtexto(s, 0, 1)) >= 0) { ops.agregar({"t": "imm", "p": _emu_texto(s)}) } sino { ops.agregar(desarma_operando_x86(s)) }
+            }
+        }
+    } sino { ops = desarma_partir_arm64(d["operandos"]) }
+    c = {"mn": d["mnemonico"], "ops": ops, "largo": d["largo"], "texto": d["texto"]}
+    e["cache"][clave] = c
+    si (e["cod_min"] == nulo o pc < e["cod_min"]) { e["cod_min"] = pc }
+    si (e["cod_max"] == nulo o pc + d["largo"] > e["cod_max"]) { e["cod_max"] = pc + d["largo"] }
+    retornar c
+}
+
+// ---------- x86-64 ----------
+
+funcion _emu_x86_reg(e, op) {
+    si (op["alto"] ?? falso) { retornar [0, cociente(e["r"][op["n"] - 4][1], 256) % 256] }
+    retornar _emu_masc(e["r"][op["n"]], op["tam"])
+}
+
+funcion _emu_x86_fijar_reg(e, op, v) {
+    sea n = op["n"]
+    si (op["alto"] ?? falso) {
+        sea r = e["r"][n - 4]
+        e["r"][n - 4] = [r[0], r[1] - (cociente(r[1], 256) % 256) * 256 + v[1] * 256]
+        retornar nulo
+    }
+    sea tam = op["tam"]
+    si (tam == 64) { e["r"][n] = v } sino si (tam == 32) { e["r"][n] = [0, v[1]] } sino {
+        sea r = e["r"][n]
+        sea m = potencia(2, tam)
+        e["r"][n] = [r[0], r[1] - r[1] % m + v[1] % m]
+    }
+    retornar nulo
+}
+
+// Dirección efectiva exacta en 64 bits (lea puede dar cualquier valor).
+funcion _emu_x86_dir_par(e, op, siguiente) {
+    sea r = _emu_de(op["disp"])
+    si (op["rip"]) { retornar _emu_suma(r, _emu_de(siguiente), 0)[0] }
+    si (op["base"] != nulo) { r = _emu_suma(r, e["r"][op["base"]], 0)[0] }
+    si (op["indice"] != nulo) { r = _emu_suma(r, _emu_mul(e["r"][op["indice"]], [0, op["escala"]])[1], 0)[0] }
+    retornar r
+}
+
+funcion _emu_x86_dir(e, op, siguiente) { retornar _emu_dir(_emu_x86_dir_par(e, op, siguiente)) }
+
+funcion _emu_x86_tam(op) {
+    si (op["t"] == "imm") { retornar 0 }
+    retornar op["tam"]
+}
+
+funcion _emu_x86_leer(e, op, tam, siguiente) {
+    si (op["t"] == "reg") { retornar _emu_x86_reg(e, op) }
+    si (op["t"] == "imm") { retornar _emu_masc(op["p"], tam) }
+    retornar _emu_leer(e, _emu_x86_dir(e, op, siguiente), cociente(tam, 8))
+}
+
+funcion _emu_x86_escribir(e, op, tam, v, siguiente) {
+    si (op["t"] == "reg") { retornar _emu_x86_fijar_reg(e, op, _emu_masc(v, tam)) }
+    _emu_escribir(e, _emu_x86_dir(e, op, siguiente), cociente(tam, 8), v)
+    retornar nulo
+}
+
+funcion _emu_x86_szp(e, r, tam) {
+    sea m = _emu_masc(r, tam)
+    e["f"]["Z"] = si(_emu_cero(m), 1, 0)
+    e["f"]["S"] = _emu_signo(m, tam)
+    sea b = m[1] % 256
+    sea unos = 0
+    mientras (b > 0) {
+        unos = unos + b % 2
+        b = cociente(b, 2)
+    }
+    e["f"]["P"] = si(unos % 2 == 0, 1, 0)
+}
+
+funcion _emu_sumar_n(a, b, c, tam) {
+    si (tam == 64) { retornar _emu_suma(a, b, c) }
+    sea s = a[1] + b[1] + c
+    sea m = potencia(2, tam)
+    retornar [[0, s % m], si(s >= m, 1, 0)]
+}
+
+funcion _emu_restar_n(a, b, c, tam) {
+    si (tam == 64) { retornar _emu_resta(a, b, c) }
+    sea s = a[1] - b[1] - c
+    sea m = potencia(2, tam)
+    retornar [[0, _emu_mod(s, m)], si(s < 0, 1, 0)]
+}
+
+funcion _emu_x86_cond(e, cc) {
+    sea f = e["f"]
+    si (cc == "o") { retornar f["O"] == 1 }
+    si (cc == "no") { retornar f["O"] == 0 }
+    si (cc == "b") { retornar f["C"] == 1 }
+    si (cc == "ae") { retornar f["C"] == 0 }
+    si (cc == "e") { retornar f["Z"] == 1 }
+    si (cc == "ne") { retornar f["Z"] == 0 }
+    si (cc == "be") { retornar f["C"] == 1 o f["Z"] == 1 }
+    si (cc == "a") { retornar f["C"] == 0 y f["Z"] == 0 }
+    si (cc == "s") { retornar f["S"] == 1 }
+    si (cc == "ns") { retornar f["S"] == 0 }
+    si (cc == "p") { retornar f["P"] == 1 }
+    si (cc == "np") { retornar f["P"] == 0 }
+    si (cc == "l") { retornar f["S"] != f["O"] }
+    si (cc == "ge") { retornar f["S"] == f["O"] }
+    si (cc == "le") { retornar f["Z"] == 1 o f["S"] != f["O"] }
+    si (cc == "g") { retornar f["Z"] == 0 y f["S"] == f["O"] }
+    lanzar "emulador: condición desconocida " + cc
+}
+
+funcion _emu_x86_push(e, v) {
+    sea sp = _emu_resta(e["r"][4], [0, 8], 0)[0]
+    e["r"][4] = sp
+    _emu_escribir(e, _emu_dir(sp), 8, v)
+}
+
+funcion _emu_x86_pop(e) {
+    sea sp = e["r"][4]
+    sea v = _emu_leer(e, _emu_dir(sp), 8)
+    e["r"][4] = _emu_suma(sp, [0, 8], 0)[0]
+    retornar v
+}
+
+sea _EMU_CC = ["o", "no", "b", "ae", "e", "ne", "be", "a", "s", "ns", "p", "np", "l", "ge", "le", "g"]
+
+funcion _emu_x86_paso(e) {
+    sea c = _emu_decodificar(e)
+    sea g = e["ganchos"]["instruccion"] ?? nulo
+    si (g != nulo) { g(e, e["pc"], c["texto"]) }
+    sea mn = c["mn"]
+    sea ops = c["ops"]
+    sea sig = e["pc"] + c["largo"]
+    sea f = e["f"]
+    sea a = nulo
+    sea b = nulo
+    si (longitud(ops) > 0) { a = ops[0] }
+    si (longitud(ops) > 1) { b = ops[1] }
+    sea tam = 64
+    si (a != nulo y a["t"] != "imm") { tam = a["tam"] }
+    si (tam == 0 y b != nulo y b["t"] == "reg") { tam = b["tam"] }
+    sea nuevo_pc = sig
+    sea alu = ["add", "adc", "sub", "sbb", "cmp", "and", "or", "xor", "test"]
+    si (lista_contiene(alu, mn)) {
+        sea x = _emu_x86_leer(e, a, tam, sig)
+        sea w = _emu_x86_leer(e, b, tam, sig)
+        sea r = nulo
+        si (mn == "add" o mn == "adc") {
+            sea s = _emu_sumar_n(x, w, si(mn == "adc", f["C"], 0), tam)
+            r = s[0]
+            f["C"] = s[1]
+            f["O"] = si(_emu_signo(x, tam) == _emu_signo(w, tam) y _emu_signo(r, tam) != _emu_signo(x, tam), 1, 0)
+        } sino si (mn == "sub" o mn == "sbb" o mn == "cmp") {
+            sea s = _emu_restar_n(x, w, si(mn == "sbb", f["C"], 0), tam)
+            r = s[0]
+            f["C"] = s[1]
+            f["O"] = si(_emu_signo(x, tam) != _emu_signo(w, tam) y _emu_signo(r, tam) != _emu_signo(x, tam), 1, 0)
+        } sino {
+            si (mn == "and" o mn == "test") { r = _emu_y(x, w) } sino si (mn == "or") { r = _emu_ob(x, w) } sino { r = _emu_xo(x, w) }
+            f["C"] = 0
+            f["O"] = 0
+        }
+        _emu_x86_szp(e, r, tam)
+        si (mn != "cmp" y mn != "test") { _emu_x86_escribir(e, a, tam, r, sig) }
+    } sino si (mn == "mov" o mn == "movabs") {
+        _emu_x86_escribir(e, a, tam, _emu_x86_leer(e, b, tam, sig), sig)
+    } sino si (mn == "movzx" o mn == "movsx" o mn == "movsxd") {
+        sea t2 = b["tam"]
+        sea v = _emu_x86_leer(e, b, t2, sig)
+        si (mn != "movzx") { v = _emu_ext(v, t2) }
+        _emu_x86_escribir(e, a, tam, v, sig)
+    } sino si (mn == "lea") {
+        _emu_x86_escribir(e, a, tam, _emu_x86_dir_par(e, b, sig), sig)
+    } sino si (mn == "push") {
+        _emu_x86_push(e, si(a["t"] == "imm", a["p"], _emu_x86_leer(e, a, 64, sig)))
+    } sino si (mn == "pop") {
+        _emu_x86_escribir(e, a, 64, _emu_x86_pop(e), sig)
+    } sino si (mn == "call") {
+        sea destino = si(a["t"] == "imm", _emu_dir(a["p"]), _emu_dir(_emu_x86_leer(e, a, 64, sig)))
+        _emu_x86_push(e, _emu_de(sig))
+        nuevo_pc = destino
+    } sino si (mn == "ret") {
+        nuevo_pc = _emu_dir(_emu_x86_pop(e))
+        si (a != nulo) { e["r"][4] = _emu_suma(e["r"][4], a["p"], 0)[0] }
+    } sino si (mn == "jmp") {
+        nuevo_pc = si(a["t"] == "imm", _emu_dir(a["p"]), _emu_dir(_emu_x86_leer(e, a, 64, sig)))
+    } sino si (texto_empieza_con(mn, "j") y lista_contiene(_EMU_CC, subtexto(mn, 1, longitud(mn)))) {
+        si (_emu_x86_cond(e, subtexto(mn, 1, longitud(mn)))) { nuevo_pc = _emu_dir(a["p"]) }
+    } sino si (texto_empieza_con(mn, "cmov")) {
+        si (_emu_x86_cond(e, subtexto(mn, 4, longitud(mn)))) { _emu_x86_escribir(e, a, tam, _emu_x86_leer(e, b, tam, sig), sig) } sino si (tam == 32) { _emu_x86_escribir(e, a, 32, _emu_x86_leer(e, a, 32, sig), sig) }
+    } sino si (texto_empieza_con(mn, "set") y lista_contiene(_EMU_CC, subtexto(mn, 3, longitud(mn)))) {
+        _emu_x86_escribir(e, a, 8, [0, si(_emu_x86_cond(e, subtexto(mn, 3, longitud(mn))), 1, 0)], sig)
+    } sino si (mn == "inc" o mn == "dec") {
+        sea x = _emu_x86_leer(e, a, tam, sig)
+        sea r = nulo
+        si (mn == "inc") {
+            r = _emu_sumar_n(x, [0, 1], 0, tam)[0]
+            f["O"] = si(_emu_signo(x, tam) == 0 y _emu_signo(r, tam) == 1, 1, 0)
+        } sino {
+            r = _emu_restar_n(x, [0, 1], 0, tam)[0]
+            f["O"] = si(_emu_signo(x, tam) == 1 y _emu_signo(r, tam) == 0, 1, 0)
+        }
+        _emu_x86_szp(e, r, tam)
+        _emu_x86_escribir(e, a, tam, r, sig)
+    } sino si (mn == "neg") {
+        sea x = _emu_x86_leer(e, a, tam, sig)
+        sea r = _emu_restar_n([0, 0], x, 0, tam)[0]
+        f["C"] = si(_emu_cero(x), 0, 1)
+        f["O"] = si(_emu_signo(x, tam) == 1 y _emu_signo(r, tam) == 1, 1, 0)
+        _emu_x86_szp(e, r, tam)
+        _emu_x86_escribir(e, a, tam, r, sig)
+    } sino si (mn == "not") {
+        _emu_x86_escribir(e, a, tam, _emu_masc(_emu_no(_emu_x86_leer(e, a, tam, sig)), tam), sig)
+    } sino si (mn == "xchg") {
+        sea x = _emu_x86_leer(e, a, tam, sig)
+        sea w = _emu_x86_leer(e, b, tam, sig)
+        _emu_x86_escribir(e, a, tam, w, sig)
+        _emu_x86_escribir(e, b, tam, x, sig)
+    } sino si (mn == "imul" y longitud(ops) >= 2) {
+        sea x = _emu_x86_leer(e, si(longitud(ops) == 3, b, a), tam, sig)
+        sea w = si(longitud(ops) == 3, _emu_masc(ops[2]["p"], tam), _emu_x86_leer(e, b, tam, sig))
+        sea p = _emu_mul_s(_emu_ext(x, tam), _emu_ext(w, tam))
+        sea r = _emu_masc(p[1], tam)
+        // Desborde si el producto completo no es la extensión de signo del truncado.
+        sea ext = _emu_ext(r, tam)
+        sea alto_esperado = si(_emu_signo(ext, 64) == 1, [_EMU_M, _EMU_M], [0, 0])
+        sea desborda = _emu_igual(p[1], ext) == falso o _emu_igual(p[0], alto_esperado) == falso
+        f["C"] = si(desborda, 1, 0)
+        f["O"] = f["C"]
+        _emu_x86_escribir(e, a, tam, r, sig)
+    } sino si (mn == "mul" o mn == "imul") {
+        sea x = _emu_x86_reg(e, {"n": 0, "tam": tam})
+        sea w = _emu_x86_leer(e, a, tam, sig)
+        sea p = nulo
+        si (mn == "mul") { p = _emu_mul(x, w) } sino { p = _emu_mul_s(_emu_ext(x, tam), _emu_ext(w, tam)) }
+        sea bajo = nulo
+        sea alto = nulo
+        si (tam == 64) {
+            bajo = p[1]
+            alto = p[0]
+        } sino {
+            bajo = _emu_masc(p[1], tam)
+            alto = _emu_masc(_emu_der(p[1], tam), tam)
+        }
+        si (mn == "mul") { f["C"] = si(_emu_cero(alto), 0, 1) } sino {
+            sea ext = _emu_masc(si(_emu_signo(bajo, tam) == 1, [_EMU_M, _EMU_M], [0, 0]), tam)
+            f["C"] = si(_emu_igual(alto, ext), 0, 1)
+        }
+        f["O"] = f["C"]
+        si (tam == 8) { _emu_x86_fijar_reg(e, {"n": 0, "tam": 16}, _emu_ob(bajo, _emu_izq(alto, 8))) } sino {
+            _emu_x86_fijar_reg(e, {"n": 0, "tam": tam}, bajo)
+            _emu_x86_fijar_reg(e, {"n": 2, "tam": tam}, alto)
+        }
+    } sino si (mn == "div" o mn == "idiv") {
+        sea w = _emu_x86_leer(e, a, tam, sig)
+        sea alto = [0, 0]
+        sea bajo = [0, 0]
+        si (tam == 64) {
+            alto = e["r"][2]
+            bajo = e["r"][0]
+        } sino si (tam == 8) {
+            bajo = _emu_masc(e["r"][0], 16)
+        } sino {
+            bajo = _emu_ob(_emu_izq(_emu_masc(e["r"][2], tam), tam), _emu_masc(e["r"][0], tam))
+        }
+        sea q = nulo
+        sea resto = nulo
+        si (mn == "div") {
+            sea d = _emu_div(alto, bajo, w)
+            si (_emu_cero(d[0]) == falso o (tam < 64 y _emu_igual(_emu_masc(d[1], tam), d[1]) == falso)) { lanzar "emulador: desborde en div (#DE)" }
+            q = d[1]
+            resto = d[2]
+        } sino {
+            // Dividendo con signo de 2*tam bits.
+            sea neg_a = falso
+            si (tam == 64) { neg_a = _emu_signo(alto, 64) == 1 } sino { neg_a = _emu_signo(bajo, tam * 2) == 1 }
+            si (tam < 64 y neg_a) { bajo = _emu_masc(_emu_neg(_emu_ext(bajo, tam * 2)), 64) }
+            si (tam == 64 y neg_a) {
+                sea nn = _emu_neg128([alto, bajo])
+                alto = nn[0]
+                bajo = nn[1]
+            }
+            sea wv = _emu_ext(w, tam)
+            sea neg_d = _emu_signo(wv, 64) == 1
+            si (neg_d) { wv = _emu_neg(wv) }
+            sea d = _emu_div(alto, bajo, wv)
+            q = d[1]
+            resto = d[2]
+            si (_emu_cero(d[0]) == falso) { lanzar "emulador: desborde en idiv (#DE)" }
+            si (neg_a != neg_d) { q = _emu_neg(q) }
+            si (neg_a) { resto = _emu_neg(resto) }
+            si (_emu_igual(_emu_ext(_emu_masc(q, tam), tam), q) == falso) { lanzar "emulador: desborde en idiv (#DE)" }
+        }
+        si (tam == 8) { _emu_x86_fijar_reg(e, {"n": 0, "tam": 16}, _emu_ob(_emu_masc(q, 8), _emu_izq(_emu_masc(resto, 8), 8))) } sino {
+            _emu_x86_fijar_reg(e, {"n": 0, "tam": tam}, _emu_masc(q, tam))
+            _emu_x86_fijar_reg(e, {"n": 2, "tam": tam}, _emu_masc(resto, tam))
+        }
+    } sino si (lista_contiene(["shl", "sal", "shr", "sar", "rol", "ror"], mn)) {
+        sea x = _emu_x86_leer(e, a, tam, sig)
+        sea k = 1
+        si (b != nulo) { k = _emu_x86_leer(e, b, 8, sig)[1] }
+        k = k % si(tam == 64, 64, 32)
+        si (k > 0) {
+            sea r = nulo
+            si (mn == "shl" o mn == "sal") {
+                r = _emu_masc(_emu_izq(x, k), tam)
+                f["C"] = si(k <= tam, _emu_bit(x, tam - k), 0)
+                f["O"] = bits_xo(_emu_signo(r, tam), f["C"])
+                _emu_x86_szp(e, r, tam)
+            } sino si (mn == "shr") {
+                r = _emu_der(x, k)
+                f["C"] = _emu_bit(x, k - 1)
+                f["O"] = _emu_signo(x, tam)
+                _emu_x86_szp(e, r, tam)
+            } sino si (mn == "sar") {
+                sea ex = _emu_ext(x, tam)
+                r = _emu_masc(_emu_ari_der(ex, k), tam)
+                f["C"] = _emu_bit(ex, minimo(k - 1, 63))
+                f["O"] = 0
+                _emu_x86_szp(e, r, tam)
+            } sino si (mn == "rol") {
+                r = _emu_rotar_der(x, tam - k % tam, tam)
+                f["C"] = _emu_bit(r, 0)
+                f["O"] = bits_xo(_emu_signo(r, tam), f["C"])
+            } sino {
+                r = _emu_rotar_der(x, k, tam)
+                f["C"] = _emu_signo(r, tam)
+                f["O"] = bits_xo(_emu_signo(r, tam), _emu_bit(r, tam - 2))
+            }
+            _emu_x86_escribir(e, a, tam, r, sig)
+        }
+    } sino si (mn == "cdq" o mn == "cqo" o mn == "cwd") {
+        sea t2 = {"cdq": 32, "cqo": 64, "cwd": 16}[mn]
+        sea s = _emu_signo(_emu_x86_reg(e, {"n": 0, "tam": t2}), t2)
+        _emu_x86_fijar_reg(e, {"n": 2, "tam": t2}, si(s == 1, _emu_masc([_EMU_M, _EMU_M], t2), [0, 0]))
+    } sino si (mn == "cdqe" o mn == "cwde" o mn == "cbw") {
+        sea t2 = {"cdqe": 32, "cwde": 16, "cbw": 8}[mn]
+        _emu_x86_fijar_reg(e, {"n": 0, "tam": t2 * 2}, _emu_masc(_emu_ext(_emu_x86_reg(e, {"n": 0, "tam": t2}), t2), t2 * 2))
+    } sino si (mn == "bswap") {
+        sea x = _emu_x86_leer(e, a, tam, sig)
+        sea r = [0, 0]
+        para i en lista_rango(0, cociente(tam, 8)) { r = _emu_ob(_emu_izq(r, 8), [0, _emu_der(x, i * 8)[1] % 256]) }
+        _emu_x86_escribir(e, a, tam, r, sig)
+    } sino si (mn == "popcnt" o mn == "tzcnt" o mn == "lzcnt" o mn == "bsf" o mn == "bsr") {
+        sea x = _emu_x86_leer(e, b, tam, sig)
+        sea r = 0
+        si (mn == "popcnt") {
+            para i en lista_rango(0, tam) { r = r + _emu_bit(x, i) }
+            f["C"] = 0
+            f["O"] = 0
+            f["Z"] = si(r == 0, 1, 0)
+        } sino {
+            si (_emu_cero(x)) {
+                f["Z"] = 1
+                f["C"] = 1
+                si (mn == "tzcnt" o mn == "lzcnt") { _emu_x86_escribir(e, a, tam, [0, tam], sig) }
+                e["pc"] = sig
+                retornar nulo
+            }
+            sea abajo = 0
+            mientras (_emu_bit(x, abajo) == 0) { abajo = abajo + 1 }
+            sea arriba = tam - 1
+            mientras (_emu_bit(x, arriba) == 0) { arriba = arriba - 1 }
+            si (mn == "tzcnt" o mn == "bsf") { r = abajo } sino si (mn == "lzcnt") { r = tam - 1 - arriba } sino { r = arriba }
+            f["Z"] = si(mn == "bsf" o mn == "bsr", 0, si(r == 0, 1, 0))
+            f["C"] = 0
+        }
+        _emu_x86_escribir(e, a, tam, [0, r], sig)
+    } sino si (mn == "leave") {
+        e["r"][4] = e["r"][5]
+        e["r"][5] = _emu_x86_pop(e)
+    } sino si (mn == "stc") { f["C"] = 1 }
+    sino si (mn == "clc") { f["C"] = 0 }
+    sino si (mn == "cmc") { f["C"] = 1 - f["C"] }
+    sino si (mn == "cld") { f["D"] = 0 }
+    sino si (mn == "std") { f["D"] = 1 }
+    sino si (mn == "nop" o mn == "pause") { }
+    sino si (mn == "syscall") {
+        e["r"][1] = _emu_de(sig)
+        e["pc"] = sig
+        _emu_llamar_sistema(e)
+        retornar nulo
+    } sino si (mn == "hlt" o mn == "int3") {
+        e["pc"] = sig
+        retornar "hlt"
+    } sino { lanzar "emulador: instrucción x86-64 no soportada: " + c["texto"] }
+    e["pc"] = nuevo_pc
+    retornar nulo
+}
+
+funcion _emu_llamar_sistema(e) {
+    sea g = e["ganchos"]["syscall"] ?? nulo
+    si (g == nulo) { lanzar "emulador: llamada al sistema sin gancho (usa emulador_gancho(e, \"syscall\", f))" }
+    g(e)
+}
+
+// ---------- ARM64 ----------
+
+funcion _emu_a64_reg(e, t) {
+    sea r = desarma_reg_arm64(t)
+    si (r == nulo o r["fp"] != nulo) { lanzar "emulador: registro ARM64 no soportado " + t }
+    sea v = [0, 0]
+    si (r["n"] == 31) { v = si(r["sp"], e["sp"], [0, 0]) } sino { v = e["x"][r["n"]] }
+    si (r["sf"] == falso) { retornar [0, v[1]] }
+    retornar v
+}
+
+funcion _emu_a64_fijar(e, t, v) {
+    sea r = desarma_reg_arm64(t)
+    si (r == nulo o r["fp"] != nulo) { lanzar "emulador: registro ARM64 no soportado " + t }
+    sea w = si(r["sf"], v, [0, v[1]])
+    si (r["n"] == 31) {
+        si (r["sp"]) { e["sp"] = w }
+        retornar nulo
+    }
+    e["x"][r["n"]] = w
+    retornar nulo
+}
+
+funcion _emu_a64_ancho(t) {
+    sea r = desarma_reg_arm64(t)
+    retornar si(r["sf"], 64, 32)
+}
+
+funcion _emu_a64_cond(e, cc) {
+    sea f = e["f"]
+    si (cc == "eq") { retornar f["Z"] == 1 }
+    si (cc == "ne") { retornar f["Z"] == 0 }
+    si (cc == "hs" o cc == "cs") { retornar f["C"] == 1 }
+    si (cc == "lo" o cc == "cc") { retornar f["C"] == 0 }
+    si (cc == "mi") { retornar f["N"] == 1 }
+    si (cc == "pl") { retornar f["N"] == 0 }
+    si (cc == "vs") { retornar f["V"] == 1 }
+    si (cc == "vc") { retornar f["V"] == 0 }
+    si (cc == "hi") { retornar f["C"] == 1 y f["Z"] == 0 }
+    si (cc == "ls") { retornar f["C"] == 0 o f["Z"] == 1 }
+    si (cc == "ge") { retornar f["N"] == f["V"] }
+    si (cc == "lt") { retornar f["N"] != f["V"] }
+    si (cc == "gt") { retornar f["Z"] == 0 y f["N"] == f["V"] }
+    si (cc == "le") { retornar f["Z"] == 1 o f["N"] != f["V"] }
+    si (cc == "al" o cc == "nv") { retornar verdadero }
+    lanzar "emulador: condición desconocida " + cc
+}
+
+funcion _emu_es_reg(t) { retornar desarma_reg_arm64(t) != nulo }
+
+// Segundo operando: inmediato (con "lsl #12") o registro desplazado.
+funcion _emu_a64_op2(e, ops, i, ancho) {
+    sea t = ops[i]
+    sea v = nulo
+    si (_emu_es_reg(t)) { v = _emu_a64_reg(e, t) } sino { v = _emu_masc(_emu_texto(t), ancho) }
+    si (longitud(ops) > i + 1) {
+        sea p = texto_dividir(texto_recortar(ops[i + 1]), " ")
+        sea k = _emu_num(_emu_texto(p[1]))
+        si (p[0] == "lsl") { v = _emu_masc(_emu_izq(v, k), ancho) }
+        sino si (p[0] == "lsr") { v = _emu_der(v, k) }
+        sino si (p[0] == "asr") { v = _emu_masc(_emu_ari_der(_emu_ext(v, ancho), k), ancho) }
+        sino si (p[0] == "ror") { v = _emu_rotar_der(v, k, ancho) }
+    }
+    retornar v
+}
+
+funcion _emu_a64_nz(e, r, ancho) {
+    e["f"]["N"] = _emu_signo(r, ancho)
+    e["f"]["Z"] = si(_emu_cero(_emu_masc(r, ancho)), 1, 0)
+}
+
+// Suma con banderas al estilo ARM (resta = suma del complemento + 1).
+funcion _emu_a64_sumar(e, x, w, acarreo, ancho, banderas) {
+    sea s = _emu_sumar_n(x, w, acarreo, ancho)
+    sea r = s[0]
+    si (banderas) {
+        _emu_a64_nz(e, r, ancho)
+        e["f"]["C"] = s[1]
+        e["f"]["V"] = si(_emu_signo(x, ancho) == _emu_signo(w, ancho) y _emu_signo(r, ancho) != _emu_signo(x, ancho), 1, 0)
+    }
+    retornar r
+}
+
+funcion _emu_a64_dir_mem(e, t) {
+    // "[base]", "[base, #imm]", "[base, xm{, ext #n}]"
+    sea dentro = subtexto(t, 1, texto_indice(t, "]"))
+    sea p = desarma_partir_arm64(dentro)
+    sea base = _emu_dir(_emu_a64_reg(e, p[0]))
+    si (longitud(p) == 1) { retornar base }
+    si (_emu_es_reg(p[1]) == falso) { retornar base + _emu_num(_emu_texto(p[1])) }
+    sea idx = _emu_a64_reg(e, p[1])
+    sea ancho = _emu_a64_ancho(p[1])
+    sea k = 0
+    si (longitud(p) > 2) {
+        sea q = texto_dividir(texto_recortar(p[2]), " ")
+        si (longitud(q) > 1) { k = _emu_num(_emu_texto(q[1])) }
+        si (q[0] == "sxtw" o q[0] == "sxtx") { idx = _emu_ext(idx, ancho) }
+    }
+    retornar base + _emu_num(_emu_izq(idx, k))
+}
+
+funcion _emu_a64_paso(e) {
+    sea c = _emu_decodificar(e)
+    sea g = e["ganchos"]["instruccion"] ?? nulo
+    si (g != nulo) { g(e, e["pc"], c["texto"]) }
+    sea mn = c["mn"]
+    sea ops = c["ops"]
+    sea pc = e["pc"]
+    sea nuevo_pc = pc + 4
+    sea f = e["f"]
+    sea ancho = 64
+    si (longitud(ops) > 0 y _emu_es_reg(ops[0])) { ancho = _emu_a64_ancho(ops[0]) }
+    // Alias que se reducen a otra instrucción.
+    si (mn == "cmp" o mn == "cmn" o mn == "tst") {
+        sea zr = si(ancho == 64, "xzr", "wzr")
+        sea resto = [zr]
+        para x en ops { resto.agregar(x) }
+        mn = {"cmp": "subs", "cmn": "adds", "tst": "ands"}[mn]
+        ops = resto
+    } sino si (mn == "neg" o mn == "negs" o mn == "mvn") {
+        sea zr = si(ancho == 64, "xzr", "wzr")
+        sea resto = [ops[0], zr]
+        sea i = 1
+        mientras (i < longitud(ops)) {
+            resto.agregar(ops[i])
+            i = i + 1
+        }
+        mn = {"neg": "sub", "negs": "subs", "mvn": "orn"}[mn]
+        ops = resto
+    }
+    si (mn == "add" o mn == "adds" o mn == "sub" o mn == "subs") {
+        sea x = _emu_a64_reg(e, ops[1])
+        sea w = _emu_a64_op2(e, ops, 2, ancho)
+        sea banderas = texto_termina_con(mn, "s")
+        sea r = nulo
+        si (texto_empieza_con(mn, "add")) { r = _emu_a64_sumar(e, x, w, 0, ancho, banderas) } sino { r = _emu_a64_sumar(e, x, _emu_masc(_emu_no(w), ancho), 1, ancho, banderas) }
+        _emu_a64_fijar(e, ops[0], r)
+    } sino si (lista_contiene(["and", "orr", "eor", "ands", "bic", "orn", "eon", "bics"], mn)) {
+        sea x = _emu_a64_reg(e, ops[1])
+        sea w = _emu_a64_op2(e, ops, 2, ancho)
+        si (mn == "bic" o mn == "orn" o mn == "eon" o mn == "bics") { w = _emu_masc(_emu_no(w), ancho) }
+        sea r = nulo
+        si (mn == "and" o mn == "ands" o mn == "bic" o mn == "bics") { r = _emu_y(x, w) } sino si (mn == "orr" o mn == "orn") { r = _emu_ob(x, w) } sino { r = _emu_xo(x, w) }
+        si (mn == "ands" o mn == "bics") {
+            _emu_a64_nz(e, r, ancho)
+            f["C"] = 0
+            f["V"] = 0
+        }
+        _emu_a64_fijar(e, ops[0], r)
+    } sino si (mn == "mov") {
+        si (_emu_es_reg(ops[1])) { _emu_a64_fijar(e, ops[0], _emu_a64_reg(e, ops[1])) } sino { _emu_a64_fijar(e, ops[0], _emu_masc(_emu_texto(ops[1]), ancho)) }
+    } sino si (mn == "movz" o mn == "movk" o mn == "movn") {
+        sea v = _emu_texto(ops[1])
+        sea k = 0
+        si (longitud(ops) > 2) { k = _emu_num(_emu_texto(texto_dividir(texto_recortar(ops[2]), " ")[1])) }
+        sea pieza = _emu_izq(v, k)
+        si (mn == "movz") { _emu_a64_fijar(e, ops[0], pieza) }
+        sino si (mn == "movn") { _emu_a64_fijar(e, ops[0], _emu_masc(_emu_no(pieza), ancho)) }
+        sino {
+            sea viejo = _emu_a64_reg(e, ops[0])
+            sea mascara = _emu_no(_emu_izq([0, 65535], k))
+            _emu_a64_fijar(e, ops[0], _emu_ob(_emu_y(viejo, mascara), pieza))
+        }
+    } sino si (lista_contiene(["mul", "mneg", "madd", "msub"], mn)) {
+        sea p = _emu_masc(_emu_mul(_emu_a64_reg(e, ops[1]), _emu_a64_reg(e, ops[2]))[1], ancho)
+        sea acum = [0, 0]
+        si (longitud(ops) > 3) { acum = _emu_a64_reg(e, ops[3]) }
+        sea r = nulo
+        si (mn == "mul" o mn == "madd") { r = _emu_sumar_n(acum, p, 0, ancho)[0] } sino { r = _emu_restar_n(acum, p, 0, ancho)[0] }
+        _emu_a64_fijar(e, ops[0], r)
+    } sino si (mn == "smulh" o mn == "umulh") {
+        sea x = _emu_a64_reg(e, ops[1])
+        sea w = _emu_a64_reg(e, ops[2])
+        _emu_a64_fijar(e, ops[0], si(mn == "umulh", _emu_mul(x, w), _emu_mul_s(x, w))[0])
+    } sino si (mn == "udiv" o mn == "sdiv") {
+        sea x = _emu_a64_reg(e, ops[1])
+        sea w = _emu_a64_reg(e, ops[2])
+        sea r = [0, 0]
+        si (_emu_cero(w) == falso) {
+            si (mn == "udiv") { r = _emu_div([0, 0], x, w)[1] } sino {
+                sea xs = _emu_ext(x, ancho)
+                sea ws = _emu_ext(w, ancho)
+                sea na = _emu_signo(xs, 64) == 1
+                sea nb = _emu_signo(ws, 64) == 1
+                r = _emu_div([0, 0], si(na, _emu_neg(xs), xs), si(nb, _emu_neg(ws), ws))[1]
+                si (na != nb) { r = _emu_neg(r) }
+                r = _emu_masc(r, ancho)
+            }
+        }
+        _emu_a64_fijar(e, ops[0], r)
+    } sino si (lista_contiene(["lsl", "lsr", "asr", "ror"], mn)) {
+        sea x = _emu_a64_reg(e, ops[1])
+        sea k = 0
+        si (_emu_es_reg(ops[2])) { k = _emu_a64_reg(e, ops[2])[1] % ancho } sino { k = _emu_num(_emu_texto(ops[2])) }
+        sea r = nulo
+        si (mn == "lsl") { r = _emu_masc(_emu_izq(x, k), ancho) }
+        sino si (mn == "lsr") { r = _emu_der(x, k) }
+        sino si (mn == "asr") { r = _emu_masc(_emu_ari_der(_emu_ext(x, ancho), k), ancho) }
+        sino { r = _emu_rotar_der(x, k, ancho) }
+        _emu_a64_fijar(e, ops[0], r)
+    } sino si (lista_contiene(["ubfx", "sbfx", "ubfiz", "sbfiz"], mn)) {
+        sea x = _emu_a64_reg(e, ops[1])
+        sea lsb = _emu_num(_emu_texto(ops[2]))
+        sea w = _emu_num(_emu_texto(ops[3]))
+        sea r = nulo
+        si (mn == "ubfx" o mn == "sbfx") {
+            r = _emu_masc(_emu_der(x, lsb), w)
+            si (mn == "sbfx") { r = _emu_ext(r, w) }
+        } sino {
+            r = _emu_masc(x, w)
+            si (mn == "sbfiz") { r = _emu_ext(r, w) }
+            r = _emu_izq(r, lsb)
+        }
+        _emu_a64_fijar(e, ops[0], _emu_masc(r, ancho))
+    } sino si (lista_contiene(["sxtb", "sxth", "sxtw", "uxtb", "uxth"], mn)) {
+        sea t2 = {"sxtb": 8, "sxth": 16, "sxtw": 32, "uxtb": 8, "uxth": 16}[mn]
+        sea x = _emu_masc(_emu_a64_reg(e, ops[1]), t2)
+        si (texto_empieza_con(mn, "s")) { x = _emu_ext(x, t2) }
+        _emu_a64_fijar(e, ops[0], _emu_masc(x, ancho))
+    } sino si (mn == "extr") {
+        sea alto = _emu_a64_reg(e, ops[1])
+        sea bajo = _emu_a64_reg(e, ops[2])
+        sea k = _emu_num(_emu_texto(ops[3]))
+        sea r = bajo
+        si (k > 0) { r = _emu_masc(_emu_ob(_emu_der(bajo, k), _emu_izq(alto, ancho - k)), ancho) }
+        _emu_a64_fijar(e, ops[0], r)
+    } sino si (lista_contiene(["csel", "csinc", "csinv", "csneg", "cset", "csetm", "cinc", "cneg"], mn)) {
+        sea n = ""
+        sea m = ""
+        sea cc = ""
+        sea base = mn
+        si (mn == "cset" o mn == "csetm") {
+            n = si(ancho == 64, "xzr", "wzr")
+            m = n
+            cc = _emu_cc_inv(ops[1])
+            base = si(mn == "cset", "csinc", "csinv")
+        } sino si (mn == "cinc" o mn == "cneg") {
+            n = ops[1]
+            m = ops[1]
+            cc = _emu_cc_inv(ops[2])
+            base = si(mn == "cinc", "csinc", "csneg")
+        } sino {
+            n = ops[1]
+            m = ops[2]
+            cc = ops[3]
+        }
+        sea r = nulo
+        si (_emu_a64_cond(e, texto_recortar(cc))) { r = _emu_a64_reg(e, n) } sino {
+            r = _emu_a64_reg(e, m)
+            si (base == "csinc") { r = _emu_sumar_n(r, [0, 1], 0, ancho)[0] }
+            si (base == "csinv") { r = _emu_masc(_emu_no(r), ancho) }
+            si (base == "csneg") { r = _emu_restar_n([0, 0], r, 0, ancho)[0] }
+        }
+        _emu_a64_fijar(e, ops[0], r)
+    } sino si (mn == "b" o mn == "bl") {
+        si (mn == "bl") { e["x"][30] = _emu_de(pc + 4) }
+        nuevo_pc = _emu_dir(_emu_texto(ops[0]))
+    } sino si (texto_empieza_con(mn, "b.")) {
+        si (_emu_a64_cond(e, subtexto(mn, 2, longitud(mn)))) { nuevo_pc = _emu_dir(_emu_texto(ops[0])) }
+    } sino si (mn == "cbz" o mn == "cbnz") {
+        sea z = _emu_cero(_emu_a64_reg(e, ops[0]))
+        si (z == (mn == "cbz")) { nuevo_pc = _emu_dir(_emu_texto(ops[1])) }
+    } sino si (mn == "tbz" o mn == "tbnz") {
+        sea bit = _emu_bit(_emu_a64_reg(e, ops[0]), _emu_num(_emu_texto(ops[1])))
+        si ((bit == 0) == (mn == "tbz")) { nuevo_pc = _emu_dir(_emu_texto(ops[2])) }
+    } sino si (mn == "br" o mn == "blr" o mn == "ret") {
+        sea destino = e["x"][30]
+        si (longitud(ops) > 0) { destino = _emu_a64_reg(e, ops[0]) }
+        si (mn == "blr") { e["x"][30] = _emu_de(pc + 4) }
+        nuevo_pc = _emu_dir(destino)
+    } sino si (mn == "adr" o mn == "adrp") {
+        _emu_a64_fijar(e, ops[0], _emu_texto(ops[1]))
+    } sino si (texto_empieza_con(mn, "ld") o texto_empieza_con(mn, "st")) {
+        _emu_a64_memoria(e, mn, ops, pc)
+    } sino si (mn == "svc") {
+        e["pc"] = pc + 4
+        _emu_llamar_sistema(e)
+        retornar nulo
+    } sino si (mn == "nop") { }
+    sino { lanzar "emulador: instrucción ARM64 no soportada: " + c["texto"] }
+    e["pc"] = nuevo_pc
+    retornar nulo
+}
+
+funcion _emu_cc_inv(cc) {
+    sea pares = {"eq": "ne", "ne": "eq", "hs": "lo", "lo": "hs", "mi": "pl", "pl": "mi", "vs": "vc", "vc": "vs", "hi": "ls", "ls": "hi", "ge": "lt", "lt": "ge", "gt": "le", "le": "gt", "cs": "cc", "cc": "cs"}
+    retornar pares[texto_recortar(cc)]
+}
+
+funcion _emu_a64_memoria(e, mn, ops, pc) {
+    sea par = mn == "ldp" o mn == "stp" o mn == "ldpsw"
+    sea carga = texto_empieza_con(mn, "ld")
+    sea m_i = si(par, 2, 1)
+    sea memo = texto_recortar(ops[m_i])
+    sea ancho_reg = _emu_a64_ancho(ops[0])
+    // Tamaño del acceso.
+    sea tam = cociente(ancho_reg, 8)
+    sea con_signo = falso
+    sea raiz = texto_reemplazar(mn, "ldur", "ldr")
+    raiz = texto_reemplazar(raiz, "stur", "str")
+    si (raiz == "ldrb" o raiz == "strb") { tam = 1 }
+    sino si (raiz == "ldrh" o raiz == "strh") { tam = 2 }
+    sino si (raiz == "ldrsb") {
+        tam = 1
+        con_signo = verdadero
+    } sino si (raiz == "ldrsh") {
+        tam = 2
+        con_signo = verdadero
+    } sino si (raiz == "ldrsw" o mn == "ldpsw") {
+        tam = 4
+        con_signo = verdadero
+    }
+    // Literal: ldr x0, #dirección
+    si (texto_empieza_con(memo, "[") == falso) {
+        sea v = _emu_leer(e, _emu_dir(_emu_texto(memo)), tam)
+        si (con_signo) { v = _emu_masc(_emu_ext(v, tam * 8), ancho_reg) }
+        _emu_a64_fijar(e, ops[0], v)
+        retornar nulo
+    }
+    sea dentro = subtexto(memo, 1, texto_indice(memo, "]"))
+    sea base_t = desarma_partir_arm64(dentro)[0]
+    sea dir = 0
+    sea post = nulo
+    sea pre = texto_termina_con(memo, "!")
+    si (longitud(ops) > m_i + 1) {
+        dir = _emu_dir(_emu_a64_reg(e, base_t))
+        post = _emu_num(_emu_texto(ops[m_i + 1]))
+    } sino { dir = _emu_a64_dir_mem(e, memo) }
+    sea regs = [ops[0]]
+    si (par) { regs.agregar(ops[1]) }
+    sea k = 0
+    para r en regs {
+        sea d = dir + k * tam
+        si (carga) {
+            sea v = _emu_leer(e, d, tam)
+            si (con_signo) { v = _emu_masc(_emu_ext(v, tam * 8), ancho_reg) }
+            _emu_a64_fijar(e, r, v)
+        } sino { _emu_escribir(e, d, tam, _emu_masc(_emu_a64_reg(e, r), tam * 8)) }
+        k = k + 1
+    }
+    si (pre) { _emu_a64_fijar(e, base_t, _emu_de(dir)) }
+    si (post != nulo) { _emu_a64_fijar(e, base_t, _emu_de(dir + post)) }
+    retornar nulo
+}

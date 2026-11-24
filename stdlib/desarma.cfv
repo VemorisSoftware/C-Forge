@@ -321,6 +321,11 @@ funcion _dsm_x86_una(b, p0, dir) {
     si (op == 233) { retornar fin("jmp", _dsm_hex(dir + (p + 4 - p0) + _dsm_s(_dsm_u(b, p, 4), 32)), p + 4) }
     si (op == 235) { retornar fin("jmp", _dsm_hex(dir + (p + 1 - p0) + _dsm_s(byte_en(b, p), 8)), p + 1) }
     si (op == 244) { retornar fin("hlt", "", p) }
+    si (op == 245) { retornar fin("cmc", "", p) }
+    si (op == 248) { retornar fin("clc", "", p) }
+    si (op == 249) { retornar fin("stc", "", p) }
+    si (op == 252) { retornar fin("cld", "", p) }
+    si (op == 253) { retornar fin("std", "", p) }
     si (op == 246 o op == 247) {
         sea mr = _dsm_modrm(b, p, st)
         sea tam = si(op == 246, 8, tv)
@@ -652,7 +657,7 @@ funcion _dsm_x86_asm(linea, dir, etiquetas) {
     sea ops = []
     si (resto != "") { para x en texto_dividir(resto, ",") { ops.agregar(x) } }
     sea sin_ops = {"ret": "c3", "leave": "c9", "nop": "90", "int3": "cc", "syscall": "0f05", "hlt": "f4", "ud2": "0f0b", "cpuid": "0fa2", "cdq": "99", "cqo": "4899",
-        "cdqe": "4898", "cwde": "98", "cbw": "6698", "cwd": "6699", "pause": "f390"}
+        "cdqe": "4898", "cwde": "98", "cbw": "6698", "cwd": "6699", "pause": "f390", "cmc": "f5", "clc": "f8", "stc": "f9", "cld": "fc", "std": "fd"}
     si (longitud(ops) == 0 y tiene_clave(sin_ops, mn)) { retornar bytes_de_hex(sin_ops[mn]) }
     // Saltos y llamadas a dirección o etiqueta.
     sea es_jcc = texto_empieza_con(mn, "j") y mn != "jmp"
@@ -859,6 +864,12 @@ funcion _dsm_ensamblar(texto, direccion, una, ancho_fijo) {
         k = texto_indice(s, "#!")
         para parte en texto_dividir(s, ";") {
             sea t = texto_recortar(parte)
+            // "etiqueta: instrucción" en la misma línea.
+            sea dp = texto_indice(t, ":")
+            si (dp > 0 y dp < longitud(t) - 1 y texto_contiene(subtexto(t, 0, dp), " ") == falso y texto_contiene(subtexto(t, 0, dp), "[") == falso) {
+                lineas.agregar(subtexto(t, 0, dp + 1))
+                t = texto_recortar(subtexto(t, dp + 1, longitud(t)))
+            }
             si (t != "") { lineas.agregar(t) }
         }
     }
@@ -1131,17 +1142,17 @@ funcion _dsm_a64_una(w, dir) {
         sea opc = b(29, 2)
         sea hw = b(21, 2)
         sea imm = b(5, 16)
-        si (opc == 2) {
-            si (imm == 0 y hw > 0) { retornar res("movz", R(rd, falso) + ", #0, lsl #" + hw * 16) }
-            retornar res("mov", R(rd, falso) + ", #" + _dsm_hexu(imm * potencia(2, hw * 16)))
-        }
-        si (opc == 0) {
-            sea v = 0 - (imm * potencia(2, hw * 16)) - 1
-            si (sf == falso) {
-                v = 0 - imm * potencia(2, hw * 16) - 1
-                si (v < -2147483648) { v = v + 4294967296 }
+        si (opc == 2 y imm == 0 y hw > 0) { retornar res("movz", R(rd, falso) + ", #0, lsl #" + hw * 16) }
+        si (opc == 0 o opc == 2) {
+            // Valor exacto como bits; Capstone lo imprime con signo.
+            sea ancho = si(sf, 64, 32)
+            sea bits = []
+            para k en lista_rango(0, ancho) { bits.agregar(0) }
+            para k en lista_rango(0, 16) { bits[hw * 16 + k] = piso(imm / potencia(2, k)) % 2 }
+            si (opc == 0) {
+                para k en lista_rango(0, ancho) { bits[k] = 1 - bits[k] }
             }
-            retornar res("mov", R(rd, falso) + ", #" + _dsm_shex(v))
+            retornar res("mov", R(rd, falso) + ", #" + _dsm_bits_con_signo(bits))
         }
         si (opc == 3) {
             sea t = R(rd, falso) + ", " + _dsm_imm_a64(imm)
@@ -1281,8 +1292,9 @@ funcion _dsm_a64_memoria_fp(w, dir, b) {
         sea escala = 2 + piso(opc / 2)
         si (v) { escala = 2 + opc }
         sea imm = _dsm_s(b(15, 7), 7) * potencia(2, escala)
-        sea r1 = _dsm_xr(rd, opc == 2, falso)
-        sea r2 = _dsm_xr(b(10, 5), opc == 2, falso)
+        sea ancho64 = opc == 2 o (opc == 1 y v == falso y carga)
+        sea r1 = _dsm_xr(rd, ancho64, falso)
+        sea r2 = _dsm_xr(b(10, 5), ancho64, falso)
         si (v) {
             r1 = ["s", "d", "q"][opc] + rd
             r2 = ["s", "d", "q"][opc] + b(10, 5)
@@ -1575,21 +1587,26 @@ funcion _dsm_a64_asm(linea, dir, etiquetas) {
             si (a["sp"] o b2["sp"]) { retornar _dsm_a64_asm("add " + ops[0] + ", " + ops[1] + ", #0", dir, etiquetas) }
             retornar _dsm_a64_asm("orr " + ops[0] + ", " + si(a["sf"], "xzr", "wzr") + ", " + ops[1], dir, etiquetas)
         }
-        sea v = _dsm_a64_imm(ops[1])
         sea ancho = si(a["sf"], 64, 32)
-        // movz con un solo trozo de 16 bits.
-        sea hw = 0
-        mientras (hw < ancho / 16) {
-            si (v >= 0 y v % potencia(2, hw * 16) == 0 y v / potencia(2, hw * 16) < 65536) { retornar _dsm_w(si(a["sf"], 2147483648, 0) + 1384120320 + hw * 2097152 + (v / potencia(2, hw * 16)) * 32 + a["n"]) }
-            hw = hw + 1
-        }
-        // movn
-        sea inv = 0 - v - 1
-        si (a["sf"] == falso) { inv = 4294967295 - (v + si(v < 0, 4294967296, 0)) }
-        hw = 0
-        mientras (hw < ancho / 16) {
-            si (inv >= 0 y inv % potencia(2, hw * 16) == 0 y inv / potencia(2, hw * 16) < 65536) { retornar _dsm_w(si(a["sf"], 2147483648, 0) + 310378496 + hw * 2097152 + (inv / potencia(2, hw * 16)) * 32 + a["n"]) }
-            hw = hw + 1
+        sea bits = _dsm_bits_de_texto(ops[1], ancho)
+        // movz o movn con un solo trozo de 16 bits distinto de 0 (o de 1).
+        para inv en [0, 1] {
+            sea hw = 0
+            mientras (hw < ancho / 16) {
+                sea solo = verdadero
+                sea k = 0
+                mientras (k < ancho y solo) {
+                    si ((k < hw * 16 o k >= hw * 16 + 16) y bits[k] != inv) { solo = falso }
+                    k = k + 1
+                }
+                si (solo) {
+                    sea trozo = 0
+                    para j en lista_rango(0, 16) { trozo = trozo + si(bits[hw * 16 + j] != inv, 1, 0) * potencia(2, j) }
+                    // movz #0 sirve para 0; para todo-unos usa movn.
+                    si (inv == 0 o hw == 0 o trozo != 0) { retornar _dsm_w(si(a["sf"], 2147483648, 0) + si(inv == 0, 1384120320, 310378496) + hw * 2097152 + trozo * 32 + a["n"]) }
+                }
+                hw = hw + 1
+            }
         }
         retornar _dsm_a64_asm("orr " + ops[0] + ", " + si(a["sf"], "xzr", "wzr") + ", " + ops[1], dir, etiquetas)
     }
@@ -1746,13 +1763,17 @@ funcion _dsm_a64_asm(linea, dir, etiquetas) {
     si (mn == "ldr" o mn == "str" o mn == "ldrb" o mn == "strb" o mn == "ldrh" o mn == "strh" o mn == "ldrsw" o mn == "ldrsb" o mn == "ldrsh" o mn == "ldur" o mn == "stur" o mn == "ldurb" o mn == "sturb") {
         retornar _dsm_a64_asm_mem(mn, ops, dir, destino)
     }
-    si (mn == "ldp" o mn == "stp") {
+    si (mn == "ldp" o mn == "stp" o mn == "ldpsw") {
         sea a = R(0)
         sea b2 = R(1)
         sea fp = a["fp"]
         sea opc = si(a["sf"], 2, 0)
         sea v = 0
         sea escala = si(a["sf"], 3, 2)
+        si (mn == "ldpsw") {
+            opc = 1
+            escala = 2
+        }
         si (fp != nulo) {
             v = 67108864
             opc = fp - 2
@@ -1774,7 +1795,7 @@ funcion _dsm_a64_asm(linea, dir, etiquetas) {
             modo = 1
             imm = _dsm_a64_imm(ops[3])
         }
-        sea carga = si(mn == "ldp", 4194304, 0)
+        sea carga = si(mn == "stp", 0, 4194304)
         sea imm7 = ((imm / potencia(2, escala)) + 128) % 128
         retornar _dsm_w(opc * 1073741824 + 671088640 + v + modo * 8388608 + carga + imm7 * 32768 + b2["n"] * 1024 + base * 32 + a["n"])
     }
@@ -1931,3 +1952,16 @@ funcion desarma_listado(codigo, arquitectura, direccion) {
     para i en desarma(codigo, arquitectura, direccion) { r.agregar(_dsm_hex(i["direccion"]) + ":  " + hex_de_bytes(i["bytes"]) + "  " + i["texto"]) }
     retornar unir(r, "\n")
 }
+
+// ---------- operandos (para emuladores y otras herramientas) ----------
+
+/// Analiza un operando x86-64 en sintaxis Intel: {"t": "reg", "n", "tam",
+/// "alto"?} | {"t": "mem", "tam", "base", "indice", "escala", "disp", "rip"} |
+/// {"t": "imm", "v"} (los inmediatos de más de 62 bits conviene leerlos aparte).
+funcion desarma_operando_x86(texto) { retornar _dsm_operando(texto) }
+
+/// Separa los operandos ARM64 por comas fuera de corchetes.
+funcion desarma_partir_arm64(texto) { retornar _dsm_a64_ops(texto) }
+
+/// Registro ARM64 por nombre: {"n", "sf" (64 bits), "sp", "fp"} o nulo.
+funcion desarma_reg_arm64(texto) { retornar _dsm_a64_reg(texto) }

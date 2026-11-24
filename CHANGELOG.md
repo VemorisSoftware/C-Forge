@@ -4,6 +4,16 @@ Sitio oficial: [c-forge.org](https://c-forge.org)
 
 ## Sin publicar
 
+- Lote 35 de bibliotecas (tres más que pasan de enlaces a nativas):
+  `emulador`/`unicorn` (emulador de CPU x86-64 y ARM64 con registros de 64
+  bits exactos, banderas, memoria por páginas y ganchos; mismo estado final
+  que Unicorn en 24 programas), `consola_remota`/`libssh2` (cliente SSH 2
+  con curve25519, ed25519 y AES-CTR, comandos, SFTP, túneles y claves
+  OpenSSH; probado contra un servidor paramiko) y `analitica`/`duckdb` (SQL
+  analítico en memoria sobre tablas, CSV y JSON con joins, ventanas, CTE y
+  subconsultas; mismos resultados que DuckDB en 59 consultas). `desarma`
+  suma stc/clc/cmc, ldpsw, inmediatos de 64 bits en ARM64 y etiquetas en
+  la misma línea.
 - Lote 34 de bibliotecas (tres más que pasan de enlaces a nativas):
   `desarma`/`capstone` (ensamblador y desensamblador de x86-64 y ARM64 con
   el formato de Capstone; probado instrucción por instrucción contra
