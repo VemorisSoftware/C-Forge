@@ -20,5 +20,5 @@ for ejemplo in "$SITIO"/ejemplos/*.cfv "$SITIO"/ejemplos/en/*.cfv; do
     echo "  FALLA ejemplo $nombre"; cat "$tmp/$nombre.diff"; fallos=$((fallos + 1))
   fi
 done
-python3 "$SITIO/generar.py" --check || fallos=$((fallos + 1))
+"$CFORGE" "$SITIO/generar.cfv" --check --sitio "$SITIO" || fallos=$((fallos + 1))
 [ "$fallos" -eq 0 ] && echo "  ✓ c-forge.org: ejemplos y páginas verificados" || { echo "  ✗ $fallos problema(s)"; exit 1; }

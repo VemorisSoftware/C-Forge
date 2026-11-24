@@ -2,7 +2,7 @@
 # Build de c-forge.org para Cloudflare Pages.
 # Configuración en Pages: directorio raíz "site", comando "sh build.sh",
 # directorio de salida "dist". Las páginas ya vienen generadas y verificadas
-# por CI (generar.py + verificar.sh); aquí solo se arma la carpeta publicada.
+# por CI (generar.cfv + verificar.sh); aquí solo se arma la carpeta publicada.
 set -eu
 cd "$(dirname "$0")"
 rm -rf dist
