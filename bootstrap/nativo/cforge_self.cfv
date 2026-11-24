@@ -2493,9 +2493,38 @@ funcion numero_dinamico(c) {
         fijar_tipo(c, 9)
         retornar 0
     }
+    si (literal_entero_grande(lexema)) {
+        // No cabe en un entero chico (>= 2^62): el runtime lo crea exacto
+        // a partir de sus cifras.
+        sea entre_comillas = str_concatenar("\"", lexema)
+        str_agregar_byte(entre_comillas, 34)
+        op_direccion(c, 1, literal_caja(c, entre_comillas))
+        empujar(c)
+        llamar_runtime(c, "dyn_entero_literal", 1)
+        fijar_tipo(c, 1)
+        retornar 0
+    }
     cargar_inmediato(c, entero * 2 + 1)
     fijar_tipo(c, 1)
     retornar 0
+}
+
+// ¿Las cifras del literal valen 2^62 o más? (no caben en un entero chico)
+funcion literal_entero_grande(lexema) {
+    sea limite = "4611686018427387904"
+    // Sin ceros a la izquierda para comparar por largo.
+    sea ini = 0
+    mientras (ini < str_largo(lexema) - 1 y str_byte(lexema, ini) == 48) { ini = ini + 1 }
+    sea n = str_largo(lexema) - ini
+    si (n != str_largo(limite)) { retornar n > str_largo(limite) }
+    sea i = 0
+    mientras (i < n) {
+        sea x = str_byte(lexema, ini + i)
+        sea y = str_byte(limite, i)
+        si (x != y) { retornar x > y }
+        i = i + 1
+    }
+    retornar 1
 }
 
 // [a, b, ...] → lista del lenguaje.
@@ -3297,17 +3326,19 @@ funcion operador_rapido(c, lex, nombre) {
     op_y_uno(c)
     op_saltar_si_cero(c, lento)
     sea op = str_byte(lex, 0)
-    si (str_largo(lex) == 1 y op == 43) {                           // a + b - 1
+    // + - *: si el resultado no cabe, el runtime lo pasa a entero grande.
+    si (str_largo(lex) == 1 y op == 43) {                           // (a - 1) + b
         op_cargar(c, 0, 4, 8)
-        op_cargar(c, 1, 4, 0)
-        op_aritmetica(c, 1)
         op_sumar_constante(c, 0 - 1)
-    }
-    si (str_largo(lex) == 1 y op == 45) {                           // a - b + 1
-        op_cargar(c, 0, 4, 8)
         op_cargar(c, 1, 4, 0)
-        op_aritmetica(c, 2)
-        op_sumar_constante(c, 1)
+        op_aritmetica_vigilada(c, 1, lento)
+    }
+    si (str_largo(lex) == 1 y op == 45) {                           // a - (b - 1)
+        op_cargar(c, 0, 4, 0)
+        op_sumar_constante(c, 0 - 1)
+        op_mov(c, 1, 0)
+        op_cargar(c, 0, 4, 8)
+        op_aritmetica_vigilada(c, 2, lento)
     }
     si (str_largo(lex) == 1 y op == 42) {                           // (a >> 1)·(b - 1) + 1
         op_cargar(c, 0, 4, 0)
@@ -3315,7 +3346,7 @@ funcion operador_rapido(c, lex, nombre) {
         op_mov(c, 1, 0)
         op_cargar(c, 0, 4, 8)
         op_sar_constante(c, 1)
-        op_aritmetica(c, 3)
+        op_aritmetica_vigilada(c, 3, lento)
         op_sumar_constante(c, 1)
     }
     si (str_igual(lex, "bits_y")) {                                 // (2x+1) & (2y+1) = 2(x&y)+1
@@ -3343,7 +3374,7 @@ funcion operador_rapido(c, lex, nombre) {
         op_sar_constante(c, 1)
         op_aritmetica(c, 4)
         op_mov(c, 1, 0)
-        op_aritmetica(c, 1)
+        op_aritmetica_vigilada(c, 1, lento)                         // MIN / -1 no cabe
         op_sumar_constante(c, 1)
     }
     si (str_largo(lex) == 1 y op == 37) {                           // (a' % b')·2 + 1, b' ≠ 0
@@ -3440,24 +3471,19 @@ funcion operador_rapido_literal(c, lex, nombre, v, probado) {
         llamar_runtime(c, nombre, 2)
         retornar 0
     }
-    si (probado == 0) {
-        op_cargar(c, 0, 4, 0)                                       // rax = izq
-        op_y_uno(c)
-        op_saltar_si_cero(c, lento)
-    }
-    op_sacar(c, 0)                                                  // rax = izq
-    si (str_largo(lex) == 1 y op == 43) { op_constante_rcx(c, 2 * v) op_aritmetica(c, 1) }
-    si (str_largo(lex) == 1 y op == 45) { op_constante_rcx(c, 2 * v) op_aritmetica(c, 2) }
+    // "probado" ya no evita la comprobación: un entero puede ser grande
+    // (caja del runtime), así que siempre se mira la etiqueta.
+    op_cargar(c, 0, 4, 0)                                           // rax = izq
+    op_y_uno(c)
+    op_saltar_si_cero(c, lento)
+    op_cargar(c, 0, 4, 0)                                           // rax = izq (sigue apilado)
+    si (str_largo(lex) == 1 y op == 43) { op_constante_rcx(c, 2 * v) op_aritmetica_vigilada(c, 1, lento) }
+    si (str_largo(lex) == 1 y op == 45) { op_constante_rcx(c, 2 * v) op_aritmetica_vigilada(c, 2, lento) }
     sea kp = potencia_de_dos(v)
-    si (str_largo(lex) == 1 y op == 42 y kp > 0 y kp < 62) {
-        op_sar_constante(c, 1)                                      // x'
-        op_shl_constante(c, kp + 1)                                 // 2·x'·2^k
-        op_sumar_constante(c, 1)
-    }
-    si (str_largo(lex) == 1 y op == 42 y (kp <= 0 o kp >= 62)) {
+    si (str_largo(lex) == 1 y op == 42) {
         op_sar_constante(c, 1)
         op_constante_rcx(c, 2 * v)
-        op_aritmetica(c, 3)
+        op_aritmetica_vigilada(c, 3, lento)
         op_sumar_constante(c, 1)
     }
     si (str_largo(lex) == 1 y op == 37 y kp > 0) {
@@ -3487,6 +3513,7 @@ funcion operador_rapido_literal(c, lex, nombre, v, probado) {
         op_comparar(c, codigo)
         si (mem_global(46) == 0) { booleano_dinamico(c) }
     }
+    op_liberar_pila(c, 8)                                           // izq
     op_saltar(c, fin)
     definir_etiqueta(c, lento)
     cargar_inmediato(c, 2 * v + 1)
@@ -3646,10 +3673,9 @@ funcion aplicar_operador(c, lex) {
             operador_rapido_literal(c, lex, nombre_r, (literal - 1) / 2, probado)
             retornar 0
         }
-        si (probado y __cargar64(c + 392) == 1) {
-            operador_entero(c, lex, nombre_r)
-            retornar 0
-        }
+        // Con enteros sin límite, "entero probado" ya no garantiza un entero
+        // chico: siempre la ruta rápida con comprobación (operador_entero
+        // queda solo para comparar en el futuro con tipos de ancho fijo).
         operador_rapido(c, lex, nombre_r)
         retornar 0
     }
