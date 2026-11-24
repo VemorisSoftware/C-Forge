@@ -4,6 +4,12 @@ Sitio oficial: [c-forge.org](https://c-forge.org)
 
 ## Sin publicar
 
+- **Navegador (`importar "navegador"`, `--target wasm`):** lienzo 2D completo
+  desde C-Forge (degradados lineales y radiales, rutas con arcos y rombos,
+  recortes, transparencia, modos de mezcla, sombras y grano de película) y
+  elementos por índice (`nav_cuantos`, `nav_clase_n`, `nav_estilo_n`,
+  `nav_caja` para saber dónde está algo en pantalla) más `nav_medio` para
+  media queries. Con esto la web de Vemoris Software anima todo en C-Forge.
 - **C-Forge es de uso libre:** la nueva licencia (`LICENSE`) deja usar
   C-Forge gratis y sin pedir permiso para cualquier fin, también en el trabajo,
   empresas y producción. Los programas que se hagan con C-Forge son de sus
