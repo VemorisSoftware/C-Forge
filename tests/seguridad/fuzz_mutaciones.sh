@@ -13,10 +13,10 @@ total=$(wc -l < "$T/fuentes")
 fallas=0
 i=1
 while [ "$i" -le "$N" ]; do
-    linea=$(( (i * 7919) % total + 1 ))
+    linea=$(( (i * 7919 + ${FUZZ_SEMILLA:-0}) % total + 1 ))
     src=$(sed -n "${linea}p" "$T/fuentes")
-    awk -v semilla="$i" -f tests/seguridad/mutar.awk "$src" > "$T/a.cfv"
-    awk -v semilla=$((i + 100000)) -f tests/seguridad/mutar.awk "$T/a.cfv" > "$T/caso.cfv"
+    awk -v semilla="$((i + ${FUZZ_SEMILLA:-0}))" -f tests/seguridad/mutar.awk "$src" > "$T/a.cfv"
+    awk -v semilla=$((i + 100000 + ${FUZZ_SEMILLA:-0})) -f tests/seguridad/mutar.awk "$T/a.cfv" > "$T/caso.cfv"
     codigo=0
     CFORGE_STDLIB=stdlib timeout 20 "$C" check "$T/caso.cfv" > /dev/null 2>&1 || codigo=$?
     if [ "$codigo" -ge 124 ]; then
