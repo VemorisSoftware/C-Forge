@@ -64,10 +64,11 @@
     var boton = e.target.closest("[data-copiar]");
     if (!boton) return;
     var texto = boton.getAttribute("data-copiar");
+    var original = boton.textContent;
     var listo = function () {
       boton.setAttribute("data-copiado", "");
-      boton.textContent = "Copiado";
-      setTimeout(function () { boton.removeAttribute("data-copiado"); boton.textContent = "Copiar"; }, 1600);
+      boton.textContent = document.documentElement.lang === "en" ? "Copied" : "Copiado";
+      setTimeout(function () { boton.removeAttribute("data-copiado"); boton.textContent = original; }, 1600);
     };
     if (navigator.clipboard) navigator.clipboard.writeText(texto).then(listo, function () {});
   });
@@ -99,6 +100,18 @@
       var p = so && lista.querySelector('[data-so="' + so + '"]');
       if (p) activar(p);
     }
+  });
+
+  // Tema claro / oscuro: alterna y recuerda la elección.
+  document.addEventListener("click", function (e) {
+    var b = e.target.closest(".tema-boton");
+    if (!b) return;
+    var raiz = document.documentElement;
+    var actual = raiz.getAttribute("data-tema") ||
+      (window.matchMedia && window.matchMedia("(prefers-color-scheme: dark)").matches ? "oscuro" : "claro");
+    var nuevo = actual === "oscuro" ? "claro" : "oscuro";
+    raiz.setAttribute("data-tema", nuevo);
+    try { localStorage.setItem("cforge-tema", nuevo); } catch (err) {}
   });
 
   // Menú móvil
