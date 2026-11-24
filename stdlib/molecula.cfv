@@ -1,0 +1,1008 @@
+// stdlib/molecula.cfv — Química con SMILES al estilo de RDKit, escrita desde
+// cero (idea de RDKit, BSD). Lee SMILES, calcula fórmula, pesos, anillos
+// (SSSR), aromaticidad de Hückel (también desde formas de Kekulé),
+// descriptores de Lipinski, TPSA de Ertl, enlaces rotables, SMILES canónico
+// y búsqueda de subestructuras con un subconjunto de SMARTS.
+//
+// En inglés: importar "rdkit".
+//
+//   importar "molecula"
+//   sea m = molecula_leer("CC(=O)Oc1ccccc1C(=O)O")   // aspirina
+//   mostrar(molecula_formula(m))                       // C9H8O4
+//   mostrar(molecula_tpsa(m))                          // 63.6
+//   mostrar(longitud(molecula_buscar(m, "C(=O)O")))    // 2
+//
+// No guarda la estereoquímica (@, /, \ se leen y se ignoran).
+
+// Peso medio y masa monoisotópica (los de la tabla periódica de RDKit).
+sea _MOL_MASAS = {"H": [1.008, 1.007825032], "B": [10.812, 11.0093054], "C": [12.011, 12.0], "N": [14.007, 14.003074], "O": [15.999, 15.99491462],
+    "F": [18.998, 18.99840322], "Na": [22.99, 22.98976928], "Mg": [24.305, 23.9850417], "Si": [28.086, 27.97692653], "P": [30.974, 30.97376163],
+    "S": [32.067, 31.972071], "Cl": [35.453, 34.96885268], "K": [39.098, 38.96370668], "Ca": [40.078, 39.96259098], "Fe": [55.845, 55.9349375],
+    "Zn": [65.39, 63.9291422], "Br": [79.904, 78.9183371], "I": [126.904, 126.904473], "Se": [78.96, 79.9165213], "Li": [6.941, 7.01600455]}
+sea _MOL_ISOTOPOS = {"H2": 2.014101778, "H3": 3.01604927, "C13": 13.00335484, "C14": 14.003241989, "N15": 15.0001089, "O17": 16.9991317, "O18": 17.999161}
+sea _MOL_Z = {"H": 1, "Li": 3, "B": 5, "C": 6, "N": 7, "O": 8, "F": 9, "Na": 11, "Mg": 12, "Si": 14, "P": 15, "S": 16, "Cl": 17, "K": 19, "Ca": 20, "Fe": 26, "Zn": 30, "Se": 34, "Br": 35, "I": 53, "*": 0}
+sea _MOL_VALENCIAS = {"B": [3], "C": [4], "N": [3, 5], "O": [2], "P": [3, 5], "S": [2, 4, 6], "F": [1], "Cl": [1], "Br": [1], "I": [1], "*": [0]}
+
+// ---------- lectura de SMILES ----------
+
+funcion _mol_es_digito(c) { retornar c != "" y texto_indice("0123456789", c) >= 0 }
+
+/// Lee un SMILES. Devuelve {"atomos": [...], "enlaces": [...], ...}; lanza
+/// un error con la posición si el texto no es válido.
+funcion molecula_leer(smiles) {
+    sea atomos = []
+    sea enlaces = []
+    sea s = texto_recortar(smiles)
+    sea i = 0
+    sea previo = -1
+    sea pila = []
+    sea anillos = {}
+    sea enlace_pend = 0
+    sea n = longitud(s)
+    sea agregar_enlace = funcion(a, b, orden) {
+        sea o = orden
+        si (o == 0) {
+            si (atomos[a]["arom"] y atomos[b]["arom"]) { o = 4 } sino { o = 1 }
+        }
+        enlaces.agregar({"a": a, "b": b, "orden": o, "kek": o, "arom": o == 4})
+    }
+    mientras (i < n) {
+        sea c = subtexto(s, i, i + 1)
+        si (c == "(") {
+            pila.agregar(previo)
+            i = i + 1
+        } sino si (c == ")") {
+            si (longitud(pila) == 0) { lanzar "molecula: paréntesis sin abrir en " + i }
+            previo = pila[longitud(pila) - 1]
+            quitar_ultimo(pila)
+            i = i + 1
+        } sino si (c == ".") {
+            previo = -1
+            i = i + 1
+        } sino si (c == "-" o c == "/" o c == "\\") {
+            enlace_pend = 1
+            i = i + 1
+        } sino si (c == "=") {
+            enlace_pend = 2
+            i = i + 1
+        } sino si (c == "#") {
+            enlace_pend = 3
+            i = i + 1
+        } sino si (c == "$") {
+            enlace_pend = 4
+            i = i + 1
+        } sino si (c == ":") {
+            enlace_pend = 4
+            i = i + 1
+        } sino si (_mol_es_digito(c) o c == "%") {
+            sea num = c
+            si (c == "%") {
+                num = subtexto(s, i + 1, i + 3)
+                i = i + 3
+            } sino { i = i + 1 }
+            si (previo < 0) { lanzar "molecula: cierre de anillo sin átomo en " + i }
+            si (tiene_clave(anillos, num)) {
+                sea ab = anillos[num]
+                sea orden = enlace_pend
+                si (orden == 0) { orden = ab[1] }
+                agregar_enlace(ab[0], previo, orden)
+                quitar_clave(anillos, num)
+            } sino { anillos[num] = [previo, enlace_pend] }
+            enlace_pend = 0
+        } sino {
+            sea at = nulo
+            si (c == "[") {
+                sea fin = texto_indice(subtexto(s, i, n), "]")
+                si (fin < 0) { lanzar "molecula: corchete sin cerrar en " + i }
+                at = _mol_corchete(subtexto(s, i + 1, i + fin))
+                i = i + fin + 1
+            } sino {
+                sea dos = subtexto(s, i, i + 2)
+                si (dos == "Cl" o dos == "Br") {
+                    at = {"el": dos, "arom": falso}
+                    i = i + 2
+                } sino si (texto_indice("BCNOPSFI*", c) >= 0) {
+                    at = {"el": c, "arom": falso}
+                    i = i + 1
+                } sino si (texto_indice("bcnops", c) >= 0) {
+                    at = {"el": texto_mayusculas(c), "arom": verdadero}
+                    i = i + 1
+                } sino { lanzar "molecula: carácter inesperado '" + c + "' en " + i }
+                at["iso"] = 0
+                at["carga"] = 0
+                at["h"] = -1
+                at["corchete"] = falso
+            }
+            atomos.agregar(at)
+            sea k = longitud(atomos) - 1
+            si (previo >= 0) { agregar_enlace(previo, k, enlace_pend) }
+            enlace_pend = 0
+            previo = k
+        }
+    }
+    si (longitud(mapa_claves(anillos)) > 0) { lanzar "molecula: anillo sin cerrar" }
+    si (longitud(pila) > 0) { lanzar "molecula: paréntesis sin cerrar" }
+    sea m = {"smiles": smiles, "atomos": atomos, "enlaces": enlaces}
+    _mol_preparar(m)
+    retornar m
+}
+
+funcion _mol_corchete(t) {
+    sea i = 0
+    sea iso = 0
+    mientras (i < longitud(t) y _mol_es_digito(subtexto(t, i, i + 1))) {
+        iso = iso * 10 + a_numero(subtexto(t, i, i + 1))
+        i = i + 1
+    }
+    sea el = ""
+    sea arom = falso
+    sea c = subtexto(t, i, i + 1)
+    sea dos = subtexto(t, i, i + 2)
+    si (dos == "se" o dos == "as") {
+        el = texto_mayusculas(subtexto(dos, 0, 1)) + subtexto(dos, 1, 2)
+        arom = verdadero
+        i = i + 2
+    } sino si (texto_indice("bcnops", c) >= 0 y c != "") {
+        el = texto_mayusculas(c)
+        arom = verdadero
+        i = i + 1
+    } sino {
+        el = c
+        i = i + 1
+        sea c2 = subtexto(t, i, i + 1)
+        si (c2 != "" y texto_indice("abcdefghijklmnopqrstuvwxyz", c2) >= 0 y tiene_clave(_MOL_Z, c + c2)) {
+            el = c + c2
+            i = i + 1
+        }
+    }
+    si (tiene_clave(_MOL_Z, el) == falso) { lanzar "molecula: elemento desconocido " + el }
+    mientras (subtexto(t, i, i + 1) == "@") { i = i + 1 }
+    sea h = 0
+    si (subtexto(t, i, i + 1) == "H") {
+        h = 1
+        i = i + 1
+        si (_mol_es_digito(subtexto(t, i, i + 1))) {
+            h = a_numero(subtexto(t, i, i + 1))
+            i = i + 1
+        }
+    }
+    sea carga = 0
+    mientras (subtexto(t, i, i + 1) == "+" o subtexto(t, i, i + 1) == "-") {
+        sea signo = si(subtexto(t, i, i + 1) == "+", 1, -1)
+        i = i + 1
+        si (_mol_es_digito(subtexto(t, i, i + 1))) {
+            carga = carga + signo * a_numero(subtexto(t, i, i + 1))
+            i = i + 1
+        } sino { carga = carga + signo }
+    }
+    retornar {"el": el, "arom": arom, "iso": iso, "carga": carga, "h": h, "corchete": verdadero}
+}
+
+// Suma de órdenes de enlace (aromático = 1) de un átomo.
+funcion _mol_suma_enlaces(m, i, campo) {
+    sea suma = 0
+    para v en m["vecinos"][i] {
+        sea o = m["enlaces"][v[1]][campo]
+        suma = suma + si(o == 4, 1, o)
+    }
+    retornar suma
+}
+
+// Hidrógenos implícitos de un átomo sin corchetes.
+funcion _mol_h_implicitos(m, i, campo) {
+    sea at = m["atomos"][i]
+    sea vals = _MOL_VALENCIAS[at["el"]] ?? [0]
+    sea suma = _mol_suma_enlaces(m, i, campo)
+    si (at["arom"]) { retornar maximo(0, vals[0] - suma - 1) }
+    para v en vals {
+        si (v >= suma) { retornar v - suma }
+    }
+    retornar 0
+}
+
+funcion _mol_preparar(m) {
+    sea na = longitud(m["atomos"])
+    sea vec = []
+    para k en lista_rango(0, na) { vec.agregar([]) }
+    sea j = 0
+    para e en m["enlaces"] {
+        vec[e["a"]].agregar([e["b"], j])
+        vec[e["b"]].agregar([e["a"], j])
+        j = j + 1
+    }
+    m["vecinos"] = vec
+    para k en lista_rango(0, na) {
+        si (m["atomos"][k]["h"] < 0) { m["atomos"][k]["h"] = _mol_h_implicitos(m, k, "kek") }
+    }
+    m["anillos"] = _mol_sssr(m)
+    _mol_aromaticidad(m)
+}
+
+// ---------- anillos (SSSR) ----------
+
+// Camino más corto de a a b sin usar el enlace prohibido; lista de enlaces.
+funcion _mol_camino(m, a, b, prohibido) {
+    sea previo = {}
+    previo["" + a] = [-1, -1]
+    sea cola = [a]
+    sea k = 0
+    mientras (k < longitud(cola)) {
+        sea x = cola[k]
+        k = k + 1
+        si (x == b) { romper }
+        para v en m["vecinos"][x] {
+            si (v[1] != prohibido y tiene_clave(previo, "" + v[0]) == falso) {
+                previo["" + v[0]] = [x, v[1]]
+                cola.agregar(v[0])
+            }
+        }
+    }
+    si (tiene_clave(previo, "" + b) == falso) { retornar nulo }
+    sea r = []
+    sea x = b
+    mientras (x != a) {
+        sea p = previo["" + x]
+        r.agregar(p[1])
+        x = p[0]
+    }
+    retornar r
+}
+
+funcion _mol_xor(a, b) {
+    sea r = []
+    para x en a {
+        si (lista_contiene(b, x) == falso) { r.agregar(x) }
+    }
+    para x en b {
+        si (lista_contiene(a, x) == falso) { r.agregar(x) }
+    }
+    retornar ordenar(r, funcion(p, q) { retornar p - q })
+}
+
+funcion _mol_sssr(m) {
+    sea na = longitud(m["atomos"])
+    sea ne = longitud(m["enlaces"])
+    // Componentes conexas.
+    sea comp = []
+    para k en lista_rango(0, na) { comp.agregar(-1) }
+    sea nc = 0
+    para k en lista_rango(0, na) {
+        si (comp[k] < 0) {
+            sea cola = [k]
+            comp[k] = nc
+            sea q = 0
+            mientras (q < longitud(cola)) {
+                para v en m["vecinos"][cola[q]] {
+                    si (comp[v[0]] < 0) {
+                        comp[v[0]] = nc
+                        cola.agregar(v[0])
+                    }
+                }
+                q = q + 1
+            }
+            nc = nc + 1
+        }
+    }
+    sea cuantos = ne - na + nc
+    si (cuantos <= 0) { retornar [] }
+    sea candidatos = []
+    sea vistos = {}
+    para j en lista_rango(0, ne) {
+        sea e = m["enlaces"][j]
+        sea c = _mol_camino(m, e["a"], e["b"], j)
+        si (c != nulo) {
+            c.agregar(j)
+            c = ordenar(c, funcion(p, q) { retornar p - q })
+            sea clave = unir(c, ",")
+            si (tiene_clave(vistos, clave) == falso) {
+                vistos[clave] = verdadero
+                candidatos.agregar(c)
+            }
+        }
+    }
+    candidatos = ordenar(candidatos, funcion(p, q) { retornar longitud(p) - longitud(q) })
+    sea base = {}
+    sea elegidos = []
+    para c en candidatos {
+        si (longitud(elegidos) >= cuantos) { romper }
+        sea v = c
+        sea libre = falso
+        mientras (longitud(v) > 0) {
+            sea piv = "" + v[longitud(v) - 1]
+            si (tiene_clave(base, piv)) { v = _mol_xor(v, base[piv]) } sino {
+                base[piv] = v
+                libre = verdadero
+                romper
+            }
+        }
+        si (libre) { elegidos.agregar(c) }
+    }
+    // SSSR simétrico (como RDKit): se suman los anillos candidatos que no
+    // son más grandes que el mayor elegido (p. ej. los tres del biciclo[2.2.2]).
+    sea mayor = 0
+    para c en elegidos { mayor = maximo(mayor, longitud(c)) }
+    para c en candidatos {
+        si (longitud(c) <= mayor y lista_contiene(elegidos, c) == falso) { elegidos.agregar(c) }
+    }
+    // Cada anillo como {"enlaces", "atomos"}.
+    sea r = []
+    para c en elegidos {
+        sea ats = []
+        para j en c {
+            para x en [m["enlaces"][j]["a"], m["enlaces"][j]["b"]] {
+                si (lista_contiene(ats, x) == falso) { ats.agregar(x) }
+            }
+        }
+        r.agregar({"enlaces": c, "atomos": ats, "aromatico": falso})
+    }
+    retornar r
+}
+
+// ---------- aromaticidad ----------
+
+funcion _mol_aromaticidad(m) {
+    // Anillos escritos en minúsculas: aromáticos si todos sus enlaces lo son.
+    para an en m["anillos"] {
+        sea todos = verdadero
+        para j en an["enlaces"] {
+            si (m["enlaces"][j]["arom"] == falso) { todos = falso }
+        }
+        an["aromatico"] = todos
+    }
+    // Formas de Kekulé: regla de Hückel anillo por anillo hasta que no cambie.
+    sea cambio = verdadero
+    mientras (cambio) {
+        cambio = falso
+        para an en m["anillos"] {
+            si (an["aromatico"] == falso) {
+                sea e = _mol_electrones_pi(m, an)
+                si (e >= 2 y (e - 2) % 4 == 0) {
+                    an["aromatico"] = verdadero
+                    cambio = verdadero
+                    para j en an["enlaces"] {
+                        m["enlaces"][j]["arom"] = verdadero
+                        m["enlaces"][j]["orden"] = 4
+                    }
+                    para x en an["atomos"] { m["atomos"][x]["arom"] = verdadero }
+                }
+            }
+        }
+    }
+}
+
+funcion _mol_en_anillo_aromatico(m, x) {
+    para an en m["anillos"] {
+        si (an["aromatico"] y lista_contiene(an["atomos"], x)) { retornar verdadero }
+    }
+    retornar falso
+}
+
+// Electrones π que aporta el anillo, o -1 si no puede ser aromático.
+funcion _mol_electrones_pi(m, an) {
+    sea total = 0
+    para x en an["atomos"] {
+        sea at = m["atomos"][x]
+        sea el = at["el"]
+        si (lista_contiene(["C", "N", "O", "S", "P", "B", "Se"], el) == falso) { retornar -1 }
+        sea doble_dentro = falso
+        sea doble_fuera = nulo
+        sea dobles = 0
+        para v en m["vecinos"][x] {
+            sea e = m["enlaces"][v[1]]
+            si (e["kek"] == 2) {
+                dobles = dobles + 1
+                si (lista_contiene(an["enlaces"], v[1])) { doble_dentro = verdadero } sino { doble_fuera = v }
+            }
+            si (e["kek"] == 3) { retornar -1 }
+        }
+        si (doble_dentro) { total = total + 1 }
+        sino si (doble_fuera != nulo) {
+            sea otro = m["atomos"][doble_fuera[0]]
+            si (_mol_en_anillo_aromatico(m, doble_fuera[0])) { total = total + 1 }
+            sino si (el == "C" y lista_contiene(["O", "N", "S"], otro["el"])) { }
+            sino { retornar -1 }
+        } sino si (at["arom"] y _mol_en_anillo_aromatico(m, x)) {
+            // Átomo de un anillo vecino ya aromático (fusión de anillos escritos en minúsculas).
+            si (el == "C") { total = total + 1 } sino { total = total + si(at["h"] > 0 o longitud(m["vecinos"][x]) == 3, 2, 1) }
+        } sino si ((el == "N" o el == "P") y dobles == 0 y at["carga"] == 0) { total = total + 2 }
+        sino si ((el == "O" o el == "S" o el == "Se") y dobles == 0 y at["carga"] == 0) { total = total + 2 }
+        sino si (el == "C" y at["carga"] == -1) { total = total + 2 }
+        sino si (el == "C" y at["carga"] == 1) { }
+        sino { retornar -1 }
+    }
+    retornar total
+}
+
+// ---------- propiedades ----------
+
+funcion _mol_h_total(m, i) {
+    sea h = m["atomos"][i]["h"]
+    para v en m["vecinos"][i] {
+        si (m["atomos"][v[0]]["el"] == "H") { h = h + 1 }
+    }
+    retornar h
+}
+
+funcion _mol_pesado(at) { retornar at["el"] != "H" y at["el"] != "*" }
+
+/// Fórmula molecular en orden de Hill (C, H y luego alfabético), con la
+/// carga al final ("H4N+").
+funcion molecula_formula(m) {
+    sea cuenta = {}
+    sea sumar = funcion(el, n) { cuenta[el] = (cuenta[el] ?? 0) + n }
+    para at en m["atomos"] {
+        si (at["el"] != "*") { sumar(at["el"], 1) }
+        si (at["h"] > 0) { sumar("H", at["h"]) }
+    }
+    sea claves = ordenar(mapa_claves(cuenta), funcion(p, q) { retornar si(p < q, -1, si(p > q, 1, 0)) })
+    sea orden = []
+    si (tiene_clave(cuenta, "C")) {
+        orden.agregar("C")
+        si (tiene_clave(cuenta, "H")) { orden.agregar("H") }
+        para k en claves {
+            si (k != "C" y k != "H") { orden.agregar(k) }
+        }
+    } sino { orden = claves }
+    sea r = ""
+    para k en orden {
+        r = r + k
+        si (cuenta[k] > 1) { r = r + cuenta[k] }
+    }
+    sea q = molecula_carga(m)
+    si (q == 1) { r = r + "+" } sino si (q == -1) { r = r + "-" } sino si (q > 1) { r = r + "+" + q } sino si (q < -1) { r = r + q }
+    retornar r
+}
+
+funcion _mol_masa(at, cual) {
+    si (at["iso"] > 0 y tiene_clave(_MOL_ISOTOPOS, at["el"] + at["iso"])) { retornar _MOL_ISOTOPOS[at["el"] + at["iso"]] }
+    si (at["iso"] > 0) { retornar at["iso"] }
+    sea t = _MOL_MASAS[at["el"]] ?? nulo
+    si (t == nulo) { retornar 0 }
+    retornar t[cual]
+}
+
+funcion _mol_sumar_masas(m, cual) {
+    sea total = 0
+    para at en m["atomos"] { total = total + _mol_masa(at, cual) + at["h"] * _MOL_MASAS["H"][cual] }
+    retornar total
+}
+
+/// Peso molecular medio (g/mol).
+funcion molecula_peso(m) { retornar _mol_sumar_masas(m, 0) }
+
+/// Masa monoisotópica exacta (con la masa de los electrones si hay carga).
+funcion molecula_masa_exacta(m) { retornar _mol_sumar_masas(m, 1) - molecula_carga(m) * 0.000548579909 }
+
+funcion molecula_atomos_pesados(m) {
+    sea n = 0
+    para at en m["atomos"] {
+        si (_mol_pesado(at)) { n = n + 1 }
+    }
+    retornar n
+}
+
+/// Hidrógenos implícitos y de corchete (sin contar átomos H escritos aparte).
+funcion molecula_hidrogenos(m) {
+    sea n = 0
+    para at en m["atomos"] { n = n + at["h"] }
+    retornar n
+}
+
+funcion molecula_carga(m) {
+    sea q = 0
+    para at en m["atomos"] { q = q + at["carga"] }
+    retornar q
+}
+
+/// Número de anillos (SSSR simétrico, como RDKit).
+funcion molecula_anillos(m) { retornar longitud(m["anillos"]) }
+
+funcion molecula_anillos_aromaticos(m) {
+    sea n = 0
+    para an en m["anillos"] {
+        si (an["aromatico"]) { n = n + 1 }
+    }
+    retornar n
+}
+
+/// Átomos de N y O (aceptores de Lipinski).
+funcion molecula_aceptores(m) {
+    sea n = 0
+    para at en m["atomos"] {
+        si (at["el"] == "N" o at["el"] == "O") { n = n + 1 }
+    }
+    retornar n
+}
+
+/// Hidrógenos sobre N y O (donadores de Lipinski).
+funcion molecula_donadores(m) {
+    sea n = 0
+    sea i = 0
+    para at en m["atomos"] {
+        si (at["el"] == "N" o at["el"] == "O") { n = n + _mol_h_total(m, i) }
+        i = i + 1
+    }
+    retornar n
+}
+
+funcion _mol_en_anillo(m, j) {
+    para an en m["anillos"] {
+        si (lista_contiene(an["enlaces"], j)) { retornar verdadero }
+    }
+    // Enlaces de anillo que no están en la SSSR (cajas): ¿hay otro camino?
+    sea e = m["enlaces"][j]
+    retornar _mol_camino(m, e["a"], e["b"], j) != nulo
+}
+
+funcion _mol_triple(m, i) {
+    para v en m["vecinos"][i] {
+        si (m["enlaces"][v[1]]["kek"] == 3) { retornar verdadero }
+    }
+    retornar falso
+}
+
+/// Enlaces rotables: simples, fuera de anillos, entre átomos no terminales
+/// y sin triples (la definición no estricta de RDKit).
+funcion molecula_rotables(m) {
+    sea n = 0
+    sea j = 0
+    para e en m["enlaces"] {
+        si (e["orden"] == 1 y longitud(m["vecinos"][e["a"]]) > 1 y longitud(m["vecinos"][e["b"]]) > 1 y _mol_triple(m, e["a"]) == falso y _mol_triple(m, e["b"]) == falso y _mol_en_anillo(m, j) == falso) { n = n + 1 }
+        j = j + 1
+    }
+    retornar n
+}
+
+/// Área de superficie polar topológica (Ertl 2000, solo N y O, como RDKit).
+funcion molecula_tpsa(m) {
+    sea total = 0
+    sea i = 0
+    para at en m["atomos"] {
+        si (at["el"] == "N" o at["el"] == "O") { total = total + _mol_tpsa_atomo(m, i) }
+        i = i + 1
+    }
+    retornar redondear(total * 100) / 100
+}
+
+funcion _mol_tpsa_atomo(m, i) {
+    sea at = m["atomos"][i]
+    sea nv = 0
+    sea sing = 0
+    sea dob = 0
+    sea tri = 0
+    sea aro = 0
+    para v en m["vecinos"][i] {
+        si (m["atomos"][v[0]]["el"] != "H") {
+            nv = nv + 1
+            sea o = m["enlaces"][v[1]]["orden"]
+            si (o == 1) { sing = sing + 1 } sino si (o == 2) { dob = dob + 1 } sino si (o == 3) { tri = tri + 1 } sino { aro = aro + 1 }
+        }
+    }
+    sea nh = _mol_h_total(m, i)
+    sea q = at["carga"]
+    sea en3 = falso
+    para an en m["anillos"] {
+        si (longitud(an["atomos"]) == 3 y lista_contiene(an["atomos"], i)) { en3 = verdadero }
+    }
+    sea t = -1
+    si (at["el"] == "N") {
+        si (nv == 1) {
+            si (nh == 0 y q == 0 y tri == 1) { t = 23.79 }
+            sino si (nh == 1 y q == 0 y dob == 1) { t = 23.85 }
+            sino si (nh == 2 y q == 0 y sing == 1) { t = 26.02 }
+            sino si (nh == 2 y q == 1 y dob == 1) { t = 25.59 }
+            sino si (nh == 3 y q == 1 y sing == 1) { t = 27.64 }
+        } sino si (nv == 2) {
+            si (nh == 0 y q == 0 y sing == 1 y dob == 1) { t = 12.36 }
+            sino si (nh == 0 y q == 0 y tri == 1 y dob == 1) { t = 13.6 }
+            sino si (nh == 1 y q == 0 y sing == 2 y en3) { t = 21.94 }
+            sino si (nh == 1 y q == 0 y sing == 2) { t = 12.03 }
+            sino si (nh == 0 y q == 1 y tri == 1 y sing == 1) { t = 4.36 }
+            sino si (nh == 1 y q == 1 y dob == 1 y sing == 1) { t = 13.97 }
+            sino si (nh == 2 y q == 1 y sing == 2) { t = 16.61 }
+            sino si (nh == 0 y q == 0 y aro == 2) { t = 12.89 }
+            sino si (nh == 1 y q == 0 y aro == 2) { t = 15.79 }
+            sino si (nh == 1 y q == 1 y aro == 2) { t = 14.14 }
+        } sino si (nv == 3) {
+            si (nh == 0 y q == 0 y sing == 3 y en3) { t = 3.01 }
+            sino si (nh == 0 y q == 0 y sing == 3) { t = 3.24 }
+            sino si (nh == 0 y q == 0 y sing == 1 y dob == 2) { t = 11.68 }
+            sino si (nh == 0 y q == 1 y sing == 2 y dob == 1) { t = 3.01 }
+            sino si (nh == 1 y q == 1 y sing == 3) { t = 4.44 }
+            sino si (nh == 0 y q == 0 y aro == 3) { t = 4.41 }
+            sino si (nh == 0 y q == 0 y sing == 1 y aro == 2) { t = 4.93 }
+            sino si (nh == 0 y q == 0 y dob == 1 y aro == 2) { t = 8.39 }
+            sino si (nh == 0 y q == 1 y aro == 3) { t = 4.1 }
+            sino si (nh == 0 y q == 1 y sing == 1 y aro == 2) { t = 3.88 }
+        } sino si (nv == 4 y nh == 0 y q == 1 y sing == 4) { t = 0 }
+        si (t < 0) { t = maximo(0, 30.5 - nv * 8.2 + nh * 1.5) }
+        retornar t
+    }
+    si (nv == 1) {
+        si (nh == 0 y q == 0 y dob == 1) { t = 17.07 }
+        sino si (nh == 1 y q == 0 y sing == 1) { t = 20.23 }
+        sino si (nh == 0 y q == -1 y sing == 1) { t = 23.06 }
+    } sino si (nv == 2) {
+        si (nh == 0 y q == 0 y sing == 2 y en3) { t = 12.53 }
+        sino si (nh == 0 y q == 0 y sing == 2) { t = 9.23 }
+        sino si (nh == 0 y q == 0 y aro == 2) { t = 13.14 }
+    }
+    si (t < 0) { t = maximo(0, 28.5 - nv * 8.6 + nh * 1.5) }
+    retornar t
+}
+
+/// Todos los descriptores de una vez.
+funcion molecula_descriptores(m) {
+    retornar {"formula": molecula_formula(m), "peso": molecula_peso(m), "masa_exacta": molecula_masa_exacta(m), "atomos_pesados": molecula_atomos_pesados(m),
+        "hidrogenos": molecula_hidrogenos(m), "anillos": molecula_anillos(m), "anillos_aromaticos": molecula_anillos_aromaticos(m), "aceptores": molecula_aceptores(m),
+        "donadores": molecula_donadores(m), "rotables": molecula_rotables(m), "tpsa": molecula_tpsa(m), "carga": molecula_carga(m)}
+}
+
+/// Regla de los cinco de Lipinski (sin logP): {"cumple", "violaciones": [...]}.
+funcion molecula_lipinski(m) {
+    sea v = []
+    si (molecula_peso(m) > 500) { v.agregar("peso > 500") }
+    si (molecula_donadores(m) > 5) { v.agregar("donadores > 5") }
+    si (molecula_aceptores(m) > 10) { v.agregar("aceptores > 10") }
+    retornar {"cumple": longitud(v) <= 1, "violaciones": v}
+}
+
+// ---------- SMILES canónico ----------
+
+funcion _mol_rangos(m) {
+    sea na = longitud(m["atomos"])
+    sea inv = []
+    para i en lista_rango(0, na) {
+        sea at = m["atomos"][i]
+        inv.agregar([_MOL_Z[at["el"]] ?? 0, si(at["arom"], 1, 0), at["iso"], at["carga"] + 10, longitud(m["vecinos"][i]), at["h"]])
+    }
+    sea rango = _mol_rangos_de(inv)
+    mientras (verdadero) {
+        rango = _mol_refinar(m, rango)
+        // ¿Empates? Se rompe el primero (el de menor rango) y se refina otra vez.
+        sea visto = {}
+        sea empate = -1
+        para i en lista_rango(0, na) {
+            sea k = "" + rango[i]
+            si (tiene_clave(visto, k)) {
+                si (empate < 0 o rango[i] < rango[empate]) { empate = i }
+            }
+            visto[k] = verdadero
+        }
+        si (empate < 0) { retornar rango }
+        // El primer átomo (por índice) con ese rango se separa.
+        sea r = rango[empate]
+        sea primero = -1
+        para i en lista_rango(0, na) {
+            si (primero < 0 y rango[i] == r) { primero = i }
+        }
+        sea nuevo = []
+        para i en lista_rango(0, na) { nuevo.agregar([rango[i] * 2 + si(rango[i] > r o (rango[i] == r y i != primero), 1, 0)]) }
+        rango = _mol_rangos_de(nuevo)
+    }
+    retornar rango
+}
+
+funcion _mol_cmp_listas(a, b) {
+    sea i = 0
+    mientras (i < longitud(a) y i < longitud(b)) {
+        si (a[i] != b[i]) { retornar a[i] - b[i] }
+        i = i + 1
+    }
+    retornar longitud(a) - longitud(b)
+}
+
+// Rango denso (0, 1, 2…) de una lista de claves (listas de números).
+funcion _mol_rangos_de(claves) {
+    sea idx = ordenar(lista_rango(0, longitud(claves)), funcion(p, q) { retornar _mol_cmp_listas(claves[p], claves[q]) })
+    sea r = []
+    para i en lista_rango(0, longitud(claves)) { r.agregar(0) }
+    sea actual = 0
+    sea k = 0
+    mientras (k < longitud(idx)) {
+        si (k > 0 y _mol_cmp_listas(claves[idx[k]], claves[idx[k - 1]]) != 0) { actual = actual + 1 }
+        r[idx[k]] = actual
+        k = k + 1
+    }
+    retornar r
+}
+
+funcion _mol_refinar(m, rango) {
+    sea r = rango
+    mientras (verdadero) {
+        sea claves = []
+        para i en lista_rango(0, longitud(r)) {
+            sea vs = []
+            para v en m["vecinos"][i] { vs.agregar(r[v[0]] * 8 + m["enlaces"][v[1]]["orden"]) }
+            vs = ordenar(vs, funcion(p, q) { retornar p - q })
+            sea k = [r[i]]
+            para x en vs { k.agregar(x) }
+            claves.agregar(k)
+        }
+        sea nuevo = _mol_rangos_de(claves)
+        si (_mol_cmp_listas(ordenar(nuevo, funcion(p, q) { retornar p - q }), ordenar(r, funcion(p, q) { retornar p - q })) == 0 y _mol_distintos(nuevo) == _mol_distintos(r)) { retornar nuevo }
+        r = nuevo
+    }
+    retornar r
+}
+
+funcion _mol_distintos(r) {
+    sea v = {}
+    para x en r { v["" + x] = verdadero }
+    retornar longitud(mapa_claves(v))
+}
+
+funcion _mol_texto_atomo(m, i) {
+    sea at = m["atomos"][i]
+    sea el = at["el"]
+    sea simb = si(at["arom"], texto_minusculas(el), el)
+    sea organico = lista_contiene(["B", "C", "N", "O", "P", "S", "F", "Cl", "Br", "I", "*"], el)
+    si (organico y at["carga"] == 0 y at["iso"] == 0 y _mol_h_implicitos(m, i, "orden") == at["h"]) { retornar simb }
+    sea t = "["
+    si (at["iso"] > 0) { t = t + at["iso"] }
+    t = t + simb
+    si (at["h"] == 1) { t = t + "H" } sino si (at["h"] > 1) { t = t + "H" + at["h"] }
+    sea q = at["carga"]
+    si (q == 1) { t = t + "+" } sino si (q == -1) { t = t + "-" } sino si (q > 1) { t = t + "+" + q } sino si (q < -1) { t = t + q }
+    retornar t + "]"
+}
+
+funcion _mol_texto_enlace(m, j) {
+    sea e = m["enlaces"][j]
+    si (e["orden"] == 2) { retornar "=" }
+    si (e["orden"] == 3) { retornar "#" }
+    si (e["orden"] == 1 y m["atomos"][e["a"]]["arom"] y m["atomos"][e["b"]]["arom"]) { retornar "-" }
+    retornar ""
+}
+
+/// SMILES canónico: el mismo texto para la misma molécula, la escribas como
+/// la escribas (aromático en minúsculas, sin estereoquímica).
+funcion molecula_smiles(m) {
+    sea na = longitud(m["atomos"])
+    si (na == 0) { retornar "" }
+    sea rango = _mol_rangos(m)
+    sea visitado = []
+    para i en lista_rango(0, na) { visitado.agregar(falso) }
+    sea partes = []
+    // Componentes en orden del rango de su mejor átomo.
+    sea orden = ordenar(lista_rango(0, na), funcion(p, q) { retornar rango[p] - rango[q] })
+    para inicio en orden {
+        si (visitado[inicio] == falso) {
+            // Primera pasada: árbol DFS y enlaces de cierre.
+            sea padre = {}
+            sea hijos = {}
+            sea cierres = []
+            sea en_arbol = {}
+            sea dfs = nulo
+            sea marcado = {}
+            dfs = funcion(x, desde) {
+                marcado["" + x] = verdadero
+                visitado[x] = verdadero
+                hijos["" + x] = []
+                sea vs = ordenar(m["vecinos"][x], funcion(p, q) { retornar rango[p[0]] - rango[q[0]] })
+                para v en vs {
+                    si (v[1] != desde) {
+                        si (tiene_clave(marcado, "" + v[0])) {
+                            si (tiene_clave(en_arbol, "" + v[1]) == falso y lista_contiene(cierres, v[1]) == falso) { cierres.agregar(v[1]) }
+                        } sino {
+                            en_arbol["" + v[1]] = verdadero
+                            hijos["" + x].agregar(v)
+                            dfs(v[0], v[1])
+                        }
+                    }
+                }
+            }
+            dfs(inicio, -1)
+            // Segunda pasada: escritura con números de anillo.
+            sea abiertos = {}
+            sea libres = []
+            sea escribir = nulo
+            escribir = funcion(x) {
+                sea t = _mol_texto_atomo(m, x)
+                // Cierres que tocan a x, en orden del rango del otro extremo.
+                sea mios = []
+                para j en cierres {
+                    sea e = m["enlaces"][j]
+                    si (e["a"] == x o e["b"] == x) { mios.agregar(j) }
+                }
+                mios = ordenar(mios, funcion(p, q) {
+                    sea ep = m["enlaces"][p]
+                    sea eq2 = m["enlaces"][q]
+                    retornar rango[si(ep["a"] == x, ep["b"], ep["a"])] - rango[si(eq2["a"] == x, eq2["b"], eq2["a"])]
+                })
+                para j en mios {
+                    si (tiene_clave(abiertos, "" + j)) {
+                        sea num = abiertos["" + j]
+                        t = t + _mol_texto_enlace(m, j) + si(num < 10, "" + num, "%" + num)
+                        quitar_clave(abiertos, "" + j)
+                        libres.agregar(num)
+                    } sino {
+                        sea num = 1
+                        mientras (lista_contiene(libres, num) == falso y _mol_usado(abiertos, num)) { num = num + 1 }
+                        si (longitud(libres) > 0) {
+                            libres = ordenar(libres, funcion(p, q) { retornar p - q })
+                            num = libres[0]
+                            eliminar(libres, 0)
+                        }
+                        mientras (_mol_usado(abiertos, num)) { num = num + 1 }
+                        abiertos["" + j] = num
+                        t = t + si(num < 10, "" + num, "%" + num)
+                    }
+                }
+                sea hs = hijos["" + x]
+                sea k = 0
+                para v en hs {
+                    sea sub = _mol_texto_enlace(m, v[1]) + escribir(v[0])
+                    si (k < longitud(hs) - 1) { t = t + "(" + sub + ")" } sino { t = t + sub }
+                    k = k + 1
+                }
+                retornar t
+            }
+            partes.agregar(escribir(inicio))
+        }
+    }
+    retornar unir(partes, ".")
+}
+
+funcion _mol_usado(abiertos, num) {
+    para k en mapa_claves(abiertos) {
+        si (abiertos[k] == num) { retornar verdadero }
+    }
+    retornar falso
+}
+
+// ---------- subestructuras (subconjunto de SMARTS) ----------
+
+// Patrón: átomos como en SMILES (mayúscula = alifático, minúscula =
+// aromático), [#n], [*], *; enlaces - = # : ~ (sin enlace = simple o
+// aromático); ramas y anillos como en SMILES.
+funcion _mol_patron(t) {
+    sea atomos = []
+    sea enlaces = []
+    sea i = 0
+    sea previo = -1
+    sea pila = []
+    sea anillos = {}
+    sea pend = "?"
+    sea n = longitud(t)
+    mientras (i < n) {
+        sea c = subtexto(t, i, i + 1)
+        si (c == "(") {
+            pila.agregar(previo)
+            i = i + 1
+        } sino si (c == ")") {
+            previo = pila[longitud(pila) - 1]
+            quitar_ultimo(pila)
+            i = i + 1
+        } sino si (c == "-" o c == "=" o c == "#" o c == ":" o c == "~") {
+            pend = c
+            i = i + 1
+        } sino si (_mol_es_digito(c)) {
+            si (tiene_clave(anillos, c)) {
+                sea ab = anillos[c]
+                enlaces.agregar({"a": ab[0], "b": previo, "tipo": si(pend == "?", ab[1], pend)})
+                quitar_clave(anillos, c)
+            } sino { anillos[c] = [previo, pend] }
+            pend = "?"
+            i = i + 1
+        } sino {
+            sea q = nulo
+            si (c == "[") {
+                sea fin = texto_indice(subtexto(t, i, n), "]")
+                sea dentro = subtexto(t, i + 1, i + fin)
+                i = i + fin + 1
+                si (texto_empieza_con(dentro, "#")) { q = {"z": a_numero(subtexto(dentro, 1, longitud(dentro))), "el": nulo, "arom": nulo} }
+                sino si (dentro == "*") { q = {"el": nulo, "arom": nulo} }
+                sino {
+                    sea at = _mol_corchete(dentro)
+                    q = {"el": at["el"], "arom": at["arom"], "carga": at["carga"]}
+                    si (texto_contiene(dentro, "H")) { q["h"] = at["h"] }
+                }
+            } sino si (c == "*") {
+                q = {"el": nulo, "arom": nulo}
+                i = i + 1
+            } sino {
+                sea dos = subtexto(t, i, i + 2)
+                si (dos == "Cl" o dos == "Br") {
+                    q = {"el": dos, "arom": falso}
+                    i = i + 2
+                } sino si (texto_indice("BCNOPSFI", c) >= 0) {
+                    q = {"el": c, "arom": falso}
+                    i = i + 1
+                } sino si (texto_indice("bcnops", c) >= 0) {
+                    q = {"el": texto_mayusculas(c), "arom": verdadero}
+                    i = i + 1
+                } sino { lanzar "molecula: patrón inválido en " + i }
+            }
+            atomos.agregar(q)
+            sea k = longitud(atomos) - 1
+            si (previo >= 0) { enlaces.agregar({"a": previo, "b": k, "tipo": pend}) }
+            pend = "?"
+            previo = k
+        }
+    }
+    retornar {"atomos": atomos, "enlaces": enlaces}
+}
+
+funcion _mol_atomo_casa(q, at) {
+    si (q["el"] != nulo y q["el"] != at["el"]) { retornar falso }
+    si (tiene_clave(q, "z") y (_MOL_Z[at["el"]] ?? -1) != q["z"]) { retornar falso }
+    si (q["arom"] != nulo y q["arom"] != at["arom"]) { retornar falso }
+    si (tiene_clave(q, "carga") y q["carga"] != at["carga"]) { retornar falso }
+    si (tiene_clave(q, "h") y q["h"] != at["h"]) { retornar falso }
+    retornar verdadero
+}
+
+funcion _mol_enlace_casa(tipo, e) {
+    si (tipo == "~") { retornar verdadero }
+    si (tipo == "?") { retornar e["orden"] == 1 o e["orden"] == 4 }
+    si (tipo == "-") { retornar e["orden"] == 1 }
+    si (tipo == "=") { retornar e["orden"] == 2 }
+    si (tipo == "#") { retornar e["orden"] == 3 }
+    retornar e["orden"] == 4
+}
+
+/// Coincidencias únicas de un patrón SMARTS sencillo: lista de listas de
+/// índices de átomos (en el orden de los átomos del patrón).
+funcion molecula_buscar(m, patron) {
+    sea p = _mol_patron(patron)
+    sea nq = longitud(p["atomos"])
+    sea r = []
+    si (nq == 0) { retornar r }
+    // Enlaces del patrón por átomo, hacia átomos anteriores.
+    sea hacia_atras = []
+    para k en lista_rango(0, nq) { hacia_atras.agregar([]) }
+    para e en p["enlaces"] {
+        sea a = minimo(e["a"], e["b"])
+        sea b = maximo(e["a"], e["b"])
+        hacia_atras[b].agregar([a, e["tipo"]])
+    }
+    sea vistos = {}
+    sea asig = []
+    sea usado = {}
+    sea buscar = nulo
+    buscar = funcion(k) {
+        si (k == nq) {
+            sea clave = unir(ordenar(asig, funcion(x, y2) { retornar x - y2 }), ",")
+            si (tiene_clave(vistos, clave) == falso) {
+                vistos[clave] = verdadero
+                sea copia = []
+                para x en asig { copia.agregar(x) }
+                r.agregar(copia)
+            }
+            retornar nulo
+        }
+        sea candidatos = lista_rango(0, longitud(m["atomos"]))
+        // Si tiene un vecino anterior, sólo sus vecinos.
+        si (longitud(hacia_atras[k]) > 0) {
+            candidatos = []
+            para v en m["vecinos"][asig[hacia_atras[k][0][0]]] { candidatos.agregar(v[0]) }
+        }
+        para x en candidatos {
+            si (tiene_clave(usado, "" + x) == falso y _mol_atomo_casa(p["atomos"][k], m["atomos"][x])) {
+                sea ok = verdadero
+                para ea en hacia_atras[k] {
+                    sea y2 = asig[ea[0]]
+                    sea j = -1
+                    para v en m["vecinos"][x] {
+                        si (v[0] == y2) { j = v[1] }
+                    }
+                    si (j < 0 o _mol_enlace_casa(ea[1], m["enlaces"][j]) == falso) { ok = falso }
+                }
+                si (ok) {
+                    asig.agregar(x)
+                    usado["" + x] = verdadero
+                    buscar(k + 1)
+                    quitar_clave(usado, "" + x)
+                    quitar_ultimo(asig)
+                }
+            }
+        }
+        retornar nulo
+    }
+    buscar(0)
+    retornar r
+}
+
+/// ¿Contiene la subestructura?
+funcion molecula_contiene(m, patron) { retornar longitud(molecula_buscar(m, patron)) > 0 }

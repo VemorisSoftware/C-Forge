@@ -1,0 +1,1933 @@
+// stdlib/desarma.cfv — Ensamblador y desensamblador de x86-64 y ARM64 al
+// estilo de Capstone y Keystone, escrito desde cero (idea de Capstone, BSD,
+// y Keystone, GPL: solo la idea). La sintaxis y el formato de salida son los
+// de Capstone (Intel en x86-64), así que se puede comparar texto con texto.
+//
+//   · x86-64: enteros (ALU, mov/movabs/movzx/movsx/movsxd, lea, push/pop,
+//     imul/mul/div/idiv, desplazamientos y rotaciones, inc/dec/neg/not,
+//     test, xchg, cmovcc, setcc, jcc, call/jmp/ret, bswap, popcnt, bsf/bsr)
+//     y SSE escalar/empaquetado (mov*, add/sub/mul/div/min/max/sqrt,
+//     and/xor, cvt*, ucomis*/comis*, movd/movq), con REX, SIB y RIP.
+//   · ARM64: aritmética y lógica (inmediatos lógicos incluidos), mov/movz/
+//     movk/movn y sus alias, mul/madd/msub/div/smulh/umulh, desplazamientos
+//     (lsl/lsr/asr/ror, ubfx/sxtw/uxtb…), cargas y guardados (offset,
+//     pre/post-índice, registro, literal, pares), saltos (b, bl, b.cond,
+//     cbz/cbnz, tbz/tbnz, br/blr/ret), csel/csinc/cset/cneg, adr/adrp, svc
+//     y punto flotante escalar (fadd…, fmov, scvtf, fcvtzs, fcmp).
+//
+// En inglés: importar "capstone".
+//
+//   importar "desarma"
+//   para i en desarma_x86(bytes_de_hex("554889e5"), 4096) { mostrar(i["texto"]) }
+//   mostrar(hex_de_bytes(ensambla_arm64("add x0, x1, #4\nret", 0)))
+
+// ---------- utilidades ----------
+
+funcion _dsm_hex(v) {
+    si (v < 10) { retornar "" + v }
+    sea h = "0123456789abcdef"
+    sea r = ""
+    sea x = v
+    mientras (x > 0) {
+        sea d = x % 16
+        r = subtexto(h, d, d + 1) + r
+        x = (x - d) / 16
+    }
+    retornar "0x" + r
+}
+
+// Con signo: "-8", "-0x80".
+funcion _dsm_shex(v) {
+    si (v < 0) { retornar "-" + _dsm_hex(0 - v) }
+    retornar _dsm_hex(v)
+}
+
+funcion _dsm_u(b, p, n) { retornar bytes_leer_entero(b, p, n, 1) }
+
+funcion _dsm_s(v, bits) {
+    sea m = potencia(2, bits)
+    si (v >= m / 2) { retornar v - m }
+    retornar v
+}
+
+// Entero sin signo de 64 bits como texto hexadecimal (para -1 → 0xffff…).
+funcion _dsm_hex64(v, bits) {
+    si (v >= 0) { retornar _dsm_hex(v) }
+    si (bits < 64) { retornar _dsm_hex(v + potencia(2, bits)) }
+    // 64 bits: complemento a dos en dos mitades.
+    sea alto = piso(v / 4294967296)
+    sea bajo = v - alto * 4294967296
+    alto = alto + 4294967296
+    sea h = _dsm_hex(bajo)
+    h = subtexto(h, 2, longitud(h))
+    mientras (longitud(h) < 8) { h = "0" + h }
+    retornar _dsm_hex(alto) + h
+}
+
+funcion _dsm_indice(l, v) {
+    sea i = 0
+    mientras (i < longitud(l)) {
+        si (l[i] == v) { retornar i }
+        i = i + 1
+    }
+    retornar -1
+}
+
+// ---------- x86-64: registros ----------
+
+sea _DSM_R64 = ["rax", "rcx", "rdx", "rbx", "rsp", "rbp", "rsi", "rdi", "r8", "r9", "r10", "r11", "r12", "r13", "r14", "r15"]
+sea _DSM_R32 = ["eax", "ecx", "edx", "ebx", "esp", "ebp", "esi", "edi", "r8d", "r9d", "r10d", "r11d", "r12d", "r13d", "r14d", "r15d"]
+sea _DSM_R16 = ["ax", "cx", "dx", "bx", "sp", "bp", "si", "di", "r8w", "r9w", "r10w", "r11w", "r12w", "r13w", "r14w", "r15w"]
+sea _DSM_R8 = ["al", "cl", "dl", "bl", "spl", "bpl", "sil", "dil", "r8b", "r9b", "r10b", "r11b", "r12b", "r13b", "r14b", "r15b"]
+sea _DSM_R8V = ["al", "cl", "dl", "bl", "ah", "ch", "dh", "bh"]
+sea _DSM_CC = ["o", "no", "b", "ae", "e", "ne", "be", "a", "s", "ns", "p", "np", "l", "ge", "le", "g"]
+sea _DSM_ALU = ["add", "or", "adc", "sbb", "and", "sub", "xor", "cmp"]
+sea _DSM_ROT = ["rol", "ror", "rcl", "rcr", "shl", "shr", "sal", "sar"]
+
+funcion _dsm_reg(n, tam, rex) {
+    si (tam == 8) {
+        si (rex == falso y n < 8) { retornar _DSM_R8V[n] }
+        retornar _DSM_R8[n]
+    }
+    si (tam == 16) { retornar _DSM_R16[n] }
+    si (tam == 32) { retornar _DSM_R32[n] }
+    si (tam == 128) { retornar "xmm" + n }
+    retornar _DSM_R64[n]
+}
+
+funcion _dsm_ptr(tam) {
+    retornar {"8": "byte ptr ", "16": "word ptr ", "32": "dword ptr ", "64": "qword ptr ", "128": "xmmword ptr ", "0": ""}["" + tam]
+}
+
+// ---------- x86-64: decodificación ----------
+
+// Decodifica ModRM (+SIB, desplazamiento) desde p. Devuelve {"mod", "reg",
+// "rm", "mem": texto o nulo, "fin", "rip"}.
+funcion _dsm_modrm(b, p, st) {
+    sea m = byte_en(b, p)
+    sea mod = piso(m / 64)
+    sea reg = piso(m / 8) % 8 + st["rex_r"] * 8
+    sea rm = m % 8
+    sea q = p + 1
+    si (mod == 3) { retornar {"mod": 3, "reg": reg, "rm": rm + st["rex_b"] * 8, "mem": nulo, "fin": q} }
+    sea base = nulo
+    sea indice = nulo
+    sea escala = 1
+    sea disp = 0
+    si (rm == 4) {
+        sea sib = byte_en(b, q)
+        q = q + 1
+        escala = potencia(2, piso(sib / 64))
+        sea idx = piso(sib / 8) % 8 + st["rex_x"] * 8
+        si (idx != 4) { indice = _DSM_R64[idx] }
+        sea bs = sib % 8
+        si (bs == 5 y mod == 0) {
+            disp = _dsm_s(_dsm_u(b, q, 4), 32)
+            q = q + 4
+        } sino { base = _DSM_R64[bs + st["rex_b"] * 8] }
+    } sino si (rm == 5 y mod == 0) {
+        base = "rip"
+        disp = _dsm_s(_dsm_u(b, q, 4), 32)
+        q = q + 4
+    } sino { base = _DSM_R64[rm + st["rex_b"] * 8] }
+    si (mod == 1) {
+        disp = _dsm_s(byte_en(b, q), 8)
+        q = q + 1
+    } sino si (mod == 2) {
+        disp = _dsm_s(_dsm_u(b, q, 4), 32)
+        q = q + 4
+    }
+    sea partes = []
+    si (base != nulo) { partes.agregar(base) }
+    si (indice != nulo) {
+        si (escala == 1) { partes.agregar(indice) } sino { partes.agregar(indice + "*" + escala) }
+    }
+    sea t = unir(partes, " + ")
+    si (t == "") { t = _dsm_hex64(disp, 32) } sino si (disp > 0) { t = t + " + " + _dsm_hex(disp) } sino si (disp < 0) { t = t + " - " + _dsm_hex(0 - disp) }
+    retornar {"mod": mod, "reg": reg, "rm": rm, "mem": "[" + t + "]", "fin": q}
+}
+
+funcion _dsm_e(mr, tam, st) {
+    si (mr["mem"] != nulo) { retornar _dsm_ptr(tam) + mr["mem"] }
+    retornar _dsm_reg(mr["rm"], tam, st["rex"])
+}
+
+funcion _dsm_imm_txt(v, tam, con_signo) {
+    si (con_signo) { retornar _dsm_shex(v) }
+    retornar _dsm_hex64(v, tam)
+}
+
+/// Desensambla código x86-64. Devuelve [{"direccion", "bytes", "mnemonico",
+/// "operandos", "texto", "largo"}]; un byte que no entiende sale como ".byte".
+funcion desarma_x86(codigo, direccion) {
+    sea r = []
+    sea p = 0
+    sea dir = direccion ?? 0
+    mientras (p < longitud(codigo)) {
+        sea ins = nulo
+        intentar { ins = _dsm_x86_una(codigo, p, dir + p) } capturar (e) { ins = nulo }
+        si (ins == nulo) { ins = {"mn": ".byte", "op": _dsm_hex(byte_en(codigo, p)), "largo": 1} }
+        r.agregar({"direccion": dir + p, "bytes": subtexto(codigo, p, p + ins["largo"]), "mnemonico": ins["mn"], "operandos": ins["op"],
+            "texto": texto_recortar(ins["mn"] + " " + ins["op"]), "largo": ins["largo"]})
+        p = p + ins["largo"]
+    }
+    retornar r
+}
+
+funcion _dsm_x86_una(b, p0, dir) {
+    sea p = p0
+    sea st = {"rex": falso, "rex_w": 0, "rex_r": 0, "rex_x": 0, "rex_b": 0, "op16": falso, "rep": 0}
+    mientras (verdadero) {
+        sea x = byte_en(b, p)
+        si (x == 102) { st["op16"] = verdadero }
+        sino si (x == 242 o x == 243) { st["rep"] = x }
+        sino si (x == 46 o x == 62 o x == 38 o x == 54 o x == 100 o x == 101 o x == 103 o x == 240) { }
+        sino { romper }
+        p = p + 1
+    }
+    sea x = byte_en(b, p)
+    si (x >= 64 y x <= 79) {
+        st["rex"] = verdadero
+        st["rex_w"] = piso(x / 8) % 2
+        st["rex_r"] = piso(x / 4) % 2
+        st["rex_x"] = piso(x / 2) % 2
+        st["rex_b"] = x % 2
+        p = p + 1
+        x = byte_en(b, p)
+    }
+    sea tv = 32
+    si (st["rex_w"] == 1) { tv = 64 } sino si (st["op16"]) { tv = 16 }
+    sea op = x
+    p = p + 1
+    sea fin = funcion(mn, ops, q) { retornar {"mn": mn, "op": ops, "largo": q - p0} }
+    // ALU 00-3F
+    si (op < 64 y op % 8 < 6) {
+        sea nom = _DSM_ALU[piso(op / 8)]
+        sea k = op % 8
+        sea arit = nom == "add" o nom == "adc" o nom == "sub" o nom == "sbb" o nom == "cmp"
+        si (k == 4) { retornar fin(nom, "al, " + _dsm_imm_txt(byte_en(b, p), 8, falso), p + 1) }
+        si (k == 5) {
+            sea anchura = 4
+            si (tv == 16) { anchura = 2 }
+            sea v = _dsm_s(_dsm_u(b, p, anchura), anchura * 8)
+            retornar fin(nom, _dsm_reg(0, tv, st["rex"]) + ", " + _dsm_imm_txt(v, tv, arit), p + anchura)
+        }
+        sea mr = _dsm_modrm(b, p, st)
+        sea tam = tv
+        si (k % 2 == 0) { tam = 8 }
+        si (k < 2) { retornar fin(nom, _dsm_e(mr, tam, st) + ", " + _dsm_reg(mr["reg"], tam, st["rex"]), mr["fin"]) }
+        retornar fin(nom, _dsm_reg(mr["reg"], tam, st["rex"]) + ", " + _dsm_e(mr, tam, st), mr["fin"])
+    }
+    si (op >= 80 y op <= 87) { retornar fin("push", _DSM_R64[op - 80 + st["rex_b"] * 8], p) }
+    si (op >= 88 y op <= 95) { retornar fin("pop", _DSM_R64[op - 88 + st["rex_b"] * 8], p) }
+    si (op == 99) {
+        sea mr = _dsm_modrm(b, p, st)
+        retornar fin("movsxd", _dsm_reg(mr["reg"], tv, st["rex"]) + ", " + _dsm_e(mr, 32, st), mr["fin"])
+    }
+    si (op == 104) { retornar fin("push", _dsm_shex(_dsm_s(_dsm_u(b, p, 4), 32)), p + 4) }
+    si (op == 106) { retornar fin("push", _dsm_shex(_dsm_s(byte_en(b, p), 8)), p + 1) }
+    si (op == 105 o op == 107) {
+        sea mr = _dsm_modrm(b, p, st)
+        sea q = mr["fin"]
+        sea v = 0
+        si (op == 107) {
+            v = _dsm_s(byte_en(b, q), 8)
+            q = q + 1
+        } sino {
+            v = _dsm_s(_dsm_u(b, q, 4), 32)
+            q = q + 4
+        }
+        retornar fin("imul", _dsm_reg(mr["reg"], tv, st["rex"]) + ", " + _dsm_e(mr, tv, st) + ", " + _dsm_shex(v), q)
+    }
+    si (op >= 112 y op <= 127) { retornar fin("j" + _DSM_CC[op - 112], _dsm_hex(dir + (p + 1 - p0) + _dsm_s(byte_en(b, p), 8)), p + 1) }
+    si (op == 128 o op == 129 o op == 131) {
+        sea mr = _dsm_modrm(b, p, st)
+        sea nom = _DSM_ALU[mr["reg"] % 8]
+        sea arit = nom == "add" o nom == "adc" o nom == "sub" o nom == "sbb" o nom == "cmp"
+        sea q = mr["fin"]
+        si (op == 128) { retornar fin(nom, _dsm_e(mr, 8, st) + ", " + _dsm_hex(byte_en(b, q)), q + 1) }
+        si (op == 131) { retornar fin(nom, _dsm_e(mr, tv, st) + ", " + _dsm_imm_txt(_dsm_s(byte_en(b, q), 8), tv, arit), q + 1) }
+        sea anchura = 4
+        si (tv == 16) { anchura = 2 }
+        retornar fin(nom, _dsm_e(mr, tv, st) + ", " + _dsm_imm_txt(_dsm_s(_dsm_u(b, q, anchura), anchura * 8), tv, arit), q + anchura)
+    }
+    si (op >= 132 y op <= 139) {
+        sea mr = _dsm_modrm(b, p, st)
+        sea tam = tv
+        si (op % 2 == 0) { tam = 8 }
+        sea nom = ["test", "test", "xchg", "xchg", "mov", "mov", "mov", "mov"][op - 132]
+        si (op <= 137) { retornar fin(nom, _dsm_e(mr, tam, st) + ", " + _dsm_reg(mr["reg"], tam, st["rex"]), mr["fin"]) }
+        retornar fin(nom, _dsm_reg(mr["reg"], tam, st["rex"]) + ", " + _dsm_e(mr, tam, st), mr["fin"])
+    }
+    si (op == 141) {
+        sea mr = _dsm_modrm(b, p, st)
+        retornar fin("lea", _dsm_reg(mr["reg"], tv, st["rex"]) + ", " + mr["mem"], mr["fin"])
+    }
+    si (op == 143) {
+        sea mr = _dsm_modrm(b, p, st)
+        retornar fin("pop", _dsm_e(mr, 64, st), mr["fin"])
+    }
+    si (op == 144 y st["rex_b"] == 0) {
+        si (st["rep"] == 243) { retornar fin("pause", "", p) }
+        retornar fin("nop", "", p)
+    }
+    si (op >= 144 y op <= 151) { retornar fin("xchg", _dsm_reg(op - 144 + st["rex_b"] * 8, tv, st["rex"]) + ", " + _dsm_reg(0, tv, st["rex"]), p) }
+    si (op == 152) { retornar fin(si(tv == 64, "cdqe", si(tv == 16, "cbw", "cwde")), "", p) }
+    si (op == 153) { retornar fin(si(tv == 64, "cqo", si(tv == 16, "cwd", "cdq")), "", p) }
+    si (op == 168) { retornar fin("test", "al, " + _dsm_hex(byte_en(b, p)), p + 1) }
+    si (op == 169) {
+        sea anchura = si(tv == 16, 2, 4)
+        retornar fin("test", _dsm_reg(0, tv, st["rex"]) + ", " + _dsm_hex64(_dsm_s(_dsm_u(b, p, anchura), anchura * 8), tv), p + anchura)
+    }
+    si (op >= 176 y op <= 183) { retornar fin("mov", _dsm_reg(op - 176 + st["rex_b"] * 8, 8, st["rex"]) + ", " + _dsm_hex(byte_en(b, p)), p + 1) }
+    si (op >= 184 y op <= 191) {
+        sea rn = op - 184 + st["rex_b"] * 8
+        si (tv == 64) {
+            sea bajo = _dsm_u(b, p, 4)
+            sea alto = _dsm_u(b, p + 4, 4)
+            sea txt = ""
+            si (alto == 0) { txt = _dsm_hex(bajo) } sino {
+                sea hb = _dsm_hex(bajo)
+                hb = subtexto(hb, 2, longitud(hb))
+                si (bajo < 10) { hb = "" + bajo }
+                mientras (longitud(hb) < 8) { hb = "0" + hb }
+                txt = _dsm_hex(alto) + hb
+            }
+            retornar fin("movabs", _DSM_R64[rn] + ", " + txt, p + 8)
+        }
+        sea anchura = si(tv == 16, 2, 4)
+        retornar fin("mov", _dsm_reg(rn, tv, st["rex"]) + ", " + _dsm_hex(_dsm_u(b, p, anchura)), p + anchura)
+    }
+    si (op == 192 o op == 193 o op == 208 o op == 209 o op == 210 o op == 211) {
+        sea mr = _dsm_modrm(b, p, st)
+        sea tam = si(op % 2 == 0, 8, tv)
+        sea nom = _DSM_ROT[mr["reg"] % 8]
+        si (op == 192 o op == 193) { retornar fin(nom, _dsm_e(mr, tam, st) + ", " + _dsm_hex(byte_en(b, mr["fin"])), mr["fin"] + 1) }
+        si (op == 208 o op == 209) { retornar fin(nom, _dsm_e(mr, tam, st) + ", 1", mr["fin"]) }
+        retornar fin(nom, _dsm_e(mr, tam, st) + ", cl", mr["fin"])
+    }
+    si (op == 194) { retornar fin("ret", _dsm_hex(_dsm_u(b, p, 2)), p + 2) }
+    si (op == 195) { retornar fin("ret", "", p) }
+    si (op == 198 o op == 199) {
+        sea mr = _dsm_modrm(b, p, st)
+        si (op == 198) { retornar fin("mov", _dsm_e(mr, 8, st) + ", " + _dsm_hex(byte_en(b, mr["fin"])), mr["fin"] + 1) }
+        sea anchura = si(tv == 16, 2, 4)
+        retornar fin("mov", _dsm_e(mr, tv, st) + ", " + _dsm_hex64(_dsm_s(_dsm_u(b, mr["fin"], anchura), anchura * 8), tv), mr["fin"] + anchura)
+    }
+    si (op == 201) { retornar fin("leave", "", p) }
+    si (op == 204) { retornar fin("int3", "", p) }
+    si (op == 205) { retornar fin("int", _dsm_hex(byte_en(b, p)), p + 1) }
+    si (op == 232) { retornar fin("call", _dsm_hex(dir + (p + 4 - p0) + _dsm_s(_dsm_u(b, p, 4), 32)), p + 4) }
+    si (op == 233) { retornar fin("jmp", _dsm_hex(dir + (p + 4 - p0) + _dsm_s(_dsm_u(b, p, 4), 32)), p + 4) }
+    si (op == 235) { retornar fin("jmp", _dsm_hex(dir + (p + 1 - p0) + _dsm_s(byte_en(b, p), 8)), p + 1) }
+    si (op == 244) { retornar fin("hlt", "", p) }
+    si (op == 246 o op == 247) {
+        sea mr = _dsm_modrm(b, p, st)
+        sea tam = si(op == 246, 8, tv)
+        sea k = mr["reg"] % 8
+        sea nom = ["test", "test", "not", "neg", "mul", "imul", "div", "idiv"][k]
+        si (k <= 1) {
+            si (op == 246) { retornar fin("test", _dsm_e(mr, 8, st) + ", " + _dsm_hex(byte_en(b, mr["fin"])), mr["fin"] + 1) }
+            sea anchura = si(tv == 16, 2, 4)
+            retornar fin("test", _dsm_e(mr, tv, st) + ", " + _dsm_hex64(_dsm_s(_dsm_u(b, mr["fin"], anchura), anchura * 8), tv), mr["fin"] + anchura)
+        }
+        retornar fin(nom, _dsm_e(mr, tam, st), mr["fin"])
+    }
+    si (op == 254) {
+        sea mr = _dsm_modrm(b, p, st)
+        retornar fin(si(mr["reg"] % 8 == 0, "inc", "dec"), _dsm_e(mr, 8, st), mr["fin"])
+    }
+    si (op == 255) {
+        sea mr = _dsm_modrm(b, p, st)
+        sea k = mr["reg"] % 8
+        si (k == 0 o k == 1) { retornar fin(si(k == 0, "inc", "dec"), _dsm_e(mr, tv, st), mr["fin"]) }
+        si (k == 2) { retornar fin("call", _dsm_e(mr, 64, st), mr["fin"]) }
+        si (k == 4) { retornar fin("jmp", _dsm_e(mr, 64, st), mr["fin"]) }
+        si (k == 6) { retornar fin("push", _dsm_e(mr, 64, st), mr["fin"]) }
+        retornar nulo
+    }
+    si (op == 15) { retornar _dsm_x86_0f(b, p, p0, dir, st, tv) }
+    retornar nulo
+}
+
+funcion _dsm_sse_sufijo(st) {
+    si (st["rep"] == 243) { retornar "ss" }
+    si (st["rep"] == 242) { retornar "sd" }
+    si (st["op16"]) { retornar "pd" }
+    retornar "ps"
+}
+
+funcion _dsm_sse_tam(st) {
+    si (st["rep"] == 243) { retornar 32 }
+    si (st["rep"] == 242) { retornar 64 }
+    retornar 128
+}
+
+funcion _dsm_x86_0f(b, p, p0, dir, st, tv) {
+    sea op = byte_en(b, p)
+    p = p + 1
+    sea fin = funcion(mn, ops, q) { retornar {"mn": mn, "op": ops, "largo": q - p0} }
+    si (op == 5) { retornar fin("syscall", "", p) }
+    si (op == 11) { retornar fin("ud2", "", p) }
+    si (op == 162) { retornar fin("cpuid", "", p) }
+    si (op == 31) {
+        sea mr = _dsm_modrm(b, p, st)
+        retornar fin("nop", _dsm_e(mr, tv, st), mr["fin"])
+    }
+    si (op == 16 o op == 17 o op == 40 o op == 41) {
+        sea mr = _dsm_modrm(b, p, st)
+        sea suf = _dsm_sse_sufijo(st)
+        sea nom = "mov" + si(op >= 40, "a", si(suf == "ss" o suf == "sd", "", "u")) + suf
+        sea tam = _dsm_sse_tam(st)
+        si (op >= 40) { tam = 128 }
+        si (op == 16 o op == 40) { retornar fin(nom, "xmm" + mr["reg"] + ", " + _dsm_e(mr, tam, st), mr["fin"]) }
+        retornar fin(nom, _dsm_e(mr, tam, st) + ", xmm" + mr["reg"], mr["fin"])
+    }
+    si (op == 42) {
+        sea mr = _dsm_modrm(b, p, st)
+        sea t2 = si(st["rex_w"] == 1, 64, 32)
+        retornar fin("cvtsi2" + subtexto(_dsm_sse_sufijo(st), 0, 2), "xmm" + mr["reg"] + ", " + _dsm_e(mr, t2, st), mr["fin"])
+    }
+    si (op == 44 o op == 45) {
+        sea mr = _dsm_modrm(b, p, st)
+        sea t2 = si(st["rex_w"] == 1, 64, 32)
+        sea suf = _dsm_sse_sufijo(st)
+        sea fuente = "xmm" + mr["rm"]
+        si (mr["mem"] != nulo) { fuente = _dsm_ptr(_dsm_sse_tam(st)) + mr["mem"] }
+        retornar fin(si(op == 44, "cvtt", "cvt") + suf + "2si", _dsm_reg(mr["reg"], t2, st["rex"]) + ", " + fuente, mr["fin"])
+    }
+    si (op == 46 o op == 47) {
+        sea mr = _dsm_modrm(b, p, st)
+        sea suf = si(st["op16"], "sd", "ss")
+        sea tam = si(st["op16"], 64, 32)
+        sea fuente = "xmm" + mr["rm"]
+        si (mr["mem"] != nulo) { fuente = _dsm_ptr(tam) + mr["mem"] }
+        retornar fin(si(op == 46, "ucomi", "comi") + suf, "xmm" + mr["reg"] + ", " + fuente, mr["fin"])
+    }
+    si (op >= 64 y op <= 79) {
+        sea mr = _dsm_modrm(b, p, st)
+        retornar fin("cmov" + _DSM_CC[op - 64], _dsm_reg(mr["reg"], tv, st["rex"]) + ", " + _dsm_e(mr, tv, st), mr["fin"])
+    }
+    si (op == 81 o op == 84 o op == 85 o op == 86 o op == 87 o op == 88 o op == 89 o op == 92 o op == 93 o op == 94 o op == 95) {
+        sea mr = _dsm_modrm(b, p, st)
+        sea base = {"81": "sqrt", "84": "and", "85": "andn", "86": "or", "87": "xor", "88": "add", "89": "mul", "92": "sub", "93": "min", "94": "div", "95": "max"}["" + op]
+        sea suf = _dsm_sse_sufijo(st)
+        sea tam = _dsm_sse_tam(st)
+        si (op >= 84 y op <= 87) {
+            tam = 128
+            si (suf == "ss") { suf = "ps" }
+            si (suf == "sd") { suf = "pd" }
+        }
+        sea fuente = "xmm" + mr["rm"]
+        si (mr["mem"] != nulo) { fuente = _dsm_ptr(tam) + mr["mem"] }
+        retornar fin(base + suf, "xmm" + mr["reg"] + ", " + fuente, mr["fin"])
+    }
+    si (op == 90) {
+        sea mr = _dsm_modrm(b, p, st)
+        sea nom = "cvtps2pd"
+        sea tam = 64
+        si (st["rep"] == 243) {
+            nom = "cvtss2sd"
+            tam = 32
+        } sino si (st["rep"] == 242) {
+            nom = "cvtsd2ss"
+            tam = 64
+        } sino si (st["op16"]) {
+            nom = "cvtpd2ps"
+            tam = 128
+        }
+        sea fuente = "xmm" + mr["rm"]
+        si (mr["mem"] != nulo) { fuente = _dsm_ptr(tam) + mr["mem"] }
+        retornar fin(nom, "xmm" + mr["reg"] + ", " + fuente, mr["fin"])
+    }
+    si (op == 110 o op == 126) {
+        sea mr = _dsm_modrm(b, p, st)
+        si (op == 126 y st["rep"] == 243) {
+            sea fuente = "xmm" + mr["rm"]
+            si (mr["mem"] != nulo) { fuente = "qword ptr " + mr["mem"] }
+            retornar fin("movq", "xmm" + mr["reg"] + ", " + fuente, mr["fin"])
+        }
+        sea t2 = si(st["rex_w"] == 1, 64, 32)
+        sea nom = si(t2 == 64, "movq", "movd")
+        si (op == 110) { retornar fin(nom, "xmm" + mr["reg"] + ", " + _dsm_e(mr, t2, st), mr["fin"]) }
+        retornar fin(nom, _dsm_e(mr, t2, st) + ", xmm" + mr["reg"], mr["fin"])
+    }
+    si (op == 214 y st["op16"]) {
+        sea mr = _dsm_modrm(b, p, st)
+        sea dest = "xmm" + mr["rm"]
+        si (mr["mem"] != nulo) { dest = "qword ptr " + mr["mem"] }
+        retornar fin("movq", dest + ", xmm" + mr["reg"], mr["fin"])
+    }
+    si (op >= 128 y op <= 143) { retornar fin("j" + _DSM_CC[op - 128], _dsm_hex(dir + (p + 4 - p0) + _dsm_s(_dsm_u(b, p, 4), 32)), p + 4) }
+    si (op >= 144 y op <= 159) {
+        sea mr = _dsm_modrm(b, p, st)
+        retornar fin("set" + _DSM_CC[op - 144], _dsm_e(mr, 8, st), mr["fin"])
+    }
+    si (op == 175) {
+        sea mr = _dsm_modrm(b, p, st)
+        retornar fin("imul", _dsm_reg(mr["reg"], tv, st["rex"]) + ", " + _dsm_e(mr, tv, st), mr["fin"])
+    }
+    si (op == 182 o op == 183 o op == 190 o op == 191) {
+        sea mr = _dsm_modrm(b, p, st)
+        sea t2 = si(op % 2 == 0, 8, 16)
+        retornar fin(si(op < 190, "movzx", "movsx"), _dsm_reg(mr["reg"], tv, st["rex"]) + ", " + _dsm_e(mr, t2, st), mr["fin"])
+    }
+    si (op == 184 y st["rep"] == 243) {
+        sea mr = _dsm_modrm(b, p, st)
+        retornar fin("popcnt", _dsm_reg(mr["reg"], tv, st["rex"]) + ", " + _dsm_e(mr, tv, st), mr["fin"])
+    }
+    si (op == 188 o op == 189) {
+        sea mr = _dsm_modrm(b, p, st)
+        sea nom = si(op == 188, "bsf", "bsr")
+        si (st["rep"] == 243) { nom = si(op == 188, "tzcnt", "lzcnt") }
+        retornar fin(nom, _dsm_reg(mr["reg"], tv, st["rex"]) + ", " + _dsm_e(mr, tv, st), mr["fin"])
+    }
+    si (op >= 200 y op <= 207) { retornar fin("bswap", _dsm_reg(op - 200 + st["rex_b"] * 8, tv, st["rex"]), p) }
+    retornar nulo
+}
+
+// ---------- x86-64: ensamblador ----------
+
+funcion _dsm_buscar_reg(t) {
+    sea tablas = [[_DSM_R64, 64], [_DSM_R32, 32], [_DSM_R16, 16], [_DSM_R8, 8]]
+    para par en tablas {
+        sea i = 0
+        mientras (i < 16) {
+            si (par[0][i] == t) { retornar {"n": i, "tam": par[1], "rex8": par[1] == 8 y i >= 4 y i < 8} }
+            i = i + 1
+        }
+    }
+    sea i = 4
+    mientras (i < 8) {
+        si (_DSM_R8V[i] == t) { retornar {"n": i, "tam": 8, "alto": verdadero, "rex8": falso} }
+        i = i + 1
+    }
+    si (texto_empieza_con(t, "xmm")) { retornar {"n": a_numero(subtexto(t, 3, longitud(t))), "tam": 128, "rex8": falso} }
+    retornar nulo
+}
+
+funcion _dsm_num(t) {
+    sea s = texto_recortar(t)
+    sea neg = falso
+    si (texto_empieza_con(s, "-")) {
+        neg = verdadero
+        s = texto_recortar(subtexto(s, 1, longitud(s)))
+    }
+    sea v = 0
+    si (texto_empieza_con(texto_minusculas(s), "0x")) {
+        sea i = 2
+        mientras (i < longitud(s)) {
+            sea d = texto_indice("0123456789abcdef", texto_minusculas(subtexto(s, i, i + 1)))
+            si (d < 0) { lanzar "desarma: número inválido " + t }
+            v = v * 16 + d
+            i = i + 1
+        }
+    } sino {
+        si (s == "" o texto_indice("0123456789", subtexto(s, 0, 1)) < 0) { lanzar "desarma: número inválido " + t }
+        v = a_numero(s)
+    }
+    si (neg) { retornar 0 - v }
+    retornar v
+}
+
+// Operando: {"t": "reg", …} | {"t": "imm", "v"} | {"t": "mem", "tam", "base", "indice", "escala", "disp", "rip"}.
+funcion _dsm_operando(t) {
+    sea s = texto_recortar(t)
+    sea tam = 0
+    para par en [["byte ptr ", 8], ["word ptr ", 16], ["dword ptr ", 32], ["qword ptr ", 64], ["xmmword ptr ", 128]] {
+        si (texto_empieza_con(s, par[0])) {
+            tam = par[1]
+            s = texto_recortar(subtexto(s, longitud(par[0]), longitud(s)))
+        }
+    }
+    si (texto_empieza_con(s, "[")) {
+        sea dentro = subtexto(s, 1, longitud(s) - 1)
+        sea m = {"t": "mem", "tam": tam, "base": nulo, "indice": nulo, "escala": 1, "disp": 0, "rip": falso}
+        // Partes separadas por + y - (el - se queda con el número).
+        sea partes = []
+        sea actual = ""
+        sea i = 0
+        mientras (i < longitud(dentro)) {
+            sea c = subtexto(dentro, i, i + 1)
+            si (c == "+" o c == "-") {
+                si (texto_recortar(actual) != "") { partes.agregar(texto_recortar(actual)) }
+                actual = si(c == "-", "-", "")
+            } sino { actual = actual + c }
+            i = i + 1
+        }
+        si (texto_recortar(actual) != "") { partes.agregar(texto_recortar(actual)) }
+        para pa en partes {
+            sea limpio = texto_reemplazar(pa, " ", "")
+            si (texto_contiene(limpio, "*")) {
+                sea q = texto_dividir(limpio, "*")
+                m["indice"] = _dsm_buscar_reg(q[0])["n"]
+                m["escala"] = a_numero(q[1])
+            } sino si (limpio == "rip") { m["rip"] = verdadero }
+            sino si (_dsm_buscar_reg(limpio) != nulo) {
+                si (m["base"] == nulo) { m["base"] = _dsm_buscar_reg(limpio)["n"] } sino { m["indice"] = _dsm_buscar_reg(limpio)["n"] }
+            } sino { m["disp"] = m["disp"] + _dsm_num(limpio) }
+        }
+        retornar m
+    }
+    sea rg = _dsm_buscar_reg(s)
+    si (rg != nulo) {
+        rg["t"] = "reg"
+        retornar rg
+    }
+    retornar {"t": "imm", "v": _dsm_num(s)}
+}
+
+// Bytes de ModRM/SIB/desplazamiento para reg (campo) y operando E.
+funcion _dsm_codificar_e(reg, e, rex) {
+    si (e["t"] == "reg") {
+        si (e["n"] >= 8) { rex["b"] = 1 }
+        retornar char_de(192 + (reg % 8) * 8 + e["n"] % 8)
+    }
+    si (e["rip"]) { retornar char_de((reg % 8) * 8 + 5) + bytes_entero(e["disp"], 4, 1) }
+    sea base = e["base"]
+    sea indice = e["indice"]
+    sea d = e["disp"]
+    sea mod = 0
+    si (base == nulo) {
+        // Sin base: SIB con base 101 y desplazamiento de 32 bits.
+        sea idx = 4
+        sea esc = 0
+        si (indice != nulo) {
+            idx = indice
+            esc = {"1": 0, "2": 1, "4": 2, "8": 3}["" + e["escala"]]
+        }
+        si (idx >= 8) { rex["x"] = 1 }
+        retornar char_de((reg % 8) * 8 + 4) + char_de(esc * 64 + (idx % 8) * 8 + 5) + bytes_entero(d, 4, 1)
+    }
+    si (base >= 8) { rex["b"] = 1 }
+    si (d == 0 y base % 8 != 5) { mod = 0 } sino si (d >= -128 y d <= 127) { mod = 1 } sino { mod = 2 }
+    sea r = ""
+    si (indice != nulo o base % 8 == 4) {
+        sea idx = 4
+        sea esc = 0
+        si (indice != nulo) {
+            idx = indice
+            esc = {"1": 0, "2": 1, "4": 2, "8": 3}["" + e["escala"]]
+        }
+        si (idx >= 8) { rex["x"] = 1 }
+        r = char_de(mod * 64 + (reg % 8) * 8 + 4) + char_de(esc * 64 + (idx % 8) * 8 + base % 8)
+    } sino { r = char_de(mod * 64 + (reg % 8) * 8 + base % 8) }
+    si (mod == 1) { r = r + char_de((d + 256) % 256) }
+    si (mod == 2) { r = r + bytes_entero(d, 4, 1) }
+    retornar r
+}
+
+funcion _dsm_armar(prefijos, tam, rex, opcodes, cuerpo, reg_campo, forzar_rex) {
+    sea p = prefijos
+    si (tam == 16) { p = p + char_de(102) }
+    si (reg_campo >= 8) { rex["r"] = 1 }
+    sea w = si(tam == 64, 1, 0)
+    sea rx = ""
+    si (w == 1 o rex["r"] == 1 o rex["x"] == 1 o rex["b"] == 1 o forzar_rex) { rx = char_de(64 + w * 8 + rex["r"] * 4 + rex["x"] * 2 + rex["b"]) }
+    retornar p + rx + opcodes + cuerpo
+}
+
+funcion _dsm_tam_ops(a, b) {
+    si (a["t"] == "reg") { retornar a["tam"] }
+    si (b != nulo y b["t"] == "reg") { retornar b["tam"] }
+    retornar a["tam"]
+}
+
+funcion _dsm_rex8(a, b) {
+    retornar (a != nulo y a["t"] == "reg" y a["rex8"]) o (b != nulo y b["t"] == "reg" y b["rex8"])
+}
+
+funcion _dsm_imm_bytes(v, n) { retornar bytes_entero(v, n, 1) }
+
+// Ensambla una instrucción x86-64 en dir; etiquetas: mapa nombre → dirección.
+funcion _dsm_x86_asm(linea, dir, etiquetas) {
+    sea s = texto_recortar(linea)
+    sea esp = texto_indice(s, " ")
+    sea mn = texto_minusculas(s)
+    sea resto = ""
+    si (esp >= 0) {
+        mn = texto_minusculas(subtexto(s, 0, esp))
+        resto = texto_recortar(subtexto(s, esp + 1, longitud(s)))
+    }
+    sea ops = []
+    si (resto != "") { para x en texto_dividir(resto, ",") { ops.agregar(x) } }
+    sea sin_ops = {"ret": "c3", "leave": "c9", "nop": "90", "int3": "cc", "syscall": "0f05", "hlt": "f4", "ud2": "0f0b", "cpuid": "0fa2", "cdq": "99", "cqo": "4899",
+        "cdqe": "4898", "cwde": "98", "cbw": "6698", "cwd": "6699", "pause": "f390"}
+    si (longitud(ops) == 0 y tiene_clave(sin_ops, mn)) { retornar bytes_de_hex(sin_ops[mn]) }
+    // Saltos y llamadas a dirección o etiqueta.
+    sea es_jcc = texto_empieza_con(mn, "j") y mn != "jmp"
+    si ((mn == "call" o mn == "jmp" o es_jcc) y longitud(ops) == 1) {
+        sea objetivo = texto_recortar(ops[0])
+        sea destino = nulo
+        si (tiene_clave(etiquetas, objetivo)) { destino = etiquetas[objetivo] }
+        sino si (texto_indice("0123456789-", subtexto(objetivo, 0, 1)) >= 0) { destino = _dsm_num(objetivo) }
+        si (destino == nulo y etiquetas["__pasada"] == 1 y _dsm_buscar_reg(objetivo) == nulo y texto_contiene(objetivo, "[") == falso) { destino = dir }
+        si (destino != nulo) {
+            si (mn == "call") { retornar char_de(232) + bytes_entero(destino - dir - 5, 4, 1) }
+            si (mn == "jmp") {
+                sea c = destino - dir - 2
+                si (c >= -128 y c <= 127 y etiquetas["__largo"] != verdadero) { retornar char_de(235) + char_de((c + 256) % 256) }
+                retornar char_de(233) + bytes_entero(destino - dir - 5, 4, 1)
+            }
+            sea cc = _dsm_cc(subtexto(mn, 1, longitud(mn)))
+            sea c = destino - dir - 2
+            si (c >= -128 y c <= 127 y etiquetas["__largo"] != verdadero) { retornar char_de(112 + cc) + char_de((c + 256) % 256) }
+            retornar char_de(15) + char_de(128 + cc) + bytes_entero(destino - dir - 6, 4, 1)
+        }
+    }
+    sea a = nulo
+    sea b = nulo
+    sea c3 = nulo
+    si (longitud(ops) > 0) { a = _dsm_operando(ops[0]) }
+    si (longitud(ops) > 1) { b = _dsm_operando(ops[1]) }
+    si (longitud(ops) > 2) { c3 = _dsm_operando(ops[2]) }
+    sea rex = {"r": 0, "x": 0, "b": 0}
+    sea alu = _dsm_indice(_DSM_ALU, mn)
+    si (alu >= 0) {
+        sea tam = _dsm_tam_ops(a, b)
+        si (b["t"] == "imm") {
+            sea v = b["v"]
+            si (tam == 8) {
+                si (a["t"] == "reg" y a["n"] == 0) { retornar char_de(alu * 8 + 4) + char_de((v + 256) % 256) }
+                retornar _dsm_armar("", 8, rex, char_de(128), _dsm_codificar_e(alu, a, rex) + char_de((v + 256) % 256), 0, _dsm_rex8(a, nulo))
+            }
+            si (v >= -128 y v <= 127) { retornar _dsm_armar("", tam, rex, char_de(131), _dsm_codificar_e(alu, a, rex) + char_de((v + 256) % 256), 0, falso) }
+            sea n = si(tam == 16, 2, 4)
+            si (a["t"] == "reg" y a["n"] == 0) { retornar _dsm_armar("", tam, rex, char_de(alu * 8 + 5), _dsm_imm_bytes(v, n), 0, falso) }
+            retornar _dsm_armar("", tam, rex, char_de(129), _dsm_codificar_e(alu, a, rex) + _dsm_imm_bytes(v, n), 0, falso)
+        }
+        si (b["t"] == "reg") { retornar _dsm_armar("", tam, rex, char_de(alu * 8 + si(tam == 8, 0, 1)), _dsm_codificar_e(b["n"], a, rex), b["n"], _dsm_rex8(a, b)) }
+        retornar _dsm_armar("", tam, rex, char_de(alu * 8 + si(tam == 8, 2, 3)), _dsm_codificar_e(a["n"], b, rex), a["n"], _dsm_rex8(a, b))
+    }
+    si (mn == "push" o mn == "pop") {
+        si (a["t"] == "reg") {
+            si (a["n"] >= 8) { retornar char_de(65) + char_de(si(mn == "push", 80, 88) + a["n"] - 8) }
+            retornar char_de(si(mn == "push", 80, 88) + a["n"])
+        }
+        si (a["t"] == "imm") {
+            si (a["v"] >= -128 y a["v"] <= 127) { retornar char_de(106) + char_de((a["v"] + 256) % 256) }
+            retornar char_de(104) + bytes_entero(a["v"], 4, 1)
+        }
+        si (mn == "push") { retornar _dsm_armar("", 32, rex, char_de(255), _dsm_codificar_e(6, a, rex), 0, falso) }
+        retornar _dsm_armar("", 32, rex, char_de(143), _dsm_codificar_e(0, a, rex), 0, falso)
+    }
+    si (mn == "mov" o mn == "movabs") {
+        sea tam = _dsm_tam_ops(a, b)
+        si (b["t"] == "imm") {
+            sea v = b["v"]
+            si (a["t"] == "reg") {
+                si (tam == 8) {
+                    si (a["n"] >= 8) { rex["b"] = 1 }
+                    retornar _dsm_armar("", 8, rex, char_de(176 + a["n"] % 8), char_de((v + 256) % 256), 0, a["rex8"])
+                }
+                si (tam == 64 y (mn == "movabs" o v > 2147483647 o v < -2147483648)) {
+                    si (a["n"] >= 8) { rex["b"] = 1 }
+                    retornar _dsm_armar("", 64, rex, char_de(184 + a["n"] % 8), bytes_entero(v, 8, 1), 0, falso)
+                }
+                si (tam == 64) { retornar _dsm_armar("", 64, rex, char_de(199), _dsm_codificar_e(0, a, rex) + bytes_entero(v, 4, 1), 0, falso) }
+                si (a["n"] >= 8) { rex["b"] = 1 }
+                retornar _dsm_armar("", tam, rex, char_de(184 + a["n"] % 8), bytes_entero(v, si(tam == 16, 2, 4), 1), 0, falso)
+            }
+            si (tam == 8) { retornar _dsm_armar("", 8, rex, char_de(198), _dsm_codificar_e(0, a, rex) + char_de((v + 256) % 256), 0, falso) }
+            retornar _dsm_armar("", tam, rex, char_de(199), _dsm_codificar_e(0, a, rex) + bytes_entero(v, si(tam == 16, 2, 4), 1), 0, falso)
+        }
+        si (b["t"] == "reg") { retornar _dsm_armar("", tam, rex, char_de(si(tam == 8, 136, 137)), _dsm_codificar_e(b["n"], a, rex), b["n"], _dsm_rex8(a, b)) }
+        retornar _dsm_armar("", tam, rex, char_de(si(tam == 8, 138, 139)), _dsm_codificar_e(a["n"], b, rex), a["n"], _dsm_rex8(a, b))
+    }
+    si (mn == "lea") { retornar _dsm_armar("", a["tam"], rex, char_de(141), _dsm_codificar_e(a["n"], b, rex), a["n"], falso) }
+    si (mn == "test") {
+        sea tam = _dsm_tam_ops(a, b)
+        si (b["t"] == "imm") {
+            si (tam == 8) {
+                si (a["t"] == "reg" y a["n"] == 0) { retornar char_de(168) + char_de((b["v"] + 256) % 256) }
+                retornar _dsm_armar("", 8, rex, char_de(246), _dsm_codificar_e(0, a, rex) + char_de((b["v"] + 256) % 256), 0, _dsm_rex8(a, nulo))
+            }
+            si (a["t"] == "reg" y a["n"] == 0) { retornar _dsm_armar("", tam, rex, char_de(169), bytes_entero(b["v"], si(tam == 16, 2, 4), 1), 0, falso) }
+            retornar _dsm_armar("", tam, rex, char_de(247), _dsm_codificar_e(0, a, rex) + bytes_entero(b["v"], si(tam == 16, 2, 4), 1), 0, falso)
+        }
+        retornar _dsm_armar("", tam, rex, char_de(si(tam == 8, 132, 133)), _dsm_codificar_e(b["n"], a, rex), b["n"], _dsm_rex8(a, b))
+    }
+    si (mn == "xchg") {
+        sea tam = _dsm_tam_ops(a, b)
+        si (tam != 8 y a["t"] == "reg" y b["t"] == "reg" y (a["n"] == 0 o b["n"] == 0)) {
+            sea otro = si(a["n"] == 0, b, a)
+            si (otro["n"] >= 8) { rex["b"] = 1 }
+            retornar _dsm_armar("", tam, rex, char_de(144 + otro["n"] % 8), "", 0, falso)
+        }
+        si (a["t"] == "reg") { retornar _dsm_armar("", tam, rex, char_de(si(tam == 8, 134, 135)), _dsm_codificar_e(a["n"], b, rex), a["n"], _dsm_rex8(a, b)) }
+        retornar _dsm_armar("", tam, rex, char_de(si(tam == 8, 134, 135)), _dsm_codificar_e(b["n"], a, rex), b["n"], _dsm_rex8(a, b))
+    }
+    sea grupo3 = _dsm_indice(["test", "test", "not", "neg", "mul", "imul", "div", "idiv"], mn)
+    si (grupo3 >= 2 y longitud(ops) == 1) {
+        sea tam = a["tam"]
+        retornar _dsm_armar("", tam, rex, char_de(si(tam == 8, 246, 247)), _dsm_codificar_e(grupo3, a, rex), 0, _dsm_rex8(a, nulo))
+    }
+    si (mn == "imul") {
+        si (longitud(ops) == 2) { retornar _dsm_armar("", a["tam"], rex, char_de(15) + char_de(175), _dsm_codificar_e(a["n"], b, rex), a["n"], falso) }
+        sea v = c3["v"]
+        si (v >= -128 y v <= 127) { retornar _dsm_armar("", a["tam"], rex, char_de(107), _dsm_codificar_e(a["n"], b, rex) + char_de((v + 256) % 256), a["n"], falso) }
+        retornar _dsm_armar("", a["tam"], rex, char_de(105), _dsm_codificar_e(a["n"], b, rex) + bytes_entero(v, 4, 1), a["n"], falso)
+    }
+    si (mn == "inc" o mn == "dec") {
+        sea tam = a["tam"]
+        retornar _dsm_armar("", tam, rex, char_de(si(tam == 8, 254, 255)), _dsm_codificar_e(si(mn == "inc", 0, 1), a, rex), 0, _dsm_rex8(a, nulo))
+    }
+    sea rot = _dsm_indice(_DSM_ROT, mn)
+    si (rot >= 0) {
+        sea tam = a["tam"]
+        si (b["t"] == "reg") { retornar _dsm_armar("", tam, rex, char_de(si(tam == 8, 210, 211)), _dsm_codificar_e(rot, a, rex), 0, _dsm_rex8(a, nulo)) }
+        si (b["v"] == 1) { retornar _dsm_armar("", tam, rex, char_de(si(tam == 8, 208, 209)), _dsm_codificar_e(rot, a, rex), 0, _dsm_rex8(a, nulo)) }
+        retornar _dsm_armar("", tam, rex, char_de(si(tam == 8, 192, 193)), _dsm_codificar_e(rot, a, rex) + char_de(b["v"] % 256), 0, _dsm_rex8(a, nulo))
+    }
+    si (mn == "movzx" o mn == "movsx") {
+        sea t2 = b["tam"]
+        sea op = si(mn == "movzx", 182, 190) + si(t2 == 16, 1, 0)
+        retornar _dsm_armar("", a["tam"], rex, char_de(15) + char_de(op), _dsm_codificar_e(a["n"], b, rex), a["n"], _dsm_rex8(nulo, b))
+    }
+    si (mn == "movsxd") { retornar _dsm_armar("", 64, rex, char_de(99), _dsm_codificar_e(a["n"], b, rex), a["n"], falso) }
+    si (texto_empieza_con(mn, "cmov")) { retornar _dsm_armar("", a["tam"], rex, char_de(15) + char_de(64 + _dsm_cc(subtexto(mn, 4, longitud(mn)))), _dsm_codificar_e(a["n"], b, rex), a["n"], falso) }
+    si (texto_empieza_con(mn, "set")) { retornar _dsm_armar("", 32, rex, char_de(15) + char_de(144 + _dsm_cc(subtexto(mn, 3, longitud(mn)))), _dsm_codificar_e(0, a, rex), 0, _dsm_rex8(a, nulo)) }
+    si ((mn == "call" o mn == "jmp") y longitud(ops) == 1) { retornar _dsm_armar("", 32, rex, char_de(255), _dsm_codificar_e(si(mn == "call", 2, 4), a, rex), 0, falso) }
+    si (mn == "ret" y a["t"] == "imm") { retornar char_de(194) + bytes_entero(a["v"], 2, 1) }
+    si (mn == "int") { retornar char_de(205) + char_de(a["v"]) }
+    si (mn == "bswap") {
+        si (a["n"] >= 8) { rex["b"] = 1 }
+        retornar _dsm_armar("", a["tam"], rex, char_de(15) + char_de(200 + a["n"] % 8), "", 0, falso)
+    }
+    si (mn == "popcnt" o mn == "tzcnt" o mn == "lzcnt") {
+        sea op = {"popcnt": 184, "tzcnt": 188, "lzcnt": 189}[mn]
+        retornar _dsm_armar(char_de(243), a["tam"], rex, char_de(15) + char_de(op), _dsm_codificar_e(a["n"], b, rex), a["n"], falso)
+    }
+    si (mn == "bsf" o mn == "bsr") { retornar _dsm_armar("", a["tam"], rex, char_de(15) + char_de(si(mn == "bsf", 188, 189)), _dsm_codificar_e(a["n"], b, rex), a["n"], falso) }
+    retornar _dsm_x86_asm_sse(mn, a, b, rex)
+}
+
+funcion _dsm_cc(t) {
+    sea alias = {"z": "e", "nz": "ne", "c": "b", "nc": "ae", "nae": "b", "nb": "ae", "na": "be", "nbe": "a", "nge": "l", "nl": "ge", "ng": "le", "nle": "g", "pe": "p", "po": "np"}
+    sea k = alias[t] ?? t
+    sea i = _dsm_indice(_DSM_CC, k)
+    si (i < 0) { lanzar "desarma: condición desconocida " + t }
+    retornar i
+}
+
+funcion _dsm_x86_asm_sse(mn, a, b, rex) {
+    sea pref = {"ss": char_de(243), "sd": char_de(242), "pd": char_de(102), "ps": ""}
+    sea suf = subtexto(mn, longitud(mn) - 2, longitud(mn))
+    sea raiz = subtexto(mn, 0, longitud(mn) - 2)
+    sea aritm = {"sqrt": 81, "and": 84, "andn": 85, "or": 86, "xor": 87, "add": 88, "mul": 89, "sub": 92, "min": 93, "div": 94, "max": 95}
+    si (tiene_clave(aritm, raiz) y tiene_clave(pref, suf) y b != nulo) { retornar pref[suf] + _dsm_armar("", 32, rex, char_de(15) + char_de(aritm[raiz]), _dsm_codificar_e(a["n"], b, rex), a["n"], falso) }
+    si (mn == "movss" o mn == "movsd" o mn == "movups" o mn == "movupd" o mn == "movaps" o mn == "movapd") {
+        sea p = pref[suf]
+        sea base = si(texto_empieza_con(mn, "mova"), 40, 16)
+        si (a["t"] == "reg") { retornar p + _dsm_armar("", 32, rex, char_de(15) + char_de(base), _dsm_codificar_e(a["n"], b, rex), a["n"], falso) }
+        retornar p + _dsm_armar("", 32, rex, char_de(15) + char_de(base + 1), _dsm_codificar_e(b["n"], a, rex), b["n"], falso)
+    }
+    si (mn == "cvtsi2sd" o mn == "cvtsi2ss") {
+        sea p = si(mn == "cvtsi2sd", char_de(242), char_de(243))
+        sea t2 = si(b["t"] == "reg", b["tam"], b["tam"])
+        retornar p + _dsm_armar("", si(t2 == 64, 64, 32), rex, char_de(15) + char_de(42), _dsm_codificar_e(a["n"], b, rex), a["n"], falso)
+    }
+    si (mn == "cvttsd2si" o mn == "cvttss2si" o mn == "cvtsd2si" o mn == "cvtss2si") {
+        sea p = si(texto_contiene(mn, "sd2"), char_de(242), char_de(243))
+        retornar p + _dsm_armar("", a["tam"], rex, char_de(15) + char_de(si(texto_empieza_con(mn, "cvtt"), 44, 45)), _dsm_codificar_e(a["n"], b, rex), a["n"], falso)
+    }
+    si (mn == "cvtss2sd" o mn == "cvtsd2ss") { retornar si(mn == "cvtss2sd", char_de(243), char_de(242)) + _dsm_armar("", 32, rex, char_de(15) + char_de(90), _dsm_codificar_e(a["n"], b, rex), a["n"], falso) }
+    si (mn == "ucomisd" o mn == "ucomiss" o mn == "comisd" o mn == "comiss") {
+        sea p = si(texto_termina_con(mn, "sd"), char_de(102), "")
+        retornar p + _dsm_armar("", 32, rex, char_de(15) + char_de(si(texto_empieza_con(mn, "u"), 46, 47)), _dsm_codificar_e(a["n"], b, rex), a["n"], falso)
+    }
+    si (mn == "movd" o mn == "movq") {
+        si (a["t"] == "reg" y a["tam"] == 128 y b["t"] == "reg" y b["tam"] == 128) { retornar char_de(243) + _dsm_armar("", 32, rex, char_de(15) + char_de(126), _dsm_codificar_e(a["n"], b, rex), a["n"], falso) }
+        si (a["t"] == "reg" y a["tam"] == 128) {
+            si (b["t"] == "mem" y mn == "movq") { retornar char_de(243) + _dsm_armar("", 32, rex, char_de(15) + char_de(126), _dsm_codificar_e(a["n"], b, rex), a["n"], falso) }
+            retornar char_de(102) + _dsm_armar("", si(mn == "movq", 64, 32), rex, char_de(15) + char_de(110), _dsm_codificar_e(a["n"], b, rex), a["n"], falso)
+        }
+        si (a["t"] == "mem" y mn == "movq") { retornar char_de(102) + _dsm_armar("", 32, rex, char_de(15) + char_de(214), _dsm_codificar_e(b["n"], a, rex), b["n"], falso) }
+        retornar char_de(102) + _dsm_armar("", si(mn == "movq", 64, 32), rex, char_de(15) + char_de(126), _dsm_codificar_e(b["n"], a, rex), b["n"], falso)
+    }
+    lanzar "desarma: instrucción x86-64 no soportada: " + mn
+}
+
+// ---------- ensamblado en dos pasadas (común) ----------
+
+funcion _dsm_ensamblar(texto, direccion, una, ancho_fijo) {
+    sea lineas = []
+    para l en texto_dividir(texto, "\n") {
+        sea s = l
+        sea k = texto_indice(s, "//")
+        si (k >= 0) { s = subtexto(s, 0, k) }
+        k = texto_indice(s, "#!")
+        para parte en texto_dividir(s, ";") {
+            sea t = texto_recortar(parte)
+            si (t != "") { lineas.agregar(t) }
+        }
+    }
+    sea etiquetas = {"__pasada": 1, "__largo": verdadero}
+    // Primera pasada con saltos largos; luego se acortan hasta que las
+    // direcciones de las etiquetas dejan de cambiar.
+    sea pasada = 1
+    sea salida = ""
+    sea previa = nulo
+    mientras (pasada <= 8) {
+        etiquetas["__pasada"] = pasada
+        etiquetas["__largo"] = pasada == 1
+        sea dir = direccion ?? 0
+        sea partes = []
+        para l en lineas {
+            si (texto_termina_con(l, ":")) {
+                etiquetas[subtexto(l, 0, longitud(l) - 1)] = dir
+            } sino {
+                sea b = una(l, dir, etiquetas)
+                partes.agregar(b)
+                dir = dir + longitud(b)
+            }
+        }
+        salida = unir(partes, "")
+        si (pasada > 2 y salida == previa) { romper }
+        previa = salida
+        pasada = pasada + 1
+    }
+    retornar salida
+}
+
+/// Ensambla texto x86-64 (sintaxis Intel de Capstone; varias líneas o ";",
+/// etiquetas "nombre:") a bytes, como si empezara en direccion.
+funcion ensambla_x86(texto, direccion) { retornar _dsm_ensamblar(texto, direccion, _dsm_x86_asm, falso) }
+
+// ---------- ARM64 ----------
+
+sea _DSM_CC64 = ["eq", "ne", "hs", "lo", "mi", "pl", "vs", "vc", "hi", "ls", "ge", "lt", "gt", "le", "al", "nv"]
+
+funcion _dsm_xr(n, sf, sp) {
+    si (n == 31) {
+        si (sp) { retornar si(sf, "sp", "wsp") }
+        retornar si(sf, "xzr", "wzr")
+    }
+    retornar si(sf, "x", "w") + n
+}
+
+funcion _dsm_bits(v, de, n) { retornar piso(v / potencia(2, de)) % potencia(2, n) }
+
+funcion _dsm_imm_a64(v) { retornar "#" + _dsm_shex(v) }
+
+// Inmediato lógico (N:immr:imms) → lista de bits (el 0 primero) del ancho
+// pedido, o nulo si es inválido. Se trabaja con bits para no perder
+// precisión con valores de 64 bits.
+funcion _dsm_bitmask(n, immr, imms, ancho) {
+    sea combinado = n * 64 + (63 - imms)
+    sea largo = -1
+    sea k = 6
+    mientras (k >= 0) {
+        si (piso(combinado / potencia(2, k)) % 2 == 1) {
+            largo = k
+            romper
+        }
+        k = k - 1
+    }
+    si (largo < 1) { retornar nulo }
+    sea tam = potencia(2, largo)
+    sea s = imms % tam
+    sea r = immr % tam
+    si (s == tam - 1) { retornar nulo }
+    // Elemento: s+1 unos abajo, rotado r a la derecha.
+    sea elem = []
+    sea i = 0
+    mientras (i < tam) {
+        elem.agregar(0)
+        i = i + 1
+    }
+    i = 0
+    mientras (i <= s) {
+        elem[((i - r) % tam + tam) % tam] = 1
+        i = i + 1
+    }
+    sea bits = []
+    i = 0
+    mientras (i < ancho) {
+        bits.agregar(elem[i % tam])
+        i = i + 1
+    }
+    retornar bits
+}
+
+funcion _dsm_bits_hex(bits) {
+    sea h = "0123456789abcdef"
+    sea r = ""
+    sea i = 0
+    mientras (i < longitud(bits)) {
+        sea d = bits[i] + bits[i + 1] * 2 + bits[i + 2] * 4 + bits[i + 3] * 8
+        r = subtexto(h, d, d + 1) + r
+        i = i + 4
+    }
+    mientras (longitud(r) > 1 y subtexto(r, 0, 1) == "0") { r = subtexto(r, 1, longitud(r)) }
+    si (longitud(r) == 1 y texto_indice("0123456789", r) >= 0) { retornar r }
+    retornar "0x" + r
+}
+
+funcion _dsm_bits_neg(bits) {
+    sea r = []
+    sea acarreo = 1
+    para b en bits {
+        sea v = (1 - b) + acarreo
+        r.agregar(v % 2)
+        acarreo = piso(v / 2)
+    }
+    retornar r
+}
+
+// Con signo: "#-0x…" si el bit alto está puesto.
+funcion _dsm_bits_con_signo(bits) {
+    si (bits[longitud(bits) - 1] == 1) { retornar "-" + _dsm_bits_hex(_dsm_bits_neg(bits)) }
+    retornar _dsm_bits_hex(bits)
+}
+
+// Bits (ancho) de un inmediato escrito "#0x…", "#-12" o "#40".
+funcion _dsm_bits_de_texto(t, ancho) {
+    sea s = texto_minusculas(texto_recortar(t))
+    si (texto_empieza_con(s, "#")) { s = subtexto(s, 1, longitud(s)) }
+    sea neg = falso
+    si (texto_empieza_con(s, "-")) {
+        neg = verdadero
+        s = subtexto(s, 1, longitud(s))
+    }
+    sea bits = []
+    sea i = 0
+    mientras (i < ancho) {
+        bits.agregar(0)
+        i = i + 1
+    }
+    si (texto_empieza_con(s, "0x")) {
+        sea dig = subtexto(s, 2, longitud(s))
+        sea k = 0
+        mientras (k < longitud(dig)) {
+            sea d = texto_indice("0123456789abcdef", subtexto(dig, longitud(dig) - 1 - k, longitud(dig) - k))
+            sea j = 0
+            mientras (j < 4) {
+                si (k * 4 + j < ancho) { bits[k * 4 + j] = piso(d / potencia(2, j)) % 2 }
+                j = j + 1
+            }
+            k = k + 1
+        }
+    } sino {
+        sea v = a_numero(s)
+        i = 0
+        mientras (i < ancho y v > 0) {
+            bits[i] = v % 2
+            v = piso(v / 2)
+            i = i + 1
+        }
+    }
+    si (neg) { retornar _dsm_bits_neg(bits) }
+    retornar bits
+}
+
+// ¿Se puede escribir con un solo movz o movn?
+funcion _dsm_bits_movz_movn(bits) {
+    para inv en [0, 1] {
+        sea trozos = 0
+        sea k = 0
+        mientras (k < longitud(bits) / 16) {
+            sea todo_cero = verdadero
+            sea j = 0
+            mientras (j < 16) {
+                si (bits[k * 16 + j] != inv) { todo_cero = falso }
+                j = j + 1
+            }
+            si (todo_cero == falso) { trozos = trozos + 1 }
+            k = k + 1
+        }
+        si (trozos <= 1) { retornar verdadero }
+    }
+    retornar falso
+}
+
+funcion _dsm_hexu(v) {
+    // Hexadecimal sin signo grande (hasta 64 bits, sin perder precisión).
+    si (v < 9007199254740992) { retornar _dsm_hex(v) }
+    sea alto = piso(v / 4294967296)
+    sea bajo = v - alto * 4294967296
+    sea h = _dsm_hex(bajo)
+    si (bajo < 10) { h = "" + bajo } sino { h = subtexto(h, 2, longitud(h)) }
+    mientras (longitud(h) < 8) { h = "0" + h }
+    retornar _dsm_hex(alto) + h
+}
+
+/// Desensambla código ARM64 (instrucciones de 4 bytes, little endian).
+funcion desarma_arm64(codigo, direccion) {
+    sea r = []
+    sea p = 0
+    sea dir = direccion ?? 0
+    mientras (p + 4 <= longitud(codigo)) {
+        sea w = bytes_leer_entero(codigo, p, 4, 1)
+        sea ins = nulo
+        intentar { ins = _dsm_a64_una(w, dir + p) } capturar (e) { ins = nulo }
+        si (ins == nulo) { ins = ["", ".word", _dsm_hex(w)] }
+        r.agregar({"direccion": dir + p, "bytes": subtexto(codigo, p, p + 4), "mnemonico": ins[1], "operandos": ins[2], "texto": texto_recortar(ins[1] + " " + ins[2]), "largo": 4})
+        p = p + 4
+    }
+    retornar r
+}
+
+funcion _dsm_a64_una(w, dir) {
+    sea b = funcion(de, n) { retornar _dsm_bits(w, de, n) }
+    sea sf = b(31, 1) == 1
+    sea rd = b(0, 5)
+    sea rn = b(5, 5)
+    sea rm = b(16, 5)
+    sea R = funcion(n, sp) { retornar _dsm_xr(n, sf, sp) }
+    sea res = funcion(mn, ops) { retornar ["", mn, ops] }
+    // Fijas.
+    si (w == 3573751839) { retornar res("nop", "") }
+    si (w == 3596551104) { retornar res("ret", "") }
+    si (b(10, 22) == 3512256 y b(0, 5) == 0) { retornar res("ret", _dsm_xr(rn, verdadero, falso)) }
+    si (b(10, 22) == 3508160 y b(0, 5) == 0) { retornar res("br", _dsm_xr(rn, verdadero, falso)) }
+    si (b(10, 22) == 3510208 y b(0, 5) == 0) { retornar res("blr", _dsm_xr(rn, verdadero, falso)) }
+    si (b(21, 11) == 1696 y b(0, 5) == 1) { retornar res("svc", _dsm_imm_a64(b(5, 16))) }
+    // Saltos.
+    si (b(26, 5) == 5) {
+        sea off = _dsm_s(b(0, 26), 26) * 4
+        retornar res(si(b(31, 1) == 1, "bl", "b"), "#" + _dsm_hex(dir + off))
+    }
+    si (b(24, 8) == 84 y b(4, 1) == 0) { retornar res("b." + _DSM_CC64[b(0, 4)], "#" + _dsm_hex(dir + _dsm_s(b(5, 19), 19) * 4)) }
+    si (b(25, 6) == 26) {
+        sea mn = si(b(24, 1) == 1, "cbnz", "cbz")
+        retornar res(mn, R(rd, falso) + ", #" + _dsm_hex(dir + _dsm_s(b(5, 19), 19) * 4))
+    }
+    si (b(25, 6) == 27) {
+        sea bit = b(31, 1) * 32 + b(19, 5)
+        sea reg = _dsm_xr(rd, b(31, 1) == 1, falso)
+        retornar res(si(b(24, 1) == 1, "tbnz", "tbz"), reg + ", " + _dsm_imm_a64(bit) + ", #" + _dsm_hex(dir + _dsm_s(b(5, 14), 14) * 4))
+    }
+    // adr / adrp
+    si (b(24, 5) == 16) {
+        sea imm = _dsm_s(b(5, 19) * 4 + b(29, 2), 21)
+        si (b(31, 1) == 1) { retornar res("adrp", _dsm_xr(rd, verdadero, falso) + ", #" + _dsm_hex(piso(dir / 4096) * 4096 + imm * 4096)) }
+        retornar res("adr", _dsm_xr(rd, verdadero, falso) + ", #" + _dsm_hex(dir + imm))
+    }
+    // Suma/resta con inmediato.
+    si (b(23, 6) == 34) {
+        sea op = b(30, 1)
+        sea s = b(29, 1)
+        sea sh = b(22, 1)
+        sea imm = b(10, 12)
+        sea immtxt = _dsm_imm_a64(imm)
+        si (sh == 1) { immtxt = immtxt + ", lsl #12" }
+        si (s == 1 y rd == 31) { retornar res(si(op == 0, "cmn", "cmp"), R(rn, verdadero) + ", " + immtxt) }
+        si (op == 0 y s == 0 y imm == 0 y sh == 0 y (rd == 31 o rn == 31)) { retornar res("mov", R(rd, verdadero) + ", " + R(rn, verdadero)) }
+        sea mn = si(op == 0, "add", "sub") + si(s == 1, "s", "")
+        retornar res(mn, R(rd, s == 0) + ", " + R(rn, verdadero) + ", " + immtxt)
+    }
+    // Lógica con inmediato.
+    si (b(23, 6) == 36) {
+        sea opc = b(29, 2)
+        sea bits = _dsm_bitmask(b(22, 1), b(16, 6), b(10, 6), si(sf, 64, 32))
+        si (bits == nulo) { retornar nulo }
+        si (opc == 3 y rd == 31) { retornar res("tst", R(rn, falso) + ", #" + _dsm_bits_hex(bits)) }
+        si (opc == 1 y rn == 31 y _dsm_bits_movz_movn(bits) == falso) { retornar res("mov", R(rd, verdadero) + ", #" + _dsm_bits_con_signo(bits)) }
+        retornar res(["and", "orr", "eor", "ands"][opc], R(rd, opc != 3) + ", " + R(rn, falso) + ", #" + _dsm_bits_hex(bits))
+    }
+    // movz / movn / movk
+    si (b(23, 6) == 37) {
+        sea opc = b(29, 2)
+        sea hw = b(21, 2)
+        sea imm = b(5, 16)
+        si (opc == 2) {
+            si (imm == 0 y hw > 0) { retornar res("movz", R(rd, falso) + ", #0, lsl #" + hw * 16) }
+            retornar res("mov", R(rd, falso) + ", #" + _dsm_hexu(imm * potencia(2, hw * 16)))
+        }
+        si (opc == 0) {
+            sea v = 0 - (imm * potencia(2, hw * 16)) - 1
+            si (sf == falso) {
+                v = 0 - imm * potencia(2, hw * 16) - 1
+                si (v < -2147483648) { v = v + 4294967296 }
+            }
+            retornar res("mov", R(rd, falso) + ", #" + _dsm_shex(v))
+        }
+        si (opc == 3) {
+            sea t = R(rd, falso) + ", " + _dsm_imm_a64(imm)
+            si (hw > 0) { t = t + ", lsl #" + hw * 16 }
+            retornar res("movk", t)
+        }
+        retornar nulo
+    }
+    // Campos de bits: lsl/lsr/asr/ubfx/sbfx/sxtw/uxtb…
+    si (b(23, 6) == 38) {
+        sea opc = b(29, 2)
+        sea immr = b(16, 6)
+        sea imms = b(10, 6)
+        sea ancho = si(sf, 64, 32)
+        si (opc == 0) {
+            si (immr == 0 y imms == 7) { retornar res("sxtb", R(rd, falso) + ", " + _dsm_xr(rn, falso, falso)) }
+            si (immr == 0 y imms == 15) { retornar res("sxth", R(rd, falso) + ", " + _dsm_xr(rn, falso, falso)) }
+            si (immr == 0 y imms == 31 y sf) { retornar res("sxtw", R(rd, falso) + ", " + _dsm_xr(rn, falso, falso)) }
+            si (imms == ancho - 1) { retornar res("asr", R(rd, falso) + ", " + R(rn, falso) + ", " + _dsm_imm_a64(immr)) }
+            si (imms >= immr) { retornar res("sbfx", R(rd, falso) + ", " + R(rn, falso) + ", " + _dsm_imm_a64(immr) + ", " + _dsm_imm_a64(imms - immr + 1)) }
+            retornar res("sbfiz", R(rd, falso) + ", " + R(rn, falso) + ", " + _dsm_imm_a64(ancho - immr) + ", " + _dsm_imm_a64(imms + 1))
+        }
+        si (opc == 2) {
+            si (immr == 0 y imms == 7 y sf == falso) { retornar res("uxtb", R(rd, falso) + ", " + _dsm_xr(rn, falso, falso)) }
+            si (immr == 0 y imms == 15 y sf == falso) { retornar res("uxth", R(rd, falso) + ", " + _dsm_xr(rn, falso, falso)) }
+            si (imms == ancho - 1) { retornar res("lsr", R(rd, falso) + ", " + R(rn, falso) + ", " + _dsm_imm_a64(immr)) }
+            si (imms + 1 == immr) { retornar res("lsl", R(rd, falso) + ", " + R(rn, falso) + ", " + _dsm_imm_a64(ancho - 1 - imms)) }
+            si (imms >= immr) { retornar res("ubfx", R(rd, falso) + ", " + R(rn, falso) + ", " + _dsm_imm_a64(immr) + ", " + _dsm_imm_a64(imms - immr + 1)) }
+            retornar res("ubfiz", R(rd, falso) + ", " + R(rn, falso) + ", " + _dsm_imm_a64(ancho - immr) + ", " + _dsm_imm_a64(imms + 1))
+        }
+        retornar res("bfm", R(rd, falso) + ", " + R(rn, falso) + ", " + _dsm_imm_a64(immr) + ", " + _dsm_imm_a64(imms))
+    }
+    // extr / ror
+    si (b(23, 6) == 39 y b(29, 2) == 0) {
+        sea lsb = b(10, 6)
+        si (rn == rm) { retornar res("ror", R(rd, falso) + ", " + R(rn, falso) + ", " + _dsm_imm_a64(lsb)) }
+        retornar res("extr", R(rd, falso) + ", " + R(rn, falso) + ", " + R(rm, falso) + ", " + _dsm_imm_a64(lsb))
+    }
+    // Lógica con registro desplazado.
+    si (b(24, 5) == 10) {
+        sea opc = b(29, 2)
+        sea neg = b(21, 1)
+        sea sh = b(22, 2)
+        sea amt = b(10, 6)
+        sea desp = ""
+        si (amt > 0) { desp = ", " + ["lsl", "lsr", "asr", "ror"][sh] + " " + _dsm_imm_a64(amt) }
+        sea nombres = [["and", "bic"], ["orr", "orn"], ["eor", "eon"], ["ands", "bics"]]
+        sea mn = nombres[opc][neg]
+        si (opc == 1 y rn == 31 y amt == 0) {
+            si (neg == 0) { retornar res("mov", R(rd, falso) + ", " + R(rm, falso)) }
+            retornar res("mvn", R(rd, falso) + ", " + R(rm, falso))
+        }
+        si (opc == 3 y neg == 0 y rd == 31) { retornar res("tst", R(rn, falso) + ", " + R(rm, falso) + desp) }
+        retornar res(mn, R(rd, falso) + ", " + R(rn, falso) + ", " + R(rm, falso) + desp)
+    }
+    // Suma/resta con registro desplazado.
+    si (b(24, 5) == 11 y b(21, 1) == 0) {
+        sea op = b(30, 1)
+        sea s = b(29, 1)
+        sea sh = b(22, 2)
+        sea amt = b(10, 6)
+        sea desp = ""
+        si (amt > 0) { desp = ", " + ["lsl", "lsr", "asr", "ror"][sh] + " " + _dsm_imm_a64(amt) }
+        si (s == 1 y rd == 31) { retornar res(si(op == 0, "cmn", "cmp"), R(rn, falso) + ", " + R(rm, falso) + desp) }
+        si (op == 1 y rn == 31) { retornar res(si(s == 1, "negs", "neg"), R(rd, falso) + ", " + R(rm, falso) + desp) }
+        retornar res(si(op == 0, "add", "sub") + si(s == 1, "s", ""), R(rd, falso) + ", " + R(rn, falso) + ", " + R(rm, falso) + desp)
+    }
+    // Multiplicaciones de 3 fuentes.
+    si (b(24, 5) == 27) {
+        sea op31 = b(21, 3)
+        sea o0 = b(15, 1)
+        sea ra = b(10, 5)
+        si (op31 == 0) {
+            si (ra == 31) { retornar res(si(o0 == 0, "mul", "mneg"), R(rd, falso) + ", " + R(rn, falso) + ", " + R(rm, falso)) }
+            retornar res(si(o0 == 0, "madd", "msub"), R(rd, falso) + ", " + R(rn, falso) + ", " + R(rm, falso) + ", " + R(ra, falso))
+        }
+        si (op31 == 2) { retornar res("smulh", R(rd, falso) + ", " + R(rn, falso) + ", " + R(rm, falso)) }
+        si (op31 == 6) { retornar res("umulh", R(rd, falso) + ", " + R(rn, falso) + ", " + R(rm, falso)) }
+        retornar nulo
+    }
+    // Procesado de 2 fuentes: div y desplazamientos variables.
+    si (b(21, 8) == 214 y b(29, 2) == 0) {
+        sea opcode = b(10, 6)
+        sea nombres = {"2": "udiv", "3": "sdiv", "8": "lsl", "9": "lsr", "10": "asr", "11": "ror"}
+        sea mn = nombres["" + opcode] ?? nulo
+        si (mn == nulo) { retornar nulo }
+        retornar res(mn, R(rd, falso) + ", " + R(rn, falso) + ", " + R(rm, falso))
+    }
+    // Selección condicional.
+    si (b(21, 8) == 212) {
+        sea op = b(30, 1)
+        sea o2 = b(10, 2)
+        sea cond = b(12, 4)
+        si (op == 0 y o2 == 0) { retornar res("csel", R(rd, falso) + ", " + R(rn, falso) + ", " + R(rm, falso) + ", " + _DSM_CC64[cond]) }
+        si (op == 0 y o2 == 1) {
+            si (rn == 31 y rm == 31) { retornar res("cset", R(rd, falso) + ", " + _DSM_CC64[bits_xo(cond, 1)]) }
+            si (rn == rm) { retornar res("cinc", R(rd, falso) + ", " + R(rn, falso) + ", " + _DSM_CC64[bits_xo(cond, 1)]) }
+            retornar res("csinc", R(rd, falso) + ", " + R(rn, falso) + ", " + R(rm, falso) + ", " + _DSM_CC64[cond])
+        }
+        si (op == 1 y o2 == 0) {
+            si (rn == 31 y rm == 31) { retornar res("csetm", R(rd, falso) + ", " + _DSM_CC64[bits_xo(cond, 1)]) }
+            retornar res("csinv", R(rd, falso) + ", " + R(rn, falso) + ", " + R(rm, falso) + ", " + _DSM_CC64[cond])
+        }
+        si (op == 1 y o2 == 1) {
+            si (rn == rm) { retornar res("cneg", R(rd, falso) + ", " + R(rn, falso) + ", " + _DSM_CC64[bits_xo(cond, 1)]) }
+            retornar res("csneg", R(rd, falso) + ", " + R(rn, falso) + ", " + R(rm, falso) + ", " + _DSM_CC64[cond])
+        }
+    }
+    retornar _dsm_a64_memoria_fp(w, dir, b)
+}
+
+funcion _dsm_a64_reg_mem(tam, v, fp, n) {
+    si (v) { retornar ["b", "h", "s", "d", "q"][fp] + n }
+    retornar _dsm_xr(n, tam == 3, falso)
+}
+
+funcion _dsm_a64_memoria_fp(w, dir, b) {
+    sea rd = b(0, 5)
+    sea rn = b(5, 5)
+    sea res = funcion(mn, ops) { retornar ["", mn, ops] }
+    sea base = _dsm_xr(rn, verdadero, verdadero)
+    // ldr (literal)
+    si (b(24, 6) == 24 o b(24, 6) == 28) {
+        sea v = b(26, 1) == 1
+        sea opc = b(30, 2)
+        sea reg = _dsm_xr(rd, opc == 1, falso)
+        si (v) { reg = ["s", "d", "q"][opc] + rd }
+        si (opc == 2 y v == falso) { retornar res("ldrsw", _dsm_xr(rd, verdadero, falso) + ", #" + _dsm_hex(dir + _dsm_s(b(5, 19), 19) * 4)) }
+        retornar res("ldr", reg + ", #" + _dsm_hex(dir + _dsm_s(b(5, 19), 19) * 4))
+    }
+    // ldp / stp
+    si (b(27, 3) == 5 y b(25, 1) == 0) {
+        sea opc = b(30, 2)
+        sea v = b(26, 1) == 1
+        sea modo = b(23, 2)
+        sea carga = b(22, 1) == 1
+        sea escala = 2 + piso(opc / 2)
+        si (v) { escala = 2 + opc }
+        sea imm = _dsm_s(b(15, 7), 7) * potencia(2, escala)
+        sea r1 = _dsm_xr(rd, opc == 2, falso)
+        sea r2 = _dsm_xr(b(10, 5), opc == 2, falso)
+        si (v) {
+            r1 = ["s", "d", "q"][opc] + rd
+            r2 = ["s", "d", "q"][opc] + b(10, 5)
+        }
+        sea mn = si(carga, "ldp", "stp")
+        si (opc == 1 y v == falso y carga) { mn = "ldpsw" }
+        sea dirtxt = ""
+        si (modo == 1) { dirtxt = "[" + base + "], " + _dsm_imm_a64(imm) }
+        sino si (modo == 3) { dirtxt = "[" + base + ", " + _dsm_imm_a64(imm) + "]!" }
+        sino si (imm == 0) { dirtxt = "[" + base + "]" }
+        sino { dirtxt = "[" + base + ", " + _dsm_imm_a64(imm) + "]" }
+        retornar res(mn, r1 + ", " + r2 + ", " + dirtxt)
+    }
+    // Cargas y guardados de registro.
+    si (b(27, 3) == 7 y b(24, 2) <= 1) {
+        sea tam = b(30, 2)
+        sea v = b(26, 1) == 1
+        sea opc = b(22, 2)
+        sea escala = tam
+        si (v y opc >= 2) { escala = 4 }
+        sea nombre = ""
+        sea reg = ""
+        si (v) {
+            nombre = si(opc % 2 == 1, "ldr", "str")
+            reg = ["b", "h", "s", "d", "q"][escala] + rd
+        } sino {
+            sea suf = ["b", "h", "", ""][tam]
+            si (opc == 0) {
+                nombre = "str" + suf
+                reg = _dsm_xr(rd, tam == 3, falso)
+            } sino si (opc == 1) {
+                nombre = "ldr" + suf
+                reg = _dsm_xr(rd, tam == 3, falso)
+            } sino {
+                // Con signo: opc 2 → destino de 64 bits, 3 → 32 bits.
+                nombre = "ldrs" + ["b", "h", "w", ""][tam]
+                reg = _dsm_xr(rd, opc == 2, falso)
+            }
+        }
+        si (b(24, 1) == 1) {
+            sea imm = b(10, 12) * potencia(2, escala)
+            si (imm == 0) { retornar res(nombre, reg + ", [" + base + "]") }
+            retornar res(nombre, reg + ", [" + base + ", " + _dsm_imm_a64(imm) + "]")
+        }
+        sea modo = b(10, 2)
+        si (b(21, 1) == 1 y modo == 2) {
+            sea rm = b(16, 5)
+            sea opcion = b(13, 3)
+            sea s = b(12, 1)
+            sea indice = _dsm_xr(rm, opcion % 2 == 1, falso)
+            sea ext = ""
+            si (opcion == 3) { ext = si(s == 1, ", lsl " + _dsm_imm_a64(escala), "") }
+            sino { ext = ", " + {"2": "uxtw", "6": "sxtw", "7": "sxtx"}["" + opcion] + si(s == 1, " " + _dsm_imm_a64(escala), "") }
+            retornar res(nombre, reg + ", [" + base + ", " + indice + ext + "]")
+        }
+        sea imm9 = _dsm_s(b(12, 9), 9)
+        si (modo == 0) {
+            sea mn = "ldur"
+            si (nombre == "str" o nombre == "strb" o nombre == "strh") { mn = "stur" }
+            sea suf = ""
+            si (texto_termina_con(nombre, "b")) { suf = "b" }
+            si (texto_termina_con(nombre, "h")) { suf = "h" }
+            si (texto_empieza_con(nombre, "ldrs")) { mn = "ldurs" + subtexto(nombre, 4, longitud(nombre)) } sino { mn = mn + suf }
+            si (imm9 == 0) { retornar res(mn, reg + ", [" + base + "]") }
+            retornar res(mn, reg + ", [" + base + ", " + _dsm_imm_a64(imm9) + "]")
+        }
+        si (modo == 1) { retornar res(nombre, reg + ", [" + base + "], " + _dsm_imm_a64(imm9)) }
+        si (modo == 3) { retornar res(nombre, reg + ", [" + base + ", " + _dsm_imm_a64(imm9) + "]!") }
+        retornar nulo
+    }
+    // Punto flotante escalar.
+    si (b(24, 7) == 30 y b(21, 1) == 1) {
+        sea tipo_f = b(22, 2)
+        sea pre = si(tipo_f == 1, "d", "s")
+        sea rm = b(16, 5)
+        si (b(10, 2) == 2) {
+            sea op = b(12, 4)
+            sea nombres = {"0": "fmul", "1": "fdiv", "2": "fadd", "3": "fsub", "4": "fmax", "5": "fmin", "8": "fnmul"}
+            sea mn = nombres["" + op] ?? nulo
+            si (mn == nulo) { retornar nulo }
+            retornar res(mn, pre + rd + ", " + pre + rn + ", " + pre + rm)
+        }
+        si (b(10, 6) == 8 y b(14, 2) == 0) {
+            si (b(3, 2) == 1) { retornar res("fcmp", pre + rn + ", #0.0") }
+            retornar res("fcmp", pre + rn + ", " + pre + rm)
+        }
+        si (b(10, 3) == 4 y b(13, 8) == 0) {
+            // fmov con inmediato de 8 bits.
+            sea imm8 = b(13, 8)
+            retornar nulo
+        }
+        si (b(10, 3) == 4) {
+            sea imm8 = b(13, 8)
+            sea signo = piso(imm8 / 128)
+            sea e = piso(imm8 / 16) % 8
+            sea fr = imm8 % 16
+            sea exp = si(e >= 4, e - 7, e + 1)
+            sea valor = (16 + fr) / 16 * potencia(2, exp)
+            si (signo == 1) { valor = 0 - valor }
+            retornar res("fmov", pre + rd + ", #" + _dsm_flotante(valor))
+        }
+        si (b(10, 5) == 16) {
+            sea op = b(15, 6)
+            sea nombres = {"0": "fmov", "1": "fabs", "2": "fneg", "3": "fsqrt"}
+            si (op == 5 o op == 4) { retornar res("fcvt", si(op == 5, "d", "s") + rd + ", " + pre + rn) }
+            sea mn = nombres["" + op] ?? nulo
+            si (mn == nulo) { retornar nulo }
+            retornar res(mn, pre + rd + ", " + pre + rn)
+        }
+        si (b(10, 6) == 0) {
+            sea rmode = b(19, 2)
+            sea opcode = b(16, 3)
+            sea sf = b(31, 1) == 1
+            si (rmode == 0 y opcode == 7) { retornar res("fmov", pre + rd + ", " + _dsm_xr(rn, sf, falso)) }
+            si (rmode == 0 y opcode == 6) { retornar res("fmov", _dsm_xr(rd, sf, falso) + ", " + pre + rn) }
+            si (rmode == 0 y opcode == 2) { retornar res("scvtf", pre + rd + ", " + _dsm_xr(rn, sf, falso)) }
+            si (rmode == 0 y opcode == 3) { retornar res("ucvtf", pre + rd + ", " + _dsm_xr(rn, sf, falso)) }
+            si (rmode == 3 y opcode == 0) { retornar res("fcvtzs", _dsm_xr(rd, sf, falso) + ", " + pre + rn) }
+            si (rmode == 3 y opcode == 1) { retornar res("fcvtzu", _dsm_xr(rd, sf, falso) + ", " + pre + rn) }
+        }
+    }
+    retornar nulo
+}
+
+funcion _dsm_flotante(v) {
+    // Capstone imprime 8 decimales: #1.00000000
+    sea neg = v < 0
+    sea a = absoluto(v)
+    sea e = piso(a)
+    sea f = redondear((a - e) * 100000000)
+    si (f >= 100000000) {
+        e = e + 1
+        f = f - 100000000
+    }
+    sea fs = "" + f
+    mientras (longitud(fs) < 8) { fs = "0" + fs }
+    retornar si(neg, "-", "") + e + "." + fs
+}
+
+// ---------- ARM64: ensamblador ----------
+
+funcion _dsm_a64_reg(t) {
+    sea s = texto_minusculas(texto_recortar(t))
+    si (s == "sp") { retornar {"n": 31, "sf": verdadero, "sp": verdadero, "fp": nulo} }
+    si (s == "wsp") { retornar {"n": 31, "sf": falso, "sp": verdadero, "fp": nulo} }
+    si (s == "xzr") { retornar {"n": 31, "sf": verdadero, "sp": falso, "fp": nulo} }
+    si (s == "wzr") { retornar {"n": 31, "sf": falso, "sp": falso, "fp": nulo} }
+    si (s == "lr") { retornar {"n": 30, "sf": verdadero, "sp": falso, "fp": nulo} }
+    si (s == "fp") { retornar {"n": 29, "sf": verdadero, "sp": falso, "fp": nulo} }
+    si (longitud(s) >= 2 y texto_indice("xwbhsdq", subtexto(s, 0, 1)) >= 0) {
+        sea resto = subtexto(s, 1, longitud(s))
+        si (resto != "" y texto_indice("0123456789", subtexto(resto, 0, 1)) >= 0) {
+            sea n = a_numero(resto)
+            sea c = subtexto(s, 0, 1)
+            si (c == "x" o c == "w") { retornar {"n": n, "sf": c == "x", "sp": falso, "fp": nulo} }
+            retornar {"n": n, "sf": falso, "sp": falso, "fp": texto_indice("bhsdq", c)}
+        }
+    }
+    retornar nulo
+}
+
+funcion _dsm_a64_imm(t) {
+    sea s = texto_recortar(t)
+    si (texto_empieza_con(s, "#")) { s = subtexto(s, 1, longitud(s)) }
+    retornar _dsm_num(s)
+}
+
+// Separa operandos por comas fuera de corchetes.
+funcion _dsm_a64_ops(t) {
+    sea r = []
+    sea actual = ""
+    sea nivel = 0
+    sea i = 0
+    mientras (i < longitud(t)) {
+        sea c = subtexto(t, i, i + 1)
+        si (c == "[") { nivel = nivel + 1 }
+        si (c == "]") { nivel = nivel - 1 }
+        si (c == "," y nivel == 0) {
+            r.agregar(texto_recortar(actual))
+            actual = ""
+        } sino { actual = actual + c }
+        i = i + 1
+    }
+    si (texto_recortar(actual) != "") { r.agregar(texto_recortar(actual)) }
+    retornar r
+}
+
+// Codifica un inmediato lógico (lista de bits); nulo si no se puede.
+funcion _dsm_codificar_bitmask(bits, ancho) {
+    sea tam = 2
+    mientras (tam <= ancho) {
+        sea ok = verdadero
+        sea i = tam
+        mientras (i < ancho y ok) {
+            si (bits[i] != bits[i % tam]) { ok = falso }
+            i = i + 1
+        }
+        si (ok) {
+            sea unos = 0
+            para i2 en lista_rango(0, tam) { unos = unos + bits[i2] }
+            si (unos == 0 o unos == tam) { retornar nulo }
+            // Rotación r tal que, al rotar a la derecha, quedan los unos abajo.
+            sea r = 0
+            mientras (r < tam) {
+                // bit j del elemento rotado = bits[(j + r) % tam]
+                sea bien = verdadero
+                sea j = 0
+                mientras (j < tam y bien) {
+                    sea esperado = si(j < unos, 1, 0)
+                    si (bits[(j + r) % tam] != esperado) { bien = falso }
+                    j = j + 1
+                }
+                si (bien) {
+                    sea immr = (tam - r) % tam
+                    sea imms = 0
+                    si (tam == 64) { imms = unos - 1 } sino { imms = (64 - 2 * tam) + (unos - 1) }
+                    retornar [si(tam == 64, 1, 0), immr, imms % 64]
+                }
+                r = r + 1
+            }
+            retornar nulo
+        }
+        tam = tam * 2
+    }
+    retornar nulo
+}
+
+funcion _dsm_w(v) { retornar bytes_entero(v, 4, 1) }
+
+funcion _dsm_a64_asm(linea, dir, etiquetas) {
+    sea s = texto_recortar(linea)
+    sea esp = texto_indice(s, " ")
+    sea mn = texto_minusculas(s)
+    sea resto = ""
+    si (esp >= 0) {
+        mn = texto_minusculas(subtexto(s, 0, esp))
+        resto = subtexto(s, esp + 1, longitud(s))
+    }
+    sea ops = _dsm_a64_ops(resto)
+    sea R = funcion(i) { retornar _dsm_a64_reg(ops[i]) }
+    si (mn == "nop") { retornar _dsm_w(3573751839) }
+    si (mn == "ret") {
+        sea n = 30
+        si (longitud(ops) > 0) { n = R(0)["n"] }
+        retornar _dsm_w(3596550144 + n * 32)
+    }
+    si (mn == "br") { retornar _dsm_w(3592355840 + R(0)["n"] * 32) }
+    si (mn == "blr") { retornar _dsm_w(3594452992 + R(0)["n"] * 32) }
+    si (mn == "svc") { retornar _dsm_w(3556769793 + _dsm_a64_imm(ops[0]) * 32) }
+    sea destino = funcion(t) {
+        sea x = texto_recortar(t)
+        si (tiene_clave(etiquetas, x)) { retornar etiquetas[x] }
+        si (texto_empieza_con(x, "#") o texto_indice("0123456789-", subtexto(x, 0, 1)) >= 0) { retornar _dsm_a64_imm(x) }
+        si (etiquetas["__pasada"] == 1) { retornar dir }
+        lanzar "desarma: etiqueta desconocida " + x
+    }
+    si (mn == "b" o mn == "bl") {
+        sea off = (destino(ops[0]) - dir) / 4
+        retornar _dsm_w(si(mn == "bl", 2483027968, 335544320) + (off + 67108864) % 67108864)
+    }
+    si (texto_empieza_con(mn, "b.")) {
+        sea c = _dsm_indice(_DSM_CC64, subtexto(mn, 2, longitud(mn)))
+        si (c < 0) { c = _dsm_indice(["eq", "ne", "cs", "cc"], subtexto(mn, 2, longitud(mn))) + 2 }
+        sea off = (destino(ops[0]) - dir) / 4
+        retornar _dsm_w(1409286144 + ((off + 524288) % 524288) * 32 + c)
+    }
+    si (mn == "cbz" o mn == "cbnz") {
+        sea r = R(0)
+        sea off = (destino(ops[1]) - dir) / 4
+        retornar _dsm_w(si(r["sf"], 2147483648, 0) + 872415232 + si(mn == "cbnz", 16777216, 0) + ((off + 524288) % 524288) * 32 + r["n"])
+    }
+    si (mn == "tbz" o mn == "tbnz") {
+        sea r = R(0)
+        sea bit = _dsm_a64_imm(ops[1])
+        sea off = (destino(ops[2]) - dir) / 4
+        retornar _dsm_w(piso(bit / 32) * 2147483648 + 905969664 + si(mn == "tbnz", 16777216, 0) + (bit % 32) * 524288 + ((off + 16384) % 16384) * 32 + r["n"])
+    }
+    si (mn == "adr" o mn == "adrp") {
+        sea r = R(0)
+        sea d = destino(ops[1])
+        sea imm = d - dir
+        si (mn == "adrp") { imm = (piso(d / 4096) - piso(dir / 4096)) }
+        sea v = (imm + 2097152) % 2097152
+        retornar _dsm_w(si(mn == "adrp", 2415919104, 268435456) + (v % 4) * 536870912 + piso(v / 4) * 32 + r["n"])
+    }
+    si (mn == "mov" y longitud(ops) == 2) {
+        sea a = R(0)
+        sea b2 = _dsm_a64_reg(ops[1])
+        si (b2 != nulo) {
+            si (a["sp"] o b2["sp"]) { retornar _dsm_a64_asm("add " + ops[0] + ", " + ops[1] + ", #0", dir, etiquetas) }
+            retornar _dsm_a64_asm("orr " + ops[0] + ", " + si(a["sf"], "xzr", "wzr") + ", " + ops[1], dir, etiquetas)
+        }
+        sea v = _dsm_a64_imm(ops[1])
+        sea ancho = si(a["sf"], 64, 32)
+        // movz con un solo trozo de 16 bits.
+        sea hw = 0
+        mientras (hw < ancho / 16) {
+            si (v >= 0 y v % potencia(2, hw * 16) == 0 y v / potencia(2, hw * 16) < 65536) { retornar _dsm_w(si(a["sf"], 2147483648, 0) + 1384120320 + hw * 2097152 + (v / potencia(2, hw * 16)) * 32 + a["n"]) }
+            hw = hw + 1
+        }
+        // movn
+        sea inv = 0 - v - 1
+        si (a["sf"] == falso) { inv = 4294967295 - (v + si(v < 0, 4294967296, 0)) }
+        hw = 0
+        mientras (hw < ancho / 16) {
+            si (inv >= 0 y inv % potencia(2, hw * 16) == 0 y inv / potencia(2, hw * 16) < 65536) { retornar _dsm_w(si(a["sf"], 2147483648, 0) + 310378496 + hw * 2097152 + (inv / potencia(2, hw * 16)) * 32 + a["n"]) }
+            hw = hw + 1
+        }
+        retornar _dsm_a64_asm("orr " + ops[0] + ", " + si(a["sf"], "xzr", "wzr") + ", " + ops[1], dir, etiquetas)
+    }
+    si (mn == "movz" o mn == "movk" o mn == "movn") {
+        sea a = R(0)
+        sea v = _dsm_a64_imm(ops[1])
+        sea hw = 0
+        si (longitud(ops) > 2) { hw = _dsm_a64_imm(subtexto(texto_recortar(ops[2]), 4, longitud(texto_recortar(ops[2])))) / 16 }
+        sea opc = {"movn": 0, "movz": 2, "movk": 3}[mn]
+        retornar _dsm_w(si(a["sf"], 2147483648, 0) + opc * 536870912 + 310378496 + hw * 2097152 + v * 32 + a["n"])
+    }
+    si (mn == "cmp" o mn == "cmn" o mn == "tst") {
+        sea a = R(0)
+        sea zr = si(a["sf"], "xzr", "wzr")
+        sea base = {"cmp": "subs", "cmn": "adds", "tst": "ands"}[mn]
+        sea resto2 = []
+        sea i = 1
+        mientras (i < longitud(ops)) {
+            resto2.agregar(ops[i])
+            i = i + 1
+        }
+        retornar _dsm_a64_asm(base + " " + zr + ", " + ops[0] + ", " + unir(resto2, ", "), dir, etiquetas)
+    }
+    si (mn == "neg" o mn == "negs") { retornar _dsm_a64_asm(si(mn == "neg", "sub", "subs") + " " + ops[0] + ", " + si(R(0)["sf"], "xzr", "wzr") + ", " + ops[1], dir, etiquetas) }
+    si (mn == "mvn") { retornar _dsm_a64_asm("orn " + ops[0] + ", " + si(R(0)["sf"], "xzr", "wzr") + ", " + ops[1], dir, etiquetas) }
+    si (mn == "add" o mn == "adds" o mn == "sub" o mn == "subs") {
+        sea a = R(0)
+        sea n = R(1)
+        sea sf = si(a["sf"], 2147483648, 0)
+        sea op = si(texto_empieza_con(mn, "sub"), 1073741824, 0)
+        sea s = si(texto_termina_con(mn, "s"), 536870912, 0)
+        si (_dsm_a64_reg(ops[2]) == nulo) {
+            sea imm = _dsm_a64_imm(ops[2])
+            sea sh = 0
+            si (longitud(ops) > 3) { sh = 4194304 }
+            si (imm < 0) {
+                // add x, y, #-n → sub x, y, #n
+                op = 1073741824 - op
+                imm = 0 - imm
+            }
+            si (imm >= 4096 y imm % 4096 == 0 y sh == 0) {
+                imm = imm / 4096
+                sh = 4194304
+            }
+            retornar _dsm_w(sf + op + s + 285212672 + sh + imm * 1024 + n["n"] * 32 + a["n"])
+        }
+        sea m = R(2)
+        sea sh = 0
+        sea amt = 0
+        si (longitud(ops) > 3) {
+            sea p = texto_dividir(texto_recortar(ops[3]), " ")
+            sh = _dsm_indice(["lsl", "lsr", "asr"], p[0])
+            amt = _dsm_a64_imm(p[1])
+        }
+        retornar _dsm_w(sf + op + s + 184549376 + sh * 4194304 + m["n"] * 65536 + amt * 1024 + n["n"] * 32 + a["n"])
+    }
+    sea logicas = ["and", "orr", "eor", "ands"]
+    sea negadas = ["bic", "orn", "eon", "bics"]
+    si (_dsm_indice(logicas, mn) >= 0 o _dsm_indice(negadas, mn) >= 0) {
+        sea a = R(0)
+        sea n = R(1)
+        sea opc = _dsm_indice(logicas, mn)
+        sea neg = 0
+        si (opc < 0) {
+            opc = _dsm_indice(negadas, mn)
+            neg = 2097152
+        }
+        sea sf = si(a["sf"], 2147483648, 0)
+        si (_dsm_a64_reg(ops[2]) == nulo) {
+            sea ancho = si(a["sf"], 64, 32)
+            sea enc = _dsm_codificar_bitmask(_dsm_bits_de_texto(ops[2], ancho), ancho)
+            si (enc == nulo) { lanzar "desarma: inmediato lógico imposible: " + ops[2] }
+            retornar _dsm_w(sf + opc * 536870912 + 301989888 + enc[0] * 4194304 + enc[1] * 65536 + enc[2] * 1024 + n["n"] * 32 + a["n"])
+        }
+        sea m = R(2)
+        sea sh = 0
+        sea amt = 0
+        si (longitud(ops) > 3) {
+            sea p = texto_dividir(texto_recortar(ops[3]), " ")
+            sh = _dsm_indice(["lsl", "lsr", "asr", "ror"], p[0])
+            amt = _dsm_a64_imm(p[1])
+        }
+        retornar _dsm_w(sf + opc * 536870912 + 167772160 + sh * 4194304 + neg + m["n"] * 65536 + amt * 1024 + n["n"] * 32 + a["n"])
+    }
+    si (mn == "mul" o mn == "madd" o mn == "msub" o mn == "mneg" o mn == "smulh" o mn == "umulh") {
+        sea a = R(0)
+        sea sf = si(a["sf"], 2147483648, 0)
+        sea ra = 31
+        si (longitud(ops) > 3) { ra = R(3)["n"] }
+        sea o0 = si(mn == "msub" o mn == "mneg", 32768, 0)
+        sea op31 = 0
+        si (mn == "smulh") { op31 = 4194304 }
+        si (mn == "umulh") { op31 = 12582912 }
+        retornar _dsm_w(sf + 452984832 + op31 + R(2)["n"] * 65536 + o0 + ra * 1024 + R(1)["n"] * 32 + a["n"])
+    }
+    si (mn == "udiv" o mn == "sdiv" o ((mn == "lsl" o mn == "lsr" o mn == "asr" o mn == "ror") y _dsm_a64_reg(ops[2]) != nulo)) {
+        sea a = R(0)
+        sea opcode = {"udiv": 2, "sdiv": 3, "lsl": 8, "lsr": 9, "asr": 10, "ror": 11}[mn]
+        retornar _dsm_w(si(a["sf"], 2147483648, 0) + 448790528 + R(2)["n"] * 65536 + opcode * 1024 + R(1)["n"] * 32 + a["n"])
+    }
+    si (mn == "lsl" o mn == "lsr" o mn == "asr" o mn == "ubfx" o mn == "sbfx" o mn == "sxtw" o mn == "sxtb" o mn == "sxth" o mn == "uxtb" o mn == "uxth" o mn == "ror") {
+        sea a = R(0)
+        sea n = R(1)
+        sea ancho = si(a["sf"], 64, 32)
+        sea sf = si(a["sf"], 2147483648 + 4194304, 0)
+        sea opc = 2
+        sea immr = 0
+        sea imms = 0
+        si (mn == "lsl") {
+            sea sh = _dsm_a64_imm(ops[2])
+            immr = (ancho - sh) % ancho
+            imms = ancho - 1 - sh
+        } sino si (mn == "lsr" o mn == "asr") {
+            immr = _dsm_a64_imm(ops[2])
+            imms = ancho - 1
+            si (mn == "asr") { opc = 0 }
+        } sino si (mn == "ubfx" o mn == "sbfx") {
+            immr = _dsm_a64_imm(ops[2])
+            imms = immr + _dsm_a64_imm(ops[3]) - 1
+            si (mn == "sbfx") { opc = 0 }
+        } sino si (mn == "ror") {
+            sea lsb = _dsm_a64_imm(ops[2])
+            retornar _dsm_w(si(a["sf"], 2147483648 + 4194304, 0) + 327155712 + n["n"] * 65536 + lsb * 1024 + n["n"] * 32 + a["n"])
+        } sino {
+            imms = {"sxtw": 31, "sxtb": 7, "sxth": 15, "uxtb": 7, "uxth": 15}[mn]
+            si (texto_empieza_con(mn, "s")) { opc = 0 }
+        }
+        retornar _dsm_w(sf + opc * 536870912 + 318767104 + immr * 65536 + imms * 1024 + n["n"] * 32 + a["n"])
+    }
+    si (mn == "csel" o mn == "csinc" o mn == "csinv" o mn == "csneg" o mn == "cset" o mn == "csetm" o mn == "cinc" o mn == "cneg") {
+        sea a = R(0)
+        sea sf = si(a["sf"], 2147483648, 0)
+        sea n = 31
+        sea m = 31
+        sea cond = 0
+        sea mn2 = mn
+        si (mn == "cset" o mn == "csetm") {
+            cond = bits_xo(_dsm_indice(_DSM_CC64, ops[1]), 1)
+            mn2 = si(mn == "cset", "csinc", "csinv")
+        } sino si (mn == "cinc" o mn == "cneg") {
+            n = R(1)["n"]
+            m = n
+            cond = bits_xo(_dsm_indice(_DSM_CC64, ops[2]), 1)
+            mn2 = si(mn == "cinc", "csinc", "csneg")
+        } sino {
+            n = R(1)["n"]
+            m = R(2)["n"]
+            cond = _dsm_indice(_DSM_CC64, ops[3])
+        }
+        sea op = si(mn2 == "csinv" o mn2 == "csneg", 1073741824, 0)
+        sea o2 = si(mn2 == "csinc" o mn2 == "csneg", 1024, 0)
+        retornar _dsm_w(sf + op + 444596224 + m * 65536 + cond * 4096 + o2 + n * 32 + a["n"])
+    }
+    si (mn == "ldr" o mn == "str" o mn == "ldrb" o mn == "strb" o mn == "ldrh" o mn == "strh" o mn == "ldrsw" o mn == "ldrsb" o mn == "ldrsh" o mn == "ldur" o mn == "stur" o mn == "ldurb" o mn == "sturb") {
+        retornar _dsm_a64_asm_mem(mn, ops, dir, destino)
+    }
+    si (mn == "ldp" o mn == "stp") {
+        sea a = R(0)
+        sea b2 = R(1)
+        sea fp = a["fp"]
+        sea opc = si(a["sf"], 2, 0)
+        sea v = 0
+        sea escala = si(a["sf"], 3, 2)
+        si (fp != nulo) {
+            v = 67108864
+            opc = fp - 2
+            escala = fp
+        }
+        sea memo = texto_recortar(ops[2])
+        sea modo = 2
+        sea imm = 0
+        sea base = 0
+        si (texto_termina_con(memo, "!")) {
+            modo = 3
+            memo = subtexto(memo, 0, longitud(memo) - 1)
+        }
+        sea dentro = subtexto(memo, 1, texto_indice(memo, "]"))
+        sea pd = _dsm_a64_ops(dentro)
+        base = _dsm_a64_reg(pd[0])["n"]
+        si (longitud(pd) > 1) { imm = _dsm_a64_imm(pd[1]) }
+        si (longitud(ops) > 3) {
+            modo = 1
+            imm = _dsm_a64_imm(ops[3])
+        }
+        sea carga = si(mn == "ldp", 4194304, 0)
+        sea imm7 = ((imm / potencia(2, escala)) + 128) % 128
+        retornar _dsm_w(opc * 1073741824 + 671088640 + v + modo * 8388608 + carga + imm7 * 32768 + b2["n"] * 1024 + base * 32 + a["n"])
+    }
+    retornar _dsm_a64_asm_fp(mn, ops)
+}
+
+funcion _dsm_a64_asm_mem(mn, ops, dir, destino) {
+    sea a = _dsm_a64_reg(ops[0])
+    sea memo = texto_recortar(ops[1])
+    // Literal: ldr x0, #dirección
+    si (texto_empieza_con(memo, "[") == falso) {
+        sea off = (destino(memo) - dir) / 4
+        sea opc = si(a["sf"], 1, 0)
+        sea v = 0
+        si (a["fp"] != nulo) {
+            v = 67108864
+            opc = a["fp"] - 2
+        }
+        si (mn == "ldrsw") { opc = 2 }
+        retornar _dsm_w(opc * 1073741824 + 402653184 + v + ((off + 524288) % 524288) * 32 + a["n"])
+    }
+    sea tam = si(a["sf"], 3, 2)
+    sea v = 0
+    sea opc = 0
+    si (a["fp"] != nulo) {
+        v = 67108864
+        tam = a["fp"] % 4
+        opc = si(a["fp"] == 4, 2, 0)
+    }
+    sea carga = texto_empieza_con(mn, "ldr") o texto_empieza_con(mn, "ldur")
+    si (texto_termina_con(mn, "b") y mn != "ldrsb") { tam = 0 }
+    si (texto_termina_con(mn, "h") y mn != "ldrsh") { tam = 1 }
+    si (carga) { opc = opc + 1 }
+    si (mn == "ldrsw") {
+        tam = 2
+        opc = 2
+    }
+    si (mn == "ldrsb" o mn == "ldrsh") {
+        tam = si(mn == "ldrsb", 0, 1)
+        opc = si(a["sf"], 2, 3)
+    }
+    sea escala = tam
+    si (a["fp"] == 4) { escala = 4 }
+    sea base_ins = tam * 1073741824 + 939524096 + v + opc * 4194304
+    sea pre = texto_termina_con(memo, "!")
+    si (pre) { memo = subtexto(memo, 0, longitud(memo) - 1) }
+    sea dentro = subtexto(memo, 1, texto_indice(memo, "]"))
+    sea pd = _dsm_a64_ops(dentro)
+    sea rn = _dsm_a64_reg(pd[0])["n"]
+    si (longitud(ops) > 2) {
+        // Post-índice.
+        sea imm = _dsm_a64_imm(ops[2])
+        retornar _dsm_w(base_ins + ((imm + 512) % 512) * 4096 + 1024 + rn * 32 + a["n"])
+    }
+    si (pre) {
+        sea imm = _dsm_a64_imm(pd[1])
+        retornar _dsm_w(base_ins + ((imm + 512) % 512) * 4096 + 3072 + rn * 32 + a["n"])
+    }
+    si (longitud(pd) > 1 y _dsm_a64_reg(pd[1]) != nulo) {
+        sea m = _dsm_a64_reg(pd[1])
+        sea opcion = 3
+        sea s = 0
+        si (longitud(pd) > 2) {
+            sea p = texto_dividir(texto_recortar(pd[2]), " ")
+            opcion = {"lsl": 3, "uxtw": 2, "sxtw": 6, "sxtx": 7}[p[0]]
+            si (longitud(p) > 1) { s = 1 }
+        }
+        retornar _dsm_w(base_ins + 2097152 + m["n"] * 65536 + opcion * 8192 + s * 4096 + 2048 + rn * 32 + a["n"])
+    }
+    sea imm = 0
+    si (longitud(pd) > 1) { imm = _dsm_a64_imm(pd[1]) }
+    si (texto_empieza_con(mn, "ldu") o texto_empieza_con(mn, "stu") o imm < 0 o imm % potencia(2, escala) != 0) {
+        retornar _dsm_w(base_ins + ((imm + 512) % 512) * 4096 + rn * 32 + a["n"])
+    }
+    retornar _dsm_w(base_ins + 16777216 + (imm / potencia(2, escala)) * 1024 + rn * 32 + a["n"])
+}
+
+funcion _dsm_a64_asm_fp(mn, ops) {
+    sea a = _dsm_a64_reg(ops[0])
+    sea fp_tipo = funcion(r) { retornar si(r["fp"] == 3, 4194304, 0) }
+    sea arit = {"fmul": 0, "fdiv": 1, "fadd": 2, "fsub": 3, "fmax": 4, "fmin": 5, "fnmul": 8}
+    si (tiene_clave(arit, mn)) {
+        sea n = _dsm_a64_reg(ops[1])
+        sea m = _dsm_a64_reg(ops[2])
+        retornar _dsm_w(505415680 + fp_tipo(a) + m["n"] * 65536 + arit[mn] * 4096 + n["n"] * 32 + a["n"])
+    }
+    si (mn == "fcmp") {
+        si (texto_contiene(ops[1], "#")) { retornar _dsm_w(505421832 + fp_tipo(a) + a["n"] * 32) }
+        sea m = _dsm_a64_reg(ops[1])
+        retornar _dsm_w(505421824 + fp_tipo(a) + m["n"] * 65536 + a["n"] * 32)
+    }
+    si (mn == "fmov" o mn == "scvtf" o mn == "ucvtf" o mn == "fcvtzs" o mn == "fcvtzu" o mn == "fabs" o mn == "fneg" o mn == "fsqrt") {
+        sea b2 = _dsm_a64_reg(ops[1])
+        si (b2 == nulo y mn == "fmov") {
+            sea v = a_numero(subtexto(texto_recortar(ops[1]), 1, longitud(texto_recortar(ops[1]))))
+            // Busca el imm8 que representa v.
+            sea k = 0
+            mientras (k < 256) {
+                sea signo = piso(k / 128)
+                sea e = piso(k / 16) % 8
+                sea fr = k % 16
+                sea exp = si(e >= 4, e - 7, e + 1)
+                sea valor = (16 + fr) / 16 * potencia(2, exp)
+                si (signo == 1) { valor = 0 - valor }
+                si (valor == v) { retornar _dsm_w(505417728 + fp_tipo(a) + k * 8192 + a["n"]) }
+                k = k + 1
+            }
+            lanzar "desarma: fmov con un inmediato no representable"
+        }
+        si (a["fp"] != nulo y b2["fp"] != nulo) {
+            sea op = {"fmov": 0, "fabs": 1, "fneg": 2, "fsqrt": 3}[mn]
+            retornar _dsm_w(505430016 + fp_tipo(a) + op * 32768 + b2["n"] * 32 + a["n"])
+        }
+        sea rmode = 0
+        sea opcode = 0
+        sea fp = a
+        sea gp = b2
+        si (mn == "fmov" y a["fp"] != nulo) { opcode = 7 }
+        sino si (mn == "fmov") {
+            opcode = 6
+            fp = b2
+            gp = a
+        } sino si (mn == "scvtf") { opcode = 2 }
+        sino si (mn == "ucvtf") { opcode = 3 }
+        sino {
+            rmode = 3
+            opcode = si(mn == "fcvtzs", 0, 1)
+            fp = b2
+            gp = a
+        }
+        retornar _dsm_w(si(gp["sf"], 2147483648, 0) + 505413632 + fp_tipo(fp) + rmode * 524288 + opcode * 65536 + b2["n"] * 32 + a["n"])
+    }
+    lanzar "desarma: instrucción ARM64 no soportada: " + mn
+}
+
+/// Ensambla texto ARM64 (sintaxis de Capstone) a bytes.
+funcion ensambla_arm64(texto, direccion) { retornar _dsm_ensamblar(texto, direccion, _dsm_a64_asm, verdadero) }
+
+/// Desensambla para "x86_64" o "arm64".
+funcion desarma(codigo, arquitectura, direccion) {
+    si (arquitectura == "arm64" o arquitectura == "aarch64") { retornar desarma_arm64(codigo, direccion) }
+    retornar desarma_x86(codigo, direccion)
+}
+
+/// Ensambla para "x86_64" o "arm64".
+funcion ensambla(texto, arquitectura, direccion) {
+    si (arquitectura == "arm64" o arquitectura == "aarch64") { retornar ensambla_arm64(texto, direccion) }
+    retornar ensambla_x86(texto, direccion)
+}
+
+/// Listado legible: "0x1000: 55   push rbp" por línea.
+funcion desarma_listado(codigo, arquitectura, direccion) {
+    sea r = []
+    para i en desarma(codigo, arquitectura, direccion) { r.agregar(_dsm_hex(i["direccion"]) + ":  " + hex_de_bytes(i["bytes"]) + "  " + i["texto"]) }
+    retornar unir(r, "\n")
+}

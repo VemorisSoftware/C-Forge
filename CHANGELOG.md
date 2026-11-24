@@ -4,6 +4,13 @@ Sitio oficial: [c-forge.org](https://c-forge.org)
 
 ## Sin publicar
 
+- Lote 34 de bibliotecas (tres más que pasan de enlaces a nativas):
+  `desarma`/`capstone` (ensamblador y desensamblador de x86-64 y ARM64 con
+  el formato de Capstone; probado instrucción por instrucción contra
+  Capstone 5 y Keystone), `molecula`/`rdkit` (SMILES, fórmula, pesos,
+  anillos, aromaticidad, TPSA, Lipinski, SMILES canónico y subestructuras;
+  mismos valores que RDKit en 65 moléculas) y `antivirus`/`clamav` (firmas
+  .hdb, .hsb, .ndb y .ldb de ClamAV, ZIP y GZIP anidados, carpetas y EICAR).
 - Lote 33 de bibliotecas (tres que antes se usaban por enlaces, ahora
   nativas): `sonda`/`libpcap` (archivos pcap y pcapng, decodificación de
   Ethernet, VLAN, ARP, IPv4, IPv6, TCP, UDP, ICMP y DNS, filtros con la

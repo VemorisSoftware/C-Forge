@@ -215,7 +215,7 @@ Estado: ✅ ya existe en C-Forge · 🔗 se usa hoy vía `cforge bindgen`,
 | 152 | `sobre` / `envelope` | Cifrado de archivos con claves | age | ✅ `sobre` |
 | 153 | `primitiva` | Cripto a prueba de errores | Tink | ✅ `crypto` (AEAD) |
 | 154 | `huella` | Patrones de malware | YARA | ✅ `huella` / `yara` |
-| 155 | `desarma` | Ensamblador y desensamblador | Capstone, Keystone | 🔗 |
+| 155 | `desarma` | Ensamblador y desensamblador | Capstone, Keystone | ✅ `desarma` / `capstone` |
 | 156 | `emulador` | Emulación de CPU | Unicorn | 🔗 |
 | 157 | `curva` / `secp256k1` | Curva secp256k1 | libsecp256k1 | ✅ `curva` |
 | 158 | `cadena` / `evm` | Contratos EVM y Web3 | ethers-rs | ✅ `cadena` |
@@ -223,7 +223,7 @@ Estado: ✅ ya existe en C-Forge · 🔗 se usa hoy vía `cforge bindgen`,
 | 160 | `paseo` / `paseto` | Tokens PASETO | PASETO | ✅ `paseo` |
 | 161 | `federa` / `oidc` | OAuth2 y OpenID Connect | OAuth2 | ✅ `federa` |
 | 162 | `segundo_factor` / `totp` | TOTP y Passkeys | TOTP, WebAuthn | ✅ `segundo_factor` |
-| 163 | `antivirus` | Escaneo por firmas | ClamAV | 🔗 |
+| 163 | `antivirus` | Escaneo por firmas | ClamAV | ✅ `antivirus` / `clamav` |
 | 164 | `centinela` / `suricata` | Detección de intrusos | Suricata | ✅ `centinela` |
 | 165 | `secretos` / `secrets` | Secretos cifrados en repos | sops | ✅ `secretos` |
 | 166 | `apreton` / `noise_protocol` | Protocolo Noise | snow | ✅ `apreton` |
@@ -243,7 +243,7 @@ Estado: ✅ ya existe en C-Forge · 🔗 se usa hoy vía `cforge bindgen`,
 | 175 | `robotica` | Física para robótica | MuJoCo | 🔗 |
 | 176 | `cuaternion` / `quaternion` | Álgebra lineal y transformaciones | nalgebra | ✅ `cuaternion` |
 | 177 | `astro` / `astronomy` | Órbitas y efemérides | NOVAS | ✅ `astro` |
-| 178 | `molecula` | Quimioinformática | RDKit | 🔗 |
+| 178 | `molecula` | Quimioinformática | RDKit | ✅ `molecula` / `rdkit` |
 | 179 | `genoma` / `bio` | Bioinformática | Rust-Bio | ✅ `genoma` |
 | 180 | `cientifica` | Funciones especiales y EDO | GSL | ✅ `cientifica` / `gsl` |
 | 181 | `grafos` / `graph` | Grafos y rutas | petgraph | ✅ `grafos` |
