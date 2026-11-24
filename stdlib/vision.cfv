@@ -1,0 +1,718 @@
+// stdlib/vision.cfv — Visión por computador al estilo de OpenCV, escrito
+// desde cero (idea de OpenCV, Apache 2.0). Matrices de 8 bits de 1 o 3
+// canales con los mismos resultados que cv2 en las funciones básicas:
+//
+//   · Color: gris (cvtColor RGB2GRAY en punto fijo), HSV.
+//   · Umbrales: binario, binario inverso, truncado, a cero, Otsu y
+//     adaptativo por media.
+//   · Filtros: caja, gaussiano, mediana, Sobel, Laplaciano, Canny.
+//   · Morfología: erosión, dilatación, apertura, cierre, gradiente.
+//   · Análisis: componentes conexas con estadísticas, contornos externos,
+//     momentos, imagen integral, ecualización de histograma, búsqueda de
+//     plantillas (SQDIFF, CCORR_NORMED, CCOEFF_NORMED) y redimensionado.
+//
+// En inglés: importar "opencv".
+//
+//   importar "vision"
+//   sea m = vision_desde_imagen(imagen_cargar("piezas.png"))
+//   sea g = vision_gris(m)
+//   sea b = vision_umbral(g, 0, 255, "otsu")
+//   mostrar(longitud(vision_componentes(b["imagen"], 8)["estadisticas"]) - 1)   // piezas
+//
+// Una matriz es {"filas", "columnas", "canales", "datos": [enteros en orden
+// fila, columna, canal]}; las imágenes de "imagen" se convierten con
+// vision_desde_imagen / vision_a_imagen (RGB, no BGR).
+
+importar "imagen"
+
+funcion _vi_mat(filas, columnas, canales, datos) { retornar {"filas": filas, "columnas": columnas, "canales": canales, "datos": datos} }
+
+funcion vision_matriz(filas, columnas, canales, valor) {
+    sea d = []
+    para i en lista_rango(0, filas * columnas * canales) { d.agregar(valor ?? 0) }
+    retornar _vi_mat(filas, columnas, canales, d)
+}
+
+/// Imagen RGBA de "imagen" → matriz RGB de 3 canales.
+funcion vision_desde_imagen(img) {
+    sea p = img["pixeles"]
+    sea d = []
+    sea i = 0
+    mientras (i < longitud(p)) {
+        d.agregar(byte_en(p, i))
+        d.agregar(byte_en(p, i + 1))
+        d.agregar(byte_en(p, i + 2))
+        i = i + 4
+    }
+    retornar _vi_mat(img["alto"], img["ancho"], 3, d)
+}
+
+/// Matriz de 1 o 3 canales → imagen RGBA opaca.
+funcion vision_a_imagen(m) {
+    sea partes = []
+    sea n = m["filas"] * m["columnas"]
+    para i en lista_rango(0, n) {
+        si (m["canales"] == 1) {
+            sea v = char_de(_vi_sat(m["datos"][i]))
+            partes.agregar(v + v + v + char_de(255))
+        } sino { partes.agregar(char_de(_vi_sat(m["datos"][i * 3])) + char_de(_vi_sat(m["datos"][i * 3 + 1])) + char_de(_vi_sat(m["datos"][i * 3 + 2])) + char_de(255)) }
+    }
+    retornar {"ancho": m["columnas"], "alto": m["filas"], "pixeles": unir(partes, "")}
+}
+
+funcion _vi_sat(v) {
+    si (v < 0) { retornar 0 }
+    si (v > 255) { retornar 255 }
+    retornar v
+}
+
+// Redondeo de OpenCV (saturate_cast: al par más cercano en .5).
+funcion _vi_red(v) {
+    sea f = piso(v)
+    sea d = v - f
+    si (d > 0.5) { retornar f + 1 }
+    si (d < 0.5) { retornar f }
+    retornar si(f % 2 == 0, f, f + 1)
+}
+
+// Redondea al float32 más cercano (empate al par).
+funcion _vi_f32(x) {
+    si (x == 0) { retornar 0.0 }
+    sea a = absoluto(x)
+    sea e = piso(logaritmo(a) / logaritmo(2))
+    si (potencia(2, e) > a) { e = e - 1 }
+    si (potencia(2, e + 1) <= a) { e = e + 1 }
+    sea paso = potencia(2, e - 23)
+    sea q = _vi_red(a / paso) * paso
+    retornar si(x < 0, 0 - q, q)
+}
+
+funcion _vi_px(m, f, c) {
+    // Borde reflejado 101 (gfedcb|abcdefgh|gfedcba).
+    sea ff = f
+    sea cc = c
+    si (ff < 0) { ff = 0 - ff }
+    si (ff >= m["filas"]) { ff = 2 * m["filas"] - ff - 2 }
+    si (cc < 0) { cc = 0 - cc }
+    si (cc >= m["columnas"]) { cc = 2 * m["columnas"] - cc - 2 }
+    retornar m["datos"][ff * m["columnas"] + cc]
+}
+
+funcion _vi_px_rep(m, f, c) {
+    retornar m["datos"][minimo(m["filas"] - 1, maximo(0, f)) * m["columnas"] + minimo(m["columnas"] - 1, maximo(0, c))]
+}
+
+funcion _vi_gris_req(m) {
+    si (m["canales"] != 1) { lanzar "vision: se esperaba una matriz de un canal (usa vision_gris)" }
+}
+
+// ---------- color ----------
+
+/// RGB → gris (Y = 0.299 R + 0.587 G + 0.114 B en punto fijo de 15 bits, como cv2).
+funcion vision_gris(m) {
+    si (m["canales"] == 1) { retornar m }
+    sea d = []
+    sea x = m["datos"]
+    sea i = 0
+    mientras (i < longitud(x)) {
+        d.agregar(cociente(x[i] * 9798 + x[i + 1] * 19235 + x[i + 2] * 3735 + 16384, 32768))
+        i = i + 3
+    }
+    retornar _vi_mat(m["filas"], m["columnas"], 1, d)
+}
+
+/// RGB → HSV con H en 0..179, S y V en 0..255 (como cv2.COLOR_RGB2HSV,
+/// con sus tablas de división en punto fijo).
+funcion vision_hsv(m) {
+    sea sdiv = [0]
+    sea hdiv = [0]
+    para i en lista_rango(1, 256) {
+        sdiv.agregar(_vi_red(255.0 * 4096 / i))
+        hdiv.agregar(_vi_red(180.0 * 4096 / (6 * i)))
+    }
+    sea d = []
+    sea x = m["datos"]
+    sea i = 0
+    mientras (i < longitud(x)) {
+        sea r = x[i]
+        sea g = x[i + 1]
+        sea b = x[i + 2]
+        sea v = maximo(r, maximo(g, b))
+        sea diff = v - minimo(r, minimo(g, b))
+        sea s = cociente(diff * sdiv[v] + 2048, 4096)
+        sea h = 0
+        si (v == r) { h = g - b } sino si (v == g) { h = b - r + 2 * diff } sino { h = r - g + 4 * diff }
+        h = h * hdiv[diff] + 2048
+        h = si(h < 0, 0 - cociente(0 - h + 4095, 4096), cociente(h, 4096))
+        si (h < 0) { h = h + 180 }
+        d.agregar(h)
+        d.agregar(s)
+        d.agregar(v)
+        i = i + 3
+    }
+    retornar _vi_mat(m["filas"], m["columnas"], 3, d)
+}
+
+// ---------- umbrales ----------
+
+funcion _vi_otsu(m) {
+    sea hist = []
+    para i en lista_rango(0, 256) { hist.agregar(0) }
+    para v en m["datos"] { hist[v] = hist[v] + 1 }
+    sea n = longitud(m["datos"])
+    sea mu = 0.0
+    para i en lista_rango(0, 256) { mu = mu + i * hist[i] }
+    mu = mu / n
+    sea q1 = 0.0
+    sea mu1 = 0.0
+    sea mejor = 0.0
+    sea umbral = 0
+    para i en lista_rango(0, 256) {
+        sea p_i = hist[i] / n
+        sea mu1_n = mu1 * q1 + i * p_i
+        q1 = q1 + p_i
+        sea q2 = 1 - q1
+        si (q1 < 0.0000001 o q1 > 0.9999999) {
+            mu1 = si(q1 > 0, mu1_n / q1, 0)
+        } sino {
+            mu1 = mu1_n / q1
+            sea mu2 = (mu - q1 * mu1) / q2
+            sea sigma = q1 * q2 * (mu1 - mu2) * (mu1 - mu2)
+            si (sigma > mejor) {
+                mejor = sigma
+                umbral = i
+            }
+        }
+    }
+    retornar umbral
+}
+
+/// Umbral global. tipo: "binario", "binario_inv", "truncar", "a_cero",
+/// "a_cero_inv" u "otsu" (binario con umbral de Otsu). Devuelve {"umbral", "imagen"}.
+funcion vision_umbral(m, umbral, maximo_, tipo_u) {
+    _vi_gris_req(m)
+    sea t = umbral
+    sea tipo_r = tipo_u ?? "binario"
+    si (tipo_r == "otsu" o tipo_r == "otsu_inv") {
+        t = _vi_otsu(m)
+        tipo_r = si(tipo_r == "otsu", "binario", "binario_inv")
+    }
+    sea d = []
+    para v en m["datos"] {
+        si (tipo_r == "binario") { d.agregar(si(v > t, maximo_, 0)) }
+        sino si (tipo_r == "binario_inv") { d.agregar(si(v > t, 0, maximo_)) }
+        sino si (tipo_r == "truncar") { d.agregar(si(v > t, t, v)) }
+        sino si (tipo_r == "a_cero") { d.agregar(si(v > t, v, 0)) }
+        sino { d.agregar(si(v > t, 0, v)) }
+    }
+    retornar {"umbral": t, "imagen": _vi_mat(m["filas"], m["columnas"], 1, d)}
+}
+
+/// Umbral adaptativo por media del vecindario bloque × bloque menos c.
+funcion vision_umbral_adaptativo(m, maximo_, bloque, c, invertido) {
+    _vi_gris_req(m)
+    sea media = vision_caja(m, bloque, "replicar")
+    sea d = []
+    para i en lista_rango(0, longitud(m["datos"])) {
+        sea ok = m["datos"][i] > media["datos"][i] - c
+        si (invertido) { ok = ok == falso }
+        d.agregar(si(ok, maximo_, 0))
+    }
+    retornar _vi_mat(m["filas"], m["columnas"], 1, d)
+}
+
+// ---------- filtros ----------
+
+/// Media en una ventana k × k (borde "reflejar" 101 o "replicar").
+funcion vision_caja(m, k, borde) {
+    _vi_gris_req(m)
+    sea r = cociente(k, 2)
+    sea px = si(borde == "replicar", _vi_px_rep, _vi_px)
+    sea d = []
+    para f en lista_rango(0, m["filas"]) {
+        para c en lista_rango(0, m["columnas"]) {
+            sea s = 0
+            para dy en lista_rango(0 - r, r + 1) {
+                para dx en lista_rango(0 - r, r + 1) { s = s + px(m, f + dy, c + dx) }
+            }
+            d.agregar(_vi_red(s / (k * k)))
+        }
+    }
+    retornar _vi_mat(m["filas"], m["columnas"], 1, d)
+}
+
+funcion _vi_nucleo_gauss(k, sigma) {
+    si (sigma <= 0 y k == 3) { retornar [0.25, 0.5, 0.25] }
+    si (sigma <= 0 y k == 5) { retornar [0.0625, 0.25, 0.375, 0.25, 0.0625] }
+    si (sigma <= 0 y k == 7) { retornar [0.03125, 0.109375, 0.21875, 0.28125, 0.21875, 0.109375, 0.03125] }
+    sea s = sigma
+    si (s <= 0) { s = 0.3 * ((k - 1) * 0.5 - 1) + 0.8 }
+    sea r = []
+    sea total = 0.0
+    para i en lista_rango(0, k) {
+        sea x = i - (k - 1) / 2
+        sea v = exponencial(0 - x * x / (2 * s * s))
+        r.agregar(v)
+        total = total + v
+    }
+    sea n = []
+    para v en r { n.agregar(v / total) }
+    retornar n
+}
+
+/// Desenfoque gaussiano k × k (σ 0 = calculado de k como OpenCV).
+funcion vision_gauss(m, k, sigma) {
+    _vi_gris_req(m)
+    sea ker = _vi_nucleo_gauss(k, sigma)
+    sea r = cociente(k, 2)
+    sea tmp = []
+    para f en lista_rango(0, m["filas"]) {
+        para c en lista_rango(0, m["columnas"]) {
+            sea s = 0.0
+            para i en lista_rango(0, k) { s = s + _vi_px(m, f, c + i - r) * ker[i] }
+            tmp.agregar(s)
+        }
+    }
+    sea t = _vi_mat(m["filas"], m["columnas"], 1, tmp)
+    sea d = []
+    para f en lista_rango(0, m["filas"]) {
+        para c en lista_rango(0, m["columnas"]) {
+            sea s = 0.0
+            para i en lista_rango(0, k) { s = s + _vi_px(t, f + i - r, c) * ker[i] }
+            d.agregar(_vi_sat(piso(s + 0.5)))
+        }
+    }
+    retornar _vi_mat(m["filas"], m["columnas"], 1, d)
+}
+
+/// Mediana k × k (borde replicado).
+funcion vision_mediana(m, k) {
+    _vi_gris_req(m)
+    sea r = cociente(k, 2)
+    sea d = []
+    para f en lista_rango(0, m["filas"]) {
+        para c en lista_rango(0, m["columnas"]) {
+            sea vals = []
+            para dy en lista_rango(0 - r, r + 1) {
+                para dx en lista_rango(0 - r, r + 1) { vals.agregar(_vi_px_rep(m, f + dy, c + dx)) }
+            }
+            vals = ordenar(vals, funcion(a, b) { retornar a - b })
+            d.agregar(vals[cociente(longitud(vals), 2)])
+        }
+    }
+    retornar _vi_mat(m["filas"], m["columnas"], 1, d)
+}
+
+/// Sobel 3 × 3 con signo (como CV_16S): dx y dy en 0 o 1.
+funcion vision_sobel(m, dx, dy) {
+    _vi_gris_req(m)
+    sea d = []
+    para f en lista_rango(0, m["filas"]) {
+        para c en lista_rango(0, m["columnas"]) {
+            sea v = 0
+            si (dx == 1 y dy == 0) { v = _vi_px(m, f - 1, c + 1) + 2 * _vi_px(m, f, c + 1) + _vi_px(m, f + 1, c + 1) - _vi_px(m, f - 1, c - 1) - 2 * _vi_px(m, f, c - 1) - _vi_px(m, f + 1, c - 1) }
+            sino si (dx == 0 y dy == 1) { v = _vi_px(m, f + 1, c - 1) + 2 * _vi_px(m, f + 1, c) + _vi_px(m, f + 1, c + 1) - _vi_px(m, f - 1, c - 1) - 2 * _vi_px(m, f - 1, c) - _vi_px(m, f - 1, c + 1) }
+            sino { lanzar "vision: Sobel admite (1, 0) o (0, 1)" }
+            d.agregar(v)
+        }
+    }
+    retornar _vi_mat(m["filas"], m["columnas"], 1, d)
+}
+
+/// Laplaciano 3 × 3 (núcleo [0 1 0; 1 -4 1; 0 1 0]) con signo.
+funcion vision_laplaciano(m) {
+    _vi_gris_req(m)
+    sea d = []
+    para f en lista_rango(0, m["filas"]) {
+        para c en lista_rango(0, m["columnas"]) { d.agregar(_vi_px(m, f - 1, c) + _vi_px(m, f + 1, c) + _vi_px(m, f, c - 1) + _vi_px(m, f, c + 1) - 4 * _vi_px(m, f, c)) }
+    }
+    retornar _vi_mat(m["filas"], m["columnas"], 1, d)
+}
+
+/// Bordes de Canny (Sobel 3 × 3, norma L1, histéresis con 8 vecinos).
+funcion vision_canny(m, bajo, alto) {
+    _vi_gris_req(m)
+    sea gx = vision_sobel(m, 1, 0)["datos"]
+    sea gy = vision_sobel(m, 0, 1)["datos"]
+    sea filas = m["filas"]
+    sea cols = m["columnas"]
+    sea mag = []
+    para i en lista_rango(0, filas * cols) { mag.agregar(absoluto(gx[i]) + absoluto(gy[i])) }
+    sea mg = funcion(f, c) {
+        si (f < 0 o c < 0 o f >= filas o c >= cols) { retornar 0 }
+        retornar mag[f * cols + c]
+    }
+    // Supresión de no máximos (como OpenCV: tan(22.5°) en punto fijo).
+    sea estado = []
+    para i en lista_rango(0, filas * cols) { estado.agregar(0) }
+    para f en lista_rango(0, filas) {
+        para c en lista_rango(0, cols) {
+            sea i = f * cols + c
+            sea a = mag[i]
+            si (a > bajo) {
+                sea x = absoluto(gx[i])
+                sea yv = absoluto(gy[i])
+                sea tg22 = 0.4142135623730950
+                sea es_max = falso
+                si (yv < x * tg22) { es_max = a > mg(f, c - 1) y a >= mg(f, c + 1) }
+                sino si (yv > x * (1 / tg22)) { es_max = a > mg(f - 1, c) y a >= mg(f + 1, c) }
+                sino {
+                    sea s = si((gx[i] < 0) != (gy[i] < 0), -1, 1)
+                    es_max = a > mg(f - 1, c - s) y a > mg(f + 1, c + s)
+                }
+                si (es_max) { estado[i] = si(a > alto, 2, 1) }
+            }
+        }
+    }
+    // Histéresis.
+    sea pila = []
+    para i en lista_rango(0, filas * cols) {
+        si (estado[i] == 2) { pila.agregar(i) }
+    }
+    mientras (longitud(pila) > 0) {
+        sea i = quitar_ultimo(pila)
+        sea f = cociente(i, cols)
+        sea c = i % cols
+        para dy en [-1, 0, 1] {
+            para dx en [-1, 0, 1] {
+                sea ff = f + dy
+                sea cc = c + dx
+                si (ff >= 0 y cc >= 0 y ff < filas y cc < cols y estado[ff * cols + cc] == 1) {
+                    estado[ff * cols + cc] = 2
+                    pila.agregar(ff * cols + cc)
+                }
+            }
+        }
+    }
+    sea d = []
+    para v en estado { d.agregar(si(v == 2, 255, 0)) }
+    retornar _vi_mat(filas, cols, 1, d)
+}
+
+// ---------- morfología ----------
+
+funcion _vi_morfo(m, k, es_max) {
+    _vi_gris_req(m)
+    sea r = cociente(k, 2)
+    sea d = []
+    para f en lista_rango(0, m["filas"]) {
+        para c en lista_rango(0, m["columnas"]) {
+            sea acc = si(es_max, 0, 255)
+            para dy en lista_rango(0 - r, k - r) {
+                para dx en lista_rango(0 - r, k - r) {
+                    sea ff = f + dy
+                    sea cc = c + dx
+                    si (ff >= 0 y cc >= 0 y ff < m["filas"] y cc < m["columnas"]) {
+                        sea v = m["datos"][ff * m["columnas"] + cc]
+                        acc = si(es_max, maximo(acc, v), minimo(acc, v))
+                    }
+                }
+            }
+            d.agregar(acc)
+        }
+    }
+    retornar _vi_mat(m["filas"], m["columnas"], 1, d)
+}
+
+funcion vision_erosion(m, k) { retornar _vi_morfo(m, k, falso) }
+funcion vision_dilatacion(m, k) { retornar _vi_morfo(m, k, verdadero) }
+funcion vision_apertura(m, k) { retornar vision_dilatacion(vision_erosion(m, k), k) }
+funcion vision_cierre(m, k) { retornar vision_erosion(vision_dilatacion(m, k), k) }
+
+funcion vision_gradiente_morfologico(m, k) {
+    sea a = vision_dilatacion(m, k)
+    sea b = vision_erosion(m, k)
+    sea d = []
+    para i en lista_rango(0, longitud(a["datos"])) { d.agregar(a["datos"][i] - b["datos"][i]) }
+    retornar _vi_mat(m["filas"], m["columnas"], 1, d)
+}
+
+// ---------- análisis ----------
+
+/// Componentes conexas de los píxeles no nulos (4 u 8 vecinos), numeradas en
+/// orden de barrido. Devuelve {"etiquetas", "estadisticas": [[x, y, ancho,
+/// alto, área]…] (la 0 es el fondo), "centroides": [[cx, cy]…]}.
+funcion vision_componentes(m, vecinos) {
+    _vi_gris_req(m)
+    sea filas = m["filas"]
+    sea cols = m["columnas"]
+    sea et = []
+    para i en lista_rango(0, filas * cols) { et.agregar(0) }
+    sea siguiente = 1
+    sea desp = si(vecinos == 4, [[0, 1], [1, 0], [0, -1], [-1, 0]], [[0, 1], [1, 0], [0, -1], [-1, 0], [1, 1], [1, -1], [-1, 1], [-1, -1]])
+    para i en lista_rango(0, filas * cols) {
+        si (m["datos"][i] != 0 y et[i] == 0) {
+            et[i] = siguiente
+            sea pila = [i]
+            mientras (longitud(pila) > 0) {
+                sea j = quitar_ultimo(pila)
+                sea f = cociente(j, cols)
+                sea c = j % cols
+                para dd en desp {
+                    sea ff = f + dd[0]
+                    sea cc = c + dd[1]
+                    si (ff >= 0 y cc >= 0 y ff < filas y cc < cols) {
+                        sea k = ff * cols + cc
+                        si (m["datos"][k] != 0 y et[k] == 0) {
+                            et[k] = siguiente
+                            pila.agregar(k)
+                        }
+                    }
+                }
+            }
+            siguiente = siguiente + 1
+        }
+    }
+    sea est = []
+    sea sumas = []
+    para i en lista_rango(0, siguiente) {
+        est.agregar([cols, filas, -1, -1, 0])
+        sumas.agregar([0.0, 0.0])
+    }
+    para f en lista_rango(0, filas) {
+        para c en lista_rango(0, cols) {
+            sea l = et[f * cols + c]
+            sea e = est[l]
+            e[0] = minimo(e[0], c)
+            e[1] = minimo(e[1], f)
+            e[2] = maximo(e[2], c)
+            e[3] = maximo(e[3], f)
+            e[4] = e[4] + 1
+            sumas[l][0] = sumas[l][0] + c
+            sumas[l][1] = sumas[l][1] + f
+        }
+    }
+    sea estad = []
+    sea cent = []
+    para l en lista_rango(0, siguiente) {
+        sea e = est[l]
+        si (e[4] == 0) { estad.agregar([0, 0, 0, 0, 0]) } sino { estad.agregar([e[0], e[1], e[2] - e[0] + 1, e[3] - e[1] + 1, e[4]]) }
+        cent.agregar(si(e[4] == 0, [0, 0], [sumas[l][0] / e[4], sumas[l][1] / e[4]]))
+    }
+    retornar {"etiquetas": _vi_mat(filas, cols, 1, et), "estadisticas": estad, "centroides": cent}
+}
+
+/// Contornos externos (seguimiento de borde de Moore, 8 vecinos) de las
+/// regiones no nulas: lista de listas de puntos [x, y].
+funcion vision_contornos(m) {
+    _vi_gris_req(m)
+    sea filas = m["filas"]
+    sea cols = m["columnas"]
+    sea comp = vision_componentes(m, 8)
+    sea et = comp["etiquetas"]["datos"]
+    sea hecho = {}
+    sea r = []
+    // Vecinos en sentido horario empezando por la izquierda.
+    sea dirs = [[-1, 0], [-1, -1], [0, -1], [1, -1], [1, 0], [1, 1], [0, 1], [-1, 1]]
+    para i en lista_rango(0, filas * cols) {
+        sea l = et[i]
+        si (l != 0 y tiene_clave(hecho, "" + l) == falso) {
+            hecho["" + l] = verdadero
+            sea x0 = i % cols
+            sea y0 = cociente(i, cols)
+            sea pts = [[x0, y0]]
+            sea x = x0
+            sea yy = y0
+            sea d = 0
+            sea pasos = 0
+            mientras (pasos < filas * cols * 4) {
+                sea encontrado = falso
+                sea k = 0
+                mientras (k < 8) {
+                    sea dd = dirs[(d + k) % 8]
+                    sea nx = x + dd[0]
+                    sea ny = yy + dd[1]
+                    si (nx >= 0 y ny >= 0 y nx < cols y ny < filas y et[ny * cols + nx] == l) {
+                        x = nx
+                        yy = ny
+                        d = (d + k + 6) % 8
+                        encontrado = verdadero
+                        romper
+                    }
+                    k = k + 1
+                }
+                si (encontrado == falso o (x == x0 y yy == y0)) { romper }
+                pts.agregar([x, yy])
+                pasos = pasos + 1
+            }
+            r.agregar(pts)
+        }
+    }
+    retornar r
+}
+
+/// Área (fórmula del zapatero) y caja de un contorno: {"area", "caja": [x, y, w, h]}.
+funcion vision_contorno_info(pts) {
+    sea a = 0.0
+    sea n = longitud(pts)
+    sea minx = pts[0][0]
+    sea miny = pts[0][1]
+    sea maxx = minx
+    sea maxy = miny
+    para i en lista_rango(0, n) {
+        sea p = pts[i]
+        sea q = pts[(i + 1) % n]
+        a = a + p[0] * q[1] - q[0] * p[1]
+        minx = minimo(minx, p[0])
+        miny = minimo(miny, p[1])
+        maxx = maximo(maxx, p[0])
+        maxy = maximo(maxy, p[1])
+    }
+    retornar {"area": absoluto(a) / 2, "caja": [minx, miny, maxx - minx + 1, maxy - miny + 1]}
+}
+
+/// Momentos espaciales y centrales (m00, m10, m01, m20, m11, m02, mu20, mu11, mu02).
+funcion vision_momentos(m) {
+    _vi_gris_req(m)
+    sea r = {"m00": 0.0, "m10": 0.0, "m01": 0.0, "m20": 0.0, "m11": 0.0, "m02": 0.0}
+    para f en lista_rango(0, m["filas"]) {
+        para c en lista_rango(0, m["columnas"]) {
+            sea v = m["datos"][f * m["columnas"] + c]
+            si (v != 0) {
+                r["m00"] = r["m00"] + v
+                r["m10"] = r["m10"] + c * v
+                r["m01"] = r["m01"] + f * v
+                r["m20"] = r["m20"] + c * c * v
+                r["m11"] = r["m11"] + c * f * v
+                r["m02"] = r["m02"] + f * f * v
+            }
+        }
+    }
+    si (r["m00"] != 0) {
+        sea cx = r["m10"] / r["m00"]
+        sea cy = r["m01"] / r["m00"]
+        r["mu20"] = r["m20"] - cx * r["m10"]
+        r["mu11"] = r["m11"] - cx * r["m01"]
+        r["mu02"] = r["m02"] - cy * r["m01"]
+    } sino {
+        r["mu20"] = 0.0
+        r["mu11"] = 0.0
+        r["mu02"] = 0.0
+    }
+    retornar r
+}
+
+/// Imagen integral (filas + 1) × (columnas + 1).
+funcion vision_integral(m) {
+    _vi_gris_req(m)
+    sea w = m["columnas"] + 1
+    sea d = []
+    para i en lista_rango(0, w) { d.agregar(0) }
+    para f en lista_rango(0, m["filas"]) {
+        d.agregar(0)
+        sea fila = 0
+        para c en lista_rango(0, m["columnas"]) {
+            fila = fila + m["datos"][f * m["columnas"] + c]
+            d.agregar(fila + d[f * w + c + 1])
+        }
+    }
+    retornar _vi_mat(m["filas"] + 1, w, 1, d)
+}
+
+/// Ecualización del histograma (como cv2.equalizeHist).
+funcion vision_ecualizar(m) {
+    _vi_gris_req(m)
+    sea hist = []
+    para i en lista_rango(0, 256) { hist.agregar(0) }
+    para v en m["datos"] { hist[v] = hist[v] + 1 }
+    sea total = longitud(m["datos"])
+    sea i = 0
+    mientras (i < 256 y hist[i] == 0) { i = i + 1 }
+    sea lut = []
+    para k en lista_rango(0, 256) { lut.agregar(0) }
+    si (i < 256 y hist[i] == total) {
+        lut[i] = i
+    } sino si (i < 256) {
+        sea escala = _vi_f32(255.0 / (total - hist[i]))
+        sea suma = 0
+        para k en lista_rango(i + 1, 256) {
+            suma = suma + hist[k]
+            lut[k] = _vi_sat(_vi_red(_vi_f32(suma * escala)))
+        }
+    }
+    sea d = []
+    para v en m["datos"] { d.agregar(lut[v]) }
+    retornar _vi_mat(m["filas"], m["columnas"], 1, d)
+}
+
+/// Busca la plantilla: devuelve {"resultado": matriz de puntajes,
+/// "mejor": [x, y], "valor"}. método: "sqdiff", "ccorr_normed" o "ccoeff_normed".
+funcion vision_buscar_plantilla(m, plantilla, metodo) {
+    _vi_gris_req(m)
+    sea th = plantilla["filas"]
+    sea tw = plantilla["columnas"]
+    sea rh = m["filas"] - th + 1
+    sea rw = m["columnas"] - tw + 1
+    sea t = plantilla["datos"]
+    sea tmed = 0.0
+    para v en t { tmed = tmed + v }
+    tmed = tmed / (tw * th)
+    sea tnorm = 0.0
+    sea tnorm_c = 0.0
+    para v en t {
+        tnorm = tnorm + v * v
+        tnorm_c = tnorm_c + (v - tmed) * (v - tmed)
+    }
+    sea res = []
+    sea mejor = [0, 0]
+    sea valor = nulo
+    para f en lista_rango(0, rh) {
+        para c en lista_rango(0, rw) {
+            sea s = 0.0
+            sea ii = 0.0
+            sea im = 0.0
+            sea it = 0.0
+            para y2 en lista_rango(0, th) {
+                para x2 en lista_rango(0, tw) {
+                    sea a = m["datos"][(f + y2) * m["columnas"] + c + x2]
+                    sea b = t[y2 * tw + x2]
+                    s = s + (a - b) * (a - b)
+                    ii = ii + a * a
+                    im = im + a
+                    it = it + a * b
+                }
+            }
+            sea v = 0.0
+            si (metodo == "sqdiff") { v = s }
+            sino si (metodo == "ccorr_normed") { v = it / raiz(ii * tnorm) }
+            sino {
+                sea n = tw * th
+                sea num = it - im * tmed
+                sea den = raiz((ii - im * im / n) * tnorm_c)
+                v = si(den == 0, 0, num / den)
+            }
+            res.agregar(v)
+            si (valor == nulo o (metodo == "sqdiff" y v < valor) o (metodo != "sqdiff" y v > valor)) {
+                valor = v
+                mejor = [c, f]
+            }
+        }
+    }
+    retornar {"resultado": _vi_mat(rh, rw, 1, res), "mejor": mejor, "valor": valor}
+}
+
+/// Redimensiona: "cercano" o "area" (promedio exacto al achicar por un factor entero).
+funcion vision_redimensionar(m, columnas, filas, metodo) {
+    sea ch = m["canales"]
+    sea d = []
+    sea fx = m["columnas"] / columnas
+    sea fy = m["filas"] / filas
+    para f en lista_rango(0, filas) {
+        para c en lista_rango(0, columnas) {
+            para k en lista_rango(0, ch) {
+                si (metodo == "area" y fx >= 1 y fy >= 1 y piso(fx) == fx y piso(fy) == fy) {
+                    sea s = 0
+                    para y2 en lista_rango(0, fy) {
+                        para x2 en lista_rango(0, fx) { s = s + m["datos"][((f * fy + y2) * m["columnas"] + c * fx + x2) * ch + k] }
+                    }
+                    d.agregar(_vi_red(s / (fx * fy)))
+                } sino {
+                    sea sx = minimo(m["columnas"] - 1, piso(c * fx))
+                    sea sy = minimo(m["filas"] - 1, piso(f * fy))
+                    d.agregar(m["datos"][(sy * m["columnas"] + sx) * ch + k])
+                }
+            }
+        }
+    }
+    retornar _vi_mat(filas, columnas, ch, d)
+}

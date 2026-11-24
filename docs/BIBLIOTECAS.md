@@ -78,7 +78,7 @@ Estado: ✅ ya existe en C-Forge · 🔗 se usa hoy vía `cforge bindgen`,
 | 52 | `oraculo` | LLM locales cuantizados | llama.cpp | 🔗 |
 | 53 | `cerebro` | Ejecutar modelos entrenados | ONNX Runtime | ✅ `cerebro` / `onnxruntime` |
 | 54 | `algebra` / `linalg` | Álgebra lineal | Eigen | ✅ `algebra` |
-| 55 | `vision` | Visión por computadora | OpenCV | 🔗 |
+| 55 | `vision` | Visión por computadora | OpenCV | ✅ `vision` / `opencv` |
 | 56 | `vela` / `trees` | Machine learning ligero | Candle | ✅ `vela` |
 | 57 | `fichas` / `tokenizers` | Tokenización (BPE, WordPiece) | Tokenizers | ✅ `fichas` |
 | 58 | `vecindad` / `vectors` | Búsqueda vectorial | FAISS | ✅ `vecindad` |
@@ -273,8 +273,8 @@ Estado: ✅ ya existe en C-Forge · 🔗 se usa hoy vía `cforge bindgen`,
 | # | Nombre | Para qué | Inspiración | Estado |
 |---|---|---|---|---|
 | 197 | `revelado` | Imágenes masivas con poca RAM | libvips | ✅ `revelado` / `vips` |
-| 198 | `formato_web` | WebP y AVIF | libwebp, libavif | 🔗 |
-| 199 | `escaner` | Documentos escaneados | Leptonica | 🔗 |
+| 198 | `formato_web` | WebP y AVIF | libwebp, libavif | ✅ `formato_web` / `libwebp` (WebP sin pérdida; con pérdida y AVIF, por enlaces) |
+| 199 | `escaner` | Documentos escaneados | Leptonica | ✅ `escaner` / `leptonica` |
 | 200 | `codigo_qr` / `qrcode` | QR y códigos de barras | ZXing | ✅ `codigo_qr` |
 | 201 | `composicion` / `typeset` | Composición tipográfica de PDFs | Typst | ✅ `composicion` |
 | 202 | `conversor` / `docconvert` | Conversión entre formatos de documento | Pandoc | ✅ `conversor` |
