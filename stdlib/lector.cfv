@@ -1,0 +1,540 @@
+// stdlib/lector.cfv — Reconocimiento óptico de caracteres (OCR) al estilo de
+// Tesseract, escrito desde cero (idea de Tesseract, Apache 2.0) para texto
+// impreso con fuentes conocidas:
+//
+//   · Binarización con Otsu (texto oscuro o claro), renglones por
+//     proyección, componentes conexas unidas en glifos (i, j, ñ, á, ¿, %…).
+//   · Clasificador por plantillas generadas con cualquier fuente TrueType
+//     (forma en rejilla, proporción, altura y posición respecto a la línea
+//     base) y un pequeño modelo de contexto (l / I, comillas).
+//   · Glifos pegados se separan buscando el mejor corte.
+//
+// En inglés: importar "tesseract".
+//
+//   importar "lector"
+//   sea modelo = lector_modelo(fuente_cargar("DejaVuSans.ttf"), nulo)
+//   mostrar(lector_texto(imagen_cargar("pagina.png"), modelo))
+
+importar "imagen"
+importar "fuente"
+
+sea _LEC_G = 10
+sea _LEC_ALFABETO = "!\"#$%&'()*+,-./0123456789:;<=>?@ABCDEFGHIJKLMNOPQRSTUVWXYZ[\\]^_`abcdefghijklmnopqrstuvwxyz{|}~¡¿áéíóúñÁÉÍÓÚÑüÜ"
+
+// ---------- binarización ----------
+
+funcion _lec_gris(img) {
+    sea p = img["pixeles"]
+    sea n = img["ancho"] * img["alto"]
+    sea r = []
+    para i en lista_rango(0, n) { r.agregar(cociente(byte_en(p, 4 * i) * 299 + byte_en(p, 4 * i + 1) * 587 + byte_en(p, 4 * i + 2) * 114, 1000)) }
+    retornar r
+}
+
+funcion _lec_otsu(g) {
+    sea h = []
+    para i en lista_rango(0, 256) { h.agregar(0) }
+    para v en g { h[v] = h[v] + 1 }
+    sea total = longitud(g)
+    sea suma = 0.0
+    para i en lista_rango(0, 256) { suma = suma + i * h[i] }
+    sea sb = 0.0
+    sea wb = 0
+    sea mejor = 0.0
+    sea t = 0
+    para i en lista_rango(0, 256) {
+        wb = wb + h[i]
+        si (wb > 0 y wb < total) {
+            sb = sb + i * h[i]
+            sea wf = total - wb
+            sea mb = sb / wb
+            sea mf = (suma - sb) / wf
+            sea v = wb * wf * (mb - mf) * (mb - mf)
+            si (v > mejor) {
+                mejor = v
+                t = i
+            }
+        }
+    }
+    retornar t
+}
+
+/// Imagen → máscara binaria {"ancho", "alto", "tinta": lista 0/1}. La tinta
+/// es la clase minoritaria (texto oscuro sobre claro o al revés).
+funcion lector_binarizar(img) {
+    sea g = _lec_gris(img)
+    sea t = _lec_otsu(g)
+    sea oscuros = 0
+    para v en g {
+        si (v <= t) { oscuros = oscuros + 1 }
+    }
+    sea tinta_oscura = oscuros * 2 <= longitud(g)
+    sea r = []
+    para v en g { r.agregar(si(tinta_oscura, si(v <= t, 1, 0), si(v > t, 1, 0))) }
+    retornar {"ancho": img["ancho"], "alto": img["alto"], "tinta": r, "umbral": t}
+}
+
+// Componentes conexas (8 vecinos) dentro de un rango de filas.
+funcion _lec_componentes(b, y0, y1) {
+    sea w = b["ancho"]
+    sea vista = {}
+    sea r = []
+    para y en lista_rango(y0, y1) {
+        para x en lista_rango(0, w) {
+            sea i = y * w + x
+            si (b["tinta"][i] == 1 y tiene_clave(vista, "" + i) == falso) {
+                vista["" + i] = verdadero
+                sea pila = [i]
+                sea pix = []
+                sea c = {"x0": x, "y0": y, "x1": x, "y1": y}
+                mientras (longitud(pila) > 0) {
+                    sea j = quitar_ultimo(pila)
+                    pix.agregar(j)
+                    sea px = j % w
+                    sea py = cociente(j, w)
+                    c["x0"] = minimo(c["x0"], px)
+                    c["x1"] = maximo(c["x1"], px)
+                    c["y0"] = minimo(c["y0"], py)
+                    c["y1"] = maximo(c["y1"], py)
+                    para dy en [-1, 0, 1] {
+                        para dx en [-1, 0, 1] {
+                            sea nx = px + dx
+                            sea ny = py + dy
+                            si (nx >= 0 y nx < w y ny >= y0 y ny < y1) {
+                                sea k = ny * w + nx
+                                si (b["tinta"][k] == 1 y tiene_clave(vista, "" + k) == falso) {
+                                    vista["" + k] = verdadero
+                                    pila.agregar(k)
+                                }
+                            }
+                        }
+                    }
+                }
+                c["pix"] = pix
+                r.agregar(c)
+            }
+        }
+    }
+    retornar r
+}
+
+// Bandas de renglones por proyección horizontal; las bandas finas (tildes
+// sobre mayúsculas) se juntan con la de abajo.
+funcion _lec_renglones(b) {
+    sea w = b["ancho"]
+    sea bandas = []
+    sea ini = -1
+    para y en lista_rango(0, b["alto"] + 1) {
+        sea hay = falso
+        si (y < b["alto"]) {
+            para x en lista_rango(0, w) {
+                si (b["tinta"][y * w + x] == 1) {
+                    hay = verdadero
+                    romper
+                }
+            }
+        }
+        si (hay y ini < 0) { ini = y }
+        si (hay == falso y ini >= 0) {
+            bandas.agregar([ini, y])
+            ini = -1
+        }
+    }
+    si (longitud(bandas) == 0) { retornar [] }
+    sea altos = []
+    para bd en bandas { altos.agregar(bd[1] - bd[0]) }
+    sea med = _lec_mediana(altos)
+    sea r = []
+    sea pendiente = nulo
+    para bd en bandas {
+        sea actual = bd
+        si (pendiente != nulo) {
+            actual = [pendiente[0], bd[1]]
+            pendiente = nulo
+        }
+        si (actual[1] - actual[0] < med * 0.45) { pendiente = actual } sino { r.agregar(actual) }
+    }
+    si (pendiente != nulo) {
+        si (longitud(r) > 0) { r[longitud(r) - 1] = [r[longitud(r) - 1][0], pendiente[1]] } sino { r.agregar(pendiente) }
+    }
+    retornar r
+}
+
+funcion _lec_mediana(l) {
+    si (longitud(l) == 0) { retornar 0 }
+    sea o = ordenar(l, funcion(a, b) { retornar si(a < b, -1, si(a > b, 1, 0)) })
+    retornar o[cociente(longitud(o), 2)]
+}
+
+// Une componentes que forman un mismo glifo (puntos, tildes, %…).
+funcion _lec_unir(comps) {
+    sea cs = ordenar(comps, funcion(a, b) { retornar a["x0"] - b["x0"] })
+    sea cambio = verdadero
+    mientras (cambio) {
+        cambio = falso
+        para i en lista_rango(0, longitud(cs)) {
+            si (cambio == falso) {
+                para j en lista_rango(i + 1, longitud(cs)) {
+                    si (cambio == falso y _lec_mismo_glifo(cs[i], cs[j])) {
+                        sea a = cs[i]
+                        sea b = cs[j]
+                        sea pix = []
+                        para p en a["pix"] { pix.agregar(p) }
+                        para p en b["pix"] { pix.agregar(p) }
+                        cs[i] = {"x0": minimo(a["x0"], b["x0"]), "y0": minimo(a["y0"], b["y0"]), "x1": maximo(a["x1"], b["x1"]), "y1": maximo(a["y1"], b["y1"]), "pix": pix}
+                        eliminar(cs, j)
+                        cambio = verdadero
+                    }
+                }
+            }
+        }
+    }
+    retornar ordenar(cs, funcion(a, b) { retornar a["x0"] - b["x0"] })
+}
+
+funcion _lec_mismo_glifo(a, b) {
+    sea sx = minimo(a["x1"], b["x1"]) - maximo(a["x0"], b["x0"]) + 1
+    si (sx <= 0) { retornar falso }
+    sea wa = a["x1"] - a["x0"] + 1
+    sea wb = b["x1"] - b["x0"] + 1
+    si (sx < 0.5 * minimo(wa, wb)) { retornar falso }
+    sea sy = minimo(a["y1"], b["y1"]) - maximo(a["y0"], b["y0"]) + 1
+    sea ha = a["y1"] - a["y0"] + 1
+    sea hb = b["y1"] - b["y0"] + 1
+    si (sy <= 0.3 * minimo(ha, hb)) { retornar verdadero }
+    // Uno dentro del ancho del otro (los círculos del %).
+    retornar (a["x0"] >= b["x0"] y a["x1"] <= b["x1"]) o (b["x0"] >= a["x0"] y b["x1"] <= a["x1"])
+}
+
+// Rasgos en rejilla G×G de un conjunto de píxeles dentro de una caja.
+funcion _lec_rasgos(pix, w_img, x0, y0, x1, y1) {
+    sea G = _LEC_G
+    sea w = x1 - x0 + 1
+    sea h = y1 - y0 + 1
+    sea celdas = []
+    para i en lista_rango(0, G * G) { celdas.agregar(0.0) }
+    // Cada píxel reparte su área entre las celdas que cubre.
+    para p en pix {
+        sea px = p % w_img - x0
+        sea py = cociente(p, w_img) - y0
+        si (px >= 0 y px < w y py >= 0 y py < h) {
+            sea cx0 = px * G / w
+            sea cx1 = (px + 1) * G / w
+            sea cy0 = py * G / h
+            sea cy1 = (py + 1) * G / h
+            para gy en lista_rango(piso(cy0), minimo(G, techo(cy1))) {
+                sea fy = minimo(cy1, gy + 1) - maximo(cy0, gy)
+                para gx en lista_rango(piso(cx0), minimo(G, techo(cx1))) {
+                    sea fx = minimo(cx1, gx + 1) - maximo(cx0, gx)
+                    si (fx > 0 y fy > 0) { celdas[gy * G + gx] = celdas[gy * G + gx] + fx * fy }
+                }
+            }
+        }
+    }
+    sea r = []
+    para c en celdas { r.agregar(minimo(1, c)) }
+    retornar r
+}
+
+// ---------- modelo ----------
+
+/// Crea el modelo de plantillas a partir de una fuente TrueType (de
+/// fuente_cargar). opciones: "alfabeto" (texto), "tamano" (48).
+funcion lector_modelo(f, opciones) {
+    sea op = opciones ?? {}
+    sea tam = op["tamano"] ?? 48
+    sea alfabeto = op["alfabeto"] ?? _LEC_ALFABETO
+    si (f == nulo) { f = fuente_sistema() }
+    sea escala = tam / f["unidades"]
+    sea plantillas = []
+    para cp en texto_codigos(alfabeto) {
+        sea c = _lec_utf8(cp)
+        sea lado = tam * 3
+        sea img = imagen_nueva(lado, lado, [255, 255, 255, 255])
+        lienzo_texto(img, f, c, tam, tam / 2, tam, [0, 0, 0, 255])
+        sea base = piso(tam / 2 + f["ascenso"] * escala + 0.5)
+        sea b = lector_binarizar(img)
+        sea comps = _lec_componentes(b, 0, lado)
+        si (longitud(comps) > 0) {
+            sea pix = []
+            sea x0 = lado
+            sea y0 = lado
+            sea x1 = 0
+            sea y1 = 0
+            para k en comps {
+                para p en k["pix"] { pix.agregar(p) }
+                x0 = minimo(x0, k["x0"])
+                y0 = minimo(y0, k["y0"])
+                x1 = maximo(x1, k["x1"])
+                y1 = maximo(y1, k["y1"])
+            }
+            plantillas.agregar({"c": c, "rasgos": _lec_rasgos(pix, lado, x0, y0, x1, y1), "ancho": (x1 - x0 + 1) / tam, "alto": (y1 - y0 + 1) / tam,
+                "arriba": (base - y0) / tam, "abajo": (base - y1 - 1) / tam, "partes": longitud(comps)})
+        }
+    }
+    sea esp = _lec_avance_espacio(f)
+    retornar {"plantillas": plantillas, "espacio": esp}
+}
+
+funcion _lec_utf8(cp) {
+    si (cp < 128) { retornar char_de(cp) }
+    si (cp < 2048) { retornar char_de(192 + cociente(cp, 64)) + char_de(128 + cp % 64) }
+    retornar char_de(224 + cociente(cp, 4096)) + char_de(128 + cociente(cp, 64) % 64) + char_de(128 + cp % 64)
+}
+
+funcion _lec_avance_espacio(f) {
+    sea g = fuente_glifo(f, 32)
+    sea m = texto_medir(f, " ", 100)
+    retornar m["ancho"] / 100
+}
+
+// Puntuación de forma (0 = idéntico).
+funcion _lec_forma(gl, p) {
+    sea s = 0.0
+    sea a = gl["rasgos"]
+    sea b = p["rasgos"]
+    para i en lista_rango(0, longitud(a)) { s = s + absoluto(a[i] - b[i]) }
+    s = s / longitud(a)
+    sea ra = gl["w"] / gl["h"]
+    sea rb = p["ancho"] / p["alto"]
+    retornar s + 0.25 * absoluto(logaritmo(ra / rb))
+}
+
+funcion _lec_posicion(gl, p, esc, base) {
+    sea arriba = (base - gl["y0"]) / esc
+    sea abajo = (base - gl["y1"] - 1) / esc
+    retornar absoluto(arriba - p["arriba"]) + absoluto(abajo - p["abajo"]) + 0.5 * absoluto(gl["w"] / esc - p["ancho"])
+}
+
+funcion _lec_glifo(comp, w_img) {
+    retornar {"x0": comp["x0"], "y0": comp["y0"], "x1": comp["x1"], "y1": comp["y1"], "w": comp["x1"] - comp["x0"] + 1, "h": comp["y1"] - comp["y0"] + 1,
+        "pix": comp["pix"], "rasgos": _lec_rasgos(comp["pix"], w_img, comp["x0"], comp["y0"], comp["x1"], comp["y1"])}
+}
+
+funcion _lec_mejor(gl, modelo, esc, base) {
+    sea mejor = nulo
+    sea ms = 1e9
+    sea segundo = 1e9
+    para p en modelo["plantillas"] {
+        sea s = _lec_forma(gl, p)
+        si (esc != nulo) { s = s + 1.5 * _lec_posicion(gl, p, esc, base) }
+        si (s < ms) {
+            segundo = ms
+            ms = s
+            mejor = p
+        } sino si (s < segundo) { segundo = s }
+    }
+    retornar {"p": mejor, "s": ms, "margen": segundo - ms}
+}
+
+// Recorta un glifo a un rango de columnas.
+funcion _lec_corte(gl, w_img, xa, xb) {
+    sea pix = []
+    sea c = {"x0": xb, "y0": 1000000000, "x1": xa, "y1": -1}
+    para p en gl["pix"] {
+        sea x = p % w_img
+        si (x >= xa y x <= xb) {
+            pix.agregar(p)
+            sea y = cociente(p, w_img)
+            c["x0"] = minimo(c["x0"], x)
+            c["x1"] = maximo(c["x1"], x)
+            c["y0"] = minimo(c["y0"], y)
+            c["y1"] = maximo(c["y1"], y)
+        }
+    }
+    si (longitud(pix) == 0) { retornar nulo }
+    c["pix"] = pix
+    retornar _lec_glifo(c, w_img)
+}
+
+// Lee un renglón: lista de {"c", "caja", "s"} y espacios.
+funcion _lec_renglon(b, y0, y1, modelo) {
+    sea w_img = b["ancho"]
+    sea comps = _lec_unir(_lec_componentes(b, y0, y1))
+    si (longitud(comps) == 0) { retornar [] }
+    sea gls = []
+    para c en comps { gls.agregar(_lec_glifo(c, w_img)) }
+    // 1.ª pasada: escala (px por em) y línea base.
+    sea escs = []
+    sea bases = []
+    para gl en gls {
+        sea m = _lec_mejor(gl, modelo, nulo, 0)
+        si (m["p"]["alto"] > 0.3) {
+            sea e = gl["h"] / m["p"]["alto"]
+            escs.agregar(e)
+            bases.agregar(gl["y1"] + 1 + m["p"]["abajo"] * e)
+        }
+    }
+    sea esc = _lec_mediana(escs)
+    si (esc == 0) { esc = (y1 - y0) / 1.2 }
+    sea base = _lec_mediana(bases)
+    // Glifos de varias partes que se solapan en x (como %).
+    sea unidos = []
+    sea i = 0
+    mientras (i < longitud(gls)) {
+        sea hecho = falso
+        para k en [2, 1] {
+            si (hecho == falso y i + k < longitud(gls)) {
+                sea seguidos = verdadero
+                para j en lista_rango(i, i + k) {
+                    si (gls[j + 1]["x0"] > gls[j]["x1"]) { seguidos = falso }
+                }
+                si (seguidos) {
+                    sea c = {"x0": gls[i]["x0"], "y0": gls[i]["y0"], "x1": gls[i]["x1"], "y1": gls[i]["y1"], "pix": []}
+                    para j en lista_rango(i, i + k + 1) {
+                        c["x0"] = minimo(c["x0"], gls[j]["x0"])
+                        c["x1"] = maximo(c["x1"], gls[j]["x1"])
+                        c["y0"] = minimo(c["y0"], gls[j]["y0"])
+                        c["y1"] = maximo(c["y1"], gls[j]["y1"])
+                        para p en gls[j]["pix"] { c["pix"].agregar(p) }
+                    }
+                    sea g = _lec_glifo(c, w_img)
+                    sea m = _lec_mejor(g, modelo, esc, base)
+                    si (m["p"]["partes"] == k + 1 y m["s"] < 0.35) {
+                        unidos.agregar(g)
+                        i = i + k + 1
+                        hecho = verdadero
+                    }
+                }
+            }
+        }
+        si (hecho == falso) {
+            unidos.agregar(gls[i])
+            i = i + 1
+        }
+    }
+    gls = unidos
+    // 2.ª pasada con posición, separando glifos pegados.
+    sea r = []
+    para gl en gls {
+        sea m = _lec_mejor(gl, modelo, esc, base)
+        si (m["s"] > 0.35 y gl["w"] > 0.7 * esc) {
+            sea mejor_div = nulo
+            sea mejor_s = m["s"]
+            para xc en lista_rango(gl["x0"] + 2, gl["x1"] - 1) {
+                sea a = _lec_corte(gl, w_img, gl["x0"], xc - 1)
+                sea bb = _lec_corte(gl, w_img, xc, gl["x1"])
+                si (a != nulo y bb != nulo) {
+                    sea ma = _lec_mejor(a, modelo, esc, base)
+                    sea mb = _lec_mejor(bb, modelo, esc, base)
+                    sea s = maximo(ma["s"], mb["s"])
+                    si (s < mejor_s) {
+                        mejor_s = s
+                        mejor_div = [[a, ma], [bb, mb]]
+                    }
+                }
+            }
+            si (mejor_div != nulo) {
+                para par en mejor_div { r.agregar({"c": par[1]["p"]["c"], "s": par[1]["s"], "gl": par[0]}) }
+            } sino { r.agregar({"c": m["p"]["c"], "s": m["s"], "gl": gl}) }
+        } sino { r.agregar({"c": m["p"]["c"], "s": m["s"], "gl": gl}) }
+    }
+    retornar {"glifos": r, "esc": esc, "base": base}
+}
+
+funcion _lec_minuscula(c) { retornar c != texto_mayusculas(c) y c == texto_minusculas(c) }
+funcion _lec_mayuscula(c) { retornar c != texto_minusculas(c) y c == texto_mayusculas(c) }
+
+// Contexto: l / I / | y comillas dobles.
+funcion _lec_contexto(gs) {
+    sea n = longitud(gs)
+    para i en lista_rango(0, n) {
+        sea c = gs[i]["c"]
+        si (c == "l" o c == "I") {
+            sea ant = si(i > 0, gs[i - 1]["c"], " ")
+            sea sig = si(i + 1 < n, gs[i + 1]["c"], " ")
+            si (_lec_minuscula(ant) o _lec_minuscula(sig)) { gs[i]["c"] = "l" }
+            sino si (_lec_mayuscula(ant) o _lec_mayuscula(sig)) { gs[i]["c"] = "I" }
+        }
+    }
+    sea r = []
+    sea i = 0
+    mientras (i < n) {
+        si (i + 1 < n y gs[i]["c"] == "'" y gs[i + 1]["c"] == "'" y gs[i + 1]["espacio"] == falso) {
+            sea g = gs[i]
+            g["c"] = "\""
+            g["caja"] = [g["caja"][0], g["caja"][1], gs[i + 1]["caja"][0] + gs[i + 1]["caja"][2] - g["caja"][0], g["caja"][3]]
+            r.agregar(g)
+            i = i + 2
+        } sino {
+            r.agregar(gs[i])
+            i = i + 1
+        }
+    }
+    retornar r
+}
+
+/// Palabras reconocidas, como image_to_data de Tesseract: lista de
+/// {"texto", "caja": [x, y, ancho, alto], "confianza" (0–100), "renglon"}.
+funcion lector_datos(img, modelo) {
+    si (modelo == nulo) { modelo = lector_modelo(nulo, nulo) }
+    sea b = lector_binarizar(img)
+    sea palabras = []
+    sea nr = 0
+    para bd en _lec_renglones(b) {
+        sea ren = _lec_renglon(b, bd[0], bd[1], modelo)
+        si (tipo(ren) == "mapa") {
+            sea gs = []
+            sea prev = nulo
+            para g en ren["glifos"] {
+                sea gl = g["gl"]
+                sea esp = prev != nulo y (gl["x0"] - prev["x1"] - 1) > 0.85 * modelo["espacio"] * ren["esc"]
+                gs.agregar({"c": g["c"], "s": g["s"], "espacio": esp, "caja": [gl["x0"], gl["y0"], gl["w"], gl["h"]]})
+                prev = gl
+            }
+            gs = _lec_contexto(gs)
+            sea actual = nulo
+            para g en gs {
+                si (actual == nulo o g["espacio"]) {
+                    si (actual != nulo) { palabras.agregar(_lec_cerrar(actual, nr)) }
+                    actual = []
+                }
+                actual.agregar(g)
+            }
+            si (actual != nulo) { palabras.agregar(_lec_cerrar(actual, nr)) }
+            nr = nr + 1
+        }
+    }
+    retornar palabras
+}
+
+funcion _lec_cerrar(gs, nr) {
+    sea t = ""
+    sea x0 = 1000000000
+    sea y0 = 1000000000
+    sea x1 = -1
+    sea y1 = -1
+    sea peor = 0.0
+    para g en gs {
+        t = t + g["c"]
+        x0 = minimo(x0, g["caja"][0])
+        y0 = minimo(y0, g["caja"][1])
+        x1 = maximo(x1, g["caja"][0] + g["caja"][2])
+        y1 = maximo(y1, g["caja"][1] + g["caja"][3])
+        peor = maximo(peor, g["s"])
+    }
+    retornar {"texto": t, "caja": [x0, y0, x1 - x0, y1 - y0], "confianza": maximo(0, minimo(100, piso(100 * (1 - peor) + 0.5))), "renglon": nr}
+}
+
+/// Texto reconocido, un renglón por línea.
+funcion lector_texto(img, modelo) {
+    sea lineas = []
+    sea actual = -1
+    para p en lector_datos(img, modelo) {
+        si (p["renglon"] != actual) {
+            lineas.agregar([])
+            actual = p["renglon"]
+        }
+        lineas[longitud(lineas) - 1].agregar(p["texto"])
+    }
+    sea r = []
+    para l en lineas { r.agregar(unir(l, " ")) }
+    retornar unir(r, "\n")
+}
+
+/// Caracteres que reconoce un modelo.
+funcion lector_alfabeto(modelo) {
+    sea r = ""
+    para p en modelo["plantillas"] { r = r + p["c"] }
+    retornar r
+}

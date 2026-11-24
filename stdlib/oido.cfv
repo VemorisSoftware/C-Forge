@@ -1,0 +1,668 @@
+// stdlib/oido.cfv — Voz a texto al estilo de Whisper, escrito desde cero
+// (idea de whisper.cpp, MIT; arquitectura de Whisper de OpenAI, MIT).
+//
+//   · Espectrograma log-mel idéntico al de Whisper: STFT de 400 puntos con
+//     ventana de Hann, salto de 160, filtros mel de Slaney, log10, rango de
+//     8 décadas y normalización (x + 4) / 4.
+//   · Lee modelos en el formato ggml de whisper.cpp (F32 y F16).
+//   · Codificador (2 convoluciones + transformer) y decodificador con
+//     atención cruzada y caché, detección de idioma y decodificación voraz
+//     o con temperatura.
+//
+// En inglés: importar "whispercpp".
+//
+//   importar "oido"
+//   sea m = oido_cargar("ggml-tiny.bin")
+//   sea r = oido_transcribir(m, oido_audio_wav(leer_archivo("voz.wav")), {"idioma": "es"})
+//   mostrar(r["texto"])
+
+sea _OID_IDIOMAS = ["en", "zh", "de", "es", "ru", "ko", "fr", "ja", "pt", "tr", "pl", "ca", "nl", "ar", "sv", "it", "id", "hi", "fi", "vi", "he", "uk", "el", "ms", "cs", "ro", "da", "hu",
+    "ta", "no", "th", "ur", "hr", "bg", "lt", "la", "mi", "ml", "cy", "sk", "te", "fa", "lv", "bn", "sr", "az", "sl", "kn", "et", "mk", "br", "eu", "is", "hy", "ne", "mn", "bs", "kk",
+    "sq", "sw", "gl", "mr", "pa", "si", "km", "sn", "yo", "so", "af", "oc", "ka", "be", "tg", "sd", "gu", "am", "yi", "lo", "uz", "fo", "ht", "ps", "tk", "nn", "mt", "sa", "lb", "my",
+    "bo", "tl", "mg", "as", "tt", "haw", "ln", "ha", "ba", "jw", "su", "yue"]
+
+sea _OID_PI = 3.141592653589793
+
+// ---------- audio ----------
+
+/// Convierte un WAV (PCM de 16 bits o flotante de 32) en muestras mono a
+/// 16 kHz en [-1, 1], como whisper.cpp (divide por 32768 y promedia canales).
+funcion oido_audio_wav(datos) {
+    si (subtexto(datos, 0, 4) != "RIFF" o subtexto(datos, 8, 12) != "WAVE") { lanzar "oido: no es un WAV" }
+    sea p = 12
+    sea fmt = nulo
+    mientras (p + 8 <= longitud(datos)) {
+        sea id = subtexto(datos, p, p + 4)
+        sea tam = bytes_leer_entero(datos, p + 4, 4, 1)
+        si (id == "fmt ") { fmt = {"f": bytes_leer_entero(datos, p + 8, 2, 1), "c": bytes_leer_entero(datos, p + 10, 2, 1), "r": bytes_leer_entero(datos, p + 12, 4, 1), "b": bytes_leer_entero(datos, p + 22, 2, 1)} }
+        si (id == "data") {
+            si (fmt == nulo) { lanzar "oido: WAV sin fmt" }
+            sea fin = minimo(longitud(datos), p + 8 + tam)
+            sea paso = cociente(fmt["b"], 8)
+            sea r = []
+            sea i = p + 8
+            mientras (i + paso * fmt["c"] <= fin) {
+                sea s = 0.0
+                para c en lista_rango(0, fmt["c"]) {
+                    si (fmt["f"] == 3) { s = s + _oid_f32(datos, i) } sino si (fmt["b"] == 16) {
+                        sea v = bytes_leer_entero(datos, i, 2, 1)
+                        s = s + si(v >= 32768, v - 65536, v) / 32768
+                    } sino { lanzar "oido: WAV de " + fmt["b"] + " bits no soportado" }
+                    i = i + paso
+                }
+                r.agregar(s / fmt["c"])
+            }
+            si (fmt["r"] != 16000) { r = oido_remuestrear(r, fmt["r"], 16000) }
+            retornar r
+        }
+        p = p + 8 + tam + tam % 2
+    }
+    lanzar "oido: WAV sin datos"
+}
+
+/// Remuestreo lineal (para llevar el audio a 16 kHz).
+funcion oido_remuestrear(muestras, de, a) {
+    sea razon = de / a
+    sea n = piso(longitud(muestras) / razon)
+    sea r = []
+    para i en lista_rango(0, n) {
+        sea x = i * razon
+        sea k = piso(x)
+        sea f = x - k
+        sea u = muestras[minimo(k, longitud(muestras) - 1)]
+        sea v = muestras[minimo(k + 1, longitud(muestras) - 1)]
+        r.agregar(u + (v - u) * f)
+    }
+    retornar r
+}
+
+// ---------- FFT de tamaño compuesto ----------
+
+funcion _oid_fft(re, im) {
+    sea n = longitud(re)
+    si (n == 1) { retornar [re, im] }
+    sea p = 2
+    mientras (n % p != 0) { p = p + 1 }
+    sea m = cociente(n, p)
+    sea subs = []
+    para r en lista_rango(0, p) {
+        sea sr = []
+        sea si_ = []
+        para k en lista_rango(0, m) {
+            sr.agregar(re[k * p + r])
+            si_.agregar(im[k * p + r])
+        }
+        subs.agregar(_oid_fft(sr, si_))
+    }
+    sea ore = []
+    sea oim = []
+    para k en lista_rango(0, n) {
+        sea ar = 0.0
+        sea ai = 0.0
+        para r en lista_rango(0, p) {
+            sea ang = -2 * _OID_PI * r * k / n
+            sea c = coseno(ang)
+            sea s = seno(ang)
+            sea xr = subs[r][0][k % m]
+            sea xi = subs[r][1][k % m]
+            ar = ar + xr * c - xi * s
+            ai = ai + xr * s + xi * c
+        }
+        ore.agregar(ar)
+        oim.agregar(ai)
+    }
+    retornar [ore, oim]
+}
+
+// ---------- mel ----------
+
+funcion _oid_hz_mel(f) {
+    si (f >= 1000) { retornar 15 + logaritmo(f / 1000) / (logaritmo(6.4) / 27) }
+    retornar f / (200 / 3)
+}
+
+funcion _oid_mel_hz(m) {
+    si (m >= 15) { retornar 1000 * exponencial(logaritmo(6.4) / 27 * (m - 15)) }
+    retornar m * 200 / 3
+}
+
+/// Filtros mel de Slaney (como librosa y Whisper): lista de n_mels filas de
+/// 201 coeficientes para FFT de 400 a 16 kHz.
+funcion oido_filtros_mel(n_mels) {
+    sea nb = 201
+    sea mmax = _oid_hz_mel(8000)
+    sea mf = []
+    para i en lista_rango(0, n_mels + 2) { mf.agregar(_oid_mel_hz(mmax * i / (n_mels + 1))) }
+    sea r = []
+    para i en lista_rango(0, n_mels) {
+        sea fila = []
+        sea en = 2 / (mf[i + 2] - mf[i])
+        para j en lista_rango(0, nb) {
+            sea f = 8000 * j / (nb - 1)
+            sea bajo = (f - mf[i]) / (mf[i + 1] - mf[i])
+            sea alto = (mf[i + 2] - f) / (mf[i + 2] - mf[i + 1])
+            fila.agregar(maximo(0, minimo(bajo, alto)) * en)
+        }
+        r.agregar(fila)
+    }
+    retornar r
+}
+
+/// Espectrograma log-mel de Whisper: lista de n_mels filas de n_cuadros
+/// (3000 = 30 s por defecto). filtros: los del modelo o oido_filtros_mel.
+funcion oido_mel(muestras, filtros, n_cuadros) {
+    sea nm = longitud(filtros)
+    si (n_cuadros == nulo) { n_cuadros = 3000 }
+    sea n = longitud(muestras)
+    sea total = n + 480000
+    sea ventana = []
+    para i en lista_rango(0, 400) { ventana.agregar(0.5 - 0.5 * coseno(2 * _OID_PI * i / 400)) }
+    // Muestra con reflejo de 200 a cada lado (la cola de ceros se refleja en ceros).
+    sea reales = minimo(cociente(total, 160), cociente(n + 200, 160) + 2)
+    sea mel = []
+    para c en lista_rango(0, reales) {
+        sea re = []
+        sea im = []
+        para k en lista_rango(0, 400) {
+            sea i = c * 160 + k - 200
+            si (i < 0) { i = 0 - i }
+            sea v = 0.0
+            si (i < n) { v = muestras[i] }
+            re.agregar(v * ventana[k])
+            im.agregar(0.0)
+        }
+        sea f = _oid_fft(re, im)
+        sea pot = []
+        para j en lista_rango(0, 201) { pot.agregar(f[0][j] * f[0][j] + f[1][j] * f[1][j]) }
+        sea col = []
+        para m en lista_rango(0, nm) {
+            sea s = 0.0
+            sea fila = filtros[m]
+            para j en lista_rango(0, 201) {
+                si (fila[j] != 0) { s = s + fila[j] * pot[j] }
+            }
+            col.agregar(_oid_log10(maximo(s, 1e-10)))
+        }
+        mel.agregar(col)
+    }
+    sea mx = -10.0
+    para col en mel {
+        para v en col { mx = maximo(mx, v) }
+    }
+    sea piso_ = mx - 8
+    sea r = []
+    para m en lista_rango(0, nm) {
+        sea fila = []
+        para c en lista_rango(0, n_cuadros) {
+            sea v = -10.0
+            si (c < longitud(mel)) { v = mel[c][m] }
+            fila.agregar((maximo(v, piso_) + 4) / 4)
+        }
+        r.agregar(fila)
+    }
+    retornar r
+}
+
+funcion _oid_log10(x) { retornar logaritmo(x) / 2.302585092994046 }
+
+// ---------- modelo ggml ----------
+
+funcion _oid_f32(b, i) {
+    sea bits = bytes_leer_entero(b, i, 4, 1)
+    sea signo = si(bits >= 2147483648, -1, 1)
+    sea e = cociente(bits, 8388608) % 256
+    sea m = bits % 8388608
+    si (e == 0) { retornar signo * m * potencia(2, -149) }
+    retornar signo * (1 + m / 8388608) * potencia(2, e - 127)
+}
+
+funcion _oid_i32(b, i) {
+    sea v = bytes_leer_entero(b, i, 4, 1)
+    retornar si(v >= 2147483648, v - 4294967296, v)
+}
+
+funcion _oid_flotantes(d, p, n, ttype, pot) {
+    sea r = []
+    si (ttype == 0) {
+        para i en lista_rango(0, n) { r.agregar(_oid_f32(d, p + 4 * i)) }
+    } sino si (ttype == 1) {
+        para i en lista_rango(0, n) {
+            sea bits = bytes_leer_entero(d, p + 2 * i, 2, 1)
+            sea e = cociente(bits, 1024) % 32
+            sea m = bits % 1024
+            sea v = 0.0
+            si (e == 0) { v = m * 5.960464477539063e-08 } sino { v = (1024 + m) * pot[e] }
+            si (bits >= 32768) { v = 0 - v }
+            r.agregar(v)
+        }
+    } sino { lanzar "oido: tipo de tensor no soportado " + ttype }
+    retornar r
+}
+
+/// Lee un modelo ggml de whisper.cpp desde bytes.
+funcion oido_desde_bytes(d) {
+    si (bytes_leer_entero(d, 0, 4, 1) != 1734831468) { lanzar "oido: no es un modelo ggml de whisper" }
+    sea nombres_h = ["n_vocab", "n_audio_ctx", "n_audio_state", "n_audio_head", "n_audio_layer", "n_text_ctx", "n_text_state", "n_text_head", "n_text_layer", "n_mels", "ftype"]
+    sea h = {}
+    para i en lista_rango(0, 11) { h[nombres_h[i]] = _oid_i32(d, 4 + 4 * i) }
+    sea p = 48
+    sea nm = _oid_i32(d, p)
+    sea nf = _oid_i32(d, p + 4)
+    p = p + 8
+    sea filtros = []
+    para i en lista_rango(0, nm) { filtros.agregar(_oid_flotantes(d, p + 4 * nf * i, nf, 0, nulo)) }
+    p = p + 4 * nm * nf
+    sea nv = _oid_i32(d, p)
+    p = p + 4
+    sea vocab = []
+    para i en lista_rango(0, nv) {
+        sea l = bytes_leer_entero(d, p, 4, 1)
+        vocab.agregar(subtexto(d, p + 4, p + 4 + l))
+        p = p + 4 + l
+    }
+    sea pot = []
+    para e en lista_rango(0, 32) { pot.agregar(potencia(2, e - 25)) }
+    sea t = {}
+    mientras (p < longitud(d)) {
+        sea nd = _oid_i32(d, p)
+        sea ln_ = _oid_i32(d, p + 4)
+        sea tt = _oid_i32(d, p + 8)
+        p = p + 12
+        sea dims = []
+        sea n = 1
+        para i en lista_rango(0, nd) {
+            dims.agregar(_oid_i32(d, p + 4 * i))
+            n = n * dims[i]
+        }
+        p = p + 4 * nd
+        sea nombre = subtexto(d, p, p + ln_)
+        p = p + ln_
+        t[nombre] = {"dims": dims, "datos": _oid_flotantes(d, p, n, tt, pot)}
+        p = p + n * si(tt == 1, 2, 4)
+    }
+    sea multi = h["n_vocab"] >= 51865
+    sea eot = 50256 + si(multi, 1, 0)
+    sea extra = h["n_vocab"] - 51865
+    si (extra < 0) { extra = 0 }
+    sea m = {"hparams": h, "filtros": filtros, "vocab": vocab, "t": t, "multilingue": multi, "eot": eot, "sot": eot + 1,
+        "traducir": eot + 101 + extra, "transcribir": eot + 102 + extra, "sin_marcas": eot + 106 + extra, "n_idiomas": 99 + extra}
+    retornar m
+}
+
+/// Carga un modelo ggml de whisper.cpp (ggml-tiny.bin, ggml-base.bin…).
+funcion oido_cargar(ruta) { retornar oido_desde_bytes(leer_archivo(ruta)) }
+
+/// Hiperparámetros y tokens especiales.
+funcion oido_info(m) {
+    sea r = {}
+    para k en claves(m["hparams"]) { r[k] = m["hparams"][k] }
+    r["multilingue"] = m["multilingue"]
+    r["eot"] = m["eot"]
+    r["sot"] = m["sot"]
+    retornar r
+}
+
+// ---------- capas ----------
+
+funcion _oid_w(m, n) {
+    sea t = m["t"][n] ?? nulo
+    si (t == nulo) { lanzar "oido: falta el tensor " + n }
+    retornar t["datos"]
+}
+
+// y = W x (+ b); W de n_sal × n_ent por filas.
+funcion _oid_lin(m, p, x, sesgo) {
+    sea w = _oid_w(m, p + ".weight")
+    sea n_ent = longitud(x)
+    sea n_sal = cociente(longitud(w), n_ent)
+    sea r = []
+    sea b = nulo
+    si (sesgo) { b = _oid_w(m, p + ".bias") }
+    para o en lista_rango(0, n_sal) {
+        sea s = 0.0
+        sea base = o * n_ent
+        para i en lista_rango(0, n_ent) { s = s + w[base + i] * x[i] }
+        si (sesgo) { s = s + b[o] }
+        r.agregar(s)
+    }
+    retornar r
+}
+
+funcion _oid_ln(m, p, x) {
+    sea n = longitud(x)
+    sea med = 0.0
+    para v en x { med = med + v }
+    med = med / n
+    sea varianza = 0.0
+    para v en x { varianza = varianza + (v - med) * (v - med) }
+    varianza = varianza / n
+    sea w = _oid_w(m, p + ".weight")
+    sea b = _oid_w(m, p + ".bias")
+    sea den = raiz(varianza + 1e-5)
+    sea r = []
+    para i en lista_rango(0, n) { r.agregar((x[i] - med) / den * w[i] + b[i]) }
+    retornar r
+}
+
+funcion _oid_erf(x) {
+    si (x < 0) { retornar 0 - _oid_erf(0 - x) }
+    si (x > 6) { retornar 1.0 }
+    si (x < 2.5) {
+        // Serie de Taylor.
+        sea s = 0.0
+        sea t = x
+        sea k = 0
+        mientras (absoluto(t) > 1e-17 * absoluto(s) o k < 3) {
+            s = s + t / (2 * k + 1)
+            k = k + 1
+            t = 0 - t * x * x / k
+            si (k > 200) { romper }
+        }
+        retornar s * 1.1283791670955126
+    }
+    // Fracción continua para erfc.
+    sea f = 0.0
+    sea k = 60
+    mientras (k >= 1) {
+        f = k / 2 / (x + f)
+        k = k - 1
+    }
+    retornar 1 - exponencial(0 - x * x) / (x + f) / 1.772453850905516
+}
+
+funcion _oid_gelu(x) {
+    sea r = []
+    para v en x { r.agregar(0.5 * v * (1 + _oid_erf(v / 1.4142135623730951))) }
+    retornar r
+}
+
+funcion _oid_sum(a, b) {
+    sea r = []
+    para i en lista_rango(0, longitud(a)) { r.agregar(a[i] + b[i]) }
+    retornar r
+}
+
+// Atención: q de una posición contra listas de claves y valores (ya escaladas).
+funcion _oid_atender(q, ks, vs, cabezas) {
+    sea n = longitud(q)
+    sea d = cociente(n, cabezas)
+    sea esc = potencia(d, -0.25)
+    sea r = []
+    para i en lista_rango(0, n) { r.agregar(0.0) }
+    para h en lista_rango(0, cabezas) {
+        sea pts = []
+        sea mx = -1e308
+        para j en lista_rango(0, longitud(ks)) {
+            sea s = 0.0
+            para c en lista_rango(h * d, h * d + d) { s = s + q[c] * esc * ks[j][c] }
+            pts.agregar(s)
+            mx = maximo(mx, s)
+        }
+        sea suma = 0.0
+        para j en lista_rango(0, longitud(pts)) {
+            pts[j] = exponencial(pts[j] - mx)
+            suma = suma + pts[j]
+        }
+        para j en lista_rango(0, longitud(pts)) {
+            sea a = pts[j] / suma
+            para c en lista_rango(h * d, h * d + d) { r[c] = r[c] + a * vs[j][c] }
+        }
+    }
+    retornar r
+}
+
+funcion _oid_escalar_claves(ks, cabezas) {
+    sea n = longitud(ks[0])
+    sea esc = potencia(cociente(n, cabezas), -0.25)
+    sea r = []
+    para k en ks {
+        sea f = []
+        para v en k { f.agregar(v * esc) }
+        r.agregar(f)
+    }
+    retornar r
+}
+
+funcion _oid_conv(m, p, x, paso) {
+    // x: lista de canales (cada uno lista de longitud L); kernel 3, relleno 1.
+    sea w = _oid_w(m, p + ".weight")
+    sea b = _oid_w(m, p + ".bias")
+    sea c_ent = longitud(x)
+    sea L = longitud(x[0])
+    sea c_sal = cociente(longitud(w), c_ent * 3)
+    sea lo = cociente(L + 2 - 3, paso) + 1
+    sea r = []
+    para o en lista_rango(0, c_sal) {
+        sea fila = []
+        para i en lista_rango(0, lo) {
+            sea s = b[o]
+            para c en lista_rango(0, c_ent) {
+                sea base = (o * c_ent + c) * 3
+                sea xc = x[c]
+                para k en lista_rango(0, 3) {
+                    sea pos = i * paso + k - 1
+                    si (pos >= 0 y pos < L) { s = s + w[base + k] * xc[pos] }
+                }
+            }
+            fila.agregar(s)
+        }
+        r.agregar(fila)
+    }
+    retornar r
+}
+
+/// Codificador: mel (n_mels × 2·n_audio_ctx cuadros o más) → lista de
+/// vectores de audio (n_audio_ctx posiciones como máximo).
+funcion oido_codificar(m, mel) {
+    sea h = m["hparams"]
+    sea n_cuadros = minimo(longitud(mel[0]), 2 * h["n_audio_ctx"])
+    sea x = []
+    para fila en mel {
+        sea f = []
+        para i en lista_rango(0, n_cuadros) { f.agregar(fila[i]) }
+        x.agregar(f)
+    }
+    sea c1 = _oid_conv(m, "encoder.conv1", x, 1)
+    sea g1 = []
+    para f en c1 { g1.agregar(_oid_gelu(f)) }
+    sea c2 = _oid_conv(m, "encoder.conv2", g1, 2)
+    sea g2 = []
+    para f en c2 { g2.agregar(_oid_gelu(f)) }
+    sea n = longitud(g2[0])
+    sea d = longitud(g2)
+    sea pe = _oid_w(m, "encoder.positional_embedding")
+    sea xs = []
+    para i en lista_rango(0, n) {
+        sea v = []
+        para c en lista_rango(0, d) { v.agregar(g2[c][i] + pe[i * d + c]) }
+        xs.agregar(v)
+    }
+    para l en lista_rango(0, h["n_audio_layer"]) {
+        sea p = "encoder.blocks." + l
+        sea normal = []
+        para v en xs { normal.agregar(_oid_ln(m, p + ".attn_ln", v)) }
+        sea ks = []
+        sea vs = []
+        para v en normal {
+            ks.agregar(_oid_lin(m, p + ".attn.key", v, falso))
+            vs.agregar(_oid_lin(m, p + ".attn.value", v, verdadero))
+        }
+        sea ks2 = _oid_escalar_claves(ks, h["n_audio_head"])
+        sea nuevos = []
+        para i en lista_rango(0, n) {
+            sea q = _oid_lin(m, p + ".attn.query", normal[i], verdadero)
+            sea a = _oid_lin(m, p + ".attn.out", _oid_atender(q, ks2, vs, h["n_audio_head"]), verdadero)
+            nuevos.agregar(_oid_sum(xs[i], a))
+        }
+        xs = []
+        para v en nuevos { xs.agregar(_oid_sum(v, _oid_mlp(m, p, v))) }
+    }
+    sea r = []
+    para v en xs { r.agregar(_oid_ln(m, "encoder.ln_post", v)) }
+    retornar r
+}
+
+funcion _oid_mlp(m, p, x) { retornar _oid_lin(m, p + ".mlp.2", _oid_gelu(_oid_lin(m, p + ".mlp.0", _oid_ln(m, p + ".mlp_ln", x), verdadero)), verdadero) }
+
+/// Prepara el estado de decodificación para un audio ya codificado.
+funcion oido_estado(m, audio_cod) {
+    sea h = m["hparams"]
+    sea cruz = []
+    para l en lista_rango(0, h["n_text_layer"]) {
+        sea p = "decoder.blocks." + l + ".cross_attn"
+        sea ks = []
+        sea vs = []
+        para v en audio_cod {
+            ks.agregar(_oid_lin(m, p + ".key", v, falso))
+            vs.agregar(_oid_lin(m, p + ".value", v, verdadero))
+        }
+        cruz.agregar({"k": _oid_escalar_claves(ks, h["n_text_head"]), "v": vs})
+    }
+    sea cache = []
+    para l en lista_rango(0, h["n_text_layer"]) { cache.agregar({"k": [], "v": []}) }
+    retornar {"cruz": cruz, "cache": cache, "pos": 0}
+}
+
+/// Pasa un token por el decodificador y devuelve los logits del siguiente.
+funcion oido_decodificar(m, estado, token) {
+    sea h = m["hparams"]
+    sea d = h["n_text_state"]
+    si (estado["pos"] >= h["n_text_ctx"]) { lanzar "oido: contexto de texto lleno" }
+    sea emb = m["t"]["decoder.token_embedding.weight"]["datos"]
+    sea pe = _oid_w(m, "decoder.positional_embedding")
+    sea x = []
+    para c en lista_rango(0, d) { x.agregar(emb[token * d + c] + pe[estado["pos"] * d + c]) }
+    para l en lista_rango(0, h["n_text_layer"]) {
+        sea p = "decoder.blocks." + l
+        sea n1 = _oid_ln(m, p + ".attn_ln", x)
+        sea ca = estado["cache"][l]
+        sea k = _oid_lin(m, p + ".attn.key", n1, falso)
+        sea esc = potencia(cociente(d, h["n_text_head"]), -0.25)
+        sea ke = []
+        para v en k { ke.agregar(v * esc) }
+        ca["k"].agregar(ke)
+        ca["v"].agregar(_oid_lin(m, p + ".attn.value", n1, verdadero))
+        sea q = _oid_lin(m, p + ".attn.query", n1, verdadero)
+        x = _oid_sum(x, _oid_lin(m, p + ".attn.out", _oid_atender(q, ca["k"], ca["v"], h["n_text_head"]), verdadero))
+        sea n2 = _oid_ln(m, p + ".cross_attn_ln", x)
+        sea q2 = _oid_lin(m, p + ".cross_attn.query", n2, verdadero)
+        sea cr = estado["cruz"][l]
+        x = _oid_sum(x, _oid_lin(m, p + ".cross_attn.out", _oid_atender(q2, cr["k"], cr["v"], h["n_text_head"]), verdadero))
+        x = _oid_sum(x, _oid_mlp(m, p, x))
+    }
+    x = _oid_ln(m, "decoder.ln", x)
+    estado["pos"] = estado["pos"] + 1
+    sea nv = h["n_vocab"]
+    sea r = []
+    para t en lista_rango(0, nv) {
+        sea s = 0.0
+        sea base = t * d
+        para c en lista_rango(0, d) { s = s + emb[base + c] * x[c] }
+        r.agregar(s)
+    }
+    retornar r
+}
+
+funcion _oid_mel_modelo(m, muestras) { retornar oido_mel(muestras, m["filtros"], 2 * m["hparams"]["n_audio_ctx"]) }
+
+/// Detecta el idioma: {"idioma", "probabilidades": {código: p}}.
+funcion oido_detectar_idioma(m, muestras) {
+    si (m["multilingue"] == falso) { retornar {"idioma": "en", "probabilidades": {"en": 1.0}} }
+    sea est = oido_estado(m, oido_codificar(m, _oid_mel_modelo(m, muestras)))
+    sea lg = oido_decodificar(m, est, m["sot"])
+    sea n = minimo(m["n_idiomas"], longitud(_OID_IDIOMAS))
+    sea mx = -1e308
+    sea mejor = 0
+    para i en lista_rango(0, n) {
+        si (lg[m["sot"] + 1 + i] > mx) {
+            mx = lg[m["sot"] + 1 + i]
+            mejor = i
+        }
+    }
+    sea suma = 0.0
+    para i en lista_rango(0, n) { suma = suma + exponencial(lg[m["sot"] + 1 + i] - mx) }
+    sea pr = {}
+    para i en lista_rango(0, n) { pr[_OID_IDIOMAS[i]] = exponencial(lg[m["sot"] + 1 + i] - mx) / suma }
+    retornar {"idioma": _OID_IDIOMAS[mejor], "probabilidades": pr}
+}
+
+funcion _oid_azar(e) {
+    e["s"] = (e["s"] * 1103515245 + 12345) % 2147483648
+    retornar e["s"] / 2147483648
+}
+
+/// Transcribe (o traduce) hasta 30 s de audio a 16 kHz. opciones:
+/// "idioma" (código o "auto"), "tarea" ("transcribir" | "traducir"),
+/// "max_tokens" (224), "temperatura" (0), "semilla".
+/// Devuelve {"texto", "tokens", "idioma"}.
+funcion oido_transcribir(m, muestras, opciones) {
+    sea op = opciones ?? {}
+    sea cod = oido_codificar(m, _oid_mel_modelo(m, muestras))
+    sea idioma = op["idioma"] ?? "auto"
+    sea prompt = [m["sot"]]
+    si (m["multilingue"]) {
+        si (idioma == "auto") {
+            sea e0 = oido_estado(m, cod)
+            sea lg = oido_decodificar(m, e0, m["sot"])
+            sea mejor = 0
+            para i en lista_rango(1, minimo(m["n_idiomas"], longitud(_OID_IDIOMAS))) {
+                si (lg[m["sot"] + 1 + i] > lg[m["sot"] + 1 + mejor]) { mejor = i }
+            }
+            idioma = _OID_IDIOMAS[mejor]
+        }
+        sea li = -1
+        para i en lista_rango(0, longitud(_OID_IDIOMAS)) {
+            si (_OID_IDIOMAS[i] == idioma) { li = i }
+        }
+        si (li < 0) { lanzar "oido: idioma desconocido " + idioma }
+        prompt.agregar(m["sot"] + 1 + li)
+        sea tarea = op["tarea"] ?? "transcribir"
+        prompt.agregar(si(tarea == "traducir" o tarea == "translate", m["traducir"], m["transcribir"]))
+    } sino { idioma = "en" }
+    prompt.agregar(m["sin_marcas"])
+    sea est = oido_estado(m, cod)
+    sea lg = nulo
+    para t en prompt { lg = oido_decodificar(m, est, t) }
+    sea temp = op["temperatura"] ?? 0
+    sea azar = {"s": (op["semilla"] ?? 42) % 2147483648}
+    sea limite = minimo(op["max_tokens"] ?? 224, m["hparams"]["n_text_ctx"] - longitud(prompt))
+    sea toks = []
+    para i en lista_rango(0, limite) {
+        sea t = 0
+        si (temp <= 0) {
+            para j en lista_rango(1, m["eot"] + 1) {
+                si (lg[j] > lg[t]) { t = j }
+            }
+        } sino {
+            sea mx = -1e308
+            para j en lista_rango(0, m["eot"] + 1) { mx = maximo(mx, lg[j]) }
+            sea suma = 0.0
+            para j en lista_rango(0, m["eot"] + 1) { suma = suma + exponencial((lg[j] - mx) / temp) }
+            sea u = _oid_azar(azar) * suma
+            t = m["eot"]
+            para j en lista_rango(0, m["eot"] + 1) {
+                u = u - exponencial((lg[j] - mx) / temp)
+                si (u <= 0) {
+                    t = j
+                    romper
+                }
+            }
+        }
+        si (t == m["eot"]) { romper }
+        toks.agregar(t)
+        si (i + 1 < limite) { lg = oido_decodificar(m, est, t) }
+    }
+    retornar {"texto": oido_texto(m, toks), "tokens": toks, "idioma": idioma}
+}
+
+/// Texto de una lista de tokens (sin especiales).
+funcion oido_texto(m, tokens) {
+    sea partes = []
+    para t en tokens {
+        si (t < m["eot"] y t < longitud(m["vocab"])) { partes.agregar(m["vocab"][t]) }
+    }
+    retornar texto_recortar(unir(partes, ""))
+}
+
+/// Códigos de idioma en el orden de Whisper.
+funcion oido_idiomas() { retornar _OID_IDIOMAS }

@@ -4,6 +4,17 @@ Sitio oficial: [c-forge.org](https://c-forge.org)
 
 ## Sin publicar
 
+- Lote 39 de bibliotecas (tres más que pasan de enlaces a nativas):
+  `lector`/`tesseract` (OCR de texto impreso con plantillas generadas desde
+  cualquier fuente TrueType: Otsu, renglones, glifos de varias partes,
+  separación de glifos pegados, cajas y confianza; lee exacto páginas de
+  20 a 40 px, incluso texto claro sobre oscuro), `oido`/`whispercpp`
+  (espectrograma log-mel de Whisper, modelos ggml de whisper.cpp,
+  codificador y decodificador con caché, detección de idioma y
+  transcripción; mismos valores que una referencia en NumPy) y
+  `estudio`/`portaudio` (flujos con callback o bloqueantes, formatos con
+  redondeo y recorte, reloj y latencia; dispositivos SDL2, bucle, WAV y
+  nulo).
 - Lote 38 de bibliotecas (tres más que pasan de enlaces a nativas):
   `oraculo`/`llamacpp` (modelos LLaMA en GGUF con tensores F32, F16, Q8_0
   y Q4_0, caché KV, tokenizador SentencePiece y muestreo; mismos logits que
