@@ -18,10 +18,11 @@
     revelar.forEach(function (e) { e.classList.add("on"); });
   }
 
-  // Terminal animada: las líneas vienen del HTML (data-secuencia)
+  // Terminal animada: escenas del HTML (data-escenas); el panel lateral cambia de escena
   var term = document.getElementById("terminal");
   if (term) {
-    var pasos = JSON.parse(term.getAttribute("data-secuencia"));
+    var escenas = JSON.parse(term.getAttribute("data-escenas"));
+    var turno = 0;
     var linea = function (clase, texto) {
       var d = document.createElement("div");
       if (clase) { var s = document.createElement("span"); s.className = clase; s.textContent = texto; d.appendChild(s); }
@@ -33,11 +34,16 @@
       d.innerHTML = '<span class="tp">$ </span><span class="cursor"></span>';
       term.appendChild(d);
     };
-    if (sinMovimiento) {
-      pasos.forEach(function (p) { if (p[0] === "$") { var d = linea("tp", "$ "); d.appendChild(document.createTextNode(p[1])); } else linea(p[0], p[1]); });
-      cursor();
-    } else {
+    var reproducir = function (n) {
+      var mio = ++turno;
+      var pasos = escenas[n] || [];
+      term.textContent = "";
+      if (sinMovimiento) {
+        pasos.forEach(function (p) { if (p[0] === "$") { var d = linea("tp", "$ "); d.appendChild(document.createTextNode(p[1])); } else linea(p[0], p[1]); });
+        cursor(); return;
+      }
       var i = 0;
+      var luego = function (f, ms) { setTimeout(function () { if (mio === turno) f(); }, ms); };
       var siguiente = function () {
         if (i >= pasos.length) { cursor(); return; }
         var p = pasos[i++];
@@ -45,18 +51,34 @@
           var d = linea("tp", "$ "); var t = document.createElement("span"); d.appendChild(t);
           var k = 0;
           var teclear = function () {
-            if (k >= p[1].length) { setTimeout(siguiente, 450); return; }
+            if (k >= p[1].length) { luego(siguiente, 350); return; }
             t.textContent += p[1][k++];
-            var demora = 38 * (0.6 + Math.random() * 0.8);
-            setTimeout(teclear, p[1][k - 1] === " " ? demora * 1.5 : demora);
+            var demora = 30 * (0.6 + Math.random() * 0.8);
+            luego(teclear, p[1][k - 1] === " " ? demora * 1.5 : demora);
           };
           teclear();
         } else {
-          linea(p[0], p[1]); setTimeout(siguiente, p[0] === "" ? 60 : 220);
+          linea(p[0], p[1]); luego(siguiente, p[0] === "" ? 60 : 160);
         }
       };
-      setTimeout(siguiente, 400);
-    }
+      luego(siguiente, 250);
+    };
+    var botones = Array.prototype.slice.call(document.querySelectorAll("[data-escena]"));
+    var elegir = function (b) {
+      botones.forEach(function (o) { var si = o === b; o.classList.toggle("activo", si); o.setAttribute("aria-selected", si ? "true" : "false"); o.tabIndex = si ? 0 : -1; });
+      reproducir(+b.getAttribute("data-escena"));
+    };
+    botones.forEach(function (b, k) {
+      b.tabIndex = k === 0 ? 0 : -1;
+      b.addEventListener("click", function () { elegir(b); });
+      b.addEventListener("keydown", function (e) {
+        var d = e.key === "ArrowDown" ? 1 : e.key === "ArrowUp" ? -1 : 0;
+        if (!d) return;
+        e.preventDefault();
+        var o = botones[(k + d + botones.length) % botones.length]; o.focus(); elegir(o);
+      });
+    });
+    setTimeout(function () { reproducir(0); }, 150);
   }
 
   // Copiar comandos
@@ -74,7 +96,7 @@
   });
 
   // Pestañas accesibles
-  document.querySelectorAll("[role=tablist]").forEach(function (lista) {
+  document.querySelectorAll("[role=tablist]:not(.vitrina-lado)").forEach(function (lista) {
     var pestanas = Array.prototype.slice.call(lista.querySelectorAll("[role=tab]"));
     function activar(p) {
       pestanas.forEach(function (o) {
