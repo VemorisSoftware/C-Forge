@@ -4,6 +4,16 @@ Sitio oficial: [c-forge.org](https://c-forge.org)
 
 ## Sin publicar
 
+- **Auditoría de robustez:** ningún programa en C-Forge puede cerrar el
+  runtime ni leer memoria ajena con valores raros. Se atacaron las 272
+  funciones integradas con argumentos extremos (60 problemas → 0) y 2.100
+  programas mutados (0 cierres). Las funciones internas del runtime ya no se
+  pueden llamar desde un programa (error de compilación claro); una función
+  del programa con el nombre de una interna ya no cambia lo que hace el
+  runtime; las conexiones TLS y las funciones de .NET no aceptan un número
+  cualquiera; `quitar_ultimo`, `bytes_entero`, `rango`, `potencia`,
+  `texto_repetir`, `pbkdf2_sha256` y otras dan errores capturables en vez de
+  colgarse o terminar el programa. El fuzz por mutaciones corre en cada PR.
 - **Enteros sin límite:** los enteros ya no se desbordan en silencio (antes
   `9223372036854775807` se mostraba como `-1` y pasado ~4,6 trillones el
   resultado era incorrecto). Ahora suma, resta, multiplicación, `potencia`,

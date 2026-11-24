@@ -142,6 +142,16 @@ funcion avanzar(c) {
     retornar t
 }
 
+// Avanza hasta el token lex (sin consumirlo); al fin del archivo, error
+// (avanzar se queda en el fin, así que un bucle sin esto no termina).
+funcion saltar_hasta(c, lex) {
+    mientras (ver(c, lex) == 0) {
+        si (tok_tipo(c) == 5) { error_en(c, str_concatenar("falta ", str_concatenar(lex, " antes del fin del archivo"))) }
+        avanzar(c)
+    }
+    retornar 0
+}
+
 funcion ver(c, lexema) {
     sea t = tok_actual(c)
     si (__cargar64(t) == 3) { retornar 0 }
@@ -776,14 +786,27 @@ funcion indice_funcion(c, nombre) {
 funcion buscar_funcion(c, nombre) {
     sea i = indice_funcion(c, nombre)
     si (i < 0) { retornar 0 }
-    retornar vec_obtener(__cargar64(c + 48), i)
+    sea f = vec_obtener(__cargar64(c + 48), i)
+    // El runtime siempre usa sus propias funciones, aunque el programa
+    // defina otra con el mismo nombre (ver registrar_funcion).
+    si (ctx_modo(c) != 2 y __cargar64(f + 24) == 2 y __cargar64(f + 72) != 0) { retornar __cargar64(f + 72) }
+    retornar f
+}
+
+// Función del runtime (para las llamadas que genera el compilador): nunca
+// la del programa con el mismo nombre.
+funcion buscar_funcion_runtime(c, nombre) {
+    sea f = buscar_funcion(c, nombre)
+    si (f != 0 y __cargar64(f + 24) == 2 y __cargar64(f + 72) != 0) { retornar __cargar64(f + 72) }
+    retornar f
 }
 
 // Cada definición recibe su propio registro (en orden). Si el programa
 // dinámico define una función con el nombre de una del lenguaje (puente),
 // la del programa tiene prioridad, como en el intérprete.
 funcion registrar_funcion(c, nombre, parametros, modo) {
-    sea f = mem_reservar(72)
+    sea f = mem_reservar(80)
+    __guardar64(f + 72, 0)                                     // la del runtime que ésta tapa
     __guardar64(f + 64, 0)                                     // línea global de la definición
     __guardar64(f + 32, 0)
     __guardar64(f + 40, 0)
@@ -801,13 +824,21 @@ funcion registrar_funcion(c, nombre, parametros, modo) {
         vec_agregar(funciones, f)
         retornar f
     }
-    sea previa = __cargar64(vec_obtener(funciones, i) + 24)
-    // El programa (2) tiene prioridad sobre el lenguaje (1 puente, 3 biblioteca).
+    sea registro_previo = vec_obtener(funciones, i)
+    sea previa = __cargar64(registro_previo + 24)
+    // El programa (2) tiene prioridad sobre el lenguaje (1 puente, 3
+    // biblioteca) para sus propias llamadas; el runtime sigue usando la suya
+    // (f + 72), así una función del programa con el nombre de una interna no
+    // cambia lo que hacen sha256, json, etc.
     si ((previa == 1 o previa == 3) y modo == 2) {
+        __guardar64(f + 72, registro_previo)
         vec_fijar(funciones, i, f)
         retornar f
     }
-    si (previa == 2 y (modo == 1 o modo == 3)) { retornar f }
+    si (previa == 2 y (modo == 1 o modo == 3)) {
+        __guardar64(registro_previo + 72, f)
+        retornar f
+    }
     rt_panico(str_concatenar("función definida dos veces: ", nombre))
     retornar f
 }
@@ -986,7 +1017,9 @@ funcion registrar_externa(c, i) {
     __guardar64(e + 32, 0)
     vec_agregar(__cargar64(c + 256), e)
     casillas_dl(c)
-    sea f = mem_reservar(64)
+    sea f = mem_reservar(80)                                   // mismo tamaño que registrar_funcion
+    __guardar64(f + 64, 0)
+    __guardar64(f + 72, 0)
     __guardar64(f + 32, 0)
     __guardar64(f + 40, 0)
     __guardar64(f + 48, 0)
@@ -1111,7 +1144,7 @@ funcion declaracion_externa(c) {
     __guardar64(c + 264, __cargar64(c + 264) + 1)
     si (__cargar64(e + 32) != 0) {
         // Declaración repetida: solo saltar la firma y resolver.
-        mientras (ver(c, ")") == 0) { avanzar(c) }
+        saltar_hasta(c, ")")
         requerir(c, ")")
         si (tomar(c, ":")) { requerir_ident(c) }
         si (tomar(c, "como") o tomar(c, "as")) { avanzar(c) }
@@ -1242,6 +1275,11 @@ funcion registrar_clase(c, i) {
     }
     sea j = i + 2
     mientras (str_igual(lexema_en(tokens, j), "{") == 0) {
+        // Sin '{' antes del fin del archivo: error claro (antes se leía más
+        // allá de los tokens y el compilador se cerraba o se colgaba).
+        si (j + 1 >= vec_largo(tokens) o __cargar64(vec_obtener(tokens, j)) == 5) {
+            rt_panico(str_concatenar("falta '{' después de la clase ", __cargar64(k)))
+        }
         si (str_igual(lexema_en(tokens, j), "extiende")) { __guardar64(k + 8, lexema_en(tokens, j + 1)) }
         j = j + 1
     }
@@ -1317,7 +1355,9 @@ funcion finalizar_clases(c) {
         si (buscar_funcion(c, __cargar64(k)) != 0) {
             rt_panico(str_concatenar("nombre usado por una clase y una función: ", __cargar64(k)))
         }
-        sea f = mem_reservar(64)
+        sea f = mem_reservar(80)                               // mismo tamaño que registrar_funcion
+        __guardar64(f + 64, 0)
+        __guardar64(f + 72, 0)
         __guardar64(f + 32, 0)
         __guardar64(f + 40, 0)
         __guardar64(f + 48, 0)
@@ -1896,6 +1936,10 @@ funcion funcion_llamable(c, nombre) {
     si (dinamico(c) y __cargar64(f + 24) == 0) {
         error_en(c, str_concatenar("función interna del runtime: ", nombre))
     }
+    // Un programa solo llama a las funciones públicas del runtime del lenguaje.
+    si (ctx_modo(c) == 2 y __cargar64(f + 24) == 1 y runtime_es_publica(__cargar64(f)) == 0) {
+        error_en(c, str_concatenar("función interna del runtime: ", nombre))
+    }
     retornar f
 }
 
@@ -2041,7 +2085,7 @@ funcion cociente_potencia_de_2(c) {
 }
 
 funcion llamar_runtime(c, nombre, n) {
-    sea f = buscar_funcion(c, nombre)
+    sea f = buscar_funcion_runtime(c, nombre)
     si (f == 0) {
         error_en(c, str_concatenar("falta el runtime del lenguaje (runtime/dyn.cfv): ", nombre))
     }
@@ -4859,7 +4903,7 @@ funcion definicion_clase(c) {
     si (tomar(c, "interfaz")) {
         // Las interfaces describen firmas; no generan código.
         requerir_ident(c)
-        mientras (ver(c, "{") == 0) { avanzar(c) }
+        saltar_hasta(c, "{")
         sea nivel = 0
         sea seguir = 1
         mientras (seguir) {
@@ -4874,7 +4918,14 @@ funcion definicion_clase(c) {
     si (tomar(c, "estructura") == 0) { requerir(c, "clase") }
     sea nombre = requerir_ident(c)
     sea k = buscar_clase(c, nombre)
-    mientras (ver(c, "{") == 0) { avanzar(c) }
+    // Solo se registran las clases del nivel superior; dentro de una función
+    // (o con llaves sin cerrar antes) no hay registro: error claro en vez de
+    // usar un registro vacío.
+    si (k == 0) { error_en(c, str_concatenar("una clase solo se puede definir fuera de las funciones: ", nombre)) }
+    mientras (ver(c, "{") == 0) {
+        si (tok_tipo(c) == 5) { error_en(c, str_concatenar("falta '{' en la clase ", nombre)) }
+        avanzar(c)
+    }
     requerir(c, "{")
     sea saltar = saltar_por_encima(c)
     sea clase_previa = __cargar64(c + 168)
@@ -6587,4 +6638,28 @@ funcion modo_de_opcion(argumento) {
     si (str_igual(argumento, "--dinamico")) { retornar 2 }
     si (str_igual(argumento, "--lenguaje")) { retornar 3 }
     retornar 0 - 1
+}
+
+// Funciones del runtime del lenguaje (puente) que un programa puede llamar.
+// Las demás son internas: usan la convención del runtime y llamarlas desde
+// un programa podía corromper memoria. Una función nueva del runtime es
+// privada hasta que se agrega aquí (seguro por defecto).
+funcion runtime_publicas() {
+    retornar " Alguno Error Ninguno Ok a_numero a_texto absoluto adler32 aes_bloque aes_cifrar aes_descifrar aes_gcm_cifrar aes_gcm_descifrar afirmar agregar aleatorio aleatorio_entero aleatorio_uniforme arccoseno arcoseno arcotangente argon2id argumentos argumentos_programa bits_o bits_xo bits_y blake2b blake3 blake3_derivar bmp_decodificar borrar_texto byte_en bytes_aleatorios bytes_bufer bytes_buscar bytes_de_hex bytes_desenmascarar bytes_direccion bytes_entero bytes_leer_entero bytes_xor c_bytes c_cadena c_desde_bytes c_escribir32 c_escribir64 c_escribir_f32 c_f32 c_i32 c_leer32 c_leer64 c_leer8 c_liberar c_llamar c_reservar c_texto caja_abrir caja_cerrar canal_cerrar canal_enviar canal_nuevo canal_recibir canal_tam caracter cfv_aleatorio_uniforme cfv_base64_codificar cfv_base64_decodificar cfv_codigo_char cfv_fecha_ahora cfv_fecha_ahora_ms cfv_json_bonito cfv_json_parsear cfv_json_serializar cfv_md5 cfv_regex_buscar cfv_regex_buscar_todos cfv_regex_coincidir cfv_regex_dividir cfv_regex_reemplazar cfv_sha1 cfv_sha256 cfv_url_codificar cfv_url_decodificar chacha20_poly1305_cifrar chacha20_poly1305_descifrar chacha20_xor char_de claves cobertura_iniciar cobertura_marcar cobertura_volcar cociente comparar_seguro comptime_escribir comptime_literal contiene cos coseno crc32 crear_carpeta crypto_rand_bytes deflar dormir dotnet_funcion dotnet_iniciar dotnet_llamar dotnet_llamar_texto ed25519_firmar ed25519_publica ed25519_verificar eliminar eliminar_archivo eliminar_clave es_carpeta es_mismo escribir escribir_archivo esperar existe_archivo exponencial f32 filtrar gl3d_atributo gl3d_cerrar gl3d_dibujar gl3d_error gl3d_iniciar gl3d_intercambiar gl3d_leer_pixel gl3d_leer_pixeles gl3d_limpiar gl3d_profundidad gl3d_programa gl3d_shader gl3d_tamanio_dibujable gl3d_textura gl3d_uniforme_f gl3d_uniforme_i gl3d_uniforme_mat4 gl3d_uniforme_mat4_filas gl3d_uniforme_vec3 gl3d_usar_programa gl3d_usar_textura gl3d_vbo gl3d_ventana gl3d_viewport gzip_comprimir gzip_descomprimir hex_de_bytes hilo hilo_dormir hkdf_sha256 hkdf_sha512 hmac_sha256 hmac_sha256_bytes hmac_sha512 hmac_sha512_bytes http_get http_solicitud inflar insertar java_estatico java_iniciar java_metodo java_nuevo java_soltar jpeg_decodificar json_texto leer leer_archivo lienzo_copiar lienzo_fijar_pixel lienzo_llenar lienzo_nuevo_buffer lienzo_poligono lienzo_rect lienzo_triangulo lienzo_triangulos lienzo_zbuffer lienzo_zlimpiar lista_aplanar lista_contiene lista_direccion lista_filtrar lista_invertir lista_mapear lista_rango lista_repetir lista_unir listar_carpeta logaritmo longitud mapa_claves mapear maximo memoria_asignar memoria_estadisticas memoria_liberar minimo mostrar mutex_bloquear mutex_crear mutex_desbloquear mutex_liberar net_cerrar net_conectar net_enviar net_enviar_recibir net_espera net_recibir net_recibir_en net_recibir_exacto net_recibir_todo numero_a_texto numero_preciso ordenar para_cada paralelo pbkdf2_sha256 pcm_de_lista pcm_mezclar pcm_muestra pcm_silencio pi piso png_codificar png_decodificar poly1305 potencia quitar_clave quitar_ultimo raiz rango red_resolver redondear reducir reloj_ms repl_preparar repl_valor rsa_oaep_cifrar ruta_extension ruta_nombre salir sdl_cargar_fuente sdl_cerrar sdl_color sdl_delay sdl_dibujar_textura sdl_esperar sdl_eventos sdl_init sdl_limpiar sdl_linea sdl_presentar sdl_rect sdl_renderer sdl_texto sdl_ticks sdl_ventana sen seno separar servidor_http_cerrar servidor_http_escuchar servidor_http_escuchar_en servidor_http_limites servidor_http_responder servidor_http_responder_con servidor_http_solicitud servidor_http_tomar_conexion sha1_bytes sha256_bytes sha384 sha512 sha512_bytes subarray subcadena subtexto sys_info tan tangente tarea techo texto_a_numero texto_buscar texto_codigos texto_contiene texto_dividir texto_empieza_con texto_indice texto_invertir texto_mayusculas texto_minusculas texto_recortar texto_reemplazar texto_repetir texto_subcadena texto_termina_con texto_unir tiempo_actual tiempo_ms tiempo_segundos tiene_clave tipo tipo_de tls_abrir tls_cerrar tls_enviar tls_recibir_todo tls_version u32 udp_cerrar udp_crear udp_enviar udp_recibir unir variable_entorno wav_codificar wav_decodificar x25519 x25519_base zlib_comprimir zlib_descomprimir "
+}
+
+// ¿nombre está en la lista (palabras separadas por espacios)?
+funcion runtime_es_publica(nombre) {
+    sea lista = runtime_publicas()
+    sea n = str_largo(nombre)
+    sea i = 0
+    mientras (i + n + 1 < str_largo(lista)) {
+        si (str_byte(lista, i) == 32 y str_byte(lista, i + n + 1) == 32) {
+            sea j = 0
+            mientras (j < n y str_byte(lista, i + 1 + j) == str_byte(nombre, j)) { j = j + 1 }
+            si (j == n) { retornar 1 }
+        }
+        i = i + 1
+    }
+    retornar 0
 }
