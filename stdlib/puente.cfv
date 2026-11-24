@@ -1,0 +1,943 @@
+// stdlib/puente.cfv — usar librerías de C++ y de Rust que ya existen, sin
+// escribir código puente a mano. Lo usa `cforge bindgen`:
+//
+//   cforge bindgen geo.hpp --lib geo --fuentes geo.cpp      // C++
+//   cforge bindgen rust:strsim                              // crate de crates.io
+//   cforge bindgen rust:../mi_crate                         // crate local
+//
+// y después, desde cualquier programa:
+//
+//   importar "cpp:geo"        // geo_Punto_nuevo(1, 2), geo_area_circulo(3)…
+//   importar "rust:strsim"    // strsim_levenshtein("casa", "cosa")…
+//
+// Cómo funciona: lee la API pública (C++: el AST de clang; Rust: el JSON de
+// rustdoc), genera una capa delgada con interfaz C (extern "C"), la compila
+// a una biblioteca compartida (clang++ o cargo) y escribe el módulo C-Forge
+// con sus funciones. Clases y structs se usan como objetos opacos
+// (Clase_nuevo / Clase_metodo / Clase_liberar); las excepciones de C++, los
+// Err de Rust y los pánicos llegan como errores de C-Forge (intentar /
+// capturar). Tipos: enteros, flotantes (también float de 32 bits), bool,
+// textos (char*, std::string, &str, String), listas de números o de textos
+// (std::vector, Vec, slices) y objetos. Lo demás (plantillas, genéricos,
+// callbacks, mapas) se omite con un comentario que explica por qué.
+//
+// Los módulos generados quedan en ~/.cforge/interop (o $CFORGE_INTEROP),
+// donde los encuentra `importar "cpp:…"` / `importar "rust:…"`.
+
+importar "sistema"
+importar "json"
+
+// ---------- utilidades ----------
+
+funcion puente_directorio() {
+    sea d = variable_entorno("CFORGE_INTEROP")
+    si (d == nulo o d == "") { d = (variable_entorno("HOME") ?? "/tmp") + "/.cforge/interop" }
+    sistema_comando("mkdir -p '" + d + "'")
+    retornar d
+}
+
+// Ejecuta un comando: {"codigo", "salida"} (stdout y stderr juntos).
+funcion _ptn_ejecutar(cmd) {
+    sea log = "/tmp/cforge-puente-" + reloj_ms() + ".log"
+    sea r = sistema_comando("(" + cmd + ") > '" + log + "' 2>&1; echo $?")
+    sea salida = ""
+    si (existe_archivo(log)) {
+        salida = leer_archivo(log)
+        eliminar_archivo(log)
+    }
+    retornar {"codigo": a_numero(texto_recortar(r ?? "1")), "salida": salida}
+}
+
+funcion _ptn_ultimo(t, c) {
+    sea i = longitud(t) - 1
+    mientras (i >= 0 y subtexto(t, i, i + 1) != c) { i = i - 1 }
+    retornar i
+}
+
+funcion _ptn_comillas(t) { retornar "'" + texto_reemplazar(t, "'", "'\\''") + "'" }
+
+funcion _ptn_absoluta(ruta) {
+    si (texto_empieza_con(ruta, "/")) { retornar ruta }
+    retornar texto_recortar(sistema_comando("pwd") ?? ".") + "/" + ruta
+}
+
+sea _PTN_CLAVES = ["si", "sino", "mientras", "para", "en", "sea", "funcion", "retornar", "clase", "verdadero", "falso", "nulo", "importar", "lanzar", "intentar", "capturar",
+    "y", "o", "no", "texto", "entero", "numero", "lista", "mapa", "esto", "romper", "continuar", "mostrar", "afirmar", "largo", "puntero", "booleano"]
+
+funcion _ptn_param(n, i) {
+    sea x = n
+    si (x == nulo o x == "" o x == "_") { x = "a" + i }
+    si (texto_empieza_con(x, "_")) { x = "p" + x }
+    retornar x + "_"
+}
+
+funcion _ptn_tipo_extern(t) {
+    si (t == "entero" o t == "largo" o t == "numero" o t == "booleano" o t == "texto") { retornar t }
+    si (texto_empieza_con(t, "objeto:")) { retornar "puntero" }
+    si (t == "lista_num" o t == "lista_texto") { retornar "texto" }
+    retornar "nulo"
+}
+
+// ---------- módulo C-Forge (común a C++ y Rust) ----------
+
+// api: {"lib", "so", "origen", "lenguaje", "funciones": [{"nombre", "simbolo",
+// "params": [{"nombre", "tipo"}], "ret", "firma"}], "omitidas": [texto]}
+funcion _ptn_modulo(api) {
+    sea lib = api["lib"]
+    sea so = api["so"]
+    sea l = []
+    l.agregar("// Módulo generado por `cforge bindgen` desde " + api["origen"] + " (" + api["lenguaje"] + "). No editar:")
+    l.agregar("// " + longitud(api["funciones"]) + " funciones; " + longitud(api["omitidas"]) + " omitidas.")
+    l.agregar("// Biblioteca: " + so)
+    l.agregar("")
+    l.agregar("extern \"" + so + "\" funcion __" + lib + "__error(): texto")
+    para f en api["funciones"] {
+        sea ps = []
+        sea i = 0
+        para p en f["params"] {
+            ps.agregar("a" + i + ": " + _ptn_tipo_extern(p["tipo"]))
+            i = i + 1
+        }
+        sea ret = _ptn_tipo_extern(f["ret"])
+        l.agregar("extern \"" + so + "\" funcion " + f["simbolo"] + "(" + unir(ps, ", ") + ")" + si(ret == "nulo", "", ": " + ret))
+    }
+    l.agregar("")
+    l.agregar("funcion _" + lib + "_err() {")
+    l.agregar("    sea e = __" + lib + "__error()")
+    l.agregar("    si (e != \"\") { lanzar \"" + lib + ": \" + e }")
+    l.agregar("    retornar nulo")
+    l.agregar("}")
+    l.agregar("")
+    l.agregar("funcion _" + lib + "_ln(v) {")
+    l.agregar("    sea r = []")
+    l.agregar("    para x en v { r.agregar(numero_preciso(x)) }")
+    l.agregar("    retornar unir(r, \",\")")
+    l.agregar("}")
+    l.agregar("")
+    l.agregar("funcion _" + lib + "_lt(v) { retornar unir(v, char_de(31)) }")
+    l.agregar("")
+    l.agregar("funcion _" + lib + "_rln(t) {")
+    l.agregar("    sea r = []")
+    l.agregar("    si (t == \"\") { retornar r }")
+    l.agregar("    para x en texto_dividir(t, \",\") { r.agregar(a_numero(x)) }")
+    l.agregar("    retornar r")
+    l.agregar("}")
+    l.agregar("")
+    l.agregar("funcion _" + lib + "_rlt(t) {")
+    l.agregar("    si (t == \"\") { retornar [] }")
+    l.agregar("    retornar texto_dividir(t, char_de(31))")
+    l.agregar("}")
+    para f en api["funciones"] {
+        sea nombres = []
+        sea args = []
+        sea i = 0
+        para p en f["params"] {
+            sea n = _ptn_param(p["nombre"], i)
+            nombres.agregar(n)
+            si (p["tipo"] == "lista_num") { args.agregar("_" + lib + "_ln(" + n + ")") } sino si (p["tipo"] == "lista_texto") { args.agregar("_" + lib + "_lt(" + n + ")") } sino { args.agregar(n) }
+            i = i + 1
+        }
+        l.agregar("")
+        l.agregar("/// " + f["firma"])
+        l.agregar("funcion " + f["nombre"] + "(" + unir(nombres, ", ") + ") {")
+        sea llamada = f["simbolo"] + "(" + unir(args, ", ") + ")"
+        si (f["ret"] == "nulo") {
+            l.agregar("    " + llamada)
+            l.agregar("    _" + lib + "_err()")
+            l.agregar("    retornar nulo")
+        } sino {
+            l.agregar("    sea r = " + llamada)
+            l.agregar("    _" + lib + "_err()")
+            si (f["ret"] == "lista_num") { l.agregar("    retornar _" + lib + "_rln(r)") } sino si (f["ret"] == "lista_texto") { l.agregar("    retornar _" + lib + "_rlt(r)") } sino { l.agregar("    retornar r") }
+        }
+        l.agregar("}")
+    }
+    si (longitud(api["omitidas"]) > 0) {
+        l.agregar("")
+        l.agregar("// Omitidas:")
+        para o en api["omitidas"] { l.agregar("//   " + o) }
+    }
+    retornar unir(l, "\n") + "\n"
+}
+
+// Nombres únicos (sobrecargas: _2, _3…).
+funcion _ptn_unico(vistos, n) {
+    si (tiene_clave(vistos, n) == falso) {
+        vistos[n] = 1
+        retornar n
+    }
+    vistos[n] = vistos[n] + 1
+    retornar _ptn_unico(vistos, n + "_" + vistos[n])
+}
+
+// ---------- C++ ----------
+
+sea _PTN_CPP_ENTEROS = ["int", "short", "char", "signed char", "unsigned char", "short int", "unsigned short", "unsigned short int", "int8_t", "int16_t", "int32_t", "uint8_t", "uint16_t",
+    "std::int8_t", "std::int16_t", "std::int32_t", "std::uint8_t", "std::uint16_t", "wchar_t", "char16_t", "char32_t"]
+sea _PTN_CPP_LARGOS = ["long", "long int", "long long", "long long int", "unsigned", "unsigned int", "unsigned long", "unsigned long int", "unsigned long long", "size_t", "std::size_t",
+    "ssize_t", "int64_t", "uint64_t", "uint32_t", "std::int64_t", "std::uint64_t", "std::uint32_t", "intptr_t", "uintptr_t", "ptrdiff_t", "std::ptrdiff_t"]
+
+funcion _ptn_cpp_limpiar(t) {
+    sea x = texto_recortar(t)
+    mientras (texto_empieza_con(x, "const ")) { x = texto_recortar(subtexto(x, 6, longitud(x))) }
+    mientras (texto_termina_con(x, " const")) { x = texto_recortar(subtexto(x, 0, longitud(x) - 6)) }
+    retornar x
+}
+
+// Tipo C++ → {"tipo", "c": tipo en la capa C, "forma": "valor" | "ref" | "ptr"}.
+funcion _ptn_cpp_tipo(t, clases, enums) {
+    sea x = _ptn_cpp_limpiar(t)
+    si (x == "void") { retornar {"tipo": "nulo", "c": "void", "forma": "valor"} }
+    si (x == "const char *" o x == "char *" o x == "const char*" o x == "char*") { retornar {"tipo": "texto", "c": "const char*", "forma": "cstr"} }
+    sea forma = "valor"
+    si (texto_termina_con(x, "&&")) { retornar nulo }
+    si (texto_termina_con(x, "&")) {
+        forma = "ref"
+        x = _ptn_cpp_limpiar(subtexto(x, 0, longitud(x) - 1))
+    } sino si (texto_termina_con(x, "*")) {
+        forma = "ptr"
+        x = _ptn_cpp_limpiar(subtexto(x, 0, longitud(x) - 1))
+    }
+    si ((x == "char" o x == "wchar_t") y (forma == "valor" o (forma == "ref" y texto_empieza_con(texto_recortar(t), "const ")))) { retornar {"tipo": "texto", "c": "const char*", "forma": "char", "cpp": x} }
+    si (x == "bool" y forma == "valor") { retornar {"tipo": "booleano", "c": "bool", "forma": forma} }
+    si (forma == "valor" o (forma == "ref" y texto_empieza_con(texto_recortar(t), "const "))) {
+        si (lista_contiene(_PTN_CPP_ENTEROS, x)) { retornar {"tipo": "entero", "c": "int", "forma": "valor", "cpp": x} }
+        si (tiene_clave(enums, x)) { retornar {"tipo": "entero", "c": "int", "forma": "valor", "cpp": enums[x]} }
+        si (lista_contiene(_PTN_CPP_LARGOS, x)) { retornar {"tipo": "largo", "c": "long long", "forma": "valor", "cpp": x} }
+        si (x == "double" o x == "float" o x == "long double") { retornar {"tipo": "numero", "c": "double", "forma": "valor", "cpp": x} }
+        si (x == "std::string" o x == "std::basic_string<char>" o x == "string" o x == "std::string_view" o x == "std::__cxx11::string") { retornar {"tipo": "texto", "c": "const char*", "forma": "std", "cpp": x} }
+        si (texto_empieza_con(x, "std::vector<") y texto_termina_con(x, ">")) {
+            sea e = _ptn_cpp_limpiar(subtexto(x, 12, longitud(x) - 1))
+            si (lista_contiene(_PTN_CPP_ENTEROS, e) o lista_contiene(_PTN_CPP_LARGOS, e) o e == "double" o e == "float") { retornar {"tipo": "lista_num", "c": "const char*", "forma": "vec", "cpp": e} }
+            si (e == "std::string" o e == "string") { retornar {"tipo": "lista_texto", "c": "const char*", "forma": "vec", "cpp": e} }
+            retornar nulo
+        }
+    }
+    para c en claves(clases) {
+        si (x == c o x == clases[c]["calificado"]) { retornar {"tipo": "objeto:" + c, "c": "void*", "forma": forma, "cpp": clases[c]["calificado"]} }
+    }
+    retornar nulo
+}
+
+// Expresión C++ que convierte un argumento de la capa C al tipo pedido.
+funcion _ptn_cpp_arg(info, n) {
+    si (info["forma"] == "char") { retornar "(" + info["cpp"] + ")(" + n + " && *" + n + " ? " + n + "[0] : 0)" }
+    si (info["forma"] == "std") { retornar "std::string(" + n + ")" }
+    si (info["forma"] == "vec") {
+        si (info["tipo"] == "lista_texto") { retornar "cfx_vtex(" + n + ")" }
+        retornar "cfx_vnum<" + info["cpp"] + ">(" + n + ")"
+    }
+    si (texto_empieza_con(info["tipo"], "objeto:")) {
+        si (info["forma"] == "ptr") { retornar "(" + info["cpp"] + "*)" + n }
+        retornar "*(" + info["cpp"] + "*)" + n
+    }
+    si (info["tipo"] == "entero" o info["tipo"] == "largo" o info["tipo"] == "numero") { retornar "(" + info["cpp"] + ")" + n }
+    retornar n
+}
+
+// Devuelve [tipo C de retorno, código que convierte "r" o nulo].
+funcion _ptn_cpp_ret(info) {
+    si (info["tipo"] == "nulo") { retornar nulo }
+    si (info["forma"] == "std") { retornar "return cfx_rtex(r);" }
+    si (info["forma"] == "char") { retornar "return cfx_rtex(std::string(1, (char)r));" }
+    si (info["forma"] == "vec") {
+        si (info["tipo"] == "lista_texto") { retornar "return cfx_rvtex(r);" }
+        retornar "return cfx_rvnum(r);"
+    }
+    si (texto_empieza_con(info["tipo"], "objeto:")) {
+        si (info["forma"] == "valor") { retornar "return (void*)new " + info["cpp"] + "(std::move(r));" }
+        si (info["forma"] == "ref") { retornar "return (void*)&r;" }
+        retornar "return (void*)r;"
+    }
+    retornar "return r;"
+}
+
+funcion _ptn_cpp_defecto(info) {
+    si (info["tipo"] == "nulo") { retornar "" }
+    si (info["c"] == "void*" o info["c"] == "const char*") { retornar " return nullptr;" }
+    si (info["c"] == "bool") { retornar " return false;" }
+    retornar " return 0;"
+}
+
+funcion _ptn_cpp_texto_ret(info) {
+    si (info["forma"] == "cstr") { retornar "return r;" }
+    retornar _ptn_cpp_ret(info)
+}
+
+// Lee los nombres de primer nivel (namespaces, clases, funciones) de una
+// cabecera, para pedirle a clang solo esas declaraciones.
+funcion _ptn_cpp_nombres(texto) {
+    sea r = []
+    sea prof = 0
+    sea actual = ""
+    sea previa = ""
+    sea antes = ""
+    sea i = 0
+    sea n = longitud(texto)
+    mientras (i < n) {
+        sea c = subtexto(texto, i, i + 1)
+        si (c == "/" y subtexto(texto, i, i + 2) == "//") {
+            mientras (i < n y subtexto(texto, i, i + 1) != "\n") { i = i + 1 }
+        } sino si (c == "/" y subtexto(texto, i, i + 2) == "/*") {
+            sea f = texto_indice(subtexto(texto, i + 2, n), "*/")
+            i = si(f < 0, n, i + f + 4)
+        } sino si (c == "#" ) {
+            mientras (i < n y subtexto(texto, i, i + 1) != "\n") { i = i + 1 }
+        } sino si (c == "\"") {
+            i = i + 1
+            mientras (i < n y subtexto(texto, i, i + 1) != "\"") { i = i + si(subtexto(texto, i, i + 1) == "\\", 2, 1) }
+            i = i + 1
+        } sino {
+            sea letra = (c >= "a" y c <= "z") o (c >= "A" y c <= "Z") o c == "_" o (c >= "0" y c <= "9")
+            si (letra) { actual = actual + c } sino {
+                si (actual != "") {
+                    antes = previa
+                    previa = actual
+                    actual = ""
+                    si (prof == 0 y (antes == "namespace" o antes == "class" o antes == "struct")) {
+                        si (lista_contiene(r, previa) == falso) { r.agregar(previa) }
+                    }
+                }
+                si (c == "(" y prof == 0 y previa != "" y previa != "operator" y lista_contiene(r, previa) == falso) { r.agregar(previa) }
+                si (c == "{") { prof = prof + 1 }
+                si (c == "}" y prof > 0) { prof = prof - 1 }
+                si (c == ";" o c == "{" o c == "}") {
+                    previa = ""
+                    antes = ""
+                }
+            }
+            i = i + 1
+        }
+    }
+    retornar r
+}
+
+// Objetos JSON de primer nivel seguidos ("{…}\n{…}").
+funcion _ptn_json_varios(t) {
+    sea r = []
+    sea partes = texto_dividir(t, "\n}\n")
+    para p en partes {
+        sea q = texto_recortar(p)
+        si (texto_empieza_con(q, "{")) { r.agregar(json_parsear(q + "\n}")) }
+    }
+    retornar r
+}
+
+funcion _ptn_cpp_qual(n) { retornar n["type"]["qualType"] ?? "" }
+
+/// Genera el módulo para una cabecera C++. opciones: "fuentes" (lista de
+/// .cpp a compilar con la capa), "enlazar" (texto para el enlazador, p. ej.
+/// "-lfmt"), "incluir" (directorios), "std" ("c++17"), "salida" (.cfv).
+/// Devuelve {"modulo", "ruta", "so", "funciones", "omitidas"}.
+funcion puente_cpp(cabecera, lib, opciones) {
+    sea op = opciones ?? {}
+    sea hdr = _ptn_absoluta(cabecera)
+    si (existe_archivo(hdr) == falso) { lanzar "puente: no existe " + cabecera }
+    sea dir_hdr = subtexto(hdr, 0, _ptn_ultimo(hdr, "/"))
+    sea incluir = " -I" + _ptn_comillas(dir_hdr)
+    para d en op["incluir"] ?? [] { incluir = incluir + " -I" + _ptn_comillas(_ptn_absoluta(d)) }
+    sea std = op["std"] ?? "c++17"
+    sea compilador = variable_entorno("CXX") ?? "clang++"
+    si (compilador == "") { compilador = "clang++" }
+    // 1. AST de clang, solo de las declaraciones de la cabecera.
+    sea nodos = []
+    sea nombres = op["nombres"] ?? _ptn_cpp_nombres(leer_archivo(hdr))
+    para nm en nombres {
+        sea r = _ptn_ejecutar("clang++ -x c++ -std=" + std + " -fsyntax-only -Wno-everything" + incluir + " -Xclang -ast-dump=json -Xclang -ast-dump-filter -Xclang " + _ptn_comillas(nm) + " " + _ptn_comillas(hdr))
+        si (r["codigo"] != 0) { lanzar "puente: clang++ no pudo leer " + cabecera + ":\n" + r["salida"] }
+        para o en _ptn_json_varios(r["salida"]) {
+            si ((o["name"] ?? "") == nm y ((o["loc"] ?? {})["file"] ?? hdr) != "" y o["kind"] != "UsingDirectiveDecl") {
+                sea archivo = (o["loc"] ?? {})["file"] ?? ""
+                si (archivo == "" o texto_termina_con(_ptn_absoluta(archivo), subtexto(hdr, _ptn_ultimo(hdr, "/"), longitud(hdr))) o texto_empieza_con(_ptn_absoluta(archivo), dir_hdr)) { nodos.agregar(o) }
+            }
+        }
+    }
+    // 2. Clases y enums (primera pasada) y funciones (segunda).
+    sea clases = {}
+    sea enums = {}
+    sea decls = []
+    para o en nodos { _ptn_cpp_recorrer(o, "", clases, enums, decls) }
+    sea vistos = {}
+    sea funciones = []
+    sea omitidas = []
+    sea capa = []
+    para d en decls {
+        sea f = _ptn_cpp_funcion(d, lib, clases, enums, vistos)
+        si (tipo(f) == "texto") { omitidas.agregar(f) } sino {
+            funciones.agregar(f["api"])
+            capa.agregar(f["c"])
+        }
+    }
+    para c en claves(clases) {
+        sea n = _ptn_unico(vistos, lib + "_" + c + "_liberar")
+        sea sim = "__" + n
+        capa.agregar("extern \"C\" void " + sim + "(void* p) { delete (" + clases[c]["calificado"] + "*)p; }")
+        funciones.agregar({"nombre": n, "simbolo": sim, "params": [{"nombre": "objeto", "tipo": "objeto:" + c}], "ret": "nulo", "firma": "delete " + c})
+    }
+    // 3. Capa C y biblioteca compartida.
+    sea dest = puente_directorio() + "/cpp_" + lib
+    sistema_comando("mkdir -p " + _ptn_comillas(dest))
+    sea cpp = _PTN_CPP_PROLOGO + "#include \"" + hdr + "\"\n\n" + texto_reemplazar(_PTN_CPP_AYUDA, "LIB", lib) + "\n" + unir(capa, "\n") + "\n"
+    escribir_archivo(dest + "/capa.cpp", cpp)
+    sea so = dest + "/lib" + lib + "_cforge.so"
+    sea fuentes = ""
+    para f en op["fuentes"] ?? [] { fuentes = fuentes + " " + _ptn_comillas(_ptn_absoluta(f)) }
+    sea r = _ptn_ejecutar(compilador + " -std=" + std + " -O2 -shared -fPIC" + incluir + " " + _ptn_comillas(dest + "/capa.cpp") + fuentes + " -o " + _ptn_comillas(so) + " " + (op["enlazar"] ?? ""))
+    si (r["codigo"] != 0) { lanzar "puente: no se pudo compilar la capa C++:\n" + r["salida"] }
+    sea api = {"lib": lib, "so": so, "origen": cabecera, "lenguaje": "C++", "funciones": funciones, "omitidas": omitidas}
+    sea modulo = _ptn_modulo(api)
+    sea ruta = puente_directorio() + "/cpp_" + lib + ".cfv"
+    escribir_archivo(ruta, modulo)
+    si ((op["salida"] ?? nulo) != nulo) { escribir_archivo(op["salida"], modulo) }
+    retornar {"modulo": modulo, "ruta": ruta, "so": so, "funciones": longitud(funciones), "omitidas": omitidas}
+}
+
+sea _PTN_CPP_PROLOGO = "// Capa C generada por cforge bindgen. No editar.\n#include <string>\n#include <vector>\n#include <sstream>\n#include <cstdlib>\n#include <exception>\n#include <utility>\n"
+
+sea _PTN_CPP_AYUDA = "static thread_local std::string cfx_err, cfx_ret;\nextern \"C\" const char* __LIB__error() { static thread_local std::string e; e = cfx_err; cfx_err.clear(); return e.c_str(); }\nstatic const char* cfx_rtex(const std::string& s) { cfx_ret = s; return cfx_ret.c_str(); }\ntemplate <class T> static std::vector<T> cfx_vnum(const char* s) { std::vector<T> v; if (!s || !*s) return v; const char* p = s; while (*p) { char* f; double x = std::strtod(p, &f); v.push_back((T)x); p = *f == ',' ? f + 1 : f; if (f == p && *p) break; } return v; }\nstatic std::vector<std::string> cfx_vtex(const char* s) { std::vector<std::string> v; if (!s || !*s) return v; std::string t(s); size_t i = 0; for (;;) { size_t j = t.find('\\x1f', i); v.push_back(t.substr(i, j == std::string::npos ? std::string::npos : j - i)); if (j == std::string::npos) break; i = j + 1; } return v; }\ntemplate <class V> static const char* cfx_rvnum(const V& v) { std::ostringstream o; o.precision(17); for (size_t i = 0; i < v.size(); i++) { if (i) o << ','; o << (double)v[i]; } cfx_ret = o.str(); return cfx_ret.c_str(); }\nstatic const char* cfx_rvtex(const std::vector<std::string>& v) { std::string r; for (size_t i = 0; i < v.size(); i++) { if (i) r += '\\x1f'; r += v[i]; } cfx_ret = r; return cfx_ret.c_str(); }\n#define CFX_TRY try {\n#define CFX_CATCH } catch (const std::exception& e) { cfx_err = e.what(); } catch (...) { cfx_err = \"excepción de C++\"; }\n"
+
+funcion _ptn_cpp_recorrer(o, ns, clases, enums, decls) {
+    si (o["isImplicit"] ?? falso) { retornar nulo }
+    sea k = o["kind"] ?? ""
+    sea nombre = o["name"] ?? ""
+    si (k == "NamespaceDecl") {
+        sea nn = si(ns == "", nombre, ns + "::" + nombre)
+        para h en o["inner"] ?? [] { _ptn_cpp_recorrer(h, nn, clases, enums, decls) }
+    } sino si (k == "EnumDecl" y nombre != "") {
+        enums[nombre] = si(ns == "", nombre, ns + "::" + nombre)
+        enums[si(ns == "", nombre, ns + "::" + nombre)] = si(ns == "", nombre, ns + "::" + nombre)
+    } sino si (k == "CXXRecordDecl" y nombre != "" y (o["completeDefinition"] ?? falso) y (o["inner"] ?? nulo) != nulo) {
+        sea cal = si(ns == "", nombre, ns + "::" + nombre)
+        clases[nombre] = {"calificado": cal}
+        sea publico = (o["tagUsed"] ?? "class") != "class"
+        sea abstracta = falso
+        para h en o["inner"] {
+            si (h["kind"] == "AccessSpecDecl") { publico = h["access"] == "public" }
+            si (publico y (h["isImplicit"] ?? falso) == falso y (h["kind"] == "CXXMethodDecl" o h["kind"] == "CXXConstructorDecl")) {
+                si (h["pure"] ?? falso) { abstracta = verdadero }
+                decls.agregar({"nodo": h, "clase": nombre, "calificado": cal})
+            }
+        }
+        clases[nombre]["abstracta"] = abstracta
+    } sino si (k == "FunctionDecl" y nombre != "" y (o["storageClass"] ?? "") != "static") {
+        decls.agregar({"nodo": o, "clase": nulo, "calificado": si(ns == "", nombre, ns + "::" + nombre)})
+    }
+    retornar nulo
+}
+
+// Devuelve {"api", "c"} o el texto de por qué se omitió.
+funcion _ptn_cpp_funcion(d, lib, clases, enums, vistos) {
+    sea o = d["nodo"]
+    sea nombre = o["name"]
+    sea firma = si(d["clase"] != nulo, d["calificado"] + "::" + nombre, d["calificado"]) + ": " + _ptn_cpp_qual(o)
+    si (o["kind"] != "CXXConstructorDecl" y texto_empieza_con(nombre, "operator")) { retornar firma + " (operador)" }
+    si ((o["variadic"] ?? falso)) { retornar firma + " (argumentos variables)" }
+    si (o["kind"] == "FunctionTemplateDecl") { retornar firma + " (plantilla)" }
+    sea ps = []
+    para h en o["inner"] ?? [] {
+        si (h["kind"] == "ParmVarDecl") { ps.agregar(h) }
+    }
+    sea params = []
+    sea c_params = []
+    sea c_args = []
+    sea metodo = d["clase"] != nulo y o["kind"] == "CXXMethodDecl" y (o["storageClass"] ?? "") != "static"
+    si (metodo) {
+        params.agregar({"nombre": "objeto", "tipo": "objeto:" + d["clase"]})
+        c_params.agregar("void* self")
+    }
+    sea i = 0
+    para p en ps {
+        sea info = _ptn_cpp_tipo(_ptn_cpp_qual(p), clases, enums)
+        si (info == nulo) { retornar firma + " (tipo de parámetro no soportado: " + _ptn_cpp_qual(p) + ")" }
+        params.agregar({"nombre": p["name"] ?? "", "tipo": info["tipo"]})
+        c_params.agregar(info["c"] + " a" + i)
+        c_args.agregar(_ptn_cpp_arg(info, "a" + i))
+        i = i + 1
+    }
+    sea qual = _ptn_cpp_qual(o)
+    sea tipo_ret = texto_recortar(subtexto(qual, 0, texto_indice(qual, "(")))
+    sea es_ctor = o["kind"] == "CXXConstructorDecl"
+    sea ret = nulo
+    si (es_ctor) {
+        si (clases[d["clase"]]["abstracta"]) { retornar firma + " (clase abstracta)" }
+        ret = {"tipo": "objeto:" + d["clase"], "c": "void*", "forma": "nuevo"}
+    } sino {
+        ret = _ptn_cpp_tipo(tipo_ret, clases, enums)
+        si (ret == nulo) { retornar firma + " (tipo de retorno no soportado: " + tipo_ret + ")" }
+    }
+    sea base = si(d["clase"] == nulo, nombre, d["clase"] + "_" + si(es_ctor, "nuevo", nombre))
+    sea cf = _ptn_unico(vistos, lib + "_" + base)
+    sea sim = "__" + cf
+    sea llamada = ""
+    si (es_ctor) { llamada = "new " + d["calificado"] + "(" + unir(c_args, ", ") + ")" }
+    sino si (metodo) { llamada = "((" + d["calificado"] + "*)self)->" + nombre + "(" + unir(c_args, ", ") + ")" }
+    sino si (d["clase"] != nulo) { llamada = d["calificado"] + "::" + nombre + "(" + unir(c_args, ", ") + ")" }
+    sino { llamada = d["calificado"] + "(" + unir(c_args, ", ") + ")" }
+    sea cuerpo = ""
+    si (es_ctor) { cuerpo = "return (void*)" + llamada + ";" }
+    sino si (ret["tipo"] == "nulo") { cuerpo = llamada + ";" }
+    sino si (ret["forma"] == "ref") { cuerpo = "auto& r = " + llamada + "; " + _ptn_cpp_texto_ret(ret) }
+    sino si (ret["forma"] == "cstr") { cuerpo = "return " + llamada + ";" }
+    sino si (ret["tipo"] == "entero" o ret["tipo"] == "largo" o ret["tipo"] == "numero") { cuerpo = "return (" + ret["c"] + ")" + llamada + ";" }
+    sino { cuerpo = "auto r = " + llamada + "; " + _ptn_cpp_texto_ret(ret) }
+    sea c = "extern \"C\" " + ret["c"] + " " + sim + "(" + unir(c_params, ", ") + ") { CFX_TRY " + cuerpo + " CFX_CATCH" + _ptn_cpp_defecto(ret) + " }"
+    retornar {"api": {"nombre": cf, "simbolo": sim, "params": params, "ret": ret["tipo"], "firma": firma}, "c": c}
+}
+
+// ---------- Rust ----------
+
+sea _PTN_RS_ENTEROS = ["i8", "i16", "i32", "u8", "u16"]
+sea _PTN_RS_LARGOS = ["u32", "i64", "u64", "isize", "usize", "i128", "u128"]
+
+funcion _ptn_rs_nombre_crate(n) { retornar texto_reemplazar(n, "-", "_") }
+
+// Tipo de rustdoc → {"tipo", "c": tipo Rust de la capa, "conv": función de
+// conversión del argumento, "ret": conversión del resultado} o nulo.
+funcion _ptn_rs_tipo(t, ctx, yo) {
+    si (t == nulo) { retornar {"tipo": "nulo", "c": "()", "forma": "unidad"} }
+    si (tiene_clave(t, "primitive")) {
+        sea p = t["primitive"]
+        si (lista_contiene(_PTN_RS_ENTEROS, p)) { retornar {"tipo": "entero", "c": "i32", "forma": "prim", "rs": p} }
+        si (lista_contiene(_PTN_RS_LARGOS, p)) { retornar {"tipo": "largo", "c": "i64", "forma": "prim", "rs": p} }
+        si (p == "f32" o p == "f64") { retornar {"tipo": "numero", "c": "f64", "forma": "prim", "rs": p} }
+        si (p == "bool") { retornar {"tipo": "booleano", "c": "bool", "forma": "prim", "rs": p} }
+        si (p == "char") { retornar {"tipo": "texto", "c": "*const c_char", "forma": "char"} }
+        retornar nulo
+    }
+    si (tiene_clave(t, "borrowed_ref")) {
+        sea b = t["borrowed_ref"]
+        sea dentro = b["type"]
+        si (tiene_clave(dentro, "primitive") y dentro["primitive"] == "str") { retornar {"tipo": "texto", "c": "*const c_char", "forma": "str"} }
+        si (tiene_clave(dentro, "slice")) {
+            sea e = _ptn_rs_elem(dentro["slice"])
+            si (e == nulo) { retornar nulo }
+            retornar {"tipo": e[0], "c": "*const c_char", "forma": "slice", "rs": e[1]}
+        }
+        sea o = _ptn_rs_tipo(dentro, ctx, yo)
+        si (o == nulo) { retornar nulo }
+        si (texto_empieza_con(o["tipo"], "objeto:")) { retornar {"tipo": o["tipo"], "c": "*mut c_void", "forma": si(b["is_mutable"], "refmut", "ref"), "rs": o["rs"]} }
+        si (o["forma"] == "string") { retornar {"tipo": "texto", "c": "*const c_char", "forma": "str"} }
+        si (o["forma"] == "vec") { retornar {"tipo": o["tipo"], "c": "*const c_char", "forma": "slice", "rs": o["rs"]} }
+        si (o["forma"] == "prim" y b["is_mutable"] == falso) { retornar {"tipo": o["tipo"], "c": o["c"], "forma": "refprim", "rs": o["rs"]} }
+        retornar nulo
+    }
+    si (tiene_clave(t, "generic")) {
+        si (t["generic"] == "Self" y yo != nulo) { retornar {"tipo": "objeto:" + yo["nombre"], "c": "*mut c_void", "forma": "obj", "rs": yo["ruta"], "clone": yo["clone"]} }
+        retornar nulo
+    }
+    si (tiene_clave(t, "resolved_path")) {
+        sea rp = t["resolved_path"]
+        sea nombre = rp["path"] ?? rp["name"] ?? ""
+        sea ult = nombre
+        si (texto_contiene(ult, "::")) { ult = subtexto(ult, _ptn_ultimo_de(ult, "::") + 2, longitud(ult)) }
+        sea args = []
+        si (rp["args"] != nulo y tiene_clave(rp["args"], "angle_bracketed")) {
+            para a en rp["args"]["angle_bracketed"]["args"] {
+                si (tiene_clave(a, "type")) { args.agregar(a["type"]) }
+            }
+        }
+        sea id = "" + (rp["id"] ?? "")
+        si (tiene_clave(ctx["tipos"], id) y longitud(args) == 0) {
+            sea x = ctx["tipos"][id]
+            retornar {"tipo": "objeto:" + x["nombre"], "c": "*mut c_void", "forma": "obj", "rs": x["ruta"], "clone": x["clone"]}
+        }
+        sea alias = ctx["idx"][id] ?? nulo
+        si (alias != nulo y tiene_clave(alias["inner"], "type_alias") y _ptn_rs_generico(alias["inner"]["type_alias"]["generics"]) == falso) { retornar _ptn_rs_tipo(alias["inner"]["type_alias"]["type"], ctx, yo) }
+        si (ult == "String") { retornar {"tipo": "texto", "c": "*const c_char", "forma": "string"} }
+        si (ult == "Ordering") { retornar {"tipo": "entero", "c": "i32", "forma": "orden"} }
+        si (ult == "Vec" y longitud(args) == 1) {
+            sea e = _ptn_rs_elem(args[0])
+            si (e == nulo) { retornar nulo }
+            retornar {"tipo": e[0], "c": "*const c_char", "forma": "vec", "rs": e[1]}
+        }
+        si ((ult == "Result" o ult == "Option") y longitud(args) >= 1) {
+            sea i = _ptn_rs_tipo(args[0], ctx, yo)
+            si (i == nulo) { retornar nulo }
+            si (ult == "Option" y texto_empieza_con(i["tipo"], "objeto:") == falso y i["tipo"] != "texto") { retornar nulo }
+            retornar {"tipo": i["tipo"], "c": i["c"], "forma": si(ult == "Result", "result", "option"), "interno": i, "rs": i["rs"] ?? ""}
+        }
+        retornar nulo
+    }
+    si (tiene_clave(t, "tuple") y longitud(t["tuple"]) == 0) { retornar {"tipo": "nulo", "c": "()", "forma": "unidad"} }
+    retornar nulo
+}
+
+funcion _ptn_ultimo_de(t, sub) {
+    sea i = longitud(t) - longitud(sub)
+    mientras (i >= 0 y subtexto(t, i, i + longitud(sub)) != sub) { i = i - 1 }
+    retornar i
+}
+
+// Elemento de lista: ["lista_num" | "lista_texto", tipo Rust del elemento].
+funcion _ptn_rs_elem(t) {
+    si (tiene_clave(t, "primitive")) {
+        sea p = t["primitive"]
+        si (lista_contiene(_PTN_RS_ENTEROS, p) o lista_contiene(_PTN_RS_LARGOS, p) o p == "f32" o p == "f64") { retornar ["lista_num", p] }
+        retornar nulo
+    }
+    si (tiene_clave(t, "resolved_path") y (t["resolved_path"]["path"] ?? "") == "String") { retornar ["lista_texto", "String"] }
+    si (tiene_clave(t, "borrowed_ref") y tiene_clave(t["borrowed_ref"]["type"], "primitive") y t["borrowed_ref"]["type"]["primitive"] == "str") { retornar ["lista_texto", "&str"] }
+    retornar nulo
+}
+
+// Expresión Rust que convierte el argumento "n" (tipo de la capa) al tipo pedido.
+funcion _ptn_rs_arg(info, n) {
+    sea f = info["forma"]
+    si (f == "prim") { retornar n + " as " + info["rs"] }
+    si (f == "refprim") { retornar "&(" + n + " as " + info["rs"] + ")" }
+    si (f == "str") { retornar "cfx_str(" + n + ")" }
+    si (f == "string") { retornar "cfx_str(" + n + ").to_string()" }
+    si (f == "char") { retornar "cfx_str(" + n + ").chars().next().unwrap_or('\\0')" }
+    si (f == "obj") {
+        si (info["clone"] ?? falso) { retornar "unsafe { (*(" + n + " as *const " + info["rs"] + ")).clone() }" }
+        retornar nulo
+    }
+    si (f == "ref") { retornar "unsafe { &*(" + n + " as *const " + info["rs"] + ") }" }
+    si (f == "refmut") { retornar "unsafe { &mut *(" + n + " as *mut " + info["rs"] + ") }" }
+    si (f == "vec" o f == "slice") {
+        sea v = si(info["tipo"] == "lista_texto", "cfx_vtex(" + n + ")", "cfx_vnum::<" + info["rs"] + ">(" + n + ")")
+        si (info["rs"] == "&str") { v = "cfx_vtex(" + n + ").iter().map(|s| s.as_str()).collect::<Vec<&str>>()" }
+        si (f == "slice") { retornar "&" + v + "[..]" }
+        retornar v
+    }
+    retornar nulo
+}
+
+// Conversión del resultado "r" al tipo de la capa.
+funcion _ptn_rs_ret(info) {
+    sea f = info["forma"]
+    si (f == "unidad") { retornar "()" }
+    si (f == "prim") { retornar "r as " + info["c"] }
+    si (f == "orden") { retornar "r as i32" }
+    si (f == "string" o f == "str") { retornar "cfx_rtex(&r)" }
+    si (f == "char") { retornar "cfx_rtex(&r.to_string())" }
+    si (f == "obj") { retornar "Box::into_raw(Box::new(r)) as *mut c_void" }
+    si (f == "ref" o f == "refmut") { retornar "r as *const _ as *mut c_void" }
+    si (f == "vec" o f == "slice") {
+        si (info["tipo"] == "lista_texto") { retornar "cfx_rvtex(r.iter().map(|s| s.to_string()).collect())" }
+        retornar "cfx_rvnum(r.iter().map(|x| *x as f64).collect())"
+    }
+    retornar nulo
+}
+
+funcion _ptn_rs_defecto(info) {
+    si (info["c"] == "()") { retornar "()" }
+    si (info["c"] == "*const c_char") { retornar "std::ptr::null()" }
+    si (info["c"] == "*mut c_void") { retornar "std::ptr::null_mut()" }
+    si (info["c"] == "bool") { retornar "false" }
+    si (info["c"] == "f64") { retornar "0.0" }
+    retornar "0"
+}
+
+funcion _ptn_rs_generico(g) {
+    para p en (g ?? {})["params"] ?? [] {
+        si (tiene_clave(p["kind"] ?? {}, "lifetime") == falso) { retornar verdadero }
+    }
+    retornar falso
+}
+
+/// Genera el módulo para un crate de Rust: "nombre", "nombre@versión" o la
+/// ruta de un crate local. opciones: "lib" (prefijo de las funciones),
+/// "salida" (.cfv). Necesita cargo. Devuelve {"modulo", "ruta", "so",
+/// "funciones", "omitidas"}.
+funcion puente_rust(spec, opciones) {
+    sea op = opciones ?? {}
+    sea dep = ""
+    sea crate = spec
+    si (texto_contiene(spec, "/") o texto_empieza_con(spec, ".") o existe_archivo(spec + "/Cargo.toml")) {
+        sea ruta = _ptn_absoluta(spec)
+        si (existe_archivo(ruta + "/Cargo.toml") == falso) { lanzar "puente: no hay Cargo.toml en " + spec }
+        sea toml = leer_archivo(ruta + "/Cargo.toml")
+        crate = _ptn_toml_nombre(toml)
+        dep = crate + " = { path = \"" + ruta + "\" }"
+    } sino {
+        sea ver = "*"
+        si (texto_contiene(spec, "@")) {
+            sea p = texto_dividir(spec, "@")
+            crate = p[0]
+            ver = p[1]
+        }
+        dep = crate + " = \"" + ver + "\""
+    }
+    sea ident = _ptn_rs_nombre_crate(crate)
+    sea lib = op["lib"] ?? ident
+    sea dest = puente_directorio() + "/rust_" + lib
+    sistema_comando("mkdir -p " + _ptn_comillas(dest + "/src"))
+    escribir_archivo(dest + "/Cargo.toml", "[package]\nname = \"" + lib + "_cforge\"\nversion = \"0.1.0\"\nedition = \"2021\"\n\n[lib]\ncrate-type = [\"cdylib\"]\n\n[dependencies]\n" + dep + "\n\n[profile.release]\npanic = \"unwind\"\n\n[workspace]\n")
+    escribir_archivo(dest + "/src/lib.rs", "")
+    // 1. API pública con rustdoc (JSON).
+    sea r = _ptn_ejecutar("cd " + _ptn_comillas(dest) + " && RUSTC_BOOTSTRAP=1 cargo rustdoc -q -p " + crate + " --lib -- -Z unstable-options --output-format json")
+    si (r["codigo"] != 0) { lanzar "puente: cargo no pudo documentar " + crate + ":\n" + r["salida"] }
+    sea doc = json_parsear(leer_archivo(dest + "/target/doc/" + ident + ".json"))
+    sea ctx = {"doc": doc, "idx": doc["index"], "tipos": {}, "items": []}
+    _ptn_rs_modulo(ctx, "" + doc["root"], ident, "", {})
+    // 2. Capa con interfaz C: una línea por función, para poder quitar las
+    // que no compilen y volver a intentar.
+    sea vistos = {}
+    sea funciones = []
+    sea omitidas = []
+    sea capa = []
+    para it en ctx["items"] {
+        sea f = _ptn_rs_funcion(ctx, it, lib, vistos)
+        si (tipo(f) == "texto") { omitidas.agregar(f) } sino {
+            funciones.agregar(f["api"])
+            capa.agregar(f["rs"])
+        }
+    }
+    sea so = ""
+    sea intento = 0
+    mientras (verdadero) {
+        escribir_archivo(dest + "/src/lib.rs", texto_reemplazar(_PTN_RS_PROLOGO, "LIB", lib) + unir(capa, "\n") + "\n")
+        sea b = _ptn_ejecutar("cd " + _ptn_comillas(dest) + " && cargo build -q --release --message-format short")
+        si (b["codigo"] == 0) { romper }
+        intento = intento + 1
+        // Quita las funciones con errores ("src/lib.rs:LÍNEA:COL: error…").
+        sea prologo = longitud(texto_dividir(texto_reemplazar(_PTN_RS_PROLOGO, "LIB", lib), "\n")) - 1
+        sea malas = {}
+        para linea en texto_dividir(b["salida"], "\n") {
+            sea k = texto_indice(linea, "src/lib.rs:")
+            si (k >= 0 y texto_contiene(linea, "error")) {
+                sea resto = texto_dividir(subtexto(linea, k + 11, longitud(linea)), ":")
+                sea n = a_numero(resto[0]) - prologo - 1
+                si (n >= 0 y n < longitud(capa)) { malas["" + n] = subtexto(linea, texto_indice(linea, "error"), minimo(longitud(linea), texto_indice(linea, "error") + 120)) }
+            }
+        }
+        si (longitud(claves(malas)) == 0 o intento > 6) { lanzar "puente: no se pudo compilar la capa de Rust:\n" + b["salida"] }
+        sea c2 = []
+        sea f2 = []
+        para i en lista_rango(0, longitud(capa)) {
+            si (tiene_clave(malas, "" + i)) { omitidas.agregar(funciones[i]["firma"] + " (no compila: " + malas["" + i] + ")") } sino {
+                c2.agregar(capa[i])
+                f2.agregar(funciones[i])
+            }
+        }
+        capa = c2
+        funciones = f2
+    }
+    so = dest + "/lib" + lib + "_cforge.so"
+    sistema_comando("cp " + _ptn_comillas(dest + "/target/release/lib" + lib + "_cforge.so") + " " + _ptn_comillas(so))
+    sea api = {"lib": lib, "so": so, "origen": "rust:" + spec, "lenguaje": "Rust", "funciones": funciones, "omitidas": omitidas}
+    sea modulo = _ptn_modulo(api)
+    sea ruta = puente_directorio() + "/rust_" + lib + ".cfv"
+    escribir_archivo(ruta, modulo)
+    si ((op["salida"] ?? nulo) != nulo) { escribir_archivo(op["salida"], modulo) }
+    retornar {"modulo": modulo, "ruta": ruta, "so": so, "funciones": longitud(funciones), "omitidas": omitidas}
+}
+
+funcion _ptn_toml_nombre(toml) {
+    sea en_paquete = falso
+    para l0 en texto_dividir(toml, "\n") {
+        sea l = texto_recortar(l0)
+        si (texto_empieza_con(l, "[")) { en_paquete = l == "[package]" }
+        si (en_paquete y texto_empieza_con(l, "name")) {
+            sea q = texto_dividir(l, "\"")
+            si (longitud(q) >= 2) { retornar q[1] }
+        }
+    }
+    lanzar "puente: Cargo.toml sin [package] name"
+}
+
+// Recorre los módulos públicos y junta funciones, tipos y sus métodos.
+funcion _ptn_rs_modulo(ctx, id, ruta, prefijo, vistos) {
+    si (tiene_clave(vistos, id)) { retornar nulo }
+    vistos[id] = verdadero
+    sea m = ctx["idx"][id] ?? nulo
+    si (m == nulo) { retornar nulo }
+    // Primero los tipos (para reconocerlos en las firmas).
+    para pasada en [1, 2] {
+        para i en m["inner"]["module"]["items"] {
+            sea it = ctx["idx"]["" + i] ?? nulo
+            sea nombre = nulo
+            si (it != nulo y tiene_clave(it["inner"], "use")) {
+                sea u = it["inner"]["use"]
+                nombre = u["name"]
+                si (u["is_glob"] ?? falso) { it = nulo } sino {
+                    it = ctx["idx"]["" + (u["id"] ?? "")] ?? nulo
+                }
+            } sino si (it != nulo) { nombre = it["name"] }
+            si (it != nulo y it["visibility"] == "public") {
+                sea k = claves(it["inner"])[0]
+                sea r2 = ruta + "::" + nombre
+                si (pasada == 1 y (k == "struct" o k == "enum") y _ptn_rs_generico(it["inner"][k]["generics"]) == falso) {
+                    sea traits = []
+                    para im en it["inner"][k]["impls"] {
+                        sea x = ctx["idx"]["" + im]["inner"]["impl"]
+                        si (x["trait"] != nulo y (x["blanket_impl"] ?? nulo) == nulo) { traits.agregar(x["trait"]["path"] ?? x["trait"]["name"] ?? "") }
+                    }
+                    ctx["tipos"]["" + it["id"]] = {"nombre": prefijo + nombre, "ruta": r2, "clone": lista_contiene(traits, "Clone"), "display": lista_contiene(traits, "Display"), "debug": lista_contiene(traits, "Debug"), "item": it, "clase": k}
+                }
+                si (pasada == 2) {
+                    si (k == "function") { ctx["items"].agregar({"item": it, "ruta": r2, "nombre": prefijo + nombre, "yo": nulo}) }
+                    si (k == "module") { _ptn_rs_modulo(ctx, "" + it["id"], r2, prefijo + nombre + "_", vistos) }
+                    si (tiene_clave(ctx["tipos"], "" + it["id"])) { _ptn_rs_tipo_items(ctx, ctx["tipos"]["" + it["id"]]) }
+                }
+            }
+        }
+    }
+    retornar nulo
+}
+
+// Métodos públicos de los impl propios, campos públicos y Display / Debug.
+funcion _ptn_rs_tipo_items(ctx, x) {
+    si (x["hecho"] ?? falso) { retornar nulo }
+    x["hecho"] = verdadero
+    sea it = x["item"]
+    para im en it["inner"][x["clase"]]["impls"] {
+        sea imp = ctx["idx"]["" + im]["inner"]["impl"]
+        si (imp["trait"] == nulo y _ptn_rs_generico(imp["generics"]) == falso) {
+            para fi en imp["items"] {
+                sea f = ctx["idx"]["" + fi] ?? nulo
+                si (f != nulo y f["visibility"] == "public" y tiene_clave(f["inner"], "function")) {
+                    ctx["items"].agregar({"item": f, "ruta": x["ruta"] + "::" + f["name"], "nombre": x["nombre"] + "_" + f["name"], "yo": x})
+                }
+            }
+        }
+    }
+    si (x["clase"] == "struct" y tiene_clave(it["inner"]["struct"]["kind"], "plain")) {
+        para fid en it["inner"]["struct"]["kind"]["plain"]["fields"] {
+            sea c = ctx["idx"]["" + fid] ?? nulo
+            si (c != nulo y c["visibility"] == "public") { ctx["items"].agregar({"campo": c, "nombre": x["nombre"] + "_" + c["name"], "yo": x}) }
+        }
+    }
+    si (x["display"]) { ctx["items"].agregar({"especial": "display", "nombre": x["nombre"] + "_texto", "yo": x}) }
+    si (x["debug"]) { ctx["items"].agregar({"especial": "debug", "nombre": x["nombre"] + "_depurar", "yo": x}) }
+    ctx["items"].agregar({"especial": "liberar", "nombre": x["nombre"] + "_liberar", "yo": x})
+    retornar nulo
+}
+
+// Una función de la capa (una línea) o el texto de por qué se omite.
+funcion _ptn_rs_funcion(ctx, e, lib, vistos) {
+    sea yo = e["yo"]
+    sea cf = _ptn_unico(vistos, lib + "_" + e["nombre"])
+    sea sim = "__" + cf
+    sea obj = nulo
+    si (yo != nulo) { obj = {"tipo": "objeto:" + yo["nombre"], "c": "*mut c_void", "forma": "ref", "rs": yo["ruta"]} }
+    si (tiene_clave(e, "especial")) {
+        sea esp = e["especial"]
+        si (esp == "liberar") {
+            retornar {"api": {"nombre": cf, "simbolo": sim, "params": [{"nombre": "objeto", "tipo": obj["tipo"]}], "ret": "nulo", "firma": "drop(" + yo["ruta"] + ")"},
+                "rs": "#[no_mangle] pub extern \"C\" fn " + sim + "(a0: *mut c_void) { if !a0.is_null() { unsafe { drop(Box::from_raw(a0 as *mut " + yo["ruta"] + ")); } } }"}
+        }
+        sea fmt = si(esp == "display", "{}", "{:?}")
+        retornar {"api": {"nombre": cf, "simbolo": sim, "params": [{"nombre": "objeto", "tipo": obj["tipo"]}], "ret": "texto", "firma": si(esp == "display", "Display", "Debug") + " de " + yo["ruta"]},
+            "rs": "#[no_mangle] pub extern \"C\" fn " + sim + "(a0: *mut c_void) -> *const c_char { cfx_run(|| { let o = unsafe { &*(a0 as *const " + yo["ruta"] + ") }; Ok(cfx_rtex(&format!(\"" + fmt + "\", o))) }).unwrap_or(std::ptr::null()) }"}
+    }
+    si (tiene_clave(e, "campo")) {
+        sea c = e["campo"]
+        sea info = _ptn_rs_tipo(c["inner"]["struct_field"], ctx, yo)
+        si (info == nulo o (info["forma"] != "prim" y info["forma"] != "string" y info["forma"] != "vec")) { retornar yo["ruta"] + "." + c["name"] + " (tipo de campo no soportado)" }
+        sea conv = texto_reemplazar(_ptn_rs_ret(info), "r.", "o." + c["name"] + ".")
+        si (info["forma"] == "prim") { conv = "o." + c["name"] + " as " + info["c"] }
+        si (info["forma"] == "string") { conv = "cfx_rtex(&o." + c["name"] + ")" }
+        retornar {"api": {"nombre": cf, "simbolo": sim, "params": [{"nombre": "objeto", "tipo": obj["tipo"]}], "ret": info["tipo"], "firma": yo["ruta"] + "." + c["name"]},
+            "rs": "#[no_mangle] pub extern \"C\" fn " + sim + "(a0: *mut c_void) -> " + info["c"] + " { cfx_run(|| { let o = unsafe { &*(a0 as *const " + yo["ruta"] + ") }; Ok(" + conv + ") }).unwrap_or(" + _ptn_rs_defecto(info) + ") }"}
+    }
+    sea it = e["item"]
+    sea fn_ = it["inner"]["function"]
+    sea firma = e["ruta"]
+    si (_ptn_rs_generico(fn_["generics"])) { retornar firma + " (genérica)" }
+    sea h = fn_["header"] ?? {}
+    si (h["is_async"] ?? falso) { retornar firma + " (async)" }
+    si (h["is_unsafe"] ?? falso) { retornar firma + " (unsafe)" }
+    sea params = []
+    sea c_params = []
+    sea args = []
+    sea i = 0
+    sea metodo = falso
+    para entrada en fn_["sig"]["inputs"] {
+        sea n = entrada[0]
+        sea t = entrada[1]
+        si (i == 0 y n == "self" y yo != nulo) {
+            metodo = verdadero
+            sea forma = "ref"
+            si (tiene_clave(t, "borrowed_ref") y t["borrowed_ref"]["is_mutable"]) { forma = "refmut" }
+            si (tiene_clave(t, "generic")) {
+                si (yo["clone"] == falso) { retornar firma + " (consume self y el tipo no es Clone)" }
+                forma = "obj"
+            }
+            params.agregar({"nombre": "objeto", "tipo": "objeto:" + yo["nombre"]})
+            c_params.agregar("a0: *mut c_void")
+            args.agregar(_ptn_rs_arg({"forma": forma, "rs": yo["ruta"], "clone": verdadero}, "a0"))
+        } sino {
+            sea info = _ptn_rs_tipo(t, ctx, yo)
+            si (info == nulo o info["forma"] == "result" o info["forma"] == "option" o info["forma"] == "unidad" o info["forma"] == "orden") { retornar firma + " (tipo de parámetro no soportado: " + n + ")" }
+            sea conv = _ptn_rs_arg(info, "a" + i)
+            si (conv == nulo) { retornar firma + " (" + n + " se pasa por valor y su tipo no es Clone)" }
+            params.agregar({"nombre": n, "tipo": info["tipo"]})
+            c_params.agregar("a" + i + ": " + info["c"])
+            args.agregar(conv)
+        }
+        i = i + 1
+    }
+    sea ret = _ptn_rs_tipo(fn_["sig"]["output"] ?? nulo, ctx, yo)
+    si (ret == nulo) { retornar firma + " (tipo de retorno no soportado)" }
+    sea interno = ret
+    sea cuerpo = ""
+    sea llamada = e["ruta"] + "(" + unir(args, ", ") + ")"
+    si (ret["forma"] == "result") {
+        interno = ret["interno"]
+        cuerpo = "let r = match " + llamada + " { Ok(v) => v, Err(e) => return Err(cfx_msg!(e)) }; "
+    } sino si (ret["forma"] == "option") {
+        interno = ret["interno"]
+        cuerpo = "let r = match " + llamada + " { Some(v) => v, None => return Ok(" + _ptn_rs_defecto(interno) + ") }; "
+    } sino { cuerpo = "let r = " + llamada + "; " }
+    sea conv = _ptn_rs_ret(interno)
+    si (conv == nulo) { retornar firma + " (tipo de retorno no soportado)" }
+    si (interno["forma"] == "unidad") { cuerpo = cuerpo + "let _ = r; Ok(())" } sino { cuerpo = cuerpo + "Ok(" + conv + ")" }
+    sea tret = si(interno["c"] == "()", "", " -> " + interno["c"])
+    sea rs = "#[no_mangle] pub extern \"C\" fn " + sim + "(" + unir(c_params, ", ") + ")" + tret + " { cfx_run(|| { " + cuerpo + " }).unwrap_or(" + _ptn_rs_defecto(interno) + ") }"
+    retornar {"api": {"nombre": cf, "simbolo": sim, "params": params, "ret": interno["tipo"], "firma": firma}, "rs": rs}
+}
+
+sea _PTN_RS_PROLOGO = "// Capa C generada por cforge bindgen. No editar.\n#![allow(unused, clippy::all)]\nuse std::ffi::{c_char, c_void, CStr, CString};\nuse std::cell::RefCell;\nthread_local! { static CFX_ERR: RefCell<String> = RefCell::new(String::new()); static CFX_RET: RefCell<CString> = RefCell::new(CString::default()); static CFX_E: RefCell<CString> = RefCell::new(CString::default()); }\n#[no_mangle] pub extern \"C\" fn __LIB__error() -> *const c_char { let e = CFX_ERR.with(|x| std::mem::take(&mut *x.borrow_mut())); CFX_E.with(|x| { *x.borrow_mut() = CString::new(e.replace('\\0', \" \")).unwrap(); x.borrow().as_ptr() }) }\nfn cfx_str<'a>(p: *const c_char) -> &'a str { if p.is_null() { \"\" } else { unsafe { CStr::from_ptr(p) }.to_str().unwrap_or(\"\") } }\nfn cfx_rtex(s: &str) -> *const c_char { CFX_RET.with(|x| { *x.borrow_mut() = CString::new(s.replace('\\0', \" \")).unwrap(); x.borrow().as_ptr() }) }\nfn cfx_vnum<T: std::str::FromStr + Default>(p: *const c_char) -> Vec<T> { let s = cfx_str(p); if s.is_empty() { return Vec::new(); } s.split(',').map(|x| x.parse::<f64>().ok().and_then(|f| { let t = if f.fract() == 0.0 { format!(\"{}\", f as i128) } else { format!(\"{}\", f) }; t.parse::<T>().ok() }).unwrap_or_default()).collect() }\nfn cfx_vtex(p: *const c_char) -> Vec<String> { let s = cfx_str(p); if s.is_empty() { return Vec::new(); } s.split('\\u{1f}').map(|x| x.to_string()).collect() }\nfn cfx_rvnum(v: Vec<f64>) -> *const c_char { cfx_rtex(&v.iter().map(|x| format!(\"{:?}\", x)).collect::<Vec<_>>().join(\",\")) }\nfn cfx_rvtex(v: Vec<String>) -> *const c_char { cfx_rtex(&v.join(\"\\u{1f}\")) }\nfn cfx_run<R, F: FnOnce() -> Result<R, String>>(f: F) -> Option<R> { static H: std::sync::Once = std::sync::Once::new(); H.call_once(|| std::panic::set_hook(Box::new(|_| {}))); match std::panic::catch_unwind(std::panic::AssertUnwindSafe(f)) { Ok(Ok(v)) => Some(v), Ok(Err(e)) => { CFX_ERR.with(|x| *x.borrow_mut() = e); None } Err(p) => { let m = if let Some(s) = p.downcast_ref::<&str>() { s.to_string() } else if let Some(s) = p.downcast_ref::<String>() { s.clone() } else { \"pánico\".to_string() }; CFX_ERR.with(|x| *x.borrow_mut() = format!(\"pánico: {}\", m)); None } } }\nstruct CfxW<'a, T>(&'a T);\ntrait CfxDisplay { fn cfx(&self) -> String; }\nimpl<T: std::fmt::Display> CfxDisplay for &&CfxW<'_, T> { fn cfx(&self) -> String { self.0.to_string() } }\ntrait CfxDebug { fn cfx(&self) -> String; }\nimpl<T: std::fmt::Debug> CfxDebug for &CfxW<'_, T> { fn cfx(&self) -> String { format!(\"{:?}\", self.0) } }\ntrait CfxNada { fn cfx(&self) -> String; }\nimpl<T> CfxNada for CfxW<'_, T> { fn cfx(&self) -> String { \"error\".to_string() } }\nmacro_rules! cfx_msg { ($e:expr) => {{ let e = $e; (&&&CfxW(&e)).cfx() }} }\n"
+
+// ---------- cforge bindgen ----------
+
+/// Lo que hace `cforge bindgen` con una cabecera C++ o un crate de Rust.
+/// Argumentos: el origen y luego --lib nombre, -o salida.cfv, --fuentes
+/// a.cpp,b.cpp, --enlazar "-lfoo", --incluir dir1,dir2, --std c++20.
+funcion puente_cli(args) {
+    sea origen = args[0]
+    sea op = {}
+    sea lib = nulo
+    sea i = 1
+    mientras (i < longitud(args)) {
+        sea a = args[i]
+        sea v = si(i + 1 < longitud(args), args[i + 1], "")
+        si (a == "--lib") { lib = v }
+        sino si (a == "-o") { op["salida"] = v }
+        sino si (a == "--fuentes") { op["fuentes"] = texto_dividir(v, ",") }
+        sino si (a == "--enlazar") { op["enlazar"] = v }
+        sino si (a == "--incluir") { op["incluir"] = texto_dividir(v, ",") }
+        sino si (a == "--std") { op["std"] = v }
+        si (a != "--cpp") { i = i + 2 } sino { i = i + 1 }
+    }
+    sea r = nulo
+    sea importar_como = ""
+    intentar {
+        si (texto_empieza_con(origen, "rust:")) {
+            si (lib != nulo) { op["lib"] = lib }
+            r = puente_rust(subtexto(origen, 5, longitud(origen)), op)
+            importar_como = "rust:" + _ptn_ultimo_nombre(r["ruta"], "rust_")
+        } sino {
+            si (lib == nulo) {
+                lib = subtexto(origen, _ptn_ultimo(origen, "/") + 1, longitud(origen))
+                lib = subtexto(lib, 0, texto_indice(lib + ".", "."))
+            }
+            r = puente_cpp(origen, lib, op)
+            importar_como = "cpp:" + lib
+        }
+    } capturar (e) {
+        mostrar("✗ cforge bindgen: " + e)
+        salir(1)
+    }
+    mostrar("✓ " + r["funciones"] + " funciones; " + longitud(r["omitidas"]) + " omitidas → importar \"" + importar_como + "\"")
+    mostrar("  módulo: " + r["ruta"])
+    para o en r["omitidas"] { mostrar("  omitida: " + o) }
+    retornar r
+}
+
+funcion _ptn_ultimo_nombre(ruta, prefijo) {
+    sea n = subtexto(ruta, _ptn_ultimo(ruta, "/") + 1, longitud(ruta))
+    retornar subtexto(n, longitud(prefijo), longitud(n) - 4)
+}

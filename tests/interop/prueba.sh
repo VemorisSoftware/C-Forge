@@ -1,11 +1,12 @@
 #!/bin/sh
-# tests/interop/prueba.sh COMPILADOR — Java (JNI) y C# (.NET, hostfxr) dentro
-# de un programa C-Forge. Cada parte se salta si falta su SDK.
+# tests/interop/prueba.sh COMPILADOR — Java (JNI), C# (.NET, hostfxr), C++
+# (clang++) y Rust (cargo) dentro de un programa C-Forge. Cada parte se salta
+# si falta su SDK.
 set -e
 C=$(cd "$(dirname "$1")" && pwd)/$(basename "$1")
 RAIZ=$(cd "$(dirname "$0")/../.." && pwd)
 T=$(mktemp -d)
-cp "$RAIZ"/tests/interop/* "$T/"
+cp -r "$RAIZ"/tests/interop/* "$T/"
 cd "$T"
 export CFORGE_STDLIB="$RAIZ/stdlib"
 unset JAVA_TOOL_OPTIONS _JAVA_OPTIONS
@@ -41,5 +42,53 @@ if command -v dotnet >/dev/null 2>&1; then
     echo "  ✓ C# (.NET): [UnmanagedCallersOnly], long y textos UTF-8"
 else
     echo "  - C#: sin .NET, se salta"
+fi
+export CFORGE_INTEROP="$T/interop"
+if command -v clang++ >/dev/null 2>&1; then
+    "$C" bindgen cpp/geo.hpp --fuentes cpp/geo.cpp | grep -q '31 funciones; 1 omitidas → importar "cpp:geo"'
+    "$C" cpp.cfv > cpp.txt
+    cat > cpp.esperado <<'F'
+5
+(4, 5)
+8
+[3, 12, [0, 3, 3], triángulo]
+4
+[3.14159, 5, 5.5, 2432902008176640000, 2.5, verdadero]
+[¡Hola, Javier!, 2.16667, [2, 3, 4, 5], [a, b, , c], x-y-z]
+32.8084
+error: geo: raíz de un negativo
+error: geo: vértice fuera de rango
+error: geo: lista vacía
+fin
+F
+    diff -u cpp.esperado cpp.txt
+    "$C" build cpp.cfv --release -o cpp_rel >/dev/null
+    ./cpp_rel | diff -u cpp.esperado -
+    echo "  ✓ C++ (clang++): clases, sobrecargas, std::string, std::vector, enums y excepciones"
+else
+    echo "  - C++: sin clang++, se salta"
+fi
+if command -v cargo >/dev/null 2>&1; then
+    "$C" bindgen rust:rust/inventario | grep -q '26 funciones; 1 omitidas → importar "rust:inventario"'
+    "$C" rust.cfv > rust.txt
+    cat > rust.esperado <<'F'
+[45, café ($4.50 × 10), café, 10]
+7
+error: inventario: solo quedan 7
+[4.05, 4.5]
+[2, [café, té], [4.5, 3], 91.5]
+20
+0
+[46, 2.333, nulo, [ÑU, AB], ñ, verdadero, aloh]
+error: inventario: pánico: división por cero
+4
+fin
+F
+    diff -u rust.esperado rust.txt
+    "$C" build rust.cfv --release -o rust_rel >/dev/null
+    ./rust_rel | diff -u rust.esperado -
+    echo "  ✓ Rust (cargo): structs, métodos, campos, Result, Option, Vec, String y pánicos"
+else
+    echo "  - Rust: sin cargo, se salta"
 fi
 cd /; rm -rf "$T"

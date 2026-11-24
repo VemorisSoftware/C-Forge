@@ -4,6 +4,13 @@ Sitio oficial: [c-forge.org](https://c-forge.org)
 
 ## Sin publicar
 
+- Librerías de C++ y de Rust desde C-Forge, sin código puente:
+  `cforge bindgen geo.hpp` (clang++) y `cforge bindgen rust:crate` (cargo,
+  desde crates.io o una ruta) generan la capa con interfaz C, la compilan y
+  dejan el módulo listo para `importar "cpp:geo"` / `importar "rust:crate"`.
+  Clases y structs como objetos, métodos, campos, sobrecargas, textos,
+  listas, `Result`, `Option`, excepciones y pánicos como errores de C-Forge
+  (`stdlib/puente.cfv`, probado en `tests/interop`).
 - Lote 40 de bibliotecas (tres más que pasan de enlaces a nativas):
   `mando`/`hidapi` (enumeración por sysfs, E/S con hidraw y analizador de
   descriptores HID con los mismos campos que hid-tools), `usb`/`libusb`
