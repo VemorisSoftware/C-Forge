@@ -59,7 +59,7 @@ PublisherUrl: https://c-forge.org
 PublisherSupportUrl: https://github.com/VemorisSoftware/C-Forge/issues
 PackageName: C-Forge
 PackageUrl: https://c-forge.org
-License: Propietaria (C-Forge Proprietary License)
+License: Uso libre (C-Forge License)
 LicenseUrl: https://github.com/VemorisSoftware/C-Forge/blob/main/LICENSE
 Copyright: Copyright (c) 2026 Vemoris Group S.A.
 ShortDescription: Lenguaje de programación compilado con sintaxis en español e inglés
@@ -86,7 +86,7 @@ PublisherUrl: https://c-forge.org
 PublisherSupportUrl: https://github.com/VemorisSoftware/C-Forge/issues
 PackageName: C-Forge
 PackageUrl: https://c-forge.org
-License: Proprietary (C-Forge Proprietary License)
+License: Freeware (C-Forge License)
 LicenseUrl: https://github.com/VemorisSoftware/C-Forge/blob/main/LICENSE
 Copyright: Copyright (c) 2026 Vemoris Group S.A.
 ShortDescription: Compiled programming language with Spanish and English syntax
