@@ -4,6 +4,13 @@ Sitio oficial: [c-forge.org](https://c-forge.org)
 
 ## Sin publicar
 
+- Lote 36 de bibliotecas (tres más que pasan de enlaces a nativas):
+  `sintaxis`/`treesitter` (árboles de sintaxis de Python y JSON con los
+  mismos nodos, campos y posiciones que tree-sitter, y consultas con su
+  lenguaje de patrones), `revelado`/`vips` (procesamiento de imágenes con
+  remuestreo idéntico a Pillow, filtros, alfa, histogramas y un codificador
+  JPEG propio) y `cerebro`/`onnxruntime` (inferencia de modelos ONNX con unos 70
+  operadores; mismos resultados que ONNX Runtime).
 - Lote 35 de bibliotecas (tres más que pasan de enlaces a nativas):
   `emulador`/`unicorn` (emulador de CPU x86-64 y ARM64 con registros de 64
   bits exactos, banderas, memoria por páginas y ganchos; mismo estado final

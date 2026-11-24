@@ -1,0 +1,1127 @@
+// stdlib/cerebro.cfv — Inferencia de modelos ONNX al estilo de ONNX
+// Runtime, escrito desde cero (idea de ONNX Runtime, MIT; formato ONNX,
+// Apache 2.0). Lee el .onnx (protobuf) y ejecuta el grafo en CPU con
+// tensores float32/float64/int64/bool y difusión (broadcasting) de NumPy.
+//
+// Operadores: Add, Sub, Mul, Div, Pow, Max, Min, Sum, Mean, Equal, Greater,
+// Less, GreaterOrEqual, LessOrEqual, And, Or, Not, Where, Relu, LeakyRelu,
+// Elu, Sigmoid, HardSigmoid, Tanh, Softplus, Exp, Log, Sqrt, Neg, Abs,
+// Reciprocal, Floor, Ceil, Sign, Erf, Gelu, Clip, Identity, Dropout, Cast,
+// MatMul, Gemm, Softmax, LogSoftmax, Conv, MaxPool, AveragePool,
+// GlobalAveragePool, GlobalMaxPool, BatchNormalization,
+// LayerNormalization, Flatten, Reshape, Transpose, Concat, Squeeze,
+// Unsqueeze, Gather, Shape, Constant, ConstantOfShape, Slice, Expand,
+// ReduceMean, ReduceSum, ReduceMax, ReduceMin, ArgMax.
+//
+// En inglés: importar "onnxruntime".
+//
+//   importar "cerebro"
+//   sea m = cerebro_cargar("modelo.onnx")
+//   mostrar(cerebro_entradas(m))          // [{"nombre": "x", "forma": [1, 4]}]
+//   sea r = cerebro_ejecutar(m, {"x": cerebro_tensor([1, 4], [0.1, 0.2, 0.3, 0.4])})
+//   mostrar(r["y"]["datos"])
+//
+// Un tensor es {"forma": [dims], "datos": [valores en orden C], "tipo"}.
+
+// ---------- protobuf ----------
+
+funcion _cer_varint(st) {
+    sea grupos = []
+    mientras (verdadero) {
+        si (st["i"] >= longitud(st["b"])) { lanzar "cerebro: protobuf truncado" }
+        sea b = byte_en(st["b"], st["i"])
+        st["i"] = st["i"] + 1
+        grupos.agregar(b % 128)
+        si (b < 128) { romper }
+    }
+    si (longitud(grupos) >= 10) {
+        // Negativo de 64 bits: complemento a dos.
+        sea k = 0
+        sea i = 8
+        mientras (i >= 0) {
+            k = k * 128 + (127 - grupos[i])
+            i = i - 1
+        }
+        retornar 0 - k - 1
+    }
+    sea v = 0
+    sea i = longitud(grupos) - 1
+    mientras (i >= 0) {
+        v = v * 128 + grupos[i]
+        i = i - 1
+    }
+    retornar v
+}
+
+// Campos de un mensaje: lista de [número, tipo_cable, valor] (valor: entero o bytes).
+funcion _cer_campos(b) {
+    sea st = {"b": b, "i": 0}
+    sea r = []
+    mientras (st["i"] < longitud(b)) {
+        sea clave = _cer_varint(st)
+        sea num = cociente(clave, 8)
+        sea tc = clave % 8
+        si (tc == 0) { r.agregar([num, 0, _cer_varint(st)]) }
+        sino si (tc == 1) {
+            r.agregar([num, 1, subtexto(b, st["i"], st["i"] + 8)])
+            st["i"] = st["i"] + 8
+        } sino si (tc == 2) {
+            sea n = _cer_varint(st)
+            r.agregar([num, 2, subtexto(b, st["i"], st["i"] + n)])
+            st["i"] = st["i"] + n
+        } sino si (tc == 5) {
+            r.agregar([num, 5, subtexto(b, st["i"], st["i"] + 4)])
+            st["i"] = st["i"] + 4
+        } sino { lanzar "cerebro: tipo de cable protobuf no soportado " + tc }
+    }
+    retornar r
+}
+
+funcion _cer_f32(b, i) {
+    sea bits = bytes_leer_entero(b, i, 4, 1)
+    sea signo = si(bits >= 2147483648, -1, 1)
+    sea e = cociente(bits, 8388608) % 256
+    sea m = bits % 8388608
+    si (e == 0) { retornar signo * m * potencia(2, -149) }
+    si (e == 255) { retornar signo * si(m == 0, 1e308 * 10, 0) }
+    retornar signo * (1 + m / 8388608) * potencia(2, e - 127)
+}
+
+funcion _cer_f64(b, i) {
+    sea bajo = bytes_leer_entero(b, i, 4, 1)
+    sea alto = bytes_leer_entero(b, i + 4, 4, 1)
+    sea signo = si(alto >= 2147483648, -1, 1)
+    sea e = cociente(alto, 1048576) % 2048
+    sea m = (alto % 1048576) * 4294967296.0 + bajo
+    si (e == 0) { retornar signo * m * potencia(2, -1074) }
+    retornar signo * (1 + m / 4503599627370496.0) * potencia(2, e - 1023)
+}
+
+funcion _cer_i64(b, i) {
+    sea bajo = bytes_leer_entero(b, i, 4, 1)
+    sea alto = bytes_leer_entero(b, i + 4, 4, 1)
+    si (alto >= 2147483648) { retornar (alto - 4294967296) * 4294967296 + bajo }
+    retornar alto * 4294967296 + bajo
+}
+
+funcion _cer_empaquetados(valor, tc, tipo_v) {
+    // Repetido empaquetado (tc 2) o suelto.
+    si (tc == 0) { retornar [valor] }
+    si (tc == 5) { retornar [_cer_f32(valor, 0)] }
+    si (tc == 1) { retornar [si(tipo_v == "f64", _cer_f64(valor, 0), _cer_i64(valor, 0))] }
+    sea r = []
+    si (tipo_v == "f32") {
+        sea i = 0
+        mientras (i < longitud(valor)) {
+            r.agregar(_cer_f32(valor, i))
+            i = i + 4
+        }
+    } sino si (tipo_v == "f64") {
+        sea i = 0
+        mientras (i < longitud(valor)) {
+            r.agregar(_cer_f64(valor, i))
+            i = i + 8
+        }
+    } sino {
+        sea st = {"b": valor, "i": 0}
+        mientras (st["i"] < longitud(valor)) { r.agregar(_cer_varint(st)) }
+    }
+    retornar r
+}
+
+sea _CER_TIPOS = {"1": "float32", "2": "uint8", "3": "int8", "6": "int32", "7": "int64", "9": "bool", "10": "float16", "11": "float64", "12": "uint32", "13": "uint64"}
+
+funcion _cer_tensor_pb(b) {
+    sea forma = []
+    sea tipo_d = 1
+    sea datos = []
+    sea crudo = nulo
+    sea nombre = ""
+    para c en _cer_campos(b) {
+        sea num = c[0]
+        si (num == 1) { para v en _cer_empaquetados(c[2], c[1], "int") { forma.agregar(v) } }
+        sino si (num == 2) { tipo_d = c[2] }
+        sino si (num == 4) { para v en _cer_empaquetados(c[2], c[1], "f32") { datos.agregar(v) } }
+        sino si (num == 5 o num == 7 o num == 11) { para v en _cer_empaquetados(c[2], c[1], "int") { datos.agregar(v) } }
+        sino si (num == 10) { para v en _cer_empaquetados(c[2], c[1], "f64") { datos.agregar(v) } }
+        sino si (num == 8) { nombre = c[2] }
+        sino si (num == 9) { crudo = c[2] }
+    }
+    sea tipo_n = _CER_TIPOS["" + tipo_d] ?? "float32"
+    si (crudo != nulo) {
+        datos = []
+        sea i = 0
+        si (tipo_n == "float32") {
+            mientras (i < longitud(crudo)) {
+                datos.agregar(_cer_f32(crudo, i))
+                i = i + 4
+            }
+        } sino si (tipo_n == "float64") {
+            mientras (i < longitud(crudo)) {
+                datos.agregar(_cer_f64(crudo, i))
+                i = i + 8
+            }
+        } sino si (tipo_n == "int64" o tipo_n == "uint64") {
+            mientras (i < longitud(crudo)) {
+                datos.agregar(_cer_i64(crudo, i))
+                i = i + 8
+            }
+        } sino si (tipo_n == "int32") {
+            mientras (i < longitud(crudo)) {
+                sea v = bytes_leer_entero(crudo, i, 4, 1)
+                datos.agregar(si(v >= 2147483648, v - 4294967296, v))
+                i = i + 4
+            }
+        } sino si (tipo_n == "uint8" o tipo_n == "bool" o tipo_n == "int8") {
+            mientras (i < longitud(crudo)) {
+                sea v = byte_en(crudo, i)
+                si (tipo_n == "int8" y v >= 128) { v = v - 256 }
+                si (tipo_n == "bool") { v = v != 0 }
+                datos.agregar(v)
+                i = i + 1
+            }
+        } sino { lanzar "cerebro: tipo de tensor no soportado " + tipo_n }
+    }
+    si (tipo_n == "bool" y crudo == nulo) {
+        sea bs = []
+        para v en datos { bs.agregar(v != 0) }
+        datos = bs
+    }
+    retornar {"nombre": nombre, "forma": forma, "datos": datos, "tipo": tipo_n}
+}
+
+funcion _cer_atributo(b) {
+    sea nombre = ""
+    sea valor = nulo
+    sea floats = []
+    sea ints = []
+    sea strings = []
+    sea tipo_a = 0
+    para c en _cer_campos(b) {
+        sea num = c[0]
+        si (num == 1) { nombre = c[2] }
+        sino si (num == 2) { valor = _cer_f32(c[2], 0) }
+        sino si (num == 3) { valor = c[2] }
+        sino si (num == 4) { valor = c[2] }
+        sino si (num == 5) { valor = _cer_tensor_pb(c[2]) }
+        sino si (num == 7) { para v en _cer_empaquetados(c[2], c[1], "f32") { floats.agregar(v) } }
+        sino si (num == 8) { para v en _cer_empaquetados(c[2], c[1], "int") { ints.agregar(v) } }
+        sino si (num == 9) { strings.agregar(c[2]) }
+        sino si (num == 20) { tipo_a = c[2] }
+    }
+    // AttributeType: 6 FLOATS, 7 INTS, 8 STRINGS.
+    si (tipo_a == 6) { valor = floats }
+    si (tipo_a == 7) { valor = ints }
+    si (tipo_a == 8) { valor = strings }
+    retornar [nombre, valor]
+}
+
+funcion _cer_info(b) {
+    sea nombre = ""
+    sea forma = []
+    sea tipo_n = "float32"
+    para c en _cer_campos(b) {
+        si (c[0] == 1) { nombre = c[2] }
+        si (c[0] == 2) {
+            para t en _cer_campos(c[2]) {
+                si (t[0] == 1) {
+                    para x en _cer_campos(t[2]) {
+                        si (x[0] == 1) { tipo_n = _CER_TIPOS["" + x[2]] ?? "float32" }
+                        si (x[0] == 2) {
+                            para d en _cer_campos(x[2]) {
+                                si (d[0] == 1) {
+                                    sea dim = nulo
+                                    para dv en _cer_campos(d[2]) {
+                                        si (dv[0] == 1) { dim = dv[2] }
+                                        si (dv[0] == 2) { dim = dv[2] }
+                                    }
+                                    forma.agregar(dim)
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+    retornar {"nombre": nombre, "forma": forma, "tipo": tipo_n}
+}
+
+/// Lee un modelo ONNX desde bytes.
+funcion cerebro_desde_bytes(datos) {
+    sea grafo = nulo
+    sea opset = 0
+    para c en _cer_campos(datos) {
+        si (c[0] == 7) { grafo = c[2] }
+        si (c[0] == 8) {
+            sea dominio = ""
+            sea v = 0
+            para x en _cer_campos(c[2]) {
+                si (x[0] == 1) { dominio = x[2] }
+                si (x[0] == 2) { v = x[2] }
+            }
+            si (dominio == "" o dominio == "ai.onnx") { opset = v }
+        }
+    }
+    si (grafo == nulo) { lanzar "cerebro: el archivo no tiene grafo (¿es ONNX?)" }
+    sea m = {"nodos": [], "iniciales": {}, "entradas": [], "salidas": [], "opset": opset}
+    para c en _cer_campos(grafo) {
+        si (c[0] == 1) {
+            sea nodo = {"entradas": [], "salidas": [], "op": "", "attrs": {}, "nombre": ""}
+            para x en _cer_campos(c[2]) {
+                si (x[0] == 1) { nodo["entradas"].agregar(x[2]) }
+                sino si (x[0] == 2) { nodo["salidas"].agregar(x[2]) }
+                sino si (x[0] == 3) { nodo["nombre"] = x[2] }
+                sino si (x[0] == 4) { nodo["op"] = x[2] }
+                sino si (x[0] == 5) {
+                    sea a = _cer_atributo(x[2])
+                    nodo["attrs"][a[0]] = a[1]
+                }
+            }
+            m["nodos"].agregar(nodo)
+        } sino si (c[0] == 5) {
+            sea t = _cer_tensor_pb(c[2])
+            m["iniciales"][t["nombre"]] = t
+        } sino si (c[0] == 11) { m["entradas"].agregar(_cer_info(c[2])) }
+        sino si (c[0] == 12) { m["salidas"].agregar(_cer_info(c[2])) }
+    }
+    retornar m
+}
+
+/// Lee un archivo .onnx.
+funcion cerebro_cargar(ruta) { retornar cerebro_desde_bytes(leer_archivo(ruta)) }
+
+/// Entradas que hay que dar (sin las que ya vienen como pesos).
+funcion cerebro_entradas(m) {
+    sea r = []
+    para e en m["entradas"] {
+        si (tiene_clave(m["iniciales"], e["nombre"]) == falso) { r.agregar(e) }
+    }
+    retornar r
+}
+
+funcion cerebro_salidas(m) { retornar m["salidas"] }
+
+/// Tensor float32 con forma y datos en orden C.
+funcion cerebro_tensor(forma, datos) {
+    sea n = _cer_tam(forma)
+    si (n != longitud(datos)) { lanzar "cerebro: la forma " + forma + " pide " + n + " valores y hay " + longitud(datos) }
+    retornar {"forma": forma, "datos": datos, "tipo": "float32"}
+}
+
+funcion _cer_tam(forma) {
+    sea n = 1
+    para d en forma { n = n * d }
+    retornar n
+}
+
+funcion _cer_pasos(forma) {
+    sea r = []
+    para d en forma { r.agregar(0) }
+    sea p = 1
+    sea i = longitud(forma) - 1
+    mientras (i >= 0) {
+        r[i] = p
+        p = p * forma[i]
+        i = i - 1
+    }
+    retornar r
+}
+
+funcion _cer_t(forma, datos, tipo_n) { retornar {"forma": forma, "datos": datos, "tipo": tipo_n ?? "float32"} }
+
+// ---------- difusión ----------
+
+funcion _cer_forma_difusion(a, b) {
+    sea n = maximo(longitud(a), longitud(b))
+    sea r = []
+    para i en lista_rango(0, n) {
+        sea da = si(i < n - longitud(a), 1, a[i - (n - longitud(a))])
+        sea db = si(i < n - longitud(b), 1, b[i - (n - longitud(b))])
+        si (da != db y da != 1 y db != 1) { lanzar "cerebro: formas incompatibles " + a + " y " + b }
+        r.agregar(maximo(da, db))
+    }
+    retornar r
+}
+
+// Índices planos de un tensor de forma f para cada posición de la forma destino.
+funcion _cer_indices(f, destino) {
+    sea n = longitud(destino)
+    sea k = n - longitud(f)
+    sea pasos = _cer_pasos(f)
+    sea pasos_d = []
+    para i en lista_rango(0, n) {
+        si (i < k o f[i - k] == 1) { pasos_d.agregar(0) } sino { pasos_d.agregar(pasos[i - k]) }
+    }
+    sea total = _cer_tam(destino)
+    sea r = []
+    sea idx = []
+    para i en lista_rango(0, n) { idx.agregar(0) }
+    sea plano = 0
+    para t en lista_rango(0, total) {
+        r.agregar(plano)
+        // Incremento del contador multidimensional.
+        sea d = n - 1
+        mientras (d >= 0) {
+            idx[d] = idx[d] + 1
+            plano = plano + pasos_d[d]
+            si (idx[d] < destino[d]) { romper }
+            plano = plano - pasos_d[d] * destino[d]
+            idx[d] = 0
+            d = d - 1
+        }
+    }
+    retornar r
+}
+
+funcion _cer_binaria(a, b, f, tipo_n) {
+    si (longitud(a["forma"]) == longitud(b["forma"]) y ("" + a["forma"]) == ("" + b["forma"])) {
+        sea r = []
+        sea x = a["datos"]
+        sea w = b["datos"]
+        para i en lista_rango(0, longitud(x)) { r.agregar(f(x[i], w[i])) }
+        retornar _cer_t(a["forma"], r, tipo_n ?? a["tipo"])
+    }
+    sea forma = _cer_forma_difusion(a["forma"], b["forma"])
+    sea ia = _cer_indices(a["forma"], forma)
+    sea ib = _cer_indices(b["forma"], forma)
+    sea r = []
+    sea x = a["datos"]
+    sea w = b["datos"]
+    para i en lista_rango(0, longitud(ia)) { r.agregar(f(x[ia[i]], w[ib[i]])) }
+    retornar _cer_t(forma, r, tipo_n ?? a["tipo"])
+}
+
+funcion _cer_unaria(a, f) {
+    sea r = []
+    para v en a["datos"] { r.agregar(f(v)) }
+    retornar _cer_t(a["forma"], r, a["tipo"])
+}
+
+funcion _cer_eje(eje, rango) { retornar si(eje < 0, eje + rango, eje) }
+
+funcion _cer_erf(x) {
+    // Serie para |x| < 3 y fracción continua de Abramowitz–Stegun más allá (error < 1e-12 en la serie).
+    sea s = si(x < 0, -1, 1)
+    sea a = absoluto(x)
+    si (a < 3) {
+        sea termino = a
+        sea suma = a
+        sea n = 0
+        mientras (absoluto(termino) > 1e-17 * absoluto(suma) y n < 200) {
+            n = n + 1
+            termino = termino * (0 - a * a) / n
+            suma = suma + termino / (2 * n + 1)
+        }
+        retornar s * 2 / raiz(3.141592653589793) * suma
+    }
+    // erfc por fracción continua.
+    sea t = 0.0
+    sea k = 60
+    mientras (k >= 1) {
+        t = (k / 2) / (a + t)
+        k = k - 1
+    }
+    sea erfc = exponencial(0 - a * a) / raiz(3.141592653589793) / (a + t)
+    retornar s * (1 - erfc)
+}
+
+// ---------- ejecución ----------
+
+funcion _cer_attr(n, k, defecto) {
+    si (tiene_clave(n["attrs"], k)) { retornar n["attrs"][k] }
+    retornar defecto
+}
+
+funcion _cer_lista_int(t) {
+    sea r = []
+    para v en t["datos"] { r.agregar(piso(v)) }
+    retornar r
+}
+
+/// Ejecuta el modelo. entradas: mapa nombre → tensor. Devuelve las salidas
+/// del grafo (o todas las pedidas en "salidas").
+funcion cerebro_ejecutar(m, entradas, salidas) {
+    sea v = {}
+    para k en claves(m["iniciales"]) { v[k] = m["iniciales"][k] }
+    para k en claves(entradas) {
+        sea t = entradas[k]
+        si (tipo(t) == "lista") { t = cerebro_tensor([longitud(t)], t) }
+        v[k] = t
+    }
+    para e en cerebro_entradas(m) {
+        si (tiene_clave(v, e["nombre"]) == falso) { lanzar "cerebro: falta la entrada " + e["nombre"] }
+    }
+    para n en m["nodos"] {
+        sea ins = []
+        para nombre en n["entradas"] { ins.agregar(si(nombre == "", nulo, v[nombre] ?? nulo)) }
+        sea outs = nulo
+        intentar { outs = _cer_op(n, ins, m["opset"]) } capturar (e) {
+            si (texto_empieza_con("" + e, "cerebro:")) { lanzar "" + e + " (nodo " + n["op"] + " " + n["nombre"] + ")" }
+            lanzar "cerebro: " + n["op"] + " " + n["nombre"] + ": " + e
+        }
+        sea i = 0
+        para nombre en n["salidas"] {
+            si (nombre != "" y i < longitud(outs)) { v[nombre] = outs[i] }
+            i = i + 1
+        }
+    }
+    sea r = {}
+    sea pedidas = salidas
+    si (pedidas == nulo) {
+        pedidas = []
+        para s en m["salidas"] { pedidas.agregar(s["nombre"]) }
+    }
+    para s en pedidas {
+        si (tiene_clave(v, s) == falso) { lanzar "cerebro: no se calculó " + s }
+        r[s] = v[s]
+    }
+    retornar r
+}
+
+funcion _cer_op(n, ins, opset) {
+    sea op = n["op"]
+    sea a = ins[0] ?? nulo
+    sea b = nulo
+    si (longitud(ins) > 1) { b = ins[1] }
+    si (op == "Add") { retornar [_cer_binaria(a, b, funcion(x, w) { retornar x + w }, nulo)] }
+    si (op == "Sub") { retornar [_cer_binaria(a, b, funcion(x, w) { retornar x - w }, nulo)] }
+    si (op == "Mul") { retornar [_cer_binaria(a, b, funcion(x, w) { retornar x * w }, nulo)] }
+    si (op == "Div") {
+        si (a["tipo"] == "int64" o a["tipo"] == "int32") { retornar [_cer_binaria(a, b, funcion(x, w) { retornar si((x < 0) != (w < 0), 0 - cociente(absoluto(x), absoluto(w)), cociente(absoluto(x), absoluto(w))) }, nulo)] }
+        retornar [_cer_binaria(a, b, funcion(x, w) { retornar x / w }, nulo)]
+    }
+    si (op == "Pow") { retornar [_cer_binaria(a, b, funcion(x, w) { retornar potencia(x, w) }, a["tipo"])] }
+    si (op == "Max" o op == "Min" o op == "Sum" o op == "Mean") {
+        sea r = a
+        sea k = 1
+        mientras (k < longitud(ins)) {
+            si (op == "Max") { r = _cer_binaria(r, ins[k], funcion(x, w) { retornar maximo(x, w) }, nulo) }
+            sino si (op == "Min") { r = _cer_binaria(r, ins[k], funcion(x, w) { retornar minimo(x, w) }, nulo) }
+            sino { r = _cer_binaria(r, ins[k], funcion(x, w) { retornar x + w }, nulo) }
+            k = k + 1
+        }
+        si (op == "Mean") { r = _cer_unaria(r, funcion(x) { retornar x / longitud(ins) }) }
+        retornar [r]
+    }
+    si (op == "Equal") { retornar [_cer_binaria(a, b, funcion(x, w) { retornar x == w }, "bool")] }
+    si (op == "Greater") { retornar [_cer_binaria(a, b, funcion(x, w) { retornar x > w }, "bool")] }
+    si (op == "Less") { retornar [_cer_binaria(a, b, funcion(x, w) { retornar x < w }, "bool")] }
+    si (op == "GreaterOrEqual") { retornar [_cer_binaria(a, b, funcion(x, w) { retornar x >= w }, "bool")] }
+    si (op == "LessOrEqual") { retornar [_cer_binaria(a, b, funcion(x, w) { retornar x <= w }, "bool")] }
+    si (op == "And") { retornar [_cer_binaria(a, b, funcion(x, w) { retornar x y w }, "bool")] }
+    si (op == "Or") { retornar [_cer_binaria(a, b, funcion(x, w) { retornar x o w }, "bool")] }
+    si (op == "Not") { retornar [_cer_unaria(a, funcion(x) { retornar x == falso })] }
+    si (op == "Where") {
+        sea c = a
+        sea x = b
+        sea w = ins[2]
+        sea forma = _cer_forma_difusion(_cer_forma_difusion(c["forma"], x["forma"]), w["forma"])
+        sea ic = _cer_indices(c["forma"], forma)
+        sea ix = _cer_indices(x["forma"], forma)
+        sea iw = _cer_indices(w["forma"], forma)
+        sea r = []
+        para i en lista_rango(0, longitud(ic)) { r.agregar(si(c["datos"][ic[i]], x["datos"][ix[i]], w["datos"][iw[i]])) }
+        retornar [_cer_t(forma, r, x["tipo"])]
+    }
+    si (op == "Relu") { retornar [_cer_unaria(a, funcion(x) { retornar si(x > 0, x, 0.0 * x) })] }
+    si (op == "LeakyRelu") {
+        sea al = _cer_attr(n, "alpha", 0.01)
+        retornar [_cer_unaria(a, funcion(x) { retornar si(x >= 0, x, al * x) })]
+    }
+    si (op == "Elu") {
+        sea al = _cer_attr(n, "alpha", 1.0)
+        retornar [_cer_unaria(a, funcion(x) { retornar si(x >= 0, x, al * (exponencial(x) - 1)) })]
+    }
+    si (op == "Sigmoid") { retornar [_cer_unaria(a, funcion(x) { retornar si(x >= 0, 1 / (1 + exponencial(0 - x)), exponencial(x) / (1 + exponencial(x))) })] }
+    si (op == "HardSigmoid") {
+        sea al = _cer_attr(n, "alpha", 0.2)
+        sea be = _cer_attr(n, "beta", 0.5)
+        retornar [_cer_unaria(a, funcion(x) { retornar maximo(0, minimo(1, al * x + be)) })]
+    }
+    si (op == "Tanh") {
+        retornar [_cer_unaria(a, funcion(x) {
+            si (x > 20) { retornar 1.0 }
+            si (x < -20) { retornar -1.0 }
+            sea e2 = exponencial(2 * x)
+            retornar (e2 - 1) / (e2 + 1)
+        })]
+    }
+    si (op == "Softplus") { retornar [_cer_unaria(a, funcion(x) { retornar si(x > 30, x, logaritmo(1 + exponencial(x))) })] }
+    si (op == "Exp") { retornar [_cer_unaria(a, funcion(x) { retornar exponencial(x) })] }
+    si (op == "Log") { retornar [_cer_unaria(a, funcion(x) { retornar logaritmo(x) })] }
+    si (op == "Sqrt") { retornar [_cer_unaria(a, funcion(x) { retornar raiz(x) })] }
+    si (op == "Neg") { retornar [_cer_unaria(a, funcion(x) { retornar 0 - x })] }
+    si (op == "Abs") { retornar [_cer_unaria(a, funcion(x) { retornar absoluto(x) })] }
+    si (op == "Reciprocal") { retornar [_cer_unaria(a, funcion(x) { retornar 1 / x })] }
+    si (op == "Floor") { retornar [_cer_unaria(a, funcion(x) { retornar piso(x) })] }
+    si (op == "Ceil") { retornar [_cer_unaria(a, funcion(x) { retornar techo(x) })] }
+    si (op == "Sign") { retornar [_cer_unaria(a, funcion(x) { retornar si(x > 0, 1, si(x < 0, -1, 0)) })] }
+    si (op == "Erf") { retornar [_cer_unaria(a, funcion(x) { retornar _cer_erf(x) })] }
+    si (op == "Gelu") {
+        si (_cer_attr(n, "approximate", "none") == "tanh") {
+            retornar [_cer_unaria(a, funcion(x) {
+                sea u = 0.7978845608028654 * (x + 0.044715 * x * x * x)
+                sea e2 = exponencial(2 * minimo(20, maximo(-20, u)))
+                retornar 0.5 * x * (1 + (e2 - 1) / (e2 + 1))
+            })]
+        }
+        retornar [_cer_unaria(a, funcion(x) { retornar 0.5 * x * (1 + _cer_erf(x / 1.4142135623730951)) })]
+    }
+    si (op == "Clip") {
+        sea lo = _cer_attr(n, "min", nulo)
+        sea hi = _cer_attr(n, "max", nulo)
+        si (longitud(ins) > 1 y ins[1] != nulo) { lo = ins[1]["datos"][0] }
+        si (longitud(ins) > 2 y ins[2] != nulo) { hi = ins[2]["datos"][0] }
+        retornar [_cer_unaria(a, funcion(x) {
+            sea r = x
+            si (lo != nulo y r < lo) { r = lo }
+            si (hi != nulo y r > hi) { r = hi }
+            retornar r
+        })]
+    }
+    si (op == "Identity" o op == "Dropout") { retornar [a] }
+    si (op == "Cast") {
+        sea to = _CER_TIPOS["" + _cer_attr(n, "to", 1)] ?? "float32"
+        sea r = []
+        para x en a["datos"] {
+            si (to == "bool") { r.agregar(x != 0 y x != falso) }
+            sino si (to == "int64" o to == "int32" o to == "int8" o to == "uint8") {
+                sea xv = si(x == verdadero, 1, si(x == falso, 0, x))
+                r.agregar(si(xv < 0, 0 - piso(0 - xv), piso(xv)))
+            } sino { r.agregar(si(x == verdadero, 1.0, si(x == falso, 0.0, x * 1.0))) }
+        }
+        retornar [_cer_t(a["forma"], r, to)]
+    }
+    si (op == "MatMul") { retornar [_cer_matmul(a, b)] }
+    si (op == "Gemm") {
+        sea ta = _cer_attr(n, "transA", 0)
+        sea tb = _cer_attr(n, "transB", 0)
+        sea al = _cer_attr(n, "alpha", 1.0)
+        sea be = _cer_attr(n, "beta", 1.0)
+        sea x = si(ta == 1, _cer_transponer(a, [1, 0]), a)
+        sea w = si(tb == 1, _cer_transponer(b, [1, 0]), b)
+        sea p = _cer_matmul(x, w)
+        si (al != 1.0) { p = _cer_unaria(p, funcion(z) { retornar z * al }) }
+        si (longitud(ins) > 2 y ins[2] != nulo) {
+            sea c = ins[2]
+            si (be != 1.0) { c = _cer_unaria(c, funcion(z) { retornar z * be }) }
+            p = _cer_binaria(p, c, funcion(z, q) { retornar z + q }, nulo)
+        }
+        retornar [p]
+    }
+    si (op == "Softmax" o op == "LogSoftmax") {
+        sea eje = _cer_eje(_cer_attr(n, "axis", si(opset >= 13, -1, 1)), longitud(a["forma"]))
+        retornar [_cer_softmax(a, eje, op == "LogSoftmax", opset)]
+    }
+    si (op == "Conv") { retornar [_cer_conv(n, a, b, si(longitud(ins) > 2, ins[2], nulo))] }
+    si (op == "MaxPool" o op == "AveragePool") { retornar [_cer_pool(n, a, op == "MaxPool")] }
+    si (op == "GlobalAveragePool" o op == "GlobalMaxPool") {
+        sea f = a["forma"]
+        sea plano = _cer_tam(_cer_desde(f, 2))
+        sea r = []
+        para nc en lista_rango(0, f[0] * f[1]) {
+            sea acc = si(op == "GlobalMaxPool", a["datos"][nc * plano], 0.0)
+            para k en lista_rango(0, plano) {
+                sea x = a["datos"][nc * plano + k]
+                si (op == "GlobalMaxPool") { acc = maximo(acc, x) } sino { acc = acc + x }
+            }
+            r.agregar(si(op == "GlobalMaxPool", acc, acc / plano))
+        }
+        sea forma = [f[0], f[1]]
+        para k en lista_rango(2, longitud(f)) { forma.agregar(1) }
+        retornar [_cer_t(forma, r, a["tipo"])]
+    }
+    si (op == "BatchNormalization") {
+        sea esc = ins[1]["datos"]
+        sea sesgo = ins[2]["datos"]
+        sea media = ins[3]["datos"]
+        sea var = ins[4]["datos"]
+        sea eps = _cer_attr(n, "epsilon", 0.00001)
+        sea f = a["forma"]
+        sea plano = _cer_tam(_cer_desde(f, 2))
+        sea r = []
+        para i en lista_rango(0, longitud(a["datos"])) {
+            sea c = cociente(i, plano) % f[1]
+            r.agregar((a["datos"][i] - media[c]) / raiz(var[c] + eps) * esc[c] + sesgo[c])
+        }
+        retornar [_cer_t(f, r, a["tipo"])]
+    }
+    si (op == "LayerNormalization") {
+        sea f = a["forma"]
+        sea eje = _cer_eje(_cer_attr(n, "axis", -1), longitud(f))
+        sea eps = _cer_attr(n, "epsilon", 0.00001)
+        sea grupo = _cer_tam(_cer_desde(f, eje))
+        sea esc = _cer_t(_cer_desde(f, eje), _cer_difundir(ins[1], _cer_desde(f, eje)), "float32")["datos"]
+        sea sesgo = nulo
+        si (longitud(ins) > 2 y ins[2] != nulo) { sesgo = _cer_difundir(ins[2], _cer_desde(f, eje)) }
+        sea r = []
+        sea filas = cociente(longitud(a["datos"]), grupo)
+        para fi en lista_rango(0, filas) {
+            sea s = 0.0
+            para k en lista_rango(0, grupo) { s = s + a["datos"][fi * grupo + k] }
+            sea med = s / grupo
+            sea v2 = 0.0
+            para k en lista_rango(0, grupo) { v2 = v2 + potencia(a["datos"][fi * grupo + k] - med, 2) }
+            sea de = raiz(v2 / grupo + eps)
+            para k en lista_rango(0, grupo) { r.agregar((a["datos"][fi * grupo + k] - med) / de * esc[k] + si(sesgo == nulo, 0, sesgo[k])) }
+        }
+        retornar [_cer_t(f, r, a["tipo"])]
+    }
+    si (op == "Flatten") {
+        sea f = a["forma"]
+        sea eje = _cer_eje(_cer_attr(n, "axis", 1), longitud(f))
+        retornar [_cer_t([_cer_tam(_cer_hasta(f, eje)), _cer_tam(_cer_desde(f, eje))], a["datos"], a["tipo"])]
+    }
+    si (op == "Reshape") {
+        sea forma = _cer_lista_int(b)
+        sea total = longitud(a["datos"])
+        sea conocido = 1
+        sea menos = -1
+        para i en lista_rango(0, longitud(forma)) {
+            si (forma[i] == 0) { forma[i] = a["forma"][i] }
+            si (forma[i] == -1) { menos = i } sino { conocido = conocido * forma[i] }
+        }
+        si (menos >= 0) { forma[menos] = cociente(total, conocido) }
+        si (_cer_tam(forma) != total) { lanzar "cerebro: Reshape de " + a["forma"] + " a " + forma + " no cuadra" }
+        retornar [_cer_t(forma, a["datos"], a["tipo"])]
+    }
+    si (op == "Transpose") {
+        sea perm = _cer_attr(n, "perm", nulo)
+        si (perm == nulo) {
+            perm = []
+            sea i = longitud(a["forma"]) - 1
+            mientras (i >= 0) {
+                perm.agregar(i)
+                i = i - 1
+            }
+        }
+        retornar [_cer_transponer(a, perm)]
+    }
+    si (op == "Concat") {
+        sea eje = _cer_eje(_cer_attr(n, "axis", 0), longitud(a["forma"]))
+        retornar [_cer_concatenar(ins, eje)]
+    }
+    si (op == "Squeeze" o op == "Unsqueeze") {
+        sea ejes = _cer_attr(n, "axes", nulo)
+        si (longitud(ins) > 1 y ins[1] != nulo) { ejes = _cer_lista_int(ins[1]) }
+        sea forma = []
+        si (op == "Squeeze") {
+            sea norm = []
+            para e en ejes ?? [] { norm.agregar(_cer_eje(e, longitud(a["forma"]))) }
+            para i en lista_rango(0, longitud(a["forma"])) {
+                sea quitar = si(ejes == nulo, a["forma"][i] == 1, lista_contiene(norm, i))
+                si (quitar == falso) { forma.agregar(a["forma"][i]) }
+            }
+        } sino {
+            sea rango = longitud(a["forma"]) + longitud(ejes)
+            sea norm = []
+            para e en ejes { norm.agregar(_cer_eje(e, rango)) }
+            sea k = 0
+            para i en lista_rango(0, rango) {
+                si (lista_contiene(norm, i)) { forma.agregar(1) } sino {
+                    forma.agregar(a["forma"][k])
+                    k = k + 1
+                }
+            }
+        }
+        retornar [_cer_t(forma, a["datos"], a["tipo"])]
+    }
+    si (op == "Gather") {
+        sea eje = _cer_eje(_cer_attr(n, "axis", 0), longitud(a["forma"]))
+        sea f = a["forma"]
+        sea externo = _cer_tam(_cer_hasta(f, eje))
+        sea interno = _cer_tam(_cer_desde(f, eje + 1))
+        sea r = []
+        para o2 en lista_rango(0, externo) {
+            para idx en b["datos"] {
+                sea k = si(idx < 0, idx + f[eje], idx)
+                para j en lista_rango(0, interno) { r.agregar(a["datos"][(o2 * f[eje] + k) * interno + j]) }
+            }
+        }
+        sea forma = _cer_hasta(f, eje)
+        para d en b["forma"] { forma.agregar(d) }
+        para d en _cer_desde(f, eje + 1) { forma.agregar(d) }
+        retornar [_cer_t(forma, r, a["tipo"])]
+    }
+    si (op == "Shape") { retornar [_cer_t([longitud(a["forma"])], a["forma"], "int64")] }
+    si (op == "Constant") {
+        si (tiene_clave(n["attrs"], "value")) { retornar [n["attrs"]["value"]] }
+        si (tiene_clave(n["attrs"], "value_float")) { retornar [_cer_t([], [n["attrs"]["value_float"]], "float32")] }
+        si (tiene_clave(n["attrs"], "value_floats")) { retornar [_cer_t([longitud(n["attrs"]["value_floats"])], n["attrs"]["value_floats"], "float32")] }
+        si (tiene_clave(n["attrs"], "value_int")) { retornar [_cer_t([], [n["attrs"]["value_int"]], "int64")] }
+        si (tiene_clave(n["attrs"], "value_ints")) { retornar [_cer_t([longitud(n["attrs"]["value_ints"])], n["attrs"]["value_ints"], "int64")] }
+        lanzar "cerebro: Constant sin valor soportado"
+    }
+    si (op == "ConstantOfShape") {
+        sea forma = _cer_lista_int(a)
+        sea val = _cer_attr(n, "value", _cer_t([1], [0.0], "float32"))
+        sea r = []
+        para i en lista_rango(0, _cer_tam(forma)) { r.agregar(val["datos"][0]) }
+        retornar [_cer_t(forma, r, val["tipo"])]
+    }
+    si (op == "Expand") {
+        sea forma = _cer_forma_difusion(a["forma"], _cer_lista_int(b))
+        sea ia = _cer_indices(a["forma"], forma)
+        sea r = []
+        para i en ia { r.agregar(a["datos"][i]) }
+        retornar [_cer_t(forma, r, a["tipo"])]
+    }
+    si (op == "Slice") { retornar [_cer_slice(a, ins)] }
+    si (op == "ReduceMean" o op == "ReduceSum" o op == "ReduceMax" o op == "ReduceMin") {
+        sea ejes = _cer_attr(n, "axes", nulo)
+        si (longitud(ins) > 1 y ins[1] != nulo) { ejes = _cer_lista_int(ins[1]) }
+        retornar [_cer_reducir(a, ejes, _cer_attr(n, "keepdims", 1) == 1, op)]
+    }
+    si (op == "ArgMax") {
+        sea eje = _cer_eje(_cer_attr(n, "axis", 0), longitud(a["forma"]))
+        sea f = a["forma"]
+        sea externo = _cer_tam(_cer_hasta(f, eje))
+        sea interno = _cer_tam(_cer_desde(f, eje + 1))
+        sea r = []
+        para o2 en lista_rango(0, externo) {
+            para j en lista_rango(0, interno) {
+                sea mejor = 0
+                para k en lista_rango(1, f[eje]) {
+                    si (a["datos"][(o2 * f[eje] + k) * interno + j] > a["datos"][(o2 * f[eje] + mejor) * interno + j]) { mejor = k }
+                }
+                r.agregar(mejor)
+            }
+        }
+        sea forma = []
+        para i en lista_rango(0, longitud(f)) {
+            si (i != eje) { forma.agregar(f[i]) } sino si (_cer_attr(n, "keepdims", 1) == 1) { forma.agregar(1) }
+        }
+        retornar [_cer_t(forma, r, "int64")]
+    }
+    lanzar "cerebro: operador no soportado " + op
+}
+
+funcion _cer_desde(l, desde) {
+    sea r = []
+    para i en lista_rango(desde, longitud(l)) { r.agregar(l[i]) }
+    retornar r
+}
+
+funcion _cer_hasta(l, hasta) {
+    sea r = []
+    para i en lista_rango(0, hasta) { r.agregar(l[i]) }
+    retornar r
+}
+
+funcion _cer_difundir(t, forma) {
+    sea ia = _cer_indices(t["forma"], forma)
+    sea r = []
+    para i en ia { r.agregar(t["datos"][i]) }
+    retornar r
+}
+
+funcion _cer_transponer(a, perm) {
+    sea f = a["forma"]
+    sea n = longitud(f)
+    sea pasos = _cer_pasos(f)
+    sea nueva = []
+    para p en perm { nueva.agregar(f[p]) }
+    sea pasos_n = []
+    para p en perm { pasos_n.agregar(pasos[p]) }
+    sea total = longitud(a["datos"])
+    sea r = []
+    sea idx = []
+    para i en lista_rango(0, n) { idx.agregar(0) }
+    sea plano = 0
+    para t en lista_rango(0, total) {
+        r.agregar(a["datos"][plano])
+        sea d = n - 1
+        mientras (d >= 0) {
+            idx[d] = idx[d] + 1
+            plano = plano + pasos_n[d]
+            si (idx[d] < nueva[d]) { romper }
+            plano = plano - pasos_n[d] * nueva[d]
+            idx[d] = 0
+            d = d - 1
+        }
+    }
+    retornar _cer_t(nueva, r, a["tipo"])
+}
+
+funcion _cer_matmul(a, b) {
+    sea fa = a["forma"]
+    sea fb = b["forma"]
+    sea x = a
+    sea w = b
+    sea uno_a = longitud(fa) == 1
+    sea uno_b = longitud(fb) == 1
+    si (uno_a) { x = _cer_t([1, fa[0]], a["datos"], a["tipo"]) }
+    si (uno_b) { w = _cer_t([fb[0], 1], b["datos"], b["tipo"]) }
+    fa = x["forma"]
+    fb = w["forma"]
+    sea m = fa[longitud(fa) - 2]
+    sea k = fa[longitud(fa) - 1]
+    sea k2 = fb[longitud(fb) - 2]
+    sea nn = fb[longitud(fb) - 1]
+    si (k != k2) { lanzar "cerebro: MatMul con dimensiones " + fa + " y " + fb }
+    sea lote_a = _cer_hasta(fa, longitud(fa) - 2)
+    sea lote_b = _cer_hasta(fb, longitud(fb) - 2)
+    sea lote = _cer_forma_difusion(lote_a, lote_b)
+    sea ia = _cer_indices(lote_a, lote)
+    sea ib = _cer_indices(lote_b, lote)
+    sea r = []
+    sea da = x["datos"]
+    sea db = w["datos"]
+    para t en lista_rango(0, longitud(ia)) {
+        sea oa = ia[t] * m * k
+        sea ob = ib[t] * k * nn
+        para i en lista_rango(0, m) {
+            para j en lista_rango(0, nn) {
+                sea s = 0.0
+                para q en lista_rango(0, k) { s = s + da[oa + i * k + q] * db[ob + q * nn + j] }
+                r.agregar(s)
+            }
+        }
+    }
+    sea forma = []
+    para d en lote { forma.agregar(d) }
+    si (uno_a == falso) { forma.agregar(m) }
+    si (uno_b == falso) { forma.agregar(nn) }
+    retornar _cer_t(forma, r, a["tipo"])
+}
+
+funcion _cer_softmax(a, eje, logaritmico, opset) {
+    sea f = a["forma"]
+    // Antes de la opset 13 el softmax se aplica sobre todo lo que sigue al eje.
+    sea externo = _cer_tam(_cer_hasta(f, eje))
+    sea largo = f[eje]
+    sea interno = _cer_tam(_cer_desde(f, eje + 1))
+    si (opset < 13) {
+        largo = _cer_tam(_cer_desde(f, eje))
+        interno = 1
+    }
+    sea r = []
+    para i en lista_rango(0, longitud(a["datos"])) { r.agregar(0.0) }
+    para o2 en lista_rango(0, externo) {
+        para j en lista_rango(0, interno) {
+            sea mx = a["datos"][o2 * largo * interno + j]
+            para k en lista_rango(0, largo) { mx = maximo(mx, a["datos"][(o2 * largo + k) * interno + j]) }
+            sea s = 0.0
+            para k en lista_rango(0, largo) { s = s + exponencial(a["datos"][(o2 * largo + k) * interno + j] - mx) }
+            para k en lista_rango(0, largo) {
+                sea idx = (o2 * largo + k) * interno + j
+                sea z = a["datos"][idx] - mx
+                r[idx] = si(logaritmico, z - logaritmo(s), exponencial(z) / s)
+            }
+        }
+    }
+    retornar _cer_t(f, r, a["tipo"])
+}
+
+funcion _cer_conv(n, x, w, sesgo) {
+    sea fx = x["forma"]
+    sea fw = w["forma"]
+    si (longitud(fx) != 4) { lanzar "cerebro: Conv solo 2D (NCHW)" }
+    sea grupos = _cer_attr(n, "group", 1)
+    sea est = _cer_attr(n, "strides", [1, 1])
+    sea dil = _cer_attr(n, "dilations", [1, 1])
+    sea pads = _cer_attr(n, "pads", [0, 0, 0, 0])
+    sea kh = fw[2]
+    sea kw = fw[3]
+    sea auto = _cer_attr(n, "auto_pad", "NOTSET")
+    si (auto == "SAME_UPPER" o auto == "SAME_LOWER") {
+        sea ph = maximo(0, (techo(fx[2] / est[0]) - 1) * est[0] + (kh - 1) * dil[0] + 1 - fx[2])
+        sea pw = maximo(0, (techo(fx[3] / est[1]) - 1) * est[1] + (kw - 1) * dil[1] + 1 - fx[3])
+        si (auto == "SAME_UPPER") { pads = [cociente(ph, 2), cociente(pw, 2), ph - cociente(ph, 2), pw - cociente(pw, 2)] } sino { pads = [ph - cociente(ph, 2), pw - cociente(pw, 2), cociente(ph, 2), cociente(pw, 2)] }
+    }
+    sea nb = fx[0]
+    sea c = fx[1]
+    sea h = fx[2]
+    sea wd = fx[3]
+    sea m = fw[0]
+    sea cg = cociente(c, grupos)
+    sea mg = cociente(m, grupos)
+    sea oh = cociente(h + pads[0] + pads[2] - dil[0] * (kh - 1) - 1, est[0]) + 1
+    sea ow = cociente(wd + pads[1] + pads[3] - dil[1] * (kw - 1) - 1, est[1]) + 1
+    sea dx = x["datos"]
+    sea dw = w["datos"]
+    sea r = []
+    para bi en lista_rango(0, nb) {
+        para oc en lista_rango(0, m) {
+            sea g = cociente(oc, mg)
+            sea base = si(sesgo == nulo, 0.0, sesgo["datos"][oc])
+            para i en lista_rango(0, oh) {
+                para j en lista_rango(0, ow) {
+                    sea s = base
+                    para ic en lista_rango(0, cg) {
+                        sea canal = g * cg + ic
+                        para ki en lista_rango(0, kh) {
+                            sea yy = i * est[0] - pads[0] + ki * dil[0]
+                            si (yy >= 0 y yy < h) {
+                                para kj en lista_rango(0, kw) {
+                                    sea xx = j * est[1] - pads[1] + kj * dil[1]
+                                    si (xx >= 0 y xx < wd) { s = s + dx[((bi * c + canal) * h + yy) * wd + xx] * dw[((oc * cg + ic) * kh + ki) * kw + kj] }
+                                }
+                            }
+                        }
+                    }
+                    r.agregar(s)
+                }
+            }
+        }
+    }
+    retornar _cer_t([nb, m, oh, ow], r, x["tipo"])
+}
+
+funcion _cer_pool(n, x, es_max) {
+    sea fx = x["forma"]
+    sea k = _cer_attr(n, "kernel_shape", [1, 1])
+    sea est = _cer_attr(n, "strides", [1, 1])
+    sea pads = _cer_attr(n, "pads", [0, 0, 0, 0])
+    sea techo_m = _cer_attr(n, "ceil_mode", 0)
+    sea incluir = _cer_attr(n, "count_include_pad", 0)
+    sea h = fx[2]
+    sea wd = fx[3]
+    sea div_h = h + pads[0] + pads[2] - k[0]
+    sea div_w = wd + pads[1] + pads[3] - k[1]
+    sea oh = si(techo_m == 1, techo(div_h / est[0]), cociente(div_h, est[0])) + 1
+    sea ow = si(techo_m == 1, techo(div_w / est[1]), cociente(div_w, est[1])) + 1
+    sea r = []
+    para nc en lista_rango(0, fx[0] * fx[1]) {
+        para i en lista_rango(0, oh) {
+            para j en lista_rango(0, ow) {
+                sea acc = nulo
+                sea cuenta = 0
+                para ki en lista_rango(0, k[0]) {
+                    para kj en lista_rango(0, k[1]) {
+                        sea yy = i * est[0] - pads[0] + ki
+                        sea xx = j * est[1] - pads[1] + kj
+                        si (yy >= 0 y yy < h y xx >= 0 y xx < wd) {
+                            sea v = x["datos"][(nc * h + yy) * wd + xx]
+                            si (es_max) { acc = si(acc == nulo, v, maximo(acc, v)) } sino { acc = (acc ?? 0.0) + v }
+                            cuenta = cuenta + 1
+                        } sino si (incluir == 1 y yy < h + pads[2] y xx < wd + pads[3]) { cuenta = cuenta + 1 }
+                    }
+                }
+                si (es_max) { r.agregar(acc) } sino { r.agregar((acc ?? 0.0) / cuenta) }
+            }
+        }
+    }
+    retornar _cer_t([fx[0], fx[1], oh, ow], r, x["tipo"])
+}
+
+funcion _cer_concatenar(ins, eje) {
+    sea f0 = ins[0]["forma"]
+    sea externo = _cer_tam(_cer_hasta(f0, eje))
+    sea r = []
+    sea total_eje = 0
+    para t en ins { total_eje = total_eje + t["forma"][eje] }
+    para o2 en lista_rango(0, externo) {
+        para t en ins {
+            sea bloque = _cer_tam(_cer_desde(t["forma"], eje))
+            para k en lista_rango(0, bloque) { r.agregar(t["datos"][o2 * bloque + k]) }
+        }
+    }
+    sea forma = []
+    para d en f0 { forma.agregar(d) }
+    forma[eje] = total_eje
+    retornar _cer_t(forma, r, ins[0]["tipo"])
+}
+
+funcion _cer_slice(a, ins) {
+    sea f = a["forma"]
+    sea n = longitud(f)
+    sea inicios = _cer_lista_int(ins[1])
+    sea fines = _cer_lista_int(ins[2])
+    sea ejes = lista_rango(0, longitud(inicios))
+    si (longitud(ins) > 3 y ins[3] != nulo) { ejes = _cer_lista_int(ins[3]) }
+    sea pasos = []
+    para e en ejes { pasos.agregar(1) }
+    si (longitud(ins) > 4 y ins[4] != nulo) { pasos = _cer_lista_int(ins[4]) }
+    // Rangos por dimensión.
+    sea rangos = []
+    para d en lista_rango(0, n) {
+        sea r = []
+        para i en lista_rango(0, f[d]) { r.agregar(i) }
+        rangos.agregar(r)
+    }
+    para k en lista_rango(0, longitud(ejes)) {
+        sea d = _cer_eje(ejes[k], n)
+        sea dim = f[d]
+        sea paso = pasos[k]
+        sea ini = inicios[k]
+        sea fin = fines[k]
+        si (ini < 0) { ini = ini + dim }
+        si (fin < 0) { fin = fin + dim }
+        sea r = []
+        si (paso > 0) {
+            ini = maximo(0, minimo(dim, ini))
+            fin = maximo(0, minimo(dim, fin))
+            sea i = ini
+            mientras (i < fin) {
+                r.agregar(i)
+                i = i + paso
+            }
+        } sino {
+            ini = maximo(-1, minimo(dim - 1, ini))
+            fin = maximo(-1, minimo(dim - 1, fin))
+            sea i = ini
+            mientras (i > fin) {
+                r.agregar(i)
+                i = i + paso
+            }
+        }
+        rangos[d] = r
+    }
+    sea pasos_f = _cer_pasos(f)
+    sea forma = []
+    para r en rangos { forma.agregar(longitud(r)) }
+    sea r = []
+    _cer_recorrer(rangos, 0, 0, pasos_f, a["datos"], r)
+    retornar _cer_t(forma, r, a["tipo"])
+}
+
+funcion _cer_recorrer(rangos, d, base, pasos, datos, r) {
+    si (d == longitud(rangos)) {
+        r.agregar(datos[base])
+        retornar nulo
+    }
+    para i en rangos[d] { _cer_recorrer(rangos, d + 1, base + i * pasos[d], pasos, datos, r) }
+    retornar nulo
+}
+
+funcion _cer_reducir(a, ejes, mantener, op) {
+    sea f = a["forma"]
+    sea n = longitud(f)
+    sea norm = []
+    si (ejes == nulo o longitud(ejes) == 0) { norm = lista_rango(0, n) } sino {
+        para e en ejes { norm.agregar(_cer_eje(e, n)) }
+    }
+    sea forma_r = []
+    para d en lista_rango(0, n) { forma_r.agregar(si(lista_contiene(norm, d), 1, f[d])) }
+    sea total_r = _cer_tam(forma_r)
+    sea acc = []
+    sea cuentas = []
+    para i en lista_rango(0, total_r) {
+        acc.agregar(nulo)
+        cuentas.agregar(0)
+    }
+    sea pasos_r = _cer_pasos(forma_r)
+    sea pasos = _cer_pasos(f)
+    para i en lista_rango(0, longitud(a["datos"])) {
+        sea resto = i
+        sea idx = 0
+        para d en lista_rango(0, n) {
+            sea c = cociente(resto, pasos[d])
+            resto = resto - c * pasos[d]
+            si (lista_contiene(norm, d) == falso) { idx = idx + c * pasos_r[d] }
+        }
+        sea v = a["datos"][i]
+        si (acc[idx] == nulo) { acc[idx] = v } sino si (op == "ReduceMax") { acc[idx] = maximo(acc[idx], v) } sino si (op == "ReduceMin") { acc[idx] = minimo(acc[idx], v) } sino { acc[idx] = acc[idx] + v }
+        cuentas[idx] = cuentas[idx] + 1
+    }
+    si (op == "ReduceMean") {
+        para i en lista_rango(0, total_r) { acc[i] = acc[i] / cuentas[i] }
+    }
+    sea forma = []
+    para d en lista_rango(0, n) {
+        si (lista_contiene(norm, d) == falso) { forma.agregar(f[d]) } sino si (mantener) { forma.agregar(1) }
+    }
+    retornar _cer_t(forma, acc, a["tipo"])
+}

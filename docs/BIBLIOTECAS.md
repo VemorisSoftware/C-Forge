@@ -76,7 +76,7 @@ Estado: ✅ ya existe en C-Forge · 🔗 se usa hoy vía `cforge bindgen`,
 | # | Nombre | Para qué | Inspiración | Estado |
 |---|---|---|---|---|
 | 52 | `oraculo` | LLM locales cuantizados | llama.cpp | 🔗 |
-| 53 | `cerebro` | Ejecutar modelos entrenados | ONNX Runtime | 🔗 |
+| 53 | `cerebro` | Ejecutar modelos entrenados | ONNX Runtime | ✅ `cerebro` / `onnxruntime` |
 | 54 | `algebra` / `linalg` | Álgebra lineal | Eigen | ✅ `algebra` |
 | 55 | `vision` | Visión por computadora | OpenCV | 🔗 |
 | 56 | `vela` / `trees` | Machine learning ligero | Candle | ✅ `vela` |
@@ -146,7 +146,7 @@ Estado: ✅ ya existe en C-Forge · 🔗 se usa hoy vía `cforge bindgen`,
 | 105 | `archivador` / `archive` | ZIP/TAR seguros | libarchive | ✅ `archivador` |
 | 106 | `ajustes` / `config` | TOML y YAML estrictos | toml, yaml-rust | ✅ `ajustes` |
 | 107 | `marcado` / `markdown` | Markdown a HTML | pulldown-cmark | ✅ `marcado` |
-| 108 | `sintaxis` | Parser incremental | tree-sitter | 🔗 |
+| 108 | `sintaxis` | Parser incremental | tree-sitter | ✅ `sintaxis` / `treesitter` |
 | 109 | `xml` | XML rápido | quick-xml | ✅ `xml` |
 | 110 | `csv` | CSV gigantes (RFC 4180) | csv-rs | ✅ `csv` |
 | 111 | `memoria_rapida` / `redisx` | Cliente Redis con clústeres | fred | ✅ `memoria_rapida` |
@@ -272,7 +272,7 @@ Estado: ✅ ya existe en C-Forge · 🔗 se usa hoy vía `cforge bindgen`,
 
 | # | Nombre | Para qué | Inspiración | Estado |
 |---|---|---|---|---|
-| 197 | `revelado` | Imágenes masivas con poca RAM | libvips | 🔗 |
+| 197 | `revelado` | Imágenes masivas con poca RAM | libvips | ✅ `revelado` / `vips` |
 | 198 | `formato_web` | WebP y AVIF | libwebp, libavif | 🔗 |
 | 199 | `escaner` | Documentos escaneados | Leptonica | 🔗 |
 | 200 | `codigo_qr` / `qrcode` | QR y códigos de barras | ZXing | ✅ `codigo_qr` |
