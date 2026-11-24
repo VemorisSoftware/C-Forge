@@ -22,6 +22,7 @@ funcion f_redondear(x) {
 }
 
 funcion f_potencia10(n) {
+    si (n > 400) { n = 400 }                                   // ya es infinito
     sea r = f_(1)
     sea i = 0
     mientras (i < n) {
@@ -124,6 +125,9 @@ funcion f_arcoseno(x) {
 
 funcion f_exponencial(x) {
     sea k = f_redondear(__f64_div(x, f_ln2()))
+    // Fuera de rango el resultado es infinito o cero (sin iterar 2^60 veces).
+    si (k > 1100) { retornar 9218868437227405312 }
+    si (k < 0 - 1100) { retornar 0 }
     sea r = __f64_resta(x, __f64_mul(f_(k), f_ln2()))
     sea termino = f_(1)
     sea suma = f_(1)
@@ -372,6 +376,10 @@ funcion potencia(base, exponente) {
     // por cuadrados sucesivos.
     si (dyn_gr_es_entero(base) y __y_bits(exponente, 1) == 1 y exponente >= 1) {
         sea e = dyn_valor_entero(exponente)
+        // Tope: unos 10 millones de cifras (más tardaría horas).
+        sea cifras = dyn_longitud_decimal(base)
+        si (cifras > 1 y e > 10000000 / (cifras - 1)) { dyn_error("potencia: el resultado tendría demasiadas cifras") }
+        si (cifras == 1 y e > 33000000 y cifras > 0 y (base > 3 o base < 0 - 1)) { dyn_error("potencia: el resultado tendría demasiadas cifras") }
         sea r = dyn_entero(1)
         sea b = base
         mientras (e > 0) {
@@ -407,6 +415,8 @@ funcion redondear(v, decimales) {
     si (dyn_gr_es_entero(v)) { retornar v }
     sea x = dyn_a_f64(v)
     si (decimales == 0) { retornar dyn_entero(f_redondear(x)) }
+    // Más de 17 decimales ya no cambian un double: el mismo número.
+    si (__y_bits(decimales, 1) == 1 y dyn_valor_entero(decimales) > 17) { retornar v }
     sea escala = f_potencia10(dyn_valor_entero(decimales))
     retornar dyn_desde_f64(__f64_div(f_(f_redondear(__f64_mul(x, escala))), escala))
 }
@@ -1354,6 +1364,8 @@ funcion texto_invertir(t) {
 
 funcion texto_repetir(t, veces) {
     sea s = dyn_a_str(t)
+    si (__y_bits(veces, 1) != 1) { dyn_error("texto_repetir: la cantidad debe ser un entero") }
+    si (dyn_valor_entero(veces) > 0 y str_largo(s) > 0 y dyn_valor_entero(veces) > 2147483648 / str_largo(s)) { dyn_error("texto_repetir: el texto sería demasiado grande") }
     sea r = str_nuevo(16)
     sea i = 0
     mientras (i < dyn_valor_entero(veces)) {
@@ -2115,6 +2127,7 @@ funcion tls_abrir(sock, anfitrion) {
     sea estado = mem_reservar(64)
     mem_llenar(estado, 0, 64)
     __guardar64(estado + 16, fd)
+    __guardar64(estado + 56, tls_marca())
     si (sys_es_windows()) { retornar tls_abrir_schannel(estado, host) }
     si (tls_libssl() == 0) {
         si (sys_dl_disponible() == 0) { tls_error(estado, "https: agrega importar \"tls\" (o \"red\") al programa para usar TLS") }
@@ -2146,8 +2159,19 @@ funcion tls_abrir(sock, anfitrion) {
     retornar dyn_caja(11, estado)
 }
 
+// Marca de una conexión TLS viva: sin ella (un número cualquiera, nulo o una
+// conexión ya cerrada) las funciones dan un error en vez de leer memoria ajena.
+funcion tls_marca() { retornar 5527379 }
+
+funcion tls_estado(t) {
+    si (dyn_tipo(t) != 11) { dyn_error("tls: se esperaba una conexión de tls_abrir") }
+    sea estado = dyn_dato(t)
+    si (estado == 0 o __cargar64(estado + 56) != tls_marca()) { dyn_error("tls: la conexión no es válida o ya se cerró") }
+    retornar estado
+}
+
 funcion tls_enviar(t, datos) {
-    sea estado = dyn_entero_c(t)
+    sea estado = tls_estado(t)
     si (__cargar64(estado + 24) == 2) { retornar tls_enviar_schannel(estado, datos) }
     sea s = dyn_a_str(datos)
     sea hecho = 0
@@ -2160,7 +2184,7 @@ funcion tls_enviar(t, datos) {
 }
 
 funcion tls_recibir_todo(t) {
-    sea estado = dyn_entero_c(t)
+    sea estado = tls_estado(t)
     si (__cargar64(estado + 24) == 2) { retornar tls_recibir_todo_schannel(estado) }
     sea r = str_nuevo(4096)
     sea leer = tls_f("SSL_read")
@@ -2174,7 +2198,10 @@ funcion tls_recibir_todo(t) {
 }
 
 funcion tls_cerrar(t) {
-    sea estado = dyn_entero_c(t)
+    sea estado = tls_estado(t)
+    // Sin marca, cualquier uso posterior da error (no se libera la memoria:
+    // el recolector la reclama cuando nadie la usa, sin usos tras liberar).
+    __guardar64(estado + 56, 0)
     si (__cargar64(estado + 24) == 2) { retornar tls_cerrar_schannel(estado) }
     si (__cargar64(estado) != 0) {
         __ccall(tls_f("SSL_shutdown"), __cargar64(estado))
@@ -2182,13 +2209,12 @@ funcion tls_cerrar(t) {
         __ccall(tls_f("SSL_CTX_free"), __cargar64(estado + 8))
     }
     sys_red_cerrar(__cargar64(estado + 16))
-    mem_liberar(estado)
     retornar 0
 }
 
 // Versión negociada ("TLSv1.3", "TLSv1.2"…).
 funcion tls_version(t) {
-    sea estado = dyn_entero_c(t)
+    sea estado = tls_estado(t)
     si (__cargar64(estado + 24) == 2) { retornar dyn_texto(sys_tls_version(estado)) }
     si (__cargar64(estado) == 0) { retornar dyn_texto("desconocida") }
     retornar dyn_texto(str_desde_c(__ccall(tls_f("SSL_get_version"), __cargar64(estado))))
@@ -2223,7 +2249,6 @@ funcion tls_recibir_todo_schannel(estado) { retornar dyn_texto(sys_tls_recibir_t
 funcion tls_cerrar_schannel(estado) {
     sys_tls_cerrar(estado)
     sys_red_cerrar(__cargar64(estado + 16))
-    mem_liberar(estado)
     retornar 0
 }
 
@@ -2234,7 +2259,7 @@ funcion repl_preparar(omitir, archivo_conteo) {
     __guardar64(r, dyn_valor_entero(omitir))
     __guardar64(r + 8, 0)
     __guardar64(r + 16, dyn_texto_de(archivo_conteo, "repl_preparar"))
-    archivo_escribir(__cargar64(r + 16), "0")
+    si (archivo_intentar_escribir(__cargar64(r + 16), "0") < 0) { dyn_error("repl: no se pudo escribir el archivo de estado") }
     mem_fijar_global(17, r)
     retornar 0
 }
@@ -2998,13 +3023,18 @@ funcion dyn_entero_truncado(n, operacion) {
 
 funcion bytes_entero(n, ancho, orden) {
     sea v = dyn_entero_truncado(n, "bytes_entero")
+    si (__y_bits(ancho, 1) != 1) { dyn_error("bytes_entero: el ancho debe ser un entero de 0 a 1048576") }
     sea w = dyn_valor_entero(ancho)
+    si (w < 0 o w > 1048576) { dyn_error("bytes_entero: el ancho debe ser un entero de 0 a 1048576") }
     sea r = str_nuevo(w)
     sea i = 0
     mientras (i < w) {
         sea d = (w - 1 - i) * 8
         si (dyn_valor_entero(orden) == 1) { d = i * 8 }
-        str_agregar_byte(r, __y_bits(__desplazar_der(v, d), 255))
+        // Más allá de 64 bits: extensión del signo (0 o 255).
+        si (d >= 64) {
+            si (v < 0) { str_agregar_byte(r, 255) } sino { str_agregar_byte(r, 0) }
+        } sino { str_agregar_byte(r, __y_bits(__desplazar_der(v, d), 255)) }
         i = i + 1
     }
     retornar dyn_texto(r)
@@ -3144,8 +3174,11 @@ funcion hmac_sha256_bytes(clave, mensaje) { retornar dyn_texto(hex_a_bytes(dyn_t
 
 // PBKDF2-HMAC-SHA256 (RFC 8018): "largo" bytes (SCRAM-SHA-256 usa 32).
 funcion pbkdf2_sha256(clave, sal, iteraciones, largo) {
+    si (__y_bits(iteraciones, 1) != 1 o __y_bits(largo, 1) != 1) { dyn_error("pbkdf2_sha256: iteraciones y largo deben ser enteros") }
     sea n = dyn_valor_entero(iteraciones)
     sea total = dyn_valor_entero(largo)
+    si (n < 1 o n > 100000000) { dyn_error("pbkdf2_sha256: las iteraciones van de 1 a 100000000") }
+    si (total < 1 o total > 1048576) { dyn_error("pbkdf2_sha256: el largo va de 1 a 1048576 bytes") }
     sea r = str_nuevo(total)
     sea bloque = 1
     mientras (str_largo(r) < total) {
@@ -3733,8 +3766,15 @@ funcion dotnet_funcion(dll, tipo, metodo) {
         str_agregar(m, " (¿es static y [UnmanagedCallersOnly]?)")
         dyn_error(m)
     }
-    retornar dyn_entero(__cargar64(p))
+    // Caja con marca: dotnet_llamar no acepta un número cualquiera como
+    // dirección de código.
+    sea r = mem_reservar(16)
+    __guardar64(r, dotnet_marca())
+    __guardar64(r + 8, __cargar64(p))
+    retornar dyn_caja(11, r)
 }
+
+funcion dotnet_marca() { retornar 4478532 }
 
 funcion dotnet_argumentos(args) {
     sea v = mem_reservar(56)
@@ -3759,8 +3799,10 @@ funcion dotnet_argumentos(args) {
 }
 
 funcion dotnet_crudo(f, args) {
+    si (dyn_tipo(f) != 11) { dyn_error("dotnet: se esperaba una función de dotnet_funcion") }
+    si (dyn_dato(f) == 0 o __cargar64(dyn_dato(f)) != dotnet_marca()) { dyn_error("dotnet: se esperaba una función de dotnet_funcion") }
     sea v = dotnet_argumentos(args)
-    retornar __ccall(dyn_valor_entero(f), __cargar64(v), __cargar64(v + 8), __cargar64(v + 16), __cargar64(v + 24), __cargar64(v + 32), __cargar64(v + 40))
+    retornar __ccall(__cargar64(dyn_dato(f) + 8), __cargar64(v), __cargar64(v + 8), __cargar64(v + 16), __cargar64(v + 24), __cargar64(v + 32), __cargar64(v + 40))
 }
 
 funcion dotnet_llamar(f, args) {
@@ -4105,4 +4147,11 @@ funcion dyn_json_bonito(v) {
     sea r = str_nuevo(64)
     dyn_json_agregar(r, v, 0, 0)
     retornar dyn_texto(r)
+}
+
+// Cantidad de cifras decimales de un entero (chico o grande).
+funcion dyn_longitud_decimal(v) {
+    sea s = dyn_a_str(v)
+    si (str_byte(s, 0) == 45) { retornar str_largo(s) - 1 }
+    retornar str_largo(s)
 }
