@@ -75,7 +75,7 @@ Estado: ✅ ya existe en C-Forge · 🔗 se usa hoy vía `cforge bindgen`,
 
 | # | Nombre | Para qué | Inspiración | Estado |
 |---|---|---|---|---|
-| 52 | `oraculo` | LLM locales cuantizados | llama.cpp | 🔗 |
+| 52 | `oraculo` | LLM locales cuantizados | llama.cpp | ✅ `oraculo` / `llamacpp` (GGUF LLaMA, F32/F16/Q8_0/Q4_0) |
 | 53 | `cerebro` | Ejecutar modelos entrenados | ONNX Runtime | ✅ `cerebro` / `onnxruntime` |
 | 54 | `algebra` / `linalg` | Álgebra lineal | Eigen | ✅ `algebra` |
 | 55 | `vision` | Visión por computadora | OpenCV | ✅ `vision` / `opencv` |
@@ -240,7 +240,7 @@ Estado: ✅ ya existe en C-Forge · 🔗 se usa hoy vía `cforge bindgen`,
 | 172 | `fourier` / `fft` | FFT rápida | FFTW | ✅ `fourier` |
 | 173 | `blas` | Matrices de alto rendimiento | OpenBLAS | ✅ `blas` / `openblas` |
 | 174 | `malla_geo` / `geometry2d` | Geometría computacional | CGAL | ✅ `malla_geo` |
-| 175 | `robotica` | Física para robótica | MuJoCo | 🔗 |
+| 175 | `robotica` | Física para robótica | MuJoCo | ✅ `robotica` / `mujoco` (bisagras y deslizamientos, sin contactos) |
 | 176 | `cuaternion` / `quaternion` | Álgebra lineal y transformaciones | nalgebra | ✅ `cuaternion` |
 | 177 | `astro` / `astronomy` | Órbitas y efemérides | NOVAS | ✅ `astro` |
 | 178 | `molecula` | Quimioinformática | RDKit | ✅ `molecula` / `rdkit` |
@@ -285,7 +285,7 @@ Estado: ✅ ya existe en C-Forge · 🔗 se usa hoy vía `cforge bindgen`,
 | 207 | `mensaje_bancario` / `iso8583` | ISO 8583 y FIX | ISO 8583, FIX | ✅ `mensaje_bancario` |
 | 208 | `cobro` / `payments` | Cobros idempotentes y webhooks | Stripe | ✅ `cobro` |
 | 209 | `postura` | Rostro, manos y pose | MediaPipe | 🔗 |
-| 210 | `tuberia` | Pipelines multimedia | GStreamer | 🔗 |
+| 210 | `tuberia` | Pipelines multimedia | GStreamer | ✅ `tuberia` / `gstreamer` |
 | 211 | `voz_activa` / `vad` | Detección de voz | Silero VAD | ✅ `voz_activa` |
 
 ### L. Nube, microservicios y DevOps

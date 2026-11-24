@@ -4,6 +4,14 @@ Sitio oficial: [c-forge.org](https://c-forge.org)
 
 ## Sin publicar
 
+- Lote 38 de bibliotecas (tres más que pasan de enlaces a nativas):
+  `oraculo`/`llamacpp` (modelos LLaMA en GGUF con tensores F32, F16, Q8_0
+  y Q4_0, caché KV, tokenizador SentencePiece y muestreo; mismos logits que
+  una referencia en NumPy), `robotica`/`mujoco` (dinámica de árboles con
+  bisagras y deslizamientos leídos de MJCF, inercias de geometrías,
+  amortiguamiento, resortes, Euler y RK4; mismas trayectorias que MuJoCo 4)
+  y `tuberia`/`gstreamer` (descripciones de gst-launch con fuentes de audio
+  y video de prueba, WAV, PNG, volumen, conversión, remuestreo y level).
 - Lote 37 de bibliotecas (tres más que pasan de enlaces a nativas):
   `vision`/`opencv` (color, umbrales con Otsu y adaptativo, filtros,
   Canny, morfología, componentes, contornos, momentos y plantillas; mismos

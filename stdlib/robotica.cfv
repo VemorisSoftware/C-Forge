@@ -1,0 +1,564 @@
+// stdlib/robotica.cfv — Simulación de dinámica de cuerpos rígidos al estilo
+// de MuJoCo, escrito desde cero (idea de MuJoCo, Apache 2.0). Lee un
+// subconjunto de MJCF (XML) y simula árboles cinemáticos con articulaciones
+// de bisagra (hinge) y deslizamiento (slide) en coordenadas generalizadas:
+//
+//   · Inercias a partir de las geometrías (sphere, capsule, box, cylinder,
+//     ellipsoid) o de <inertial>, como el compilador de MuJoCo.
+//   · Matriz de masas (por jacobianos), fuerzas de sesgo (Newton–Euler
+//     recursivo), gravedad, amortiguamiento, resortes y fuerzas aplicadas.
+//   · Integradores Euler semiimplícito (con amortiguamiento implícito, como
+//     MuJoCo) y RK4.
+//
+// No hay contactos ni límites de articulación.
+//
+// En inglés: importar "mujoco".
+//
+//   importar "robotica"
+//   sea s = robotica_cargar_xml(leer_archivo("pendulo.xml"))
+//   robotica_fijar(s, "qpos", [0.5])
+//   para i en lista_rango(0, 1000) { robotica_paso(s) }
+//   mostrar(robotica_estado(s)["qpos"])
+
+importar "xml"
+
+// ---------- álgebra 3D ----------
+
+funcion _rb_sum(a, b) { retornar [a[0] + b[0], a[1] + b[1], a[2] + b[2]] }
+funcion _rb_res(a, b) { retornar [a[0] - b[0], a[1] - b[1], a[2] - b[2]] }
+funcion _rb_esc(a, s) { retornar [a[0] * s, a[1] * s, a[2] * s] }
+funcion _rb_punto(a, b) { retornar a[0] * b[0] + a[1] * b[1] + a[2] * b[2] }
+funcion _rb_cruz(a, b) { retornar [a[1] * b[2] - a[2] * b[1], a[2] * b[0] - a[0] * b[2], a[0] * b[1] - a[1] * b[0]] }
+funcion _rb_norm(a) {
+    sea n = raiz(_rb_punto(a, a))
+    si (n == 0) { retornar a }
+    retornar _rb_esc(a, 1 / n)
+}
+// Matrices 3×3 por filas.
+funcion _rb_mv(m, v) { retornar [m[0] * v[0] + m[1] * v[1] + m[2] * v[2], m[3] * v[0] + m[4] * v[1] + m[5] * v[2], m[6] * v[0] + m[7] * v[1] + m[8] * v[2]] }
+funcion _rb_mm(a, b) {
+    sea r = []
+    para i en lista_rango(0, 3) {
+        para j en lista_rango(0, 3) { r.agregar(a[i * 3] * b[j] + a[i * 3 + 1] * b[3 + j] + a[i * 3 + 2] * b[6 + j]) }
+    }
+    retornar r
+}
+funcion _rb_tr(a) { retornar [a[0], a[3], a[6], a[1], a[4], a[7], a[2], a[5], a[8]] }
+funcion _rb_id() { retornar [1, 0, 0, 0, 1, 0, 0, 0, 1] }
+funcion _rb_rot(eje, ang) {
+    sea u = _rb_norm(eje)
+    sea c = coseno(ang)
+    sea s = seno(ang)
+    sea t = 1 - c
+    sea x = u[0]
+    sea yy = u[1]
+    sea z = u[2]
+    retornar [t * x * x + c, t * x * yy - s * z, t * x * z + s * yy, t * x * yy + s * z, t * yy * yy + c, t * yy * z - s * x, t * x * z - s * yy, t * yy * z + s * x, t * z * z + c]
+}
+funcion _rb_quat_mat(q) {
+    sea n = raiz(q[0] * q[0] + q[1] * q[1] + q[2] * q[2] + q[3] * q[3])
+    sea w = q[0] / n
+    sea x = q[1] / n
+    sea yy = q[2] / n
+    sea z = q[3] / n
+    retornar [1 - 2 * (yy * yy + z * z), 2 * (x * yy - z * w), 2 * (x * z + yy * w), 2 * (x * yy + z * w), 1 - 2 * (x * x + z * z), 2 * (yy * z - x * w), 2 * (x * z - yy * w), 2 * (yy * z + x * w), 1 - 2 * (x * x + yy * yy)]
+}
+
+// ---------- MJCF ----------
+
+funcion _rb_nums(t, defecto) {
+    si (t == nulo) { retornar defecto }
+    sea r = []
+    para p en texto_dividir(texto_recortar("" + t), " ") {
+        si (texto_recortar(p) != "") { r.agregar(a_numero(texto_recortar(p))) }
+    }
+    retornar r
+}
+
+funcion _rb_attr(n, k) { retornar n["atributos"][k] ?? nulo }
+
+funcion _rb_orientacion(n, grados) {
+    si (_rb_attr(n, "quat") != nulo) { retornar _rb_quat_mat(_rb_nums(_rb_attr(n, "quat"), nulo)) }
+    si (_rb_attr(n, "axisangle") != nulo) {
+        sea a = _rb_nums(_rb_attr(n, "axisangle"), nulo)
+        retornar _rb_rot([a[0], a[1], a[2]], a[3] * si(grados, 3.141592653589793 / 180, 1))
+    }
+    si (_rb_attr(n, "euler") != nulo) {
+        sea e = _rb_nums(_rb_attr(n, "euler"), nulo)
+        sea f = si(grados, 3.141592653589793 / 180, 1)
+        // Secuencia xyz intrínseca (la de MuJoCo por defecto).
+        retornar _rb_mm(_rb_mm(_rb_rot([1, 0, 0], e[0] * f), _rb_rot([0, 1, 0], e[1] * f)), _rb_rot([0, 0, 1], e[2] * f))
+    }
+    retornar _rb_id()
+}
+
+// Masa, centro (en el marco del cuerpo) e inercia 3×3 alrededor del centro.
+funcion _rb_geom(n, densidad_def) {
+    sea tipo_g = _rb_attr(n, "type") ?? "sphere"
+    sea tam = _rb_nums(_rb_attr(n, "size"), [0, 0, 0])
+    sea pos = _rb_nums(_rb_attr(n, "pos"), [0, 0, 0])
+    sea rot = _rb_orientacion(n, verdadero)
+    si (_rb_attr(n, "fromto") != nulo) {
+        sea ft = _rb_nums(_rb_attr(n, "fromto"), nulo)
+        sea a = [ft[0], ft[1], ft[2]]
+        sea b = [ft[3], ft[4], ft[5]]
+        pos = _rb_esc(_rb_sum(a, b), 0.5)
+        sea d = _rb_res(b, a)
+        sea largo = raiz(_rb_punto(d, d))
+        tam = [tam[0], largo / 2, 0]
+        // Rotación que lleva z al eje del segmento.
+        sea z = [0, 0, 1]
+        sea u = _rb_norm(d)
+        sea eje = _rb_cruz(z, u)
+        sea s = raiz(_rb_punto(eje, eje))
+        si (s > 1e-12) { rot = _rb_rot(eje, _rb_atan2(s, _rb_punto(z, u))) } sino si (_rb_punto(z, u) < 0) { rot = _rb_rot([1, 0, 0], 3.141592653589793) }
+    }
+    sea dens = a_numero("" + (_rb_attr(n, "density") ?? densidad_def))
+    sea vol = 0.0
+    sea ix = 0.0
+    sea iy = 0.0
+    sea iz = 0.0
+    sea pi = 3.141592653589793
+    si (tipo_g == "sphere") {
+        vol = 4 / 3 * pi * potencia(tam[0], 3)
+    } sino si (tipo_g == "capsule") {
+        vol = pi * tam[0] * tam[0] * 2 * tam[1] + 4 / 3 * pi * potencia(tam[0], 3)
+    } sino si (tipo_g == "cylinder") {
+        vol = pi * tam[0] * tam[0] * 2 * tam[1]
+    } sino si (tipo_g == "box") {
+        vol = 8 * tam[0] * tam[1] * tam[2]
+    } sino si (tipo_g == "ellipsoid") {
+        vol = 4 / 3 * pi * tam[0] * tam[1] * tam[2]
+    } sino { lanzar "robotica: geometría no soportada para inercia: " + tipo_g }
+    sea masa = dens * vol
+    si (_rb_attr(n, "mass") != nulo) { masa = a_numero("" + _rb_attr(n, "mass")) }
+    si (tipo_g == "sphere") {
+        ix = 2 * masa * tam[0] * tam[0] / 5
+        iy = ix
+        iz = ix
+    } sino si (tipo_g == "capsule") {
+        sea r = tam[0]
+        sea h = 2 * tam[1]
+        sea ms = masa * 4 * r / (4 * r + 3 * h)
+        sea mc = masa - ms
+        ix = mc * (3 * r * r + h * h) / 12 + 2 * ms * r * r / 5 + ms * h * (3 * r + 2 * h) / 8
+        iy = ix
+        iz = mc * r * r / 2 + 2 * ms * r * r / 5
+    } sino si (tipo_g == "cylinder") {
+        sea r = tam[0]
+        sea h = 2 * tam[1]
+        ix = masa * (3 * r * r + h * h) / 12
+        iy = ix
+        iz = masa * r * r / 2
+    } sino si (tipo_g == "box") {
+        ix = masa * (4 * tam[1] * tam[1] + 4 * tam[2] * tam[2]) / 12
+        iy = masa * (4 * tam[0] * tam[0] + 4 * tam[2] * tam[2]) / 12
+        iz = masa * (4 * tam[0] * tam[0] + 4 * tam[1] * tam[1]) / 12
+    } sino {
+        ix = masa * (tam[1] * tam[1] + tam[2] * tam[2]) / 5
+        iy = masa * (tam[0] * tam[0] + tam[2] * tam[2]) / 5
+        iz = masa * (tam[0] * tam[0] + tam[1] * tam[1]) / 5
+    }
+    sea local = _rb_mm(_rb_mm(rot, [ix, 0, 0, 0, iy, 0, 0, 0, iz]), _rb_tr(rot))
+    retornar {"masa": masa, "centro": pos, "inercia": local}
+}
+
+funcion _rb_atan2(yy, x) {
+    si (x > 0) { retornar _rb_atan(yy / x) }
+    si (x < 0 y yy >= 0) { retornar _rb_atan(yy / x) + 3.141592653589793 }
+    si (x < 0) { retornar _rb_atan(yy / x) - 3.141592653589793 }
+    retornar si(yy > 0, 1.5707963267948966, -1.5707963267948966)
+}
+
+funcion _rb_atan(x) {
+    // Reducción a |x| ≤ 0.5 y serie.
+    si (x < 0) { retornar 0 - _rb_atan(0 - x) }
+    si (x > 1) { retornar 1.5707963267948966 - _rb_atan(1 / x) }
+    si (x > 0.5) { retornar 0.7853981633974483 + _rb_atan((x - 1) / (1 + x)) }
+    sea s = 0.0
+    sea t = x
+    sea k = 1
+    mientras (absoluto(t) > 1e-18 y k < 200) {
+        s = s + t / k
+        t = 0 - t * x * x
+        k = k + 2
+    }
+    retornar s
+}
+
+// Combina masas puntuales con inercia en un solo cuerpo.
+funcion _rb_combinar(partes) {
+    sea masa = 0.0
+    sea c = [0.0, 0.0, 0.0]
+    para p en partes {
+        masa = masa + p["masa"]
+        c = _rb_sum(c, _rb_esc(p["centro"], p["masa"]))
+    }
+    si (masa == 0) { retornar {"masa": 0.0, "centro": [0.0, 0.0, 0.0], "inercia": [0, 0, 0, 0, 0, 0, 0, 0, 0]} }
+    c = _rb_esc(c, 1 / masa)
+    sea I = [0, 0, 0, 0, 0, 0, 0, 0, 0]
+    para p en partes {
+        sea d = _rb_res(p["centro"], c)
+        sea dd = _rb_punto(d, d)
+        para i en lista_rango(0, 3) {
+            para j en lista_rango(0, 3) { I[i * 3 + j] = I[i * 3 + j] + p["inercia"][i * 3 + j] + p["masa"] * (si(i == j, dd, 0) - d[i] * d[j]) }
+        }
+    }
+    retornar {"masa": masa, "centro": c, "inercia": I}
+}
+
+/// Lee un modelo MJCF (texto XML) y devuelve la simulación lista.
+funcion robotica_cargar_xml(texto) {
+    sea raiz_x = xml_analizar(texto)
+    si (raiz_x["nombre"] != "mujoco") { lanzar "robotica: se esperaba <mujoco>" }
+    sea s = {"cuerpos": [], "articulaciones": [], "h": 0.002, "gravedad": [0, 0, -9.81], "integrador": "Euler", "tiempo": 0.0, "grados": verdadero, "densidad": 1000}
+    para n en raiz_x["hijos"] {
+        si (tipo(n) == "mapa" y n["nombre"] == "compiler") { s["grados"] = (_rb_attr(n, "angle") ?? "degree") == "degree" }
+    }
+    para n en raiz_x["hijos"] {
+        si (tipo(n) == "mapa" y n["nombre"] == "option") {
+            si (_rb_attr(n, "timestep") != nulo) { s["h"] = a_numero("" + _rb_attr(n, "timestep")) }
+            si (_rb_attr(n, "gravity") != nulo) { s["gravedad"] = _rb_nums(_rb_attr(n, "gravity"), nulo) }
+            si (_rb_attr(n, "integrator") != nulo) { s["integrador"] = _rb_attr(n, "integrator") }
+        }
+    }
+    para n en raiz_x["hijos"] {
+        si (tipo(n) == "mapa" y n["nombre"] == "worldbody") {
+            para h en n["hijos"] {
+                si (tipo(h) == "mapa" y h["nombre"] == "body") { _rb_cuerpo(s, h, -1) }
+            }
+        }
+    }
+    sea nv = longitud(s["articulaciones"])
+    s["qpos"] = []
+    s["qvel"] = []
+    s["fuerza"] = []
+    para j en s["articulaciones"] {
+        s["qpos"].agregar(j["ref"])
+        s["qvel"].agregar(0.0)
+        s["fuerza"].agregar(0.0)
+    }
+    s["qacc"] = []
+    para i en lista_rango(0, nv) { s["qacc"].agregar(0.0) }
+    retornar s
+}
+
+funcion _rb_cuerpo(s, n, padre) {
+    sea id = longitud(s["cuerpos"])
+    sea partes = []
+    sea inercial = nulo
+    sea juntas = []
+    para h en n["hijos"] {
+        si (tipo(h) == "mapa") {
+            si (h["nombre"] == "geom") { partes.agregar(_rb_geom(h, s["densidad"])) }
+            si (h["nombre"] == "inertial") {
+                sea d = _rb_nums(_rb_attr(h, "diaginertia"), [0, 0, 0])
+                sea rot = _rb_orientacion(h, s["grados"])
+                inercial = {"masa": a_numero("" + _rb_attr(h, "mass")), "centro": _rb_nums(_rb_attr(h, "pos"), [0, 0, 0]), "inercia": _rb_mm(_rb_mm(rot, [d[0], 0, 0, 0, d[1], 0, 0, 0, d[2]]), _rb_tr(rot))}
+            }
+        }
+    }
+    sea props = si(inercial != nulo, inercial, _rb_combinar(partes))
+    s["cuerpos"].agregar({"nombre": _rb_attr(n, "name") ?? ("cuerpo" + id), "padre": padre, "pos": _rb_nums(_rb_attr(n, "pos"), [0, 0, 0]), "rot": _rb_orientacion(n, s["grados"]),
+        "masa": props["masa"], "centro": props["centro"], "inercia": props["inercia"], "juntas": juntas})
+    para h en n["hijos"] {
+        si (tipo(h) == "mapa" y h["nombre"] == "joint") {
+            sea t = _rb_attr(h, "type") ?? "hinge"
+            si (t != "hinge" y t != "slide") { lanzar "robotica: articulación no soportada: " + t }
+            sea j = {"nombre": _rb_attr(h, "name") ?? ("junta" + longitud(s["articulaciones"])), "tipo": t, "cuerpo": id, "eje": _rb_norm(_rb_nums(_rb_attr(h, "axis"), [0, 0, 1])),
+                "pos": _rb_nums(_rb_attr(h, "pos"), [0, 0, 0]), "amortiguamiento": a_numero("" + (_rb_attr(h, "damping") ?? 0)), "rigidez": a_numero("" + (_rb_attr(h, "stiffness") ?? 0)),
+                "ref": a_numero("" + (_rb_attr(h, "ref") ?? 0)) * si(t == "hinge" y s["grados"], 3.141592653589793 / 180, 1), "resorte": a_numero("" + (_rb_attr(h, "springref") ?? 0)) * si(t == "hinge" y s["grados"], 3.141592653589793 / 180, 1)}
+            juntas.agregar(longitud(s["articulaciones"]))
+            s["articulaciones"].agregar(j)
+        }
+    }
+    para h en n["hijos"] {
+        si (tipo(h) == "mapa" y h["nombre"] == "body") { _rb_cuerpo(s, h, id) }
+    }
+}
+
+// ---------- dinámica ----------
+
+// Cinemática y velocidades: posiciones, ejes y aceleraciones sin qacc.
+funcion _rb_cinematica(s, q, qd) {
+    sea cuerpos = s["cuerpos"]
+    sea est = []
+    para b en lista_rango(0, longitud(cuerpos)) {
+        sea c = cuerpos[b]
+        sea pr = nulo
+        si (c["padre"] >= 0) { pr = est[c["padre"]] }
+        sea R = si(pr == nulo, c["rot"], _rb_mm(pr["R"], c["rot"]))
+        sea x = si(pr == nulo, c["pos"], _rb_sum(pr["x"], _rb_mv(pr["R"], c["pos"])))
+        // Velocidad espacial (ω, v del punto en el origen) y aceleración espacial sin qdd.
+        sea w = si(pr == nulo, [0.0, 0.0, 0.0], pr["w"])
+        sea vo = si(pr == nulo, [0.0, 0.0, 0.0], pr["vo"])
+        sea al = si(pr == nulo, [0.0, 0.0, 0.0], pr["al"])
+        sea ao = si(pr == nulo, [0.0, 0.0, 0.0], pr["ao"])
+        sea ejes = []
+        para j en c["juntas"] {
+            sea jt = s["articulaciones"][j]
+            sea a = _rb_mv(R, jt["eje"])
+            sea p = _rb_sum(x, _rb_mv(R, jt["pos"]))
+            sea dq = q[j] - jt["ref"]
+            sea S_w = [0.0, 0.0, 0.0]
+            sea S_v = [0.0, 0.0, 0.0]
+            si (jt["tipo"] == "hinge") {
+                R = _rb_mm(_rb_rot(a, dq), R)
+                x = _rb_res(p, _rb_mv(R, jt["pos"]))
+                S_w = a
+                S_v = _rb_cruz(p, a)
+            } sino {
+                x = _rb_sum(x, _rb_esc(a, dq))
+                S_v = a
+            }
+            ejes.agregar({"j": j, "a": a, "p": p, "tipo": jt["tipo"]})
+            // V += S q̇ ; A += V × (S q̇).
+            sea mw = _rb_esc(S_w, qd[j])
+            sea mv = _rb_esc(S_v, qd[j])
+            w = _rb_sum(w, mw)
+            vo = _rb_sum(vo, mv)
+            al = _rb_sum(al, _rb_cruz(w, mw))
+            ao = _rb_sum(ao, _rb_sum(_rb_cruz(w, mv), _rb_cruz(vo, mw)))
+        }
+        sea cm = _rb_sum(x, _rb_mv(R, c["centro"]))
+        sea Iw = _rb_mm(_rb_mm(R, c["inercia"]), _rb_tr(R))
+        // Aceleración clásica del centro de masa (sin qdd).
+        sea vcm = _rb_sum(vo, _rb_cruz(w, cm))
+        sea acm = _rb_sum(_rb_sum(ao, _rb_cruz(al, cm)), _rb_cruz(w, vcm))
+        est.agregar({"R": R, "x": x, "w": w, "vo": vo, "al": al, "ao": ao, "cm": cm, "I": Iw, "acm": acm, "vcm": vcm, "ejes": ejes})
+    }
+    retornar est
+}
+
+funcion _rb_ancestros(s, b) {
+    sea r = []
+    sea x = b
+    mientras (x >= 0) {
+        r.agregar(x)
+        x = s["cuerpos"][x]["padre"]
+    }
+    retornar r
+}
+
+// Jacobianos del centro de masa de cada cuerpo: lista por cuerpo de [Jv, Jw] por dof.
+funcion _rb_jacobianos(s, est) {
+    sea nv = longitud(s["articulaciones"])
+    sea r = []
+    para b en lista_rango(0, longitud(s["cuerpos"])) {
+        sea jv = []
+        sea jw = []
+        para i en lista_rango(0, nv) {
+            jv.agregar([0.0, 0.0, 0.0])
+            jw.agregar([0.0, 0.0, 0.0])
+        }
+        para a en _rb_ancestros(s, b) {
+            para e en est[a]["ejes"] {
+                si (e["tipo"] == "hinge") {
+                    jv[e["j"]] = _rb_cruz(e["a"], _rb_res(est[b]["cm"], e["p"]))
+                    jw[e["j"]] = e["a"]
+                } sino { jv[e["j"]] = e["a"] }
+            }
+        }
+        r.agregar([jv, jw])
+    }
+    retornar r
+}
+
+funcion _rb_resolver(M, f) {
+    // Eliminación gaussiana (M es simétrica definida positiva).
+    sea n = longitud(f)
+    sea a = []
+    para i en lista_rango(0, n) {
+        sea fila = []
+        para j en lista_rango(0, n) { fila.agregar(M[i][j]) }
+        fila.agregar(f[i])
+        a.agregar(fila)
+    }
+    para k en lista_rango(0, n) {
+        sea piv = k
+        para i en lista_rango(k + 1, n) {
+            si (absoluto(a[i][k]) > absoluto(a[piv][k])) { piv = i }
+        }
+        sea tmp = a[k]
+        a[k] = a[piv]
+        a[piv] = tmp
+        para i en lista_rango(k + 1, n) {
+            sea fct = a[i][k] / a[k][k]
+            para j en lista_rango(k, n + 1) { a[i][j] = a[i][j] - fct * a[k][j] }
+        }
+    }
+    sea x = []
+    para i en lista_rango(0, n) { x.agregar(0.0) }
+    sea i = n - 1
+    mientras (i >= 0) {
+        sea s = a[i][n]
+        para j en lista_rango(i + 1, n) { s = s - a[i][j] * x[j] }
+        x[i] = s / a[i][i]
+        i = i - 1
+    }
+    retornar x
+}
+
+// Matriz de masas, fuerzas de sesgo y fuerzas pasivas en (q, q̇).
+funcion _rb_dinamica(s, q, qd) {
+    sea nv = longitud(s["articulaciones"])
+    sea est = _rb_cinematica(s, q, qd)
+    sea J = _rb_jacobianos(s, est)
+    sea M = []
+    para i en lista_rango(0, nv) {
+        sea fila = []
+        para j en lista_rango(0, nv) { fila.agregar(0.0) }
+        M.agregar(fila)
+    }
+    sea sesgo = []
+    para i en lista_rango(0, nv) { sesgo.agregar(0.0) }
+    sea g = s["gravedad"]
+    para b en lista_rango(0, longitud(s["cuerpos"])) {
+        sea c = s["cuerpos"][b]
+        sea e = est[b]
+        sea m = c["masa"]
+        sea Iw = e["I"]
+        sea fuerza = _rb_esc(_rb_res(e["acm"], g), m)
+        sea par = _rb_sum(_rb_mv(Iw, e["al"]), _rb_cruz(e["w"], _rb_mv(Iw, e["w"])))
+        sea jv = J[b][0]
+        sea jw = J[b][1]
+        para i en lista_rango(0, nv) {
+            sesgo[i] = sesgo[i] + _rb_punto(jv[i], fuerza) + _rb_punto(jw[i], par)
+            para k en lista_rango(0, nv) { M[i][k] = M[i][k] + m * _rb_punto(jv[i], jv[k]) + _rb_punto(jw[i], _rb_mv(Iw, jw[k])) }
+        }
+    }
+    sea pasiva = []
+    para i en lista_rango(0, nv) {
+        sea jt = s["articulaciones"][i]
+        pasiva.agregar(0 - jt["amortiguamiento"] * qd[i] - jt["rigidez"] * (q[i] - jt["resorte"]))
+    }
+    retornar {"M": M, "sesgo": sesgo, "pasiva": pasiva, "est": est}
+}
+
+funcion _rb_aceleracion(s, q, qd, implicito) {
+    sea d = _rb_dinamica(s, q, qd)
+    sea nv = longitud(q)
+    sea f = []
+    para i en lista_rango(0, nv) { f.agregar(d["pasiva"][i] + s["fuerza"][i] - d["sesgo"][i]) }
+    sea M = d["M"]
+    si (implicito) {
+        para i en lista_rango(0, nv) { M[i][i] = M[i][i] + s["h"] * s["articulaciones"][i]["amortiguamiento"] }
+    }
+    retornar _rb_resolver(M, f)
+}
+
+/// Avanza un paso de tiempo con el integrador del modelo ("Euler" o "RK4").
+funcion robotica_paso(s) {
+    sea nv = longitud(s["qpos"])
+    sea h = s["h"]
+    si (nv == 0) {
+        s["tiempo"] = s["tiempo"] + h
+        retornar nulo
+    }
+    si (s["integrador"] == "RK4") {
+        sea q0 = s["qpos"]
+        sea v0 = s["qvel"]
+        sea k1v = v0
+        sea k1a = _rb_aceleracion(s, q0, v0, falso)
+        sea q2 = []
+        sea v2 = []
+        para i en lista_rango(0, nv) {
+            q2.agregar(q0[i] + h / 2 * k1v[i])
+            v2.agregar(v0[i] + h / 2 * k1a[i])
+        }
+        sea k2a = _rb_aceleracion(s, q2, v2, falso)
+        sea q3 = []
+        sea v3 = []
+        para i en lista_rango(0, nv) {
+            q3.agregar(q0[i] + h / 2 * v2[i])
+            v3.agregar(v0[i] + h / 2 * k2a[i])
+        }
+        sea k3a = _rb_aceleracion(s, q3, v3, falso)
+        sea q4 = []
+        sea v4 = []
+        para i en lista_rango(0, nv) {
+            q4.agregar(q0[i] + h * v3[i])
+            v4.agregar(v0[i] + h * k3a[i])
+        }
+        sea k4a = _rb_aceleracion(s, q4, v4, falso)
+        sea nq = []
+        sea nvv = []
+        para i en lista_rango(0, nv) {
+            nq.agregar(q0[i] + h / 6 * (v0[i] + 2 * v2[i] + 2 * v3[i] + v4[i]))
+            nvv.agregar(v0[i] + h / 6 * (k1a[i] + 2 * k2a[i] + 2 * k3a[i] + k4a[i]))
+        }
+        s["qacc"] = k1a
+        s["qpos"] = nq
+        s["qvel"] = nvv
+    } sino {
+        sea acc = _rb_aceleracion(s, s["qpos"], s["qvel"], verdadero)
+        s["qacc"] = acc
+        para i en lista_rango(0, nv) {
+            s["qvel"][i] = s["qvel"][i] + h * acc[i]
+            s["qpos"][i] = s["qpos"][i] + h * s["qvel"][i]
+        }
+    }
+    s["tiempo"] = s["tiempo"] + h
+    retornar nulo
+}
+
+/// Fija "qpos", "qvel" o "fuerza" (lista por articulación) o "tiempo".
+/// También acepta los nombres de MuJoCo "qfrc_applied" y "time".
+funcion robotica_fijar(s, campo, valores) {
+    si (campo == "qfrc_applied") { campo = "fuerza" }
+    si (campo == "time") { campo = "tiempo" }
+    si (lista_contiene(["qpos", "qvel", "fuerza", "tiempo"], campo) == falso) { lanzar "robotica: campo desconocido " + campo }
+    si (campo == "tiempo") {
+        s["tiempo"] = valores
+        retornar nulo
+    }
+    si (longitud(valores) != longitud(s["articulaciones"])) { lanzar "robotica: se esperaban " + longitud(s["articulaciones"]) + " valores para " + campo }
+    sea r = []
+    para v en valores { r.agregar(v * 1.0) }
+    s[campo] = r
+    retornar nulo
+}
+
+/// Estado actual: {"tiempo", "qpos", "qvel", "qacc"}.
+funcion robotica_estado(s) { retornar {"tiempo": s["tiempo"], "qpos": s["qpos"], "qvel": s["qvel"], "qacc": s["qacc"]} }
+
+/// Masa e inercias calculadas: [{"nombre", "masa", "centro", "inercia"}].
+funcion robotica_cuerpos(s) {
+    sea r = []
+    para c en s["cuerpos"] { r.agregar({"nombre": c["nombre"], "masa": c["masa"], "centro": c["centro"], "inercia": c["inercia"]}) }
+    retornar r
+}
+
+/// Nombres de las articulaciones en orden.
+funcion robotica_articulaciones(s) {
+    sea r = []
+    para j en s["articulaciones"] { r.agregar(j["nombre"]) }
+    retornar r
+}
+
+/// Posición del centro de masa de cada cuerpo en el mundo.
+funcion robotica_posiciones(s) {
+    sea r = []
+    para e en _rb_cinematica(s, s["qpos"], s["qvel"]) { r.agregar(e["cm"]) }
+    retornar r
+}
+
+/// Energía {"potencial", "cinetica"} (gravedad y resortes; cinética ½ q̇ᵀ M q̇).
+funcion robotica_energia(s) {
+    sea d = _rb_dinamica(s, s["qpos"], s["qvel"])
+    sea pot = 0.0
+    para b en lista_rango(0, longitud(s["cuerpos"])) { pot = pot - s["cuerpos"][b]["masa"] * _rb_punto(s["gravedad"], d["est"][b]["cm"]) }
+    para i en lista_rango(0, longitud(s["articulaciones"])) {
+        sea jt = s["articulaciones"][i]
+        pot = pot + 0.5 * jt["rigidez"] * (s["qpos"][i] - jt["resorte"]) * (s["qpos"][i] - jt["resorte"])
+    }
+    sea cin = 0.0
+    sea nv = longitud(s["qvel"])
+    para i en lista_rango(0, nv) {
+        para k en lista_rango(0, nv) { cin = cin + 0.5 * s["qvel"][i] * d["M"][i][k] * s["qvel"][k] }
+    }
+    retornar {"potencial": pot, "cinetica": cin}
+}
+
+/// Matriz de masas en el estado actual (para control).
+funcion robotica_matriz_masas(s) { retornar _rb_dinamica(s, s["qpos"], s["qvel"])["M"] }

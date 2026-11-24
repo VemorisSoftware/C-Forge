@@ -1,0 +1,487 @@
+// stdlib/oraculo.cfv — Modelos de lenguaje LLaMA en formato GGUF al estilo
+// de llama.cpp, escrito desde cero (idea de llama.cpp, MIT; formato GGUF de
+// ggml). Lee el archivo (metadatos y tensores F32, F16, Q8_0 y Q4_0),
+// tokeniza con el vocabulario SentencePiece del modelo y genera texto en
+// CPU con caché KV: RMSNorm, RoPE, atención con grupos de cabezas (GQA) y
+// SwiGLU, igual que la arquitectura "llama" de llama.cpp.
+//
+// En inglés: importar "llamacpp".
+//
+//   importar "oraculo"
+//   sea m = oraculo_cargar("modelo.gguf")
+//   mostrar(oraculo_info(m))
+//   mostrar(oraculo_completar(m, "Había una vez", {"max_tokens": 40, "temperatura": 0.7, "semilla": 1}))
+//
+// Pensado para modelos chicos (el cálculo es de C-Forge puro, sin SIMD).
+
+// ---------- lectura GGUF ----------
+
+funcion _orc_u(st, n) {
+    sea v = bytes_leer_entero(st["d"], st["p"], n, 1)
+    st["p"] = st["p"] + n
+    retornar v
+}
+
+funcion _orc_u64(st) {
+    sea bajo = _orc_u(st, 4)
+    sea alto = _orc_u(st, 4)
+    retornar alto * 4294967296 + bajo
+}
+
+funcion _orc_texto(st) {
+    sea n = _orc_u64(st)
+    sea t = subtexto(st["d"], st["p"], st["p"] + n)
+    st["p"] = st["p"] + n
+    retornar t
+}
+
+funcion _orc_f32(b, i) {
+    sea bits = bytes_leer_entero(b, i, 4, 1)
+    sea signo = si(bits >= 2147483648, -1, 1)
+    sea e = cociente(bits, 8388608) % 256
+    sea m = bits % 8388608
+    si (e == 0) { retornar signo * m * potencia(2, -149) }
+    retornar signo * (1 + m / 8388608) * potencia(2, e - 127)
+}
+
+funcion _orc_f16(b, i) {
+    sea bits = bytes_leer_entero(b, i, 2, 1)
+    sea signo = si(bits >= 32768, -1, 1)
+    sea e = cociente(bits, 1024) % 32
+    sea m = bits % 1024
+    si (e == 0) { retornar signo * m * potencia(2, -24) }
+    si (e == 31) { retornar signo * 1e38 }
+    retornar signo * (1 + m / 1024) * potencia(2, e - 15)
+}
+
+funcion _orc_valor(st, tipo_v) {
+    si (tipo_v == 0) { retornar _orc_u(st, 1) }
+    si (tipo_v == 1) {
+        sea v = _orc_u(st, 1)
+        retornar si(v >= 128, v - 256, v)
+    }
+    si (tipo_v == 2) { retornar _orc_u(st, 2) }
+    si (tipo_v == 3) {
+        sea v = _orc_u(st, 2)
+        retornar si(v >= 32768, v - 65536, v)
+    }
+    si (tipo_v == 4) { retornar _orc_u(st, 4) }
+    si (tipo_v == 5) {
+        sea v = _orc_u(st, 4)
+        retornar si(v >= 2147483648, v - 4294967296, v)
+    }
+    si (tipo_v == 6) {
+        sea v = _orc_f32(st["d"], st["p"])
+        st["p"] = st["p"] + 4
+        retornar v
+    }
+    si (tipo_v == 7) { retornar _orc_u(st, 1) != 0 }
+    si (tipo_v == 8) { retornar _orc_texto(st) }
+    si (tipo_v == 9) {
+        sea t = _orc_u(st, 4)
+        sea n = _orc_u64(st)
+        sea r = []
+        para i en lista_rango(0, n) { r.agregar(_orc_valor(st, t)) }
+        retornar r
+    }
+    si (tipo_v == 10 o tipo_v == 11) { retornar _orc_u64(st) }
+    si (tipo_v == 12) {
+        st["p"] = st["p"] + 8
+        retornar 0.0
+    }
+    lanzar "oraculo: tipo de metadato GGUF desconocido " + tipo_v
+}
+
+sea _ORC_TIPOS = {"0": "F32", "1": "F16", "2": "Q4_0", "8": "Q8_0"}
+
+/// Lee un GGUF desde bytes: {"meta", "tensores"} (sin construir el modelo).
+funcion oraculo_gguf(datos) {
+    si (subtexto(datos, 0, 4) != "GGUF") { lanzar "oraculo: no es un archivo GGUF" }
+    sea st = {"d": datos, "p": 4}
+    sea version = _orc_u(st, 4)
+    si (version < 2 o version > 3) { lanzar "oraculo: versión GGUF no soportada " + version }
+    sea n_t = _orc_u64(st)
+    sea n_kv = _orc_u64(st)
+    sea meta = {}
+    para i en lista_rango(0, n_kv) {
+        sea k = _orc_texto(st)
+        meta[k] = _orc_valor(st, _orc_u(st, 4))
+    }
+    sea infos = []
+    para i en lista_rango(0, n_t) {
+        sea nombre = _orc_texto(st)
+        sea nd = _orc_u(st, 4)
+        sea dims = []
+        para k en lista_rango(0, nd) { dims.agregar(_orc_u64(st)) }
+        sea tipo_t = _orc_u(st, 4)
+        infos.agregar({"nombre": nombre, "dims": dims, "tipo": _ORC_TIPOS["" + tipo_t] ?? ("tipo " + tipo_t), "desp": _orc_u64(st)})
+    }
+    sea alin = meta["general.alignment"] ?? 32
+    sea base = st["p"] + (alin - st["p"] % alin) % alin
+    sea tensores = {}
+    para t en infos {
+        t["inicio"] = base + t["desp"]
+        tensores[t["nombre"]] = t
+    }
+    retornar {"meta": meta, "tensores": tensores, "datos": datos, "version": version}
+}
+
+funcion _orc_n(t) {
+    sea n = 1
+    para d en t["dims"] { n = n * d }
+    retornar n
+}
+
+/// Valores de un tensor como lista de números (descuantizando).
+funcion oraculo_tensor(g, nombre) {
+    sea t = g["tensores"][nombre] ?? nulo
+    si (t == nulo) { lanzar "oraculo: falta el tensor " + nombre }
+    sea n = _orc_n(t)
+    sea d = g["datos"]
+    sea p = t["inicio"]
+    sea r = []
+    si (t["tipo"] == "F32") {
+        para i en lista_rango(0, n) { r.agregar(_orc_f32(d, p + i * 4)) }
+    } sino si (t["tipo"] == "F16") {
+        para i en lista_rango(0, n) { r.agregar(_orc_f16(d, p + i * 2)) }
+    } sino si (t["tipo"] == "Q8_0") {
+        para b en lista_rango(0, cociente(n, 32)) {
+            sea q = p + b * 34
+            sea esc = _orc_f16(d, q)
+            para k en lista_rango(0, 32) {
+                sea v = byte_en(d, q + 2 + k)
+                r.agregar(si(v >= 128, v - 256, v) * esc)
+            }
+        }
+    } sino si (t["tipo"] == "Q4_0") {
+        para b en lista_rango(0, cociente(n, 32)) {
+            sea q = p + b * 18
+            sea esc = _orc_f16(d, q)
+            sea bajos = []
+            sea altos = []
+            para k en lista_rango(0, 16) {
+                sea v = byte_en(d, q + 2 + k)
+                bajos.agregar((v % 16 - 8) * esc)
+                altos.agregar((cociente(v, 16) - 8) * esc)
+            }
+            para v en bajos { r.agregar(v) }
+            para v en altos { r.agregar(v) }
+        }
+    } sino { lanzar "oraculo: tipo de tensor no soportado " + t["tipo"] + " en " + nombre }
+    retornar r
+}
+
+// ---------- modelo ----------
+
+/// Carga un modelo LLaMA GGUF desde bytes.
+funcion oraculo_desde_bytes(datos) {
+    sea g = oraculo_gguf(datos)
+    sea me = g["meta"]
+    sea arq = me["general.architecture"] ?? "llama"
+    si (arq != "llama") { lanzar "oraculo: arquitectura no soportada " + arq + " (solo llama)" }
+    sea p = funcion(k, defecto) { retornar me[arq + "." + k] ?? defecto }
+    sea m = {"arq": arq, "meta": me, "g": g, "n_embd": p("embedding_length", 0), "n_capas": p("block_count", 0), "n_cabezas": p("attention.head_count", 0),
+        "eps": p("attention.layer_norm_rms_epsilon", 0.00001), "base_rope": p("rope.freq_base", 10000.0), "contexto": p("context_length", 2048), "n_ff": p("feed_forward_length", 0)}
+    m["n_cabezas_kv"] = p("attention.head_count_kv", m["n_cabezas"])
+    m["dim_cabeza"] = cociente(m["n_embd"], m["n_cabezas"])
+    m["vocab"] = me["tokenizer.ggml.tokens"] ?? []
+    m["puntajes"] = me["tokenizer.ggml.scores"] ?? []
+    m["tipos_tok"] = me["tokenizer.ggml.token_type"] ?? []
+    m["bos"] = me["tokenizer.ggml.bos_token_id"] ?? 1
+    m["eos"] = me["tokenizer.ggml.eos_token_id"] ?? 2
+    m["agregar_bos"] = me["tokenizer.ggml.add_bos_token"] ?? verdadero
+    sea indice = {}
+    para i en lista_rango(0, longitud(m["vocab"])) { indice[m["vocab"][i]] = i }
+    m["indice"] = indice
+    // Pesos.
+    m["emb"] = oraculo_tensor(g, "token_embd.weight")
+    m["n_vocab"] = cociente(longitud(m["emb"]), m["n_embd"])
+    m["norma_final"] = oraculo_tensor(g, "output_norm.weight")
+    m["salida"] = si(tiene_clave(g["tensores"], "output.weight"), oraculo_tensor(g, "output.weight"), m["emb"])
+    m["capas"] = []
+    para l en lista_rango(0, m["n_capas"]) {
+        sea pre = "blk." + l + "."
+        m["capas"].agregar({"norma_att": oraculo_tensor(g, pre + "attn_norm.weight"), "q": oraculo_tensor(g, pre + "attn_q.weight"), "k": oraculo_tensor(g, pre + "attn_k.weight"),
+            "v": oraculo_tensor(g, pre + "attn_v.weight"), "o": oraculo_tensor(g, pre + "attn_output.weight"), "norma_ff": oraculo_tensor(g, pre + "ffn_norm.weight"),
+            "puerta": oraculo_tensor(g, pre + "ffn_gate.weight"), "arriba": oraculo_tensor(g, pre + "ffn_up.weight"), "abajo": oraculo_tensor(g, pre + "ffn_down.weight")})
+    }
+    m["cache"] = nulo
+    retornar m
+}
+
+/// Carga un archivo .gguf.
+funcion oraculo_cargar(ruta) { retornar oraculo_desde_bytes(leer_archivo(ruta)) }
+
+/// Datos principales del modelo.
+funcion oraculo_info(m) {
+    retornar {"arquitectura": m["arq"], "nombre": m["meta"]["general.name"] ?? "", "capas": m["n_capas"], "embedding": m["n_embd"], "cabezas": m["n_cabezas"],
+        "cabezas_kv": m["n_cabezas_kv"], "vocabulario": m["n_vocab"], "contexto": m["contexto"]}
+}
+
+// y = W x con W de forma [entrada, salida] en orden ggml (entrada contigua).
+funcion _orc_mat(w, x, n_sal) {
+    sea n = longitud(x)
+    sea r = []
+    para o en lista_rango(0, n_sal) {
+        sea s = 0.0
+        sea b = o * n
+        para i en lista_rango(0, n) { s = s + w[b + i] * x[i] }
+        r.agregar(s)
+    }
+    retornar r
+}
+
+funcion _orc_rms(x, w, eps) {
+    sea s = 0.0
+    para v en x { s = s + v * v }
+    sea esc = 1 / raiz(s / longitud(x) + eps)
+    sea r = []
+    para i en lista_rango(0, longitud(x)) { r.agregar(x[i] * esc * w[i]) }
+    retornar r
+}
+
+funcion _orc_rope(v, pos, cabezas, dim, base) {
+    sea r = []
+    para h en lista_rango(0, cabezas) {
+        sea i = 0
+        mientras (i < dim) {
+            sea theta = pos * potencia(base, 0 - i / dim)
+            sea c = coseno(theta)
+            sea s = seno(theta)
+            sea a = v[h * dim + i]
+            sea b = v[h * dim + i + 1]
+            r.agregar(a * c - b * s)
+            r.agregar(a * s + b * c)
+            i = i + 2
+        }
+    }
+    retornar r
+}
+
+/// Reinicia la caché KV (para empezar una conversación nueva).
+funcion oraculo_reiniciar(m) { m["cache"] = nulo }
+
+/// Procesa un token en la posición siguiente y devuelve los logits.
+funcion oraculo_evaluar(m, token) {
+    si (m["cache"] == nulo) {
+        m["cache"] = {"pos": 0, "k": [], "v": []}
+        para l en lista_rango(0, m["n_capas"]) {
+            m["cache"]["k"].agregar([])
+            m["cache"]["v"].agregar([])
+        }
+    }
+    sea cache = m["cache"]
+    sea pos = cache["pos"]
+    si (pos >= m["contexto"]) { lanzar "oraculo: se llenó el contexto (" + m["contexto"] + " tokens)" }
+    si (token < 0 o token >= m["n_vocab"]) { lanzar "oraculo: token fuera del vocabulario " + token }
+    sea ne = m["n_embd"]
+    sea hd = m["dim_cabeza"]
+    sea nh = m["n_cabezas"]
+    sea nkv = m["n_cabezas_kv"]
+    sea grupo = cociente(nh, nkv)
+    sea x = []
+    para i en lista_rango(0, ne) { x.agregar(m["emb"][token * ne + i]) }
+    para l en lista_rango(0, m["n_capas"]) {
+        sea c = m["capas"][l]
+        sea h = _orc_rms(x, c["norma_att"], m["eps"])
+        sea q = _orc_rope(_orc_mat(c["q"], h, nh * hd), pos, nh, hd, m["base_rope"])
+        sea k = _orc_rope(_orc_mat(c["k"], h, nkv * hd), pos, nkv, hd, m["base_rope"])
+        sea v = _orc_mat(c["v"], h, nkv * hd)
+        cache["k"][l].agregar(k)
+        cache["v"][l].agregar(v)
+        sea att = []
+        para cab en lista_rango(0, nh) {
+            sea kvh = cociente(cab, grupo)
+            sea puntos = []
+            sea mx = -1e300
+            para t en lista_rango(0, pos + 1) {
+                sea kk = cache["k"][l][t]
+                sea s = 0.0
+                para i en lista_rango(0, hd) { s = s + q[cab * hd + i] * kk[kvh * hd + i] }
+                s = s / raiz(hd)
+                puntos.agregar(s)
+                mx = maximo(mx, s)
+            }
+            sea suma = 0.0
+            para t en lista_rango(0, pos + 1) {
+                puntos[t] = exponencial(puntos[t] - mx)
+                suma = suma + puntos[t]
+            }
+            para i en lista_rango(0, hd) {
+                sea s = 0.0
+                para t en lista_rango(0, pos + 1) { s = s + puntos[t] * cache["v"][l][t][kvh * hd + i] }
+                att.agregar(s / suma)
+            }
+        }
+        sea o = _orc_mat(c["o"], att, ne)
+        para i en lista_rango(0, ne) { x[i] = x[i] + o[i] }
+        sea h2 = _orc_rms(x, c["norma_ff"], m["eps"])
+        sea gp = _orc_mat(c["puerta"], h2, m["n_ff"])
+        sea ar = _orc_mat(c["arriba"], h2, m["n_ff"])
+        sea act = []
+        para i en lista_rango(0, m["n_ff"]) { act.agregar(gp[i] / (1 + exponencial(0 - gp[i])) * ar[i]) }
+        sea d = _orc_mat(c["abajo"], act, ne)
+        para i en lista_rango(0, ne) { x[i] = x[i] + d[i] }
+    }
+    cache["pos"] = pos + 1
+    retornar _orc_mat(m["salida"], _orc_rms(x, m["norma_final"], m["eps"]), m["n_vocab"])
+}
+
+// ---------- tokenizador (SentencePiece) ----------
+
+funcion _orc_utf8(t) {
+    // Caracteres UTF-8 como textos.
+    sea r = []
+    sea i = 0
+    mientras (i < longitud(t)) {
+        sea b = byte_en(t, i)
+        sea n = 1
+        si (b >= 240) { n = 4 } sino si (b >= 224) { n = 3 } sino si (b >= 192) { n = 2 }
+        r.agregar(subtexto(t, i, minimo(i + n, longitud(t))))
+        i = i + n
+    }
+    retornar r
+}
+
+/// Texto → lista de tokens (con BOS al principio si el modelo lo pide).
+funcion oraculo_tokenizar(m, texto, con_bos) {
+    sea r = []
+    si (con_bos ?? m["agregar_bos"]) { r.agregar(m["bos"]) }
+    si (texto == "") { retornar r }
+    sea t = "▁" + texto_reemplazar(texto, " ", "▁")
+    sea simb = _orc_utf8(t)
+    // Fusiones: el par adyacente que forma el token de mayor puntaje.
+    mientras (verdadero) {
+        sea mejor = -1
+        sea mejor_p = -1e300
+        para i en lista_rango(0, longitud(simb) - 1) {
+            sea k = simb[i] + simb[i + 1]
+            si (tiene_clave(m["indice"], k)) {
+                sea p = m["puntajes"][m["indice"][k]] ?? 0
+                si (p > mejor_p) {
+                    mejor_p = p
+                    mejor = i
+                }
+            }
+        }
+        si (mejor < 0) { romper }
+        sea nuevos = []
+        para i en lista_rango(0, longitud(simb)) {
+            si (i == mejor) { nuevos.agregar(simb[i] + simb[i + 1]) } sino si (i != mejor + 1) { nuevos.agregar(simb[i]) }
+        }
+        simb = nuevos
+    }
+    para s en simb {
+        si (tiene_clave(m["indice"], s)) { r.agregar(m["indice"][s]) } sino {
+            // Respaldo por bytes: <0xNN>.
+            para i en lista_rango(0, longitud(s)) {
+                sea h = texto_mayusculas(hex_de_bytes(subtexto(s, i, i + 1)))
+                sea id = m["indice"]["<0x" + h + ">"] ?? nulo
+                si (id == nulo) { lanzar "oraculo: el vocabulario no tiene respaldo para el byte " + h }
+                r.agregar(id)
+            }
+        }
+    }
+    retornar r
+}
+
+/// Tokens → texto.
+funcion oraculo_texto(m, tokens) {
+    sea partes = []
+    para t en tokens {
+        sea tipo_t = si(t < longitud(m["tipos_tok"]), m["tipos_tok"][t], 1)
+        sea s = m["vocab"][t]
+        si (tipo_t == 6 y texto_empieza_con(s, "<0x")) { partes.agregar(bytes_de_hex(subtexto(s, 3, 5))) }
+        sino si (tipo_t == 3) { }
+        sino { partes.agregar(texto_reemplazar(s, "▁", " ")) }
+    }
+    sea r = unir(partes, "")
+    si (texto_empieza_con(r, " ")) { r = subtexto(r, 1, longitud(r)) }
+    retornar r
+}
+
+// ---------- generación ----------
+
+funcion _orc_azar(estado) {
+    // xorshift sobre 31 bits.
+    sea x = estado["s"]
+    x = (x * 1103515245 + 12345) % 2147483648
+    estado["s"] = x
+    retornar x / 2147483648
+}
+
+/// Elige el siguiente token: temperatura 0 = el más probable; si no,
+/// muestreo con top_k y top_p.
+funcion oraculo_muestrear(logits, opciones, estado) {
+    sea temp = opciones["temperatura"] ?? 0
+    si (temp <= 0) {
+        sea mejor = 0
+        para i en lista_rango(1, longitud(logits)) {
+            si (logits[i] > logits[mejor]) { mejor = i }
+        }
+        retornar mejor
+    }
+    sea idx = ordenar(lista_rango(0, longitud(logits)), funcion(a, b) { retornar si(logits[b] > logits[a], 1, si(logits[b] < logits[a], -1, a - b)) })
+    sea k = minimo(opciones["top_k"] ?? 40, longitud(idx))
+    sea probs = []
+    sea mx = logits[idx[0]]
+    sea suma = 0.0
+    para i en lista_rango(0, k) {
+        sea p = exponencial((logits[idx[i]] - mx) / temp)
+        probs.agregar(p)
+        suma = suma + p
+    }
+    sea top_p = opciones["top_p"] ?? 0.95
+    sea acum = 0.0
+    sea corte = k
+    para i en lista_rango(0, k) {
+        acum = acum + probs[i] / suma
+        si (acum >= top_p y corte == k) { corte = i + 1 }
+    }
+    sea total = 0.0
+    para i en lista_rango(0, corte) { total = total + probs[i] }
+    sea u = _orc_azar(estado) * total
+    para i en lista_rango(0, corte) {
+        u = u - probs[i]
+        si (u <= 0) { retornar idx[i] }
+    }
+    retornar idx[corte - 1]
+}
+
+/// Genera tokens a partir de un prompt. opciones: "max_tokens" (32),
+/// "temperatura" (0), "top_k", "top_p", "semilla", "parar" (lista de textos).
+/// Devuelve {"texto", "tokens", "fin": "eos" | "largo" | "parada"}.
+funcion oraculo_generar(m, prompt, opciones) {
+    sea op = opciones ?? {}
+    oraculo_reiniciar(m)
+    sea toks = oraculo_tokenizar(m, prompt, nulo)
+    sea logits = nulo
+    para t en toks { logits = oraculo_evaluar(m, t) }
+    sea estado = {"s": (op["semilla"] ?? 42) % 2147483648}
+    sea nuevos = []
+    sea fin = "largo"
+    sea paradas = op["parar"] ?? []
+    para i en lista_rango(0, op["max_tokens"] ?? 32) {
+        sea t = oraculo_muestrear(logits, op, estado)
+        si (t == m["eos"]) {
+            fin = "eos"
+            romper
+        }
+        nuevos.agregar(t)
+        sea txt = oraculo_texto(m, nuevos)
+        sea parar = falso
+        para s en paradas {
+            si (texto_contiene(txt, s)) { parar = verdadero }
+        }
+        si (parar) {
+            fin = "parada"
+            romper
+        }
+        si (m["cache"]["pos"] >= m["contexto"]) { romper }
+        logits = oraculo_evaluar(m, t)
+    }
+    retornar {"texto": oraculo_texto(m, nuevos), "tokens": nuevos, "fin": fin}
+}
+
+/// Atajo: solo el texto generado.
+funcion oraculo_completar(m, prompt, opciones) { retornar oraculo_generar(m, prompt, opciones)["texto"] }
