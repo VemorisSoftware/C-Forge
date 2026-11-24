@@ -12,8 +12,12 @@
         if (e.isIntersecting) { e.target.classList.add("on"); io.unobserve(e.target); }
       });
     }, { threshold: 0.05, rootMargin: "0px 0px -30px 0px" });
-    revelar.forEach(function (el, i) { el.style.transitionDelay = (i % 5) * 0.07 + "s"; io.observe(el); });
-    setTimeout(function () { revelar.forEach(function (e) { e.classList.add("on"); }); }, 6000);
+    var alto = window.innerHeight;
+    revelar.forEach(function (el, i) {
+      if (el.getBoundingClientRect().top < alto) { el.classList.add("on"); return; }
+      el.style.transitionDelay = (i % 4) * 0.04 + "s"; io.observe(el);
+    });
+    setTimeout(function () { revelar.forEach(function (e) { e.classList.add("on"); }); }, 4000);
   } else {
     revelar.forEach(function (e) { e.classList.add("on"); });
   }
