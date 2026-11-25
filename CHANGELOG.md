@@ -4,6 +4,13 @@ Sitio oficial: [c-forge.org](https://c-forge.org)
 
 ## Sin publicar
 
+- **Bucles y listas más rápidos:** `lista.agregar(x)` en línea (sin llamada
+  al runtime cuando hay capacidad); las listas grandes crecen con `mremap`
+  en Linux (sin copiar); `lista_repetir` reserva de una vez; `x % N` con N
+  constante usa multiplicación en vez de división (x86-64 y ARM64); el
+  recolector descarta enteros sin llamada. Criba de 2 millones ~2× más
+  rápida. La variable de un `para` ya no sigue viva después del ciclo (antes
+  tapaba una variable del mismo nombre declarada más adelante).
 - **Rendimiento del runtime:** multiplicación de enteros grandes con
   Karatsuba y NTT (`potencia` de 2 millones de cifras en ~1 s; tope de 4
   millones de cifras con error claro); nuevo motor de expresiones regulares

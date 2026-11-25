@@ -453,3 +453,76 @@ funcion op_trampolin_hilo(c) {
     si (es_arm64(c)) { retornar a64_trampolin_hilo(c) }
     retornar x64_trampolin_hilo(c)
 }
+
+// ── Resto por una constante sin dividir ──────────────────────────────────
+// rax = x (|x| < 2^62) → rax = x % d (truncado, como idiv), con d en
+// [3, 2^31) y no potencia de 2. q = (mulhi(x, M) >> s) + (x < 0), con
+// 2^s en (d/4, d/2) y M = floor(2^(64+s) / d) + 1 < 2^63: el error
+// M·d − 2^(64+s) ≤ d y d·2^62 < 2^(64+s), así que q es exacto en el rango.
+// WebAssembly no tiene mulhi de 64 bits: ahí sigue la división.
+funcion magia_corrimiento(d) {
+    sea s = 0
+    mientras (__desplazar_izq(1, s + 2) <= d) { s = s + 1 }
+    retornar s
+}
+
+// floor(2^k / d) por división larga (resto < d < 2^62, cociente < 2^63).
+funcion magia_multiplicador(d, s) {
+    sea r = 1
+    sea q = 0
+    sea i = 0
+    mientras (i < 64 + s) {
+        r = r * 2
+        q = q * 2
+        si (r >= d) {
+            r = r - d
+            q = q + 1
+        }
+        i = i + 1
+    }
+    retornar q + 1
+}
+
+funcion resto_constante_valido(c, d) {
+    si (es_wasm(c)) { retornar 0 }
+    retornar d >= 3 y d < 2147483648
+}
+
+funcion a64_mov_constante(c, reg, v) {
+    a64(c, 3531603968 + __y_bits(v, 65535) * 32 + reg)                             // movz reg, #v0
+    a64(c, 4070572032 + __y_bits(__desplazar_der(v, 16), 65535) * 32 + reg)        // movk reg, #v1, lsl 16
+    a64(c, 4072669184 + __y_bits(__desplazar_der(v, 32), 65535) * 32 + reg)        // movk reg, #v2, lsl 32
+    a64(c, 4074766336 + __y_bits(__desplazar_der(v, 48), 65535) * 32 + reg)        // movk reg, #v3, lsl 48
+    retornar 0
+}
+
+funcion op_resto_constante(c, d) {
+    sea s = magia_corrimiento(d)
+    sea m = magia_multiplicador(d, s)
+    si (es_arm64(c)) {
+        a64(c, 2852127728)                                         // mov x16, x0
+        a64_mov_constante(c, 17, m)
+        a64(c, 2604694528 + 17 * 65536 + 16 * 32)                  // smulh x0, x16, x17
+        si (s > 0) { a64(c, 2470509568 + s * 65536) }              // asr x0, x0, #s
+        a64(c, 2470509568 + 63 * 65536 + 16 * 32 + 2)              // asr x2, x16, #63
+        a64(c, 3405774848 + 2 * 65536)                             // sub x0, x0, x2
+        a64_mov_constante(c, 17, d)
+        a64(c, 2600501248 + 17 * 65536 + 16 * 1024)                // msub x0, x0, x17, x16
+        retornar 0
+    }
+    e3(c, 72, 137, 193)                                            // mov rcx, rax
+    e2(c, 72, 186)                                                 // mov rdx, imm64
+    e32(c, __y_bits(m, 4294967295))
+    e32(c, __desplazar_der(m, 32))
+    e3(c, 72, 247, 234)                                            // imul rdx (rdx:rax = rax·rdx)
+    e3(c, 72, 137, 208)                                            // mov rax, rdx
+    si (s > 0) { e4(c, 72, 193, 248, s) }                          // sar rax, s
+    e3(c, 72, 137, 202)                                            // mov rdx, rcx
+    e4(c, 72, 193, 250, 63)                                        // sar rdx, 63
+    e3(c, 72, 41, 208)                                             // sub rax, rdx
+    e3(c, 72, 105, 192)                                            // imul rax, rax, imm32
+    e32(c, d)
+    e3(c, 72, 41, 193)                                             // sub rcx, rax
+    e3(c, 72, 137, 200)                                            // mov rax, rcx
+    retornar 0
+}
