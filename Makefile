@@ -234,6 +234,9 @@ stdlib-check: build
 	echo "  ✓ juego: física 2D/3D, colisiones, entrada y partículas"; \
 	(cd tests/seguridad && CFORGE_STDLIB=../../stdlib ../../$(TARGET) prueba.cfv) | diff -u tests/seguridad/prueba.salida - || { echo "  ✗ tests/seguridad"; exit 1; }; \
 	(cd tests/seguridad && CFORGE_GC_ESTRES=1 CFORGE_STDLIB=../../stdlib ../../$(TARGET) prueba.cfv) | diff -u tests/seguridad/prueba.salida - >/dev/null || { echo "  ✗ tests/seguridad (GC en estrés)"; exit 1; }; \
+	(cd tests/seguridad && CFORGE_STDLIB=../../stdlib ../../$(TARGET) fuzzlab_regresiones.cfv) | diff -u tests/seguridad/fuzzlab_regresiones.salida - || { echo "  ✗ tests/seguridad (regresiones del Fuzz Lab)"; exit 1; }; \
+	printf 'mostrar("antes")\nretornar 5\n' > /tmp/cforge_retornar.cfv; \
+	if ./$(TARGET) check /tmp/cforge_retornar.cfv 2>&1 | grep -q "retornar fuera de una función"; then :; else echo "  ✗ retornar fuera de una función se aceptó"; exit 1; fi; \
 	echo "  ✓ seguridad: imágenes y fuentes hostiles, bombas de compresión, lecturas fuera de rango y secretos"
 
 ## Recolector de basura: memoria acotada en un programa largo y la suite

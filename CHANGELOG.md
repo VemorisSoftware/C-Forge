@@ -4,6 +4,14 @@ Sitio oficial: [c-forge.org](https://c-forge.org)
 
 ## Sin publicar
 
+- **Regresiones del Fuzz Lab (4 bugs):** `xml_analizar` ya no se cuelga con
+  `<![` sin `CDATA[` (error capturable); `markdown_html` es lineal (memoria de
+  búsquedas fallidas, URL con hasta 32 paréntesis anidados y citas con hasta
+  32 niveles): 100.000 caracteres hostiles en segundos en vez de horas; la
+  recursión profunda da el error capturable "desbordamiento de pila" en vez
+  de SIGSEGV (hilo principal e hilos de `tarea()`, x86-64 y ARM64; más de
+  128.000 niveles en Linux); `retornar` fuera de una función es un error de
+  compilación. Nuevo `texto_indice_desde(t, buscado, desde)`.
 - **Auditoría de robustez:** ningún programa en C-Forge puede cerrar el
   runtime ni leer memoria ajena con valores raros. Se atacaron las 272
   funciones integradas con argumentos extremos (60 problemas → 0) y 2.100

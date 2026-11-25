@@ -24,15 +24,32 @@ funcion _md_url(u) {
     retornar marcado_escapar(texto_recortar(u))
 }
 
-// Busca el cierre "fin" desde i; -1 si no está.
-funcion _md_hasta(t, fin, i) {
-    sea p = texto_indice(subcadena(t, i, longitud(t)), fin)
-    si (p < 0) { retornar 0 - 1 }
-    retornar p + i
+// Busca el cierre "fin" desde i; -1 si no está. "fallos" recuerda desde
+// dónde ya se buscó cada cierre sin encontrarlo: si no está desde p, tampoco
+// está desde ninguna posición posterior, así que no se vuelve a recorrer el
+// texto (con miles de "[" o "`" sin cerrar el tiempo era cuadrático).
+funcion _md_hasta(t, fin, i, fallos) {
+    si (tiene_clave(fallos, fin) y i >= fallos[fin]) { retornar 0 - 1 }
+    // Lo mismo con un acierto: si desde d el primero estaba en p, desde
+    // cualquier i entre d y p también es p.
+    sea clave = "+" + fin
+    si (tiene_clave(fallos, clave) y i >= fallos[clave][0] y i <= fallos[clave][1]) { retornar fallos[clave][1] }
+    sea p = texto_indice_desde(t, fin, i)
+    si (p < 0) { fallos[fin] = i } sino { fallos[clave] = [i, p] }
+    retornar p
 }
 
+// Topes contra entradas hostiles: anidamiento de formato y de citas, y largo
+// de una URL entre paréntesis.
+funcion _md_max_anidamiento() { retornar 32 }
+funcion _md_max_url() { retornar 4096 }
+
 // Formato en línea (el texto ya viene sin escapar).
-funcion _md_linea(t) {
+funcion _md_linea(t) { retornar _md_linea_en(t, 0) }
+
+funcion _md_linea_en(t, prof) {
+    si (prof > _md_max_anidamiento()) { retornar marcado_escapar(t) }
+    sea fallos = {}
     sea r = []
     sea i = 0
     sea n = longitud(t)
@@ -41,7 +58,7 @@ funcion _md_linea(t) {
         sea dos = subcadena(t, i, i + 2)
         sea hecho = falso
         si (c == "`") {
-            sea f = _md_hasta(t, "`", i + 1)
+            sea f = _md_hasta(t, "`", i + 1, fallos)
             si (f > i) {
                 r.agregar("<code>" + marcado_escapar(subcadena(t, i + 1, f)) + "</code>")
                 i = f + 1
@@ -49,25 +66,25 @@ funcion _md_linea(t) {
             }
         }
         si (hecho == falso y (dos == "**" o dos == "__")) {
-            sea f = _md_hasta(t, dos, i + 2)
+            sea f = _md_hasta(t, dos, i + 2, fallos)
             si (f > i + 2) {
-                r.agregar("<strong>" + _md_linea(subcadena(t, i + 2, f)) + "</strong>")
+                r.agregar("<strong>" + _md_linea_en(subcadena(t, i + 2, f), prof + 1) + "</strong>")
                 i = f + 2
                 hecho = verdadero
             }
         }
         si (hecho == falso y dos == "~~") {
-            sea f = _md_hasta(t, "~~", i + 2)
+            sea f = _md_hasta(t, "~~", i + 2, fallos)
             si (f > i + 2) {
-                r.agregar("<del>" + _md_linea(subcadena(t, i + 2, f)) + "</del>")
+                r.agregar("<del>" + _md_linea_en(subcadena(t, i + 2, f), prof + 1) + "</del>")
                 i = f + 2
                 hecho = verdadero
             }
         }
         si (hecho == falso y (c == "*" o c == "_") y i + 1 < n y subcadena(t, i + 1, i + 2) != " ") {
-            sea f = _md_hasta(t, c, i + 1)
+            sea f = _md_hasta(t, c, i + 1, fallos)
             si (f > i + 1) {
-                r.agregar("<em>" + _md_linea(subcadena(t, i + 1, f)) + "</em>")
+                r.agregar("<em>" + _md_linea_en(subcadena(t, i + 1, f), prof + 1) + "</em>")
                 i = f + 1
                 hecho = verdadero
             }
@@ -76,22 +93,28 @@ funcion _md_linea(t) {
             sea imagen = dos == "!["
             sea a = i + 1
             si (imagen) { a = i + 2 }
-            sea cierra = _md_hasta(t, "](", a)
+            sea cierra = _md_hasta(t, "](", a, fallos)
             si (cierra > 0) {
                 // El ")" que cierra (la URL puede tener paréntesis).
                 sea fin = 0 - 1
                 sea prof = 0
                 sea k = cierra + 2
-                mientras (k < n y fin < 0) {
-                    sea ck = subcadena(t, k, k + 1)
-                    si (ck == "(") { prof = prof + 1 }
-                    si (ck == ")") { si (prof == 0) { fin = k } sino { prof = prof - 1 } }
+                sea tope = cierra + 2 + _md_max_url()
+                // Sin ningún ")" más adelante no hay enlace: no se recorre.
+                si (_md_hasta(t, ")", k, fallos) < 0) { k = n }
+                mientras (k < n y k < tope y fin < 0) {
+                    sea ck = byte_en(t, k)
+                    si (ck == 40) { prof = prof + 1 }
+                    // Como CommonMark: la URL no cruza líneas ni lleva más de 32
+                    // paréntesis anidados (si no, cada "[" recorría miles de bytes).
+                    si (prof > 32 o ck == 10) { k = n }
+                    si (ck == 41) { si (prof == 0) { fin = k } sino { prof = prof - 1 } }
                     k = k + 1
                 }
                 si (fin > 0) {
                     sea texto = subcadena(t, a, cierra)
                     sea url = _md_url(subcadena(t, cierra + 2, fin))
-                    si (imagen) { r.agregar("<img src=\"" + url + "\" alt=\"" + marcado_escapar(texto) + "\">") } sino { r.agregar("<a href=\"" + url + "\">" + _md_linea(texto) + "</a>") }
+                    si (imagen) { r.agregar("<img src=\"" + url + "\" alt=\"" + marcado_escapar(texto) + "\">") } sino { r.agregar("<a href=\"" + url + "\">" + _md_linea_en(texto, prof + 1) + "</a>") }
                     i = fin + 1
                     hecho = verdadero
                 }
@@ -120,7 +143,9 @@ funcion _md_lista_item(l) {
 }
 
 /// Markdown → HTML.
-funcion marcado_html(texto) {
+funcion marcado_html(texto) { retornar _md_html(texto, 0) }
+
+funcion _md_html(texto, prof_cita) {
     sea lineas = texto_dividir(texto_reemplazar("" + texto, "\r\n", "\n"), "\n")
     sea r = []
     sea parrafo = []
@@ -181,7 +206,7 @@ funcion marcado_html(texto) {
                         r.agregar("<hr>")
                         i = i + 1
                     } sino {
-                        si (texto_empieza_con(s, ">")) {
+                        si (texto_empieza_con(s, ">") y prof_cita < _md_max_anidamiento()) {
                             cerrar_parrafo()
                             sea cita = []
                             mientras (i < n y texto_empieza_con(texto_recortar(lineas[i]), ">")) {
@@ -191,7 +216,7 @@ funcion marcado_html(texto) {
                                 cita.agregar(c)
                                 i = i + 1
                             }
-                            r.agregar("<blockquote>\n" + marcado_html(unir(cita, "\n")) + "</blockquote>")
+                            r.agregar("<blockquote>\n" + _md_html(unir(cita, "\n"), prof_cita + 1) + "</blockquote>")
                         } sino {
                             sea item = _md_lista_item(l)
                             si (item != nulo) {
