@@ -502,7 +502,8 @@ funcion dyn_suma(a, b) {
         }
         retornar dyn_caja(2, r)
     }
-    si (dyn_tipo(a) == 1 o dyn_tipo(b) == 1) {
+    si (dyn_tipo(a) == 1) { retornar dyn_texto_sumar(a, b) }
+    si (dyn_tipo(b) == 1) {
         sea r = str_nuevo(16)
         dyn_agregar_valor(r, a, 0)
         dyn_agregar_valor(r, b, 0)
@@ -1328,31 +1329,374 @@ funcion dyn_gr_sumar(a, b, sb) {
     retornar dyn_gr_restar_mag(b, a, signo_b)
 }
 
+// Multiplicación de magnitudes sobre cifras crudas (base 10^9).
+// r[0..na+nb) = a[0..na) · b[0..nb). Escolar para operandos chicos y
+// Karatsuba para los grandes; tmp es memoria de trabajo (≥ 4·max + 256).
+funcion dyn_gr_mul_escolar(r, a, na, b, nb) {
+    // Por columnas: cada producto (< 2^60) se parte en 32 bits altos y bajos
+    // y la división por 10^9 se hace una vez por columna, no por producto.
+    // Requiere min(na, nb) < 2^20 (aquí siempre es < 64).
+    si (na < nb) { retornar dyn_gr_mul_escolar(r, b, nb, a, na) }
+    sea mascara = 4294967295
+    sea acarreo = 0
+    sea n = na + nb
+    sea k = 0
+    mientras (k < n - 1) {
+        sea lo = acarreo
+        sea hi = 0
+        sea i = 0
+        si (k >= nb) { i = k - nb + 1 }
+        sea fin = k
+        si (fin > na - 1) { fin = na - 1 }
+        sea pa = a + i * 8
+        sea pb = b + (k - i) * 8
+        mientras (i <= fin) {
+            sea p = __cargar64(pa) * __cargar64(pb)
+            lo = lo + __y_bits(p, mascara)
+            hi = hi + __desplazar_der(p, 32)
+            pa = pa + 8
+            pb = pb - 8
+            i = i + 1
+        }
+        hi = hi + __desplazar_der(lo, 32)
+        lo = __y_bits(lo, mascara)
+        sea hq = hi / 1000000000
+        sea medio = (hi - hq * 1000000000) * 4294967296 + lo
+        sea mq = medio / 1000000000
+        __guardar64(r + k * 8, medio - mq * 1000000000)
+        acarreo = hq * 4294967296 + mq
+        k = k + 1
+    }
+    __guardar64(r + (n - 1) * 8, acarreo)
+    retornar 0
+}
+
+// r[0..n) += x[0..nx) (nx <= n); el acarreo que sobra se descarta.
+funcion dyn_gr_sumar_en(r, n, x, nx) {
+    sea acarreo = 0
+    sea i = 0
+    mientras (i < nx o (acarreo != 0 y i < n)) {
+        sea t = __cargar64(r + i * 8) + acarreo
+        si (i < nx) { t = t + __cargar64(x + i * 8) }
+        acarreo = 0
+        si (t >= 1000000000) {
+            t = t - 1000000000
+            acarreo = 1
+        }
+        __guardar64(r + i * 8, t)
+        i = i + 1
+    }
+    retornar 0
+}
+
+// r[0..n) -= x[0..nx) (el resultado no es negativo).
+funcion dyn_gr_restar_en(r, n, x, nx) {
+    sea prestamo = 0
+    sea i = 0
+    mientras (i < nx o (prestamo != 0 y i < n)) {
+        sea t = __cargar64(r + i * 8) - prestamo
+        si (i < nx) { t = t - __cargar64(x + i * 8) }
+        prestamo = 0
+        si (t < 0) {
+            t = t + 1000000000
+            prestamo = 1
+        }
+        __guardar64(r + i * 8, t)
+        i = i + 1
+    }
+    retornar 0
+}
+
+// s[0..m+1) = x[0..m) + y[0..ny) (ny <= m).
+funcion dyn_gr_sumar_mitades(s, x, m, y, ny) {
+    sea acarreo = 0
+    sea i = 0
+    mientras (i < m) {
+        sea t = __cargar64(x + i * 8) + acarreo
+        si (i < ny) { t = t + __cargar64(y + i * 8) }
+        acarreo = 0
+        si (t >= 1000000000) {
+            t = t - 1000000000
+            acarreo = 1
+        }
+        __guardar64(s + i * 8, t)
+        i = i + 1
+    }
+    __guardar64(s + m * 8, acarreo)
+    retornar 0
+}
+
+funcion dyn_gr_kara(r, a, na, b, nb, tmp) {
+    si (na < nb) { retornar dyn_gr_kara(r, b, nb, a, na, tmp) }
+    si (nb < 48) { retornar dyn_gr_mul_escolar(r, a, na, b, nb) }
+    si (na >= 2 * nb) {
+        // Desbalanceado: a por trozos del largo de b.
+        sea i = 0
+        mientras (i < na + nb) {
+            __guardar64(r + i * 8, 0)
+            i = i + 1
+        }
+        sea prod = tmp
+        sea resto = tmp + (2 * nb + 2) * 8
+        sea off = 0
+        mientras (off < na) {
+            sea largo = nb
+            si (na - off < largo) { largo = na - off }
+            dyn_gr_kara(prod, a + off * 8, largo, b, nb, resto)
+            dyn_gr_sumar_en(r + off * 8, na + nb - off, prod, largo + nb)
+            off = off + nb
+        }
+        retornar 0
+    }
+    sea m = (na + 1) / 2
+    // z0 en r[0..2m), z2 en r[2m..na+nb)
+    dyn_gr_kara(r, a, m, b, m, tmp)
+    dyn_gr_kara(r + 2 * m * 8, a + m * 8, na - m, b + m * 8, nb - m, tmp)
+    sea sa = tmp
+    sea sb = tmp + (m + 1) * 8
+    sea z1 = tmp + (2 * m + 2) * 8
+    dyn_gr_sumar_mitades(sa, a, m, a + m * 8, na - m)
+    dyn_gr_sumar_mitades(sb, b, m, b + m * 8, nb - m)
+    dyn_gr_kara(z1, sa, m + 1, sb, m + 1, tmp + (4 * m + 4) * 8)
+    dyn_gr_restar_en(z1, 2 * m + 2, r, 2 * m)
+    dyn_gr_restar_en(z1, 2 * m + 2, r + 2 * m * 8, na + nb - 2 * m)
+    // z1 cabe en na + nb - m cifras (las de arriba son cero)
+    sea nz = 2 * m + 2
+    si (nz > na + nb - m) { nz = na + nb - m }
+    dyn_gr_sumar_en(r + m * 8, na + nb - m, z1, nz)
+    retornar 0
+}
+
+// ── Multiplicación por NTT (operandos muy grandes) ───────────────────────
+// Convolución exacta con tres primos p = c·2^k + 1 (< 2^30) y reconstrucción
+// por CRT (Garner) a base 10^9. Los productos modulares usan Montgomery con
+// R = 2^32 (sin divisiones). Cota: cada coeficiente < 10^18 · min(na, nb)
+// < p1·p2·p3 ≈ 5,9·10^25 mientras min(na, nb) < 5·10^7 cifras.
+
+// Montgomery: a·b·2^-32 mod p (a, b < p < 2^30).
+funcion dyn_gr_mont(a, b, p, np) {
+    sea t = a * b
+    sea m = __y_bits(__y_bits(t, 4294967295) * np, 4294967295)
+    t = __desplazar_der(t + m * p, 32)
+    si (t >= p) { t = t - p }
+    retornar t
+}
+
+// -p^-1 mod 2^32 (p impar).
+funcion dyn_gr_mont_np(p) {
+    sea inv = p
+    sea i = 0
+    mientras (i < 5) {
+        sea x = __y_bits(p * inv, 4294967295)
+        inv = __y_bits(inv * __y_bits(2 - x, 4294967295), 4294967295)
+        i = i + 1
+    }
+    retornar __y_bits(4294967296 - inv, 4294967295)
+}
+
+funcion dyn_gr_potmod(b, e, p) {
+    sea r = 1
+    b = b % p
+    mientras (e > 0) {
+        si (__y_bits(e, 1) == 1) { r = r * b % p }
+        b = b * b % p
+        e = __desplazar_der(e, 1)
+    }
+    retornar r
+}
+
+// Transformada en el sitio de x[0..n) (n potencia de 2). raices[j] = w^j·R,
+// j < n/2, con w raíz n-ésima primitiva (o su inversa), en forma Montgomery.
+funcion dyn_gr_ntt(x, n, p, np, raices) {
+    // permutación por inversión de bits
+    sea j = 0
+    sea i = 1
+    mientras (i < n) {
+        sea bit = __desplazar_der(n, 1)
+        mientras (__y_bits(j, bit) != 0) {
+            j = j - bit
+            bit = __desplazar_der(bit, 1)
+        }
+        j = j + bit
+        si (i < j) {
+            sea t = __cargar64(x + i * 8)
+            __guardar64(x + i * 8, __cargar64(x + j * 8))
+            __guardar64(x + j * 8, t)
+        }
+        i = i + 1
+    }
+    sea largo = 2
+    mientras (largo <= n) {
+        sea mitad = __desplazar_der(largo, 1)
+        sea paso = (n / largo) * 8
+        sea bloque = 0
+        mientras (bloque < n) {
+            sea pu = x + bloque * 8
+            sea pv = pu + mitad * 8
+            sea pw = raices
+            sea k = 0
+            mientras (k < mitad) {
+                sea u = __cargar64(pu)
+                sea t = __cargar64(pv) * __cargar64(pw)
+                sea m = __y_bits(__y_bits(t, 4294967295) * np, 4294967295)
+                sea v = __desplazar_der(t + m * p, 32)
+                si (v >= p) { v = v - p }
+                sea s = u + v
+                si (s >= p) { s = s - p }
+                sea d = u - v
+                si (d < 0) { d = d + p }
+                __guardar64(pu, s)
+                __guardar64(pv, d)
+                pu = pu + 8
+                pv = pv + 8
+                pw = pw + paso
+                k = k + 1
+            }
+            bloque = bloque + largo
+        }
+        largo = largo * 2
+    }
+    retornar 0
+}
+
+funcion dyn_gr_raices(raices, n, p, w) {
+    sea r = 4294967296 % p
+    sea j = 0
+    mientras (j < __desplazar_der(n, 1)) {
+        __guardar64(raices + j * 8, r)
+        r = r * w % p
+        j = j + 1
+    }
+    retornar 0
+}
+
+// Convolución de a y b (cifras crudas) módulo p en sal[0..n).
+funcion dyn_gr_conv_mod(sal, a, na, b, nb, n, p, g, aux, raices) {
+    sea i = 0
+    mientras (i < n) {
+        sea v = 0
+        si (i < na) { v = __cargar64(a + i * 8) % p }
+        __guardar64(sal + i * 8, v)
+        i = i + 1
+    }
+    sea np = dyn_gr_mont_np(p)
+    sea w = dyn_gr_potmod(g, (p - 1) / n, p)
+    dyn_gr_raices(raices, n, p, w)
+    dyn_gr_ntt(sal, n, p, np, raices)
+    si (a == b y na == nb) {
+        i = 0
+        mientras (i < n) {
+            sea v = __cargar64(sal + i * 8)
+            __guardar64(sal + i * 8, dyn_gr_mont(v, v, p, np))
+            i = i + 1
+        }
+    } sino {
+        i = 0
+        mientras (i < n) {
+            sea v = 0
+            si (i < nb) { v = __cargar64(b + i * 8) % p }
+            __guardar64(aux + i * 8, v)
+            i = i + 1
+        }
+        dyn_gr_ntt(aux, n, p, np, raices)
+        i = 0
+        mientras (i < n) {
+            __guardar64(sal + i * 8, dyn_gr_mont(__cargar64(sal + i * 8), __cargar64(aux + i * 8), p, np))
+            i = i + 1
+        }
+    }
+    dyn_gr_raices(raices, n, p, dyn_gr_potmod(w, p - 2, p))
+    dyn_gr_ntt(sal, n, p, np, raices)
+    // valores = n·conv·R^-1: se escalan por n^-1·R² con un producto Montgomery
+    sea rr = 4294967296 % p
+    sea escala = dyn_gr_potmod(n, p - 2, p) * (rr * rr % p) % p
+    i = 0
+    mientras (i < n) {
+        __guardar64(sal + i * 8, dyn_gr_mont(__cargar64(sal + i * 8), escala, p, np))
+        i = i + 1
+    }
+    retornar 0
+}
+
+// r[0..na+nb) = a · b por NTT.
+funcion dyn_gr_mul_ntt(r, a, na, b, nb) {
+    sea n = 1
+    mientras (n < na + nb) { n = n * 2 }
+    sea p1 = 469762049
+    sea p2 = 754974721
+    sea p3 = 167772161
+    sea bloque = mem_reservar(n * 8 * 5)
+    sea c1 = bloque
+    sea c2 = bloque + n * 8
+    sea c3 = bloque + n * 16
+    sea aux = bloque + n * 24
+    sea raices = bloque + n * 32
+    dyn_gr_conv_mod(c1, a, na, b, nb, n, p1, 3, aux, raices)
+    dyn_gr_conv_mod(c2, a, na, b, nb, n, p2, 11, aux, raices)
+    dyn_gr_conv_mod(c3, a, na, b, nb, n, p3, 3, aux, raices)
+    // Garner: x = r1 + p1·(t2 + p2·t3)
+    sea inv_p1_p2 = dyn_gr_potmod(p1 % p2, p2 - 2, p2)
+    sea p1p2_p3 = (p1 % p3) * (p2 % p3) % p3
+    sea inv_p1p2_p3 = dyn_gr_potmod(p1p2_p3, p3 - 2, p3)
+    sea base = 1000000000
+    // p1 = p1_hi·10^9 + p1_lo ; p1·p2 = q_hi·10^9 + q_lo
+    sea p1p2 = p1 * p2
+    sea q_hi = p1p2 / base
+    sea q_lo = p1p2 - q_hi * base
+    // acarreo de 3 cifras en base 10^9 (c0 + c1·B + c2·B²)
+    sea k0 = 0
+    sea k1 = 0
+    sea k2 = 0
+    sea total = na + nb
+    sea i = 0
+    mientras (i < total) {
+        sea r1 = __cargar64(c1 + i * 8)
+        sea r2 = __cargar64(c2 + i * 8)
+        sea r3 = __cargar64(c3 + i * 8)
+        sea t2 = (r2 - r1 % p2 + p2) % p2 * inv_p1_p2 % p2
+        // x mod p3 con lo ya conocido
+        sea y = (r1 % p3 + (p1 % p3) * t2) % p3
+        sea t3 = (r3 - y + p3) % p3 * inv_p1p2_p3 % p3
+        // x = r1 + p1·t2 + p1p2·t3  (en base 10^9 sumado al acarreo)
+        sea x01 = r1 + p1 * t2
+        sea d0 = k0 + x01 % base + q_lo * (t3 % base)
+        sea d1 = k1 + x01 / base + q_hi * (t3 % base) + q_lo * (t3 / base)
+        sea d2 = k2 + q_hi * (t3 / base)
+        // normalizar: d0 → cifra
+        sea c = d0 / base
+        __guardar64(r + i * 8, d0 - c * base)
+        d1 = d1 + c
+        c = d1 / base
+        k0 = d1 - c * base
+        d2 = d2 + c
+        c = d2 / base
+        k1 = d2 - c * base
+        k2 = c
+        i = i + 1
+    }
+    mem_liberar(bloque)
+    retornar 0
+}
+
 funcion dyn_gr_multiplicar(a, b) {
     sea na = dyn_gr_largo(a)
     sea nb = dyn_gr_largo(b)
     sea r = dyn_gr_nuevo(na + nb)
     __guardar64(r, dyn_gr_signo(a) * dyn_gr_signo(b))
-    sea i = 0
-    mientras (i < na) {
-        sea x = dyn_gr_cifra(a, i)
-        sea acarreo = 0
-        sea j = 0
-        mientras (j < nb) {
-            sea t = dyn_gr_cifra(r, i + j) + x * dyn_gr_cifra(b, j) + acarreo
-            acarreo = t / 1000000000
-            dyn_gr_fijar(r, i + j, t % 1000000000)
-            j = j + 1
-        }
-        sea k = i + nb
-        mientras (acarreo != 0) {
-            sea t = dyn_gr_cifra(r, k) + acarreo
-            acarreo = t / 1000000000
-            dyn_gr_fijar(r, k, t % 1000000000)
-            k = k + 1
-        }
-        i = i + 1
+    si (na == 0 o nb == 0) { retornar r }
+    sea mayor = na
+    si (nb > mayor) { mayor = nb }
+    si (na < 48 o nb < 48) {
+        dyn_gr_mul_escolar(r + 16, a + 16, na, b + 16, nb)
+        retornar r
     }
+    si (na >= 1500 y nb >= 1500) {
+        dyn_gr_mul_ntt(r + 16, a + 16, na, b + 16, nb)
+        retornar r
+    }
+    sea tmp = mem_reservar((4 * mayor + 256) * 8)
+    dyn_gr_kara(r + 16, a + 16, na, b + 16, nb, tmp)
+    mem_liberar(tmp)
     retornar r
 }
 
@@ -1542,4 +1886,246 @@ funcion dyn_pila_lenta() {
     sea base = mem_global(63)
     si (sp <= base y base - sp < 67108864) { dyn_error("desbordamiento de pila: recursión demasiado profunda") }
     retornar 0
+}
+
+// ── Ordenamiento natural (ordenar sin función) ───────────────────────────
+// Mergesort estable de abajo arriba sobre las palabras crudas, con tramos
+// iniciales por inserción. Si todos son enteros chicos se comparan las
+// palabras directamente (la etiqueta n·2+1 conserva el orden). Para listas
+// mixtas hay un orden total: nulo < booleanos < números < textos < listas <
+// mapas < lo demás; dentro de un mismo tipo sin orden natural (listas,
+// mapas, funciones) se conserva el orden original.
+
+funcion dyn_ord_rango(v) {
+    sea t = dyn_tipo(v)
+    si (t == 0) { retornar 0 }
+    si (t == 5) { retornar 1 }
+    si (t == 6 o t == 4 o t == 12) { retornar 2 }
+    si (t == 1) { retornar 3 }
+    si (t == 2) { retornar 4 }
+    si (t == 3) { retornar 5 }
+    retornar 6
+}
+
+funcion dyn_ord_comparar(a, b) {
+    si (__y_bits(a, 1) == 1 y __y_bits(b, 1) == 1) {
+        si (a < b) { retornar 0 - 1 }
+        si (a > b) { retornar 1 }
+        retornar 0
+    }
+    sea ra = dyn_ord_rango(a)
+    sea rb = dyn_ord_rango(b)
+    si (ra != rb) {
+        si (ra < rb) { retornar 0 - 1 }
+        retornar 1
+    }
+    si (ra == 1) {
+        si (a < b) { retornar 0 - 1 }
+        si (a > b) { retornar 1 }
+        retornar 0
+    }
+    si (ra == 2 o ra == 3) { retornar dyn_comparar(a, b) }
+    retornar 0
+}
+
+// Inserción estable de x[desde..hasta).
+funcion dyn_ord_insercion(x, desde, hasta, enteros) {
+    sea i = desde + 1
+    mientras (i < hasta) {
+        sea v = __cargar64(x + i * 8)
+        sea j = i - 1
+        si (enteros == 1) {
+            mientras (j >= desde y __cargar64(x + j * 8) > v) {
+                __guardar64(x + (j + 1) * 8, __cargar64(x + j * 8))
+                j = j - 1
+            }
+        } sino {
+            mientras (j >= desde y dyn_ord_comparar(__cargar64(x + j * 8), v) > 0) {
+                __guardar64(x + (j + 1) * 8, __cargar64(x + j * 8))
+                j = j - 1
+            }
+        }
+        __guardar64(x + (j + 1) * 8, v)
+        i = i + 1
+    }
+    retornar 0
+}
+
+// Mezcla estable de x[a..m) y x[m..b) en y[a..b).
+funcion dyn_ord_mezclar(x, y, a, m, b, enteros) {
+    sea i = a
+    sea j = m
+    sea k = a
+    mientras (i < m y j < b) {
+        sea u = __cargar64(x + i * 8)
+        sea v = __cargar64(x + j * 8)
+        sea tomar_derecha = 0
+        si (enteros == 1) {
+            si (v < u) { tomar_derecha = 1 }
+        } sino {
+            si (dyn_ord_comparar(u, v) > 0) { tomar_derecha = 1 }
+        }
+        si (tomar_derecha == 1) {
+            __guardar64(y + k * 8, v)
+            j = j + 1
+        } sino {
+            __guardar64(y + k * 8, u)
+            i = i + 1
+        }
+        k = k + 1
+    }
+    mientras (i < m) {
+        __guardar64(y + k * 8, __cargar64(x + i * 8))
+        i = i + 1
+        k = k + 1
+    }
+    mientras (j < b) {
+        __guardar64(y + k * 8, __cargar64(x + j * 8))
+        j = j + 1
+        k = k + 1
+    }
+    retornar 0
+}
+
+funcion dyn_ordenar_natural(l) {
+    si (dyn_tipo(l) != 2) { dyn_error_tipo("ordenar", l) }
+    sea origen = dyn_dato(l)
+    sea n = vec_largo(origen)
+    // resultado: un vec propio con capacidad exacta
+    sea r = vec_nuevo()
+    sea cap = n
+    si (cap < 8) { cap = 8 }
+    mem_liberar(__cargar64(r + 16))
+    __guardar64(r + 16, mem_reservar(cap * 8))
+    __guardar64(r + 8, cap)
+    sea x = __cargar64(r + 16)
+    mem_copiar(x, __cargar64(origen + 16), n * 8)
+    __guardar64(r, n)
+    si (n < 2) { retornar dyn_caja(2, r) }
+    sea enteros = 1
+    sea i = 0
+    mientras (i < n) {
+        si (__y_bits(__cargar64(x + i * 8), 1) != 1) {
+            enteros = 0
+            romper
+        }
+        i = i + 1
+    }
+    // ¿ya ordenada? (caso común y barato de detectar)
+    sea ordenada = 1
+    i = 1
+    mientras (i < n) {
+        sea u = __cargar64(x + (i - 1) * 8)
+        sea v = __cargar64(x + i * 8)
+        si (enteros == 1) {
+            si (v < u) { ordenada = 0 }
+        } sino {
+            si (dyn_ord_comparar(u, v) > 0) { ordenada = 0 }
+        }
+        si (ordenada == 0) { romper }
+        i = i + 1
+    }
+    si (ordenada == 1) { retornar dyn_caja(2, r) }
+    sea tramo = 24
+    i = 0
+    mientras (i < n) {
+        sea fin = i + tramo
+        si (fin > n) { fin = n }
+        dyn_ord_insercion(x, i, fin, enteros)
+        i = fin
+    }
+    sea y = mem_reservar(n * 8)
+    sea a = x
+    sea b = y
+    sea ancho = tramo
+    mientras (ancho < n) {
+        sea inicio = 0
+        mientras (inicio < n) {
+            sea medio = inicio + ancho
+            sea fin = inicio + 2 * ancho
+            si (medio > n) { medio = n }
+            si (fin > n) { fin = n }
+            dyn_ord_mezclar(a, b, inicio, medio, fin, enteros)
+            inicio = fin
+        }
+        sea t = a
+        a = b
+        b = t
+        ancho = ancho * 2
+    }
+    si (a != x) { mem_copiar(x, a, n * 8) }
+    mem_liberar(y)
+    retornar dyn_caja(2, r)
+}
+
+// ── Concatenación de textos con búfer compartido ─────────────────────────
+// a + b copia a y b; en un bucle (t = t + x) eso es cuadrático. Cuando el
+// resultado pasa de 32 bytes se guarda en un búfer con el doble de
+// capacidad, marcado como compartido (propio = 2) y con un contador de bytes
+// usados al final del bloque. Si después se suma algo a un texto cuyo largo
+// coincide con lo usado del búfer (nadie escribió más allá), los bytes se
+// agregan en el mismo búfer y el texto nuevo es otra cabecera sobre él: los
+// textos anteriores siguen viendo solo su prefijo, que no cambia. Así una
+// cadena de sumas cuesta O(n) amortizado. str_c repone el 0 final si hace
+// falta (str_c_propio) y str_asegurar copia antes de modificar.
+
+funcion dyn_cat_usado_dir(datos, cap) { retornar datos + __y_bits(cap + 8, 0 - 8) }
+
+funcion dyn_cat_nuevo(cap) {
+    sea s = mem_reservar(32)
+    sea datos = mem_reservar(__y_bits(cap + 8, 0 - 8) + 8)
+    __guardar64(s, 0)
+    __guardar64(s + 8, cap)
+    __guardar64(s + 16, datos)
+    __guardar64(s + 24, 2)
+    __guardar64(dyn_cat_usado_dir(datos, cap), 0)
+    retornar s
+}
+
+funcion dyn_texto_sumar(a, b) {
+    // b como bytes (los números, nulo, etc. se escriben como en a_texto)
+    sea sb = 0
+    si (dyn_tipo(b) == 1) {
+        sb = dyn_dato(b)
+    } sino {
+        sb = str_nuevo(16)
+        dyn_agregar_valor(sb, b, 0)
+    }
+    sea sa = dyn_dato(a)
+    sea la = __cargar64(sa)
+    sea lb = __cargar64(sb)
+    sea total = la + lb
+    si (mem_global(34) == 0) {
+        // Agregar en el sitio: búfer compartido, nadie más allá de a, cabe.
+        si (__cargar64(sa + 24) == 2) {
+            sea cap = __cargar64(sa + 8)
+            sea datos = __cargar64(sa + 16)
+            sea usado = dyn_cat_usado_dir(datos, cap)
+            si (__cargar64(usado) == la y total <= cap) {
+                mem_copiar(datos + la, __cargar64(sb + 16), lb)
+                __guardar8(datos + total, 0)
+                __guardar64(usado, total)
+                sea r = mem_reservar(32)
+                __guardar64(r, total)
+                __guardar64(r + 8, cap)
+                __guardar64(r + 16, datos)
+                __guardar64(r + 24, 2)
+                retornar dyn_texto(r)
+            }
+        }
+        si (total >= 32) {
+            sea r = dyn_cat_nuevo(total * 2)
+            sea datos = __cargar64(r + 16)
+            mem_copiar(datos, __cargar64(sa + 16), la)
+            mem_copiar(datos + la, __cargar64(sb + 16), lb)
+            __guardar8(datos + total, 0)
+            __guardar64(r, total)
+            __guardar64(dyn_cat_usado_dir(datos, total * 2), total)
+            retornar dyn_texto(r)
+        }
+    }
+    sea r = str_nuevo(total)
+    str_agregar(r, sa)
+    str_agregar(r, sb)
+    retornar dyn_texto(r)
 }

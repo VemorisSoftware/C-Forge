@@ -192,6 +192,7 @@ funcion re_secuencia(estado) {
         sea nodo = re_atomo(estado)
         nodo["min"] = 1
         nodo["max"] = 1
+        nodo["perezoso"] = falso
         si (estado["i"] < longitud(p)) {
             sea q = p[estado["i"]]
             si (q == "*") { nodo["min"] = 0  nodo["max"] = -1  estado["i"] += 1 }
@@ -210,7 +211,10 @@ funcion re_secuencia(estado) {
                 si (p[estado["i"]] != "\}") { lanzar "regex: cuantificador inválido" }
                 estado["i"] += 1
             }
-            si (estado["i"] < longitud(p) y p[estado["i"]] == "?") { estado["i"] += 1 }
+            si (estado["i"] < longitud(p) y p[estado["i"]] == "?") {
+                nodo["perezoso"] = verdadero
+                estado["i"] += 1
+            }
         }
         items.agregar(nodo)
     }
@@ -230,7 +234,7 @@ funcion re_compilar(patron) {
     sea estado = {"p": patron, "i": 0}
     sea alt = re_alternativas(estado)
     si (estado["i"] != longitud(patron)) { lanzar "regex: ')' sin abrir" }
-    retornar alt
+    retornar re_programa(alt)
 }
 
 funcion re_en_conjunto(nodo, b) {
@@ -242,72 +246,233 @@ funcion re_en_conjunto(nodo, b) {
     retornar dentro
 }
 
-// Una repetición del nodo desde pos: posición final o -1.
-funcion re_uno(nodo, s, pos) {
+// ── Máquina de hilos (Pike VM) ───────────────────────────────────────────
+// El árbol se compila a un programa y se ejecuta avanzando todos los hilos a
+// la vez, una posición del texto por paso: tiempo O(texto · programa) sin
+// retroceso. Prioridad de hilos = semántica de primera alternativa (como
+// Perl); los cuantificadores con "?" son perezosos.
+// Instrucciones: 0 char(c) · 1 any · 2 set(i) · 3 bol · 4 eol
+//                5 split(x, y) (x primero) · 6 jmp(x) · 7 match
+//                8 vuelta(x, salida): jmp al inicio del bucle; si la vuelta no
+//                  consumió nada (x ya visitado aquí), sale del bucle (Perl)
+//                9 control(x, salida): igual, pero si consumió sigue de largo
+
+funcion re_emitir(prog, op, a, b) {
+    si (longitud(prog["op"]) >= 200000) { lanzar "regex: el patrón es demasiado grande" }
+    prog["op"].agregar(op)
+    prog["a"].agregar(a)
+    prog["b"].agregar(b)
+    retornar longitud(prog["op"]) - 1
+}
+
+funcion re_prog_alt(prog, opciones) {
+    sea saltos = []
+    sea i = 0
+    mientras (i < longitud(opciones)) {
+        si (i < longitud(opciones) - 1) {
+            sea division = re_emitir(prog, 5, 0, 0)
+            prog["a"][division] = division + 1
+            re_prog_seq(prog, opciones[i])
+            saltos.agregar(re_emitir(prog, 6, 0, 0))
+            prog["b"][division] = longitud(prog["op"])
+        } sino {
+            re_prog_seq(prog, opciones[i])
+        }
+        i += 1
+    }
+    para j en saltos { prog["a"][j] = longitud(prog["op"]) }
+}
+
+funcion re_prog_seq(prog, items) {
+    para nodo en items { re_prog_rep(prog, nodo) }
+}
+
+// split hacia el cuerpo y la salida, en el orden que pide el cuantificador
+funcion re_split(prog, nodo, division, cuerpo, salida) {
+    si (nodo["perezoso"]) {
+        prog["a"][division] = salida
+        prog["b"][division] = cuerpo
+    } sino {
+        prog["a"][division] = cuerpo
+        prog["b"][division] = salida
+    }
+}
+
+funcion re_prog_rep(prog, nodo) {
+    sea i = 0
+    mientras (i < nodo["min"]) {
+        re_prog_atomo(prog, nodo)
+        i += 1
+    }
+    si (nodo["max"] < 0) {
+        sea division = re_emitir(prog, 5, 0, 0)
+        re_prog_atomo(prog, nodo)
+        sea vuelta = re_emitir(prog, 8, division, 0)
+        prog["b"][vuelta] = longitud(prog["op"])
+        re_split(prog, nodo, division, division + 1, longitud(prog["op"]))
+        retornar nulo
+    }
+    sea pendientes = []
+    sea controles = []
+    mientras (i < nodo["max"]) {
+        sea division = re_emitir(prog, 5, 0, 0)
+        re_prog_atomo(prog, nodo)
+        controles.agregar(re_emitir(prog, 9, division, 0))
+        pendientes.agregar(division)
+        i += 1
+    }
+    sea salida = longitud(prog["op"])
+    para d en pendientes { re_split(prog, nodo, d, d + 1, salida) }
+    para c en controles { prog["b"][c] = salida }
+}
+
+funcion re_prog_atomo(prog, nodo) {
     sea t = nodo["t"]
-    si (t == "char") {
-        si (pos < longitud(s) y byte_en(s, pos) == nodo["c"]) { retornar pos + 1 }
-        retornar -1
+    si (t == "char") { re_emitir(prog, 0, nodo["c"], 0) }
+    sino si (t == "any") { re_emitir(prog, 1, 0, 0) }
+    sino si (t == "set") {
+        prog["sets"].agregar(nodo)
+        re_emitir(prog, 2, longitud(prog["sets"]) - 1, 0)
     }
-    si (t == "any") {
-        si (pos < longitud(s) y byte_en(s, pos) != 10) { retornar pos + 1 }
-        retornar -1
-    }
-    si (t == "set") {
-        si (pos < longitud(s) y re_en_conjunto(nodo, byte_en(s, pos))) { retornar pos + 1 }
-        retornar -1
-    }
-    si (t == "bol") { si (pos == 0) { retornar pos } retornar -1 }
-    si (t == "eol") { si (pos == longitud(s)) { retornar pos } retornar -1 }
-    retornar re_alt(nodo["alt"], s, pos, funcion(x) { retornar x })
+    sino si (t == "bol") { re_emitir(prog, 3, 0, 0) }
+    sino si (t == "eol") { re_emitir(prog, 4, 0, 0) }
+    sino { re_prog_alt(prog, nodo["alt"]) }
 }
 
-funcion re_seq(items, k, s, pos, cont) {
-    si (k == longitud(items)) { retornar cont(pos) }
-    sea nodo = items[k]
-    sea posiciones = [pos]
-    sea ultima = pos
-    sea cuenta = 0
-    mientras (nodo["max"] < 0 o cuenta < nodo["max"]) {
-        sea siguiente = re_uno(nodo, s, ultima)
-        si (siguiente < 0 o (siguiente == ultima y cuenta >= nodo["min"])) { romper }
-        posiciones.agregar(siguiente)
-        ultima = siguiente
-        cuenta += 1
+funcion re_programa(alt) {
+    sea prog = {"op": [], "a": [], "b": [], "sets": []}
+    re_prog_alt(prog, alt)
+    re_emitir(prog, 7, 0, 0)
+    sea n = longitud(prog["op"])
+    prog["marca"] = lista_repetir(-1, n)
+    prog["gen"] = 0
+    // listas de hilos (actual y siguiente) y pila, de tamaño fijo: cada pc
+    // entra a lo más una vez por posición
+    prog["pcs"] = [lista_repetir(0, n), lista_repetir(0, n)]
+    prog["inicios"] = [lista_repetir(0, n), lista_repetir(0, n)]
+    prog["pila"] = lista_repetir(0, 2 * n + 2)
+    // tabla de bytes por conjunto (evita recorrer rangos en cada paso)
+    sea tablas = []
+    para c en prog["sets"] {
+        sea tabla = lista_repetir(falso, 256)
+        sea b = 0
+        mientras (b < 256) {
+            tabla[b] = re_en_conjunto(c, b)
+            b += 1
+        }
+        tablas.agregar(tabla)
     }
-    sea i = longitud(posiciones) - 1
-    mientras (i >= nodo["min"]) {
-        sea r = re_seq(items, k + 1, s, posiciones[i], cont)
-        si (r >= 0) { retornar r }
-        i -= 1
-    }
-    retornar -1
+    prog["tablas"] = tablas
+    retornar prog
 }
 
-funcion re_alt(opciones, s, pos, cont) {
-    para items en opciones {
-        sea r = re_seq(items, 0, s, pos, cont)
-        si (r >= 0) { retornar r }
+// Agrega el hilo pc (y lo que alcanza sin consumir) a la lista desde la
+// posición cuenta, en orden de prioridad; devuelve la nueva cuenta. marca
+// evita repetir un pc en la misma posición.
+funcion re_agregar_hilo(prog, pcs, inicios, cuenta, pc, inicio, pos, n, gen) {
+    sea op = prog["op"]
+    sea arg_a = prog["a"]
+    sea arg_b = prog["b"]
+    sea marca = prog["marca"]
+    sea pila = prog["pila"]
+    sea tope = 1
+    pila[0] = pc
+    mientras (tope > 0) {
+        tope -= 1
+        sea p = pila[tope]
+        si (marca[p] == gen) { continuar }
+        marca[p] = gen
+        sea o = op[p]
+        si (o == 6) {
+            pila[tope] = arg_a[p]
+            tope += 1
+        } sino si (o == 5) {
+            pila[tope] = arg_b[p]
+            pila[tope + 1] = arg_a[p]
+            tope += 2
+        } sino si (o == 8) {
+            si (marca[arg_a[p]] == gen) { pila[tope] = arg_b[p] } sino { pila[tope] = arg_a[p] }
+            tope += 1
+        } sino si (o == 9) {
+            si (marca[arg_a[p]] == gen) { pila[tope] = arg_b[p] } sino { pila[tope] = p + 1 }
+            tope += 1
+        } sino si (o == 3) {
+            si (pos == 0) {
+                pila[tope] = p + 1
+                tope += 1
+            }
+        } sino si (o == 4) {
+            si (pos == n) {
+                pila[tope] = p + 1
+                tope += 1
+            }
+        } sino {
+            pcs[cuenta] = p
+            inicios[cuenta] = inicio
+            cuenta += 1
+        }
     }
-    retornar -1
+    retornar cuenta
 }
 
 // Primera coincidencia desde inicio: [comienzo, fin] o nulo.
-funcion re_buscar_desde(alt, s, inicio) {
-    sea i = inicio
-    mientras (i <= longitud(s)) {
-        sea fin = re_alt(alt, s, i, funcion(x) { retornar x })
-        si (fin >= 0) { retornar [i, fin] }
-        i += 1
+funcion re_buscar_desde(prog, s, inicio) {
+    sea n = longitud(s)
+    sea op = prog["op"]
+    sea arg = prog["a"]
+    sea tablas = prog["tablas"]
+    sea pcs = prog["pcs"][0]
+    sea inicios = prog["inicios"][0]
+    sea npcs = prog["pcs"][1]
+    sea ninicios = prog["inicios"][1]
+    sea cuenta = 0
+    sea hallado = nulo
+    sea pos = inicio
+    // generación de marcas: única entre búsquedas sobre el mismo programa
+    prog["gen"] += 1
+    sea gen = prog["gen"]
+    mientras (pos <= n) {
+        si (hallado == nulo) { cuenta = re_agregar_hilo(prog, pcs, inicios, cuenta, 0, pos, pos, n, gen) }
+        si (cuenta == 0 y hallado != nulo) { romper }
+        sea b = -1
+        si (pos < n) { b = byte_en(s, pos) }
+        sea ncuenta = 0
+        sea i = 0
+        mientras (i < cuenta) {
+            sea pc = pcs[i]
+            sea o = op[pc]
+            si (o == 7) {
+                hallado = [inicios[i], pos]
+                romper
+            }
+            sea ok = falso
+            si (b >= 0) {
+                si (o == 0) { ok = b == arg[pc] }
+                sino si (o == 1) { ok = b != 10 }
+                sino si (o == 2) { ok = tablas[arg[pc]][b] }
+            }
+            si (ok) { ncuenta = re_agregar_hilo(prog, npcs, ninicios, ncuenta, pc + 1, inicios[i], pos + 1, n, gen + 1) }
+            i += 1
+        }
+        sea tp = pcs
+        pcs = npcs
+        npcs = tp
+        sea ti = inicios
+        inicios = ninicios
+        ninicios = ti
+        cuenta = ncuenta
+        gen += 1
+        pos += 1
     }
-    retornar nulo
+    prog["gen"] = gen + 1
+    retornar hallado
 }
 
-funcion re_todas(alt, s) {
+funcion re_todas(prog, s) {
     sea r = []
     sea i = 0
     mientras (i <= longitud(s)) {
-        sea m = re_buscar_desde(alt, s, i)
+        sea m = re_buscar_desde(prog, s, i)
         si (m == nulo) { romper }
         r.agregar(m)
         si (m[1] > m[0]) { i = m[1] } sino { i = m[0] + 1 }
@@ -358,38 +523,52 @@ funcion cfv_regex_dividir(patron, texto) {
 // comparar(a, b) < 0 si a va antes que b; sin función se usa el orden natural.
 
 funcion ordenar(lista, comparar) {
-    si (longitud(lista) <= 1) { retornar lista_invertir(lista_invertir(lista)) }
-    sea medio = piso(longitud(lista) / 2)
-    sea izquierda = []
-    sea derecha = []
-    sea i = 0
-    para x en lista {
-        si (i < medio) { izquierda.agregar(x) } sino { derecha.agregar(x) }
-        i += 1
-    }
-    izquierda = ordenar(izquierda, comparar)
-    derecha = ordenar(derecha, comparar)
-    sea r = []
-    sea a = 0
-    sea b = 0
-    mientras (a < longitud(izquierda) o b < longitud(derecha)) {
-        sea tomar_izquierda = b >= longitud(derecha)
-        si (a < longitud(izquierda) y b < longitud(derecha)) {
-            si (comparar == nulo) {
-                tomar_izquierda = no (derecha[b] < izquierda[a])
-            } sino {
-                tomar_izquierda = comparar(izquierda[a], derecha[b]) <= 0
+    si (comparar == nulo) { retornar dyn_ordenar_natural(lista) }
+    // Con función: mergesort estable de abajo arriba sobre dos listas.
+    sea n = longitud(lista)
+    sea a = []
+    para v en lista { a.agregar(v) }
+    si (n < 2) { retornar a }
+    sea b = lista_repetir(nulo, n)
+    sea ancho = 1
+    mientras (ancho < n) {
+        sea inicio = 0
+        mientras (inicio < n) {
+            sea medio = inicio + ancho
+            sea fin = inicio + 2 * ancho
+            si (medio > n) { medio = n }
+            si (fin > n) { fin = n }
+            sea i = inicio
+            sea j = medio
+            sea k = inicio
+            mientras (i < medio y j < fin) {
+                si (comparar(a[i], a[j]) <= 0) {
+                    b[k] = a[i]
+                    i += 1
+                } sino {
+                    b[k] = a[j]
+                    j += 1
+                }
+                k += 1
             }
+            mientras (i < medio) {
+                b[k] = a[i]
+                i += 1
+                k += 1
+            }
+            mientras (j < fin) {
+                b[k] = a[j]
+                j += 1
+                k += 1
+            }
+            inicio = fin
         }
-        si (tomar_izquierda) {
-            r.agregar(izquierda[a])
-            a += 1
-        } sino {
-            r.agregar(derecha[b])
-            b += 1
-        }
+        sea t = a
+        a = b
+        b = t
+        ancho = ancho * 2
     }
-    retornar r
+    retornar a
 }
 
 funcion lista_ordenar(lista) { retornar ordenar(lista, nulo) }
