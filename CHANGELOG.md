@@ -4,6 +4,14 @@ Sitio oficial: [c-forge.org](https://c-forge.org)
 
 ## Sin publicar
 
+- **Rendimiento del runtime:** multiplicación de enteros grandes con
+  Karatsuba y NTT (`potencia` de 2 millones de cifras en ~1 s; tope de 4
+  millones de cifras con error claro); nuevo motor de expresiones regulares
+  de tiempo lineal con semántica de primera alternativa y cuantificadores
+  perezosos (`*?`, `+?`, `??`); `ordenar` con mergesort estable sobre memoria
+  cruda (200.000 enteros en ~40 ms) y orden total para listas mixtas;
+  `t = t + x` y `+=` con textos agregan en el sitio cuando se puede
+  (100.000 sumas en ~30 ms).
 - **Regresiones del Fuzz Lab (4 bugs):** `xml_analizar` ya no se cuelga con
   `<![` sin `CDATA[` (error capturable); `markdown_html` es lineal (memoria de
   búsquedas fallidas, URL con hasta 32 paréntesis anidados y citas con hasta
