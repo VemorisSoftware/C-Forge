@@ -209,6 +209,11 @@ para fruta en ["manzana", "pera"] { mostrar(fruta) }
 intentar { lanzar "fallo" } capturar (e) { mostrar(e) }
 ```
 
+La recursión demasiado profunda no cierra el programa: da el error
+capturable `"desbordamiento de pila: recursión demasiado profunda"` (en el
+hilo principal, más de 128.000 niveles en Linux; en los hilos de `tarea()`,
+hasta 7 MiB de pila). `retornar` solo se permite dentro de una función.
+
 ---
 
 ## 5. Funciones ✅
