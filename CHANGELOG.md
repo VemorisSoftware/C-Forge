@@ -4,6 +4,8 @@ Sitio oficial: [c-forge.org](https://c-forge.org)
 
 ## Sin publicar
 
+- **cforge fmt:** sin espacio entre una coma final y `)`, `]` o `}`, ni entre
+  dos comas seguidas; formatear dos veces da el mismo texto.
 - **Bucles y listas más rápidos:** `lista.agregar(x)` en línea (sin llamada
   al runtime cuando hay capacidad); las listas grandes crecen con `mremap`
   en Linux (sin copiar); `lista_repetir` reserva de una vez; `x % N` con N
