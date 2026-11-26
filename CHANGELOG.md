@@ -4,6 +4,8 @@ Sitio oficial: [c-forge.org](https://c-forge.org)
 
 ## Sin publicar
 
+## 5.1.0 — 2026-11-26
+
 - **cforge fmt:** sin espacio entre una coma final y `)`, `]` o `}`, ni entre
   dos comas seguidas; formatear dos veces da el mismo texto.
 - **Bucles y listas más rápidos:** `lista.agregar(x)` en línea (sin llamada
@@ -21,10 +23,9 @@ Sitio oficial: [c-forge.org](https://c-forge.org)
   cruda (200.000 enteros en ~40 ms) y orden total para listas mixtas;
   `t = t + x` y `+=` con textos agregan en el sitio cuando se puede
   (100.000 sumas en ~30 ms).
-- **Regresiones del Fuzz Lab (4 bugs):** `xml_analizar` ya no se cuelga con
-  `<![` sin `CDATA[` (error capturable); `markdown_html` es lineal (memoria de
-  búsquedas fallidas, URL con hasta 32 paréntesis anidados y citas con hasta
-  32 niveles): 100.000 caracteres hostiles en segundos en vez de horas; la
+- **Robustez:** `xml_analizar` da un error capturable con secciones `<![`
+  incompletas; `markdown_html` es lineal (URL con hasta 32 paréntesis
+  anidados y citas con hasta 32 niveles); la
   recursión profunda da el error capturable "desbordamiento de pila" en vez
   de SIGSEGV (hilo principal e hilos de `tarea()`, x86-64 y ARM64; más de
   128.000 niveles en Linux); `retornar` fuera de una función es un error de
