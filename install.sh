@@ -5,7 +5,7 @@
 #   curl -fsSL https://c-forge.org/install.sh | sh
 #
 # Variables opcionales:
-#   CFORGE_VERSION=5.0.0   instala una versión concreta (por defecto: la última)
+#   CFORGE_VERSION=5.1.0   instala una versión concreta (por defecto: la última)
 #   CFORGE_PREFIX=$HOME/.local   carpeta de instalación (por defecto: /usr/local)
 #   CFORGE_FROM_SOURCE=1   compila desde el código fuente en vez de bajar binario
 # ============================================================================
@@ -43,11 +43,11 @@ if [ -z "$VERSION" ]; then
     VERSION=$(curl -fsSLI -o /dev/null -w '%{url_effective}' "${GITHUB}/releases/latest" 2>/dev/null \
       | sed -n 's#.*/tag/v\{0,1\}\([0-9][0-9.]*\)$#\1#p')
   fi
-  [ -n "$VERSION" ] || fail "no se pudo detectar la última versión; usa CFORGE_VERSION=5.0.0"
+  [ -n "$VERSION" ] || fail "no se pudo detectar la última versión; usa CFORGE_VERSION=5.1.0"
 fi
 VERSION="${VERSION#v}"
 case "$VERSION" in
-  ""|*[!0-9.]*) fail "versión inválida: ${VERSION} (ejemplo: CFORGE_VERSION=5.0.0)" ;;
+  ""|*[!0-9.]*) fail "versión inválida: ${VERSION} (ejemplo: CFORGE_VERSION=5.1.0)" ;;
 esac
 
 # ── Plataforma ─────────────────────────────────────────────────────────────

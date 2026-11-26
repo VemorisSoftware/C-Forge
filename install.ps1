@@ -4,7 +4,7 @@
 #   irm https://c-forge.org/install.ps1 | iex
 #
 # Variables opcionales:
-#   $env:CFORGE_VERSION = "5.0.0"   instala una versión concreta
+#   $env:CFORGE_VERSION = "5.1.0"   instala una versión concreta
 # ============================================================================
 $ErrorActionPreference = 'Stop'
 $ProgressPreference = 'SilentlyContinue'
@@ -30,7 +30,7 @@ if (-not $Version) {
   if (-not $Version) { Fail 'no se pudo detectar la última versión; define $env:CFORGE_VERSION' }
 }
 $Version = $Version.TrimStart('v')
-if ($Version -notmatch '^[0-9]+(\.[0-9]+)*$') { Fail "versión inválida: $Version (ejemplo: 5.0.0)" }
+if ($Version -notmatch '^[0-9]+(\.[0-9]+)*$') { Fail "versión inválida: $Version (ejemplo: 5.1.0)" }
 
 $Name = "cforge-$Version-windows-x64"
 $Base = "$GitHub/releases/download/v$Version"
