@@ -239,6 +239,8 @@ stdlib-check: build
 	if ./$(TARGET) check /tmp/cforge_retornar.cfv 2>&1 | grep -q "retornar fuera de una función"; then :; else echo "  ✗ retornar fuera de una función se aceptó"; exit 1; fi; \
 	printf 'funcion f() { mientras (verdadero) { } }\nsea x = f()\nsea y = comptime(1 + 1)\n' > /tmp/cforge_comptime_tope.cfv; \
 	if timeout 60 ./$(TARGET) check /tmp/cforge_comptime_tope.cfv 2>&1 | grep -q "no terminó en 10 s"; then :; else echo "  ✗ comptime sin fin colgó el compilador"; exit 1; fi; \
+	printf 'funcion p(n: i64): i64 {\n    si (n == 0) { retornar 0 }\n    retornar p(n - 1) + 1\n}\nsea m = ""\nintentar { p(100000000) } capturar (e) { m = e }\nmostrar(p(100000))\nmostrar(texto_contiene(m, "pila"))\n' > /tmp/cforge_pila_i64.cfv; \
+	if [ "$$(./$(TARGET) /tmp/cforge_pila_i64.cfv 2>&1 | tr '\n' ' ')" = "100000 verdadero " ]; then :; else echo "  ✗ recursión i64 sin control de pila"; exit 1; fi; \
 	echo "  ✓ seguridad: imágenes y fuentes hostiles, bombas de compresión, lecturas fuera de rango y secretos"
 
 ## Recolector de basura: memoria acotada en un programa largo y la suite

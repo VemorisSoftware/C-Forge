@@ -132,6 +132,18 @@ puede ser grande, la aritmética sigue comprobando la etiqueta y el
 desborde en línea (sin llamar al runtime). `decimal` / `numero` solo
 los verifica `cforge check`.
 
+**Funciones `i64` con registros (6.0, x86-64):** una función cuyos
+parámetros y resultado son todos `i64`, y cuyo cuerpo solo usa enteros
+(`+ - * %`, comparaciones, `y/o/no`, `si/sino/mientras/romper/continuar`,
+`sea`, asignaciones y llamadas a otras funciones así), se compila con las
+variables en registros del procesador, comparar-y-saltar y resto por
+constante sin dividir. El resultado es siempre el mismo que en el modo
+dinámico: si un argumento no es un entero chico, o si un cálculo se sale de
+i64 o divide por cero, la función (que no tiene efectos) se repite con su
+forma normal y da el entero grande o el error de siempre. En ARM64 y
+WebAssembly, por ahora, se compila de la forma normal. `CFORGE_TURBO=0`
+lo desactiva.
+
 ### 3.3 Opcionales y punteros seguros ✅
 
 ```cfv
