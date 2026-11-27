@@ -4,6 +4,11 @@ Sitio oficial: [c-forge.org](https://c-forge.org)
 
 ## Sin publicar
 
+- **comptime con tope de 10 s:** si la evaluación al compilar no termina, el
+  compilador da un error claro en vez de quedarse esperando.
+- **Regex:** tope de trabajo por llamada (error capturable) y el motor es
+  unas 4 veces más rápido.
+
 ## 5.1.0 — 2026-11-26
 
 - **cforge fmt:** sin espacio entre una coma final y `)`, `]` o `}`, ni entre
