@@ -57,9 +57,14 @@
 funcion ctx_nuevo(tokens) {
     mem_fijar_global(44, 0)                                    // nivel de anidamiento
     mem_fijar_global(51, 0 - 1)                                // mirilla: sin guardado previo
-    sea c = mem_reservar(464)
-    mem_llenar(c, 0, 464)                                       // c + 456: funciones abiertas
+    sea c = mem_reservar(480)
+    mem_llenar(c, 0, 480)                                       // c + 456: funciones abiertas
     __guardar64(c + 400, 0 - 1)
+    // c + 464: posición del código antes de apilar el operando izquierdo;
+    // c + 472: posición al terminar un operando derecho literal (ver
+    // operador_rapido_literal).
+    __guardar64(c + 464, 0 - 1)
+    __guardar64(c + 472, 0 - 1)
     __guardar64(c, reescribir_async(tokens))
     __guardar64(c + 8, 0)
     __guardar64(c + 16, str_nuevo(65536))
@@ -3548,6 +3553,7 @@ funcion operador_entero(c, lex, nombre) {
 // Igual que operador_rapido, con el operando derecho entero literal v
 // (etiquetado L = 2v + 1, ya en rax): solo se comprueba el izquierdo.
 funcion operador_rapido_literal(c, lex, nombre, v, probado) {
+    si (operador_literal_en_registro(c, lex, nombre, v)) { retornar 0 }
     sea lento = nueva_etiqueta(c)
     sea fin = nueva_etiqueta(c)
     sea op = str_byte(lex, 0)
@@ -3612,6 +3618,65 @@ funcion operador_rapido_literal(c, lex, nombre, v, probado) {
     si (mem_global(46) != 0) { op_sumar_constante(c, 0 - 2) }
     definir_etiqueta(c, fin)
     retornar 0
+}
+
+// ¿Se puede deshacer "apilar izquierdo + cargar literal"? Solo si lo último
+// emitido es exactamente eso (push rax; mov rax, imm), sin nada en medio.
+funcion deshacer_apilado_literal(c) {
+    sea desde = __cargar64(c + 464)
+    sea hasta = __cargar64(c + 472)
+    __guardar64(c + 472, 0 - 1)
+    si (es_wasm(c) o desde < 0 o hasta != posicion_codigo(c) o hasta - desde > 24 o hasta <= desde) { retornar 0 }
+    sea codigo = ctx_codigo(c)
+    si (es_arm64(c)) {
+        sea w = str_byte(codigo, desde) + str_byte(codigo, desde + 1) * 256 + str_byte(codigo, desde + 2) * 65536 + str_byte(codigo, desde + 3) * 16777216
+        si (w != 4162817920 + a64_r(0)) { retornar 0 }
+    } sino {
+        si (str_byte(codigo, desde) != 80) { retornar 0 }               // push rax
+    }
+    __guardar64(codigo, desde)                                       // se descarta el código
+    mem_fijar_global(51, 0 - 1)                                       // mirilla sin estado
+    retornar 1
+}
+
+// izq OP literal con izq en rax (sin pasar por la pila): + - y
+// comparaciones. rdx guarda el izquierdo para la vía lenta.
+funcion operador_literal_en_registro(c, lex, nombre, v) {
+    sea op = str_byte(lex, 0)
+    sea suma_resta = str_largo(lex) == 1 y (op == 43 o op == 45)
+    sea codigo = 0
+    si (str_igual(lex, "<")) { codigo = 156 }
+    si (str_igual(lex, "<=")) { codigo = 158 }
+    si (str_igual(lex, ">")) { codigo = 159 }
+    si (str_igual(lex, ">=")) { codigo = 157 }
+    si (str_igual(lex, "==")) { codigo = 148 }
+    si (str_igual(lex, "!=")) { codigo = 149 }
+    si (suma_resta == 0 y codigo == 0) { retornar 0 }
+    si (deshacer_apilado_literal(c) == 0) { retornar 0 }
+    sea lento = nueva_etiqueta(c)
+    sea fin = nueva_etiqueta(c)
+    op_mov(c, 2, 0)                                                  // rdx = izq
+    op_y_uno(c)
+    op_saltar_si_cero(c, lento)
+    op_mov(c, 0, 2)                                                  // rax = izq
+    si (suma_resta) {
+        op_constante_rcx(c, 2 * v)
+        si (op == 43) { op_aritmetica_vigilada(c, 1, lento) } sino { op_aritmetica_vigilada(c, 2, lento) }
+    } sino {
+        op_constante_rcx(c, 2 * v + 1)
+        op_comparar(c, codigo)
+        si (mem_global(46) == 0) { booleano_dinamico(c) }
+    }
+    op_saltar(c, fin)
+    definir_etiqueta(c, lento)
+    op_mov(c, 0, 2)                                                  // izq a la pila, como la vía general
+    empujar(c)
+    cargar_inmediato(c, 2 * v + 1)
+    empujar(c)
+    llamar_runtime(c, nombre, 2)
+    si (codigo != 0 y mem_global(46) != 0) { op_sumar_constante(c, 0 - 2) }
+    definir_etiqueta(c, fin)
+    retornar 1
 }
 
 // k si v = 2^k (1 ≤ k ≤ 62), si no -1.
@@ -3716,6 +3781,7 @@ funcion marcar_literal_entero(c, pos) {
     }
     si (plegado y mem_global(49) >= 0 y mem_global(49) < 1000000000) {
         __guardar64(c + 376, mem_global(49) * 2 + 1)
+        __guardar64(c + 472, posicion_codigo(c))
         retornar 0
     }
     si (__cargar64(c + 8) != pos + 1) { retornar 0 }
@@ -3724,6 +3790,7 @@ funcion marcar_literal_entero(c, pos) {
     sea lexema = __cargar64(t + 8)
     si (posicion_exponente(lexema) >= 0 o str_largo(lexema) > 9) { retornar 0 }
     __guardar64(c + 376, numero_literal(lexema) * 2 + 1)
+    __guardar64(c + 472, posicion_codigo(c))
     retornar 0
 }
 
@@ -3818,6 +3885,7 @@ funcion producto(c) {
         si (ver(c, "*") o ver(c, "/") o ver(c, "%")) {
             sea lex = __cargar64(avanzar(c) + 8)
             sea tl = tipo_actual(c)
+            __guardar64(c + 464, posicion_codigo(c))
             empujar(c)
             sea pos_der = __cargar64(c + 8)
             unaria(c)
@@ -3843,6 +3911,7 @@ funcion suma(c) {
         si (ver(c, "+") o ver(c, "-")) {
             sea lex = __cargar64(avanzar(c) + 8)
             sea tl = tipo_actual(c)
+            __guardar64(c + 464, posicion_codigo(c))
             empujar(c)
             sea pos_der = __cargar64(c + 8)
             producto(c)
@@ -3875,6 +3944,7 @@ funcion comparacion(c) {
         si (ver(c, "<") o ver(c, "<=") o ver(c, ">") o ver(c, ">=")) {
             sea lex = __cargar64(avanzar(c) + 8)
             sea tl = tipo_actual(c)
+            __guardar64(c + 464, posicion_codigo(c))
             empujar(c)
             sea pos_der = __cargar64(c + 8)
             suma(c)
@@ -3907,6 +3977,7 @@ funcion igualdad(c) {
         si (ver(c, "==") o ver(c, "!=")) {
             sea lex = __cargar64(avanzar(c) + 8)
             sea tl = tipo_actual(c)
+            __guardar64(c + 464, posicion_codigo(c))
             empujar(c)
             sea pos_der = __cargar64(c + 8)
             comparacion(c)
