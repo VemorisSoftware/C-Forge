@@ -4,6 +4,12 @@ Sitio oficial: [c-forge.org](https://c-forge.org)
 
 ## Sin publicar
 
+- **Funciones `i64` con registros (x86-64):** las funciones con parámetros y
+  resultado `i64` que solo hacen cuentas con enteros se compilan con
+  variables en registros, comparar-y-saltar y resto por constante sin
+  dividir: un bucle de 100 millones pasa de ~390 ms a ~86 ms (Rust: 79 ms) y
+  `fib(35)` de ~105 ms a ~55 ms. Mismos resultados que siempre (si algo se
+  sale de i64, se repite con la forma normal).
 - **comptime con tope de 10 s:** si la evaluación al compilar no termina, el
   compilador da un error claro en vez de quedarse esperando.
 - **Regex:** tope de trabajo por llamada (error capturable) y el motor es
