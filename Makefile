@@ -237,6 +237,8 @@ stdlib-check: build
 	(cd tests/seguridad && CFORGE_STDLIB=../../stdlib ../../$(TARGET) fuzzlab_regresiones.cfv) | diff -u tests/seguridad/fuzzlab_regresiones.salida - || { echo "  ✗ tests/seguridad (regresiones del Fuzz Lab)"; exit 1; }; \
 	printf 'mostrar("antes")\nretornar 5\n' > /tmp/cforge_retornar.cfv; \
 	if ./$(TARGET) check /tmp/cforge_retornar.cfv 2>&1 | grep -q "retornar fuera de una función"; then :; else echo "  ✗ retornar fuera de una función se aceptó"; exit 1; fi; \
+	printf 'funcion f() { mientras (verdadero) { } }\nsea x = f()\nsea y = comptime(1 + 1)\n' > /tmp/cforge_comptime_tope.cfv; \
+	if timeout 60 ./$(TARGET) check /tmp/cforge_comptime_tope.cfv 2>&1 | grep -q "no terminó en 10 s"; then :; else echo "  ✗ comptime sin fin colgó el compilador"; exit 1; fi; \
 	echo "  ✓ seguridad: imágenes y fuentes hostiles, bombas de compresión, lecturas fuera de rango y secretos"
 
 ## Recolector de basura: memoria acotada en un programa largo y la suite
