@@ -48,6 +48,15 @@ Sitio oficial: [c-forge.org](https://c-forge.org)
   norm: ~9,6 s → ~0,09 s; mandelbrot: ~25 s → ~0,1 s.
 - **`x += k` justo después de una división** da siempre el resultado
   correcto en el modo dinámico.
+- **Runtime y recolector más rápidos:** el código del runtime y del
+  compilador sale más corto en x86-64 y ARM64 (operandos simples directo al
+  registro, sin pasar por la pila, inmediatos en la misma instrucción y
+  comparar-y-saltar en `si`/`mientras`, también con `y`);
+  listas literales cortas del tamaño justo; reservas sin cerrojo cuando no
+  hay hilos; el barrido del recolector recorre los mapas de bits y no toca
+  los bloques vivos; `x == nulo` sin llamar al runtime. Árboles binarios:
+  ~6,9 s → ~1,6 s; mapas con 3 M de operaciones: ~4,3 s → ~2,2 s; textos:
+  ~0,8 s → ~0,3 s. El compilador también sale ~7 % más chico.
 - **comptime con tope de 10 s:** si la evaluación al compilar no termina, el
   compilador da un error claro en vez de quedarse esperando.
 - **Regex:** tope de trabajo por llamada (error capturable) y el motor es

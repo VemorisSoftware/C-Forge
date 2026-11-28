@@ -57,8 +57,9 @@
 funcion ctx_nuevo(tokens) {
     mem_fijar_global(44, 0)                                    // nivel de anidamiento
     mem_fijar_global(51, 0 - 1)                                // mirilla: sin guardado previo
-    sea c = mem_reservar(512)
-    mem_llenar(c, 0, 512)                                       // c + 480/488: tabla turbo                                       // c + 456: funciones abiertas
+    sea c = mem_reservar(592)
+    mem_llenar(c, 0, 592)                                       // 512..560: mirilla · 568/576: condición con saltos
+    __guardar64(c + 568, 0 - 1)                                       // c + 480/488: tabla turbo                                       // c + 456: funciones abiertas
     __guardar64(c + 400, 0 - 1)
     // c + 464: posición del código antes de apilar el operando izquierdo;
     // c + 472: posición al terminar un operando derecho literal (ver
@@ -750,6 +751,7 @@ funcion nueva_etiqueta(c) {
 
 funcion definir_etiqueta(c, etiqueta) {
     mem_fijar_global(51, 0 - 1)                                // un salto puede llegar aquí
+    __guardar64(c + 544, posicion_codigo(c))
     // WebAssembly: cada etiqueta empieza un bloque y su "dirección" es el
     // número del bloque (ver gen_wasm.cfv).
     si (es_wasm(c)) {
@@ -761,6 +763,7 @@ funcion definir_etiqueta(c, etiqueta) {
 }
 
 funcion nuevo_arreglo(c, tipo, valor) {
+    __guardar64(c + 544, posicion_codigo(c))
     sea a = mem_reservar(24)
     __guardar64(a, posicion_codigo(c))
     __guardar64(a + 8, tipo)
@@ -1666,7 +1669,13 @@ funcion literal_caja(c, lexema) {
 // ── Expresiones (resultado en rax) ────────────────────────────────────────
 
 funcion empujar(c) { retornar op_empujar(c) }
-funcion rax_a_rcx_y_sacar(c) { op_mov(c, 1, 0) op_sacar(c, 0) retornar 0 }
+funcion rax_a_rcx_y_sacar(c) {
+    si (es_wasm(c) == 0 y es_arm64(c) == 0 y x64_mirilla_rcx(c)) { retornar 0 }
+    si (es_arm64(c) y a64_mirilla_rcx(c)) { retornar 0 }
+    op_mov(c, 1, 0)
+    op_sacar(c, 0)
+    retornar 0
+}
 
 funcion argumentos(c) {
     requerir(c, "(")
@@ -1689,6 +1698,17 @@ funcion argumentos(c) {
 funcion dos_argumentos(c) {
     sea n = argumentos(c)
     si (n != 2) { error_en(c, "se esperaban 2 argumentos") }
+    si (es_wasm(c) == 0 y es_arm64(c) == 0 y x64_tras_push(c, posicion_codigo(c) - 1)) {
+        // el segundo sigue en rax: sin apilarlo (y, si es simple, directo a rcx)
+        __guardar64(ctx_codigo(c), posicion_codigo(c) - 1)
+        __guardar64(c + 512, __cargar64(c + 552))
+        retornar rax_a_rcx_y_sacar(c)
+    }
+    si (es_arm64(c) y a64_tras_push(c, posicion_codigo(c) - 4)) {
+        __guardar64(ctx_codigo(c), posicion_codigo(c) - 4)
+        __guardar64(c + 512, __cargar64(c + 552))
+        retornar rax_a_rcx_y_sacar(c)
+    }
     op_sacar(c, 1)                                                  // pop rcx
     op_sacar(c, 0)                                                  // pop rax
     retornar 0
@@ -2604,8 +2624,49 @@ funcion literal_entero_grande(lexema) {
     retornar 1
 }
 
+// Cantidad de elementos de la lista literal que empieza aquí (tras "[").
+funcion contar_elementos_lista(c) {
+    sea tokens = __cargar64(c)
+    sea j = __cargar64(c + 8)
+    sea nivel = 0
+    sea n = 0
+    sea hay = 0
+    mientras (j < vec_largo(tokens)) {
+        sea t = vec_obtener(tokens, j)
+        si (__cargar64(t) == 5) { retornar 0 - 1 }
+        si (es_simbolo(t, "(") o es_simbolo(t, "[") o es_simbolo(t, "{")) {
+            nivel = nivel + 1
+            hay = 1
+        } sino si (es_simbolo(t, ")") o es_simbolo(t, "]") o es_simbolo(t, "}")) {
+            si (nivel == 0) { retornar n + hay }
+            nivel = nivel - 1
+        } sino si (nivel == 0 y es_simbolo(t, ",")) {
+            n = n + 1
+            hay = 0
+        } sino {
+            hay = 1
+        }
+        j = j + 1
+    }
+    retornar 0 - 1
+}
+
 // [a, b, ...] → lista del lenguaje.
 funcion lista_literal(c) {
+    // hasta 4 elementos: se evalúan y la lista sale del tamaño justo
+    sea k = contar_elementos_lista(c)
+    si (k >= 1 y k <= 4) {
+        sea i = 0
+        mientras (i < k) {
+            expresion(c)
+            empujar(c)
+            i = i + 1
+            si (i < k) { requerir(c, ",") } sino { tomar(c, ",") }
+        }
+        requerir(c, "]")
+        llamar_runtime(c, str_concatenar("dyn_lista_", str_desde_entero(k)), k)
+        retornar 0
+    }
     llamar_runtime(c, "dyn_lista_nueva", 0)
     empujar(c)
     si (ver(c, "]") == 0) {
@@ -4028,7 +4089,15 @@ funcion igualdad(c) {
             __guardar64(c + 392, tr)
             sea crudo = es_condicion_cruda(c)
             mem_fijar_global(46, crudo)
-            aplicar_operador(c, lex)
+            si (dinamico(c) y __cargar64(c + 8) == pos_der + 1 y str_igual(lexema_en(__cargar64(c), pos_der), "nulo")) {
+                // x == nulo / x != nulo: nulo es el 0, sin llamar al runtime
+                __guardar64(c + 376, 0)
+                op_sacar(c, 0)                                      // rax = x
+                si (str_igual(lex, "==")) { op_es_cero(c) } sino { op_no_cero(c) }
+                si (crudo == 0) { booleano_dinamico(c) }
+            } sino {
+                aplicar_operador(c, lex)
+            }
             mem_fijar_global(46, 0)
             __guardar64(c + 384, 0)
             __guardar64(c + 392, 0)
@@ -4044,8 +4113,38 @@ funcion igualdad(c) {
     retornar 0
 }
 
+// ¿La condición que empieza aquí (tras "(") no tiene "o" ni "?" afuera de
+// paréntesis? (entonces "a y b" puede saltar parte por parte)
+funcion condicion_sin_o(c) {
+    sea tokens = __cargar64(c)
+    sea j = __cargar64(c + 8)
+    sea nivel = 0
+    mientras (j < vec_largo(tokens)) {
+        sea t = vec_obtener(tokens, j)
+        si (__cargar64(t) == 5) { retornar 0 }
+        si (es_simbolo(t, "(") o es_simbolo(t, "[") o es_simbolo(t, "{")) { nivel = nivel + 1 }
+        si (es_simbolo(t, ")") o es_simbolo(t, "]") o es_simbolo(t, "}")) {
+            si (nivel == 0) { retornar 1 }
+            nivel = nivel - 1
+        }
+        si (nivel == 0) {
+            sea lx = __cargar64(t + 8)
+            si (str_igual(lx, "o") o str_igual(lx, "or") o str_igual(lx, "||") o str_igual(lx, "?")) { retornar 0 }
+        }
+        j = j + 1
+    }
+    retornar 0
+}
+
 // y / o con cortocircuito; el resultado se normaliza a booleano.
 funcion logica(c, operador, siguiente) {
+    // condición de si/mientras (modo nativo, sin "o"): salto directo al falso
+    si (operador == 1 y __cargar64(c + 568) >= 0 y mem_global(44) == __cargar64(c + 576)) {
+        condicion(c)
+        op_saltar_si_falso(c, __cargar64(c + 568))
+        igualdad(c)
+        retornar 0
+    }
     sea fin = nueva_etiqueta(c)
     condicion(c)
     si (operador == 1) { op_saltar_si_cero(c, fin) } sino { op_saltar_si_no_cero(c, fin) }
@@ -4503,9 +4602,17 @@ funcion sentencia(c) {
                 si (tipo_variable(c, cand) == 13) { estrechada = cand }
             }
         }
+        // Modo nativo, "a y b y …" sin "o": cada parte salta sola al sino.
+        sea falso_pre = 0 - 1
+        si (dinamico(c) == 0 y condicion_sin_o(c)) {
+            falso_pre = nueva_etiqueta(c)
+            __guardar64(c + 568, falso_pre)
+            __guardar64(c + 576, mem_global(44) + 1)
+        }
         mem_fijar_global(45, mem_global(44) + 1)
         expresion(c)
         mem_fijar_global(45, 0)
+        __guardar64(c + 568, 0 - 1)
         requerir(c, ")")
         // si (opcional) |v| { … }: v es el valor ya comprobado (*T).
         sea desempaque = 0
@@ -4520,8 +4627,9 @@ funcion sentencia(c) {
         }
         condicion(c)
         sea otro = nueva_etiqueta(c)
+        si (falso_pre >= 0) { otro = falso_pre }
         sea fin = nueva_etiqueta(c)
-        op_saltar_si_cero(c, otro)
+        op_saltar_si_falso(c, otro)
         sea marca_tipos = 0 - 1
         si (estrechada != 0 y __cargar64(c + 336) != 0) {
             marca_tipos = vec_largo(__cargar64(c + 336))
@@ -4543,12 +4651,17 @@ funcion sentencia(c) {
         sea fin = nueva_etiqueta(c)
         definir_etiqueta(c, inicio)
         requerir(c, "(")
+        si (dinamico(c) == 0 y condicion_sin_o(c)) {
+            __guardar64(c + 568, fin)
+            __guardar64(c + 576, mem_global(44) + 1)
+        }
         mem_fijar_global(45, mem_global(44) + 1)
         expresion(c)
         mem_fijar_global(45, 0)
+        __guardar64(c + 568, 0 - 1)
         requerir(c, ")")
         condicion(c)
-        op_saltar_si_cero(c, fin)
+        op_saltar_si_falso(c, fin)
         cuerpo_ciclo(c, fin, inicio)
         op_saltar(c, inicio)
         definir_etiqueta(c, fin)
