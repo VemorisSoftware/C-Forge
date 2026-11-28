@@ -20,6 +20,9 @@ Sitio oficial: [c-forge.org](https://c-forge.org)
   registros por uso, restos por potencias de dos sin dividir, llenado y
   reserva de una vez en ciclos con `agregar`. Criba de 2 M: ~55 → ~8 ms;
   ordenar 200 k: ~51 → ~4 ms.
+- **Recursión desenrollada un nivel:** en `retornar f(a) + f(b)` la llamada
+  que no es de cola se hace en línea con su propio ciclo: `fib(35)` ~60 →
+  ~48 ms.
 - **comptime con tope de 10 s:** si la evaluación al compilar no termina, el
   compilador da un error claro en vez de quedarse esperando.
 - **Regex:** tope de trabajo por llamada (error capturable) y el motor es
