@@ -14,6 +14,8 @@
 
 funcion op_empujar(c) {
     si (es_wasm(c)) { retornar w_empujar_reg(c, 0) }
+    __guardar64(c + 552, __cargar64(c + 512))                  // mirilla: el push anterior
+    __guardar64(c + 512, posicion_codigo(c))                   // y este push rax
     si (es_arm64(c)) { retornar a64_empujar_reg(c, 0) }
     retornar x64_empujar_reg(c, 0)
 }
@@ -24,8 +26,102 @@ funcion op_empujar_reg(c, r) {
 }
 funcion op_sacar(c, r) {
     si (es_wasm(c)) { retornar w_sacar(c, r) }
-    si (es_arm64(c)) { retornar a64_sacar(c, r) }
+    sea pos = posicion_codigo(c)
+    si (es_arm64(c)) {
+        // str x0, [x28, #-8]!; ldr xr, [x28], #8 → mov xr, x0 (o nada)
+        si (a64_tras_push(c, pos - 4)) {
+            __guardar64(ctx_codigo(c), pos - 4)
+            mem_fijar_global(51, 0 - 1)
+            __guardar64(c + 512, 0 - 1)
+            si (r != 0) { a64_mov_op(c, r, 0) }
+            retornar 0
+        }
+        retornar a64_sacar(c, r)
+    }
+    // push rax; pop r → mov r, rax (o nada)
+    si (r < 8 y x64_tras_push(c, pos - 1)) {
+        __guardar64(ctx_codigo(c), pos - 1)
+        mem_fijar_global(51, 0 - 1)
+        __guardar64(c + 512, 0 - 1)
+        si (r != 0) { x64_mov(c, r, 0) }
+        retornar 0
+    }
     retornar x64_sacar(c, r)
+}
+
+// Mirilla de x86-64: ¿hay un "push rax" en p, sin etiquetas ni arreglos
+// desde ahí? (c + 512: posición del último push rax · c + 544: última
+// etiqueta o arreglo)
+funcion x64_tras_push(c, p) {
+    si (p < 0 o __cargar64(c + 512) != p o __cargar64(c + 544) > p) { retornar 0 }
+    retornar str_byte(ctx_codigo(c), p) == 80
+}
+
+funcion a64_tras_push(c, p) {
+    si (p < 0 o __cargar64(c + 512) != p o __cargar64(c + 544) > p) { retornar 0 }
+    retornar a64_palabra(ctx_codigo(c), p) == 4162817920 + a64_r(0)
+}
+
+funcion a64_palabra(codigo, p) { retornar str_byte(codigo, p) + str_byte(codigo, p + 1) * 256 + str_byte(codigo, p + 2) * 65536 + str_byte(codigo, p + 3) * 16777216 }
+
+// ARM64: push x0; (mov x0, k | ldur x0, [x29, #d]); (mov x1, x0; pop x0)
+// → la misma carga a x1. Devuelve 1 si lo hizo.
+funcion a64_mirilla_rcx(c) {
+    sea pos = posicion_codigo(c)
+    sea p = __cargar64(c + 512)
+    si (a64_tras_push(c, p) == 0 o pos <= p + 4 o pos - p > 20 o (pos - p) % 4 != 0) { retornar 0 }
+    sea codigo = ctx_codigo(c)
+    sea palabras = vec_nuevo()
+    sea q = p + 4
+    mientras (q < pos) {
+        sea w = a64_palabra(codigo, q)
+        sea ok = 0
+        // movz / movn / movk x0, #k (con desplazamiento)
+        si (__y_bits(w, 4286578719) == 3531603968 o __y_bits(w, 4286578719) == 2457862144 o __y_bits(w, 4286578719) == 4068474880) { ok = 1 }
+        // ldur x0, [x29, #d]
+        si (__y_bits(w, 4292874239) == 4164944800 y pos - p == 8) { ok = 1 }
+        si (ok == 0) {
+            vec_liberar(palabras)
+            retornar 0
+        }
+        vec_agregar(palabras, w + 1)                            // destino x1
+        q = q + 4
+    }
+    __guardar64(codigo, p)
+    mem_fijar_global(51, 0 - 1)
+    __guardar64(c + 512, 0 - 1)
+    __guardar64(c + 520, 0 - 1)
+    sea i = 0
+    mientras (i < vec_largo(palabras)) {
+        a64(c, vec_obtener(palabras, i))
+        i = i + 1
+    }
+    vec_liberar(palabras)
+    retornar 1
+}
+
+// push rax; mov rax, X; (mov rcx, rax; pop rax) → mov rcx, X, si X es un
+// inmediato o una local (c + 520: dónde empieza · 528: 1 inmediato, 2 local
+// · 536: valor o desplazamiento). Devuelve 1 si lo hizo.
+funcion x64_mirilla_rcx(c) {
+    sea pos = posicion_codigo(c)
+    sea inicio = __cargar64(c + 520)
+    sea p = __cargar64(c + 512)
+    si (inicio != p + 1 o x64_tras_push(c, p) == 0) { retornar 0 }
+    sea tipo = __cargar64(c + 528)
+    sea v = __cargar64(c + 536)
+    sea codigo = ctx_codigo(c)
+    sea largo = 0
+    si (tipo == 1 y str_byte(codigo, inicio) == 72 y str_byte(codigo, inicio + 1) == 199 y str_byte(codigo, inicio + 2) == 192) { largo = 7 }
+    si (tipo == 1 y str_byte(codigo, inicio) == 72 y str_byte(codigo, inicio + 1) == 184) { largo = 10 }
+    si (tipo == 2 y str_byte(codigo, inicio) == 72 y str_byte(codigo, inicio + 1) == 139 y str_byte(codigo, inicio + 2) == 133) { largo = 7 }
+    si (largo == 0 o inicio + largo != pos) { retornar 0 }
+    __guardar64(codigo, p)
+    mem_fijar_global(51, 0 - 1)
+    __guardar64(c + 512, 0 - 1)
+    __guardar64(c + 520, 0 - 1)
+    si (tipo == 1) { op_constante_rcx(c, v) } sino { x64_cargar32(c, 1, 5, v) }
+    retornar 1
 }
 funcion op_mov(c, destino, origen) {
     si (es_wasm(c)) { retornar w_mov(c, destino, origen) }
@@ -35,6 +131,9 @@ funcion op_mov(c, destino, origen) {
 funcion op_inmediato(c, valor) {
     si (es_wasm(c)) { retornar w_inmediato(c, valor) }
     si (es_arm64(c)) { retornar a64_inmediato(c, valor) }
+    __guardar64(c + 520, posicion_codigo(c))
+    __guardar64(c + 528, 1)
+    __guardar64(c + 536, valor)
     retornar x64_inmediato(c, valor)
 }
 
@@ -46,6 +145,11 @@ funcion op_cargar(c, destino, base, d) {
 funcion op_cargar32(c, destino, base, d) {
     si (es_wasm(c)) { retornar w_cargar(c, destino, base, d) }
     si (es_arm64(c)) { retornar a64_cargar(c, destino, base, d) }
+    si (destino == 0 y base == 5) {
+        __guardar64(c + 520, posicion_codigo(c))
+        __guardar64(c + 528, 2)
+        __guardar64(c + 536, d)
+    }
     retornar x64_cargar32(c, destino, base, d)
 }
 funcion op_guardar(c, base, d, origen) {
@@ -285,6 +389,43 @@ funcion op_saltar_si_cero(c, etiqueta) {
     si (es_arm64(c)) { retornar a64_saltar_si(c, 1, etiqueta) }
     retornar x64_saltar_si(c, 1, etiqueta)
 }
+// Condición de si/mientras (el valor ya no se usa): tras una comparación,
+// cmp + salto directo, sin pasar por 0/1.
+funcion op_saltar_si_falso(c, etiqueta) {
+    si (es_wasm(c)) { retornar op_saltar_si_cero(c, etiqueta) }
+    si (es_arm64(c)) {
+        // cmp x0, x1; cset x0, cc → b.(no cc)
+        sea pa = posicion_codigo(c)
+        sea ca = ctx_codigo(c)
+        si (pa >= 8 y __cargar64(c + 544) <= pa - 8 y a64_palabra(ca, pa - 8) == 3942711327 y __y_bits(a64_palabra(ca, pa - 4), 4294905855) == 2594113504) {
+            sea no_cc = __y_bits(__desplazar_der(a64_palabra(ca, pa - 4), 12), 15)
+            __guardar64(ca, pa - 4)
+            mem_fijar_global(51, 0 - 1)
+            a64_arreglo(c, 11, etiqueta)
+            retornar a64(c, 1409286144 + no_cc)
+        }
+        retornar op_saltar_si_cero(c, etiqueta)
+    }
+    sea pos = posicion_codigo(c)
+    sea k = pos - 9
+    sea codigo = ctx_codigo(c)
+    // cmp rax, imm32 (6 bytes) en vez de cmp rax, rcx (3)
+    sea cmp_inm = pos >= 12 y str_byte(codigo, pos - 12) == 72 y str_byte(codigo, pos - 11) == 61
+    si (cmp_inm) { k = pos - 12 }
+    sea ok_cmp = cmp_inm o (k >= 0 y str_byte(codigo, k) == 72 y str_byte(codigo, k + 1) == 57 y str_byte(codigo, k + 2) == 200)
+    si (k >= 0 y ok_cmp y __cargar64(c + 544) <= k y str_byte(codigo, pos - 6) == 15 y str_byte(codigo, pos - 4) == 192 y str_byte(codigo, pos - 3) == 15 y str_byte(codigo, pos - 2) == 182 y str_byte(codigo, pos - 1) == 192) {
+        sea cc = str_byte(codigo, pos - 5)
+        si (cc >= 144 y cc <= 159) {
+            __guardar64(codigo, pos - 6)                       // queda el cmp
+            mem_fijar_global(51, 0 - 1)
+            e2(c, 15, __xo_bits(cc, 1) - 16)                   // j(no cc) etiqueta
+            nuevo_arreglo(c, 0, etiqueta)
+            retornar 0
+        }
+    }
+    retornar x64_saltar_si(c, 1, etiqueta)
+}
+
 funcion op_saltar_si_no_cero(c, etiqueta) {
     si (es_wasm(c)) { retornar w_saltar_si(c, 0, etiqueta) }
     si (es_arm64(c)) { retornar a64_saltar_si(c, 0, etiqueta) }
