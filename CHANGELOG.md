@@ -23,6 +23,11 @@ Sitio oficial: [c-forge.org](https://c-forge.org)
 - **Recursión desenrollada un nivel:** en `retornar f(a) + f(b)` la llamada
   que no es de cola se hace en línea con su propio ciclo: `fib(35)` ~60 →
   ~48 ms.
+- **Modo turbo con `/`:** división exacta en registros (si no es exacta,
+  el decimal de siempre). Además: elección sin salto (`cmov`/`csel`) en
+  `si (c) { x = A } sino { x = B }`, `x·3 + k` con `lea`, pruebas de
+  bits para `x % 2^k == 0`. Collatz de 2 M: 5,2 s → 0,35 s.
+- **Listas crudas del modo turbo sin recorrer por el recolector.**
 - **ordenar reusa su búfer auxiliar** entre llamadas (sin volver a pedir
   memoria al sistema).
 - **Modo turbo en ARM64:** el mismo modo turbo (registros, listas,

@@ -7014,14 +7014,15 @@ funcion tb_primario(p) {
 funcion tb_producto(p) {
     sea c = __cargar64(p)
     sea e = tb_primario(p)
-    mientras (tb_fallo(p) == 0 y (ver(c, "*") o ver(c, "%"))) {
+    mientras (tb_fallo(p) == 0 y (ver(c, "*") o ver(c, "%") o ver(c, "/"))) {
         sea op = 3
         si (ver(c, "%")) { op = 5 }
+        // "/" da decimal si no es exacta: en turbo, división exacta o se
+        // repite con la forma dinámica.
+        si (ver(c, "/")) { op = 4 }
         avanzar(c)
         e = tb_nodo(3, op, e, tb_primario(p))
     }
-    // "/" da decimal en el lenguaje: no es turbo.
-    si (ver(c, "/")) { retornar tb_fallar(p) }
     retornar e
 }
 
@@ -7190,6 +7191,7 @@ funcion tb_sentencia(p) {
             si (str_igual(siguiente, "-")) { op = 2 }
             si (str_igual(siguiente, "*")) { op = 3 }
             si (str_igual(siguiente, "%")) { op = 5 }
+            si (str_igual(siguiente, "/")) { op = 4 }
         }
         si (op != 0) {
             avanzar(c)
@@ -7600,6 +7602,12 @@ funcion tba_memoria(c, op, r, d) {
 // Salto condicional con los códigos de x86 (jo jno jc jae je jne ja jl jge
 // jle jg); b.cond directo (±1 MiB: los saltos quedan dentro de la función).
 funcion tba_jcc(c, cc, etiqueta) {
+    sea cond = tba_cond(c, cc)
+    a64_arreglo(c, 11, etiqueta)
+    retornar a64(c, 1409286144 + cond)                             // b.cond
+}
+
+funcion tba_cond(c, cc) {
     sea cond = 0 - 1
     si (cc == 0) { cond = 6 }
     si (cc == 1) { cond = 7 }
@@ -7614,8 +7622,7 @@ funcion tba_jcc(c, cc, etiqueta) {
     si (cc == 14) { cond = 13 }
     si (cc == 15) { cond = 12 }
     si (cond < 0) { rt_panico("turbo arm64: salto sin traducir") }
-    a64_arreglo(c, 11, etiqueta)
-    retornar a64(c, 1409286144 + cond)                             // b.cond
+    retornar cond
 }
 
 // [base + índice·ancho] (físicos)
@@ -8472,6 +8479,15 @@ funcion tb_expr(g, e, d) {
     sea op = __cargar64(e + 8)
     sea izq = __cargar64(e + 16)
     sea der = __cargar64(e + 24)
+    // k + x / k · x: el literal a la derecha (forma con inmediato)
+    si ((op == 1 o op == 3) y __cargar64(izq) == 1 y __cargar64(der) != 1) {
+        sea t2 = izq
+        izq = der
+        der = t2
+    }
+    // x·c (+ k) con x >= 0 y c en {3, 5, 9}: una prueba de cota fuera de la
+    // cadena de dependencias y lea (sin imul)
+    si (tb_lea_posible(g, op, izq, der)) { retornar tb_lea_mul(g, op, izq, der, d) }
     // p - c sin desborde con p en un registro: lea r, [p - c]
     si (op == 2 y __cargar64(der) == 1 y __cargar64(der + 8) >= 0 y __cargar64(der + 8) < 128 y tb_acotado(g, izq)) {
         sea x = tb_operando(g, izq)
@@ -8490,6 +8506,18 @@ funcion tb_expr(g, e, d) {
     }
     tb_expr(g, izq, d)
     sea literal = __cargar64(der) == 1 y tb_cabe32(__cargar64(der + 8))
+    si (op == 4) {
+        si (__cargar64(der) == 1 y tb_division_sabida(g, izq, __cargar64(der + 8))) {
+            // exacta: solo el corrimiento
+            sea k = potencia_de_dos(__cargar64(der + 8))
+            si (es_arm64(c)) { retornar a64(c, 2470509568 + k * 65536 + tba_f(r) * 33) }
+            tb_rex(c, 0, r)
+            e2(c, 193, 248 + __y_bits(r, 7))
+            e1(c, k)
+            retornar 0
+        }
+        retornar tb_division(g, der, d)
+    }
     si (op == 5) {
         __guardar64(g + 256, (__cargar64(izq) == 2 y __cargar64(g + 240) != 0 y str_igual(__cargar64(izq + 8), __cargar64(g + 240))) o tb_nn_expr(g, izq))
         retornar tb_resto(g, der, d, __cargar64(der) == 1 y (literal o potencia_de_dos(__cargar64(der + 8)) > 0))
@@ -8518,6 +8546,254 @@ funcion tb_expr(g, e, d) {
         si (op == 3) { tb_imul(c, r, s) }
     }
     tb_jcc(c, 0, __cargar64(g + 24))                              // jo desborde
+    retornar 0
+}
+
+// si (cond) { x = A } sino { x = B } con x en registro y A, B sin llamadas
+// ni listas: se calculan los dos y se elige con cmov / csel (sin salto que
+// adivinar). A se calcula como si cond fuera cierta (p. ej. x / 2 exacta
+// tras x % 2 == 0); si cond es falsa ese valor se descarta. Si A o B se
+// salen de i64, se repite con la dinámica (correcto, solo más lento).
+funcion tb_sin_saltos(g, s) {
+    sea c = __cargar64(g)
+    sea v1 = __cargar64(s + 16)
+    sea v2 = __cargar64(s + 24)
+    si (v2 == 0 o vec_largo(v1) != 1 o vec_largo(v2) != 1) { retornar 0 }
+    sea a1 = vec_obtener(v1, 0)
+    sea a2 = vec_obtener(v2, 0)
+    si (__cargar64(a1) != 21 o __cargar64(a2) != 21 o str_igual(__cargar64(a1 + 8), __cargar64(a2 + 8)) == 0) { retornar 0 }
+    sea x = __cargar64(a1 + 8)
+    sea k = tb_variable(g, x)
+    si (k >= 4) { retornar 0 }
+    sea ea = __cargar64(a1 + 16)
+    sea eb = __cargar64(a2 + 16)
+    si (tb_llama_expr(ea) o tb_llama_expr(eb) o tb_lee_lista(ea) o tb_lee_lista(eb)) { retornar 0 }
+    sea cond = __cargar64(s + 8)
+    si (__cargar64(cond) != 10) { retornar 0 }
+    si (tb_necesita(ea) > 5 o tb_necesita(eb) > 5) { retornar 0 }
+    // A (con lo que cond deja saber) en trabajo 1, B en trabajo 0
+    sea div_viejo = __cargar64(g + 312)
+    sea kdiv_viejo = __cargar64(g + 320)
+    sea kd = tb_resto_cero(cond)
+    si (kd > 0) {
+        __guardar64(g + 312, __cargar64(__cargar64(__cargar64(cond + 16) + 16) + 8))
+        __guardar64(g + 320, kd)
+    }
+    tb_expr(g, ea, 1)
+    __guardar64(g + 312, div_viejo)
+    __guardar64(g + 320, kdiv_viejo)
+    tb_expr(g, eb, 0)
+    sea cc = tb_cond_banderas(g, cond, 2)
+    sea h = tb_hogar(k)
+    tb_mov(c, h, tb_trabajo(0))
+    tb_cmov(c, cc, h, tb_trabajo(1))
+    si (__cargar64(g + 312) != 0 y str_igual(__cargar64(g + 312), x)) { __guardar64(g + 312, 0) }
+    retornar 1
+}
+
+funcion tb_lee_lista(e) {
+    sea t = __cargar64(e)
+    si (t == 32 o t == 35) { retornar 1 }
+    si (t == 3 o t == 10 o t == 11 o t == 12) { retornar tb_lee_lista(__cargar64(e + 16)) o tb_lee_lista(__cargar64(e + 24)) }
+    si (t == 13) { retornar tb_lee_lista(__cargar64(e + 16)) }
+    si (t == 4) { retornar tb_lee_lista(__cargar64(e + 8)) }
+    retornar 0
+}
+
+// Compara (t == 10) usando trabajo d en adelante y devuelve el código de
+// condición (x86) que vale cuando cond es cierta.
+funcion tb_cond_banderas(g, e, d) {
+    sea c = __cargar64(g)
+    sea cc = __cargar64(e + 8)
+    sea izq = __cargar64(e + 16)
+    sea der = __cargar64(e + 24)
+    si ((cc == 4 o cc == 5) y __cargar64(der) == 1 y __cargar64(der + 8) == 0 y __cargar64(izq) == 3 y __cargar64(izq + 8) == 5 y __cargar64(__cargar64(izq + 24)) == 1) {
+        sea k = potencia_de_dos(__cargar64(__cargar64(izq + 24) + 8))
+        si (k >= 1 y k <= 30 y tb_nn_expr(g, __cargar64(izq + 16))) {
+            sea x = tb_fuente(g, __cargar64(izq + 16), d)
+            si (es_arm64(c)) {
+                a64(c, 4064280576 + (k - 1) * 1024 + tba_f(x) * 32 + 31)
+                __guardar64(c + 504, 0)
+            } sino {
+                tb_rex(c, 0, x)
+                e2(c, 247, 192 + __y_bits(x, 7))
+                e32(c, __desplazar_izq(1, k) - 1)
+            }
+            retornar cc
+        }
+    }
+    sea a = tb_fuente(g, izq, d)
+    si (__cargar64(der) == 1 y __cargar64(der + 8) == 0) {
+        tb_rr(c, 133, a, a)
+    } sino si (__cargar64(der) == 1 y tb_cabe32(__cargar64(der + 8))) {
+        tb_op_inm(c, 7, a, __cargar64(der + 8))
+    } sino {
+        tb_rr(c, 57, a, tb_fuente(g, der, d + 1))
+    }
+    retornar cc
+}
+
+// dst ← src si cc (códigos de x86)
+funcion tb_cmov(c, cc, dst, src) {
+    si (es_arm64(c)) {
+        sea d = tba_f(dst)
+        retornar a64(c, 2592079872 + d * 65536 + tba_cond(c, cc) * 4096 + tba_f(src) * 32 + d)   // csel d, src, d, cond
+    }
+    tb_rex(c, dst, src)
+    e2(c, 15, 64 + cc)
+    e1(c, 192 + __y_bits(dst, 7) * 8 + __y_bits(src, 7))
+    retornar 0
+}
+
+funcion tb_lea_partes(op, izq, der) {
+    // devuelve el nodo del producto x·c (o 0)
+    si (op == 3 y __cargar64(der) == 1) { retornar 1 }
+    si (op == 1 y __cargar64(der) == 1 y __cargar64(izq) == 3 y __cargar64(izq + 8) == 3 y __cargar64(__cargar64(izq + 24)) == 1) { retornar 2 }
+    retornar 0
+}
+
+funcion tb_lea_posible(g, op, izq, der) {
+    sea forma = tb_lea_partes(op, izq, der)
+    si (forma == 0) { retornar 0 }
+    sea x = izq
+    sea m = __cargar64(der + 8)
+    sea k = 0
+    si (forma == 2) {
+        x = __cargar64(izq + 16)
+        m = __cargar64(__cargar64(izq + 24) + 8)
+        k = __cargar64(der + 8)
+    }
+    si (m != 3 y m != 5 y m != 9) { retornar 0 }
+    si (k < 0 o k > 1000000) { retornar 0 }
+    si (tb_operando(g, x) < 0) { retornar 0 }
+    retornar tb_nn_expr(g, x)
+}
+
+funcion tb_lea_mul(g, op, izq, der, d) {
+    sea c = __cargar64(g)
+    sea r = tb_trabajo(d)
+    sea x = izq
+    sea m = __cargar64(der + 8)
+    sea k = 0
+    si (tb_lea_partes(op, izq, der) == 2) {
+        x = __cargar64(izq + 16)
+        m = __cargar64(__cargar64(izq + 24) + 8)
+        k = __cargar64(der + 8)
+    }
+    sea rx = tb_operando(g, x)
+    sea s = 1
+    si (m == 5) { s = 2 }
+    si (m == 9) { s = 3 }
+    // x <= (2^63 − 1 − k) / m
+    tb_inmediato(c, 0, (9223372036854775807 - k) / m)
+    tb_rr(c, 57, rx, 0)                                            // cmp x, cota
+    tb_jcc(c, 15, __cargar64(g + 24))                              // jg: repetir
+    si (es_arm64(c)) {
+        sea fx = tba_f(rx)
+        sea fr = tba_f(r)
+        a64(c, 2332033024 + fx * 65536 + s * 1024 + fx * 32 + fr)  // add r, x, x, lsl #s
+        si (k > 0) { a64_sumar_inm(c, fr, fr, k) }
+        retornar 0
+    }
+    sea rex = 72
+    si (r >= 8) { rex = rex + 4 }
+    si (rx >= 8) { rex = rex + 3 }
+    sea modo = 0
+    si (k > 0 o __y_bits(rx, 7) == 5) { modo = 64 }
+    si (k > 127) { modo = 128 }
+    e3(c, rex, 141, modo + __y_bits(r, 7) * 8 + 4)                 // lea r, [x + x·(m − 1) + k]
+    e1(c, s * 64 + __y_bits(rx, 7) * 8 + __y_bits(rx, 7))
+    si (modo == 64) { e1(c, k) }
+    si (modo == 128) { e32(c, k) }
+    retornar 0
+}
+
+// cond = (x % 2^k == 0) con x variable: k; si no, 0.
+funcion tb_resto_cero(cond) {
+    si (__cargar64(cond) != 10 o __cargar64(cond + 8) != 4) { retornar 0 }
+    sea izq = __cargar64(cond + 16)
+    sea der = __cargar64(cond + 24)
+    si (__cargar64(der) != 1 o __cargar64(der + 8) != 0) { retornar 0 }
+    si (__cargar64(izq) != 3 o __cargar64(izq + 8) != 5) { retornar 0 }
+    sea x = __cargar64(izq + 16)
+    sea m = __cargar64(izq + 24)
+    si (__cargar64(x) != 2 o __cargar64(m) != 1) { retornar 0 }
+    sea k = potencia_de_dos(__cargar64(m + 8))
+    si (k < 1 o k > 30) { retornar 0 }
+    retornar k
+}
+
+// ¿x / v es exacta por lo que ya se probó?
+funcion tb_division_sabida(g, izq, v) {
+    retornar __cargar64(g + 312) != 0 y __cargar64(izq) == 2 y str_igual(__cargar64(izq + 8), __cargar64(g + 312)) y potencia_de_dos(v) >= 1 y potencia_de_dos(v) <= __cargar64(g + 320)
+}
+
+// x / y exacta (izq ya en el registro d): si no es exacta, o y es 0, se
+// repite con la forma dinámica (que da el decimal o el error).
+funcion tb_division(g, der, d) {
+    sea c = __cargar64(g)
+    sea r = tb_trabajo(d)
+    sea a = es_arm64(c)
+    si (__cargar64(der) == 1 y tb_cabe32(__cargar64(der + 8))) {
+        sea v = __cargar64(der + 8)
+        si (v == 0) {
+            op_saltar(c, __cargar64(g + 32))
+            retornar 0
+        }
+        si (v == 1) { retornar 0 }
+        sea k = potencia_de_dos(v)
+        si (k >= 1 y k <= 30) {
+            // exacta si los k bits bajos son 0; luego un corrimiento
+            si (a) {
+                a64(c, 4064280576 + (k - 1) * 1024 + tba_f(r) * 32 + 31)          // tst r, #(2^k − 1)
+                tba_jcc(c, 5, __cargar64(g + 24))
+                retornar a64(c, 2470509568 + k * 65536 + tba_f(r) * 33)          // asr r, r, #k
+            }
+            tb_mov(c, 0, r)
+            tb_op_inm(c, 4, 0, v - 1)                                          // and rax, 2^k − 1
+            tb_jcc(c, 5, __cargar64(g + 24))
+            tb_rex(c, 0, r)
+            e2(c, 193, 248 + __y_bits(r, 7))                                   // sar r, k
+            e1(c, k)
+            retornar 0
+        }
+        tb_inmediato(c, tb_trabajo(d + 1), v)
+    } sino {
+        tb_expr(g, der, d + 1)
+    }
+    sea s = tb_trabajo(d + 1)
+    tb_rr(c, 133, s, s)
+    tb_jcc(c, 4, __cargar64(g + 32))                               // / 0: repetir
+    sea normal = nueva_etiqueta(c)
+    sea fin = nueva_etiqueta(c)
+    tb_op_inm(c, 7, s, 0 - 1)
+    tb_jcc(c, 5, normal)
+    // x / -1 = -x (el mínimo se desborda)
+    si (a) { a64(c, 3942646752 + tba_f(r) * 65537) } sino {
+        tb_rex(c, 0, r)
+        e2(c, 247, 216 + __y_bits(r, 7))                          // neg r
+    }
+    tb_jcc(c, 0, __cargar64(g + 24))
+    op_saltar(c, fin)
+    definir_etiqueta(c, normal)
+    si (a) {
+        sea x = tba_f(r)
+        sea y = tba_f(s)
+        a64(c, 2596277248 + y * 65536 + x * 32 + 16)                // sdiv x16, x, y
+        a64(c, 2600501248 + y * 65536 + x * 1024 + 16 * 32 + 17)    // msub x17, x16, y, x
+        a64(c, 4043309056 + 17 * 32 + 31)                          // cmp x17, #0
+        tba_jcc(c, 5, __cargar64(g + 24))
+        a64_mov(c, x, 16)
+    } sino {
+        tb_mov(c, 0, r)
+        e2(c, 72, 153)                                             // cqo
+        tb_rex(c, 0, s)
+        e2(c, 247, 248 + __y_bits(s, 7))                           // idiv s
+        tb_rr(c, 133, 2, 2)                                        // test rdx, rdx
+        tb_jcc(c, 5, __cargar64(g + 24))                           // no exacta: repetir
+        tb_mov(c, r, 0)
+    }
+    definir_etiqueta(c, fin)
     retornar 0
 }
 
@@ -8759,8 +9035,29 @@ funcion tb_cond(g, e, etiqueta, sentido) {
     sea cc = __cargar64(e + 8)
     sea izq = __cargar64(e + 16)
     sea der = __cargar64(e + 24)
+    si (sentido == 0) { cc = __xo_bits(cc, 1) }
+    // x % 2^k == 0 / != 0 con x >= 0: probar los bits bajos
+    si ((cc == 4 o cc == 5) y __cargar64(der) == 1 y __cargar64(der + 8) == 0 y __cargar64(izq) == 3 y __cargar64(izq + 8) == 5 y __cargar64(__cargar64(izq + 24)) == 1) {
+        sea k = potencia_de_dos(__cargar64(__cargar64(izq + 24) + 8))
+        si (k >= 1 y k <= 30 y tb_nn_expr(g, __cargar64(izq + 16))) {
+            sea x = tb_fuente(g, __cargar64(izq + 16), 0)
+            si (es_arm64(c)) {
+                a64(c, 4064280576 + (k - 1) * 1024 + tba_f(x) * 32 + 31)      // tst x, #(2^k − 1)
+                __guardar64(c + 504, 0)
+            } sino {
+                tb_rex(c, 0, x)
+                e2(c, 247, 192 + __y_bits(x, 7))                           // test x, imm32
+                e32(c, __desplazar_izq(1, k) - 1)
+            }
+            tb_jcc(c, cc, etiqueta)
+            retornar 0
+        }
+    }
+    si (sentido == 0) { cc = __xo_bits(cc, 1) }
     sea a = tb_fuente(g, izq, 0)
-    si (__cargar64(der) == 1 y tb_cabe32(__cargar64(der + 8))) {
+    si (__cargar64(der) == 1 y __cargar64(der + 8) == 0) {
+        tb_rr(c, 133, a, a)                                        // test a, a
+    } sino si (__cargar64(der) == 1 y tb_cabe32(__cargar64(der + 8))) {
         tb_op_inm(c, 7, a, __cargar64(der + 8))
     } sino {
         tb_rr(c, 57, a, tb_fuente(g, der, 1))
@@ -8813,6 +9110,63 @@ funcion tb_bloque_gen(g, v) {
     __guardar64(g + 200, 0)
     __guardar64(g + 224, 0)
     __guardar64(nombres, marca)
+    retornar 0
+}
+
+// x = e (sentencia 21).
+funcion tb_asignar(g, s) {
+    sea c = __cargar64(g)
+    sea k = tb_variable(g, __cargar64(s + 8))
+    sea e = __cargar64(s + 16)
+    // x = x / 2^k con x en registro: en el sitio (revisando si es exacta,
+    // salvo que ya se sepa)
+    si (k < 4 y __cargar64(e) == 3 y __cargar64(e + 8) == 4 y __cargar64(__cargar64(e + 16)) == 2 y str_igual(__cargar64(__cargar64(e + 16) + 8), __cargar64(s + 8)) y __cargar64(__cargar64(e + 24)) == 1) {
+        sea v = __cargar64(__cargar64(e + 24) + 8)
+        sea kk = potencia_de_dos(v)
+        si (kk >= 1 y kk <= 30) {
+            sea h = tb_hogar(k)
+            si (tb_division_sabida(g, __cargar64(e + 16), v) == 0) {
+                si (es_arm64(c)) {
+                    a64(c, 4064280576 + (kk - 1) * 1024 + tba_f(h) * 32 + 31)
+                    __guardar64(c + 504, 0)
+                } sino {
+                    tb_rex(c, 0, h)
+                    e2(c, 247, 192 + __y_bits(h, 7))
+                    e32(c, v - 1)
+                }
+                tb_jcc(c, 5, __cargar64(g + 24))
+            }
+            si (es_arm64(c)) { retornar a64(c, 2470509568 + kk * 65536 + tba_f(h) * 33) }
+            tb_rex(c, 0, h)
+            e2(c, 193, 248 + __y_bits(h, 7))
+            e1(c, kk)
+            retornar 0
+        }
+    }
+    // x = x + k / x = x - k con x en registro: una sola instrucción
+    si (k < 4 y __cargar64(e) == 3 y (__cargar64(e + 8) == 1 o __cargar64(e + 8) == 2) y __cargar64(__cargar64(e + 16)) == 2 y str_igual(__cargar64(__cargar64(e + 16) + 8), __cargar64(s + 8)) y __cargar64(__cargar64(e + 24)) == 1 y tb_cabe32(__cargar64(__cargar64(e + 24) + 8))) {
+        sea ext = 0
+        si (__cargar64(e + 8) == 2) { ext = 5 }
+        tb_op_inm(c, ext, tb_hogar(k), __cargar64(__cargar64(e + 24) + 8))
+        sea seguro = ext == 0 y ((__cargar64(__cargar64(e + 24) + 8) == 1 y __cargar64(g + 248) != 0 y str_igual(__cargar64(g + 248), __cargar64(s + 8))) o (__cargar64(__cargar64(e + 24) + 8) >= 0 y tb_paso_probado(g, __cargar64(s + 8))))
+        si (seguro == 0) { tb_jcc(c, 0, __cargar64(g + 24)) }
+        retornar 0
+    }
+    // x = x + E / x - E / x * E con x en registro: se opera en el sitio.
+    si (k < 4 y __cargar64(e) == 3 y __cargar64(e + 8) != 5 y __cargar64(e + 8) != 4 y __cargar64(__cargar64(e + 16)) == 2 y str_igual(__cargar64(__cargar64(e + 16) + 8), __cargar64(s + 8)) y tb_usa(__cargar64(e + 24), __cargar64(s + 8)) == 0) {
+        sea h = tb_hogar(k)
+        sea fuente = tb_fuente(g, __cargar64(e + 24), 0)
+        sea op = __cargar64(e + 8)
+        si (op == 1) { tb_rr(c, 1, h, fuente) }
+        si (op == 2) { tb_rr(c, 41, h, fuente) }
+        si (op == 3) { tb_imul(c, h, fuente) }
+        // paso de un ciclo probado: x <= E < 2^28 y el paso < 2^31
+        si ((op == 1 y tb_paso_probado(g, __cargar64(s + 8))) == 0) { tb_jcc(c, 0, __cargar64(g + 24)) }
+        retornar 0
+    }
+    tb_expr(g, e, 0)
+    tb_guardar_var(c, k, tb_trabajo(0))
+    retornar 0
     retornar 0
 }
 
@@ -8889,37 +9243,28 @@ funcion tb_sentencia_gen(g, s) {
         retornar 0
     }
     si (t == 21) {
-        sea k = tb_variable(g, __cargar64(s + 8))
-        sea e = __cargar64(s + 16)
-        // x = x + k / x = x - k con x en registro: una sola instrucción
-        si (k < 4 y __cargar64(e) == 3 y (__cargar64(e + 8) == 1 o __cargar64(e + 8) == 2) y __cargar64(__cargar64(e + 16)) == 2 y str_igual(__cargar64(__cargar64(e + 16) + 8), __cargar64(s + 8)) y __cargar64(__cargar64(e + 24)) == 1 y tb_cabe32(__cargar64(__cargar64(e + 24) + 8))) {
-            sea ext = 0
-            si (__cargar64(e + 8) == 2) { ext = 5 }
-            tb_op_inm(c, ext, tb_hogar(k), __cargar64(__cargar64(e + 24) + 8))
-            sea seguro = ext == 0 y ((__cargar64(__cargar64(e + 24) + 8) == 1 y __cargar64(g + 248) != 0 y str_igual(__cargar64(g + 248), __cargar64(s + 8))) o (__cargar64(__cargar64(e + 24) + 8) >= 0 y tb_paso_probado(g, __cargar64(s + 8))))
-            si (seguro == 0) { tb_jcc(c, 0, __cargar64(g + 24)) }
-            retornar 0
-        }
-        // x = x + E / x - E / x * E con x en registro: se opera en el sitio.
-        si (k < 4 y __cargar64(e) == 3 y __cargar64(e + 8) != 5 y __cargar64(__cargar64(e + 16)) == 2 y str_igual(__cargar64(__cargar64(e + 16) + 8), __cargar64(s + 8)) y tb_usa(__cargar64(e + 24), __cargar64(s + 8)) == 0) {
-            sea h = tb_hogar(k)
-            sea fuente = tb_fuente(g, __cargar64(e + 24), 0)
-            sea op = __cargar64(e + 8)
-            si (op == 1) { tb_rr(c, 1, h, fuente) }
-            si (op == 2) { tb_rr(c, 41, h, fuente) }
-            si (op == 3) { tb_imul(c, h, fuente) }
-            // paso de un ciclo probado: x <= E < 2^28 y el paso < 2^31
-            si ((op == 1 y tb_paso_probado(g, __cargar64(s + 8))) == 0) { tb_jcc(c, 0, __cargar64(g + 24)) }
-            retornar 0
-        }
-        tb_expr(g, e, 0)
-        tb_guardar_var(c, k, tb_trabajo(0))
+        tb_asignar(g, s)
+        // x cambió: ya no vale lo que se sabía de su divisibilidad
+        si (__cargar64(g + 312) != 0 y str_igual(__cargar64(g + 312), __cargar64(s + 8))) { __guardar64(g + 312, 0) }
         retornar 0
     }
+    si (t == 22 y tb_sin_saltos(g, s)) { retornar 0 }
     si (t == 22) {
         sea otro = nueva_etiqueta(c)
         tb_cond(g, __cargar64(s + 8), otro, 0)
+        // si (x % 2^k == 0) { … }: dentro, x / 2^k es exacta (hasta que x cambie)
+        sea div_viejo = __cargar64(g + 312)
+        sea kdiv_viejo = __cargar64(g + 320)
+        sea kd = tb_resto_cero(__cargar64(s + 8))
+        si (kd > 0) {
+            __guardar64(g + 312, __cargar64(__cargar64(__cargar64(__cargar64(s + 8) + 16) + 16) + 8))
+            __guardar64(g + 320, kd)
+        }
         tb_bloque_gen(g, __cargar64(s + 16))
+        si (kd > 0) {
+            __guardar64(g + 312, div_viejo)
+            __guardar64(g + 320, kdiv_viejo)
+        }
         si (__cargar64(s + 24) != 0) {
             sea fin = nueva_etiqueta(c)
             op_saltar(c, fin)
@@ -9318,7 +9663,7 @@ funcion tb_nn_expr(g, e) {
     si (t == 2) { retornar __cargar64(g + 288) != 0 y tb_declarada(__cargar64(g + 288), __cargar64(e + 8)) }
     si (t == 3) {
         sea op = __cargar64(e + 8)
-        si (op == 1 o op == 3) { retornar tb_nn_expr(g, __cargar64(e + 16)) y tb_nn_expr(g, __cargar64(e + 24)) }
+        si (op == 1 o op == 3 o op == 4) { retornar tb_nn_expr(g, __cargar64(e + 16)) y tb_nn_expr(g, __cargar64(e + 24)) }
         si (op == 5) { retornar tb_nn_expr(g, __cargar64(e + 16)) }
         retornar 0
     }
@@ -10205,8 +10550,8 @@ funcion tb_emitir_turbo(c, e, normal, dinamica, inicio) {
     }
 
     // 3) Entrada cruda.
-    sea g = mem_reservar(312)
-    mem_llenar(g, 0, 312)
+    sea g = mem_reservar(328)
+    mem_llenar(g, 0, 328)
     __guardar64(g, c)
     __guardar64(g + 8, vec_nuevo())
     __guardar64(g + 16, nueva_etiqueta(c))                           // salida (rdx ya fijado)
