@@ -144,7 +144,13 @@ forma normal y da el entero grande o el error de siempre. Además:
 `retornar f(a) + f(b)` (la misma función) se convierte en un ciclo con
 acumulador (la mitad de las llamadas, y `retornar f(n - 1) + x` ya no gasta
 pila), y si la función empieza con `si (guarda) { retornar E }`, cada
-llamada prueba la guarda antes de llamar. En ARM64 y WebAssembly, por
+llamada prueba la guarda antes de llamar. Los parámetros sin tipo se tratan
+igual (se supone que llegan enteros y, si no, se repite con la forma
+normal), y también las funciones anónimas. Una lista creada dentro de la
+función (`[]`, `lista_repetir`, `ordenar`) que no sale de ella se guarda
+como enteros sin etiqueta —o bytes, si todo lo que se escribe son
+constantes 0..255—, con lectura, escritura, `agregar` y `longitud` en
+línea; `ordenar` usa radix en código nativo. En ARM64 y WebAssembly, por
 ahora, se compila de la forma normal. `CFORGE_TURBO=0` lo desactiva.
 
 ### 3.3 Opcionales y punteros seguros ✅

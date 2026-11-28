@@ -57,8 +57,8 @@
 funcion ctx_nuevo(tokens) {
     mem_fijar_global(44, 0)                                    // nivel de anidamiento
     mem_fijar_global(51, 0 - 1)                                // mirilla: sin guardado previo
-    sea c = mem_reservar(496)
-    mem_llenar(c, 0, 496)                                       // c + 480/488: tabla turbo                                       // c + 456: funciones abiertas
+    sea c = mem_reservar(504)
+    mem_llenar(c, 0, 504)                                       // c + 480/488: tabla turbo                                       // c + 456: funciones abiertas
     __guardar64(c + 400, 0 - 1)
     // c + 464: posición del código antes de apilar el operando izquierdo;
     // c + 472: posición al terminar un operando derecho literal (ver
@@ -1736,6 +1736,34 @@ funcion intrinseco(c, nombre) {
         op_syscall(c, n)
         retornar 1
     }
+    // __llenar64(destino, valor, palabras) / __copiar8(destino, origen, bytes):
+    // en x86-64, rep stosq / rep movsb; en el resto, el bucle del runtime.
+    si (str_igual(nombre, "__llenar64") o str_igual(nombre, "__copiar8")) {
+        sea n = argumentos(c)
+        si (n != 3) { error_en(c, "se esperaban 3 argumentos") }
+        si (es_arm64(c) o es_wasm(c)) {
+            si (str_igual(nombre, "__llenar64")) { llamar_runtime(c, "mem_llenar64_lento", 3) } sino { llamar_runtime(c, "mem_copiar_lento", 3) }
+            retornar 1
+        }
+        op_sacar(c, 1)                                              // rcx = cuántos
+        si (str_igual(nombre, "__llenar64")) {
+            op_sacar(c, 0)                                          // rax = valor
+            op_sacar(c, 2)                                          // rdx = destino
+            e2(c, 86, 87)                                           // push rsi; push rdi
+            e3(c, 72, 137, 215)                                     // mov rdi, rdx
+            e3(c, 243, 72, 171)                                     // rep stosq
+        } sino {
+            op_sacar(c, 0)                                          // rax = origen
+            op_sacar(c, 2)                                          // rdx = destino
+            e2(c, 86, 87)
+            e3(c, 72, 137, 215)                                     // mov rdi, rdx
+            e3(c, 72, 137, 198)                                     // mov rsi, rax
+            e2(c, 243, 164)                                         // rep movsb
+        }
+        e2(c, 95, 94)                                               // pop rdi; pop rsi
+        e2(c, 49, 192)                                              // xor eax, eax
+        retornar 1
+    }
     si (str_igual(nombre, "__cargar64")) { un_argumento(c) op_cargar(c, 0, 0, 0) retornar 1 }
     si (str_igual(nombre, "__cargar8")) { un_argumento(c) op_cargar8(c) retornar 1 }
     si (str_igual(nombre, "__guardar64")) { dos_argumentos(c) op_guardar(c, 0, 0, 1) retornar 1 }
@@ -3279,6 +3307,18 @@ funcion llamada_cierre(c) {
 funcion funcion_anonima(c) {
     sea saltar = saltar_por_encima(c)
     sea etiqueta = nueva_etiqueta(c)
+    sea aridad_turbo = tb_cierre(c, etiqueta)
+    si (aridad_turbo > 0) {
+        definir_etiqueta(c, saltar)
+        op_direccion(c, 4, etiqueta)
+        empujar(c)
+        cargar_inmediato(c, aridad_turbo - 1)
+        empujar(c)
+        cargar_inmediato(c, 0)
+        empujar(c)
+        llamar_runtime(c, "dyn_cierre_nuevo", 3)
+        retornar 0
+    }
     sea nombres = parametros(c, un_nombre(str_nuevo(0)))
     sea n = vec_largo(nombres) - 1
     sea estado = abrir_cierre(c, etiqueta, nombres)
@@ -6920,8 +6960,40 @@ funcion tb_primario(p) {
         avanzar(c)
         retornar tb_nodo(1, numero_literal(lex), 0, 0)
     }
+    si (tomar(c, "[")) {
+        // solo la lista vacía []
+        si (tomar(c, "]") == 0) { retornar tb_fallar(p) }
+        retornar tb_nodo(30, 0, 0, 0)
+    }
     si (tok_tipo(c) == 1 y tb_es_palabra(tok_lexema(c)) == 0) {
         sea nombre = __cargar64(avanzar(c) + 8)
+        si (ver(c, "[")) {
+            avanzar(c)
+            sea idx = tb_suma(p)
+            si (tomar(c, "]") == 0) { retornar tb_fallar(p) }
+            si (ver(c, "[") o ver(c, ".")) { retornar tb_fallar(p) }
+            retornar tb_nodo(32, nombre, idx, 0)
+        }
+        si (str_igual(nombre, "longitud") y ver(c, "(")) {
+            avanzar(c)
+            sea arg = tb_suma(p)
+            si (tomar(c, ")") == 0) { retornar tb_fallar(p) }
+            retornar tb_nodo(35, arg, 0, 0)
+        }
+        si (str_igual(nombre, "ordenar") y ver(c, "(")) {
+            avanzar(c)
+            sea arg = tb_suma(p)
+            si (tomar(c, ")") == 0) { retornar tb_fallar(p) }
+            retornar tb_nodo(36, arg, 0, 0)
+        }
+        si (str_igual(nombre, "lista_repetir") y ver(c, "(")) {
+            avanzar(c)
+            sea v = tb_suma(p)
+            si (tomar(c, ",") == 0) { retornar tb_fallar(p) }
+            sea cuantos = tb_suma(p)
+            si (tomar(c, ")") == 0) { retornar tb_fallar(p) }
+            retornar tb_nodo(31, v, cuantos, 0)
+        }
         si (tomar(c, "(")) {
             sea args = vec_nuevo()
             si (ver(c, ")") == 0) {
@@ -7076,17 +7148,51 @@ funcion tb_sentencia(p) {
     si (tok_tipo(c) == 1 y tb_es_palabra(tok_lexema(c)) == 0) {
         sea siguiente = tok_siguiente_lexema(c)
         sea nombre = tok_lexema(c)
+        // l[i] = v
+        si (str_igual(siguiente, "[")) {
+            avanzar(c)
+            avanzar(c)
+            sea idx = tb_suma(p)
+            si (tomar(c, "]") == 0 o tomar(c, "=") == 0) { retornar tb_fallar(p) }
+            retornar tb_nodo(33, nombre, idx, tb_suma(p))
+        }
+        // l.agregar(v)
+        si (str_igual(siguiente, ".")) {
+            avanzar(c)
+            avanzar(c)
+            si (tomar(c, "agregar") == 0 o tomar(c, "(") == 0) { retornar tb_fallar(p) }
+            sea v = tb_suma(p)
+            si (tomar(c, ")") == 0) { retornar tb_fallar(p) }
+            retornar tb_nodo(34, nombre, v, 0)
+        }
+        // agregar(l, v)
+        si (str_igual(nombre, "agregar") y str_igual(siguiente, "(")) {
+            avanzar(c)
+            avanzar(c)
+            si (tok_tipo(c) != 1) { retornar tb_fallar(p) }
+            sea lista = __cargar64(avanzar(c) + 8)
+            si (tomar(c, ",") == 0) { retornar tb_fallar(p) }
+            sea v = tb_suma(p)
+            si (tomar(c, ")") == 0) { retornar tb_fallar(p) }
+            retornar tb_nodo(34, lista, v, 0)
+        }
         si (str_igual(siguiente, "=")) {
             avanzar(c)
             avanzar(c)
             retornar tb_nodo(21, nombre, tb_suma(p), 0)
         }
+        // x += e llega como "x" "+" "=" e
         sea op = 0
-        si (str_igual(siguiente, "+=")) { op = 1 }
-        si (str_igual(siguiente, "-=")) { op = 2 }
-        si (str_igual(siguiente, "*=")) { op = 3 }
-        si (str_igual(siguiente, "%=")) { op = 5 }
+        sea tokens = __cargar64(c)
+        sea j = __cargar64(c + 8)
+        si (j + 2 < vec_largo(tokens) y str_igual(lexema_en(tokens, j + 2), "=")) {
+            si (str_igual(siguiente, "+")) { op = 1 }
+            si (str_igual(siguiente, "-")) { op = 2 }
+            si (str_igual(siguiente, "*")) { op = 3 }
+            si (str_igual(siguiente, "%")) { op = 5 }
+        }
         si (op != 0) {
+            avanzar(c)
             avanzar(c)
             avanzar(c)
             retornar tb_nodo(21, nombre, tb_nodo(3, op, tb_nodo(2, nombre, 0, 0), tb_suma(p)), 0)
@@ -7111,11 +7217,19 @@ funcion tb_analizar_funcion(c) {
         mientras (seguir) {
             si (tok_tipo(c) != 1) { tb_fallar(p) retornar p }
             vec_agregar(nombres, __cargar64(avanzar(c) + 8))
-            si (tomar(c, ":") == 0 o tomar(c, "i64") == 0) { tb_fallar(p) retornar p }
+            // sin tipo: se especula que es un entero (si no lo es, la
+            // entrada normal usa la forma dinámica)
+            si (tomar(c, ":")) {
+                si (tomar(c, "i64") == 0) { tb_fallar(p) retornar p }
+            }
+            si (ver(c, "=")) { tb_fallar(p) retornar p }              // valores por defecto: no
             si (tomar(c, ",") == 0) { seguir = 0 }
         }
     }
-    si (tomar(c, ")") == 0 o tomar(c, ":") == 0 o tomar(c, "i64") == 0) { tb_fallar(p) retornar p }
+    si (tomar(c, ")") == 0) { tb_fallar(p) retornar p }
+    si (tomar(c, ":")) {
+        si (tomar(c, "i64") == 0) { tb_fallar(p) retornar p }
+    }
     si (vec_largo(nombres) > 6) { tb_fallar(p) retornar p }
     __guardar64(p + 48, tb_bloque(p))
     retornar p
@@ -7130,7 +7244,14 @@ funcion tb_necesita(e) {
         si (b + 1 > a) { a = b + 1 }
         retornar a
     }
-    si (t == 4) { retornar tb_necesita(__cargar64(e + 8)) }
+    si (t == 4 o t == 35 o t == 36) { retornar tb_necesita(__cargar64(e + 8)) + 1 }
+    si (t == 32) { retornar tb_necesita(__cargar64(e + 16)) + 1 }
+    si (t == 31) {
+        sea a = tb_necesita(__cargar64(e + 8))
+        sea b = tb_necesita(__cargar64(e + 16)) + 1
+        si (b > a) { a = b }
+        retornar a
+    }
     si (t == 6) {
         sea args = __cargar64(e + 16)
         sea m = 1
@@ -7165,6 +7286,8 @@ funcion tb_cabe_cond(e) {
 funcion tb_cabe_sentencia(s) {
     sea t = __cargar64(s)
     si (t == 20 o t == 21) { retornar tb_necesita(__cargar64(s + 16)) <= 7 }
+    si (t == 33) { retornar tb_necesita(__cargar64(s + 16)) <= 5 y tb_necesita(__cargar64(s + 24)) <= 5 }
+    si (t == 34) { retornar tb_necesita(__cargar64(s + 16)) <= 5 }
     si (t == 24 o t == 27) { retornar tb_necesita(__cargar64(s + 8)) <= 7 }
     si (t == 22) {
         si (tb_cabe_cond(__cargar64(s + 8)) == 0 o tb_cabe_bloque(__cargar64(s + 16)) == 0) { retornar 0 }
@@ -7173,6 +7296,104 @@ funcion tb_cabe_sentencia(s) {
     }
     si (t == 23) { retornar tb_cabe_cond(__cargar64(s + 8)) y tb_cabe_bloque(__cargar64(s + 16)) }
     retornar 1
+}
+
+// ¿Toda variable usada es un parámetro o una local declarada antes? (Las
+// globales no se compilan en turbo.)
+funcion tb_declarada(nombres, n) {
+    sea i = vec_largo(nombres) - 1
+    mientras (i >= 0) {
+        si (str_igual(vec_obtener(nombres, i), n)) { retornar 1 }
+        i = i - 1
+    }
+    retornar 0
+}
+
+// Clase de una expresión: 1 entero, 2 lista (las listas son locales: no
+// salen de la función ni se pasan a otras). Las variables de lista se
+// anotan en "nombres" con el prefijo "[]".
+funcion tb_es_lista_var(nombres, n) {
+    retornar tb_declarada(nombres, str_concatenar("[]", n))
+}
+
+funcion tb_clase(e, nombres) {
+    sea t = __cargar64(e)
+    si (t == 30 o t == 31 o t == 36) { retornar 2 }
+    si (t == 2 y tb_es_lista_var(nombres, __cargar64(e + 8))) { retornar 2 }
+    retornar 1
+}
+
+funcion tb_validar_lista(e, nombres) {
+    sea t = __cargar64(e)
+    si (t == 2) { retornar tb_es_lista_var(nombres, __cargar64(e + 8)) }
+    si (t == 30) { retornar 1 }
+    si (t == 31) { retornar tb_validar_expr(__cargar64(e + 8), nombres) y tb_validar_expr(__cargar64(e + 16), nombres) }
+    si (t == 36) { retornar tb_validar_lista(__cargar64(e + 8), nombres) }
+    retornar 0
+}
+
+funcion tb_validar_expr(e, nombres) {
+    sea t = __cargar64(e)
+    si (t == 2) { retornar tb_declarada(nombres, __cargar64(e + 8)) y tb_es_lista_var(nombres, __cargar64(e + 8)) == 0 }
+    si (t == 30 o t == 31 o t == 36) { retornar 0 }
+    si (t == 32) { retornar tb_es_lista_var(nombres, __cargar64(e + 8)) y tb_validar_expr(__cargar64(e + 16), nombres) }
+    si (t == 35) { retornar tb_validar_lista(__cargar64(e + 8), nombres) }
+    si (t == 3 o t == 10 o t == 11 o t == 12) { retornar tb_validar_expr(__cargar64(e + 16), nombres) y tb_validar_expr(__cargar64(e + 24), nombres) }
+    si (t == 13) { retornar tb_validar_expr(__cargar64(e + 16), nombres) }
+    si (t == 4) { retornar tb_validar_expr(__cargar64(e + 8), nombres) }
+    si (t == 6) {
+        sea args = __cargar64(e + 16)
+        sea i = 0
+        mientras (i < vec_largo(args)) {
+            si (tb_validar_expr(vec_obtener(args, i), nombres) == 0) { retornar 0 }
+            i = i + 1
+        }
+        // una local con el nombre de la función la taparía
+        retornar tb_declarada(nombres, __cargar64(e + 8)) == 0
+    }
+    retornar 1
+}
+
+funcion tb_validar(v, nombres) {
+    sea marca = vec_largo(nombres)
+    sea ok = 1
+    sea i = 0
+    mientras (ok y i < vec_largo(v)) {
+        sea s = vec_obtener(v, i)
+        sea t = __cargar64(s)
+        si (t == 20 y tb_declarada(nombres, __cargar64(s + 8))) { ok = 0 }  // sin variables tapadas
+        si (ok y t == 20) {
+            si (tb_clase(__cargar64(s + 16), nombres) == 2) {
+                ok = tb_validar_lista(__cargar64(s + 16), nombres)
+                vec_agregar(nombres, str_concatenar("[]", __cargar64(s + 8)))
+            } sino {
+                ok = tb_validar_expr(__cargar64(s + 16), nombres)
+            }
+            vec_agregar(nombres, __cargar64(s + 8))
+        }
+        si (t == 21) { ok = tb_declarada(nombres, __cargar64(s + 8)) y tb_es_lista_var(nombres, __cargar64(s + 8)) == 0 y tb_validar_expr(__cargar64(s + 16), nombres) }
+        si (t == 33) { ok = tb_es_lista_var(nombres, __cargar64(s + 8)) y tb_validar_expr(__cargar64(s + 16), nombres) y tb_validar_expr(__cargar64(s + 24), nombres) }
+        si (t == 34) { ok = tb_es_lista_var(nombres, __cargar64(s + 8)) y tb_validar_expr(__cargar64(s + 16), nombres) }
+        si (t == 22) {
+            ok = tb_validar_expr(__cargar64(s + 8), nombres) y tb_validar(__cargar64(s + 16), nombres)
+            si (ok y __cargar64(s + 24) != 0) { ok = tb_validar(__cargar64(s + 24), nombres) }
+        }
+        si (t == 23) { ok = tb_validar_expr(__cargar64(s + 8), nombres) y tb_validar(__cargar64(s + 16), nombres) }
+        si (t == 24 o t == 27) { ok = tb_validar_expr(__cargar64(s + 8), nombres) }
+        i = i + 1
+    }
+    __guardar64(nombres, marca)
+    retornar ok
+}
+
+funcion tb_copiar_vec(v) {
+    sea r = vec_nuevo()
+    sea i = 0
+    mientras (i < vec_largo(v)) {
+        vec_agregar(r, vec_obtener(v, i))
+        i = i + 1
+    }
+    retornar r
 }
 
 // ¿El bloque siempre termina en retornar? (si no, el lenguaje devolvería
@@ -7192,6 +7413,7 @@ funcion tb_tabla(c) {
     sea tabla = vec_nuevo()
     __guardar64(c + 480, tabla)
     __guardar64(c + 488, __cargar64(c + 40))
+    __guardar64(c + 496, 0)                                          // rutina de orden (por pasada)
     si (es_arm64(c) o es_wasm(c) o mem_global(40) != 0) { retornar tabla }
     si (variable_entorno_es(c, "CFORGE_TURBO", "0")) { retornar tabla }
     sea tokens = __cargar64(c)
@@ -7210,7 +7432,7 @@ funcion tb_tabla(c) {
                 si (f != 0 y __cargar64(f + 24) == 2 y tb_buscar(tabla, nombre) == 0) {
                     __guardar64(c + 8, i + 2)
                     sea p = tb_analizar_funcion(c)
-                    si (tb_fallo(p) == 0 y tb_cabe_bloque(__cargar64(p + 48)) y tb_termina(__cargar64(p + 48))) {
+                    si (tb_fallo(p) == 0 y tb_cabe_bloque(__cargar64(p + 48)) y tb_termina(__cargar64(p + 48)) y tb_validar(__cargar64(p + 48), tb_copiar_vec(__cargar64(p + 40)))) {
                         sea e = mem_reservar(64)
                         __guardar64(e, nombre)
                         __guardar64(e + 8, f)
@@ -7414,13 +7636,390 @@ funcion tb_guardar_var(c, k, r) {
 // g = [c][nombres de variables (vec)][salida][desborde][div0][bucles (vec)]
 
 funcion tb_variable(g, nombre) {
-    sea v = __cargar64(g + 8)
+    sea v = __cargar64(g + 152)
     sea i = vec_largo(v) - 1
     mientras (i >= 0) {
         si (str_igual(vec_obtener(v, i), nombre)) { retornar i }
         i = i - 1
     }
     rt_panico(str_concatenar("turbo: variable desconocida ", nombre))
+    retornar 0
+}
+
+// ── Listas locales ───────────────────────────────────────────────────
+// mov dst, [base + d8]
+funcion tb_carga_base(c, dst, base, d) {
+    tb_rex(c, dst, base)
+    e2(c, 139, 64 + __y_bits(dst, 7) * 8 + __y_bits(base, 7))
+    e1(c, d)
+    retornar 0
+}
+
+// mov [base + d8], src
+funcion tb_guarda_base(c, base, d, src) {
+    tb_rex(c, src, base)
+    e2(c, 137, 64 + __y_bits(src, 7) * 8 + __y_bits(base, 7))
+    e1(c, d)
+    retornar 0
+}
+
+funcion tb_lista_desp(g, k) { retornar 0 - __cargar64(g + 112) - 8 * (k + 1) }
+
+funcion tb_lista_slot(g, nombre) {
+    sea v = __cargar64(g + 120)
+    sea i = vec_largo(v) - 1
+    mientras (i >= 0) {
+        si (str_igual(vec_obtener(v, i), nombre)) { retornar i }
+        i = i - 1
+    }
+    rt_panico(str_concatenar("turbo: lista desconocida ", nombre))
+    retornar 0
+}
+
+funcion tb_lista_ancho(g, nombre) { retornar vec_obtener(__cargar64(g + 128), tb_lista_slot(g, nombre)) }
+
+// Ancho de los elementos de la lista de e (1: bytes, 8: i64).
+funcion tb_ancho_expr(g, e) {
+    sea t = __cargar64(e)
+    si (t == 2) { retornar tb_lista_ancho(g, __cargar64(e + 8)) }
+    si (t == 36) { retornar tb_ancho_expr(g, __cargar64(e + 8)) }
+    retornar 8
+}
+
+funcion tb_es_byte(e) { retornar __cargar64(e) == 1 y __cargar64(e + 8) >= 0 y __cargar64(e + 8) <= 255 }
+
+// ¿Toda escritura a la lista "nombre" en v es una constante 0..255?
+funcion tb_escrituras_byte(v, nombre) {
+    sea i = 0
+    mientras (i < vec_largo(v)) {
+        sea s = vec_obtener(v, i)
+        sea t = __cargar64(s)
+        si ((t == 33 o t == 34) y str_igual(__cargar64(s + 8), nombre)) {
+            sea valor = __cargar64(s + 16)
+            si (t == 33) { valor = __cargar64(s + 24) }
+            si (tb_es_byte(valor) == 0) { retornar 0 }
+        }
+        si (t == 22) {
+            si (tb_escrituras_byte(__cargar64(s + 16), nombre) == 0) { retornar 0 }
+            si (__cargar64(s + 24) != 0 y tb_escrituras_byte(__cargar64(s + 24), nombre) == 0) { retornar 0 }
+        }
+        si (t == 23 y tb_escrituras_byte(__cargar64(s + 16), nombre) == 0) { retornar 0 }
+        i = i + 1
+    }
+    retornar 1
+}
+
+// Etiqueta un entero en r (r·2 + 1); fuera de 62 bits: repetir.
+funcion tb_etiquetar(g, r) {
+    sea c = __cargar64(g)
+    tb_rr(c, 1, r, r)                                              // add r, r
+    tb_jcc(c, 0, __cargar64(g + 24))
+    tb_rex(c, 0, r)
+    e3(c, 131, 200 + __y_bits(r, 7), 1)                           // or r, 1
+    retornar 0
+}
+
+// Llamada al runtime desde código turbo: guarda los registros de trabajo
+// vivos (0..d-1), apila los argumentos (registros) y deja el resultado en rax.
+funcion tb_runtime(g, d, nombre, args) {
+    sea c = __cargar64(g)
+    sea i = 0
+    mientras (i < d) {
+        tb_empujar(c, tb_trabajo(i))
+        i = i + 1
+    }
+    i = 0
+    mientras (i < vec_largo(args)) {
+        tb_empujar(c, vec_obtener(args, i))
+        i = i + 1
+    }
+    llamar_runtime(c, nombre, vec_largo(args))
+    i = d - 1
+    mientras (i >= 0) {
+        tb_sacar(c, tb_trabajo(i))
+        i = i - 1
+    }
+    retornar 0
+}
+
+// Acceso [base + índice·ancho]: op 139 cargar r (ancho 8), 137 guardar r
+// (ancho 8), "byte" con ancho 1 (movzx al cargar, mov r8 al guardar).
+funcion tb_elemento(c, guardar, ancho, r, base, indice) {
+    sea x = 64
+    si (r >= 8) { x = x + 4 }
+    si (indice >= 8) { x = x + 2 }
+    si (base >= 8) { x = x + 1 }
+    sea escala = 192
+    si (ancho == 1) { escala = 0 }
+    sea sib = escala + __y_bits(indice, 7) * 8 + __y_bits(base, 7)
+    sea modrm = 4 + __y_bits(r, 7) * 8
+    si (ancho == 8) {
+        e1(c, x + 8)
+        si (guardar) { e1(c, 137) } sino { e1(c, 139) }
+        e2(c, modrm, sib)
+        retornar 0
+    }
+    si (guardar) {
+        e3(c, x, 136, modrm)                                       // mov byte [..], r8
+        e1(c, sib)
+        retornar 0
+    }
+    e4(c, x + 8, 15, 182, modrm)                                   // movzx r, byte [..]
+    e1(c, sib)
+    retornar 0
+}
+
+// mov byte/qword [base + índice·ancho], inmediato
+funcion tb_elemento_inm(c, ancho, base, indice, v) {
+    sea x = 64
+    si (indice >= 8) { x = x + 2 }
+    si (base >= 8) { x = x + 1 }
+    sea escala = 192
+    si (ancho == 1) { escala = 0 }
+    sea sib = escala + __y_bits(indice, 7) * 8 + __y_bits(base, 7)
+    si (ancho == 1) {
+        si (x != 64) { e1(c, x) }
+        e3(c, 198, 4, sib)
+        e1(c, __y_bits(v, 255))
+        retornar 0
+    }
+    e4(c, x + 8, 199, 4, sib)
+    e32(c, v)
+    retornar 0
+}
+
+// Una lista local del modo turbo es una lista cruda (ver dyn_crudo_*):
+// sus elementos no llevan etiqueta y, si todo lo que se escribe en ella son
+// constantes 0..255, ocupan un byte. No sale de la función (no se retorna ni
+// se pasa a otras), así que nadie más la ve; si un índice queda fuera de
+// rango, se repite con la forma dinámica, que da el error de siempre.
+// Cabecera de la lista de e en el registro de trabajo d.
+funcion tb_lista_expr(g, e, d) {
+    sea c = __cargar64(g)
+    sea r = tb_trabajo(d)
+    sea t = __cargar64(e)
+    si (t == 2) { retornar tb_memoria(c, 139, r, tb_lista_desp(g, tb_lista_slot(g, __cargar64(e + 8)))) }
+    sea ancho = __cargar64(g + 136)
+    si (t == 30) {
+        tb_inmediato(c, r, ancho)
+        sea args = vec_nuevo()
+        vec_agregar(args, r)
+        tb_runtime(g, d, "dyn_crudo_nueva", args)
+        retornar tb_mov(c, r, 0)
+    }
+    si (t == 31) {
+        tb_expr(g, __cargar64(e + 8), d)
+        tb_expr(g, __cargar64(e + 16), d + 1)
+        sea n = tb_trabajo(d + 1)
+        tb_op_inm(c, 7, n, 268435456)
+        tb_jcc(c, 7, __cargar64(g + 24))                           // ja (o negativo): lo decide la dinámica
+        sea a = tb_trabajo(d + 2)
+        tb_inmediato(c, a, ancho)
+        sea args = vec_nuevo()
+        vec_agregar(args, r)
+        vec_agregar(args, n)
+        vec_agregar(args, a)
+        tb_runtime(g, d, "dyn_crudo_repetir", args)
+        retornar tb_mov(c, r, 0)
+    }
+    si (t == 36) {
+        tb_lista_expr(g, __cargar64(e + 8), d)
+        sea args = vec_nuevo()
+        vec_agregar(args, r)
+        si (__cargar64(e + 16) == 1) {
+            tb_runtime(g, d, "dyn_crudo_en_sitio", args)           // rax = la misma lista (o una copia ya ordenada)
+        } sino {
+            tb_runtime(g, d, "dyn_crudo_copia", args)             // rax = copia (ya ordenada si es corta o de bytes)
+        }
+        tb_ordenar_nativo(g, d)
+        retornar tb_mov(c, r, 0)
+    }
+    rt_panico("turbo: lista inesperada")
+    retornar 0
+}
+
+// Ordena en el sitio la copia (cabecera en rax) con la rutina nativa; deja
+// la cabecera en rax. Los registros de trabajo vivos se guardan.
+funcion tb_ordenar_nativo(g, d) {
+    sea c = __cargar64(g)
+    sea i = 0
+    mientras (i < d) {
+        tb_empujar(c, tb_trabajo(i))
+        i = i + 1
+    }
+    sea saltar = nueva_etiqueta(c)
+    e1(c, 80)                                                      // push rax (cabecera)
+    e1(c, 80)                                                      // argumento
+    llamar_runtime(c, "dyn_crudo_temporal", 1)                     // rax = búfer o 0
+    e3(c, 72, 133, 192)                                            // test rax, rax
+    tb_jcc(c, 4, saltar)
+    e4(c, 76, 139, 28, 36)                                         // mov r11, [rsp]
+    e1(c, 80)                                                      // push rax (búfer)
+    e4(c, 73, 139, 123, 16)                                        // mov rdi, [r11 + 16]
+    e3(c, 73, 139, 51)                                             // mov rsi, [r11]
+    e3(c, 72, 137, 194)                                            // mov rdx, rax
+    e4(c, 72, 141, 12, 240)                                        // lea rcx, [rax + rsi·8]
+    op_llamar(c, tb_rutina_radix(c))
+    llamar_runtime(c, "mem_liberar", 1)                            // (el búfer ya está apilado)
+    definir_etiqueta(c, saltar)
+    e1(c, 88)                                                      // pop rax (cabecera)
+    i = d - 1
+    mientras (i >= 0) {
+        tb_sacar(c, tb_trabajo(i))
+        i = i - 1
+    }
+    retornar 0
+}
+
+// Radix LSD de 11 bits (los contadores caben en la caché L1) sobre
+// x - mínimo (solo las pasadas que cubren el rango), en código nativo.
+// Entrada: rdi = x, rsi = n, rdx = búfer de n palabras, rcx = 2048
+// contadores. Conserva rbx y r12–r15. Se emite una
+// vez por programa (por pasada), en la primera lista que se ordena.
+funcion tb_rutina_radix(c) {
+    si (__cargar64(c + 496) != 0) { retornar __cargar64(c + 496) }
+    sea rutina = nueva_etiqueta(c)
+    __guardar64(c + 496, rutina)
+    sea saltar = nueva_etiqueta(c)
+    op_saltar(c, saltar)
+    tb_alinear(c)
+    definir_etiqueta(c, rutina)
+    sea l1 = nueva_etiqueta(c)
+    sea l1f = nueva_etiqueta(c)
+    sea rango_ok = nueva_etiqueta(c)
+    sea pasada = nueva_etiqueta(c)
+    sea hecho = nueva_etiqueta(c)
+    sea l2 = nueva_etiqueta(c)
+    sea l2f = nueva_etiqueta(c)
+    sea l3 = nueva_etiqueta(c)
+    sea l3f = nueva_etiqueta(c)
+    sea l4 = nueva_etiqueta(c)
+    sea l4f = nueva_etiqueta(c)
+    sea fin = nueva_etiqueta(c)
+    e1(c, 83) e2(c, 65, 84) e2(c, 65, 85) e2(c, 65, 86) e2(c, 65, 87)   // push rbx, r12–r15
+    e3(c, 73, 137, 248)                                            // mov r8, rdi   (a)
+    e3(c, 73, 137, 209)                                            // mov r9, rdx   (b)
+    e3(c, 73, 137, 254)                                            // mov r14, rdi  (x)
+    e3(c, 72, 137, 207)                                            // mov rdi, rcx  (contadores)
+    // mínimo y máximo
+    e3(c, 77, 139, 16)                                             // mov r10, [r8]
+    e3(c, 77, 137, 211)                                            // mov r11, r10
+    e1(c, 187) e32(c, 1)                                           // mov ebx, 1
+    definir_etiqueta(c, l1)
+    e3(c, 72, 57, 243)                                             // cmp rbx, rsi
+    tb_jcc(c, 13, l1f)
+    e4(c, 73, 139, 4, 216)                                         // mov rax, [r8 + rbx·8]
+    e3(c, 76, 57, 208)                                             // cmp rax, r10
+    e4(c, 76, 15, 76, 208)                                         // cmovl r10, rax
+    e3(c, 76, 57, 216)                                             // cmp rax, r11
+    e4(c, 76, 15, 79, 216)                                         // cmovg r11, rax
+    e3(c, 72, 255, 195)                                            // inc rbx
+    op_saltar(c, l1)
+    definir_etiqueta(c, l1f)
+    e3(c, 77, 41, 211)                                             // sub r11, r10 (rango)
+    tb_jcc(c, 1, rango_ok)                                         // jno
+    e2(c, 73, 186) e32(c, 0) e32(c, 0 - 2147483648)                // mov r10, -2^63 (clave = v con el signo invertido)
+    e3(c, 73, 199, 195) e32(c, 0 - 1)                              // mov r11, -1
+    definir_etiqueta(c, rango_ok)
+    e2(c, 49, 201)                                                 // xor ecx, ecx
+    definir_etiqueta(c, pasada)
+    e3(c, 131, 249, 64)                                            // cmp ecx, 64
+    tb_jcc(c, 13, hecho)
+    e3(c, 76, 137, 216)                                            // mov rax, r11
+    e3(c, 72, 211, 232)                                            // shr rax, cl
+    e3(c, 72, 133, 192)                                            // test rax, rax
+    tb_jcc(c, 4, hecho)
+    e3(c, 73, 137, 205)                                            // mov r13, rcx
+    e3(c, 73, 137, 252)                                            // mov r12, rdi
+    e2(c, 49, 192)                                                 // xor eax, eax
+    e1(c, 185) e32(c, 2048)                                        // mov ecx, 2048
+    e3(c, 243, 72, 171)                                            // rep stosq
+    e3(c, 76, 137, 231)                                            // mov rdi, r12
+    e3(c, 76, 137, 233)                                            // mov rcx, r13
+    // conteo
+    e2(c, 49, 219)                                                 // xor ebx, ebx
+    definir_etiqueta(c, l2)
+    e3(c, 72, 57, 243)
+    tb_jcc(c, 13, l2f)
+    e4(c, 73, 139, 4, 216)                                         // mov rax, [r8 + rbx·8]
+    e3(c, 76, 41, 208)                                             // sub rax, r10
+    e3(c, 72, 211, 232)                                            // shr rax, cl
+    e1(c, 37) e32(c, 2047)                                         // and eax, 2047
+    e4(c, 72, 255, 4, 199)                                         // inc qword [rdi + rax·8]
+    e3(c, 72, 255, 195)
+    op_saltar(c, l2)
+    definir_etiqueta(c, l2f)
+    // sumas prefijas
+    e2(c, 49, 219)                                                 // xor ebx, ebx
+    e2(c, 49, 210)                                                 // xor edx, edx
+    definir_etiqueta(c, l3)
+    e3(c, 72, 129, 251) e32(c, 2048)                               // cmp rbx, 2048
+    tb_jcc(c, 13, l3f)
+    e4(c, 72, 139, 4, 223)                                         // mov rax, [rdi + rbx·8]
+    e4(c, 72, 137, 20, 223)                                        // mov [rdi + rbx·8], rdx
+    e3(c, 72, 1, 194)                                              // add rdx, rax
+    e3(c, 72, 255, 195)
+    op_saltar(c, l3)
+    definir_etiqueta(c, l3f)
+    // reparto (estable)
+    e2(c, 49, 219)
+    definir_etiqueta(c, l4)
+    e3(c, 72, 57, 243)
+    tb_jcc(c, 13, l4f)
+    e4(c, 73, 139, 20, 216)                                        // mov rdx, [r8 + rbx·8]
+    e3(c, 72, 137, 208)                                            // mov rax, rdx
+    e3(c, 76, 41, 208)                                             // sub rax, r10
+    e3(c, 72, 211, 232)                                            // shr rax, cl
+    e1(c, 37) e32(c, 2047)                                         // and eax, 2047
+    e4(c, 76, 139, 36, 199)                                        // mov r12, [rdi + rax·8]
+    e4(c, 75, 137, 20, 225)                                        // mov [r9 + r12·8], rdx
+    e3(c, 73, 255, 196)                                            // inc r12
+    e4(c, 76, 137, 36, 199)                                        // mov [rdi + rax·8], r12
+    e3(c, 72, 255, 195)
+    op_saltar(c, l4)
+    definir_etiqueta(c, l4f)
+    e3(c, 77, 135, 200)                                            // xchg r8, r9
+    e3(c, 131, 193, 11)                                            // add ecx, 11
+    op_saltar(c, pasada)
+    definir_etiqueta(c, hecho)
+    e3(c, 77, 57, 240)                                             // cmp r8, r14
+    tb_jcc(c, 4, fin)
+    e3(c, 76, 137, 247)                                            // mov rdi, r14
+    e3(c, 72, 137, 241)                                            // mov rcx, rsi
+    e3(c, 76, 137, 198)                                            // mov rsi, r8
+    e3(c, 243, 72, 165)                                            // rep movsq
+    definir_etiqueta(c, fin)
+    e2(c, 65, 95) e2(c, 65, 94) e2(c, 65, 93) e2(c, 65, 92) e1(c, 91)   // pop r15–r12, rbx
+    e1(c, 195)                                                     // ret
+    definir_etiqueta(c, saltar)
+    retornar rutina
+}
+
+// Datos de la lista "nombre" en b, con el índice (registro i) comprobado.
+funcion tb_datos_comprobados(g, nombre, i, b) {
+    sea c = __cargar64(g)
+    si (__cargar64(g + 168) != 0 y str_igual(__cargar64(g + 168), nombre)) {
+        tb_memoria(c, 59, i, __cargar64(g + 184))                  // cmp i, [largo]
+        tb_jcc(c, 3, __cargar64(g + 24))
+        retornar 12                                                // datos en r12
+    }
+    tb_memoria(c, 139, b, tb_lista_desp(g, tb_lista_slot(g, nombre)))
+    tb_carga_base(c, 0, b, 0)                                      // rax = largo
+    tb_rr(c, 57, i, 0)                                             // cmp i, largo
+    tb_jcc(c, 3, __cargar64(g + 24))                               // jae (también i < 0): repetir
+    tb_carga_base(c, b, b, 16)                                     // datos
+    retornar b
+}
+
+// l[i] (lectura) en el registro d.
+funcion tb_indice(g, e, d) {
+    sea c = __cargar64(g)
+    sea r = tb_trabajo(d)
+    sea b = tb_trabajo(d + 1)
+    sea nombre = __cargar64(e + 8)
+    sea ri = tb_fuente(g, __cargar64(e + 16), d)
+    b = tb_datos_comprobados(g, nombre, ri, b)
+    tb_elemento(c, 0, tb_lista_ancho(g, nombre), r, b, ri)
     retornar 0
 }
 
@@ -7450,6 +8049,14 @@ funcion tb_expr(g, e, d) {
     si (t == 1) { retornar tb_inmediato(c, r, __cargar64(e + 8)) }
     si (t == 2) { retornar tb_cargar_var(c, r, tb_variable(g, __cargar64(e + 8))) }
     si (t == 7) { retornar tb_mov(c, r, __cargar64(e + 8)) }
+    si (t == 32) { retornar tb_indice(g, e, d) }
+    si (t == 35) {
+        sea interior = __cargar64(e + 8)
+        __guardar64(g + 136, 8)
+        tb_lista_expr(g, interior, d)
+        tb_carga_base(c, r, r, 0)                                  // largo
+        retornar 0
+    }
     si (t == 4) {
         tb_expr(g, __cargar64(e + 8), d)
         tb_rex(c, 0, r)
@@ -7464,7 +8071,7 @@ funcion tb_expr(g, e, d) {
     sea der = __cargar64(e + 24)
     tb_expr(g, izq, d)
     sea literal = __cargar64(der) == 1 y tb_cabe32(__cargar64(der + 8))
-    si (op == 5) { retornar tb_resto(g, der, d, literal) }
+    si (op == 5) { retornar tb_resto(g, der, d, __cargar64(der) == 1 y (literal o potencia_de_dos(__cargar64(der + 8)) > 0)) }
     si (literal) {
         sea v = __cargar64(der + 8)
         si (op == 1) { tb_op_inm(c, 0, r, v) }
@@ -7495,7 +8102,7 @@ funcion tb_resto(g, der, d, literal) {
             op_saltar(c, __cargar64(g + 32))
             retornar 0
         }
-        si (v >= 3 y potencia_de_dos(v) < 0) {
+        si (v >= 3 y potencia_de_dos(v) < 0 y tb_cabe32(v)) {
             // Resto por constante: q = (mulhi(x, M) >> s) + (x < 0); r = x - q·v
             sea s = magia_corrimiento(v)
             sea m = magia_multiplicador(v, s)
@@ -7513,7 +8120,24 @@ funcion tb_resto(g, der, d, literal) {
             tb_rr(c, 41, r, 2)                                     // sub r, rdx
             retornar 0
         }
-        // potencia de 2 o 1: por la vía general con el divisor en un registro
+        si (v == 1) { retornar tb_inmediato(c, r, 0) }
+        sea k = potencia_de_dos(v)
+        si (k >= 1 y k <= 62) {
+            // x % 2^k (signo del dividendo): t = (x >> 63) >>> (64 - k);
+            // r = ((x + t) & (2^k - 1)) - t
+            tb_mov(c, 0, r)
+            e4(c, 72, 193, 248, 63)                                // sar rax, 63
+            e4(c, 72, 193, 232, 64 - k)                            // shr rax, 64 - k
+            tb_rr(c, 1, r, 0)                                      // add r, rax
+            si (tb_cabe32(v - 1)) {
+                tb_op_inm(c, 4, r, v - 1)                          // and r, máscara
+            } sino {
+                tb_inmediato(c, 2, v - 1)
+                tb_rr(c, 33, r, 2)                                 // and r, rdx
+            }
+            tb_rr(c, 41, r, 0)                                     // sub r, rax
+            retornar 0
+        }
         tb_inmediato(c, tb_trabajo(d + 1), __cargar64(der + 8))
     } sino {
         tb_expr(g, der, d + 1)
@@ -7686,11 +8310,72 @@ funcion tb_bloque_gen(g, v) {
 funcion tb_sentencia_gen(g, s) {
     sea c = __cargar64(g)
     sea t = __cargar64(s)
+    si (t == 20 y tb_clase_gen(g, __cargar64(s + 16)) == 2) {
+        sea nombre = __cargar64(s + 8)
+        sea inicial = __cargar64(s + 16)
+        sea k = __cargar64(inicial)
+        sea ancho = 8
+        si (k == 36) { ancho = tb_ancho_expr(g, inicial) }
+        si (k == 30 y tb_escrituras_byte(__cargar64(g + 144), nombre)) { ancho = 1 }
+        si (k == 31 y tb_es_byte(__cargar64(inicial + 8)) y tb_escrituras_byte(__cargar64(g + 144), nombre)) { ancho = 1 }
+        __guardar64(g + 136, ancho)
+        tb_lista_expr(g, inicial, 0)
+        vec_agregar(__cargar64(g + 120), nombre)
+        vec_agregar(__cargar64(g + 128), ancho)
+        tb_memoria(c, 137, tb_trabajo(0), tb_lista_desp(g, vec_largo(__cargar64(g + 120)) - 1))
+        retornar 0
+    }
+    si (t == 33) {
+        sea v = tb_trabajo(0)
+        sea i = tb_trabajo(1)
+        sea b = tb_trabajo(2)
+        sea nombre = __cargar64(s + 8)
+        sea ancho = tb_lista_ancho(g, nombre)
+        sea valor = __cargar64(s + 24)
+        sea inmediato = __cargar64(valor) == 1 y tb_cabe32(__cargar64(valor + 8))
+        si (inmediato == 0) { v = tb_fuente(g, valor, 0) }
+        i = tb_fuente(g, __cargar64(s + 16), 1)
+        b = tb_datos_comprobados(g, nombre, i, b)
+        si (inmediato) {
+            tb_elemento_inm(c, ancho, b, i, __cargar64(valor + 8))
+            retornar 0
+        }
+        tb_elemento(c, 1, ancho, v, b, i)                          // datos[i] = v
+        retornar 0
+    }
+    si (t == 34) {
+        sea v = tb_trabajo(0)
+        sea h = tb_trabajo(1)
+        sea b = tb_trabajo(2)
+        sea nombre = __cargar64(s + 8)
+        sea otra_vez = nueva_etiqueta(c)
+        sea lento = nueva_etiqueta(c)
+        sea fin = nueva_etiqueta(c)
+        tb_expr(g, __cargar64(s + 16), 0)
+        definir_etiqueta(c, otra_vez)
+        tb_memoria(c, 139, h, tb_lista_desp(g, tb_lista_slot(g, nombre)))
+        tb_carga_base(c, 0, h, 0)                                  // rax = largo
+        tb_carga_base(c, b, h, 8)                                  // capacidad
+        tb_rr(c, 57, 0, b)
+        tb_jcc(c, 3, lento)
+        tb_carga_base(c, b, h, 16)
+        tb_elemento(c, 1, tb_lista_ancho(g, nombre), v, b, 0)      // datos[largo] = v
+        tb_op_inm(c, 0, 0, 1)
+        tb_guarda_base(c, h, 0, 0)                                 // largo + 1
+        op_saltar(c, fin)
+        definir_etiqueta(c, lento)
+        sea args = vec_nuevo()
+        vec_agregar(args, h)
+        tb_runtime(g, 1, "dyn_crudo_crecer", args)
+        op_saltar(c, otra_vez)
+        definir_etiqueta(c, fin)
+        retornar 0
+    }
     si (t == 20) {
         tb_expr(g, __cargar64(s + 16), 0)
         sea nombres = __cargar64(g + 8)
         vec_agregar(nombres, __cargar64(s + 8))
-        tb_guardar_var(c, vec_largo(nombres) - 1, tb_trabajo(0))
+        tb_guardar_var(c, tb_variable(g, __cargar64(s + 8)), tb_trabajo(0))
         retornar 0
     }
     si (t == 21) {
@@ -7742,6 +8427,32 @@ funcion tb_sentencia_gen(g, s) {
         sea bucles = __cargar64(g + 40)
         vec_agregar(bucles, prueba)
         vec_agregar(bucles, fin)
+        // La lista más usada del ciclo, si este la deja quieta: datos en r12
+        // y largo en el marco, cargados una vez.
+        sea fijada = 0
+        si (__cargar64(g + 176) != 0 y __cargar64(g + 168) == 0 y tb_llama_expr(__cargar64(s + 8)) == 0 y tb_listas_quietas(__cargar64(s + 16))) {
+            sea listas = __cargar64(g + 120)
+            sea mejor = 0
+            sea j = 0
+            mientras (j < vec_largo(listas)) {
+                sea nombre = vec_obtener(listas, j)
+                sea k = tb_contar_accesos(__cargar64(s + 16), nombre) + tb_contar_accesos_expr(__cargar64(s + 8), nombre)
+                si (k > mejor) {
+                    mejor = k
+                    fijada = nombre
+                }
+                j = j + 1
+            }
+        }
+        tb_llenar_ciclo(g, s, fin)
+        tb_reservar_ciclo(g, s)
+        si (fijada != 0) {
+            tb_memoria(c, 139, 0, tb_lista_desp(g, tb_lista_slot(g, fijada)))
+            tb_carga_base(c, 12, 0, 16)                              // r12 = datos
+            tb_carga_base(c, 0, 0, 0)
+            tb_memoria(c, 137, 0, __cargar64(g + 184))               // largo al marco
+            __guardar64(g + 168, fijada)
+        }
         op_saltar(c, prueba)
         tb_alinear(c)
         definir_etiqueta(c, cuerpo)
@@ -7751,11 +8462,13 @@ funcion tb_sentencia_gen(g, s) {
         definir_etiqueta(c, fin)
         vec_quitar_ultimo(bucles)
         vec_quitar_ultimo(bucles)
+        si (fijada != 0) { __guardar64(g + 168, 0) }
         retornar 0
     }
     si (t == 24) {
         sea e = __cargar64(s + 8)
         si (__cargar64(g + 64) != 0) { retornar tb_retornar_cola(g, e) }
+        tb_marcar_en_sitio(g, e, e)
         tb_expr(g, e, 0)
         tb_mov(c, 0, tb_trabajo(0))
         op_saltar(c, __cargar64(g + 56))
@@ -7853,10 +8566,10 @@ funcion tb_retornar_cola(g, e) {
     si (vec_largo(args) == 1) {
         sea a0 = vec_obtener(args, 0)
         // n = n ± k con n en registro: en el sitio
-        si (__cargar64(a0) == 3 y (__cargar64(a0 + 8) == 1 o __cargar64(a0 + 8) == 2) y __cargar64(__cargar64(a0 + 16)) == 2 y tb_variable(g, __cargar64(__cargar64(a0 + 16) + 8)) == 0 y __cargar64(__cargar64(a0 + 24)) == 1 y tb_cabe32(__cargar64(__cargar64(a0 + 24) + 8))) {
+        si (__cargar64(a0) == 3 y (__cargar64(a0 + 8) == 1 o __cargar64(a0 + 8) == 2) y __cargar64(__cargar64(a0 + 16)) == 2 y str_igual(__cargar64(__cargar64(a0 + 16) + 8), vec_obtener(__cargar64(g + 160), 0)) y tb_variable(g, vec_obtener(__cargar64(g + 160), 0)) < 4 y __cargar64(__cargar64(a0 + 24)) == 1 y tb_cabe32(__cargar64(__cargar64(a0 + 24) + 8))) {
             sea ext = 0
             si (__cargar64(a0 + 8) == 2) { ext = 5 }
-            tb_op_inm(c, ext, tb_hogar(0), __cargar64(__cargar64(a0 + 24) + 8))
+            tb_op_inm(c, ext, tb_hogar(tb_variable(g, vec_obtener(__cargar64(g + 160), 0))), __cargar64(__cargar64(a0 + 24) + 8))
             tb_jcc(c, 0, __cargar64(g + 24))
             op_saltar(c, __cargar64(g + 96))
             retornar 0
@@ -7869,7 +8582,7 @@ funcion tb_retornar_cola(g, e) {
     }
     i = 0
     mientras (i < vec_largo(args)) {
-        tb_guardar_var(c, i, tb_trabajo(i))
+        tb_guardar_var(c, tb_variable(g, vec_obtener(__cargar64(g + 160), i)), tb_trabajo(i))
         i = i + 1
     }
     op_saltar(c, __cargar64(g + 96))
@@ -7882,11 +8595,375 @@ funcion tb_usa(e, nombre) {
     si (t == 2) { retornar str_igual(__cargar64(e + 8), nombre) }
     si (t == 3) { retornar tb_usa(__cargar64(e + 16), nombre) o tb_usa(__cargar64(e + 24), nombre) }
     si (t == 4) { retornar tb_usa(__cargar64(e + 8), nombre) }
+    si (t == 32) { retornar tb_usa(__cargar64(e + 16), nombre) }
+    si (t == 30 o t == 31 o t == 35 o t == 36) { retornar 1 }
     si (t == 6) {
         // una llamada puede desbordar y repetir: el valor de x no debe cambiar antes
         retornar 1
     }
     retornar 0
+}
+
+funcion tb_hay_listas(v) {
+    sea i = 0
+    mientras (i < vec_largo(v)) {
+        sea s = vec_obtener(v, i)
+        sea t = __cargar64(s)
+        si (t == 20) {
+            sea k = __cargar64(__cargar64(s + 16))
+            si (k == 30 o k == 31 o k == 36) { retornar 1 }
+        }
+        si (t == 22) {
+            si (tb_hay_listas(__cargar64(s + 16))) { retornar 1 }
+            si (__cargar64(s + 24) != 0 y tb_hay_listas(__cargar64(s + 24))) { retornar 1 }
+        }
+        si (t == 23 y tb_hay_listas(__cargar64(s + 16))) { retornar 1 }
+        i = i + 1
+    }
+    retornar 0
+}
+
+// mientras (i < E) / (i <= E) con "i += 1" y "l.agregar(…)" en el cuerpo
+// (sin si de por medio): se reserva de una vez lo que el ciclo va a
+// agregar, como Vec::with_capacity. Si el ciclo sale antes, sobra
+// capacidad; nada más cambia.
+funcion tb_reservar_ciclo(g, s) {
+    sea c = __cargar64(g)
+    sea cond = __cargar64(s + 8)
+    si (__cargar64(cond) != 10) { retornar 0 }
+    sea cc = __cargar64(cond + 8)
+    si (cc != 12 y cc != 14) { retornar 0 }
+    sea izq = __cargar64(cond + 16)
+    sea der = __cargar64(cond + 24)
+    si (__cargar64(izq) != 2) { retornar 0 }
+    sea i = __cargar64(izq + 8)
+    si (__cargar64(der) != 1 y __cargar64(der) != 2) { retornar 0 }
+    si (tb_es_lista_gen(g, i)) { retornar 0 }
+    si (__cargar64(der) == 2 y tb_es_lista_gen(g, __cargar64(der + 8))) { retornar 0 }
+    sea cuerpo = __cargar64(s + 16)
+    sea paso = 0
+    sea lista = 0
+    sea veces = 0
+    sea k = 0
+    mientras (k < vec_largo(cuerpo)) {
+        sea st = vec_obtener(cuerpo, k)
+        sea t = __cargar64(st)
+        si (t == 21 y str_igual(__cargar64(st + 8), i)) {
+            sea e = __cargar64(st + 16)
+            si (__cargar64(e) == 3 y __cargar64(e + 8) == 1 y __cargar64(__cargar64(e + 16)) == 2 y str_igual(__cargar64(__cargar64(e + 16) + 8), i) y __cargar64(__cargar64(e + 24)) == 1 y __cargar64(__cargar64(e + 24) + 8) == 1) { paso = paso + 1 } sino { retornar 0 }
+        }
+        si (t == 34) {
+            si (lista != 0 y str_igual(lista, __cargar64(st + 8)) == 0) { retornar 0 }
+            lista = __cargar64(st + 8)
+            veces = veces + 1
+        }
+        si (t == 21 y __cargar64(der) == 2 y str_igual(__cargar64(st + 8), __cargar64(der + 8))) { retornar 0 }
+        k = k + 1
+    }
+    si (paso != 1 o lista == 0) { retornar 0 }
+    // rax = E - i (+1 si <=), ya multiplicado por las veces
+    sea fuera = nueva_etiqueta(c)
+    sea r = tb_trabajo(0)
+    tb_expr(g, der, 0)
+    tb_rr(c, 41, r, tb_fuente(g, izq, 1))                          // sub r, i
+    tb_jcc(c, 0, fuera)
+    si (cc == 14) {
+        tb_op_inm(c, 0, r, 1)
+        tb_jcc(c, 0, fuera)
+    }
+    tb_op_inm(c, 7, r, 0)
+    tb_jcc(c, 14, fuera)                                           // jle: nada que reservar
+    tb_op_inm(c, 7, r, 67108864)
+    tb_jcc(c, 15, fuera)                                           // jg: demasiado; que crezca sola
+    si (veces > 1) {
+        tb_inmediato(c, tb_trabajo(1), veces)
+        tb_imul(c, r, tb_trabajo(1))
+    }
+    sea h = tb_trabajo(1)
+    tb_memoria(c, 139, h, tb_lista_desp(g, tb_lista_slot(g, lista)))
+    sea args = vec_nuevo()
+    vec_agregar(args, h)
+    vec_agregar(args, r)
+    tb_runtime(g, 0, "dyn_crudo_reservar", args)
+    definir_etiqueta(c, fuera)
+    retornar 0
+}
+
+// En "retornar …" las listas locales mueren: ordenar(l) puede ordenar l
+// en su sitio si l no aparece en otra parte de la expresión.
+funcion tb_menciones(e, nombre) {
+    sea t = __cargar64(e)
+    si (t == 2) { retornar str_igual(__cargar64(e + 8), nombre) }
+    si (t == 32) { retornar str_igual(__cargar64(e + 8), nombre) + tb_menciones(__cargar64(e + 16), nombre) }
+    si (t == 3 o t == 10 o t == 11 o t == 12) { retornar tb_menciones(__cargar64(e + 16), nombre) + tb_menciones(__cargar64(e + 24), nombre) }
+    si (t == 13) { retornar tb_menciones(__cargar64(e + 16), nombre) }
+    si (t == 4 o t == 35 o t == 36) { retornar tb_menciones(__cargar64(e + 8), nombre) }
+    si (t == 31) { retornar tb_menciones(__cargar64(e + 8), nombre) + tb_menciones(__cargar64(e + 16), nombre) }
+    si (t == 6) {
+        sea args = __cargar64(e + 16)
+        sea n = 0
+        sea i = 0
+        mientras (i < vec_largo(args)) {
+            n = n + tb_menciones(vec_obtener(args, i), nombre)
+            i = i + 1
+        }
+        retornar n
+    }
+    retornar 0
+}
+
+funcion tb_marcar_en_sitio(g, raiz, e) {
+    sea t = __cargar64(e)
+    si (t == 36) {
+        sea x = __cargar64(e + 8)
+        si (__cargar64(x) == 2 y tb_menciones(raiz, __cargar64(x + 8)) == 1) { __guardar64(e + 16, 1) }
+        retornar tb_marcar_en_sitio(g, raiz, x)
+    }
+    si (t == 3 o t == 10 o t == 11 o t == 12) {
+        tb_marcar_en_sitio(g, raiz, __cargar64(e + 16))
+        retornar tb_marcar_en_sitio(g, raiz, __cargar64(e + 24))
+    }
+    si (t == 13) { retornar tb_marcar_en_sitio(g, raiz, __cargar64(e + 16)) }
+    si (t == 4 o t == 35) { retornar tb_marcar_en_sitio(g, raiz, __cargar64(e + 8)) }
+    si (t == 32) { retornar tb_marcar_en_sitio(g, raiz, __cargar64(e + 16)) }
+    retornar 0
+}
+
+// mientras (i < E) { l.agregar(K) i += 1 } con K constante: se llena de
+// una vez (como vec![K; n]) y se salta a fin con i ya en su valor final.
+// Si la cuenta es <= 0 o muy grande, sigue el ciclo normal.
+funcion tb_llenar_ciclo(g, s, fin) {
+    sea c = __cargar64(g)
+    sea cuerpo = __cargar64(s + 16)
+    si (vec_largo(cuerpo) != 2) { retornar 0 }
+    sea ag = vec_obtener(cuerpo, 0)
+    sea inc = vec_obtener(cuerpo, 1)
+    si (__cargar64(ag) != 34 o __cargar64(inc) != 21) { retornar 0 }
+    sea valor = __cargar64(ag + 16)
+    si (__cargar64(valor) != 1 o tb_cabe32(__cargar64(valor + 8)) == 0) { retornar 0 }
+    sea cond = __cargar64(s + 8)
+    si (__cargar64(cond) != 10) { retornar 0 }
+    sea cc = __cargar64(cond + 8)
+    si (cc != 12 y cc != 14) { retornar 0 }
+    sea izq = __cargar64(cond + 16)
+    sea der = __cargar64(cond + 24)
+    si (__cargar64(izq) != 2 o (__cargar64(der) != 1 y __cargar64(der) != 2)) { retornar 0 }
+    sea i = __cargar64(izq + 8)
+    si (tb_es_lista_gen(g, i) o (__cargar64(der) == 2 y tb_es_lista_gen(g, __cargar64(der + 8)))) { retornar 0 }
+    si (__cargar64(der) == 2 y str_igual(__cargar64(der + 8), i)) { retornar 0 }
+    si (str_igual(__cargar64(inc + 8), i) == 0) { retornar 0 }
+    sea e = __cargar64(inc + 16)
+    si ((__cargar64(e) == 3 y __cargar64(e + 8) == 1 y __cargar64(__cargar64(e + 16)) == 2 y str_igual(__cargar64(__cargar64(e + 16) + 8), i) y __cargar64(__cargar64(e + 24)) == 1 y __cargar64(__cargar64(e + 24) + 8) == 1) == 0) { retornar 0 }
+    sea normal = nueva_etiqueta(c)
+    sea r = tb_trabajo(0)
+    tb_expr(g, der, 0)
+    tb_rr(c, 41, r, tb_fuente(g, izq, 1))                          // r = E - i
+    tb_jcc(c, 0, normal)
+    si (cc == 14) {
+        tb_op_inm(c, 0, r, 1)
+        tb_jcc(c, 0, normal)
+    }
+    tb_op_inm(c, 7, r, 0)
+    tb_jcc(c, 14, normal)
+    tb_op_inm(c, 7, r, 67108864)
+    tb_jcc(c, 15, normal)
+    sea h = tb_trabajo(1)
+    sea v = tb_trabajo(2)
+    tb_memoria(c, 139, h, tb_lista_desp(g, tb_lista_slot(g, __cargar64(ag + 8))))
+    tb_inmediato(c, v, __cargar64(valor + 8))
+    sea args = vec_nuevo()
+    vec_agregar(args, h)
+    vec_agregar(args, v)
+    vec_agregar(args, r)
+    tb_runtime(g, 1, "dyn_crudo_llenar", args)                     // conserva r
+    // i = i + cuenta
+    sea k = tb_variable(g, i)
+    tb_cargar_var(c, tb_trabajo(1), k)
+    tb_rr(c, 1, tb_trabajo(1), r)
+    tb_guardar_var(c, k, tb_trabajo(1))
+    op_saltar(c, fin)
+    definir_etiqueta(c, normal)
+    retornar 1
+}
+
+funcion tb_es_lista_gen(g, nombre) { retornar tb_declarada(__cargar64(g + 120), nombre) }
+
+// ¿La expresión llama a algo (función o runtime)?
+funcion tb_llama_expr(e) {
+    sea t = __cargar64(e)
+    si (t == 6 o t == 30 o t == 31 o t == 36) { retornar 1 }
+    si (t == 3 o t == 10 o t == 11 o t == 12) { retornar tb_llama_expr(__cargar64(e + 16)) o tb_llama_expr(__cargar64(e + 24)) }
+    si (t == 13) { retornar tb_llama_expr(__cargar64(e + 16)) }
+    si (t == 4 o t == 35) { retornar tb_llama_expr(__cargar64(e + 8)) }
+    si (t == 32) { retornar tb_llama_expr(__cargar64(e + 16)) }
+    retornar 0
+}
+
+// ¿El bloque deja quietas las listas (sin agregar, sin listas nuevas y sin
+// llamadas)? Entonces sus datos y su largo se pueden tener a mano.
+funcion tb_listas_quietas(v) {
+    sea i = 0
+    mientras (i < vec_largo(v)) {
+        sea s = vec_obtener(v, i)
+        sea t = __cargar64(s)
+        si (t == 34) { retornar 0 }
+        si ((t == 20 o t == 21) y tb_llama_expr(__cargar64(s + 16))) { retornar 0 }
+        si ((t == 24 o t == 27) y tb_llama_expr(__cargar64(s + 8))) { retornar 0 }
+        si (t == 22) {
+            si (tb_llama_expr(__cargar64(s + 8)) o tb_listas_quietas(__cargar64(s + 16)) == 0) { retornar 0 }
+            si (__cargar64(s + 24) != 0 y tb_listas_quietas(__cargar64(s + 24)) == 0) { retornar 0 }
+        }
+        si (t == 23) {
+            si (tb_llama_expr(__cargar64(s + 8)) o tb_listas_quietas(__cargar64(s + 16)) == 0) { retornar 0 }
+        }
+        si (t == 33 y (tb_llama_expr(__cargar64(s + 16)) o tb_llama_expr(__cargar64(s + 24)))) { retornar 0 }
+        i = i + 1
+    }
+    retornar 1
+}
+
+funcion tb_contar_accesos_expr(e, nombre) {
+    sea t = __cargar64(e)
+    si (t == 32) { retornar str_igual(__cargar64(e + 8), nombre) + tb_contar_accesos_expr(__cargar64(e + 16), nombre) }
+    si (t == 3 o t == 10 o t == 11 o t == 12) { retornar tb_contar_accesos_expr(__cargar64(e + 16), nombre) + tb_contar_accesos_expr(__cargar64(e + 24), nombre) }
+    si (t == 13) { retornar tb_contar_accesos_expr(__cargar64(e + 16), nombre) }
+    si (t == 4) { retornar tb_contar_accesos_expr(__cargar64(e + 8), nombre) }
+    retornar 0
+}
+
+funcion tb_contar_accesos(v, nombre) {
+    sea n = 0
+    sea i = 0
+    mientras (i < vec_largo(v)) {
+        sea s = vec_obtener(v, i)
+        sea t = __cargar64(s)
+        si (t == 20 o t == 21) { n = n + tb_contar_accesos_expr(__cargar64(s + 16), nombre) }
+        si (t == 24 o t == 27) { n = n + tb_contar_accesos_expr(__cargar64(s + 8), nombre) }
+        si (t == 33) { n = n + str_igual(__cargar64(s + 8), nombre) + tb_contar_accesos_expr(__cargar64(s + 16), nombre) + tb_contar_accesos_expr(__cargar64(s + 24), nombre) }
+        si (t == 22) {
+            n = n + tb_contar_accesos_expr(__cargar64(s + 8), nombre) + tb_contar_accesos(__cargar64(s + 16), nombre)
+            si (__cargar64(s + 24) != 0) { n = n + tb_contar_accesos(__cargar64(s + 24), nombre) }
+        }
+        si (t == 23) { n = n + tb_contar_accesos_expr(__cargar64(s + 8), nombre) + tb_contar_accesos(__cargar64(s + 16), nombre) }
+        i = i + 1
+    }
+    retornar n
+}
+
+funcion tb_clase_gen(g, e) {
+    sea t = __cargar64(e)
+    si (t == 30 o t == 31 o t == 36) { retornar 2 }
+    si (t == 2 y tb_declarada(__cargar64(g + 120), __cargar64(e + 8))) { retornar 2 }
+    retornar 1
+}
+
+// ── Reparto de registros ─────────────────────────────────────────────
+// Cada nombre (parámetro o "sea") recibe una casilla fija; las cuatro con
+// más peso (usos ponderados ×10 por nivel de ciclo) van a rbx, r13, r14 y
+// r15. Sin variables tapadas, dos "sea" con el mismo nombre nunca están
+// vivas a la vez, así que comparten casilla.
+funcion tb_peso_sumar(pesos, nombres, nombre, w) {
+    sea i = 0
+    mientras (i < vec_largo(nombres)) {
+        si (str_igual(vec_obtener(nombres, i), nombre)) {
+            vec_fijar(pesos, i, vec_obtener(pesos, i) + w)
+            retornar 0
+        }
+        i = i + 1
+    }
+    vec_agregar(nombres, nombre)
+    vec_agregar(pesos, w)
+    retornar 0
+}
+
+funcion tb_peso_expr(pesos, nombres, e, w) {
+    sea t = __cargar64(e)
+    si (t == 2) { retornar tb_peso_sumar(pesos, nombres, __cargar64(e + 8), w) }
+    si (t == 3 o t == 10 o t == 11 o t == 12) {
+        tb_peso_expr(pesos, nombres, __cargar64(e + 16), w)
+        retornar tb_peso_expr(pesos, nombres, __cargar64(e + 24), w)
+    }
+    si (t == 13) { retornar tb_peso_expr(pesos, nombres, __cargar64(e + 16), w) }
+    si (t == 4) { retornar tb_peso_expr(pesos, nombres, __cargar64(e + 8), w) }
+    si (t == 32) { retornar tb_peso_expr(pesos, nombres, __cargar64(e + 16), w) }
+    si (t == 31) {
+        tb_peso_expr(pesos, nombres, __cargar64(e + 8), w)
+        retornar tb_peso_expr(pesos, nombres, __cargar64(e + 16), w)
+    }
+    si (t == 6) {
+        sea args = __cargar64(e + 16)
+        sea i = 0
+        mientras (i < vec_largo(args)) {
+            tb_peso_expr(pesos, nombres, vec_obtener(args, i), w)
+            i = i + 1
+        }
+    }
+    retornar 0
+}
+
+funcion tb_peso_bloque(pesos, nombres, v, w) {
+    sea i = 0
+    mientras (i < vec_largo(v)) {
+        sea s = vec_obtener(v, i)
+        sea t = __cargar64(s)
+        si (t == 20 o t == 21) {
+            // las listas no ocupan casilla de entero
+            sea k = __cargar64(__cargar64(s + 16))
+            si (t == 21 o (k != 30 y k != 31 y k != 36)) { tb_peso_sumar(pesos, nombres, __cargar64(s + 8), w) }
+            tb_peso_expr(pesos, nombres, __cargar64(s + 16), w)
+        }
+        si (t == 22) {
+            tb_peso_expr(pesos, nombres, __cargar64(s + 8), w)
+            tb_peso_bloque(pesos, nombres, __cargar64(s + 16), w)
+            si (__cargar64(s + 24) != 0) { tb_peso_bloque(pesos, nombres, __cargar64(s + 24), w) }
+        }
+        si (t == 23) {
+            sea w2 = w * 10
+            si (w2 > 100000) { w2 = 100000 }
+            tb_peso_expr(pesos, nombres, __cargar64(s + 8), w2)
+            tb_peso_bloque(pesos, nombres, __cargar64(s + 16), w2)
+        }
+        si (t == 24 o t == 27) { tb_peso_expr(pesos, nombres, __cargar64(s + 8), w) }
+        si (t == 33) {
+            tb_peso_expr(pesos, nombres, __cargar64(s + 16), w)
+            tb_peso_expr(pesos, nombres, __cargar64(s + 24), w)
+        }
+        si (t == 34) { tb_peso_expr(pesos, nombres, __cargar64(s + 16), w) }
+        i = i + 1
+    }
+    retornar 0
+}
+
+// Casillas en orden: primero las de más peso (a igual peso, el orden de
+// aparición). extra: nombre con peso máximo (acumulador) o 0.
+funcion tb_repartir(params, cuerpo, extra) {
+    sea nombres = vec_nuevo()
+    sea pesos = vec_nuevo()
+    sea i = 0
+    mientras (i < vec_largo(params)) {
+        tb_peso_sumar(pesos, nombres, vec_obtener(params, i), 1)
+        i = i + 1
+    }
+    si (extra != 0) { tb_peso_sumar(pesos, nombres, extra, 1000000000) }
+    tb_peso_bloque(pesos, nombres, cuerpo, 1)
+    sea orden = vec_nuevo()
+    sea usado = vec_nuevo()
+    i = 0
+    mientras (i < vec_largo(nombres)) {
+        vec_agregar(usado, 0)
+        i = i + 1
+    }
+    mientras (vec_largo(orden) < vec_largo(nombres)) {
+        sea mejor = 0 - 1
+        i = 0
+        mientras (i < vec_largo(nombres)) {
+            si (vec_obtener(usado, i) == 0 y (mejor < 0 o vec_obtener(pesos, i) > vec_obtener(pesos, mejor))) { mejor = i }
+            i = i + 1
+        }
+        vec_fijar(usado, mejor, 1)
+        vec_agregar(orden, vec_obtener(nombres, mejor))
+    }
+    retornar orden
 }
 
 // Cuenta "sea" (cota de variables) para el tamaño del marco.
@@ -7926,6 +9003,55 @@ funcion tb_emitir(c, e) {
     cerrar_funcion(c, estado)
     definir_etiqueta(c, saltar_d)
     __guardar64(f + 8, normal)
+    retornar tb_emitir_turbo(c, e, normal, dinamica, inicio)
+}
+
+// Cierre anónimo sin capturas: funcion(a, b) { … } como expresión. Si es
+// turbo, emite la forma dinámica en "dinamica", la entrada normal en
+// "etiqueta" y la cruda; devuelve aridad + 1 (o 0 si no es turbo). El
+// cursor queda tras el cuerpo.
+funcion tb_cierre(c, etiqueta) {
+    si (dinamico(c) == 0) { retornar 0 }
+    sea tabla = tb_tabla(c)
+    si (es_arm64(c) o es_wasm(c) o mem_global(40) != 0 o variable_entorno_es(c, "CFORGE_TURBO", "0")) { retornar 0 }
+    sea inicio = __cargar64(c + 8)
+    sea p = tb_analizar_funcion(c)
+    sea ok = tb_fallo(p) == 0 y tb_cabe_bloque(__cargar64(p + 48)) y tb_termina(__cargar64(p + 48)) y tb_validar(__cargar64(p + 48), tb_copiar_vec(__cargar64(p + 40)))
+    si (ok) {
+        sea llamadas = __cargar64(p + 16)
+        sea j = 0
+        mientras (j < vec_largo(llamadas)) {
+            sea otra = tb_buscar(tabla, vec_obtener(llamadas, j))
+            si (otra == 0 o __cargar64(otra + 40) != 1) { ok = 0 }
+            j = j + 1
+        }
+    }
+    __guardar64(c + 8, inicio)
+    si (ok == 0) { retornar 0 }
+    sea e = mem_reservar(64)
+    __guardar64(e, " cierre")                                        // sin recursión por nombre
+    __guardar64(e + 8, 0)
+    __guardar64(e + 16, nueva_etiqueta(c))
+    __guardar64(e + 24, vec_largo(__cargar64(p + 40)))
+    __guardar64(e + 40, 1)
+    // Forma dinámica del cierre (convención de cierres).
+    sea dinamica = nueva_etiqueta(c)
+    sea saltar_d = saltar_por_encima(c)
+    sea nombres = parametros(c, un_nombre(str_nuevo(0)))
+    sea estado = abrir_cierre(c, dinamica, nombres)
+    vec_liberar(nombres)
+    aplicar_defectos(c)
+    aplicar_comprobaciones(c)
+    bloque(c)
+    cerrar_funcion(c, estado)
+    definir_etiqueta(c, saltar_d)
+    tb_emitir_turbo(c, e, etiqueta, dinamica, inicio)
+    retornar __cargar64(e + 24) + 1
+}
+
+// Entrada normal y cruda (tras compilar la forma dinámica). El cursor
+// vuelve a "inicio" para leer el cuerpo y queda tras él.
+funcion tb_emitir_turbo(c, e, normal, dinamica, inicio) {
     sea fin_tokens = __cargar64(c + 8)
     __guardar64(c + 8, inicio)
 
@@ -7972,8 +9098,8 @@ funcion tb_emitir(c, e) {
     op_saltar(c, dinamica)
 
     // 3) Entrada cruda.
-    sea g = mem_reservar(112)
-    mem_llenar(g, 0, 112)
+    sea g = mem_reservar(192)
+    mem_llenar(g, 0, 192)
     __guardar64(g, c)
     __guardar64(g + 8, vec_nuevo())
     __guardar64(g + 16, nueva_etiqueta(c))                           // salida (rdx ya fijado)
@@ -7983,7 +9109,16 @@ funcion tb_emitir(c, e) {
     __guardar64(g + 56, nueva_etiqueta(c))                           // salida normal (rdx = 0)
     __guardar64(g + 72, __cargar64(e))                               // nombre (recursión de cola)
     __guardar64(g + 80, n)
+    __guardar64(g + 120, vec_nuevo())                                // listas locales
+    __guardar64(g + 128, vec_nuevo())                                // y su ancho
+    __guardar64(g + 144, cuerpo)
     sea cola = tb_tiene_cola(g, cuerpo)
+    sea extra = 0
+    si (cola) { extra = "  acumulador" }
+    sea reparto = tb_repartir(params, cuerpo, extra)
+    si (cola) { vec_agregar(reparto, "  vueltas") }                 // al final: en el marco
+    __guardar64(g + 152, reparto)
+    __guardar64(g + 160, params)
     si (n == 1 y vec_largo(cuerpo) > 0) {
         sea primera = vec_obtener(cuerpo, 0)
         si (__cargar64(primera) == 22 y __cargar64(primera + 24) == 0 y vec_largo(__cargar64(primera + 16)) == 1) {
@@ -7996,7 +9131,7 @@ funcion tb_emitir(c, e) {
     definir_etiqueta(c, __cargar64(e + 16))
     // Solo se guardan los hogares que se usan (rbx, r13, r14, r15). Sin
     // variables en memoria no hace falta marco (rbp).
-    sea total = n + tb_contar_sea(cuerpo) + cola
+    sea total = n + tb_contar_sea(cuerpo) + cola * 2
     sea usados = total
     si (usados > 4) { usados = 4 }
     // (Probado sin marco: resultó más lento en recursión; se deja el marco.)
@@ -8012,26 +9147,47 @@ funcion tb_emitir(c, e) {
         i = i + 1
     }
     si (hueco) { e1(c, 80) }                                         // push rax (hueco)
-    si (total > 4) {
-        e3(c, 72, 129, 236)                                          // sub rsp, imm32
-        e32(c, 8 * (total - 4))
+    sea ranuras = 0
+    si (total > 4) { ranuras = total - 4 }
+    // listas locales: una zona aparte del marco, debajo de las variables
+    __guardar64(g + 112, 8 * usados + 8 * ranuras)
+    si (tb_hay_listas(cuerpo)) {
+        // listas, más el largo de la lista fijada y el r12 de quien llama
+        __guardar64(g + 176, 1)
+        __guardar64(g + 184, tb_lista_desp(g, total))
+        ranuras = ranuras + total + 2
     }
+    si (ranuras > 0) {
+        e3(c, 72, 129, 236)                                          // sub rsp, imm32
+        e32(c, 8 * ranuras)
+    }
+    si (__cargar64(g + 176) != 0) { tb_memoria(c, 137, 12, tb_lista_desp(g, total + 1)) }
     i = 0
     mientras (i < n) {
         vec_agregar(__cargar64(g + 8), vec_obtener(params, i))
-        tb_guardar_var(c, i, tb_argumento(i))
+        tb_guardar_var(c, tb_variable(g, vec_obtener(params, i)), tb_argumento(i))
         i = i + 1
     }
     comprobar_pila(c)
     si (cola) {
         // acumulador (después de los parámetros) y comienzo del ciclo
         vec_agregar(__cargar64(g + 8), "  acumulador")
-        __guardar64(g + 88, n)
+        __guardar64(g + 88, tb_variable(g, "  acumulador"))
         tb_inmediato(c, tb_trabajo(0), 0)
-        tb_guardar_var(c, n, tb_trabajo(0))
+        tb_guardar_var(c, __cargar64(g + 88), tb_trabajo(0))
+        // Cada vuelta del ciclo es una llamada de la forma normal: pasadas
+        // 10000, se repite con la dinámica, que llega al mismo límite de
+        // pila (y al mismo error) que siempre.
+        sea vueltas = tb_variable(g, "  vueltas")
+        tb_guardar_var(c, vueltas, tb_trabajo(0))
         __guardar64(g + 96, nueva_etiqueta(c))
         tb_alinear(c)
         definir_etiqueta(c, __cargar64(g + 96))
+        tb_cargar_var(c, tb_trabajo(0), vueltas)
+        tb_op_inm(c, 0, tb_trabajo(0), 1)
+        tb_guardar_var(c, vueltas, tb_trabajo(0))
+        tb_op_inm(c, 7, tb_trabajo(0), 10000)
+        tb_jcc(c, 15, __cargar64(g + 24))                            // jg: repetir
         __guardar64(g + 64, 1)
     }
     tb_bloque_gen(g, cuerpo)
@@ -8039,6 +9195,7 @@ funcion tb_emitir(c, e) {
     definir_etiqueta(c, __cargar64(g + 56))
     e1(c, 248)                                                       // clc: resultado válido
     definir_etiqueta(c, __cargar64(g + 16))
+    si (__cargar64(g + 176) != 0) { tb_memoria(c, 139, 12, tb_lista_desp(g, total + 1)) }
     si (con_marco) { e4(c, 72, 141, 101, __y_bits(256 - 8 * usados, 255)) }   // lea rsp, [rbp - 8·usados]
     si (hueco) { e4(c, 72, 141, 100, 36) e1(c, 8) }                  // lea rsp, [rsp + 8]
     i = usados - 1
