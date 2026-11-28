@@ -23,6 +23,14 @@ Sitio oficial: [c-forge.org](https://c-forge.org)
 - **Recursión desenrollada un nivel:** en `retornar f(a) + f(b)` la llamada
   que no es de cola se hace en línea con su propio ciclo: `fib(35)` ~60 →
   ~48 ms.
+- **Modo turbo más fino:** recursión en línea hasta tres niveles y sin
+  contador de vueltas cuando el argumento baja de a poco; restas y pasos
+  sin revisar desborde donde no puede haberlo; variables que nunca son
+  negativas (restos con solo una máscara); ciclos de dos vueltas por
+  prueba; ciclos con paso probado sin revisar índices; radix que cuenta
+  todas las cifras en un solo recorrido. Contra Rust (`rustc -O`) en las
+  pruebas de Fuzz Lab: fib30 −7 %, suma 10 M −9 %, criba 2 M y ordenar
+  200 k a la par o mejor.
 - **comptime con tope de 10 s:** si la evaluación al compilar no termina, el
   compilador da un error claro en vez de quedarse esperando.
 - **Regex:** tope de trabajo por llamada (error capturable) y el motor es
