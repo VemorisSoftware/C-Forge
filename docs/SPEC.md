@@ -150,9 +150,17 @@ normal), y también las funciones anónimas. Una lista creada dentro de la
 función (`[]`, `lista_repetir`, `ordenar`) que no sale de ella se guarda
 como enteros sin etiqueta —o bytes, si todo lo que se escribe son
 constantes 0..255—, con lectura, escritura, `agregar` y `longitud` en
-línea; `ordenar` usa radix en código nativo. Funciona en x86-64 y ARM64
-(Linux, macOS, iOS); en WebAssembly, por ahora, se compila de la forma
-normal. `CFORGE_TURBO=0` lo desactiva.
+línea; `ordenar` usa radix en código nativo. También van en turbo los
+decimales (en registros `xmm`/`d`, con `raiz`), las listas que llegan como
+parámetro (se copian a una lista cruda de enteros o decimales al entrar y,
+si se escriben, de vuelta al salir; si un elemento no sirve, se repite con
+la forma normal y la lista no se toca), más de 6 parámetros y las funciones
+chicas de un solo `retornar`, que se copian en línea donde se llaman. Cada
+cuenta decimal da lo mismo que la dinámica: si con valores enteros el
+resultado podría llegar a 2^52 (donde la dinámica pasa a enteros exactos o
+grandes), se vigila y, si llega, se repite con la forma normal. Funciona en
+x86-64 y ARM64 (Linux, macOS, iOS); en WebAssembly, por ahora, se compila
+de la forma normal. `CFORGE_TURBO=0` lo desactiva.
 
 ### 3.3 Opcionales y punteros seguros ✅
 
