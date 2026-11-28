@@ -57,8 +57,8 @@
 funcion ctx_nuevo(tokens) {
     mem_fijar_global(44, 0)                                    // nivel de anidamiento
     mem_fijar_global(51, 0 - 1)                                // mirilla: sin guardado previo
-    sea c = mem_reservar(504)
-    mem_llenar(c, 0, 504)                                       // c + 480/488: tabla turbo                                       // c + 456: funciones abiertas
+    sea c = mem_reservar(512)
+    mem_llenar(c, 0, 512)                                       // c + 480/488: tabla turbo                                       // c + 456: funciones abiertas
     __guardar64(c + 400, 0 - 1)
     // c + 464: posición del código antes de apilar el operando izquierdo;
     // c + 472: posición al terminar un operando derecho literal (ver
@@ -5506,7 +5506,7 @@ funcion aplicar_arreglos(c, va_codigo, va_datos, va_globales, iat) {
         si (tipo == 5) { parchear32(codigo, posicion, vec_obtener(iat, valor)) }
         si (tipo >= 10) {
             sea destino = 0
-            si (tipo == 10 o tipo == 24) {
+            si (tipo == 10 o tipo == 11 o tipo == 24) {
                 destino = vec_obtener(etiquetas, valor)
                 si (destino < 0) { rt_panico("etiqueta sin definir") }
                 destino = va_codigo + destino
@@ -6883,7 +6883,7 @@ funcion comprobar_pila(c) {
     retornar 0
 }
 
-// ══ Modo turbo (x86-64) ══════════════════════════════════════════════════
+// ══ Modo turbo (x86-64 y ARM64) ═══════════════════════════════════════════
 // Una función cuyos parámetros y resultado son todos i64 y cuyo cuerpo solo
 // usa enteros (+ - * %, comparaciones en condiciones, si/sino/mientras,
 // llamadas a otras funciones turbo) se compila con registros en vez de la
@@ -7414,7 +7414,7 @@ funcion tb_tabla(c) {
     __guardar64(c + 480, tabla)
     __guardar64(c + 488, __cargar64(c + 40))
     __guardar64(c + 496, 0)                                          // rutina de orden (por pasada)
-    si (es_arm64(c) o es_wasm(c) o mem_global(40) != 0) { retornar tabla }
+    si (es_wasm(c) o mem_global(40) != 0) { retornar tabla }
     si (variable_entorno_es(c, "CFORGE_TURBO", "0")) { retornar tabla }
     sea tokens = __cargar64(c)
     sea guardado = __cargar64(c + 8)
@@ -7503,6 +7503,142 @@ funcion tb_de(c, f) {
     retornar 0
 }
 
+// ── Codificación ARM64 ───────────────────────────────────────────────────
+// El modo turbo se escribe con los números de registro de x86-64; en ARM64
+// cada uno va a un registro físico: rax x7 · rcx x3 · rdx x2 · rbx x24 ·
+// rsp x28 · rbp x29 · rsi x1 · rdi x0 · r8 x4 · r9 x5 · r10 x10 · r11 x11 ·
+// r12 x22 · r13–r15 x25–x27. Argumentos en x0–x5 (rdi, rsi, rdx, rcx, r8,
+// r9), resultado en x7; la pila es x28 (la del lenguaje) y x30 se guarda
+// al entrar. x16 y x17 son auxiliares. El acarreo indica "repetir con la
+// dinámica" (cmp xzr, xzr lo enciende; cmn xzr, xzr lo apaga). El
+// desborde de mul se prueba con smulh: tras tb_imul, "jo" es b.ne.
+funcion tba_f(r) {
+    si (r == 0) { retornar 7 }
+    si (r == 1) { retornar 3 }
+    si (r == 2) { retornar 2 }
+    si (r == 3) { retornar 24 }
+    si (r == 4) { retornar 28 }
+    si (r == 5) { retornar 29 }
+    si (r == 6) { retornar 1 }
+    si (r == 7) { retornar 0 }
+    si (r == 8) { retornar 4 }
+    si (r == 9) { retornar 5 }
+    si (r == 12) { retornar 22 }
+    si (r >= 13) { retornar r + 12 }
+    retornar r
+}
+
+funcion tba_rr(c, op, dst, src) {
+    sea d = tba_f(dst)
+    sea m = tba_f(src)
+    __guardar64(c + 504, 0)
+    si (op == 1) { retornar a64(c, 2868903936 + m * 65536 + d * 32 + d) }    // adds d, d, m
+    si (op == 41) { retornar a64(c, 3942645760 + m * 65536 + d * 32 + d) }   // subs d, d, m
+    si (op == 57) { retornar a64(c, 3942645760 + m * 65536 + d * 32 + 31) }  // cmp d, m
+    si (op == 137) { retornar a64_mov(c, d, m) }
+    si (op == 33) { retornar a64(c, 2315255808 + m * 65536 + d * 32 + d) }   // and d, d, m
+    si (op == 133) { retornar a64(c, 3925868544 + m * 65536 + d * 32 + 31) } // tst d, m
+    rt_panico("turbo arm64: operación sin traducir")
+    retornar 0
+}
+
+// d ← d · m (físicos); deja Z = 1 si no se desbordó.
+funcion tba_mul_vigilado(c, d, m) {
+    a64(c, 2604694528 + m * 65536 + d * 32 + 16)                   // smulh x16, d, m
+    a64(c, 2600500224 + m * 65536 + d * 32 + d)                    // mul d, d, m
+    a64(c, 3951034368 + d * 65536 + 63 * 1024 + 16 * 32 + 31)      // cmp x16, d, asr #63
+    __guardar64(c + 504, 1)
+    retornar 0
+}
+
+// ext: 0 add · 5 sub · 7 cmp · 4 and (con x físico)
+funcion tba_op_inm(c, ext, x, v) {
+    __guardar64(c + 504, 0)
+    si (ext == 0 o ext == 5) {
+        sea suma = ext == 0
+        si (v < 0 y v > 0 - 4096) {
+            v = 0 - v
+            suma = 1 - suma
+        }
+        si (v >= 0 y v < 4096) {
+            si (suma) { retornar a64(c, 2969567232 + v * 1024 + x * 32 + x) }   // adds x, x, #v
+            retornar a64(c, 4043309056 + v * 1024 + x * 32 + x)                 // subs x, x, #v
+        }
+        a64_constante(c, 16, v)
+        si (suma) { retornar a64(c, 2868903936 + 16 * 65536 + x * 32 + x) }
+        retornar a64(c, 3942645760 + 16 * 65536 + x * 32 + x)
+    }
+    si (ext == 7) {
+        si (v >= 0 y v < 4096) { retornar a64(c, 4043309056 + v * 1024 + x * 32 + 31) }                 // cmp x, #v
+        si (v < 0 y v > 0 - 4096) { retornar a64(c, 2969567232 + (0 - v) * 1024 + x * 32 + 31) }       // cmn x, #-v
+        a64_constante(c, 16, v)
+        retornar a64(c, 3942645760 + 16 * 65536 + x * 32 + 31)
+    }
+    si (ext == 4) {
+        sea k = potencia_de_dos(v + 1)
+        si (v > 0 y k >= 1 y k <= 63) { retornar a64(c, 2453667840 + (k - 1) * 1024 + x * 32 + x) }   // and x, x, #(2^k − 1)
+        a64_constante(c, 16, v)
+        retornar a64(c, 2315255808 + 16 * 65536 + x * 32 + x)
+    }
+    rt_panico("turbo arm64: inmediato sin traducir")
+    retornar 0
+}
+
+// [x29 + d]: 139 cargar · 137 guardar · 59 comparar
+funcion tba_memoria(c, op, r, d) {
+    __guardar64(c + 504, 0)
+    si (op == 139) { retornar a64_memoria(c, 0, tba_f(r), 29, d) }
+    si (op == 137) { retornar a64_memoria(c, 1, tba_f(r), 29, d) }
+    si (op == 59) {
+        a64_memoria(c, 0, 16, 29, d)
+        retornar a64(c, 3942645760 + 16 * 65536 + tba_f(r) * 32 + 31)   // cmp r, x16
+    }
+    rt_panico("turbo arm64: memoria sin traducir")
+    retornar 0
+}
+
+// Salto condicional con los códigos de x86 (jo jno jc jae je jne ja jl jge
+// jle jg); b.cond directo (±1 MiB: los saltos quedan dentro de la función).
+funcion tba_jcc(c, cc, etiqueta) {
+    sea cond = 0 - 1
+    si (cc == 0) { cond = 6 }
+    si (cc == 1) { cond = 7 }
+    si (cc == 0 y __cargar64(c + 504) == 1) { cond = 1 }
+    si (cc == 1 y __cargar64(c + 504) == 1) { cond = 0 }
+    si (cc == 2 o cc == 3) { cond = 2 }
+    si (cc == 4) { cond = 0 }
+    si (cc == 5) { cond = 1 }
+    si (cc == 7) { cond = 8 }
+    si (cc == 12) { cond = 11 }
+    si (cc == 13) { cond = 10 }
+    si (cc == 14) { cond = 13 }
+    si (cc == 15) { cond = 12 }
+    si (cond < 0) { rt_panico("turbo arm64: salto sin traducir") }
+    a64_arreglo(c, 11, etiqueta)
+    retornar a64(c, 1409286144 + cond)                             // b.cond
+}
+
+// [base + índice·ancho] (físicos)
+funcion tba_elemento(c, guardar, ancho, t, base, indice) {
+    si (ancho == 8) {
+        si (guardar) { retornar a64(c, 4162877440 + indice * 65536 + base * 32 + t) }   // str t, [base, i, lsl #3]
+        retornar a64(c, 4167071744 + indice * 65536 + base * 32 + t)                    // ldr
+    }
+    si (guardar) { retornar a64(c, 941647872 + indice * 65536 + base * 32 + t) }        // strb
+    retornar a64(c, 945842176 + indice * 65536 + base * 32 + t)                         // ldrb
+}
+
+// x ← x % v con el multiplicador mágico (q = mulhi(x, M) >> s, +1 si x < 0)
+funcion tba_resto_magia(c, x, m, s, v, signo) {
+    a64_constante(c, 16, m)
+    a64(c, 2604694528 + 16 * 65536 + x * 32 + 17)                  // smulh x17, x, x16
+    si (s > 0) { a64(c, 2470509568 + s * 65536 + 17 * 32 + 17) }   // asr x17, x17, #s
+    si (signo) { a64(c, 3414163456 + x * 65536 + 63 * 1024 + 17 * 32 + 17) }   // sub x17, x17, x, asr #63
+    a64_constante(c, 16, v)
+    a64(c, 2600501248 + 16 * 65536 + x * 1024 + 17 * 32 + x)       // msub x, x17, x16, x
+    retornar 0
+}
+
 // ── Codificación x86-64 ──────────────────────────────────────────────────
 // Registros: 0 rax 1 rcx 2 rdx 3 rbx 4 rsp 5 rbp 6 rsi 7 rdi 8-15 r8-r15.
 
@@ -7516,6 +7652,7 @@ funcion tb_rex(c, r, b) {
 
 // op r/m64(dst), r64(src): mov 89, add 01, sub 29, cmp 39, test 85
 funcion tb_rr(c, op, dst, src) {
+    si (es_arm64(c)) { retornar tba_rr(c, op, dst, src) }
     tb_rex(c, src, dst)
     e1(c, op)
     e1(c, 192 + __y_bits(src, 7) * 8 + __y_bits(dst, 7))
@@ -7528,6 +7665,7 @@ funcion tb_mov(c, dst, src) {
 }
 
 funcion tb_imul(c, dst, src) {
+    si (es_arm64(c)) { retornar tba_mul_vigilado(c, tba_f(dst), tba_f(src)) }
     tb_rex(c, dst, src)
     e2(c, 15, 175)
     e1(c, 192 + __y_bits(dst, 7) * 8 + __y_bits(src, 7))
@@ -7537,6 +7675,7 @@ funcion tb_imul(c, dst, src) {
 funcion tb_cabe32(v) { retornar v >= 0 - 2147483648 y v <= 2147483647 }
 
 funcion tb_inmediato(c, r, v) {
+    si (es_arm64(c)) { retornar a64_constante(c, tba_f(r), v) }
     si (v == 0) {
         si (r >= 8) { e1(c, 69) }                                    // REX.RB
         e2(c, 49, 192 + __y_bits(r, 7) * 9)                          // xor r32, r32
@@ -7557,6 +7696,7 @@ funcion tb_inmediato(c, r, v) {
 
 // add/sub/cmp r, imm32 (ext: 0 add, 5 sub, 7 cmp)
 funcion tb_op_inm(c, ext, r, v) {
+    si (es_arm64(c)) { retornar tba_op_inm(c, ext, tba_f(r), v) }
     tb_rex(c, 0, r)
     e2(c, 129, 192 + ext * 8 + __y_bits(r, 7))
     e32(c, v)
@@ -7565,6 +7705,7 @@ funcion tb_op_inm(c, ext, r, v) {
 
 // [rbp + d]
 funcion tb_memoria(c, op, r, d) {
+    si (es_arm64(c)) { retornar tba_memoria(c, op, r, d) }
     tb_rex(c, r, 0)
     e2(c, op, 133 + __y_bits(r, 7) * 8)
     e32(c, d)
@@ -7572,12 +7713,14 @@ funcion tb_memoria(c, op, r, d) {
 }
 
 funcion tb_empujar(c, r) {
+    si (es_arm64(c)) { retornar a64_empujar_fis(c, tba_f(r)) }
     si (r >= 8) { e1(c, 65) }
     e1(c, 80 + __y_bits(r, 7))
     retornar 0
 }
 
 funcion tb_sacar(c, r) {
+    si (es_arm64(c)) { retornar a64_sacar_fis(c, tba_f(r)) }
     si (r >= 8) { e1(c, 65) }
     e1(c, 88 + __y_bits(r, 7))
     retornar 0
@@ -7586,6 +7729,10 @@ funcion tb_sacar(c, r) {
 // Rellena con nop hasta múltiplo de 16 (entradas de función y ciclos: el
 // procesador las busca más rápido y los tiempos no dependen de dónde caen).
 funcion tb_alinear(c) {
+    si (es_arm64(c)) {
+        mientras (__y_bits(posicion_codigo(c), 15) != 0) { a64(c, 3573751839) }   // nop
+        retornar 0
+    }
     // En Linux el código empieza tras las cabeceras ELF (64 + 56 = 120 bytes).
     sea desfase = 0
     si (es_macos(c) == 0 y es_windows(c) == 0) { desfase = 120 }
@@ -7594,6 +7741,7 @@ funcion tb_alinear(c) {
 }
 
 funcion tb_jcc(c, cc, etiqueta) {
+    si (es_arm64(c)) { retornar tba_jcc(c, cc, etiqueta) }
     e2(c, 15, 128 + cc)
     nuevo_arreglo(c, 0, etiqueta)
     retornar 0
@@ -7649,6 +7797,7 @@ funcion tb_variable(g, nombre) {
 // ── Listas locales ───────────────────────────────────────────────────
 // mov dst, [base + d8]
 funcion tb_carga_base(c, dst, base, d) {
+    si (es_arm64(c)) { retornar a64_memoria(c, 0, tba_f(dst), tba_f(base), d) }
     tb_rex(c, dst, base)
     e2(c, 139, 64 + __y_bits(dst, 7) * 8 + __y_bits(base, 7))
     e1(c, d)
@@ -7657,6 +7806,7 @@ funcion tb_carga_base(c, dst, base, d) {
 
 // mov [base + d8], src
 funcion tb_guarda_base(c, base, d, src) {
+    si (es_arm64(c)) { retornar a64_memoria(c, 1, tba_f(src), tba_f(base), d) }
     tb_rex(c, src, base)
     e2(c, 137, 64 + __y_bits(src, 7) * 8 + __y_bits(base, 7))
     e1(c, d)
@@ -7714,6 +7864,7 @@ funcion tb_etiquetar(g, r) {
     sea c = __cargar64(g)
     tb_rr(c, 1, r, r)                                              // add r, r
     tb_jcc(c, 0, __cargar64(g + 24))
+    si (es_arm64(c)) { retornar a64(c, 2990538752 + tba_f(r) * 33) }   // orr r, r, #1
     tb_rex(c, 0, r)
     e3(c, 131, 200 + __y_bits(r, 7), 1)                           // or r, 1
     retornar 0
@@ -7734,6 +7885,7 @@ funcion tb_runtime(g, d, nombre, args) {
         i = i + 1
     }
     llamar_runtime(c, nombre, vec_largo(args))
+    si (es_arm64(c)) { a64_mov(c, 7, 0) }                          // resultado: x0 → "rax"
     i = d - 1
     mientras (i >= 0) {
         tb_sacar(c, tb_trabajo(i))
@@ -7745,6 +7897,7 @@ funcion tb_runtime(g, d, nombre, args) {
 // Acceso [base + índice·ancho]: op 139 cargar r (ancho 8), 137 guardar r
 // (ancho 8), "byte" con ancho 1 (movzx al cargar, mov r8 al guardar).
 funcion tb_elemento(c, guardar, ancho, r, base, indice) {
+    si (es_arm64(c)) { retornar tba_elemento(c, guardar, ancho, tba_f(r), tba_f(base), tba_f(indice)) }
     sea x = 64
     si (r >= 8) { x = x + 4 }
     si (indice >= 8) { x = x + 2 }
@@ -7771,6 +7924,10 @@ funcion tb_elemento(c, guardar, ancho, r, base, indice) {
 
 // mov byte/qword [base + índice·ancho], inmediato
 funcion tb_elemento_inm(c, ancho, base, indice, v) {
+    si (es_arm64(c)) {
+        a64_constante(c, 16, v)
+        retornar tba_elemento(c, 1, ancho, 16, tba_f(base), tba_f(indice))
+    }
     sea x = 64
     si (indice >= 8) { x = x + 2 }
     si (base >= 8) { x = x + 1 }
@@ -7842,6 +7999,7 @@ funcion tb_lista_expr(g, e, d) {
 // la cabecera en rax. Los registros de trabajo vivos se guardan.
 funcion tb_ordenar_nativo(g, d) {
     sea c = __cargar64(g)
+    si (es_arm64(c)) { retornar tba_ordenar_nativo(g, d) }
     sea i = 0
     mientras (i < d) {
         tb_empujar(c, tb_trabajo(i))
@@ -7869,6 +8027,192 @@ funcion tb_ordenar_nativo(g, d) {
         i = i - 1
     }
     retornar 0
+}
+
+// Lo mismo en ARM64 (cabecera en x7).
+funcion tba_ordenar_nativo(g, d) {
+    sea c = __cargar64(g)
+    sea i = 0
+    mientras (i < d) {
+        tb_empujar(c, tb_trabajo(i))
+        i = i + 1
+    }
+    sea saltar = nueva_etiqueta(c)
+    a64_empujar_fis(c, 7)                                          // cabecera
+    a64_empujar_fis(c, 7)                                          // argumento
+    llamar_runtime(c, "dyn_crudo_temporal", 1)                     // x0 = búfer o 0
+    a64(c, 3036676160)                                             // cbnz x0, +8
+    a64_b(c, saltar)
+    a64_memoria(c, 0, 11, 28, 0)                                   // x11 = cabecera
+    a64_empujar_fis(c, 0)                                          // búfer
+    a64_mov(c, 2, 0)                                               // x2 = búfer
+    a64_memoria(c, 0, 1, 11, 0)                                    // x1 = n
+    a64_memoria(c, 0, 0, 11, 16)                                   // x0 = datos
+    a64(c, 2332033024 + 1 * 65536 + 3 * 1024 + 2 * 32 + 3)         // add x3, x2, x1, lsl #3
+    a64_bl(c, tba_rutina_radix(c))
+    llamar_runtime(c, "mem_liberar", 1)
+    definir_etiqueta(c, saltar)
+    a64_sacar_fis(c, 7)
+    i = d - 1
+    mientras (i >= 0) {
+        tb_sacar(c, tb_trabajo(i))
+        i = i - 1
+    }
+    retornar 0
+}
+
+// Radix de ARM64: x0 = datos, x1 = n, x2 = búfer, x3 = contadores. Solo
+// registros de trabajo (x4–x17); hoja (vuelve con x30).
+funcion tba_rutina_radix(c) {
+    si (__cargar64(c + 496) != 0) { retornar __cargar64(c + 496) }
+    sea rutina = nueva_etiqueta(c)
+    __guardar64(c + 496, rutina)
+    __guardar64(c + 504, 0)
+    sea saltar = nueva_etiqueta(c)
+    op_saltar(c, saltar)
+    definir_etiqueta(c, rutina)
+    sea l1 = nueva_etiqueta(c)
+    sea l1f = nueva_etiqueta(c)
+    sea rango_ok = nueva_etiqueta(c)
+    sea pc = nueva_etiqueta(c)
+    sea pcf = nueva_etiqueta(c)
+    sea z = nueva_etiqueta(c)
+    sea h = nueva_etiqueta(c)
+    sea hp = nueva_etiqueta(c)
+    sea hf = nueva_etiqueta(c)
+    sea pp = nueva_etiqueta(c)
+    sea pl = nueva_etiqueta(c)
+    sea plf = nueva_etiqueta(c)
+    sea sp = nueva_etiqueta(c)
+    sea sl = nueva_etiqueta(c)
+    sea slf = nueva_etiqueta(c)
+    sea hecho = nueva_etiqueta(c)
+    sea cb = nueva_etiqueta(c)
+    sea fin = nueva_etiqueta(c)
+    a64_mov(c, 8, 0)                                               // a
+    a64_mov(c, 9, 2)                                               // b
+    a64_mov(c, 6, 3)                                               // contadores
+    a64_memoria(c, 0, 10, 8, 0)                                    // x10 = mínimo
+    a64_mov(c, 11, 10)                                             // x11 = máximo
+    a64_constante(c, 12, 1)
+    definir_etiqueta(c, l1)
+    a64(c, 3942645760 + 1 * 65536 + 12 * 32 + 31)                  // cmp x12, x1
+    tba_jcc(c, 13, l1f)
+    tba_elemento(c, 0, 8, 4, 8, 12)                                // x4 = a[i]
+    a64(c, 3942645760 + 10 * 65536 + 4 * 32 + 31)                  // cmp x4, x10
+    a64(c, 2592079872 + 10 * 65536 + 11 * 4096 + 4 * 32 + 10)      // csel x10, x4, x10, lt
+    a64(c, 3942645760 + 11 * 65536 + 4 * 32 + 31)                  // cmp x4, x11
+    a64(c, 2592079872 + 11 * 65536 + 12 * 4096 + 4 * 32 + 11)      // csel x11, x4, x11, gt
+    a64(c, 2432696320 + 1024 + 12 * 32 + 12)                       // add x12, x12, #1
+    a64_b(c, l1)
+    definir_etiqueta(c, l1f)
+    a64(c, 3942645760 + 10 * 65536 + 11 * 32 + 11)                 // subs x11, x11, x10
+    tba_jcc(c, 1, rango_ok)                                        // b.vc
+    a64_constante(c, 10, 0 - 9223372036854775807 - 1)
+    a64_constante(c, 11, 0 - 1)
+    definir_etiqueta(c, rango_ok)
+    a64_constante(c, 13, 0)                                        // cifras
+    a64_constante(c, 15, 0)                                        // corrimiento
+    definir_etiqueta(c, pc)
+    a64(c, 4043309056 + 64 * 1024 + 15 * 32 + 31)                  // cmp x15, #64
+    tba_jcc(c, 13, pcf)
+    a64(c, 2596283392 + 15 * 65536 + 11 * 32 + 4)                  // lsr x4, x11, x15
+    a64(c, 3036676160 + 4)                                         // cbnz x4, +8
+    a64_b(c, pcf)
+    a64(c, 2432696320 + 1024 + 13 * 32 + 13)                       // add x13, x13, #1
+    a64(c, 2432696320 + 11 * 1024 + 15 * 32 + 15)                  // add x15, x15, #11
+    a64_b(c, pc)
+    definir_etiqueta(c, pcf)
+    a64(c, 3036676160 + 13)                                        // cbnz x13, +8
+    a64_b(c, hecho)
+    // contadores en cero
+    a64(c, 3544186880 + 53 * 65536 + 52 * 1024 + 13 * 32 + 4)      // lsl x4, x13, #11
+    a64_mov(c, 5, 6)
+    definir_etiqueta(c, z)
+    a64(c, 4160783360 + 5 * 32 + 31)                               // str xzr, [x5], #8
+    a64(c, 4043309056 + 1024 + 4 * 32 + 4)                         // subs x4, x4, #1
+    tba_jcc(c, 5, z)
+    // un recorrido: todas las cifras
+    a64_constante(c, 12, 0)
+    definir_etiqueta(c, h)
+    a64(c, 3942645760 + 1 * 65536 + 12 * 32 + 31)
+    tba_jcc(c, 13, hf)
+    tba_elemento(c, 0, 8, 4, 8, 12)
+    a64(c, 3405774848 + 10 * 65536 + 4 * 32 + 4)                   // sub x4, x4, x10
+    a64_mov(c, 5, 6)
+    a64_mov(c, 14, 13)
+    definir_etiqueta(c, hp)
+    a64(c, 2453667840 + 10 * 1024 + 4 * 32 + 16)                   // and x16, x4, #2047
+    tba_elemento(c, 0, 8, 17, 5, 16)
+    a64(c, 2432696320 + 1024 + 17 * 32 + 17)                       // add x17, x17, #1
+    tba_elemento(c, 1, 8, 17, 5, 16)
+    a64(c, 3544251392 + 11 * 65536 + 4 * 32 + 4)                   // lsr x4, x4, #11
+    a64_sumar_inm(c, 5, 5, 16384)
+    a64(c, 4043309056 + 1024 + 14 * 32 + 14)                       // subs x14, x14, #1
+    tba_jcc(c, 5, hp)
+    a64(c, 2432696320 + 1024 + 12 * 32 + 12)
+    a64_b(c, h)
+    definir_etiqueta(c, hf)
+    // sumas prefijas
+    a64_mov(c, 5, 6)
+    a64_mov(c, 14, 13)
+    definir_etiqueta(c, pp)
+    a64_constante(c, 12, 0)
+    a64_constante(c, 16, 0)
+    definir_etiqueta(c, pl)
+    a64(c, 4043309056 + 2048 * 1024 + 12 * 32 + 31)                // cmp x12, #2048
+    tba_jcc(c, 13, plf)
+    tba_elemento(c, 0, 8, 17, 5, 12)
+    tba_elemento(c, 1, 8, 16, 5, 12)
+    a64(c, 2332033024 + 17 * 65536 + 16 * 32 + 16)                 // add x16, x16, x17
+    a64(c, 2432696320 + 1024 + 12 * 32 + 12)
+    a64_b(c, pl)
+    definir_etiqueta(c, plf)
+    a64_sumar_inm(c, 5, 5, 16384)
+    a64(c, 4043309056 + 1024 + 14 * 32 + 14)
+    tba_jcc(c, 5, pp)
+    // repartos (estables)
+    a64_constante(c, 15, 0)
+    a64_mov(c, 5, 6)
+    a64_mov(c, 14, 13)
+    definir_etiqueta(c, sp)
+    a64_constante(c, 12, 0)
+    definir_etiqueta(c, sl)
+    a64(c, 3942645760 + 1 * 65536 + 12 * 32 + 31)
+    tba_jcc(c, 13, slf)
+    tba_elemento(c, 0, 8, 4, 8, 12)                                // v
+    a64(c, 3405774848 + 10 * 65536 + 4 * 32 + 16)                  // sub x16, x4, x10
+    a64(c, 2596283392 + 15 * 65536 + 16 * 32 + 16)                 // lsr x16, x16, x15
+    a64(c, 2453667840 + 10 * 1024 + 16 * 32 + 16)                  // and x16, x16, #2047
+    tba_elemento(c, 0, 8, 17, 5, 16)                               // posición
+    tba_elemento(c, 1, 8, 4, 9, 17)                                // b[pos] = v
+    a64(c, 2432696320 + 1024 + 17 * 32 + 17)
+    tba_elemento(c, 1, 8, 17, 5, 16)
+    a64(c, 2432696320 + 1024 + 12 * 32 + 12)
+    a64_b(c, sl)
+    definir_etiqueta(c, slf)
+    a64_mov(c, 16, 8)
+    a64_mov(c, 8, 9)
+    a64_mov(c, 9, 16)
+    a64(c, 2432696320 + 11 * 1024 + 15 * 32 + 15)                  // add x15, x15, #11
+    a64_sumar_inm(c, 5, 5, 16384)
+    a64(c, 4043309056 + 1024 + 14 * 32 + 14)
+    tba_jcc(c, 5, sp)
+    definir_etiqueta(c, hecho)
+    a64(c, 3942645760 + 0 * 65536 + 8 * 32 + 31)                   // cmp x8, x0
+    tba_jcc(c, 4, fin)
+    a64_constante(c, 12, 0)
+    definir_etiqueta(c, cb)
+    a64(c, 3942645760 + 1 * 65536 + 12 * 32 + 31)
+    tba_jcc(c, 13, fin)
+    tba_elemento(c, 0, 8, 4, 8, 12)
+    tba_elemento(c, 1, 8, 4, 0, 12)
+    a64(c, 2432696320 + 1024 + 12 * 32 + 12)
+    a64_b(c, cb)
+    definir_etiqueta(c, fin)
+    a64(c, 3596551104)                                             // ret
+    definir_etiqueta(c, saltar)
+    retornar rutina
 }
 
 // Radix LSD de 11 bits (contadores en la caché L1) sobre x - mínimo, en
@@ -8114,8 +8458,12 @@ funcion tb_expr(g, e, d) {
     }
     si (t == 4) {
         tb_expr(g, __cargar64(e + 8), d)
-        tb_rex(c, 0, r)
-        e2(c, 247, 216 + __y_bits(r, 7))                          // neg
+        si (es_arm64(c)) {
+            a64(c, 3942646752 + tba_f(r) * 65537)                  // negs r, r
+        } sino {
+            tb_rex(c, 0, r)
+            e2(c, 247, 216 + __y_bits(r, 7))                      // neg
+        }
         tb_jcc(c, 0, __cargar64(g + 24))
         retornar 0
     }
@@ -8127,6 +8475,10 @@ funcion tb_expr(g, e, d) {
     // p - c sin desborde con p en un registro: lea r, [p - c]
     si (op == 2 y __cargar64(der) == 1 y __cargar64(der + 8) >= 0 y __cargar64(der + 8) < 128 y tb_acotado(g, izq)) {
         sea x = tb_operando(g, izq)
+        si (x >= 0 y es_arm64(c)) {
+            a64(c, 3506438144 + __cargar64(der + 8) * 1024 + tba_f(x) * 32 + tba_f(r))   // sub r, x, #c
+            retornar 0
+        }
         si (x >= 0 y __y_bits(x, 7) != 4) {
             sea rex = 72
             si (r >= 8) { rex = rex + 4 }
@@ -8150,7 +8502,11 @@ funcion tb_expr(g, e, d) {
         sea v = __cargar64(der + 8)
         si (op == 1) { tb_op_inm(c, 0, r, v) }
         si (op == 2) { tb_op_inm(c, 5, r, v) }
-        si (op == 3) {
+        si (op == 3 y es_arm64(c)) {
+            a64_constante(c, 17, v)
+            tba_mul_vigilado(c, tba_f(r), 17)
+        }
+        si (op == 3 y es_arm64(c) == 0) {
             tb_rex(c, r, r)
             e2(c, 105, 192 + __y_bits(r, 7) * 9)                  // imul r, r, imm32
             e32(c, v)
@@ -8180,6 +8536,7 @@ funcion tb_resto(g, der, d, literal) {
             // Resto por constante: q = (mulhi(x, M) >> s) + (x < 0); r = x - q·v
             sea s = magia_corrimiento(v)
             sea m = magia_multiplicador(v, s)
+            si (es_arm64(c)) { retornar tba_resto_magia(c, tba_f(r), m, s, v, __cargar64(g + 256) == 0) }
             e2(c, 72, 184)                                         // mov rax, M
             e32(c, __y_bits(m, 4294967295))
             e32(c, __desplazar_der(m, 32))
@@ -8207,6 +8564,15 @@ funcion tb_resto(g, der, d, literal) {
                 tb_inmediato(c, 2, v - 1)
                 tb_rr(c, 33, r, 2)
             }
+            retornar 0
+        }
+        si (k >= 1 y k <= 62 y es_arm64(c)) {
+            sea x = tba_f(r)
+            a64(c, 2470509568 + 63 * 65536 + x * 32 + 16)          // asr x16, x, #63
+            a64(c, 3544251392 + (64 - k) * 65536 + 16 * 32 + 16)   // lsr x16, x16, #(64 - k)
+            a64(c, 2332033024 + 16 * 65536 + x * 32 + x)           // add x, x, x16
+            tba_op_inm(c, 4, x, v - 1)                             // and x, máscara
+            a64(c, 3405774848 + 16 * 65536 + x * 32 + x)           // sub x, x, x16
             retornar 0
         }
         si (k >= 1 y k <= 62) {
@@ -8239,6 +8605,12 @@ funcion tb_resto(g, der, d, literal) {
     tb_inmediato(c, r, 0)                                          // x % -1 = 0 (sin #DE)
     op_saltar(c, fin)
     definir_etiqueta(c, normal)
+    si (es_arm64(c)) {
+        a64(c, 2596277248 + tba_f(s) * 65536 + tba_f(r) * 32 + 16)              // sdiv x16, r, s
+        a64(c, 2600501248 + tba_f(s) * 65536 + tba_f(r) * 1024 + 16 * 32 + tba_f(r))   // msub r, x16, s, r
+        definir_etiqueta(c, fin)
+        retornar 0
+    }
     tb_mov(c, 0, r)
     e2(c, 72, 153)                                                 // cqo
     tb_rex(c, 0, s)
@@ -8757,8 +9129,14 @@ funcion tb_contar_vuelta(g) {
     si (vueltas < 4) {
         tb_op_inm(c, 5, tb_hogar(vueltas), 1)                      // sub hogar, 1
     } sino {
-        tb_memoria(c, 131, 5, tb_desplazamiento(vueltas))          // sub qword [rbp + d], 1
-        e1(c, 1)
+        si (es_arm64(c)) {
+            a64_memoria(c, 0, 16, 29, tb_desplazamiento(vueltas))
+            a64(c, 4043310608)                                     // subs x16, x16, #1
+            a64_memoria(c, 1, 16, 29, tb_desplazamiento(vueltas))
+        } sino {
+            tb_memoria(c, 131, 5, tb_desplazamiento(vueltas))      // sub qword [rbp + d], 1
+            e1(c, 1)
+        }
     }
     tb_jcc(c, 12, __cargar64(g + 24))                              // jl: más de 10000, repetir
     retornar 0
@@ -9674,7 +10052,7 @@ funcion tb_emitir(c, e) {
 funcion tb_cierre(c, etiqueta) {
     si (dinamico(c) == 0) { retornar 0 }
     sea tabla = tb_tabla(c)
-    si (es_arm64(c) o es_wasm(c) o mem_global(40) != 0 o variable_entorno_es(c, "CFORGE_TURBO", "0")) { retornar 0 }
+    si (es_wasm(c) o mem_global(40) != 0 o variable_entorno_es(c, "CFORGE_TURBO", "0")) { retornar 0 }
     sea inicio = __cargar64(c + 8)
     sea p = tb_analizar_funcion(c)
     sea ok = tb_fallo(p) == 0 y tb_cabe_bloque(__cargar64(p + 48)) y tb_termina(__cargar64(p + 48)) y tb_validar(__cargar64(p + 48), tb_copiar_vec(__cargar64(p + 40)))
@@ -9712,6 +10090,70 @@ funcion tb_cierre(c, etiqueta) {
 
 // Entrada normal y cruda (tras compilar la forma dinámica). El cursor
 // vuelve a "inicio" para leer el cuerpo y queda tras él.
+// Entrada normal en ARM64: argumentos en la pila del lenguaje (x28), como
+// cualquier función; si son enteros chicos, a la entrada cruda.
+funcion tba_entrada_normal(c, e, n, dinamica) {
+    sea repetir = nueva_etiqueta(c)
+    sea grande = nueva_etiqueta(c)
+    a64_empujar_fis(c, 30)
+    a64_empujar_fis(c, 29)
+    a64_mov(c, 29, 28)
+    sea i = 0
+    mientras (i < n) {
+        a64_memoria(c, 0, 7, 29, 16 + 8 * (n - 1 - i))            // x7 = argumento
+        a64(c, 4064280576 + 7 * 32 + 31)                          // tst x7, #1
+        tba_jcc(c, 4, repetir)                                     // no es entero chico
+        a64(c, 2470509568 + 1 * 65536 + 7 * 32 + 7)                // asr x7, x7, #1
+        a64_mov(c, tba_f(tb_argumento(i)), 7)
+        i = i + 1
+    }
+    a64_bl(c, __cargar64(e + 16))
+    tba_jcc(c, 2, repetir)                                         // acarreo: repetir con la dinámica
+    a64_mov(c, 3, 7)
+    a64(c, 2868903936 + 7 * 65536 + 7 * 32 + 0)                    // adds x0, x7, x7
+    tba_jcc(c, 0, grande)
+    a64(c, 2432696320 + 1024 + 0 * 32 + 0)                         // add x0, x0, #1
+    a64_mov(c, 28, 29)
+    a64_sacar_fis(c, 29)
+    a64_sacar_fis(c, 30)
+    a64(c, 3596551104)                                             // ret
+    definir_etiqueta(c, grande)
+    a64_empujar_fis(c, 3)
+    llamar_runtime(c, "dyn_turbo_entero", 1)
+    a64_mov(c, 28, 29)
+    a64_sacar_fis(c, 29)
+    a64_sacar_fis(c, 30)
+    a64(c, 3596551104)
+    definir_etiqueta(c, repetir)
+    a64_mov(c, 28, 29)
+    a64_sacar_fis(c, 29)
+    a64_sacar_fis(c, 30)
+    op_saltar(c, dinamica)
+    retornar 0
+}
+
+// Salida de la entrada cruda en ARM64 (normal: acarreo apagado; repetir:
+// encendido).
+funcion tba_salida(c, g, usados, total) {
+    definir_etiqueta(c, __cargar64(g + 56))
+    a64(c, 2870936575)                                             // cmn xzr, xzr: acarreo 0
+    definir_etiqueta(c, __cargar64(g + 16))
+    si (__cargar64(g + 176) != 0) { a64_memoria(c, 0, 22, 29, tb_lista_desp(g, total + 1)) }
+    a64_restar_inm(c, 28, 29, 8 * usados)
+    sea i = usados - 1
+    mientras (i >= 0) {
+        a64_sacar_fis(c, tba_f(tb_hogar(i)))
+        i = i - 1
+    }
+    a64_sacar_fis(c, 29)
+    a64_sacar_fis(c, 30)
+    a64(c, 3596551104)                                             // ret
+    definir_etiqueta(c, __cargar64(g + 24))
+    a64(c, 3944678399)                                             // cmp xzr, xzr: acarreo 1
+    op_saltar(c, __cargar64(g + 16))
+    retornar 0
+}
+
 funcion tb_emitir_turbo(c, e, normal, dinamica, inicio) {
     sea fin_tokens = __cargar64(c + 8)
     __guardar64(c + 8, inicio)
@@ -9726,6 +10168,9 @@ funcion tb_emitir_turbo(c, e, normal, dinamica, inicio) {
 
     // 2) Entrada normal (convención del lenguaje).
     definir_etiqueta(c, normal)
+    si (es_arm64(c)) {
+        tba_entrada_normal(c, e, n, dinamica)
+    } sino {
     e1(c, 85)                                                       // push rbp
     e3(c, 72, 137, 229)                                             // mov rbp, rsp
     sea repetir = nueva_etiqueta(c)
@@ -9757,6 +10202,7 @@ funcion tb_emitir_turbo(c, e, normal, dinamica, inicio) {
     e3(c, 72, 137, 236)                                              // mov rsp, rbp
     e1(c, 93)                                                        // pop rbp
     op_saltar(c, dinamica)
+    }
 
     // 3) Entrada cruda.
     sea g = mem_reservar(312)
@@ -9825,7 +10271,7 @@ funcion tb_emitir_turbo(c, e, normal, dinamica, inicio) {
             desenrollar = 2
             __guardar64(g + 192, 2)
             // y un tercero en r12 (guardado aparte) si no hay listas
-            si (tb_hay_listas(cuerpo) == 0) {
+            si (tb_hay_listas(cuerpo) == 0 y es_arm64(c) == 0) {
                 __guardar64(g + 192, 3)
                 __guardar64(g + 304, 1)
             }
@@ -9853,11 +10299,15 @@ funcion tb_emitir_turbo(c, e, normal, dinamica, inicio) {
     // (Probado sin marco: resultó más lento en recursión; se deja el marco.)
     sea con_marco = 1
     sea hueco = 0
-    si (con_marco) {
+    si (es_arm64(c)) {
+        a64_empujar_fis(c, 30)                                       // x30 (vuelta)
+        a64_empujar_fis(c, 29)
+        a64_mov(c, 29, 28)
+    } sino {
         e1(c, 85)                                                    // push rbp
         e3(c, 72, 137, 229)                                          // mov rbp, rsp
     }
-    i = 0
+    sea i = 0
     mientras (i < usados) {
         tb_empujar(c, tb_hogar(i))
         i = i + 1
@@ -9874,7 +10324,8 @@ funcion tb_emitir_turbo(c, e, normal, dinamica, inicio) {
         __guardar64(g + 184, tb_lista_desp(g, total))
         ranuras = ranuras + total + 2
     }
-    si (ranuras > 0) {
+    si (ranuras > 0 y es_arm64(c)) { a64_restar_inm(c, 28, 28, 8 * ranuras) }
+    si (ranuras > 0 y es_arm64(c) == 0) {
         e3(c, 72, 129, 236)                                          // sub rsp, imm32
         e32(c, 8 * ranuras)
     }
@@ -9911,6 +10362,11 @@ funcion tb_emitir_turbo(c, e, normal, dinamica, inicio) {
         __guardar64(g + 64, 1)
     }
     tb_bloque_gen(g, cuerpo)
+    si (es_arm64(c)) {
+        tba_salida(c, g, usados, total)
+        definir_etiqueta(c, saltar)
+        retornar 0
+    }
     e3(c, 72, 49, 192)                                               // xor rax, rax (no se llega)
     definir_etiqueta(c, __cargar64(g + 56))
     e1(c, 248)                                                       // clc: resultado válido
