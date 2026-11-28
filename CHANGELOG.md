@@ -41,6 +41,13 @@ Sitio oficial: [c-forge.org](https://c-forge.org)
   todas las cifras en un solo recorrido. Contra Rust (`rustc -O`) en las
   pruebas de Fuzz Lab: fib30 −7 %, suma 10 M −9 %, criba 2 M y ordenar
   200 k a la par o mejor.
+- **Modo turbo con decimales y listas como parámetros:** cuentas decimales
+  en registros (con `raiz`), listas de enteros o decimales que llegan como
+  parámetro, hasta 12 parámetros y funciones chicas en línea, siempre con
+  los mismos resultados que la dinámica. nbody: ~21 s → ~0,14 s; spectral
+  norm: ~9,6 s → ~0,09 s; mandelbrot: ~25 s → ~0,1 s.
+- **`x += k` justo después de una división** da siempre el resultado
+  correcto en el modo dinámico.
 - **comptime con tope de 10 s:** si la evaluación al compilar no termina, el
   compilador da un error claro en vez de quedarse esperando.
 - **Regex:** tope de trabajo por llamada (error capturable) y el motor es
