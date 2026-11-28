@@ -23,6 +23,9 @@ Sitio oficial: [c-forge.org](https://c-forge.org)
 - **Recursión desenrollada un nivel:** en `retornar f(a) + f(b)` la llamada
   que no es de cola se hace en línea con su propio ciclo: `fib(35)` ~60 →
   ~48 ms.
+- **Modo turbo en ARM64:** el mismo modo turbo (registros, listas,
+  recursión en línea, radix nativo) en Linux, macOS e iOS ARM64, con los
+  mismos resultados que en x86-64.
 - **Modo turbo más fino:** recursión en línea hasta tres niveles y sin
   contador de vueltas cuando el argumento baja de a poco; restas y pasos
   sin revisar desborde donde no puede haberlo; variables que nunca son
