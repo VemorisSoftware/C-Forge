@@ -14,6 +14,12 @@ Sitio oficial: [c-forge.org](https://c-forge.org)
   caso base en línea en cada llamada, operandos directo desde registros,
   operaciones en el sitio (`x = x + E`) y entradas de función y ciclos
   alineadas: `fib(35)` ~50 ms y el bucle de 100 M por delante de Rust.
+- **Modo turbo para más código:** parámetros sin tipo, funciones anónimas,
+  `+=`/`-=`/`*=` y listas locales de enteros (lectura, escritura, `agregar`,
+  `longitud`, `lista_repetir`, `ordenar` con radix nativo). Reparto de
+  registros por uso, restos por potencias de dos sin dividir, llenado y
+  reserva de una vez en ciclos con `agregar`. Criba de 2 M: ~55 → ~8 ms;
+  ordenar 200 k: ~51 → ~4 ms.
 - **comptime con tope de 10 s:** si la evaluación al compilar no termina, el
   compilador da un error claro en vez de quedarse esperando.
 - **Regex:** tope de trabajo por llamada (error capturable) y el motor es
