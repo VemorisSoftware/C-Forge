@@ -140,9 +140,12 @@ variables en registros del procesador, comparar-y-saltar y resto por
 constante sin dividir. El resultado es siempre el mismo que en el modo
 dinámico: si un argumento no es un entero chico, o si un cálculo se sale de
 i64 o divide por cero, la función (que no tiene efectos) se repite con su
-forma normal y da el entero grande o el error de siempre. En ARM64 y
-WebAssembly, por ahora, se compila de la forma normal. `CFORGE_TURBO=0`
-lo desactiva.
+forma normal y da el entero grande o el error de siempre. Además:
+`retornar f(a) + f(b)` (la misma función) se convierte en un ciclo con
+acumulador (la mitad de las llamadas, y `retornar f(n - 1) + x` ya no gasta
+pila), y si la función empieza con `si (guarda) { retornar E }`, cada
+llamada prueba la guarda antes de llamar. En ARM64 y WebAssembly, por
+ahora, se compila de la forma normal. `CFORGE_TURBO=0` lo desactiva.
 
 ### 3.3 Opcionales y punteros seguros ✅
 
