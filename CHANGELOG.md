@@ -10,6 +10,10 @@ Sitio oficial: [c-forge.org](https://c-forge.org)
   dividir: un bucle de 100 millones pasa de ~390 ms a ~86 ms (Rust: 79 ms) y
   `fib(35)` de ~105 ms a ~55 ms. Mismos resultados que siempre (si algo se
   sale de i64, se repite con la forma normal).
+- **Más rápido aún:** recursión `f(a) + f(b)` como ciclo con acumulador,
+  caso base en línea en cada llamada, operandos directo desde registros,
+  operaciones en el sitio (`x = x + E`) y entradas de función y ciclos
+  alineadas: `fib(35)` ~50 ms y el bucle de 100 M por delante de Rust.
 - **comptime con tope de 10 s:** si la evaluación al compilar no termina, el
   compilador da un error claro en vez de quedarse esperando.
 - **Regex:** tope de trabajo por llamada (error capturable) y el motor es
